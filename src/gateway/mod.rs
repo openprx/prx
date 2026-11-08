@@ -1318,16 +1318,42 @@ impl AppState {
             std::process::abort();
         }
         #[cfg(test)]
-        Arc::new(TurnRuntimeGeneration {
-            provider_binding: None,
-            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
-            config_generation: self.config.pin(),
-            provider: Arc::clone(&self.provider),
-            model: self.model.clone(),
-            temperature: self.temperature,
-            tools_registry: Arc::clone(&self.tools_registry),
-            mcp_tool: self.mcp_tool.clone(),
-        })
+        {
+            let mut generation = TurnRuntimeGeneration {
+                provider_binding: None,
+                decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
+                config_generation: self.config.pin(),
+                provider: Arc::clone(&self.provider),
+                model: self.model.clone(),
+                temperature: self.temperature,
+                tools_registry: Arc::clone(&self.tools_registry),
+                mcp_tool: self.mcp_tool.clone(),
+            };
+            let config = &generation.config_generation.effective;
+            if let Some(provider_name) = config.default_provider.as_deref() {
+                let catalog = crate::providers::selection::catalog_for(config);
+                if let Ok(resolved) = crate::providers::selection::check_with(
+                    config,
+                    &catalog,
+                    provider_name,
+                    &generation.model,
+                    crate::providers::selection::credential_for(config, provider_name),
+                    &crate::providers::catalog::Requirement::chat(),
+                    crate::providers::catalog::UnknownPolicy::Invocation,
+                ) {
+                    generation.provider_binding = Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                        Arc::clone(&generation.provider),
+                        resolved,
+                    )));
+                    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                        &config.autonomy,
+                        &config.workspace_dir,
+                    ));
+                    generation.decision_slot = Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0));
+                }
+            }
+            Arc::new(generation)
+        }
     }
 }
 

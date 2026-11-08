@@ -40,6 +40,108 @@ pub(crate) fn agent_partition_clause(principal: &MemoryPrincipal, first_placehol
     }
 }
 
+pub(crate) const fn conversation_turns_ordering(recorded_order: bool) -> &'static str {
+    if recorded_order {
+        "julianday(timestamp) DESC, COALESCE((SELECT event.id FROM message_events event WHERE event.event_id = conversation_turns.message_event_id), id) DESC, id DESC"
+    } else {
+        "id DESC"
+    }
+}
+
+pub(crate) fn conversation_turns_select_sql(session_fragment: &str, partition_sql: &str, ordering: &str) -> String {
+    format!(
+        "SELECT id, session_key, role, content, timestamp, message_id
+                 FROM conversation_turns
+                 WHERE {session_fragment}
+                   AND (
+                       ?4 = 'system:*'
+                       OR
+                       owner_id = ?4
+                       OR (?5 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
+                   ){partition_sql}
+                 ORDER BY {ordering}
+                 LIMIT ?2 OFFSET ?3"
+    )
+}
+
+pub(crate) fn message_events_since_select_sql(
+    session_fragment: &str,
+    owner_fragment: &str,
+    owner_required_fragment: &str,
+    partition_sql: &str,
+) -> String {
+    format!(
+        "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE id > ?1
+                   AND (
+                       visibility = 'global'
+                       OR (
+                           workspace_id = ?2
+                           AND (
+                               visibility = 'workspace'{owner_fragment}
+                               OR (visibility = 'agent' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                               ))
+                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
+                               OR (visibility = 'private' AND (
+                                   (?3 IS NOT NULL AND agent_id = ?3)
+                                   OR (?4 IS NOT NULL AND persona_id = ?4)
+                                   OR (?6 IS NOT NULL AND sender = ?6)
+                               ){owner_required_fragment})
+                               OR (visibility = 'system' AND ?7)
+                           )
+                       )
+                   ){partition_sql}
+                 ORDER BY id ASC
+                 LIMIT ?8"
+    )
+}
+
+pub(crate) struct MessageEventsSinceStatement {
+    pub sql: String,
+    pub partition_values: Vec<String>,
+    pub legacy_session_keys: Vec<String>,
+    pub bind_owner: bool,
+}
+
+/// Production conversation-turns statement, including the partition conjunct.
+/// Returns `(sql, partition_values, legacy_session_keys)`.
+pub(crate) fn conversation_turns_statement(
+    principal: &MemoryPrincipal,
+    session_key: &str,
+    recorded_order: bool,
+) -> (String, Vec<String>, Vec<String>) {
+    let legacy_session_keys: Vec<String> = principal
+        .legacy_session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && *key != session_key.trim())
+        .map(|key| vec![key.to_string()])
+        .unwrap_or_default();
+    let mut session_indices = vec![1usize];
+    for offset_idx in 0..legacy_session_keys.len() {
+        session_indices.push(6 + offset_idx);
+    }
+    let session_fragment =
+        crate::memory::session_predicate::session_key_match_fragment(super::SQLITE_DIALECT, &session_indices);
+    let (partition_sql, partition_values) = agent_partition_clause(principal, 6 + legacy_session_keys.len());
+    (
+        conversation_turns_select_sql(
+            &session_fragment.sql,
+            &partition_sql,
+            conversation_turns_ordering(recorded_order),
+        ),
+        partition_values,
+        legacy_session_keys,
+    )
+}
+
 use super::ingress_recovery;
 use super::recovery_authority::{self, FullSync};
 use super::recovery_keys::KeyDirectory;
@@ -57,11 +159,6 @@ impl SqliteMemory {
         recorded_order: bool,
     ) -> anyhow::Result<Vec<ConversationTurn>> {
         let pool = self.pool.clone();
-        let ordering = if recorded_order {
-            "julianday(timestamp) DESC, COALESCE((SELECT event.id FROM message_events event WHERE event.event_id = conversation_turns.message_event_id), id) DESC, id DESC"
-        } else {
-            "id DESC"
-        };
         let owner_id = principal
             .owner_id
             .as_deref()
@@ -75,38 +172,13 @@ impl SqliteMemory {
         // (bound at `?1`); the principal may carry a distinct legacy key bound
         // at trailing placeholders starting at `?6`. With no legacy key the
         // predicate degrades to the byte-identical `session_key = ?1`.
-        let legacy_session_keys: Vec<String> = principal
-            .legacy_session_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty() && *key != session_key.trim())
-            .map(|key| vec![key.to_string()])
-            .unwrap_or_default();
-        let mut session_indices = vec![1usize];
-        for offset_idx in 0..legacy_session_keys.len() {
-            session_indices.push(6 + offset_idx);
-        }
-        let session_fragment =
-            crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
-        let (partition_sql, partition_values) = agent_partition_clause(principal, 6 + legacy_session_keys.len());
+        let (sql, partition_values, legacy_session_keys) =
+            conversation_turns_statement(principal, &session_key, recorded_order);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT id, session_key, role, content, timestamp, message_id
-                 FROM conversation_turns
-                 WHERE {session_fragment}
-                   AND (
-                       ?4 = 'system:*'
-                       OR
-                       owner_id = ?4
-                       OR (?5 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
-                   ){partition_sql}
-                 ORDER BY {ordering}
-                 LIMIT ?2 OFFSET ?3",
-                session_fragment = session_fragment.sql,
-            ))?;
+            let mut stmt = conn.prepare(&sql)?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> =
                 vec![&session_key, &limit, &offset, &owner_id, &legacy_visible];
             for key in &legacy_session_keys {
@@ -930,6 +1002,44 @@ impl SqliteMemory {
         .await?
     }
 
+    /// Production message-events-since statement, including the partition conjunct.
+    pub(crate) fn message_events_since_statement(principal: &MemoryPrincipal) -> MessageEventsSinceStatement {
+        let legacy_session_keys = Self::legacy_session_key_params(principal);
+        // Canonical key keeps its original `?5` binding; legacy key(s) bind to
+        // new trailing placeholders starting at `?9` (after limit at `?8`).
+        let session_indices = Self::session_indices(5, 9, principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            principal.require_owner_match,
+            crate::memory::owner_predicate::has_owner_id(principal),
+        );
+        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
+        // isolated or not, and admits nothing to a reader without one. Same
+        // placeholder as `owner_fragment`, so one bound value serves both.
+        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
+            SQLITE_DIALECT,
+            Self::owner_index(9, legacy_session_keys.len()),
+            true,
+            crate::memory::owner_predicate::has_owner_id(principal),
+        );
+        let partition_first = 9 + legacy_session_keys.len() + usize::from(owner_required_fragment.bound_owner);
+        let (partition_sql, partition_values) = agent_partition_clause(principal, partition_first);
+        MessageEventsSinceStatement {
+            sql: message_events_since_select_sql(
+                &session_fragment.sql,
+                &owner_fragment.sql,
+                &owner_required_fragment.sql,
+                &partition_sql,
+            ),
+            partition_values,
+            legacy_session_keys,
+            bind_owner: owner_required_fragment.bound_owner,
+        }
+    }
+
     pub(super) async fn list_message_events_since_impl(
         &self,
         principal: &MemoryPrincipal,
@@ -940,68 +1050,12 @@ impl SqliteMemory {
         let principal = principal.clone();
         let limit = Self::sanitize_conversation_limit(limit);
         let system_allowed = Self::is_system_principal(&principal);
-
-        let legacy_session_keys = Self::legacy_session_key_params(&principal);
-        // Canonical key keeps its original `?5` binding; legacy key(s) bind to
-        // new trailing placeholders starting at `?9` (after limit at `?8`).
-        let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
-        let session_fragment =
-            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
-        let owner_fragment = crate::memory::owner_predicate::owner_match_suffix(
-            SQLITE_DIALECT,
-            Self::owner_index(9, legacy_session_keys.len()),
-            principal.require_owner_match,
-            crate::memory::owner_predicate::has_owner_id(&principal),
-        );
-        // OV-E (OQ-1): the `private` arm requires the owner for every reader,
-        // isolated or not, and admits nothing to a reader without one. Same
-        // placeholder as `owner_fragment`, so one bound value serves both.
-        let owner_required_fragment = crate::memory::owner_predicate::owner_match_suffix(
-            SQLITE_DIALECT,
-            Self::owner_index(9, legacy_session_keys.len()),
-            true,
-            crate::memory::owner_predicate::has_owner_id(&principal),
-        );
-        let partition_first = 9 + legacy_session_keys.len() + usize::from(owner_required_fragment.bound_owner);
-        let (partition_sql, partition_values) = agent_partition_clause(&principal, partition_first);
+        let statement = Self::message_events_since_statement(&principal);
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let reader = pool.read()?;
             let conn = reader.connection()?;
-            let mut stmt = conn.prepare(&format!(
-                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
-                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
-                 FROM message_events
-                 WHERE id > ?1
-                   AND (
-                       visibility = 'global'
-                       OR (
-                           workspace_id = ?2
-                           AND (
-                               visibility = 'workspace'{owner_fragment}
-                               OR (visibility = 'agent' AND (
-                                   (?3 IS NOT NULL AND agent_id = ?3)
-                                   OR (?4 IS NOT NULL AND persona_id = ?4)
-                               ))
-                               OR (visibility = 'session' AND {session_fragment}{owner_fragment})
-                               OR (visibility = 'private' AND (
-                                   (?3 IS NOT NULL AND agent_id = ?3)
-                                   OR (?4 IS NOT NULL AND persona_id = ?4)
-                                   OR (?6 IS NOT NULL AND sender = ?6)
-                               ){owner_required_fragment})
-                               OR (visibility = 'system' AND ?7)
-                           )
-                       )
-                   ){partition_sql}
-                 ORDER BY id ASC
-                 LIMIT ?8",
-                session_fragment = session_fragment.sql,
-                owner_fragment = owner_fragment.sql,
-                owner_required_fragment = owner_required_fragment.sql,
-            ))?;
+            let mut stmt = conn.prepare(&statement.sql)?;
             let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
                 &after_id,
                 &principal.workspace_id,
@@ -1012,13 +1066,13 @@ impl SqliteMemory {
                 &system_allowed,
                 &limit,
             ];
-            for key in &legacy_session_keys {
+            for key in &statement.legacy_session_keys {
                 bind.push(key);
             }
-            if owner_required_fragment.bound_owner {
+            if statement.bind_owner {
                 bind.push(&principal.owner_id);
             }
-            for value in &partition_values {
+            for value in &statement.partition_values {
                 bind.push(value);
             }
             let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;

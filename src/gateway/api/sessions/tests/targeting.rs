@@ -1141,6 +1141,57 @@ const TARGET_SCOPE: &str = "00000000-0000-4000-8000-0000000000c1";
 const TARGET_MAIN_U: &str = "00000000-0000-4000-8000-0000000000b1";
 const TARGET_MAIN_SCOPE: &str = "00000000-0000-4000-8000-0000000000d1";
 const TARGET_REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const CAPTURE_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b2-partition";
+
+fn capture_provider_config(config: &mut Config, agent_cfg: DelegateAgentConfig) {
+    config.default_provider = Some(CAPTURE_PROVIDER.to_owned());
+    config.default_model = Some("test-model".to_owned());
+    config.cost.prices.insert(
+        format!("{CAPTURE_PROVIDER}/test-model"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(
+        toml::from_str(&format!(
+            "provider = {CAPTURE_PROVIDER:?}\nmodel = \"test-model\"\noperations = [\"chat\"]\n"
+        ))
+        .expect("test: catalog"),
+    );
+    let mut agent_cfg = agent_cfg;
+    agent_cfg.provider = CAPTURE_PROVIDER.to_owned();
+    agent_cfg.model = "test-model".to_owned();
+    config.agents.insert("x".to_owned(), agent_cfg);
+}
+
+fn captured_contents(provider: &CapturingProvider, index: usize) -> Vec<String> {
+    provider
+        .requests
+        .lock()
+        .get(index)
+        .expect("test: captured request")
+        .iter()
+        .map(|message| message.content.clone())
+        .collect()
+}
+
+fn assert_history_partition(contents: &[String], present: &[&str], absent: &[&str], label: &str) {
+    for item in present {
+        assert!(
+            contents.iter().any(|content| content.contains(item)),
+            "{label} missing {item} in {contents:?}"
+        );
+    }
+    for item in absent {
+        assert!(
+            !contents.iter().any(|content| content.contains(item)),
+            "{label} leaked {item} in {contents:?}"
+        );
+    }
+}
 
 fn named_partition(workspace: &str, owner: &str, name: &str, incarnation: &str) -> AgentPartition {
     AgentPartition {
@@ -1218,14 +1269,13 @@ async fn sqlite_targeted_scope_supported() {
     let fixture = fixture(|config| {
         config.gateway.targeted_agents = true;
         config.autonomy.level = AutonomyLevel::Full;
-        config.api_url = Some("http://127.0.0.1:1".to_owned());
-        config.agents.insert("x".to_owned(), agent(false, &[]));
-        config.providers.models.push(
-            toml::from_str("provider = \"ollama\"\nmodel = \"test-model\"\noperations = [\"chat\"]\n")
-                .expect("test: catalog"),
-        );
+        capture_provider_config(config, agent(false, &[]));
     })
     .await;
+    crate::providers::test_fixture::register(
+        CAPTURE_PROVIDER,
+        Arc::clone(&fixture.provider) as Arc<dyn crate::providers::Provider>,
+    );
     assert!(fixture.memory.supports_agent_scope());
     let workspace = fixture
         .state
@@ -1267,15 +1317,23 @@ async fn sqlite_targeted_scope_supported() {
     .expect("test: named target");
     assert_eq!(selected.incarnation.as_deref(), Some(TARGET_U));
 
-    let (status, value) = post(
-        &fixture,
-        "no-such-session",
-        serde_json::json!({"message": "hi", "agent": "x"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
-    assert_ne!(error_code(&value), Some("agent_backend_unsupported"));
-    assert_eq!(selected.incarnation.as_deref(), Some(TARGET_U));
+    let (status, value) = post(&fixture, SESSION, serde_json::json!({"message": "hi", "agent": "x"})).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_history_partition(
+        &captured_contents(&fixture.provider, 0),
+        &["x-only"],
+        &["main-row", "null-row"],
+        "Named POST",
+    );
+
+    let (status, value) = post(&fixture, SESSION, serde_json::json!({"message": "hi"})).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_history_partition(
+        &captured_contents(&fixture.provider, 1),
+        &["main-row", "null-row"],
+        &["x-only"],
+        "Main POST",
+    );
 }
 
 #[tokio::test]
@@ -1307,7 +1365,7 @@ async fn none_targeted_scope_rejected() {
     let mut state = test_app_state(config, provider.clone());
     state.mem = Arc::new(NoneMemory::new());
     let response = post_session_message(
-        State(state),
+        State(state.clone()),
         Path(SESSION.to_owned()),
         http_request(serde_json::json!({"message": "hi", "agent": "x"})),
     )
@@ -1321,4 +1379,18 @@ async fn none_targeted_scope_rejected() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(error_code(&body), Some("agent_backend_unsupported"));
     assert!(provider.requests.lock().is_empty(), "no provider access");
+    assert!(state.mem.agent_registry().is_none(), "no registry row");
+    let session = state
+        .mem
+        .get_conversation_session(SESSION)
+        .await
+        .expect("test: read session");
+    assert!(session.is_none(), "no input event");
+    let job_label = format!("gateway:session_message:{SESSION}");
+    assert!(
+        crate::gateway::jobs::snapshot_all()
+            .iter()
+            .all(|job| job.label != job_label),
+        "no job"
+    );
 }

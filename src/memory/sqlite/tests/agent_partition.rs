@@ -1,7 +1,7 @@
 //! MA-01b2: transcript and event reads are partitioned by agent scope.
 use super::*;
 use crate::config::agent_name::AgentName;
-use crate::memory::sqlite::events::agent_partition_clause;
+use crate::memory::sqlite::events::conversation_turns_statement;
 use crate::memory::{AgentPartition, ConversationTurn, PartitionKey};
 use rusqlite::{Connection, params};
 
@@ -265,58 +265,44 @@ async fn agent_partition_filters_transcripts_and_events() {
     assert!(all_ids.contains(&"a-x-1") && all_ids.contains(&"a-null"));
     assert!(!all_ids.iter().any(|id| id.starts_with("b-")), "{all_ids:?}");
 
-    let turn_sql = |clause: &str| {
-        format!(
-            "SELECT id, session_key, role, content, timestamp, message_id
-             FROM conversation_turns
-             WHERE session_key = ?1
-               AND (
-                   ?4 = 'system:*'
-                   OR owner_id = ?4
-                   OR (?5 = 1 AND (owner_id IS NULL OR owner_id = 'legacy:' || session_key))
-               ){clause}
-             ORDER BY id DESC
-             LIMIT ?2 OFFSET ?3"
-        )
-    };
-    let event_sql = |clause: &str| {
-        format!(
-            "SELECT id FROM message_events
-             WHERE id > ?1
-               AND workspace_id = ?2
-               AND visibility = 'session'
-               AND session_key = ?5
-               {clause}
-             ORDER BY id ASC
-             LIMIT ?8"
-        )
-    };
     let owner = Some("system:*".to_string());
     let legacy = 1_i64;
     let limit = 50_i64;
     let offset = 0_i64;
     let after = 0_i64;
     let session = SESSION_A.to_owned();
+    let none_reader = principal(SESSION_A, None);
+    let (none_turn_sql, _, none_turn_legacy) = conversation_turns_statement(&none_reader, SESSION_A, true);
+    let mut none_turn_binds: Vec<&dyn rusqlite::types::ToSql> = vec![&session, &limit, &offset, &owner, &legacy];
+    for key in &none_turn_legacy {
+        none_turn_binds.push(key);
+    }
+    let none_turn_plan = explain(&conn, &none_turn_sql, &none_turn_binds);
+    let none_event = SqliteMemory::message_events_since_statement(&none_reader);
     let agent: Option<String> = Some("system".to_owned());
     let persona: Option<String> = None;
     let sender: Option<String> = Some("s".to_owned());
     let system_allowed = true;
-    let none_turn_plan = explain(&conn, &turn_sql(""), &[&session, &limit, &offset, &owner, &legacy]);
-    // Production events bind ?1..=?8; unused slots still occupy the numbered range
-    // so SQLite's highest-index rule matches `agent_partition_clause(..., 9)`.
-    let none_event_plan = explain(
-        &conn,
-        &event_sql(""),
-        &[&after, &W, &agent, &persona, &session, &sender, &system_allowed, &limit],
-    );
+    let mut none_event_binds: Vec<&dyn rusqlite::types::ToSql> =
+        vec![&after, &W, &agent, &persona, &session, &sender, &system_allowed, &limit];
+    for key in &none_event.legacy_session_keys {
+        none_event_binds.push(key);
+    }
+    if none_event.bind_owner {
+        none_event_binds.push(&none_reader.owner_id);
+    }
+    let none_event_plan = explain(&conn, &none_event.sql, &none_event_binds);
     for (label, partition) in [("named", Some(named("x", UX))), ("main", Some(main_partition()))] {
         let reader = principal(SESSION_A, partition);
-        let (turn_clause, turn_values) = agent_partition_clause(&reader, 6);
+        let (turn_sql, turn_values, turn_legacy) = conversation_turns_statement(&reader, SESSION_A, true);
         let mut turn_binds: Vec<&dyn rusqlite::types::ToSql> = vec![&session, &limit, &offset, &owner, &legacy];
+        for key in &turn_legacy {
+            turn_binds.push(key);
+        }
         for value in &turn_values {
             turn_binds.push(value);
         }
-        let turn_plan = explain(&conn, &turn_sql(&turn_clause), &turn_binds);
+        let turn_plan = explain(&conn, &turn_sql, &turn_binds);
         assert!(
             extra_scans(&turn_plan, &none_turn_plan).is_empty(),
             "{label} turns extra SCAN: {turn_plan:?} vs {none_turn_plan:?}"
@@ -325,13 +311,19 @@ async fn agent_partition_filters_transcripts_and_events() {
             turn_plan.iter().all(|line| !line.contains("SCAN agent_scopes")),
             "{label} turns SCAN agent_scopes: {turn_plan:?}"
         );
-        let (event_clause, event_values) = agent_partition_clause(&reader, 9);
+        let event = SqliteMemory::message_events_since_statement(&reader);
         let mut event_binds: Vec<&dyn rusqlite::types::ToSql> =
             vec![&after, &W, &agent, &persona, &session, &sender, &system_allowed, &limit];
-        for value in &event_values {
+        for key in &event.legacy_session_keys {
+            event_binds.push(key);
+        }
+        if event.bind_owner {
+            event_binds.push(&reader.owner_id);
+        }
+        for value in &event.partition_values {
             event_binds.push(value);
         }
-        let event_plan = explain(&conn, &event_sql(&event_clause), &event_binds);
+        let event_plan = explain(&conn, &event.sql, &event_binds);
         assert!(
             extra_scans(&event_plan, &none_event_plan).is_empty(),
             "{label} events extra SCAN: {event_plan:?} vs {none_event_plan:?}"
