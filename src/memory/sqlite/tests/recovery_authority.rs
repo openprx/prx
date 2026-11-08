@@ -1024,7 +1024,7 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     );
     let lost_bytes: [u8; 32] = source.get(&k1).context("source bytes of K1")?.as_slice().try_into()?;
     KeyDirectory::open(&memory_dir, false)?.install(&k1, &lost_bytes)?;
-    assert!(key_bytes(&source_keys)? == source);
+    assert!(key_bytes(&source_keys)? == source, "K1 was reinstalled unchanged");
 
     // (iv) A never-activated database backs up with no key directory.
     let (fresh_dir, fresh) = store()?;
@@ -1032,7 +1032,7 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     fresh.backup_database_to(&target).await?;
     assert_eq!(
         directory_listing(&parent_of(&target)?)?,
-        ["target.db".to_owned()].into_iter().collect()
+        std::collections::BTreeSet::from(["target.db".to_owned()])
     );
     assert_eq!(mode_of(&parent_of(&target)?)?, 0o700);
 
