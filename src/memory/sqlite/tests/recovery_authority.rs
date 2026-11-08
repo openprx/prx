@@ -1028,6 +1028,52 @@ async fn recovery_backup_includes_every_referenced_key_generation() -> anyhow::R
     ));
     drop(restored);
 
+    // (v) The migration path: a live WAL row, the notes and every key generation
+    // are published together; a fault before publication leaves only refused attempts.
+    seed(&memory, "live-wal-row", "user")?;
+    std::fs::write(root.join("MEMORY.md"), b"core notes")?;
+    std::fs::write(memory_dir.join("2026-01-01.md"), b"daily notes")?;
+    let migrations = memory_dir.join("migrations");
+    let crashed = with_fault(
+        {
+            let leftover = root.join("migration-leftover");
+            move |step, at| {
+                if step == Step::Staged {
+                    std::fs::rename(at, &leftover)?;
+                    anyhow::bail!("simulated crash");
+                }
+                Ok(())
+            }
+        },
+        || crate::migration::backup_target_memory(&root),
+    );
+    refusal(crashed, "migration backup crash")?;
+    assert!(
+        directory_listing(&migrations)?.is_empty(),
+        "nothing published by the crash"
+    );
+    assert_refused_untouched(&root.join("migration-leftover"))?;
+    let migrated = crate::migration::backup_target_memory(&root)?.context("the migration backup was created")?;
+    assert_eq!(mode_of(&migrated)?, 0o700);
+    assert!(
+        key_bytes(&migrated.join(".recovery_keys"))? == source,
+        "migration bundle carries every key"
+    );
+    assert_eq!(std::fs::read(migrated.join("MEMORY.md"))?, b"core notes");
+    assert_eq!(
+        std::fs::read(migrated.join("daily").join("2026-01-01.md"))?,
+        b"daily notes"
+    );
+    let restored = SqliteMemory::new_with_path(migrated.join("brain.db"))?;
+    let live_rows: i64 = restored.pool.write().query_row(
+        "SELECT count(*) FROM message_events WHERE event_id='live-wal-row'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(live_rows, 1, "the uncheckpointed row is in the bundle");
+    assert_eq!(restored.activate_recovery_authority()?, k2);
+    drop(restored);
+
     // (ii) A restore missing any referenced generation fails closed, never
     // regenerates, and leaves the bundle mode and every remaining key byte alone.
     for (index, missing) in [k1.clone(), k0.clone(), kc.clone()].into_iter().enumerate() {

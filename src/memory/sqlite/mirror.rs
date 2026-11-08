@@ -27,6 +27,17 @@ impl SqliteMemory {
         .await?
     }
 
+    /// Back up a database file that no handle holds, with every recovery key it
+    /// references, as one atomic bundle (see `backup_database_to`). `extras`
+    /// stages more files, durably, into the bundle before it is published.
+    pub(crate) fn backup_file_with(
+        source: &Path,
+        target: &Path,
+        extras: &dyn Fn(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        super::recovery_backup::backup_file_with(source, target, extras)
+    }
+
     fn backup_file_path(db_path: &Path, category: &MemoryCategory) -> PathBuf {
         let memory_dir = db_path
             .parent()

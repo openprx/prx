@@ -460,37 +460,49 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let backup_root = workspace_dir
         .join("memory")
         .join("migrations")
         .join(format!("openclaw-{timestamp}"));
 
-    let mut copied_any = false;
-    fs::create_dir_all(&backup_root)?;
-
-    let files_to_copy = [
-        workspace_dir.join("memory").join("brain.db"),
-        workspace_dir.join("MEMORY.md"),
-    ];
-
-    for source in files_to_copy {
-        if source.exists() {
-            let Some(name) = source.file_name() else {
-                continue;
-            };
-            fs::copy(&source, backup_root.join(name))?;
-            copied_any = true;
-        }
+    let database = workspace_dir.join("memory").join("brain.db");
+    if database.exists() {
+        // The database snapshot, its recovery keys and the notes are published
+        // as one crash-safe bundle; a live WAL is never copied byte for byte.
+        memory::SqliteMemory::backup_file_with(&database, &backup_root.join("brain.db"), &|staging| {
+            copy_notes(workspace_dir, staging).map(drop)
+        })?;
+        return Ok(Some(backup_root));
     }
+    fs::create_dir_all(&backup_root)?;
+    if copy_notes(workspace_dir, &backup_root)? {
+        Ok(Some(backup_root))
+    } else {
+        let _ = fs::remove_dir_all(&backup_root);
+        Ok(None)
+    }
+}
 
+/// Copy `MEMORY.md` and the daily notes into `destination`, each fsynced.
+fn copy_notes(workspace_dir: &Path, destination: &Path) -> Result<bool> {
+    let copy = |source: &Path, target: PathBuf| -> Result<()> {
+        fs::copy(source, &target)?;
+        fs::File::open(&target)?.sync_all()?;
+        Ok(())
+    };
+    let mut copied_any = false;
+    let notes = workspace_dir.join("MEMORY.md");
+    if notes.exists() {
+        copy(&notes, destination.join("MEMORY.md"))?;
+        copied_any = true;
+    }
     let daily_dir = workspace_dir.join("memory");
     if daily_dir.exists() {
-        let daily_backup = backup_root.join("daily");
+        let daily_backup = destination.join("daily");
         for file in fs::read_dir(&daily_dir)? {
-            let file = file?;
-            let path = file.path();
+            let path = file?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                 continue;
             }
@@ -498,17 +510,14 @@ fn backup_target_memory(workspace_dir: &Path) -> Result<Option<PathBuf>> {
             let Some(name) = path.file_name() else {
                 continue;
             };
-            fs::copy(&path, daily_backup.join(name))?;
+            copy(&path, daily_backup.join(name))?;
             copied_any = true;
         }
+        if daily_backup.exists() {
+            fs::File::open(&daily_backup)?.sync_all()?;
+        }
     }
-
-    if copied_any {
-        Ok(Some(backup_root))
-    } else {
-        let _ = fs::remove_dir_all(&backup_root);
-        Ok(None)
-    }
+    Ok(copied_any)
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -723,8 +732,7 @@ mod tests {
         std::fs::create_dir_all(&mem_dir).unwrap();
 
         // Create a brain.db to back up
-        let db_path = mem_dir.join("brain.db");
-        std::fs::write(&db_path, "fake db content").unwrap();
+        let _store = memory::SqliteMemory::new(tmp.path()).unwrap();
 
         let result = backup_target_memory(tmp.path()).unwrap();
         assert!(result.is_some(), "backup should be created when files exist");

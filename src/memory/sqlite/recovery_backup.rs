@@ -115,6 +115,26 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 /// only this attempt's files are removed. The bundle directory must not exist
 /// or must be empty.
 pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<()> {
+    backup_bundle_with(conn, target, &|_| Ok(()))
+}
+
+/// Like [`backup_bundle`], for a database file no handle of ours holds (the
+/// migration path): `extras` stages further files into the staging directory,
+/// durably, before publication, so they join the same atomic bundle.
+pub(super) fn backup_file_with(
+    source: &Path,
+    target: &Path,
+    extras: &dyn Fn(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let conn = Connection::open_with_flags(std::path::absolute(source)?, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    backup_bundle_with(&conn, target, extras)
+}
+
+fn backup_bundle_with(
+    conn: &Connection,
+    target: &Path,
+    extras: &dyn Fn(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let target = std::path::absolute(target)?;
     let file_name = target.file_name().context("backup target has no file name")?;
     // Reserved names, symlinks and incomplete attempts are refused before any
@@ -141,7 +161,7 @@ pub(super) fn backup_bundle(conn: &Connection, target: &Path) -> anyhow::Result<
         .map_err(anyhow::Error::from)
         .and_then(|()| sync_directory(&staging))
         .and_then(|()| sync_directory(root));
-    let outcome = marked.and_then(|()| stage_and_publish(conn, file_name, bundle, root, &staging));
+    let outcome = marked.and_then(|()| stage_and_publish(conn, file_name, bundle, root, &staging, extras));
     // After a successful rename the staging path is gone; this only cleans failures.
     discard(std::fs::remove_dir_all(&staging));
     outcome
@@ -153,6 +173,7 @@ fn stage_and_publish(
     bundle: &Path,
     root: &Path,
     staging: &Path,
+    extras: &dyn Fn(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let staged = staging.join(file_name);
     // A coherent snapshot: a live write-ahead log is never copied byte for byte.
@@ -179,6 +200,7 @@ fn stage_and_publish(
             fault(Step::AfterInstall, staging)?;
         }
     }
+    extras(staging)?;
     sync_directory(staging)?;
     #[cfg(test)]
     fault(Step::Staged, staging)?;
