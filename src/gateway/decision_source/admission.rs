@@ -555,26 +555,30 @@ mod tests {
         );
     }
 
-    /// (iii) A database that never activated recovery is admitted and gains no state.
+    /// (iii) The stable-key fence creates no recovery state. Plane-off sqlite
+    /// activation may create `.recovery_keys`; it never opens the decision store.
     #[tokio::test]
-    async fn gateway_plane_off_never_activated_store_creates_no_recovery_state() {
+    async fn gateway_plane_off_fence_creates_no_recovery_state() {
         use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture::home_dir();
         let workspace = dir.path().canonicalize().unwrap();
-        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        let memory = fresh_memory(&workspace);
+        let recorded = fixture::fence_only_record(Arc::clone(&memory), &workspace, "fence-only", "prx-fence-only-key")
+            .await
+            .expect("test: fence-only");
+        assert!(
+            recorded.is_some_and(|event| event.id > 0),
+            "fence-only input was not recorded"
+        );
+        fixture::assert_fence_created_nothing(&workspace);
+        let issuer = GatewayIssuer::new(&workspace, false, memory);
         let (_receipt, event, guard) = issuer.admit("prx input").await.expect("test: admission");
         assert!(event.is_some_and(|event| event.id > 0), "input was not recorded");
         let (ticket, _acknowledgement) = guard.into_terminal_parts().expect("test: hand off the admission");
         ticket.finish(true);
         issuer.drained().await.expect("test: cleanup");
-        assert!(
-            !fixture::table_exists(&workspace, "recovery_tombstones"),
-            "the fence created the tombstone table"
-        );
-        assert!(
-            !fixture::keys_dir(&workspace).exists(),
-            "the fence created .recovery_keys"
-        );
+        fixture::assert_plane_off_no_decision_store(&workspace);
+        fixture::assert_recovery_keys_owner_modes(&workspace);
     }
 
     struct CommitThenSuspend {

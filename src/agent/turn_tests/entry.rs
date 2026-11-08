@@ -918,15 +918,26 @@ async fn scheduled_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
     );
 }
 
-/// (iii) A database that never activated recovery is admitted and gains no state.
+/// (iii) The stable-key fence creates no recovery state. Plane-off sqlite
+/// activation may create `.recovery_keys`; it never opens the decision store.
 #[tokio::test]
-async fn scheduled_plane_off_never_activated_store_creates_no_recovery_state() {
+async fn scheduled_plane_off_fence_creates_no_recovery_state() {
     use crate::providers::credential_probe::CredentialProbe;
     use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
 
-    let root = TempDir::new().expect("test: tempdir");
+    let root = fixture::home_dir();
     let probe = CredentialProbe::start().await;
     let issuer = ScheduledIssuer::new(root.path(), &probe).await;
+    let workspace = &issuer.config.workspace_dir;
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
+    let recorded = fixture::fence_only_record(memory, workspace, "fence-only", "prx-fence-only-key")
+        .await
+        .expect("test: fence-only");
+    assert!(
+        recorded.is_some_and(|event| event.id > 0),
+        "fence-only input was not recorded"
+    );
+    fixture::assert_fence_created_nothing(workspace);
     let first = issuer.run().await;
     assert!(
         first
@@ -935,19 +946,12 @@ async fn scheduled_plane_off_never_activated_store_creates_no_recovery_state() {
             .is_none_or(|error| { !fixture::is_already_accepted(error) && !fixture::is_fence_unavailable(error) }),
         "a never-activated store was refused: {first:?}"
     );
-    let workspace = &issuer.config.workspace_dir;
     assert!(
         fixture::row_count(workspace, "message_events") >= 1,
         "input was not recorded"
     );
-    assert!(
-        !fixture::table_exists(workspace, "recovery_tombstones"),
-        "the fence created the tombstone table"
-    );
-    assert!(
-        !fixture::keys_dir(workspace).exists(),
-        "the fence created .recovery_keys"
-    );
+    fixture::assert_plane_off_no_decision_store(workspace);
+    fixture::assert_recovery_keys_owner_modes(workspace);
 }
 
 /// A scheduled turn retains its creator's read-only tool authority even when

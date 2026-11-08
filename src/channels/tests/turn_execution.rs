@@ -1386,12 +1386,21 @@ async fn channel_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
     );
 }
 
-/// (iii) A database that never activated recovery is admitted and gains no state.
+/// (iii) The stable-key fence creates no recovery state. Plane-off sqlite
+/// activation may create `.recovery_keys`; it never opens the decision store.
 #[tokio::test]
-async fn channel_plane_off_never_activated_store_creates_no_recovery_state() {
+async fn channel_plane_off_fence_creates_no_recovery_state() {
     use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
-    let dir = TempDir::new().expect("test: tempdir");
+    let dir = fixture::home_dir();
     let (ctx, generation) = channel_issuer(&dir, None, false);
+    let recorded = fixture::fence_only_record(Arc::clone(&ctx.memory), dir.path(), "fence-only", "prx-fence-only-key")
+        .await
+        .expect("test: fence-only");
+    assert!(
+        recorded.is_some_and(|event| event.id > 0),
+        "fence-only input was not recorded"
+    );
+    fixture::assert_fence_created_nothing(dir.path());
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let (event, _source, guard) = channel_admit(&ctx, &generation, &cleanup, "admit me once", "prx-channel-run-1")
         .await
@@ -1399,12 +1408,6 @@ async fn channel_plane_off_never_activated_store_creates_no_recovery_state() {
     assert!(event.is_some_and(|event| event.id > 0), "input was not recorded");
     guard.finish_without_decision();
     drained(&cleanup).await.expect("test: cleanup");
-    assert!(
-        !fixture::table_exists(dir.path(), "recovery_tombstones"),
-        "the fence created the tombstone table"
-    );
-    assert!(
-        !fixture::keys_dir(dir.path()).exists(),
-        "the fence created .recovery_keys"
-    );
+    fixture::assert_plane_off_no_decision_store(dir.path());
+    fixture::assert_recovery_keys_owner_modes(dir.path());
 }

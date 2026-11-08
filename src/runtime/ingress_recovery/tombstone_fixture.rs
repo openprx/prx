@@ -76,3 +76,63 @@ pub(crate) fn is_fence_unavailable(error: &anyhow::Error) -> bool {
         .chain()
         .any(|cause| cause.is::<crate::memory::ingress_recovery::StableKeyFenceUnavailable>())
 }
+
+/// Production fence-only append: no `with_ingress_recovery`, so AUTH-02-2a
+/// activation never runs. The stable-key fence still executes inside the
+/// backend commit.
+pub(crate) async fn fence_only_record(
+    memory: Arc<dyn Memory>,
+    workspace: &Path,
+    content: &str,
+    key: &str,
+) -> anyhow::Result<Option<crate::memory::MessageEvent>> {
+    let fabric = crate::memory::MemoryFabric::new(memory, workspace.to_string_lossy());
+    let scope = crate::memory::fabric::MessageEventScope::new(
+        crate::memory::MessageEventSource::Agent,
+        crate::memory::MemoryVisibility::Session,
+    )
+    .with_owner_id("prx_user")
+    .with_run_id("prx-fence-only");
+    fabric
+        .record_inbound_user_message_best_effort(scope, content, Some(key.to_owned()), "fence")
+        .await
+}
+
+pub(crate) fn assert_fence_created_nothing(workspace: &Path) {
+    assert!(
+        !table_exists(workspace, "recovery_tombstones"),
+        "the fence created the tombstone table"
+    );
+    assert!(!keys_dir(workspace).exists(), "the fence created .recovery_keys");
+}
+
+pub(crate) fn assert_plane_off_no_decision_store(workspace: &Path) {
+    assert!(
+        !workspace.join("self/causal_tree/.decision_key").exists(),
+        "plane-off created .decision_key"
+    );
+    assert!(
+        !crate::causal_tree::store::db_path(workspace).exists(),
+        "plane-off created decisions.db"
+    );
+}
+
+pub(crate) fn assert_recovery_keys_owner_modes(workspace: &Path) {
+    let dir = keys_dir(workspace);
+    assert!(
+        dir.exists(),
+        "plane-off sqlite activation did not create .recovery_keys"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).expect("test: metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, ".recovery_keys is not 0700");
+        for entry in std::fs::read_dir(&dir).expect("test: keys dir") {
+            let path = entry.expect("test: key entry").path();
+            if path.is_file() {
+                assert_eq!(mode(&path), 0o600, "recovery key is not 0600");
+            }
+        }
+    }
+}
