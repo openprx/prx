@@ -598,18 +598,26 @@ async fn ingress_recovery_unchanged_by_switch() {
             .unwrap()
             .expect("recording sqlite prepares a recorder");
         let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-        let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
-            crate::observability::NoopObserver,
-        )));
         let key = crate::decision::key::DecisionKey::load_or_create(dir.path()).unwrap();
+        let advisory = if plane {
+            let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                crate::observability::NoopObserver,
+            )));
+            let (store, events) = super::open_advisory_store(&generation, Arc::clone(&memory), observer, &tracker)
+                .await
+                .unwrap();
+            super::PreparedAdvisory::opened(store, events).unwrap()
+        } else {
+            super::PreparedAdvisory::default()
+        };
         let recovery = RecoveryScope::prepare(
             &generation,
             memory,
             crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-            observer,
             None,
             &tracker,
             Some(key),
+            advisory,
         )
         .await
         .unwrap();
