@@ -6,6 +6,7 @@ mod catalog_drift;
 mod discovery_surface;
 mod enabled_service;
 pub(crate) mod exact_call_approval;
+mod execution;
 mod ledger_probe;
 mod performance;
 mod recorded_chain;

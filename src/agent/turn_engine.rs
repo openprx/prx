@@ -304,7 +304,7 @@ async fn run_turn_unguarded(
         on_delta,
         on_tool_call,
     } = delivery;
-    service.validate_agent_execution_model(proof, provider_name, model)?;
+    crate::runtime::turn_model::validate_execution(proof, provider_name, model)?;
     if matches!(
         context.disposition()?,
         crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments

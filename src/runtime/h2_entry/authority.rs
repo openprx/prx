@@ -76,6 +76,7 @@ impl std::fmt::Debug for EntryInvocation {
     }
 }
 impl EntryInvocation {
+    #[cfg(test)]
     fn admit(
         origin: Arc<VerifiedEntryOrigin>,
         call: EntryCall,
@@ -106,43 +107,6 @@ impl EntryInvocation {
             consumed: AtomicBool::new(false),
             local_review,
         }))
-    }
-    pub(crate) fn from_verified(
-        origin: Arc<VerifiedEntryOrigin>,
-        verified: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
-        local_review: Option<LocalOwnerReview>,
-    ) -> Result<Arc<Self>> {
-        let command = verified.command();
-        ensure!(command.name == "skills_manage", "controlled call has another backend");
-        let action = EntryAction::parse(
-            command
-                .arguments
-                .get("action")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("controlled action missing"))?,
-        )?;
-        let scope = verified.scope();
-        let call = EntryCall {
-            action,
-            tool: command.name.clone(),
-            args_sha256: arguments_digest(&command.arguments)?,
-            call_digest: hex::encode(verified.binding().call_digest),
-            capability: verified.capability().id.as_str().into(),
-            capability_generation: hex::encode(verified.capability().generation.0),
-            catalog_generation: hex::encode(verified.binding().catalog_generation),
-            actor: scope.resolved_owner_id(),
-            workspace: scope.workspace_id.clone(),
-            session: scope.session_key.clone(),
-            run: scope
-                .run_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("controlled run missing"))?,
-            event: scope
-                .source_message_event_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("controlled event missing"))?,
-        };
-        Self::admit(origin, call, local_review)
     }
     pub(crate) fn ensure_live(&self) -> Result<()> {
         self.origin.ensure_live()
