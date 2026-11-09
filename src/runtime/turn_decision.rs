@@ -3256,6 +3256,7 @@ impl TurnDecisionService {
     }
 
     /// Retain the existing source/catalog gate around decision-free binding admission.
+    #[cfg(test)]
     pub(crate) fn validate_agent_execution_model(
         &self,
         proof: &dyn TurnSourceProof,

@@ -355,3 +355,228 @@ async fn disabled_entry_turn_has_finite_call_budget() {
     );
     assert_eq!(decision.service.prediction_port_calls(), before);
 }
+
+struct SpawnFixtureChannel;
+
+#[async_trait]
+impl crate::channels::traits::Channel for SpawnFixtureChannel {
+    fn name(&self) -> &str {
+        "prx_grant_fixture"
+    }
+    async fn send(&self, _: &crate::channels::traits::SendMessage) -> anyhow::Result<()> {
+        anyhow::bail!("grant fixture must not announce")
+    }
+    async fn listen(
+        &self,
+        _: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("grant fixture has no listener")
+    }
+}
+
+/// Child proof through `bind_agent_execution_with_runtime` keeps scope, pin
+/// and grant. Deleting the `child_pin` stamp fails this cell. A call outside
+/// the sealed manifest is StaleCapability (02c `admit_child`).
+#[tokio::test]
+async fn bound_child_context_keeps_scope_pin_and_grant() {
+    use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
+    use crate::causal_tree::state::TurnSurfaceKind;
+    use crate::memory::{MemoryVisibility, MessageEventScope};
+    use crate::runtime::child_source::ChildProviderBinding;
+    use crate::runtime::turn_decision::{AgentTurnKind, TurnServiceBuild, build_turn_decision_service};
+    use crate::tools::capability::catalog::CatalogSources;
+    use crate::tools::execution::{
+        AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionCommand,
+        ToolExecutionService, ToolExecutionStatus, TracingToolExecutionAudit,
+    };
+    use crate::tools::sessions_spawn::SessionsSpawnTool;
+    use std::collections::BTreeMap;
+
+    let workspace = tempfile::tempdir().expect("child-stamp workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.config_path = workspace.path().join("config.toml");
+    config.causal_tree.enabled = true;
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.sessions_spawn.allow_recursive_delegation = true;
+    config.tool_tiering.always_include.push("sessions_spawn".into());
+    let security = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        workspace.path(),
+    ));
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("child-stamp memory"));
+    let spawn = SessionsSpawnTool::new(
+        Arc::new(SpawnFixtureChannel),
+        "ollama",
+        "prx-local-model",
+        0.0,
+        Arc::clone(&security),
+        workspace.path().to_owned(),
+        config.multimodal.clone(),
+        Default::default(),
+        None,
+        Default::default(),
+        config.sessions_spawn.clone(),
+    )
+    .with_shared_memory(Arc::clone(&memory));
+    let parent_registry = registry_with_search(vec![Box::new(spawn)]);
+    let admitted = AdmittedTurn::with_enabled_builtin_model(
+        config.clone(),
+        "sessions_spawn: Explain two integers.",
+        Arc::clone(&parent_registry),
+        Arc::clone(&memory),
+        ("ollama", "prx-local-model"),
+    )
+    .await;
+    let decision = admitted.decision();
+    let selected = decision
+        .service
+        .agent_execution_specs(decision.proof, decision.context)
+        .expect("parent selected sessions_spawn");
+    let incoming = admitted.adapter().tool_execution_context;
+    let (_, parent_bound) = decision
+        .service
+        .bind_agent_execution_with_runtime(decision.proof, decision.context, &incoming, &selected.specs, None)
+        .expect("parent bind stamps an outgoing grant");
+    let grant = parent_bound
+        .child_grant
+        .clone()
+        .expect("parent bind stamps an outgoing grant");
+    let recursive = grant
+        .for_spawn_request(true, "ollama", "prx-local-model")
+        .expect("recursive child retains sessions_spawn");
+    let credential = crate::providers::selection::credential_for(&recursive.generation().effective, "ollama");
+    let binding = ChildProviderBinding::build(Arc::clone(&recursive), "ollama", "prx-local-model", credential)
+        .expect("child provider binding");
+    let provider = binding.provider();
+    let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy())
+        .with_event_recording(config.memory.event_recording_config());
+    let mut task_scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
+        .with_session_key("prx_child_stamp_session")
+        .with_run_id("prx_child_stamp_task");
+    recursive
+        .bind_event_scope(&mut task_scope)
+        .expect("grant binds the child event scope");
+    let receipt = crate::runtime::child_source::record_child_input(
+        &fabric,
+        task_scope,
+        "sessions_spawn: Explain a nested integer.",
+        Some("prx_child_stamp_task:input".into()),
+        None,
+        Some(recursive.as_ref()),
+    )
+    .await
+    .expect("record child input")
+    .expect("durable child input receipt");
+    let child_proof = binding
+        .source_proof(recursive.as_ref(), &receipt, &provider)
+        .expect("child source proof");
+    let mut child_execution_context = receipt
+        .execution_context(&child_proof)
+        .expect("child execution context");
+    child_execution_context.child_pin = None;
+    let child_spawn = SessionsSpawnTool::new(
+        Arc::new(SpawnFixtureChannel),
+        "ollama",
+        "prx-local-model",
+        0.0,
+        Arc::clone(recursive.security()),
+        workspace.path().to_owned(),
+        config.multimodal.clone(),
+        Default::default(),
+        None,
+        Default::default(),
+        config.sessions_spawn.clone(),
+    )
+    .with_shared_memory(Arc::clone(&memory));
+    let child_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+        Box::new(child_spawn) as Box<dyn Tool>,
+        Box::new(RecordingTool {
+            name: "project_tool".to_owned(),
+            execution_order: Arc::new(Mutex::new(Vec::new())),
+        }) as Box<dyn Tool>,
+    ]);
+    let child_execution = Arc::new(
+        ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&child_registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(recursive.security()))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        )
+        .with_idempotency_memory(Arc::clone(&memory)),
+    );
+    let generation = Arc::clone(recursive.generation());
+    let hooks = crate::hooks::HookDiagnostics {
+        configured: false,
+        valid: true,
+        config_path: String::new(),
+        timeout_ms: 0,
+        action_count: 0,
+        events: BTreeMap::new(),
+        catalog_digest: None,
+        error: None,
+        runs: false,
+        blocked: None,
+    };
+    let provider_catalog = crate::providers::catalog::CatalogView::from_config(&generation.effective);
+    let child_service = build_turn_decision_service(
+        TurnSurfaceKind::Worker,
+        TurnServiceBuild {
+            parent_grant: Some(Arc::clone(&recursive)),
+            generation: Arc::clone(&generation),
+            registry: Arc::clone(&child_registry),
+            execution: Arc::clone(&child_execution),
+            catalog_sources: CatalogSources::from_runtime_inputs(
+                generation.id.0.to_string(),
+                &generation.effective,
+                Vec::new(),
+                &hooks,
+                0,
+            ),
+            surface_policy: crate::runtime::turn_publication::surface_policy(
+                TurnSurfaceKind::Worker,
+                &generation.effective.tool_tiering,
+            ),
+            provider_catalog: &provider_catalog,
+            transports: &NoExternalTransport,
+            events: Arc::new(SilentEvents),
+            memory: Arc::clone(&memory),
+            security: Arc::clone(recursive.security()),
+        },
+    )
+    .await
+    .expect("child worker service");
+    let child_context = child_service
+        .decide_agent_initial(
+            &child_proof,
+            AgentTurnKind::Repl,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("child turn admission");
+    let child_specs = child_service
+        .agent_execution_specs(&child_proof, &child_context)
+        .expect("child execution specs");
+    let (execution, bound) = child_service
+        .bind_agent_execution_with_runtime(
+            &child_proof,
+            &child_context,
+            &child_execution_context,
+            &child_specs.specs,
+            None,
+        )
+        .expect("child bind stamps scope, pin and grant");
+    assert!(bound.child_scope.is_some());
+    assert!(bound.child_pin.is_some());
+    assert!(bound.child_grant.is_some());
+    let outside = execution
+        .execute(
+            ToolExecutionCommand::new("project_tool", serde_json::json!({})),
+            bound,
+            None,
+        )
+        .await;
+    assert_eq!(outside.status, ToolExecutionStatus::StaleCapability);
+}
