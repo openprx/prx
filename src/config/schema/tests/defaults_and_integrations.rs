@@ -985,6 +985,7 @@ async fn an_unused_tool_dialect_entry_is_warned_about_once() {
 
 #[test]
 async fn targeted_agents_true_warns_prerelease() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
     const NEEDLE: &str = "gateway.targeted_agents is pre-release";
     let mut config = Config::default();
     config.gateway.targeted_agents = true;
