@@ -533,11 +533,7 @@ async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery(
         None,
         &cleanup,
         Some(key),
-        crate::runtime::ingress_recovery::PreparedAdvisory {
-            writer: store.writer(),
-            events: Some(events),
-            store: Some(store),
-        },
+        crate::runtime::ingress_recovery::PreparedAdvisory::opened(store, events).expect("independent advisory writer"),
     )
     .await
     .expect("independent recovery initialization");

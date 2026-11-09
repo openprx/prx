@@ -160,11 +160,8 @@ async fn open_advisory(
         crate::runtime::ingress_recovery::open_advisory_store(generation, memory, observer(), tracker)
             .await
             .expect("test: advisory store");
-    crate::runtime::ingress_recovery::PreparedAdvisory {
-        writer: store.writer(),
-        events: Some(events),
-        store: Some(store),
-    }
+    crate::runtime::ingress_recovery::PreparedAdvisory::opened(store, events)
+        .expect("test: advisory store requires a writer")
 }
 
 async fn prepare_recovery(

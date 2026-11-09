@@ -992,7 +992,9 @@ impl super::ingress_recovery::RecoveryScope {
         let decision = replay.decision();
         let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
             .with_verified_resume(&replay);
-        let writer = legacy.writer.clone();
+        let writer = store
+            .map(|_| legacy.writer.clone().context("terminal rejoin writer is missing"))
+            .transpose()?;
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
         let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
