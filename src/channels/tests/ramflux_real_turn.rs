@@ -2324,6 +2324,8 @@ async fn real_turn_decision_memory_reads_own_plaintext_and_excludes_foreign_work
     .await
     .expect("test: own seed");
     let context = crate::memory::MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some(dir.path().to_string_lossy().into_owned()),
         channel: Some("ramflux".to_owned()),
         chat_id: Some("conv-1".to_owned()),

@@ -239,6 +239,7 @@ async fn c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
 
     for (owner, draft_id, key) in [(&owner_a, "draft-a", "key-a"), (&owner_b, "draft-b", "key-b")] {
         mem.create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some(draft_id.to_string()),
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: Some(owner.clone()),
@@ -273,6 +274,7 @@ async fn c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
         (&owner_b, "doc-b", "issuer-b document"),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: Some(owner.clone()),
@@ -351,6 +353,7 @@ async fn c03_memory_events_are_owner_qualified() {
 
     for (owner, subject) in [(&owner_a, "run-a"), (&owner_b, "run-b")] {
         mem.append_memory_event(MemoryEventInput {
+            agent_partition: None,
             event_id: None,
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: Some(owner.clone()),
@@ -625,6 +628,7 @@ async fn a_private_ingest_event_requires_the_owner_even_for_a_non_isolated_princ
     let owner_b = c03_owner("issuer-b");
 
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         agent_id: Some(SUB_AGENT.to_string()),
         ..c03_ingest_input(
             "doc-private-agent",
@@ -1165,6 +1169,7 @@ async fn move_to_trash_soft_deletes_and_is_idempotent() {
 async fn memory_event_records_and_queries_parent_run_id() {
     let (_tmp, mem) = temp_sqlite();
     mem.append_memory_event(MemoryEventInput {
+        agent_partition: None,
         owner_id: None,
         event_id: None,
         workspace_id: "/ws".to_string(),

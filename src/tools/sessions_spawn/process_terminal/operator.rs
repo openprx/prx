@@ -713,6 +713,7 @@ mod startup_segment_boundary_tests {
         fabric
             .memory()
             .append_message_event(crate::memory::MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: Some(format!("worker:{run}:operator-segment:0:{kind}")),
                 workspace_id: fabric.workspace_id().to_owned(),

@@ -6,6 +6,8 @@ use crate::memory::principal::MemoryWriteContext;
 #[test]
 fn source_owner_read_scope_is_stricter_and_rejects_conflicting_identity() {
     let write = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("prx_workspace".into()),
         chat_type: Some("private".into()),
         chat_id: Some("prx_session".into()),
@@ -41,6 +43,8 @@ async fn selected_custom_loader_reads_actual_owner_rows_only() {
     let tmp = tempfile::tempdir().unwrap();
     let memory = crate::memory::SqliteMemory::new(tmp.path()).unwrap();
     let write = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("prx_workspace".into()),
         channel: Some("agent_api".into()),
         raw_sender: Some("prx_user".into()),

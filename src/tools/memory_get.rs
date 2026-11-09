@@ -138,6 +138,8 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     let owner_id = str_field("owner_id");
 
     Some(MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: str_field("workspace_id"),
         channel: str_field("channel"),
         chat_type: str_field("chat_type"),

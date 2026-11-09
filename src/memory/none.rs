@@ -94,6 +94,7 @@ mod tests {
         let memory = NoneMemory::new();
         let err = memory
             .append_message_event(MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: None,
                 workspace_id: "workspace".to_string(),
@@ -129,6 +130,7 @@ mod tests {
 
         let err = memory
             .append_memory_event(MemoryEventInput {
+                agent_partition: None,
                 owner_id: None,
                 event_id: None,
                 workspace_id: "workspace".to_string(),
@@ -149,6 +151,7 @@ mod tests {
 
         let err = memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: None,
                 workspace_id: "workspace".to_string(),
                 owner_id: None,
@@ -190,6 +193,7 @@ mod tests {
 
         let err = memory
             .append_retrieval_trace(RetrievalTraceInput {
+                agent_partition: None,
                 trace_id: None,
                 workspace_id: "workspace".to_string(),
                 owner_id: None,
@@ -212,6 +216,7 @@ mod tests {
 
         let err = memory
             .append_compaction_run(CompactionRunInput {
+                agent_partition: None,
                 run_id: None,
                 workspace_id: "workspace".to_string(),
                 owner_id: None,

@@ -596,6 +596,10 @@ pub struct MessageEventInput {
     pub content: String,
     pub raw_payload_json: Option<String>,
     pub visibility: MemoryVisibility,
+    /// Agent partition the writing turn runs under (MA-01b3). In-process carrier only:
+    /// not serialised, so ingress capsule digests stay byte-identical (R0-2).
+    #[serde(skip)]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 impl MessageEventInput {
@@ -827,6 +831,7 @@ mod message_event_contract_tests {
         source_event_range_json: Option<String>,
     ) -> CompactionRunInput {
         CompactionRunInput {
+            agent_partition: None,
             run_id: Some("compact-contract".to_string()),
             workspace_id: "workspace".to_string(),
             owner_id: None,
@@ -952,6 +957,9 @@ pub struct MemoryEventInput {
     pub persona_id: Option<String>,
     pub visibility: MemoryVisibility,
     pub payload_json: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 /// Persisted memory fabric outbox event.
@@ -1018,6 +1026,9 @@ pub struct MemoryDraftInput {
     pub source_event_id: Option<String>,
     pub visibility: MemoryVisibility,
     pub payload_json: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1066,6 +1077,9 @@ pub struct DocumentIngestInput {
     pub session_key: Option<String>,
     pub agent_id: Option<String>,
     pub persona_id: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1144,6 +1158,9 @@ pub struct MemoryLinkInput {
     pub chunk_id: Option<String>,
     pub link_type: String,
     pub payload_json: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1179,6 +1196,9 @@ pub struct RetrievalTraceInput {
     pub selected_json: Option<String>,
     pub dropped_json: Option<String>,
     pub payload_json: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1231,6 +1251,9 @@ pub struct CompactionRunInput {
     pub source_document_refs_json: Option<String>,
     pub fidelity_status: String,
     pub payload_json: Option<String>,
+    /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_partition: Option<AgentPartition>,
 }
 
 impl CompactionRunInput {
@@ -2456,6 +2479,8 @@ pub(crate) mod conformance {
 
     pub(crate) async fn assert_scoped_memory_acl_conformance(mem: &dyn Memory, key_prefix: &str) {
         let alice_ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
@@ -2466,6 +2491,8 @@ pub(crate) mod conformance {
             require_owner_match: false,
         };
         let bob_ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
@@ -2588,6 +2615,8 @@ mod tests {
     /// the one that authored the row.
     fn isolated_reader_context(owner_id: Option<&str>) -> MemoryWriteContext {
         MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("ws-isolation".to_string()),
             channel: Some("mcp".to_string()),
             chat_type: Some("gateway".to_string()),

@@ -368,6 +368,9 @@ impl ParentSource {
             policy_chat_type: fields.policy_chat_type,
             surface: TurnSurfaceKind::Interactive,
             memory_scope: MemoryWriteContext {
+                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
+                agent_partition: None,
+                session_key: None,
                 workspace_id: fields.memory_scope.workspace_id,
                 channel: fields.memory_scope.channel,
                 chat_type: fields.memory_scope.chat_type,
@@ -454,6 +457,9 @@ impl ParentSource {
             policy_chat_type: fields.policy_chat_type,
             surface,
             memory_scope: MemoryWriteContext {
+                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
+                agent_partition: None,
+                session_key: None,
                 workspace_id: fields.memory_scope.workspace_id,
                 channel: fields.memory_scope.channel,
                 chat_type: fields.memory_scope.chat_type,
@@ -607,6 +613,9 @@ impl ParentSource {
             policy_chat_type: fields.policy_chat_type,
             surface,
             memory_scope: MemoryWriteContext {
+                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
+                agent_partition: None,
+                session_key: None,
                 workspace_id: fields.memory_scope.workspace_id,
                 channel: fields.memory_scope.channel,
                 chat_type: fields.memory_scope.chat_type,

@@ -252,6 +252,8 @@ async fn seed_owned_memory(
 ) {
     use crate::memory::Memory as _;
     let context = crate::memory::principal::MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some(identity.workspace_id.clone()),
         channel: Some("mcp".to_string()),
         chat_type: Some("gateway".to_string()),

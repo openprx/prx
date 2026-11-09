@@ -619,6 +619,12 @@ pub struct MemoryWriteContext {
     /// way of [`crate::tools::execution::scope_requires_owner_match`]. Never
     /// from model-supplied arguments, and never from a config flag.
     pub require_owner_match: bool,
+    /// Agent partition of the writing turn (MA-01b3), carried from the runtime
+    /// envelope or the trusted `_zc_scope`. Never from model-supplied arguments.
+    pub agent_partition: Option<crate::memory::AgentPartition>,
+    /// Durable session key of the writing turn (MA-01b3, H3), carried from the
+    /// runtime envelope or the trusted `_zc_scope`.
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -955,6 +961,8 @@ mod tests {
         let principal = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                agent_partition: None,
+                session_key: None,
                 workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
@@ -974,6 +982,8 @@ mod tests {
     #[test]
     fn owner_principal_from_write_context_uses_sender_id_as_stable_anchor() {
         let ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("dm".into()),
@@ -1015,6 +1025,8 @@ mod tests {
         let principal = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                agent_partition: None,
+                session_key: None,
                 workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
@@ -1057,6 +1069,8 @@ mod tests {
         let anonymous = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                agent_partition: None,
+                session_key: None,
                 workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
@@ -1071,6 +1085,8 @@ mod tests {
         let member = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                agent_partition: None,
+                session_key: None,
                 workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
@@ -1106,6 +1122,8 @@ mod tests {
             require_owner_match: false,
         };
         let ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("group".into()),
@@ -1140,6 +1158,8 @@ mod tests {
             require_owner_match: false,
         };
         let ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("dm".into()),

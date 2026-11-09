@@ -30,6 +30,7 @@ async fn quoted_events_reach_the_prompt_without_live_media_markers() {
                         an older shot lived at [IMAGE:/gone/artifacts/deleted.jpg] \
                         and a clip at [VOICE:/gone/artifacts/deleted.m4a]";
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -176,6 +177,7 @@ async fn build_context_with_shared_events_includes_external_visible_events() {
     let mem = SqliteMemory::new(tmp.path()).unwrap();
 
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -208,6 +210,7 @@ async fn build_context_with_shared_events_includes_external_visible_events() {
     .await
     .unwrap();
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -277,6 +280,7 @@ async fn build_agent_context_returns_structured_bundle() {
     .await
     .unwrap();
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -308,6 +312,7 @@ async fn build_agent_context_returns_structured_bundle() {
     .await
     .unwrap();
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -363,6 +368,7 @@ async fn build_agent_context_returns_structured_bundle() {
     .await
     .unwrap();
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -523,6 +529,7 @@ async fn build_agent_context_includes_document_evidence_with_source_ids() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("doc-context-1".to_string()),
         workspace_id: "workspace-a".to_string(),
         owner_id: None,
@@ -592,6 +599,7 @@ async fn build_agent_context_keeps_current_session_when_shared_events_are_noisy(
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
     mem.append_message_event(MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: "workspace-a".to_string(),
@@ -624,6 +632,7 @@ async fn build_agent_context_keeps_current_session_when_shared_events_are_noisy(
     .unwrap();
     for index in 0..40 {
         mem.append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
@@ -942,6 +951,7 @@ async fn seed_recall_memory(mem: &SqliteMemory, scope: &RecallScope, key: &str, 
 
 async fn seed_recall_document(mem: &SqliteMemory, owner: &str, workspace: &str, content: &str) {
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: None,
         workspace_id: workspace.into(),
         owner_id: Some(owner.into()),
@@ -1480,6 +1490,7 @@ fn seed_event(
     content: &str,
 ) -> MessageEventInput {
     MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: workspace.to_string(),
@@ -1645,6 +1656,7 @@ async fn child_recall_drops_semantic_and_document_copies_of_sibling_tasks() {
         .unwrap();
     }
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: None,
         workspace_id: "workspace-a".into(),
         owner_id: Some("owner-a".into()),
@@ -2018,6 +2030,7 @@ async fn child_recall_resolves_taskless_document_copies_through_source_events() 
     assert_eq!(own_copy.task_id.as_deref(), Some("run-own"));
     memory
         .ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: None,
             workspace_id: ws.clone(),
             owner_id: Some("owner-a".into()),

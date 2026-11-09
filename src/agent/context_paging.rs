@@ -142,6 +142,7 @@ pub(super) async fn apply_os_paging(
     })
     .to_string();
     let input = DocumentIngestInput {
+        agent_partition: runtime.agent_partition.clone(),
         document_id: Some(document_id.clone()),
         workspace_id: runtime.workspace_id.clone(),
         owner_id: runtime.owner_id.clone(),

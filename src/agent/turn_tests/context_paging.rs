@@ -242,6 +242,7 @@ async fn owner_isolated_context_paging_recall_excludes_another_owners_workspace_
         ("owner-b", "context-page:owner-b", "OWNER_B_CONTEXT_SENTINEL"),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: workspace.clone(),
             owner_id: Some(owner.to_string()),
@@ -293,6 +294,7 @@ async fn owner_isolated_spawn_child_recall_excludes_another_owners_workspace_pag
         ("owner-b", "context-page:child-owner-b", "CHILD_OWNER_B_CONTEXT"),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: workspace.clone(),
             owner_id: Some(owner.to_string()),
@@ -666,6 +668,7 @@ async fn child_page_recall_is_bound_to_the_child_task() {
     // Task-less page: a legacy page, or one written by a main turn whose
     // envelope has neither task nor run id. Seeded directly to prove children fail closed.
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("context-page:delegate:shared:unlabelled".to_string()),
         workspace_id: workspace.clone(),
         owner_id: Some("owner-a".to_string()),

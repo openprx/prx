@@ -233,6 +233,8 @@ fn postgres_isolated_reads_short_circuit_before_applying_the_rls_owner() {
 /// differ in `owner_id` and nothing else.
 pub(super) fn r5_context(owner_id: Option<&str>, isolated: bool) -> MemoryWriteContext {
     MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some(C03_WORKSPACE.to_string()),
         channel: Some("mcp".to_string()),
         chat_type: Some("gateway".to_string()),

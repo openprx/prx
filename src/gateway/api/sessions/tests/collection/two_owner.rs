@@ -678,6 +678,7 @@ async fn run_two_owner_work(endpoint: &str, calls: &AtomicUsize, scratch: &std::
         state
             .mem
             .ingest_document(crate::memory::DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some(format!("context-page:console-owner-{index}")),
                 workspace_id: workspace.to_string_lossy().into_owned(),
                 owner_id: Some(principal.owner_id),

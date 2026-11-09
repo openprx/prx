@@ -16,6 +16,7 @@ async fn hybrid_worker_shared_context_reads_parent_fabric() {
     let shared_memory = crate::memory::SqliteMemory::new_with_path_and_acl(shared_db.clone(), false).unwrap();
     shared_memory
         .append_message_event(crate::memory::MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: None,
             workspace_id: parent.path().to_string_lossy().to_string(),
@@ -135,6 +136,7 @@ async fn process_mode_worker_prompt_carries_no_other_owners_spawn_text() {
     ] {
         shared_memory
             .append_message_event(crate::memory::MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: None,
                 workspace_id: parent.path().to_string_lossy().to_string(),

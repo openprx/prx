@@ -594,6 +594,7 @@ mod tests {
 
     fn task_event(workspace_id: &str, event_type: &str, subject_id: &str, task: &str) -> MemoryEventInput {
         MemoryEventInput {
+            agent_partition: None,
             owner_id: None,
             event_id: None,
             workspace_id: workspace_id.to_string(),
@@ -646,6 +647,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .append_message_event(MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: None,
                 workspace_id: "/tmp".to_string(),
@@ -718,6 +720,7 @@ mod tests {
     async fn seed_workspace_run(memory: &Arc<dyn Memory>, run_id: &str, owner_id: Option<&str>, task: &str) {
         memory
             .append_memory_event(MemoryEventInput {
+                agent_partition: None,
                 owner_id: owner_id.map(str::to_string),
                 event_id: None,
                 workspace_id: "/tmp".to_string(),
@@ -736,6 +739,7 @@ mod tests {
             .expect("test: append the task.spawned event");
         memory
             .append_message_event(MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: None,
                 workspace_id: "/tmp".to_string(),

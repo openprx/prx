@@ -1027,6 +1027,8 @@ exit 1
         let cmd = write_probe_lucid_script(tmp.path(), &marker);
         let memory = test_memory(tmp.path(), cmd);
         let context = crate::memory::principal::MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some(tmp.path().to_string_lossy().into_owned()),
             channel: Some("cli".into()),
             chat_type: Some("private".into()),
@@ -1079,6 +1081,8 @@ exit 1
         let tmp = TempDir::new().unwrap();
         let memory = test_memory(tmp.path(), "nonexistent-lucid-binary".to_string());
         let context = crate::memory::MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             channel: Some("webhook".to_string()),
             sender_id: Some("webhook-owner".to_string()),
             ..crate::memory::MemoryWriteContext::default()
@@ -1315,6 +1319,8 @@ exit 1
 
     fn lucid_owner_context(owner_id: &str, isolated: bool) -> crate::memory::principal::MemoryWriteContext {
         crate::memory::principal::MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some(LUCID_WORKSPACE.to_string()),
             channel: Some("mcp".to_string()),
             chat_type: Some("gateway".to_string()),

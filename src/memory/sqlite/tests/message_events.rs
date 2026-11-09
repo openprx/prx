@@ -266,6 +266,7 @@ async fn list_message_events_since_applies_visibility_policy() {
         ),
         // OWNER-VIS OV-E: a `private` row is readable only by its owner.
         MessageEventInput {
+            agent_partition: None,
             owner_id: Some("owner:workspace-a:terminal:alice".to_string()),
             ..message_input(
                 "workspace-a",
@@ -906,6 +907,7 @@ async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
     // OWNER-VIS OV-D: the feed carries the reader's own owner's events, so
     // every row here belongs to the reading owner.
     let owned = |content: &str| MessageEventInput {
+        agent_partition: None,
         owner_id: Some("owner-a".to_string()),
         ..message_input("workspace-a", content, MemoryVisibility::Workspace, None, None, None)
     };

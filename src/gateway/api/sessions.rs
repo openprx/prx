@@ -1958,17 +1958,18 @@ async fn submit_console_message(
         );
     }
     let mut principal = operator_history_principal(&api_principal, &runtime_envelope);
-    principal.agent_partition = Some(
-        match history_partition(
-            &runtime_envelope,
-            &api_principal.owner_id,
-            target.as_ref(),
-            incarnation.as_deref(),
-        ) {
-            Ok(partition) => partition,
-            Err(response) => return *response,
-        },
-    );
+    let partition = match history_partition(
+        &runtime_envelope,
+        &api_principal.owner_id,
+        target.as_ref(),
+        incarnation.as_deref(),
+    ) {
+        Ok(partition) => partition,
+        Err(response) => return *response,
+    };
+    principal.agent_partition = Some(partition.clone());
+    // MA-01b3: the turn's writers stamp from the envelope; reads keep the principal.
+    let runtime_envelope = runtime_envelope.with_agent_partition(partition);
     let turns = match state
         .mem
         .list_console_conversation_turns(&principal, &session_id, MAX_PAGE_LIMIT, 0)
@@ -3954,6 +3955,7 @@ mod tests {
 
     fn pending_event(workspace: &str, owner: &str, session: &str, decision: &str) -> crate::memory::MessageEventInput {
         crate::memory::MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: Some(format!("decision-approval:{decision}:pending")),
             workspace_id: workspace.to_owned(),

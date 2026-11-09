@@ -81,6 +81,8 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         .map(str::to_string);
 
     Some(MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id,
         channel,
         chat_type,
@@ -262,6 +264,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = Arc::new(SqliteMemory::new_with_path(tmp.path().join("brain.db")).unwrap());
         let alice_ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
@@ -302,6 +306,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = Arc::new(SqliteMemory::new_with_path(tmp.path().join("brain.db")).unwrap());
         let alice_ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
@@ -364,6 +370,8 @@ mod tests {
 
     async fn seed_owned(mem: &Arc<SqliteMemory>, owner_id: &str, key: &str) {
         let context = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some("ws-isolation".into()),
             channel: Some("mcp".into()),
             chat_type: Some("gateway".into()),

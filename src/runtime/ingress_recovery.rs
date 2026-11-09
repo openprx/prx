@@ -1093,6 +1093,7 @@ impl IngressRecorder {
         let recorded = self
             .memory
             .append_message_event(MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: Some(key.clone()),
                 workspace_id: scope.workspace_id.clone(),

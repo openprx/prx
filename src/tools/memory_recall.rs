@@ -32,6 +32,8 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     };
     let owner_id = str_field("owner_id");
     Some(MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: str_field("workspace_id"),
         channel: str_field("channel"),
         chat_type: str_field("chat_type"),
@@ -134,6 +136,8 @@ impl Tool for MemoryRecallTool {
         let isolated = crate::tools::execution::scope_requires_owner_match(&args);
         let recall_result = if self.acl_enabled || isolated {
             let mut scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
+                agent_partition: None,
+                session_key: None,
                 workspace_id: None,
                 channel: None,
                 chat_type: None,

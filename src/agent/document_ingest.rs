@@ -21,6 +21,9 @@ pub(crate) struct DocumentIngestRuntime {
     pub(super) source_message_event_id: Option<String>,
     pub(super) session_key: Option<String>,
     pub(super) legacy_session_key: Option<String>,
+    /// Agent partition of the turn this runtime serves (MA-01b3); `None` when
+    /// the runtime is built from a scope that carries none.
+    pub(super) agent_partition: Option<crate::memory::AgentPartition>,
     /// Stable identity of the turn this runtime serves.
     ///
     /// The runtime is built once per turn, so the incoming message event id
@@ -59,6 +62,7 @@ impl DocumentIngestRuntime {
             source_message_event_id: envelope.source_message_event_id.clone(),
             session_key: Some(envelope.session_key.clone()),
             legacy_session_key: envelope.legacy_session_key.clone(),
+            agent_partition: envelope.agent_partition.clone(),
             turn_key: envelope
                 .source_message_event_id
                 .clone()
@@ -99,6 +103,8 @@ impl DocumentIngestRuntime {
             source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
             session_key: Some(scope.session_key.unwrap_or(scope.chat_id).to_string()),
             legacy_session_key: None,
+            // CARRY 01b3-3 (document_ingest tool parse of the partition): from_scope has no partition input
+            agent_partition: None,
             turn_key: scope
                 .source_message_event_id
                 .map(ToString::to_string)
@@ -205,6 +211,7 @@ pub(super) async fn persist_tool_output_document(
     })
     .to_string();
     let input = DocumentIngestInput {
+        agent_partition: runtime.agent_partition.clone(),
         document_id: Some(document_id.clone()),
         workspace_id: runtime.workspace_id.clone(),
         owner_id: runtime.owner_id.clone(),
@@ -320,6 +327,7 @@ pub(super) async fn persist_untrusted_external_copy(
     })
     .to_string();
     let input = DocumentIngestInput {
+        agent_partition: runtime.agent_partition.clone(),
         document_id: Some(document_id.clone()),
         workspace_id: runtime.workspace_id.clone(),
         owner_id: runtime.owner_id.clone(),

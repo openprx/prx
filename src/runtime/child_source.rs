@@ -160,6 +160,8 @@ impl ChildInputReceipt {
     pub(crate) fn logical_task_scope(&self) -> MessageEventScope {
         let event = self.event();
         MessageEventScope {
+            // CARRY 01c2 (target_switch_and_delegate_keep_partition): logical_task_scope has no partition input
+            agent_partition: None,
             source: event.source.clone(),
             owner_id: event.owner_id.clone(),
             channel: event.channel.clone(),
@@ -490,6 +492,8 @@ impl ChildSegmentSequence {
         let task_run = event.run_id.as_deref().context("child task run missing")?;
         let segment_run = format!("child-segment:{}:{}", event.event_id, self.next);
         let scope = MessageEventScope {
+            // CARRY 01c2 (target_switch_and_delegate_keep_partition): segment record has no partition input
+            agent_partition: None,
             source: self.segment_source.clone(),
             owner_id: event.owner_id.clone(),
             channel: event.channel.clone(),

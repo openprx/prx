@@ -216,6 +216,8 @@ mod tests {
 
     fn store_context(owner: Option<&str>, isolated: bool) -> crate::memory::principal::MemoryWriteContext {
         crate::memory::principal::MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             owner_id: owner.map(str::to_string),
             require_owner_match: isolated,
             ..crate::memory::principal::MemoryWriteContext::default()

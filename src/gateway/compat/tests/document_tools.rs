@@ -69,6 +69,7 @@ async fn seed_document(
     use crate::memory::Memory as _;
     memory
         .ingest_document(crate::memory::DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: workspace_id.to_string(),
             owner_id: owner_id.map(ToString::to_string),

@@ -31,6 +31,7 @@ pub(super) fn c03_message_input(
     content: &str,
 ) -> MessageEventInput {
     MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: workspace_id.to_string(),
@@ -197,6 +198,7 @@ async fn postgres_c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
 
     for (owner, draft_id, key) in [(&owner_a, "draft-a", "key-a"), (&owner_b, "draft-b", "key-b")] {
         mem.create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some(draft_id.to_string()),
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: Some(owner.clone()),
@@ -227,6 +229,7 @@ async fn postgres_c03_draft_lifecycle_and_ingest_events_carry_the_owner() {
         (&owner_b, "doc-b", "issuer-b document"),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: Some(owner.clone()),
@@ -307,6 +310,7 @@ async fn postgres_c03_memory_events_are_owner_qualified() {
         (None, "run-legacy"),
     ] {
         mem.append_memory_event(MemoryEventInput {
+            agent_partition: None,
             event_id: None,
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: owner.cloned(),
@@ -363,6 +367,7 @@ pub(super) fn postgres_c03_ingest_input(
     visibility: MemoryVisibility,
 ) -> DocumentIngestInput {
     DocumentIngestInput {
+        agent_partition: None,
         document_id: Some(document_id.to_string()),
         workspace_id: C03_WORKSPACE.to_string(),
         owner_id: Some(owner_id.to_string()),

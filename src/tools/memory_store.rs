@@ -21,7 +21,7 @@ impl MemoryStoreTool {
     }
 }
 
-fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
+pub(crate) fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     let trusted = args
         .get("_zc_scope_trusted")
         .and_then(serde_json::Value::as_bool)
@@ -79,6 +79,11 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         raw_sender: sender,
         owner_id: owner_anchor,
         require_owner_match: false,
+        agent_partition: crate::tools::execution::trusted_scope_agent_partition(args),
+        session_key: scope
+            .get("session_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 

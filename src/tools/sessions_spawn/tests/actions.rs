@@ -380,6 +380,7 @@ async fn kill_memory_backed_run_reports_not_manageable() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
     memory
         .append_memory_event(MemoryEventInput {
+            agent_partition: None,
             owner_id: None,
             event_id: None,
             workspace_id: "/tmp".to_string(),

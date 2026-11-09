@@ -121,6 +121,7 @@ pub(crate) async fn append_document_tool_retrieval_trace(
     let dropped_json = serde_json::to_string(dropped).ok();
     match memory
         .append_retrieval_trace(RetrievalTraceInput {
+            agent_partition: principal.agent_partition.clone(),
             trace_id: None,
             workspace_id: principal.workspace_id.clone(),
             owner_id: owner_id_for_document_principal(principal),
@@ -294,6 +295,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-search-1".into()),
                 workspace_id: tmp.path().to_string_lossy().to_string(),
                 owner_id: None,

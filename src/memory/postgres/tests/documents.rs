@@ -88,6 +88,7 @@ async fn postgres_document_chunk_search_is_owner_qualified_for_an_isolated_princ
         ),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: C03_WORKSPACE.to_string(),
             owner_id: owner_id.map(str::to_string),

@@ -44,6 +44,9 @@ pub struct RuntimeEnvelope {
     pub sender: Option<String>,
     pub recipient: Option<String>,
     pub visibility: MemoryVisibility,
+    /// Agent partition the turn runs under (MA-01b3). Set only by the console
+    /// submit path; `None` for every other origin.
+    pub agent_partition: Option<crate::memory::AgentPartition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +116,7 @@ impl RuntimeEnvelope {
             sender: None,
             recipient: None,
             visibility,
+            agent_partition: None,
         }
     }
 
@@ -664,7 +668,15 @@ impl RuntimeEnvelope {
                     .map(|topic_id| crate::memory::MessageEventSubject::Topic(topic_id.clone()))
             });
         scope.causation_event_id = self.source_message_event_id.clone();
+        scope.agent_partition = self.agent_partition.clone();
         scope
+    }
+
+    /// Bind the agent partition the turn runs under (MA-01b3).
+    #[must_use]
+    pub fn with_agent_partition(mut self, agent_partition: crate::memory::AgentPartition) -> Self {
+        self.agent_partition = Some(agent_partition);
+        self
     }
 
     /// Pin the configuration generation used by this complete runtime operation.
@@ -694,6 +706,8 @@ impl RuntimeEnvelope {
             // statements it produces are unchanged.
             owner_id: None,
             require_owner_match: false,
+            agent_partition: self.agent_partition.clone(),
+            session_key: Some(self.session_key.clone()),
         }
     }
 

@@ -58,6 +58,7 @@ pub(super) fn ov_memory_event(
     marker: &str,
 ) -> MemoryEventInput {
     MemoryEventInput {
+        agent_partition: None,
         owner_id: owner_id.map(str::to_string),
         event_id: None,
         workspace_id: C03_WORKSPACE.to_string(),

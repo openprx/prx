@@ -192,6 +192,7 @@ impl DocumentIngestRuntime {
 
         let record = memory_view
             .ingest_document(DocumentIngestInput {
+                agent_partition: crate::tools::execution::trusted_scope_agent_partition(&args),
                 document_id,
                 workspace_id: principal.workspace_id,
                 owner_id,

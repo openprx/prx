@@ -1027,6 +1027,7 @@ impl crate::config::ConfigGenerationAuditSink for ConfigGenerationMessageAuditSi
                 .map(|revision| revision.fingerprint_sha256.clone());
             let raw_payload_json = serde_json::to_string(&event).ok();
             let input = crate::memory::MessageEventInput {
+                agent_partition: None,
                 event_id: None,
                 idempotency_key: None,
                 workspace_id,

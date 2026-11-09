@@ -37,6 +37,8 @@ async fn postgres_vector_rls_denies_missing_and_cross_owner_context_from_env() {
     .unwrap();
 
     let context = |workspace: &str, owner: &str| MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some(workspace.to_string()),
         channel: Some("test".to_string()),
         chat_type: Some("private".to_string()),
@@ -96,6 +98,8 @@ async fn postgres_vector_rls_denies_missing_and_cross_owner_context_from_env() {
     );
 
     let missing_workspace = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: None,
         ..owner_a.clone()
     };

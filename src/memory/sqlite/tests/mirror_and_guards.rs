@@ -228,6 +228,8 @@ async fn the_adapter_mirrors_only_an_explicit_operator_write() {
     let tmp = TempDir::new().unwrap();
     let mem = SqliteMemory::new(tmp.path()).unwrap();
     let context = |isolated: bool| MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         owner_id: Some(c03_owner("issuer-b")),
         sender_id: Some(c03_owner("issuer-b")),
         channel: Some("mcp".to_string()),
@@ -357,6 +359,8 @@ async fn owner_isolated_store_metadata_update_cannot_reown_a_row_changed_underne
         )
         .expect("test: install the stand-in writer");
     let isolated = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         owner_id: Some(owner_b.clone()),
         sender_id: Some(owner_b.clone()),
         channel: Some("mcp".to_string()),

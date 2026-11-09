@@ -680,6 +680,7 @@ async fn reindex_rebuilds_fts() {
         ..MemoryPrincipal::default()
     };
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("reindex-document".to_string()),
         workspace_id: principal.workspace_id.clone(),
         owner_id: None,
@@ -934,6 +935,8 @@ async fn recall_unicode_query() {
 async fn recall_with_context_filters_private_sender_scope() {
     let (_tmp, mem) = temp_sqlite();
     let alice_ctx = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("workspace-a".into()),
         channel: Some("telegram".into()),
         chat_type: Some("private".into()),
@@ -944,6 +947,8 @@ async fn recall_with_context_filters_private_sender_scope() {
         require_owner_match: false,
     };
     let bob_ctx = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("workspace-a".into()),
         channel: Some("telegram".into()),
         chat_type: Some("private".into()),
@@ -986,6 +991,8 @@ async fn recall_with_context_filters_private_sender_scope() {
 async fn rehearsal_count_is_scoped_bounded_and_does_not_cache_embeddings() {
     let (_tmp, mem) = temp_sqlite();
     let alice = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("prx_workspace".into()),
         channel: Some("cli".into()),
         chat_type: Some("private".into()),
@@ -996,6 +1003,8 @@ async fn rehearsal_count_is_scoped_bounded_and_does_not_cache_embeddings() {
         require_owner_match: false,
     };
     let bob = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         chat_id: Some("prx_bob_session".into()),
         raw_sender: Some("prx_bob".into()),
         ..alice.clone()
@@ -1078,6 +1087,8 @@ async fn rehearsal_count_is_scoped_bounded_and_does_not_cache_embeddings() {
 async fn decision_memory_retrieval_is_scoped_bounded_and_read_only() {
     let (_tmp, mem) = temp_sqlite();
     let first = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("prx_workspace".into()),
         channel: Some("cli".into()),
         chat_type: Some("private".into()),
@@ -1088,6 +1099,8 @@ async fn decision_memory_retrieval_is_scoped_bounded_and_read_only() {
         require_owner_match: false,
     };
     let second = MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         chat_id: Some("prx_session_b".into()),
         raw_sender: Some("prx_user_b".into()),
         ..first.clone()

@@ -413,6 +413,8 @@ pub(super) async fn run_channel_turn(
     if autosave_allowed && ctx.auto_save_memory && is_direct_chat && memory::should_autosave_content(&msg.content) {
         let autosave_key = conversation_memory_key(&msg);
         let write_ctx = MemoryWriteContext {
+            agent_partition: None,
+            session_key: None,
             workspace_id: Some(ctx.workspace_dir.as_path().to_string_lossy().to_string()),
             channel: Some(msg.channel.clone()),
             chat_type: Some(inferred_chat_type.to_string()),

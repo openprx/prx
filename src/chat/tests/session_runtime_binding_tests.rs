@@ -154,6 +154,7 @@ async fn chat_entrypoint_records_user_and_assistant_message_events() {
     // pre-cutover legacy event must recall via read-merge under the canonical key.
     memory
         .append_message_event(crate::memory::MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: None,
             workspace_id: tmp.path().to_string_lossy().to_string(),

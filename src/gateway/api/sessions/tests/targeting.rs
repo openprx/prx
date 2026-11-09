@@ -81,6 +81,39 @@ async fn fixture(config: impl FnOnce(&mut Config)) -> Fixture {
     }
 }
 
+/// Like [`fixture`], but keeps a caller-configured decision backend and the
+/// Console private-filesystem layout `drive()` uses.
+///
+/// `test_app_state` (`sessions.rs`, `causal_tree.enabled = false`) would drop
+/// the native-tool surface this POST needs, even after `configure(...)`.
+/// Default `config_path` is the user config dir; without a temp private root,
+/// `console_filesystem` stays `None` and owner-isolated `file_read` is gated.
+async fn fixture_with_decision_backend(config: impl FnOnce(&mut Config)) -> Fixture {
+    let temp = tempfile::tempdir().expect("test: tempdir");
+    let workspace = temp.path().join("workspace");
+    let private = temp.path().join("private");
+    std::fs::create_dir_all(&workspace).expect("test: workspace");
+    std::fs::create_dir_all(&private).expect("test: private root");
+    let mut base = Config::default();
+    base.workspace_dir = workspace.clone();
+    base.config_path = private.join("config.toml");
+    config(&mut base);
+    let provider = Arc::new(CapturingProvider::default());
+    let mut state = test_app_state_with_config(base, provider.clone());
+    let memory = Arc::new(crate::memory::SqliteMemory::new(&workspace).expect("test: sqlite memory"));
+    state.mem = memory.clone();
+    memory
+        .create_conversation_session(SESSION, "api:local")
+        .await
+        .expect("test: session");
+    Fixture {
+        state,
+        provider,
+        memory,
+        _temp: temp,
+    }
+}
+
 async fn post(fixture: &Fixture, session: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
     let response = post_session_message(
         State(fixture.state.clone()),
@@ -407,10 +440,19 @@ async fn target_allowlist_semantics() {
 
 type ToolBox = Box<dyn crate::tools::Tool>;
 
-/// Emits the scripted calls in its first reply and answers in text after that.
+/// Queue of call batches. Each `chat` pops one; an empty queue answers in text.
 struct ScriptedCalls {
-    calls: Vec<(&'static str, serde_json::Value)>,
+    batches: parking_lot::Mutex<Vec<Vec<(&'static str, serde_json::Value)>>>,
     requests: parking_lot::Mutex<Vec<Vec<ChatMessage>>>,
+}
+
+impl ScriptedCalls {
+    fn batches(batches: Vec<Vec<(&'static str, serde_json::Value)>>) -> Self {
+        Self {
+            batches: parking_lot::Mutex::new(batches),
+            requests: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait]
@@ -433,24 +475,25 @@ impl Provider for ScriptedCalls {
     }
 
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
-        let first = {
-            let mut requests = self.requests.lock();
-            requests.push(request.messages.to_vec());
-            requests.len() == 1
+        self.requests.lock().push(request.messages.to_vec());
+        let batch = {
+            let mut batches = self.batches.lock();
+            if batches.is_empty() {
+                None
+            } else {
+                Some(batches.remove(0))
+            }
         };
-        let tool_calls: Vec<crate::providers::ToolCall> = if first {
-            self.calls
-                .iter()
-                .enumerate()
-                .map(|(index, (name, arguments))| crate::providers::ToolCall {
-                    id: format!("call-targeted-{index}"),
-                    name: (*name).to_owned(),
-                    arguments: arguments.to_string(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let tool_calls: Vec<crate::providers::ToolCall> = batch
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| crate::providers::ToolCall {
+                id: format!("call-targeted-{index}"),
+                name: (*name).to_owned(),
+                arguments: arguments.to_string(),
+            })
+            .collect();
         Ok(ChatResponse {
             text: tool_calls.is_empty().then(|| "done".to_owned()),
             tool_calls,
@@ -591,10 +634,7 @@ async fn drive(
                         worker.model = CONSOLE_WINDOW_MODEL.to_owned();
                         config.agents.insert("worker".to_owned(), worker);
                     }
-                    let scripted = Arc::new(ScriptedCalls {
-                        calls,
-                        requests: parking_lot::Mutex::new(Vec::new()),
-                    });
+                    let scripted = Arc::new(ScriptedCalls::batches(vec![calls]));
                     let mut state = test_app_state_with_config(config, Arc::new(CapturingProvider::default()));
                     state.mem = Arc::new(
                         crate::memory::SqliteMemory::new(&state.config.pin().effective.workspace_dir)
@@ -1157,7 +1197,7 @@ fn capture_provider_config(config: &mut Config, agent_cfg: DelegateAgentConfig) 
     );
     config.providers.models.push(
         toml::from_str(&format!(
-            "provider = {CAPTURE_PROVIDER:?}\nmodel = \"test-model\"\noperations = [\"chat\"]\n"
+            "provider = {CAPTURE_PROVIDER:?}\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = true\n"
         ))
         .expect("test: catalog"),
     );
@@ -1334,6 +1374,189 @@ async fn sqlite_targeted_scope_supported() {
         &["x-only"],
         "Main POST",
     );
+}
+
+const SCOPE_TOOL: &str = "file_read";
+
+/// Records every argument set the runtime delivers to it, `_zc_scope` included.
+/// Named and catalogued as `file_read` (CountingTool pattern) so the published
+/// surface includes it.
+struct ScopeRecorder {
+    seen: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    inner: crate::tools::file_read::FileReadTool,
+}
+
+#[async_trait]
+impl crate::tools::Tool for ScopeRecorder {
+    fn name(&self) -> &str {
+        SCOPE_TOOL
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn tier(&self) -> crate::tools::traits::ToolTier {
+        self.inner.tier()
+    }
+    fn categories(&self) -> &'static [crate::tools::traits::ToolCategory] {
+        self.inner.categories()
+    }
+    fn supports_owner_filesystem(&self) -> bool {
+        self.inner.supports_owner_filesystem()
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        self.seen.lock().push(args);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "recorded".to_owned(),
+            error: None,
+        })
+    }
+}
+
+/// MA-01b3 part 0: the partition and session reach every writer input. The
+/// envelope views are asserted directly; the POST views assert what the
+/// runtime delivers to a tool (`_zc_scope`) and what `parse_scope_ctx` reads
+/// back from it.
+/// A console input literal whose only varying field is the in-process partition (R0-2).
+fn digest_cell_input(agent_partition: Option<AgentPartition>) -> crate::memory::MessageEventInput {
+    crate::memory::MessageEventInput {
+        agent_partition,
+        event_id: None,
+        idempotency_key: Some("console:run-1:input".to_owned()),
+        workspace_id: "workspace-a".to_owned(),
+        owner_id: Some("owner-a".to_owned()),
+        source: crate::memory::MessageEventSource::Console,
+        channel: Some("console".to_owned()),
+        session_key: Some(SESSION.to_owned()),
+        parent_session_key: None,
+        run_id: None,
+        parent_run_id: None,
+        agent_id: None,
+        persona_id: None,
+        sender: None,
+        recipient: None,
+        role: "user".to_owned(),
+        event_type: "message".to_owned(),
+        subject: None,
+        goal_id: None,
+        causation_event_id: None,
+        correlation_id: None,
+        attempt_id: None,
+        lease_epoch: None,
+        config_generation_id: None,
+        config_source_revision: None,
+        content: "hi".to_owned(),
+        raw_payload_json: None,
+        visibility: crate::memory::MemoryVisibility::Session,
+    }
+}
+
+#[tokio::test]
+async fn agent_partition_reaches_every_writer_input() {
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("filesystem")
+        .await
+        .expect("test: decision fixture");
+    let endpoint = driver.endpoint().to_owned();
+    driver
+        .run(true, async move {
+            let mut fixture = fixture_with_decision_backend(|config| {
+                config.gateway.targeted_agents = true;
+                config.autonomy.level = AutonomyLevel::Full;
+                config.tool_tiering.always_include = vec![SCOPE_TOOL.to_owned()];
+                capture_provider_config(config, agent(true, &[SCOPE_TOOL]));
+                crate::agent::agent::native_decision_fixture::configure(config, &endpoint)
+                    .expect("test: decision backend");
+            })
+            .await;
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let workspace_dir = fixture.state.config.pin().effective.workspace_dir.clone();
+            let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                &fixture.state.config.pin().effective.autonomy,
+                &workspace_dir,
+            ));
+            fixture.state.tools_registry = Arc::new(vec![Box::new(ScopeRecorder {
+                seen: Arc::clone(&seen),
+                inner: crate::tools::file_read::FileReadTool::new(security, false),
+            }) as ToolBox]);
+            let workspace = workspace_dir.to_string_lossy().into_owned();
+            let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+            stamp_console_rows(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
+
+            let named = named_partition(&workspace, &owner, "x", TARGET_U);
+            let envelope = crate::runtime::envelope::RuntimeEnvelope::console(workspace.clone(), SESSION.to_owned())
+                .with_agent_partition(named.clone());
+            let write_context = envelope.memory_write_context("direct");
+            assert_eq!(
+                serde_json::to_vec(&digest_cell_input(Some(named.clone()))).expect("test: input json"),
+                serde_json::to_vec(&digest_cell_input(None)).expect("test: input json"),
+                "MessageEventInput serialisation (capsule digest input) ignores the partition"
+            );
+            assert_eq!(
+                write_context.agent_partition.as_ref(),
+                Some(&named),
+                "write context carries the partition"
+            );
+            assert_eq!(
+                write_context.session_key.as_deref(),
+                Some(SESSION),
+                "write context carries the session"
+            );
+            assert_eq!(
+                envelope.message_scope().agent_partition.as_ref(),
+                Some(&named),
+                "message scope carries the partition"
+            );
+
+            for (label, body, expected) in [
+                (
+                    "Named POST",
+                    serde_json::json!({"message": "hi", "agent": "x"}),
+                    named.clone(),
+                ),
+                (
+                    "Main POST",
+                    serde_json::json!({"message": "hi"}),
+                    main_partition(&workspace, &owner),
+                ),
+            ] {
+                let scripted = Arc::new(ScriptedCalls::batches(vec![vec![(
+                    SCOPE_TOOL,
+                    serde_json::json!({"path": "probe.txt"}),
+                )]]));
+                // The fixture holds only a Weak handle: keep this Arc alive for the POST.
+                let provider = Arc::clone(&scripted) as Arc<dyn crate::providers::Provider>;
+                crate::providers::test_fixture::register(CAPTURE_PROVIDER, Arc::clone(&provider));
+                // Main pins `AppState.provider`; Named builds through the factory.
+                fixture.state.provider = Arc::clone(&provider);
+                seen.lock().clear();
+                let (status, value) = post(&fixture, SESSION, body).await;
+                drop(provider);
+                assert_eq!(status, StatusCode::OK, "{label}: {value}");
+                let args = seen.lock().last().cloned().expect("test: recorder ran");
+                let scope = args.get("_zc_scope").expect("test: runtime scope");
+                assert_eq!(
+                    scope.get("agent_partition"),
+                    Some(&serde_json::to_value(&expected).expect("test: partition json")),
+                    "{label}: _zc_scope carries the partition"
+                );
+                assert_eq!(
+                    scope.get("session_key").and_then(serde_json::Value::as_str),
+                    Some(SESSION),
+                    "{label}: _zc_scope carries the session"
+                );
+                let context = crate::tools::memory_store::parse_scope_ctx(&args).expect("test: trusted scope");
+                assert_eq!(
+                    context.agent_partition.as_ref(),
+                    Some(&expected),
+                    "{label}: parsed partition"
+                );
+                assert_eq!(context.session_key.as_deref(), Some(SESSION), "{label}: parsed session");
+            }
+        })
+        .await;
 }
 
 #[tokio::test]

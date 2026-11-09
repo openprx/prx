@@ -340,6 +340,8 @@ fn to_message_input(
         "source_event_id": event.lineage.source_event_id.as_deref(),
     });
     MessageEventInput {
+        // CARRY 01b4 (causal family): to_message_input has no partition input
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: workspace_id.to_string(),

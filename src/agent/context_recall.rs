@@ -706,6 +706,7 @@ async fn append_document_retrieval_trace(
 
     if let Err(error) = mem
         .append_retrieval_trace(RetrievalTraceInput {
+            agent_partition: principal.agent_partition.clone(),
             trace_id: None,
             workspace_id: principal.workspace_id.clone(),
             owner_id: owner_id_for_memory_principal(principal),

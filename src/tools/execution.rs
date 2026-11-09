@@ -3657,6 +3657,7 @@ fn tool_execution_event_input(
         source: context.envelope.source.as_str().into(),
         channel: context.envelope.channel.clone(),
         session_key: Some(context.envelope.session_key.clone()),
+        agent_partition: context.envelope.agent_partition.clone(),
         parent_session_key: context.envelope.legacy_session_key.clone(),
         run_id: context.envelope.run_id.clone(),
         parent_run_id: context.envelope.parent_run_id.clone(),
@@ -3751,6 +3752,29 @@ pub fn owner_isolation_refusal(tool_name: &str) -> String {
 /// rebuild a [`crate::memory::MemoryPrincipal`] from the scope read it back with
 /// [`scope_requires_owner_match`].
 pub const SCOPE_OWNER_ISOLATED_KEY: &str = "owner_isolated";
+
+/// The agent partition the runtime authored into a trusted `_zc_scope` (MA-01b3).
+///
+/// Read only when `_zc_scope_trusted` is literally `true`, so a model-supplied
+/// `_zc_scope` never yields a partition. A malformed value reads as `None`.
+#[must_use]
+pub(crate) fn trusted_scope_agent_partition(args: &serde_json::Value) -> Option<crate::memory::AgentPartition> {
+    let trusted = args
+        .get("_zc_scope_trusted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !trusted {
+        return None;
+    }
+    let raw = args.get("_zc_scope")?.get("agent_partition")?;
+    match serde_json::from_value(raw.clone()) {
+        Ok(partition) => Some(partition),
+        Err(error) => {
+            tracing::warn!(error = %error, "ignoring malformed trusted agent_partition in _zc_scope");
+            None
+        }
+    }
+}
 
 /// Read the owner-isolation marker back out of tool arguments.
 ///
@@ -3895,6 +3919,12 @@ fn normalize_arguments(
         // turn's authored scope stays byte-identical to the pre-C03 one.
         if context.envelope.owner_isolated {
             scope.insert(SCOPE_OWNER_ISOLATED_KEY.to_string(), serde_json::Value::Bool(true));
+        }
+        if let Some(partition) = &context.envelope.agent_partition {
+            scope.insert(
+                "agent_partition".to_string(),
+                serde_json::to_value(partition).map_err(|error| error.to_string())?,
+            );
         }
         insert_optional(scope, "topic_id", context.envelope.topic_id.as_deref());
         insert_optional(scope, "task_id", context.envelope.task_id.as_deref());

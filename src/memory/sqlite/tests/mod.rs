@@ -68,6 +68,7 @@ fn message_input(
     sender: Option<&str>,
 ) -> MessageEventInput {
     MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: workspace_id.to_string(),
@@ -106,6 +107,7 @@ fn memory_event_input(
     session_key: Option<&str>,
 ) -> MemoryEventInput {
     MemoryEventInput {
+        agent_partition: None,
         owner_id: None,
         event_id: None,
         workspace_id: workspace_id.to_string(),
@@ -201,6 +203,7 @@ async fn seed_document_visibility_fixture(mem: &SqliteMemory, workspace_id: &str
         ),
     ] {
         mem.ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some(document_id.to_string()),
             workspace_id: workspace_id.to_string(),
             owner_id: owner_id.map(ToString::to_string),
@@ -234,6 +237,8 @@ const ISOLATED_OWNER_B: &str = "owner:ws-isolation:agent:issuer-b.example:shared
 
 fn isolated_mcp_context(owner_id: Option<&str>) -> MemoryWriteContext {
     MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         workspace_id: Some("ws-isolation".into()),
         channel: Some("mcp".into()),
         chat_type: Some("gateway".into()),
@@ -286,6 +291,7 @@ fn make_public(mem: &SqliteMemory, key: &str) {
 
 fn g1_draft_input(owner: Option<&str>, worker_run_id: &str, draft_id: &str, key: &str) -> MemoryDraftInput {
     MemoryDraftInput {
+        agent_partition: None,
         draft_id: Some(draft_id.to_string()),
         workspace_id: "ws".to_string(),
         owner_id: owner.map(str::to_string),
@@ -371,6 +377,7 @@ fn c03_message_input(
     content: &str,
 ) -> MessageEventInput {
     MessageEventInput {
+        agent_partition: None,
         event_id: None,
         idempotency_key: None,
         workspace_id: workspace_id.to_string(),
@@ -439,6 +446,7 @@ fn c03_ingest_input(
     visibility: MemoryVisibility,
 ) -> DocumentIngestInput {
     DocumentIngestInput {
+        agent_partition: None,
         document_id: Some(document_id.to_string()),
         workspace_id: C03_WORKSPACE.to_string(),
         owner_id: owner_id.map(str::to_string),
@@ -573,6 +581,7 @@ fn ov_memory_event(
     marker: &str,
 ) -> MemoryEventInput {
     MemoryEventInput {
+        agent_partition: None,
         owner_id: owner_id.map(str::to_string),
         event_id: None,
         workspace_id: C03_WORKSPACE.to_string(),
@@ -681,6 +690,8 @@ fn mirror_entries(mirror: &str) -> Vec<(String, String)> {
 
 fn n1_context(channel: &str, sender: &str, chat_id: &str, owner: Option<&str>, isolated: bool) -> MemoryWriteContext {
     MemoryWriteContext {
+        agent_partition: None,
+        session_key: None,
         channel: Some(channel.to_string()),
         raw_sender: Some(sender.to_string()),
         chat_id: Some(chat_id.to_string()),

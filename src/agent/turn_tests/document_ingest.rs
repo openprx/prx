@@ -79,6 +79,7 @@ fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
         memory,
         workspace_id,
         owner_id: Some(owner_id),
+        agent_partition: None,
         require_owner_match: false,
         topic_id: None,
         task_id: None,
@@ -239,6 +240,7 @@ async fn drop_untrusted_external_results_filters_untrusted_only() {
     // 2. A normal, trusted document with the same query-matching token.
     memory
         .ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some("trusted-doc-1".to_string()),
             workspace_id: "workspace-untrusted".to_string(),
             owner_id: runtime.owner_id.clone(),

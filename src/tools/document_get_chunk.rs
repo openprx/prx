@@ -317,6 +317,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-get-1".into()),
                 workspace_id,
                 owner_id: Some(owner),
@@ -377,6 +378,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-mcp-1".into()),
                 workspace_id: workspace_id.clone(),
                 owner_id: Some(subject_derived_owner),
@@ -400,6 +402,7 @@ mod tests {
         // equally unprovable as the caller's.
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-unowned-1".into()),
                 workspace_id,
                 owner_id: None,
@@ -464,6 +467,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-owned-by-b".into()),
                 workspace_id,
                 owner_id: Some(ISSUER_B_OWNER.to_string()),
@@ -523,6 +527,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-no-owner-caller".into()),
                 workspace_id,
                 owner_id: Some(subject_derived_owner),
@@ -590,6 +595,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         memory
             .ingest_document(DocumentIngestInput {
+                agent_partition: None,
                 document_id: Some("doc-hidden-1".into()),
                 workspace_id,
                 owner_id: Some(owner),

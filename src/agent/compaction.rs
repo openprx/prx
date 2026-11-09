@@ -620,6 +620,7 @@ async fn persist_context_switch(
     audit
         .memory
         .append_message_event(crate::memory::MessageEventInput {
+            agent_partition: audit.agent_partition.clone(),
             event_id: Some(handoff_event_id.to_string()),
             idempotency_key: Some(format!("context-switch:{handoff_event_id}")),
             workspace_id: audit.workspace_id.clone(),
@@ -706,6 +707,7 @@ pub(crate) async fn persist_context_switch_degradation(
     if let Err(error) = audit
         .memory
         .append_message_event(crate::memory::MessageEventInput {
+            agent_partition: audit.agent_partition.clone(),
             event_id: Some(degraded_event_id.clone()),
             idempotency_key: Some(idempotency_key),
             workspace_id: audit.workspace_id.clone(),
@@ -806,6 +808,7 @@ async fn persist_compaction_audit(
         match audit
             .memory
             .append_message_event(crate::memory::MessageEventInput {
+                agent_partition: audit.agent_partition.clone(),
                 event_id: None,
                 idempotency_key: Some(format!("compaction:{run_id}:summary")),
                 workspace_id: audit.workspace_id.clone(),
@@ -851,6 +854,7 @@ async fn persist_compaction_audit(
     if let Err(error) = audit
         .memory
         .append_compaction_run(CompactionRunInput {
+            agent_partition: audit.agent_partition.clone(),
             run_id: Some(run_id),
             workspace_id: audit.workspace_id.clone(),
             owner_id: audit.owner_id.clone(),

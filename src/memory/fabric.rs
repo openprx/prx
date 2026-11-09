@@ -154,6 +154,8 @@ pub struct MessageEventScope {
     pub config_generation_id: Option<u64>,
     pub config_source_revision: Option<String>,
     pub authority_guard: Option<RuntimeAuthorityGuard>,
+    /// Agent partition of the writing turn (MA-01b3). `None` for unpartitioned writers.
+    pub agent_partition: Option<crate::memory::AgentPartition>,
     pub visibility: MemoryVisibility,
 }
 
@@ -199,6 +201,7 @@ impl MessageEventScope {
             config_generation_id: None,
             config_source_revision: None,
             authority_guard: None,
+            agent_partition: None,
             visibility,
         }
     }
@@ -482,6 +485,7 @@ impl MemoryFabric {
     ) -> anyhow::Result<MemoryEvent> {
         self.memory
             .append_memory_event(MemoryEventInput {
+                agent_partition: scope.agent_partition.clone(),
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
                 // C03: task lifecycle events inherit the writing scope's owner so
@@ -566,6 +570,8 @@ impl MemoryFabric {
         let _event = self
             .memory
             .append_memory_event(MemoryEventInput {
+                // CARRY 01b3-2 (W7, interim rule M3): record_semantic_memory_from_event has no partition input in part 0
+                agent_partition: None,
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
                 // Semantic promotion has no caller scope in hand; the event is
@@ -601,6 +607,8 @@ impl MemoryFabric {
             let link = self
                 .memory
                 .link_memory_source(MemoryLinkInput {
+                    // CARRY 01b3-3 (D4): record_semantic_memory_from_event link has no partition input in part 0
+                    agent_partition: None,
                     link_id: None,
                     workspace_id: self.workspace_id.clone(),
                     owner_id: None,
@@ -636,6 +644,7 @@ impl MemoryFabric {
     ) -> anyhow::Result<MemoryDraft> {
         self.memory
             .create_memory_draft(MemoryDraftInput {
+                agent_partition: scope.agent_partition.clone(),
                 draft_id: None,
                 workspace_id: self.workspace_id.clone(),
                 owner_id: scope.owner_id.clone(),
@@ -661,6 +670,8 @@ impl MemoryFabric {
     ) -> anyhow::Result<MemoryEvent> {
         self.memory
             .append_memory_event(MemoryEventInput {
+                // CARRY 01b3-2 (W8/W9): record_draft_merge_requested has no partition input in part 0
+                agent_partition: None,
                 event_id: None,
                 workspace_id: target_workspace_id.unwrap_or_else(|| self.workspace_id()).to_string(),
                 owner_id: draft.owner_id.clone(),
@@ -758,6 +769,7 @@ impl MemoryFabric {
             ));
         }
         let input = MessageEventInput {
+            agent_partition: scope.agent_partition,
             event_id: None,
             idempotency_key,
             workspace_id: self.workspace_id.clone(),

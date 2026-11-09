@@ -23,6 +23,7 @@ async fn record_agent_note(memory: &Arc<dyn Memory>, workspace: &Path) {
     let workspace_id = workspace.to_string_lossy().into_owned();
     memory
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: Some("agent:prx-note".to_owned()),
             workspace_id: workspace_id.clone(),
@@ -91,6 +92,7 @@ async fn append_bad_final(memory: &Arc<dyn Memory>, source: &MessageEvent) {
     let run = source.run_id.clone().expect("run");
     memory
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: None,
             idempotency_key: Some(format!("turn:{run}:final")),
             workspace_id: source.workspace_id.clone(),

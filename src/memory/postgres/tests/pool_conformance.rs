@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 pub(super) fn fitness_message_input(workspace_id: &str, content: &str) -> MessageEventInput {
     MessageEventInput {
+        agent_partition: None,
         event_id: Some(format!("fitness-event-{}", Uuid::new_v4())),
         idempotency_key: None,
         workspace_id: workspace_id.to_string(),
@@ -318,6 +319,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let user = mem
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: Some("event-user-1".to_string()),
             idempotency_key: Some("idem-user-1".to_string()),
             workspace_id: "workspace-a".to_string(),
@@ -350,6 +352,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
         .unwrap();
     let duplicate = mem
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: Some("event-user-duplicate".to_string()),
             idempotency_key: Some("idem-user-1".to_string()),
             workspace_id: "workspace-a".to_string(),
@@ -384,6 +387,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
     assert_eq!(duplicate.content, user.content);
     let other_workspace = mem
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: Some("event-user-workspace-b".to_string()),
             idempotency_key: Some("idem-user-1".to_string()),
             workspace_id: "workspace-b".to_string(),
@@ -432,6 +436,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let assistant = mem
         .append_message_event(MessageEventInput {
+            agent_partition: None,
             event_id: Some("event-assistant-1".to_string()),
             idempotency_key: None,
             workspace_id: "workspace-a".to_string(),
@@ -533,6 +538,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let custom_event = mem
         .append_memory_event(MemoryEventInput {
+            agent_partition: None,
             owner_id: None,
             event_id: Some("memory-event-1".to_string()),
             workspace_id: "workspace-a".to_string(),
@@ -558,6 +564,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let draft = mem
         .create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some("draft-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -599,6 +606,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let rejected = mem
         .create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some("draft-2".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -638,6 +646,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let document = mem
         .ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some("doc-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -679,6 +688,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let link = mem
         .link_memory_source(MemoryLinkInput {
+            agent_partition: None,
             link_id: Some("link-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -697,6 +707,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let trace = mem
         .append_retrieval_trace(RetrievalTraceInput {
+            agent_partition: None,
             trace_id: Some("trace-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -721,6 +732,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
 
     let compaction = mem
         .append_compaction_run(CompactionRunInput {
+            agent_partition: None,
             run_id: Some("compact-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -826,6 +838,7 @@ async fn postgres_embedding_vector_reindex_from_env() {
     );
 
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("doc-vector-postgres-1".to_string()),
         workspace_id: "workspace-a".to_string(),
         owner_id: Some("owner-a".to_string()),
@@ -846,6 +859,7 @@ async fn postgres_embedding_vector_reindex_from_env() {
     .await
     .unwrap();
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("doc-vector-postgres-2".to_string()),
         workspace_id: "workspace-a".to_string(),
         owner_id: Some("owner-a".to_string()),

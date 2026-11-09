@@ -542,6 +542,7 @@ async fn retrieval_trace_persists_context_pack_audit() {
 
     let trace = mem
         .append_retrieval_trace(RetrievalTraceInput {
+            agent_partition: None,
             trace_id: Some("trace-sqlite-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -573,6 +574,7 @@ async fn compaction_run_persists_summary_audit() {
 
     let run = mem
         .append_compaction_run(CompactionRunInput {
+            agent_partition: None,
             run_id: Some("compact-sqlite-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -743,6 +745,7 @@ async fn document_ingest_chunks_searches_and_links_sources() {
     let (_tmp, mem) = temp_sqlite();
     let document = mem
         .ingest_document(DocumentIngestInput {
+            agent_partition: None,
             document_id: Some("doc-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner:workspace-a:telegram:alice".to_string()),
@@ -803,6 +806,7 @@ async fn document_ingest_chunks_searches_and_links_sources() {
 
     let link = mem
         .link_memory_source(MemoryLinkInput {
+            agent_partition: None,
             link_id: Some("link-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner:workspace-a:telegram:alice".to_string()),
@@ -836,6 +840,7 @@ async fn document_chunk_vector_search_uses_current_embedding_metadata() {
     )
     .unwrap();
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("doc-vector-1".to_string()),
         workspace_id: "workspace-a".to_string(),
         owner_id: None,
@@ -1123,6 +1128,7 @@ async fn reindex_backfills_stale_document_chunk_embeddings() {
     )
     .unwrap();
     mem.ingest_document(DocumentIngestInput {
+        agent_partition: None,
         document_id: Some("doc-reindex-1".to_string()),
         workspace_id: "workspace-a".to_string(),
         owner_id: None,
@@ -1199,6 +1205,7 @@ async fn memory_draft_lifecycle_creates_merges_and_rejects_with_outbox() {
 
     let draft = mem
         .create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some("draft-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),
@@ -1249,6 +1256,7 @@ async fn memory_draft_lifecycle_creates_merges_and_rejects_with_outbox() {
 
     let rejected = mem
         .create_memory_draft(MemoryDraftInput {
+            agent_partition: None,
             draft_id: Some("draft-2".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),

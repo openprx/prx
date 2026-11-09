@@ -503,6 +503,7 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
         .to_string();
         match mem
             .append_message_event(crate::memory::MessageEventInput {
+                agent_partition: envelope.agent_partition.clone(),
                 event_id: None,
                 idempotency_key: Some(format!("compaction:{run_id}:summary")),
                 workspace_id: envelope.workspace_id.clone(),
@@ -546,6 +547,7 @@ pub(super) async fn persist_legacy_chat_compaction_audit(
     };
     if let Err(error) = mem
         .append_compaction_run(CompactionRunInput {
+            agent_partition: envelope.agent_partition.clone(),
             run_id: Some(run_id),
             workspace_id: envelope.workspace_id.clone(),
             owner_id: Some(owner.owner_id),
