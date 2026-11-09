@@ -207,6 +207,11 @@ impl TurnDecisionService {
         self.catalog.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn prediction_port_calls(&self) -> usize {
+        self.factory.prediction_port_calls()
+    }
+
     #[must_use]
     pub(crate) const fn publication_policy(&self) -> &SurfacePolicy {
         &self.publication_policy
@@ -1961,8 +1966,9 @@ impl TurnDecisionService {
         })
     }
 
-    /// Build the turn context and G6 slice with the engine off: no prediction
-    /// port, no directive from selection, and no call budget (R1b stamps that).
+    /// Build the turn context, G6 slice and SendLimits with the engine off:
+    /// no prediction port and no directive from selection. The turn engine
+    /// stamps the call budget from this context.
     pub(crate) async fn open_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
@@ -1993,6 +1999,7 @@ impl TurnDecisionService {
             .await
             .map_err(AgentDecisionError::IngressRecovery)?;
         let budget = self.agent_budget_snapshot(proof)?;
+        let limits = self.send_limits(proof)?;
         let deadline = crate::causal_tree::logical_clock::now()
             .checked_add(Duration::from_millis(budget.budgets.latency_ms))
             .ok_or(AgentDecisionError::Deadline)?;
@@ -2050,7 +2057,7 @@ impl TurnDecisionService {
             budgets: TurnBudgets {
                 tokens: g6_slice,
                 latency_ms: budget.budgets.latency_ms,
-                micro_usd: budget.budgets.micro_usd,
+                micro_usd: limits.remaining_micro_usd,
             },
             delivery: DeliveryConstraints {
                 interactive: kind == AgentTurnKind::Repl || proof.approval_review_adapter().is_some(),
@@ -2074,6 +2081,27 @@ impl TurnDecisionService {
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
+        let engine = EngineDecision::without_prediction(state, deadline, decision_id);
+        let call_fingerprints = BTreeMap::new();
+        let replayed_non_idempotent = BTreeSet::new();
+        let gates = GateInputs {
+            policy: &self.security,
+            owner_id: proof.owner_id(),
+            sender: proof.policy_sender(),
+            policy_channel: proof.policy_channel(),
+            chat_type: proof.policy_chat_type(),
+            model_ref: &model_ref,
+            model_can_chat: true,
+            model_can_call_tools: self.model_can_call_tools(proof),
+            decision_endpoint_ready: true,
+            child_scope: proof.child_scope().map(|scope| scope.gate_inputs()),
+            verified_approval_calls: BTreeMap::new(),
+            call_fingerprints: &call_fingerprints,
+            failed_call_counts: BTreeMap::new(),
+            replayed_non_idempotent: &replayed_non_idempotent,
+            retry_limit: None,
+        };
+        let execution_refs = direct_answer_refs(&engine, &catalog, &gates, &BTreeSet::new());
         Ok(Arc::new(TurnDecisionContext {
             _event_memory: event_memory,
             model_catalog: self.provider_catalog.release_pin(),
@@ -2091,12 +2119,12 @@ impl TurnDecisionService {
             collected_approval_result: std::sync::OnceLock::new(),
             discovery_offers: std::sync::OnceLock::new(),
             discovery_admissions: std::sync::OnceLock::new(),
-            engine: EngineDecision::without_prediction(state, deadline, decision_id),
+            engine,
             hop_ids: vec![decision_id],
             prior_hops: Vec::new(),
             directive: TurnExecutionDirective::AnswerDirectly,
             main_compaction: budget.main_compaction,
-            execution_refs: BTreeSet::new(),
+            execution_refs,
             #[cfg(test)]
             selected_retrieved: Vec::new(),
             #[cfg(feature = "llm-router")]
@@ -2114,6 +2142,7 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        // R1a: keeps open_turn_context reachable; removed when R3a switches this entry.
         if cancellation.is_cancelled() && !self.generation.effective.decision_engine.enabled {
             return self.open_turn_context(proof, kind, cancellation).await;
         }

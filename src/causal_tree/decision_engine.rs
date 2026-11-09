@@ -14,9 +14,12 @@ pub(crate) mod original_observation;
 #[cfg(test)]
 mod resume_availability_tests;
 
-use super::branch::{CandidateId, CapabilityRef, CausalActionKind, CausalCandidate};
+use super::branch::{
+    ApprovalRequirement, CandidateId, CandidateSpec, CapabilityRef, CapabilityTarget, CausalActionKind,
+    CausalCandidate, CostEstimate, SideEffectClass,
+};
 use super::candidate_generator::{
-    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, NoLegalReason, is_retrieval_source,
+    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, DiscoveryFamilies, is_retrieval_source,
 };
 use super::config::CausalTreeConfig;
 #[cfg(test)]
@@ -371,11 +374,29 @@ impl SelectedRouterReadGrant {
 }
 
 impl EngineDecision {
-    /// Trusted state and G6 slice for a disabled engine: no prediction port,
-    /// no selected candidates, and no compiled request.
+    /// Trusted state and G6 slice for a disabled engine: no prediction port
+    /// and no compiled request. A committed Legal Answer with a known cost
+    /// lets later execution stamp the call budget and publish the Direct
+    /// catalog surface.
     pub(crate) fn without_prediction(state: CausalState, deadline: Instant, decision_id: DecisionId) -> Self {
-        let empty_gates = GateReport {
-            outcomes: BTreeMap::new(),
+        let answer = CausalCandidate::new(
+            CausalActionKind::Answer,
+            CapabilityTarget::None,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: SideEffectClass::ReadOnly,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(CostEstimate {
+                    tokens: 0,
+                    micro_usd: 0,
+                }),
+                estimated_latency_ms: Some(0),
+            },
+        );
+        let answer_id = answer.candidate_id().clone();
+        let gates = GateReport {
+            outcomes: BTreeMap::from([(answer_id.clone(), GateOutcome::Passed)]),
             gate_set_hash: [0; 32],
         };
         Self {
@@ -383,15 +404,18 @@ impl EngineDecision {
             deadline,
             elapsed_ms: 0,
             state,
-            candidates: CandidateSet::NoLegalPath {
-                reason: NoLegalReason::NoLegalCandidate,
-                terminals: Vec::new(),
-                approval_only: Vec::new(),
-                report: empty_gates.clone(),
+            candidates: CandidateSet::Legal {
+                discoverable_families: DiscoveryFamilies::default(),
+                candidates: vec![answer],
+                exact_mentions: BTreeSet::new(),
+                truncated: Vec::new(),
+                approval_scopes: BTreeMap::new(),
+                report: gates.clone(),
             },
-            selection: Selection::Abstain {
-                action: CausalActionKind::Answer,
-                reason_code: "engine_disabled",
+            selection: Selection::Commit {
+                candidate_id: answer_id,
+                propensity: 1.0,
+                reason_code: Some("engine_disabled"),
             },
             exploration_propensities: BTreeMap::new(),
             prediction: None,
@@ -402,8 +426,8 @@ impl EngineDecision {
             scored_count: 0,
             #[cfg(test)]
             rehearsal: BTreeMap::new(),
-            post_rehearsal: empty_gates.clone(),
-            pre_commit: empty_gates,
+            post_rehearsal: gates.clone(),
+            pre_commit: gates,
             call_fingerprints: BTreeMap::new(),
             outgoing_child: None,
             outgoing_parent_allowed: None,

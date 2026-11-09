@@ -35,6 +35,8 @@
 //! - An unavailable decision key (D-057) leaves only the builtin.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -455,6 +457,8 @@ pub struct DecisionBackendFactory {
     cache: DecisionCache,
     secrets: OutboundSecrets,
     config_generation: u64,
+    #[cfg(test)]
+    prediction_port_calls: AtomicUsize,
 }
 
 impl std::fmt::Debug for DecisionBackendFactory {
@@ -682,10 +686,17 @@ impl DecisionBackendFactory {
         &'a self,
         accounting: Option<&'a dyn super::budget::DecisionAttemptAccounting>,
     ) -> AccountedPrediction<'a> {
+        #[cfg(test)]
+        self.prediction_port_calls.fetch_add(1, Ordering::SeqCst);
         AccountedPrediction {
             factory: self,
             accounting,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prediction_port_calls(&self) -> usize {
+        self.prediction_port_calls.load(Ordering::SeqCst)
     }
 
     /// The backend order for `section` (SP-CDP-A 5.6 under D-040). Pure:
@@ -862,6 +873,8 @@ impl DecisionBackendFactory {
             cache: DecisionCache::new(),
             secrets,
             config_generation: deps.config_generation,
+            #[cfg(test)]
+            prediction_port_calls: AtomicUsize::new(0),
         })
     }
 
@@ -878,6 +891,8 @@ impl DecisionBackendFactory {
             cache: DecisionCache::new(),
             secrets: OutboundSecrets::of_config(config),
             config_generation: 0,
+            #[cfg(test)]
+            prediction_port_calls: AtomicUsize::new(0),
         }
     }
 
@@ -942,6 +957,7 @@ impl DecisionBackendFactory {
             cache: DecisionCache::new(),
             secrets,
             config_generation: 0,
+            prediction_port_calls: AtomicUsize::new(0),
         }
     }
 
