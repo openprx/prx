@@ -169,6 +169,10 @@ async fn warm_handle_refuses_lost_historical_capsule_key() -> anyhow::Result<()>
         decided == 0,
         "a lost historical capsule produced marker or outcome evidence"
     );
+    anyhow::ensure!(
+        !memory.recovery_key_load_sites().is_empty(),
+        "K0 replay never reached a disk key load"
+    );
     Ok(())
 }
 
