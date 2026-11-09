@@ -244,7 +244,11 @@ fn chat_resume_consumed_decision_in_same_chat_refuses_and_processes_later_input(
 #[test]
 #[serial(prx_chat_pty)]
 fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
-    let (guard, mut sg, decision_id) = approve_and_resume_publish_failure_with_delay("prx_busy_resume_turn=5000");
+    // FU-FLAKE-PTY-RESUME: the delay only has to outlast the /resume-decision +
+    // /queue round trip (~30 ms on qaa). 800 ms keeps the "1 queued, 1 running"
+    // read reliable on a loaded hosted runner; 5000 ms was paid twice (busy turn
+    // and the later "hi") and blew the nextest 60 s budget.
+    let (guard, mut sg, decision_id) = approve_and_resume_publish_failure_with_delay("prx_busy_resume_turn=800");
     let session = sg.session();
     session.send("hi prx_busy_resume_turn\r").expect("start delayed turn");
     session.send("/queue\r").expect("inspect running turn");
