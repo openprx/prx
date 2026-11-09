@@ -1595,6 +1595,26 @@ mod tests {
         server.abort();
     }
 
+    /// The terminal status and cause of each reserved batch member, read from
+    /// the run registry, so a red names what ended the member.
+    async fn member_terminal_report(
+        runs: &tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>,
+        run_ids: &[String],
+    ) -> String {
+        let runs = runs.read().await;
+        run_ids
+            .iter()
+            .map(|id| {
+                let state = runs.iter().find(|run| run.id == *id).map_or_else(
+                    || "absent from the run registry".to_owned(),
+                    |run| format!("{:?} (finished_at {:?})", run.status, run.finished_at),
+                );
+                format!("{id}: {state}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// §7.1 end to end: a `spawn_batch` fan-out is visible as a batch through
     /// the very listing `prx tasks list` renders, and the batch id is a kill
     /// address that ends every member.
@@ -1618,6 +1638,15 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .expect("test: spawn_batch must return a batch id")
             .to_string();
+        let reserved: Vec<String> = payload
+            .get("spawned")
+            .and_then(serde_json::Value::as_array)
+            .expect("test: spawn_batch must list its spawned members")
+            .iter()
+            .filter_map(|member| member.get("run_id").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(reserved.len(), 3, "test: all three members must be spawned: {payload}");
 
         let (endpoint, server) = serve(test_app_state(AutonomyLevel::Full, workspace.path())).await;
 
@@ -1642,10 +1671,11 @@ mod tests {
             .iter()
             .filter(|item| item.batch_id.as_deref() == Some(batch_id.as_str()))
             .collect();
+        let terminals = member_terminal_report(&fixture.runs, &reserved).await;
         assert_eq!(
             members.len(),
             3,
-            "every batch member must report its batch in the operator listing: {:?}",
+            "every batch member must report its batch in the operator listing: {:?}; member terminals: {terminals}",
             listing.running
         );
 
@@ -1663,9 +1693,10 @@ mod tests {
             .expect("test: a batch id must be a valid kill address");
         assert_eq!(report.requested, batch_id);
         for member in &members {
+            let terminals = member_terminal_report(&fixture.runs, &reserved).await;
             assert!(
                 report.targets.iter().any(|target| target.id == member.id),
-                "the batch kill must have reached {}: {report:?}",
+                "the batch kill must have reached {}: {report:?}; member terminals: {terminals}",
                 member.id
             );
         }
