@@ -119,10 +119,10 @@ async fn assert_plane_on_legacy_rejoin(cell: &MatrixCell, recovery: &RecoverySco
                 .await
                 .expect("test: seeded plane-on rejoin");
             let after = store.reader().counts().expect("test: outcomes after").outcomes;
-            let directive = recovery.spies().directive_repair();
-            assert!(
-                after > before || directive > 0,
-                "sqlite plane-on rejoin must write an outcomes row or repair the chain (before={before} after={after} directive={directive})"
+            assert_eq!(
+                after,
+                before + 1,
+                "sqlite plane-on rejoin writes one outcomes row through the builder writer"
             );
         }
         ("sqlite", true, true, false, true) => {
