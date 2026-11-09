@@ -315,10 +315,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
         flush(&store).await;
         CausalDecisionStore::close(Arc::new(store), Instant::now() + Duration::from_secs(5)).await;
         assert!(
-            !std::path::Path::new(&format!("{}-wal", db_path(workspace).display())).exists()
-                || std::fs::metadata(format!("{}-wal", db_path(workspace).display()))
-                    .map(|meta| meta.len() == 0)
-                    .unwrap_or(true),
+            std::fs::metadata(format!("{}-wal", db_path(workspace).display())).map_or(true, |m| m.len() == 0),
             "test: checkpointed store has no live WAL"
         );
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
@@ -410,6 +407,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
             "test: truncated WAL so the recovery probe uses immutable=1"
         );
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
+        let before = snapshot_decision_files(workspace);
         let (recovery, tracker) = prepare_recovery_only(workspace, Arc::clone(&memory)).await;
         assert_recovery_only_reader(&recovery);
         let (probed_tx, probed_rx) = std::sync::mpsc::channel();
@@ -449,6 +447,10 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
             "test: discarded immutable read; mode=ro re-read sees the uncheckpointed row"
         );
         let after = snapshot_decision_files(workspace);
+        assert_eq!(before.key_bytes, after.key_bytes, "test: .decision_key bytes unchanged");
+        assert_eq!(before.key_mtime, after.key_mtime, "test: .decision_key mtime unchanged");
+        assert_eq!(before.db_bytes, after.db_bytes, "test: decisions.db bytes unchanged");
+        assert_eq!(before.db_mtime, after.db_mtime, "test: decisions.db mtime unchanged");
         assert_files_unchanged(&mid, &after);
         tracker
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
