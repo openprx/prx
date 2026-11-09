@@ -2107,6 +2107,8 @@ fn open_reader(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
 
 /// A live WAL sidecar: `-wal` present with bytes. Recovery probes this file
 /// only (`-shm` is excluded from the mode decision).
+/// A 0-byte -wal counts as absent (same as open_read_only); the post-read
+/// re-probe covers a writer that appends later.
 fn wal_sidecar_present(path: &Path) -> bool {
     std::fs::symlink_metadata(side_file(path, "-wal")).is_ok_and(|wal| wal.len() > 0)
 }

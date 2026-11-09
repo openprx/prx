@@ -1317,7 +1317,10 @@ async fn recovery_only_legacy(
 fn recovery_only_legacy_sync(workspace: &std::path::Path) -> anyhow::Result<Option<LegacyEvidence>> {
     let key = match DecisionKey::load_existing(workspace) {
         Ok(key) => key,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            tracing::warn!("recovery legacy key unavailable: {error}");
+            return Ok(None);
+        }
     };
     let Some(store) = crate::causal_tree::store::CausalDecisionStore::open_recovery_read_only(workspace)? else {
         return Ok(None);
