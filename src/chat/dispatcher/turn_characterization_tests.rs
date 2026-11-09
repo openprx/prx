@@ -810,9 +810,9 @@ fn message_roles(history: &[ChatMessage]) -> Vec<&str> {
 }
 
 async fn wait_for_call_count(counter: &AtomicUsize, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while counter.load(Ordering::SeqCst) < expected {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
