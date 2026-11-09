@@ -1182,12 +1182,13 @@ const TARGET_MAIN_U: &str = "00000000-0000-4000-8000-0000000000b1";
 const TARGET_MAIN_SCOPE: &str = "00000000-0000-4000-8000-0000000000d1";
 const TARGET_REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const CAPTURE_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b2-partition";
+const PARTITION_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b3-partition";
 
-fn capture_provider_config(config: &mut Config, agent_cfg: DelegateAgentConfig) {
-    config.default_provider = Some(CAPTURE_PROVIDER.to_owned());
+fn capture_provider_config(config: &mut Config, provider: &str, agent_cfg: DelegateAgentConfig) {
+    config.default_provider = Some(provider.to_owned());
     config.default_model = Some("test-model".to_owned());
     config.cost.prices.insert(
-        format!("{CAPTURE_PROVIDER}/test-model"),
+        format!("{provider}/test-model"),
         crate::config::schema::ModelPricing {
             input: 1.0,
             output: 1.0,
@@ -1197,12 +1198,12 @@ fn capture_provider_config(config: &mut Config, agent_cfg: DelegateAgentConfig) 
     );
     config.providers.models.push(
         toml::from_str(&format!(
-            "provider = {CAPTURE_PROVIDER:?}\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = true\n"
+            "provider = {provider:?}\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = true\n"
         ))
         .expect("test: catalog"),
     );
     let mut agent_cfg = agent_cfg;
-    agent_cfg.provider = CAPTURE_PROVIDER.to_owned();
+    agent_cfg.provider = provider.to_owned();
     agent_cfg.model = "test-model".to_owned();
     config.agents.insert("x".to_owned(), agent_cfg);
 }
@@ -1309,7 +1310,7 @@ async fn sqlite_targeted_scope_supported() {
     let fixture = fixture(|config| {
         config.gateway.targeted_agents = true;
         config.autonomy.level = AutonomyLevel::Full;
-        capture_provider_config(config, agent(false, &[]));
+        capture_provider_config(config, CAPTURE_PROVIDER, agent(false, &[]));
     })
     .await;
     crate::providers::test_fixture::register(
@@ -1416,10 +1417,6 @@ impl crate::tools::Tool for ScopeRecorder {
     }
 }
 
-/// MA-01b3 part 0: the partition and session reach every writer input. The
-/// envelope views are asserted directly; the POST views assert what the
-/// runtime delivers to a tool (`_zc_scope`) and what `parse_scope_ctx` reads
-/// back from it.
 /// A console input literal whose only varying field is the in-process partition (R0-2).
 fn digest_cell_input(agent_partition: Option<AgentPartition>) -> crate::memory::MessageEventInput {
     crate::memory::MessageEventInput {
@@ -1454,6 +1451,10 @@ fn digest_cell_input(agent_partition: Option<AgentPartition>) -> crate::memory::
     }
 }
 
+/// MA-01b3 part 0: the partition and session reach every writer input. The
+/// envelope views are asserted directly; the POST views assert what the
+/// runtime delivers to a tool (`_zc_scope`) and what `parse_scope_ctx` reads
+/// back from it.
 #[tokio::test]
 async fn agent_partition_reaches_every_writer_input() {
     let driver = crate::agent::agent::native_decision_fixture::Driver::start("filesystem")
@@ -1466,7 +1467,7 @@ async fn agent_partition_reaches_every_writer_input() {
                 config.gateway.targeted_agents = true;
                 config.autonomy.level = AutonomyLevel::Full;
                 config.tool_tiering.always_include = vec![SCOPE_TOOL.to_owned()];
-                capture_provider_config(config, agent(true, &[SCOPE_TOOL]));
+                capture_provider_config(config, PARTITION_PROVIDER, agent(true, &[SCOPE_TOOL]));
                 crate::agent::agent::native_decision_fixture::configure(config, &endpoint)
                     .expect("test: decision backend");
             })
@@ -1528,7 +1529,7 @@ async fn agent_partition_reaches_every_writer_input() {
                 )]]));
                 // The fixture holds only a Weak handle: keep this Arc alive for the POST.
                 let provider = Arc::clone(&scripted) as Arc<dyn crate::providers::Provider>;
-                crate::providers::test_fixture::register(CAPTURE_PROVIDER, Arc::clone(&provider));
+                crate::providers::test_fixture::register(PARTITION_PROVIDER, Arc::clone(&provider));
                 // Main pins `AppState.provider`; Named builds through the factory.
                 fixture.state.provider = Arc::clone(&provider);
                 seen.lock().clear();
