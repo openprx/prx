@@ -450,17 +450,6 @@ Examples:
         message: Option<String>,
     },
 
-    /// Start the AI agent loop
-    #[command(long_about = "\
-Start the AI agent loop.
-
-Launches an interactive chat session with the configured AI provider. \
-Use --message for single-shot queries without entering interactive mode.
-
-Examples:
-  prx agent                              # interactive session
-  prx agent -m \"Summarize today's logs\"  # single message
-  prx agent -p anthropic --model claude-sonnet-4-20250514")]
     /// Run the agent once with a single message, or interactively.
     #[command(long_about = "\
 Run the agent on a single message and print the reply, or omit the message \
