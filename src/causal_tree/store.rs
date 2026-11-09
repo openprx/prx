@@ -1583,6 +1583,9 @@ pub(crate) struct DecisionStoreReader {
     path: Option<Arc<Path>>,
     /// Read without locks or side files: the disabled plane's store.
     immutable: bool,
+    /// Recovery-only: probe `-wal` on every read; after an `immutable=1`
+    /// read, re-probe and discard the result when a WAL now exists.
+    wal_reprobe: bool,
     idle: Arc<parking_lot::Mutex<Vec<Connection>>>,
 }
 
@@ -1699,11 +1702,14 @@ impl DecisionReplayRecord {
 const MAX_IDLE_READERS: usize = 4;
 
 impl DecisionStoreReader {
-    fn with<T>(&self, empty: T, read: impl FnOnce(&Connection) -> Result<T, StoreError>) -> Result<T, StoreError> {
+    fn with<T>(&self, empty: T, mut read: impl FnMut(&Connection) -> Result<T, StoreError>) -> Result<T, StoreError> {
         let Some(path) = &self.path else {
             // No database exists (a disabled plane that never wrote).
             return Ok(empty);
         };
+        if self.wal_reprobe {
+            return read_with_wal_reprobe(path, &mut read);
+        }
         let idle = self.idle.lock().pop();
         let conn = match idle {
             Some(conn) => conn,
@@ -1723,10 +1729,13 @@ impl DecisionStoreReader {
     fn with_until<T>(
         &self,
         deadline: Instant,
-        read: impl FnOnce(&Connection) -> Result<T, StoreError>,
+        mut read: impl FnMut(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         recovery_time_left(deadline)?;
         let path = self.path.as_ref().ok_or(StoreError::RecoveryUnavailable)?;
+        if self.wal_reprobe {
+            return read_with_wal_reprobe_until(path, deadline, &mut read);
+        }
         let idle = self
             .idle
             .try_lock_until(deadline)
@@ -2096,6 +2105,115 @@ fn open_reader(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// A live WAL sidecar: `-wal` present with bytes. Recovery probes this file
+/// only (`-shm` is excluded from the mode decision).
+fn wal_sidecar_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(side_file(path, "-wal")).is_ok_and(|wal| wal.len() > 0)
+}
+
+/// Recovery-only reader open: `immutable=1` or non-immutable `mode=ro`.
+fn open_recovery_reader_connection(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        | OpenFlags::SQLITE_OPEN_URI;
+    let query = if immutable { "mode=ro&immutable=1" } else { "mode=ro" };
+    Ok(Connection::open_with_flags(
+        format!("file:{}?{query}", uri_path(path)?),
+        flags,
+    )?)
+}
+
+fn open_recovery_reader(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
+    let conn = open_recovery_reader_connection(path, immutable)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
+    Ok(conn)
+}
+
+fn read_with_wal_reprobe<T>(
+    path: &Path,
+    read: &mut impl FnMut(&Connection) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let immutable = !wal_sidecar_present(path);
+    let conn = open_recovery_reader(path, immutable)?;
+    #[cfg(test)]
+    if immutable {
+        wait_wal_reprobe_gate();
+    }
+    let result = read(&conn);
+    if immutable && wal_sidecar_present(path) {
+        drop(conn);
+        let conn = open_recovery_reader(path, false)?;
+        read(&conn)
+    } else {
+        result
+    }
+}
+
+fn read_with_wal_reprobe_until<T>(
+    path: &Path,
+    deadline: Instant,
+    read: &mut impl FnMut(&Connection) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    recovery_time_left(deadline)?;
+    let immutable = !wal_sidecar_present(path);
+    let conn = open_recovery_reader_connection(path, immutable)?;
+    #[cfg(test)]
+    if immutable {
+        wait_wal_reprobe_gate();
+    }
+    recovery_time_left(deadline)?;
+    let result = {
+        let _budget = RecoveryReadBudget::new(&conn, deadline)?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        recovery_time_left(deadline)?;
+        let result = read(&conn);
+        recovery_time_left(deadline)?;
+        result
+    };
+    if immutable && wal_sidecar_present(path) {
+        drop(conn);
+        recovery_time_left(deadline)?;
+        let conn = open_recovery_reader_connection(path, false)?;
+        recovery_time_left(deadline)?;
+        let _budget = RecoveryReadBudget::new(&conn, deadline)?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        recovery_time_left(deadline)?;
+        let result = read(&conn);
+        recovery_time_left(deadline)?;
+        result
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+struct WalReprobeGate {
+    probed: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static WAL_REPROBE_GATE: parking_lot::Mutex<Option<WalReprobeGate>> = parking_lot::Mutex::new(None);
+
+/// Arm the recovery WAL re-probe barrier: the next `immutable=1` read sends
+/// `probed` after opening the immutable connection and waits on `resume`
+/// before SQL, so a test can create a WAL between the probe and the read.
+#[cfg(test)]
+pub(crate) fn arm_wal_reprobe_gate(probed: std::sync::mpsc::Sender<()>, resume: std::sync::mpsc::Receiver<()>) {
+    *WAL_REPROBE_GATE.lock() = Some(WalReprobeGate { probed, resume });
+}
+
+#[cfg(test)]
+fn wait_wal_reprobe_gate() {
+    let Some(gate) = WAL_REPROBE_GATE.lock().take() else {
+        return;
+    };
+    let _ = gate.probed.send(());
+    let _ = gate.resume.recv_timeout(std::time::Duration::from_secs(15));
+}
+
 /// `path` for an SQLite `file:` URI: `%`, `?` and `#` escaped.
 fn uri_path(path: &Path) -> Result<String, StoreError> {
     let text = path
@@ -2157,6 +2275,7 @@ impl CausalDecisionStore {
                 reader: DecisionStoreReader {
                     path: None,
                     immutable: true,
+                    wal_reprobe: false,
                     idle: Arc::default(),
                 },
                 writer: None,
@@ -2260,6 +2379,7 @@ impl CausalDecisionStore {
         let reader = DecisionStoreReader {
             path: Some(Arc::from(path.as_path())),
             immutable: false,
+            wal_reprobe: false,
             idle: Arc::default(),
         };
         if let SchemaState::Newer(version) = state {
@@ -2309,6 +2429,44 @@ impl CausalDecisionStore {
         })
     }
 
+    /// Recovery-only legacy reader: never creates a key or database.
+    /// `-wal` present ⇒ non-immutable `mode=ro`; `-wal` absent ⇒ `immutable=1`.
+    /// Missing database ⇒ `None`.
+    pub(crate) fn open_recovery_read_only(workspace_dir: &Path) -> Result<Option<Self>, StoreError> {
+        let dir_exists = crate::decision::key::check_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
+        if !dir_exists {
+            return Ok(None);
+        }
+        let path = real_path(&workspace_dir.join("self").join("causal_tree"))?;
+        if !check_files(&path)? {
+            return Ok(None);
+        }
+        let live_wal = wal_sidecar_present(&path);
+        let reader = DecisionStoreReader {
+            path: Some(Arc::from(path.as_path())),
+            immutable: !live_wal,
+            wal_reprobe: true,
+            idle: Arc::default(),
+        };
+        let workspace_id = reader
+            .with(None, |conn| match store_schema::workspace_id(conn) {
+                Ok(id) => Ok(id),
+                Err(error) => {
+                    tracing::warn!("the decision store's workspace id could not be read: {error}");
+                    Ok(None)
+                }
+            })?
+            .map(Arc::<str>::from);
+        Ok(Some(Self {
+            shared_slot: None,
+            path,
+            mode: StoreMode::ReadOnly,
+            workspace_id,
+            reader,
+            writer: None,
+        }))
+    }
+
     /// A read-only store over `path`. Nothing is created: a missing
     /// database reads as empty. `immutable` reads take no lock and create no
     /// side file (the disabled plane).
@@ -2328,6 +2486,7 @@ impl CausalDecisionStore {
         let reader = DecisionStoreReader {
             path: exists.then(|| Arc::from(path.as_path())),
             immutable: immutable && !live_wal,
+            wal_reprobe: false,
             idle: Arc::default(),
         };
         let workspace_id = if exists {

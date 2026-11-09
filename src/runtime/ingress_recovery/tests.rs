@@ -905,3 +905,8 @@ async fn recovery_failed_readwrite_open_leaves_drain_unclean() {
 async fn recovery_store_without_writer_rejoin_fails_closed() {
     auth_02_2b_tests::recovery_store_without_writer_rejoin_fails_closed().await;
 }
+
+#[tokio::test]
+async fn recovery_legacy_reader_creates_no_files() {
+    auth_02_2b_tests::recovery_legacy_reader_creates_no_files().await;
+}
