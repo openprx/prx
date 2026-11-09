@@ -47,6 +47,40 @@ fn key_path(memory: &SqliteMemory, id: &str) -> anyhow::Result<std::path::PathBu
 
 #[test]
 #[serial_test::serial(recovery_authority)]
+fn recovery_mac_bytes_are_unchanged() -> anyhow::Result<()> {
+    let (_dir, memory) = store()?;
+    let bytes = [7u8; 32];
+    let id = KeyDirectory::key_id(&bytes);
+    let parent = memory
+        .db_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("fixture repository has no memory directory"))?;
+    KeyDirectory::open(parent, true)?.install(&id, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(key_path(&memory, &id)?)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let capsule = memory.recovery_mac(Some(&id), RecoveryMacDomain::CapsuleV3, b"fixed")?;
+    assert_eq!(
+        hex::encode(capsule.tag),
+        "0ca4d25441b7413aadada92b23e64df08779c56954cf93872abcdae19a14bebe"
+    );
+    assert_eq!(capsule.key_id, id);
+    let digest = memory.recovery_mac(Some(&id), RecoveryMacDomain::InputDigestV3, b"fixed")?;
+    assert_eq!(
+        hex::encode(digest.tag),
+        "decaf66f760e0cf400435fa4a1e3235c281dd616b496baccf32400dd7e9b05f6"
+    );
+    assert_eq!(digest.key_id, id);
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial(recovery_authority)]
 fn recovery_key_create_race_is_durable() {
     let (_dir, memory) = store().unwrap();
     assert!(memory.recovery_repository().is_some());
