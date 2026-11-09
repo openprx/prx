@@ -473,10 +473,18 @@ async fn reset_store_and_restart(arm: StoreReset) {
     let decision_dir = dir.path().join("self/causal_tree");
     let saved = dir.path().join("previous-decisions");
     std::fs::create_dir(&saved).unwrap();
-    for name in ["decisions.db", "decisions.db-wal", "decisions.db-shm"] {
-        let file = decision_dir.join(name);
-        if file.exists() {
-            std::fs::rename(&file, saved.join(name)).unwrap();
+    let main_db = decision_dir.join("decisions.db");
+    if main_db.exists() {
+        std::fs::rename(&main_db, saved.join("decisions.db")).unwrap();
+    }
+    // Only the -wal/-shm sidecars tolerate NotFound: SQLite deletes a sidecar
+    // when the last connection closes, so it can vanish between a probe and
+    // the rename. No probe is made for them. The main db has no such tolerance.
+    for name in ["decisions.db-wal", "decisions.db-shm"] {
+        match std::fs::rename(decision_dir.join(name), saved.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("move sidecar {name} aside before the store reset: {error}"),
         }
     }
     let log = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
