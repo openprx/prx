@@ -3408,35 +3408,46 @@ pub(crate) async fn build_turn_decision_service(
         grant.catalog().check_child_parity(&build.execution, grant.scope())?;
     }
     let recovery_owner = super::turn_cleanup::current_tracker().unwrap_or_default();
-    let recovery = super::ingress_recovery::RecoveryScope::prepare(
-        &build.generation,
-        Arc::clone(&build.memory),
-        surface,
-        Arc::clone(&build.events),
-        build.parent_grant.as_deref(),
-        &recovery_owner,
-        workspace_key.clone(),
-    )
-    .await
-    .map_err(TurnServiceBuildError::RecoveryPreparation)?;
-    let durable_events = if durable_key {
-        recovery.legacy_events().cloned()
+    let opened = if durable_key {
+        Some(
+            super::ingress_recovery::open_advisory_store(
+                &build.generation,
+                Arc::clone(&build.memory),
+                Arc::clone(&build.events),
+                &recovery_owner,
+            )
+            .await
+            .map_err(TurnServiceBuildError::RecoveryPreparation)?,
+        )
     } else {
         None
     };
+    let store = match &opened {
+        Some((store, _)) => Arc::clone(store),
+        None => {
+            store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&build.events), None, false).await?
+        }
+    };
+    let durable_events = opened.as_ref().map(|(_, events)| Arc::clone(events));
     let events: Arc<dyn CausalEventSink> = durable_events.as_ref().map_or_else(
         || Arc::clone(&build.events),
         |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
     );
-    let store = if durable_key {
-        recovery.legacy_store().cloned().ok_or_else(|| {
-            TurnServiceBuildError::RecoveryPreparation(anyhow::anyhow!(
-                "enabled decision service requires a durable recovery store"
-            ))
-        })?
-    } else {
-        store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&events), None, false).await?
-    };
+    let recovery = super::ingress_recovery::RecoveryScope::prepare(
+        &build.generation,
+        Arc::clone(&build.memory),
+        surface,
+        build.parent_grant.as_deref(),
+        &recovery_owner,
+        workspace_key.clone(),
+        super::ingress_recovery::PreparedAdvisory {
+            writer: opened.as_ref().and_then(|(store, _)| store.writer()),
+            events: durable_events.clone(),
+            store: opened.as_ref().map(|(store, _)| Arc::clone(store)),
+        },
+    )
+    .await
+    .map_err(TurnServiceBuildError::RecoveryPreparation)?;
     let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnServiceBuildError::PolicyFingerprint)?;

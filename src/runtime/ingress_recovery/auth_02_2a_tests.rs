@@ -151,6 +151,42 @@ fn observer() -> Arc<dyn crate::decision::telemetry::CausalEventSink> {
     )))
 }
 
+async fn open_advisory(
+    generation: &crate::config::ConfigGeneration,
+    memory: Arc<dyn Memory>,
+    tracker: &Arc<CleanupTracker>,
+) -> crate::runtime::ingress_recovery::PreparedAdvisory {
+    let (store, events) =
+        crate::runtime::ingress_recovery::open_advisory_store(generation, memory, observer(), tracker)
+            .await
+            .expect("test: advisory store");
+    crate::runtime::ingress_recovery::PreparedAdvisory {
+        writer: store.writer(),
+        events: Some(events),
+        store: Some(store),
+    }
+}
+
+async fn prepare_recovery(
+    generation: &crate::config::ConfigGeneration,
+    memory: Arc<dyn Memory>,
+    tracker: &Arc<CleanupTracker>,
+    workspace_key: Option<Arc<crate::decision::key::DecisionKey>>,
+    advisory: crate::runtime::ingress_recovery::PreparedAdvisory,
+) -> Arc<RecoveryScope> {
+    RecoveryScope::prepare(
+        generation,
+        memory,
+        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        None,
+        tracker,
+        workspace_key,
+        advisory,
+    )
+    .await
+    .expect("test: recovery prepare")
+}
+
 /// Literal sqlite 16-cell table: (plane, recording, k, l) → (recordable, legacy_some).
 const SQLITE_MATRIX: [((bool, bool, bool, bool), (bool, bool)); 16] = [
     ((true, true, true, true), (true, true)),
@@ -275,17 +311,6 @@ async fn run_matrix_cell(cell: MatrixCell) {
         None
     };
     let tracker = Arc::new(CleanupTracker::default());
-    let recovery = RecoveryScope::prepare(
-        &generation,
-        Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
-        &tracker,
-        workspace_key,
-    )
-    .await
-    .expect("test: recovery prepare");
     let (recordable, open_legacy) = expected_recordable_legacy(&MatrixCell {
         backend,
         plane,
@@ -293,6 +318,12 @@ async fn run_matrix_cell(cell: MatrixCell) {
         k,
         l,
     });
+    let advisory = if open_legacy {
+        open_advisory(&generation, Arc::clone(&memory), &tracker).await
+    } else {
+        crate::runtime::ingress_recovery::PreparedAdvisory::default()
+    };
+    let recovery = prepare_recovery(&generation, Arc::clone(&memory), &tracker, workspace_key, advisory).await;
     assert_eq!(
         recorder_ready, recordable,
         "{backend} plane={plane} recording={recording} k={k} l={l} recorder"
@@ -308,10 +339,7 @@ async fn run_matrix_cell(cell: MatrixCell) {
         "{backend} plane={plane} recording={recording} k={k} l={l} legacy"
     );
     if open_legacy {
-        assert!(
-            recovery.legacy_store().and_then(|store| store.writer()).is_some(),
-            "{backend} plane-on repair writer"
-        );
+        assert!(recovery.legacy_writer().is_some(), "{backend} plane-on repair writer");
         assert!(recovery.legacy_events().is_some(), "{backend} plane-on sink");
     }
     if !plane {
@@ -529,17 +557,14 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
     let attestations = table_rows(&workspace, "recovery_attestations");
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let tracker = Arc::new(CleanupTracker::default());
-    let recovery = RecoveryScope::prepare(
+    let recovery = prepare_recovery(
         &generation,
         Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
         &tracker,
         None,
+        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
-    .await
-    .expect("test: plane-off prepare");
+    .await;
     assert!(recovery.ingress_recovery_enabled());
     assert!(recovery.authority.legacy.is_none());
     recovery
@@ -578,17 +603,14 @@ pub(super) async fn recovery_off_never_writes_outcome_or_child_link() {
 
     let generation = crate::config::ConfigGenerationManager::new(cell_config(&workspace, true, true)).pin();
     let tracker_on = Arc::new(CleanupTracker::default());
-    let plane_on_without_key = RecoveryScope::prepare(
+    let plane_on_without_key = prepare_recovery(
         &generation,
         Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
         &tracker_on,
         None,
+        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
-    .await
-    .expect("test: plane-on without key");
+    .await;
     assert!(plane_on_without_key.authority.legacy.is_none());
     assert!(
         crate::runtime::turn_decision::child_recovery_gate(&plane_on_without_key, true, true, true).is_some(),
@@ -617,17 +639,8 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let key = crate::decision::key::DecisionKey::load_or_create(&workspace).expect("test: workspace key");
     let tracker = Arc::new(CleanupTracker::default());
-    let recovery = RecoveryScope::prepare(
-        &generation,
-        Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
-        &tracker,
-        Some(key),
-    )
-    .await
-    .expect("test: plane-on prepare");
+    let advisory = open_advisory(&generation, Arc::clone(&memory), &tracker).await;
+    let recovery = prepare_recovery(&generation, Arc::clone(&memory), &tracker, Some(key), advisory).await;
     assert!(recovery.authority.legacy.is_some());
     let error = recovery
         .rejoin_terminal("prx_legacy", "prx_user")
@@ -667,17 +680,14 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     drop(recorder);
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let tracker = Arc::new(CleanupTracker::default());
-    let recovery = RecoveryScope::prepare(
+    let recovery = prepare_recovery(
         &generation,
         Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
         &tracker,
         None,
+        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
-    .await
-    .expect("test: plane-off prepare");
+    .await;
     let error = recovery
         .rejoin_terminal("prx_pending", "prx_user")
         .await
@@ -769,17 +779,14 @@ async fn settled_setup_with(facts: SettledTerminalFacts, facts_bytes: Option<Vec
     drop(recorder);
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let tracker = Arc::new(CleanupTracker::default());
-    let recovery = RecoveryScope::prepare(
+    let recovery = prepare_recovery(
         &generation,
         Arc::clone(&memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
         &tracker,
         None,
+        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
-    .await
-    .expect("test: plane-off prepare");
+    .await;
     SettledSetup {
         dir,
         workspace,
@@ -823,17 +830,14 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     other_config.workspace_dir = other_ws.clone();
     let generation = crate::config::ConfigGenerationManager::new(other_config).pin();
     let tracker = Arc::new(CleanupTracker::default());
-    let foreign = RecoveryScope::prepare(
+    let foreign = prepare_recovery(
         &generation,
         Arc::clone(&workspace_cell.memory),
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer(),
-        None,
         &tracker,
         None,
+        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
-    .await
-    .expect("test: foreign workspace");
+    .await;
     let error = foreign
         .rejoin_terminal("prx_run", "prx_user")
         .await

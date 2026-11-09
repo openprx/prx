@@ -668,17 +668,14 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
     );
     let _ = fabric;
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-    let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
-        crate::observability::NoopObserver,
-    )));
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
         crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer,
         None,
         &tracker,
         None,
+        super::PreparedAdvisory::default(),
     )
     .await
     .unwrap();
@@ -706,17 +703,14 @@ async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
     let generation = crate::config::ConfigGenerationManager::new(config).pin();
     let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
-    let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
-        crate::observability::NoopObserver,
-    )));
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
         crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer,
         None,
         &tracker,
         None,
+        super::PreparedAdvisory::default(),
     )
     .await
     .expect("missing decision key does not abort repository recovery");
@@ -838,19 +832,16 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
         .unwrap();
     fabric.verify_ingress_input(&event).unwrap();
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-    let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
-        crate::observability::NoopObserver,
-    )));
     // Supply durable authority so the recording opt-out is the deciding gate.
     let key = DecisionKey::load_or_create(dir.path()).unwrap();
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
         crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
-        observer,
         None,
         &tracker,
         Some(key),
+        super::PreparedAdvisory::default(),
     )
     .await
     .unwrap();
@@ -887,4 +878,12 @@ async fn recovery_legacy_chain_writes_no_attestation() {
 #[tokio::test]
 async fn recovery_settled_receipt_each_bound_field_is_refused() {
     auth_02_2a_tests::recovery_settled_receipt_each_bound_field_is_refused().await;
+}
+
+#[path = "auth_02_2b_tests.rs"]
+mod auth_02_2b_tests;
+
+#[tokio::test]
+async fn recovery_legacy_reader_creates_no_files() {
+    auth_02_2b_tests::recovery_legacy_reader_creates_no_files().await;
 }
