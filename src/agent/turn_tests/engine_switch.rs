@@ -160,3 +160,32 @@ async fn tool_surface_is_built_without_decision_service() {
         "engine-off dispatch of the excluded tool was not Denied: {history:?}"
     );
 }
+
+/// Disabled `open_turn_context` stamps the G6 slice from the reserved window:
+/// (32768 − 4096) / 8 = 3584, below the 8192 cap, with ratio 1.0 not binding.
+#[tokio::test]
+async fn open_turn_context_g6_slice_is_literal() {
+    let workspace = tempfile::tempdir().expect("open-turn-context workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    assert!(
+        !config.decision_engine.enabled,
+        "this cell runs with the decision engine off"
+    );
+    config.agent.compaction.max_context_tokens = 32_768;
+    config.agent.compaction.max_context_tokens_explicit = true;
+    config.agent.compaction.reserve_tokens = 4_096;
+    config.causal_tree.policy.extra_token_ratio_limit = 1.0;
+    let admitted = AdmittedTurn::with_config(config, "open the turn context", Arc::new(Vec::new())).await;
+    let decision = admitted.decision();
+    let context = decision
+        .service
+        .open_turn_context(
+            decision.proof,
+            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("disabled engine opens a turn context");
+    assert_eq!(crate::agent::send_admission::live_g6_tokens(&context), 3584);
+}

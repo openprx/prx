@@ -16,7 +16,7 @@ mod resume_availability_tests;
 
 use super::branch::{CandidateId, CapabilityRef, CausalActionKind, CausalCandidate};
 use super::candidate_generator::{
-    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, is_retrieval_source,
+    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, NoLegalReason, is_retrieval_source,
 };
 use super::config::CausalTreeConfig;
 #[cfg(test)]
@@ -371,6 +371,45 @@ impl SelectedRouterReadGrant {
 }
 
 impl EngineDecision {
+    /// Trusted state and G6 slice for a disabled engine: no prediction port,
+    /// no selected candidates, and no compiled request.
+    pub(crate) fn without_prediction(state: CausalState, deadline: Instant, decision_id: DecisionId) -> Self {
+        let empty_gates = GateReport {
+            outcomes: BTreeMap::new(),
+            gate_set_hash: [0; 32],
+        };
+        Self {
+            decision_id,
+            deadline,
+            elapsed_ms: 0,
+            state,
+            candidates: CandidateSet::NoLegalPath {
+                reason: NoLegalReason::NoLegalCandidate,
+                terminals: Vec::new(),
+                approval_only: Vec::new(),
+                report: empty_gates.clone(),
+            },
+            selection: Selection::Abstain {
+                action: CausalActionKind::Answer,
+                reason_code: "engine_disabled",
+            },
+            exploration_propensities: BTreeMap::new(),
+            prediction: None,
+            request_compiled: false,
+            audit_trace: None,
+            fallback_cause: None,
+            scores: BTreeMap::new(),
+            scored_count: 0,
+            #[cfg(test)]
+            rehearsal: BTreeMap::new(),
+            post_rehearsal: empty_gates.clone(),
+            pre_commit: empty_gates,
+            call_fingerprints: BTreeMap::new(),
+            outgoing_child: None,
+            outgoing_parent_allowed: None,
+        }
+    }
+
     /// The engine owns the backend attempt evidence; downstream directives
     /// may use this verdict only to narrow a selected recovery.
     pub(crate) fn served_prediction_succeeded(&self) -> bool {

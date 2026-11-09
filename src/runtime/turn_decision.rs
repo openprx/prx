@@ -1961,6 +1961,149 @@ impl TurnDecisionService {
         })
     }
 
+    /// Build the turn context and G6 slice with the engine off: no prediction
+    /// port, no directive from selection, and no call budget (R1b stamps that).
+    pub(crate) async fn open_turn_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        kind: AgentTurnKind,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        if cancellation.is_cancelled() {
+            return Err(AgentDecisionError::Cancelled);
+        }
+        if self.generation.effective.decision_engine.enabled {
+            return Err(AgentDecisionError::UnsupportedAction);
+        }
+        let event_namespace = self
+            .store
+            .workspace_id()
+            .unwrap_or_else(|| Arc::from(self.generation.effective.workspace_dir.to_string_lossy().as_ref()));
+        let event_memory = super::causal_events::routes::register(
+            &event_namespace,
+            proof.workspace_id(),
+            proof.run_id(),
+            Arc::clone(&self.memory),
+            self.generation.id.0,
+            &self.generation.source_revision.fingerprint_sha256,
+        )
+        .map_err(AgentDecisionError::EventMemory)?;
+        let model = self.resolve_agent_model(proof)?;
+        super::ingress_recovery::service_ready(self)
+            .await
+            .map_err(AgentDecisionError::IngressRecovery)?;
+        let budget = self.agent_budget_snapshot(proof)?;
+        let deadline = crate::causal_tree::logical_clock::now()
+            .checked_add(Duration::from_millis(budget.budgets.latency_ms))
+            .ok_or(AgentDecisionError::Deadline)?;
+        let owner_filesystem = self
+            .console_filesystem(proof)
+            .await
+            .map_err(AgentDecisionError::PendingApproval)?;
+        let catalog = self.catalog_view();
+        let model_ref: Arc<str> = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
+        let effective_exclusions = effective_agent_exclusions(
+            &self.generation.effective,
+            &self.registry,
+            &catalog,
+            model.model(),
+            &self.policy_version,
+            &self.state_key,
+        );
+        let g6_slice = budget.budgets.tokens;
+        let trusted = TrustedState::from_runtime(TrustedParts {
+            workspace_id: Arc::from(proof.workspace_id()),
+            owner_id: Some(Arc::from(proof.owner_id())),
+            session_key: Some(Arc::from(proof.session_key())),
+            run_id: Some(Arc::from(proof.run_id())),
+            task_id: proof.task_id().map(Arc::from),
+            channel: None,
+            source_event_id: proof.source_event_id().map(Arc::from),
+            causation_event_id: None,
+            surface: proof.surface(),
+            side_effect_mode: match self.security.autonomy {
+                crate::security::AutonomyLevel::ReadOnly => crate::causal_tree::state::SideEffectMode::ReadOnly,
+                crate::security::AutonomyLevel::Supervised => {
+                    crate::causal_tree::state::SideEffectMode::ApprovalRequired
+                }
+                crate::security::AutonomyLevel::Full => crate::causal_tree::state::SideEffectMode::GuardedWrite,
+            },
+            exclusions: effective_exclusions.names,
+            model_admission: effective_exclusions.model_admission,
+            constraints: {
+                let mut constraints = Vec::new();
+                if proof.owner_isolated() {
+                    constraints.push(crate::causal_tree::state::ConstraintCode::new("owner_isolated"));
+                }
+                if proof.intercepts_writes() {
+                    constraints.push(crate::causal_tree::state::ConstraintCode::new("intercepts_writes"));
+                }
+                if owner_filesystem.is_some() {
+                    constraints.push(crate::causal_tree::state::ConstraintCode::new(
+                        "owner_private_filesystem_v1",
+                    ));
+                }
+                constraints
+            },
+            approval_pending: false,
+            approval_grants: Vec::new(),
+            budgets: TurnBudgets {
+                tokens: g6_slice,
+                latency_ms: budget.budgets.latency_ms,
+                micro_usd: budget.budgets.micro_usd,
+            },
+            delivery: DeliveryConstraints {
+                interactive: kind == AgentTurnKind::Repl || proof.approval_review_adapter().is_some(),
+                can_ask_question: kind == AgentTurnKind::Repl || proof.approval_review_adapter().is_some(),
+                approval_channel: proof.approval_review_adapter().is_some(),
+            },
+            catalog_generation: catalog.generation(),
+            policy_version: Arc::clone(&self.policy_version),
+            resolved_model: Arc::clone(&model_ref),
+        });
+        let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
+        let decision_id = DecisionId::new_runtime();
+        let state = CausalState {
+            trusted,
+            observed: segment_observation::initial_observations(None, deadline, cancellation)?,
+            predicted: None,
+            derived: DerivedState::default(),
+            has_conversation_history: proof.has_conversation_history(),
+            routing_input: RawRoutingInput::new(projected_input.clone()),
+            goal: RawRoutingInput::new(projected_input),
+            lineage: HopLineage::First,
+            built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+        };
+        Ok(Arc::new(TurnDecisionContext {
+            _event_memory: event_memory,
+            model_catalog: self.provider_catalog.release_pin(),
+            resume: None,
+            accounting: None,
+            owner_filesystem,
+            source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
+            service_id: self.service_id,
+            record_admitted: AtomicBool::new(false),
+            recursive_allowance: self.recursive_allowances.retain(proof),
+            main_parameters: Default::default(),
+            execution_trace: std::sync::OnceLock::new(),
+            execution_closed: Arc::new(AtomicBool::new(false)),
+            approval_collection_started: AtomicBool::new(false),
+            collected_approval_result: std::sync::OnceLock::new(),
+            discovery_offers: std::sync::OnceLock::new(),
+            discovery_admissions: std::sync::OnceLock::new(),
+            engine: EngineDecision::without_prediction(state, deadline, decision_id),
+            hop_ids: vec![decision_id],
+            prior_hops: Vec::new(),
+            directive: TurnExecutionDirective::AnswerDirectly,
+            main_compaction: budget.main_compaction,
+            execution_refs: BTreeSet::new(),
+            #[cfg(test)]
+            selected_retrieved: Vec::new(),
+            #[cfg(feature = "llm-router")]
+            router_transition: None,
+        }))
+    }
+
     /// Run a source-bound Agent decision through the pinned catalog and gates.
     /// Selected evidence reads and catalog discoveries feed bounded dependent
     /// hops. Selected Execute is retained as exact immutable metadata;
@@ -1971,6 +2114,9 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        if cancellation.is_cancelled() && !self.generation.effective.decision_engine.enabled {
+            return self.open_turn_context(proof, kind, cancellation).await;
+        }
         let context = self
             .decide_agent_initial_inner(
                 proof,

@@ -574,6 +574,79 @@ async fn recovery_recorder(
 }
 
 #[tokio::test]
+async fn ingress_recovery_unchanged_by_switch() {
+    async fn prepared(
+        plane: bool,
+        engine: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<IngressRecorder>,
+        Arc<RecoveryScope>,
+        super::super::turn_cleanup::CleanupTicket,
+        Arc<super::super::turn_cleanup::CleanupTracker>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = recovery_config(dir.path());
+        config.causal_tree.enabled = plane;
+        config.decision_engine.enabled = engine;
+        let config = Arc::new(config);
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+        let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
+        let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
+        let recorder = IngressRecorder::prepare(Arc::clone(&memory), &config, &ticket)
+            .await
+            .unwrap()
+            .expect("recording sqlite prepares a recorder");
+        let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
+        let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+            crate::observability::NoopObserver,
+        )));
+        let key = crate::decision::key::DecisionKey::load_or_create(dir.path()).unwrap();
+        let recovery = RecoveryScope::prepare(
+            &generation,
+            memory,
+            crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            observer,
+            None,
+            &tracker,
+            Some(key),
+        )
+        .await
+        .unwrap();
+        (dir, recorder, recovery, ticket, tracker)
+    }
+
+    let (on_dir, on_recorder, on_recovery, on_ticket, on_tracker) = prepared(true, false).await;
+    assert!(
+        on_recorder.plane,
+        "recovery plane follows [causal_tree].enabled, not the engine switch"
+    );
+    assert!(on_recovery.ingress_recovery_enabled());
+    assert!(on_recovery.authority.legacy.is_some());
+    assert!(on_recovery.legacy_store().is_some());
+    on_ticket.finish(true);
+    on_tracker
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(on_dir);
+
+    let (off_dir, off_recorder, off_recovery, off_ticket, off_tracker) = prepared(false, true).await;
+    assert!(
+        !off_recorder.plane,
+        "recovery plane stays off when [causal_tree].enabled is off"
+    );
+    assert!(off_recovery.authority.legacy.is_none());
+    assert!(off_recovery.legacy_store().is_none());
+    assert!(!off_dir.path().join("self/causal_tree/decisions.db").exists());
+    off_ticket.finish(true);
+    off_tracker
+        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = recovery_config(dir.path());
