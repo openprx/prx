@@ -3440,10 +3440,12 @@ pub(crate) async fn build_turn_decision_service(
         build.parent_grant.as_deref(),
         &recovery_owner,
         workspace_key.clone(),
-        super::ingress_recovery::PreparedAdvisory {
-            writer: opened.as_ref().and_then(|(store, _)| store.writer()),
-            events: durable_events.clone(),
-            store: opened.as_ref().map(|(store, _)| Arc::clone(store)),
+        match &opened {
+            Some((store, events)) => {
+                super::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))
+                    .map_err(TurnServiceBuildError::RecoveryPreparation)?
+            }
+            None => super::ingress_recovery::PreparedAdvisory::default(),
         },
     )
     .await

@@ -884,6 +884,16 @@ async fn recovery_settled_receipt_each_bound_field_is_refused() {
 mod auth_02_2b_tests;
 
 #[tokio::test]
-async fn recovery_legacy_reader_creates_no_files() {
-    auth_02_2b_tests::recovery_legacy_reader_creates_no_files().await;
+async fn recovery_builder_repair_writes_outcome_through_passed_writer() {
+    auth_02_2b_tests::recovery_builder_repair_writes_outcome_through_passed_writer().await;
+}
+
+#[tokio::test]
+async fn recovery_failed_readwrite_open_leaves_drain_unclean() {
+    auth_02_2b_tests::recovery_failed_readwrite_open_leaves_drain_unclean().await;
+}
+
+#[tokio::test]
+async fn recovery_store_without_writer_rejoin_fails_closed() {
+    auth_02_2b_tests::recovery_store_without_writer_rejoin_fails_closed().await;
 }

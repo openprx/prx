@@ -69,11 +69,26 @@ pub(crate) struct LegacyEvidence {
 
 /// Advisory ReadWrite store opened by a plane-on builder and passed into
 /// [`RecoveryScope::prepare`]. Recovery itself never opens ReadWrite.
+/// A store without a writer is not a valid construction: use [`Self::opened`].
 #[derive(Clone, Default)]
 pub(crate) struct PreparedAdvisory {
     pub writer: Option<crate::causal_tree::store::DecisionStoreWriter>,
     pub events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
     pub store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+}
+
+impl PreparedAdvisory {
+    /// Pair the ReadWrite store with its writer. A store without a writer is refused.
+    pub(crate) fn opened(
+        store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+        events: Arc<super::causal_events::DurableCausalEventSink>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            writer: Some(store.writer().context("advisory store requires a writer")?),
+            events: Some(events),
+            store: Some(store),
+        })
+    }
 }
 
 impl LegacyEvidence {
@@ -228,20 +243,13 @@ impl RecoveryScope {
             workspace_key,
             store,
         ) {
-            (true, Some(key), Some(store)) => {
-                if let Some(namespace) = store.workspace_id()
-                    && let Some(events) = &events
-                {
-                    events.bind_store_namespace(namespace)?;
-                }
-                Some(LegacyEvidence {
-                    key,
-                    reader: store.reader(),
-                    writer,
-                    events,
-                    store,
-                })
-            }
+            (true, Some(key), Some(store)) => Some(LegacyEvidence {
+                key,
+                reader: store.reader(),
+                writer,
+                events,
+                store,
+            }),
             _ => None,
         };
         let scope = Arc::new(Self {
