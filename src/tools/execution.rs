@@ -2477,10 +2477,19 @@ impl ToolExecutionService {
         cancellation: Option<CancellationToken>,
     ) -> ToolExecutionOutcome {
         let pending = context.execution_trace.as_ref().map(|trace| {
-            let binding = context
+            let map_binding = context
                 .execution_bindings
                 .as_ref()
                 .and_then(|bindings| bindings.get(&command.name));
+            let port_binding = if map_binding.is_some() {
+                None
+            } else {
+                context.decision_approval.as_ref().and_then(|port| {
+                    port.issued_binding(&command.name, &context.envelope, context.child_scope.clone())
+                        .ok()
+                })
+            };
+            let binding = map_binding.or(port_binding.as_ref());
             trace.begin(
                 &command.operation_id,
                 binding.map(|binding| binding.capability_id()),
@@ -2601,6 +2610,30 @@ impl ToolExecutionService {
                     None,
                     ToolExecutionStatus::Failed,
                     error.clone(),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                );
+            }
+        }
+
+        if let Some(bindings) = &context.execution_bindings {
+            let verified = bindings
+                .get(&command.name)
+                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                .and_then(|binding| binding.verify(self, &context.envelope, &descriptor));
+            if let Err(error) = verified {
+                let error = error.to_string();
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    None,
+                    ToolExecutionStatus::StaleCapability,
+                    format!("Error: {error}"),
                     None,
                     Some(error),
                     None,
@@ -2869,23 +2902,37 @@ impl ToolExecutionService {
             runtime_approval_granted = true;
         } else if decision == ToolExecutionDecision::Ask && context.decision_resume.is_none() {
             let decision_call = match async {
-                let Some(bindings) = context.execution_bindings.as_ref() else {
-                    return Ok(None);
-                };
-                let binding = bindings
-                    .get(&command.name)
-                    .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
-                binding
-                    .bind_call(
+                if let Some(bindings) = context.execution_bindings.as_ref() {
+                    let binding = bindings
+                        .get(&command.name)
+                        .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
+                    binding
+                        .bind_call(
+                            self,
+                            &context.envelope,
+                            &descriptor,
+                            &command,
+                            context.decision_approval.as_ref(),
+                            context.schema_dialect,
+                        )
+                        .await
+                        .map(Some)
+                } else if let Some(port) = context.decision_approval.as_ref() {
+                    // Agent bind no longer assigns the map; the stamped port
+                    // still mints decision_call until R9.
+                    port.bind_call(
                         self,
                         &context.envelope,
                         &descriptor,
                         &command,
-                        context.decision_approval.as_ref(),
+                        context.child_scope.clone(),
                         context.schema_dialect,
                     )
                     .await
                     .map(Some)
+                } else {
+                    Ok(None)
+                }
             }
             .await
             {
@@ -3217,6 +3264,38 @@ impl ToolExecutionService {
                 Some(preparation),
                 started,
             );
+        }
+        if let Some(bindings) = &context.execution_bindings {
+            let verified = bindings
+                .get(&command.name)
+                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                .and_then(|binding| binding.verify(self, &context.envelope, &descriptor));
+            if let Err(error) = verified {
+                let abandonment = self
+                    .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
+                    .await;
+                let (status, error) = match abandonment {
+                    Ok(()) => (ToolExecutionStatus::StaleCapability, error.to_string()),
+                    Err(error) => (ToolExecutionStatus::Indeterminate, error),
+                };
+                if let Some(observation) = exact_call {
+                    observation.complete(status);
+                }
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    Some(decision),
+                    status,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    Some(preparation),
+                    started,
+                );
+            }
         }
 
         // The resolved Arc is immutable for the in-flight call even if a
