@@ -238,11 +238,8 @@ impl RecoveryScope {
         let has_repository = memory.recovery_repository().is_some();
         let recordable = recording_on && (repository_ready || (plane && ledger && !has_repository));
         let PreparedAdvisory { writer, events, store } = advisory;
-        let legacy = match (
-            plane && workspace_key.is_some() && ledger && recording_on,
-            workspace_key,
-            store,
-        ) {
+        let plane_on_legacy = plane && ledger && recording_on;
+        let legacy = match (plane_on_legacy, workspace_key, store) {
             (true, Some(key), Some(store)) => Some(LegacyEvidence {
                 key,
                 reader: store.reader(),
@@ -250,6 +247,7 @@ impl RecoveryScope {
                 events,
                 store,
             }),
+            (true, _, None) => recovery_only_legacy(owner, config.workspace_dir.clone()).await?,
             _ => None,
         };
         let scope = Arc::new(Self {
@@ -1304,6 +1302,34 @@ fn original_input(event: &MessageEvent, capsule: &IngressCapsule) -> anyhow::Res
         .context("original ingress payload missing")?
         .clone();
     Ok(serde_json::from_value(value)?)
+}
+
+/// Recovery-only path: load an existing key and a read-only store. Missing
+/// key or database leaves legacy unconfirmed. Never creates a key or opens
+/// ReadWrite.
+async fn recovery_only_legacy(
+    owner: &Arc<super::turn_cleanup::CleanupTracker>,
+    workspace: std::path::PathBuf,
+) -> anyhow::Result<Option<LegacyEvidence>> {
+    owned_store_operation(owner, move || recovery_only_legacy_sync(&workspace)).await
+}
+
+fn recovery_only_legacy_sync(workspace: &std::path::Path) -> anyhow::Result<Option<LegacyEvidence>> {
+    let key = match DecisionKey::load_existing(workspace) {
+        Ok(key) => key,
+        Err(_) => return Ok(None),
+    };
+    let Some(store) = crate::causal_tree::store::CausalDecisionStore::open_recovery_read_only(workspace)? else {
+        return Ok(None);
+    };
+    let store = Arc::new(store);
+    Ok(Some(LegacyEvidence {
+        key,
+        reader: store.reader(),
+        writer: None,
+        events: None,
+        store,
+    }))
 }
 
 /// Blocking operations remain registered until the actual closure exits.
