@@ -34,15 +34,22 @@ def run(command):
     resources()
     child = subprocess.Popen(command, start_new_session=True)
     received_signal = None
+    signal_emitted = False
 
     def forward(signum, _frame):
+        # Print-free: stdout is not reentrant if a signal arrives during emit().
         nonlocal received_signal
         received_signal = signum
-        emit("signal", signal=signum, child_pid=child.pid)
         try:
             os.killpg(child.pid, signum)
         except ProcessLookupError:
             pass
+
+    def emit_received_signal():
+        nonlocal signal_emitted
+        if received_signal is not None and not signal_emitted:
+            emit("signal", signal=received_signal, child_pid=child.pid)
+            signal_emitted = True
 
     previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGTERM, signal.SIGINT)}
     emit("started", child_pid=child.pid)
@@ -52,7 +59,9 @@ def run(command):
                 status = child.wait(timeout=30)
                 break
             except subprocess.TimeoutExpired:
+                emit_received_signal()
                 resources()
+        emit_received_signal()
         # A wrapper termination must never become success if the child catches it.
         result = 128 + received_signal if received_signal else (128 - status if status < 0 else status)
         resources()
