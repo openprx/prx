@@ -148,8 +148,8 @@ impl SqliteMemory {
                     clock.visit_site("router.sqlite-read");
                 }
                 check(deadline)?;
-                let connection = pool.write_until(deadline)?;
-                let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
+                let mut connection = pool.write_until(deadline)?;
+                let connection = super::ingress_recovery::ConnectionDeadline::new(&mut connection, deadline)?;
                 let tx = connection.unchecked_transaction()?;
                 let sequence = source_sequence(&tx, &evidence)?;
                 // First selected read may observe an empty new history. It does not
@@ -221,8 +221,8 @@ impl SqliteMemory {
         {
             let work = move || {
             check(deadline)?;
-            let connection=pool.write_until(deadline)?;
-            let _deadline=super::ingress_recovery::ConnectionDeadline::new(&connection,deadline)?;
+            let mut connection=pool.write_until(deadline)?;
+            let connection=super::ingress_recovery::ConnectionDeadline::new(&mut connection,deadline)?;
             let tx=Transaction::new_unchecked(&connection,rusqlite::TransactionBehavior::Immediate)?;
             let source_sequence=validate_terminal(&tx,&evidence)?;
             let event=&evidence.terminal;

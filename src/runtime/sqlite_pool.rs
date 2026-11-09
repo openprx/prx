@@ -139,7 +139,7 @@ fn wait_for_database_lock(attempts: i32) -> bool {
 /// Pooled connections get this automatically; it is exported for the few
 /// standalone connections that are opened outside a pool but share a database
 /// file with one, so the whole process agrees on what a held lock means.
-pub fn install_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+pub fn install_busy_handler(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_handler(Some(wait_for_database_lock))
 }
 
@@ -257,7 +257,7 @@ fn wait_for_database_lock_bounded(attempts: i32) -> bool {
 /// branch is a real, tested behaviour rather than an outage: a bounded wait
 /// turns "another process holds the lock" into an error the caller already
 /// knows how to survive, instead of a blocked thread.
-pub fn install_bounded_busy_handler(conn: &Connection) -> rusqlite::Result<()> {
+pub fn install_bounded_busy_handler(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.busy_handler(Some(wait_for_database_lock_bounded))
 }
 
@@ -720,11 +720,11 @@ impl SqliteConnectionPool {
 
 /// Open one connection and give it this runtime's lock-waiting policy.
 fn open_connection(db_path: &Path, open_timeout_secs: Option<u64>) -> anyhow::Result<Connection> {
-    let conn = match open_timeout_secs {
+    let mut conn = match open_timeout_secs {
         Some(secs) => open_with_deadline(db_path, secs)?,
         None => Connection::open(db_path).context("SQLite failed to open database")?,
     };
-    install_busy_handler(&conn).context("SQLite failed to install busy handler")?;
+    install_busy_handler(&mut conn).context("SQLite failed to install busy handler")?;
     Ok(conn)
 }
 
@@ -1085,8 +1085,8 @@ pub(crate) fn probe_bounded_busy_contention() -> anyhow::Result<String> {
     let path = temp.path().join("probe.db");
     let held = Connection::open(&path)?;
     held.execute_batch("CREATE TABLE probe(value); BEGIN IMMEDIATE;")?;
-    let contender = Connection::open(&path)?;
-    install_bounded_busy_handler(&contender)?;
+    let mut contender = Connection::open(&path)?;
+    install_bounded_busy_handler(&mut contender)?;
     let _budget = BoundedBusyBudget::start();
     let error = contender
         .execute("INSERT INTO probe VALUES (1)", [])

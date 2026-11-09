@@ -3,7 +3,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn count_commits(connection: &Connection) -> Arc<AtomicUsize> {
+fn count_commits(connection: &mut Connection) -> Arc<AtomicUsize> {
     let commits = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&commits);
     connection
@@ -17,8 +17,8 @@ fn count_commits(connection: &Connection) -> Arc<AtomicUsize> {
 
 #[test]
 fn fresh_and_reopened_schemas_each_commit_only_once() {
-    let connection = Connection::open_in_memory().unwrap();
-    let commits = count_commits(&connection);
+    let mut connection = Connection::open_in_memory().unwrap();
+    let commits = count_commits(&mut connection);
     SqliteMemory::init_schema(&connection).unwrap();
     assert_eq!(commits.load(Ordering::SeqCst), 1);
     assert!(connection.is_autocommit());
@@ -36,7 +36,7 @@ fn fresh_and_reopened_schemas_each_commit_only_once() {
 
 #[test]
 fn a_late_migration_conflict_rolls_back_every_schema_change() {
-    let connection = Connection::open_in_memory().unwrap();
+    let mut connection = Connection::open_in_memory().unwrap();
     connection.execute_batch("CREATE TABLE memory_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);").unwrap();
     let (version, name, descriptor) = SqliteMemory::memory_schema_migration_registry().last().unwrap();
     connection
@@ -45,7 +45,7 @@ fn a_late_migration_conflict_rolls_back_every_schema_change() {
             params![version, name],
         )
         .unwrap();
-    let commits = count_commits(&connection);
+    let commits = count_commits(&mut connection);
     let error = SqliteMemory::init_schema(&connection).unwrap_err();
     assert!(error.to_string().contains("migration checksum mismatch"));
     assert!(connection.is_autocommit());

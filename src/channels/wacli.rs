@@ -283,14 +283,14 @@ fn lid_alias_chat_ids(store_root: &Path, chat_id: &str) -> Vec<String> {
     if !db_path.is_file() {
         return Vec::new();
     }
-    let conn = match rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+    let mut conn = match rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
         Err(error) => {
             tracing::debug!("wacli: cannot open the whatsmeow session store read-only: {error}");
             return Vec::new();
         }
     };
-    if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(&conn) {
+    if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(&mut conn) {
         tracing::debug!("wacli: cannot install a busy handler on the whatsmeow session store: {error}");
         return Vec::new();
     }
@@ -479,13 +479,13 @@ fn wait_for_local_media_path(
         .canonicalize()
         .with_context(|| format!("canonicalize wacli store directory: {store_dir}"))?;
     let db_path = store_root.join("wacli.db");
-    let conn = rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    let mut conn = rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open wacli metadata database read-only: {}", db_path.display()))?;
     // The wacli helper process writes this database while we read it. A lock it
     // holds means "come back in a moment", not "this media does not exist", so
     // the lookup waits for the lock (warning periodically) instead of the 100 ms
     // deadline it used to give up after.
-    crate::runtime::sqlite_pool::install_busy_handler(&conn).context("install wacli media lookup busy handler")?;
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn).context("install wacli media lookup busy handler")?;
 
     // wacli's webhook and its own database can address the same one-to-one chat
     // by different JID forms, so resolve the alternates once up front: the LID

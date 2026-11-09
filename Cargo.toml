@@ -124,7 +124,7 @@ notify-debouncer-mini = "0.7.0"
 # Async traits
 async-trait = "0.1"
 # MCP client (stdio + streamable HTTP)
-rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 # The reqwest 0.13 client of the MCP streamable-HTTP transport (rmcp's own
 # reqwest). Its TLS backend is pinned here: without it, `https://` MCP servers
 # were reachable only when another dependency (the Matrix SDK) enabled rustls
@@ -139,7 +139,7 @@ ring = "0.17"
 prost = { version = "0.14", default-features = false }
 
 # Memory / persistence
-rusqlite = { version = "0.40", features = ["bundled", "hooks", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks", "functions"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -361,5 +361,9 @@ workspace = true
 ignored = ["probe-rs", "serde-big-array"]  # optional/feature-gated deps
 
 # Minimal upstream maintenance backport; see vendor/matrix-sdk-0.19.1/PRX-BACKPORT.md.
+# matrix-sdk-sqlite 0.19.1 pins rusqlite 0.40.2 / libsqlite3-sys 0.38.2
+# (RUSTSEC-2026-0459). `links = "sqlite3"` allows one libsqlite3-sys; this
+# vendor only lifts that pin to rusqlite 0.41. See vendor/matrix-sdk-sqlite-0.19.1/PRX-PATCH.md.
 [patch.crates-io]
 matrix-sdk = { path = "vendor/matrix-sdk-0.19.1" }
+matrix-sdk-sqlite = { path = "vendor/matrix-sdk-sqlite-0.19.1" }

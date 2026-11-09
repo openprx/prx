@@ -71,7 +71,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/gateway/tests/agent_registry.rs::db::rusqlite::Connection::open(dir.join(\"workspace/memory/brain.db\")).expect(\"test: open registry database\")",
     // MA-01b2 fixture: stamps conversation_turns under a Named/Main scope for the targeting tests.
     "src/gateway/api/sessions/tests/targeting.rs::stamp_console_rows::let conn = rusqlite::Connection::open(dir.join(\"memory\").join(\"brain.db\")).expect(\"test: open store\");",
-    "src/gateway/compat.rs::upsert_agent_identity_binding::let conn = Connection::open(db_path)?;",
+    "src/gateway/compat.rs::upsert_agent_identity_binding::let mut conn = Connection::open(db_path)?;",
     "src/main.rs::open_approval_ledger::Connection::open(&db_path).with_context(|| format!(\"Failed to open approval ledger: {}\", db_path.display()))?;",
     "src/memory/hygiene.rs::close_stale_topics::let conn = Connection::open(db_path)?;",
     "src/memory/hygiene.rs::closes_stale_open_topics::let conn = Connection::open(&db_path).unwrap();",
@@ -110,7 +110,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/tools/memory_store.rs::store_persists_trusted_scope_metadata::let conn = rusqlite::Connection::open(db_path).unwrap();",
     "src/webhook/mod.rs::committed_ingestion_replays_after_state_restart_without_duplicate_rows::let conn = Connection::open(db_path).unwrap();",
     "src/webhook/mod.rs::failed_ingestion_rolls_back_all_state_and_same_key_retries::let conn = Connection::open(&db_path).unwrap();",
-    "src/webhook/mod.rs::new::let conn = Connection::open(&db_path)",
+    "src/webhook/mod.rs::new::let mut conn = Connection::open(&db_path)",
     "src/webhook/mod.rs::pending_ingestion_reports_processing_and_expired_lease_is_reclaimed::let conn = Connection::open(db_path).unwrap();",
     "src/webhook/mod.rs::readonly_autonomy_blocks_persist_with_forbidden::let conn = Connection::open(db_path).unwrap();",
     "src/webhook/mod.rs::same_external_id_in_different_projects_keeps_separate_topics::let conn = Connection::open(db_path).unwrap();",
@@ -122,8 +122,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/xin/store.rs::event_outbox_recovers_cross_database_delivery_idempotently::let brain = Connection::open(memory_path.join(\"brain.db\")).unwrap();",
     "src/xin/store.rs::event_outbox_recovers_cross_database_delivery_idempotently::let brain = Connection::open(memory_path.join(\"brain.db\")).unwrap();",
     "src/xin/store.rs::legacy_xin_tasks_schema_migrates_lineage_columns_and_events_table::let conn = Connection::open(&db_path).unwrap();",
-    "src/xin/store.rs::open_xin_test_connection::let conn = Connection::open(&db_path).unwrap();",
-    "src/xin/store.rs::with_connection::let conn = Connection::open(&db_path).with_context(|| format!(\"Failed to open xin DB: {}\", db_path.display()))?;",
+    "src/xin/store.rs::open_xin_test_connection::let mut conn = Connection::open(&db_path).unwrap();",
+    "src/xin/store.rs::with_connection::Connection::open(&db_path).with_context(|| format!(\"Failed to open xin DB: {}\", db_path.display()))?;",
 ];
 
 /// The `.rs` files directly under `src/memory/sqlite/` that make up the split

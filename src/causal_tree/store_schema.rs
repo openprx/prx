@@ -218,7 +218,7 @@ mod tests {
                 let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
                 std::thread::spawn(move || {
                     let mut conn = Connection::open(&path).expect("test: open");
-                    crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn).expect("test: busy");
+                    crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn).expect("test: busy");
                     conn.execute_batch("PRAGMA journal_mode = WAL;").ok();
                     barrier.wait();
                     migrate(&mut conn).expect("test: migrate")

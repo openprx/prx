@@ -31,21 +31,34 @@ fn wait_for_lock(_attempt: i32) -> bool {
 
 /// Restores the pool's normal handler before its writer is returned. Rollback
 /// drops before this guard, so even failed transactions retain the deadline.
+///
+/// rusqlite 0.41 installs handlers through `&mut self`. Callers shadow the
+/// connection with this guard and use it via Deref/DerefMut.
 pub(super) struct ConnectionDeadline<'a> {
-    connection: &'a Connection,
+    connection: &'a mut Connection,
     previous: Option<Instant>,
 }
 impl<'a> ConnectionDeadline<'a> {
-    pub(super) fn new(connection: &'a Connection, deadline: Instant) -> anyhow::Result<Self> {
+    pub(super) fn new(connection: &'a mut Connection, deadline: Instant) -> anyhow::Result<Self> {
         remaining(deadline)?;
         let previous = IO_DEADLINE.with(|cell| cell.replace(Some(deadline)));
-        let guard = Self { connection, previous };
         connection.busy_handler(Some(wait_for_lock))?;
         connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
-        Ok(guard)
+        Ok(Self { connection, previous })
+    }
+}
+impl std::ops::Deref for ConnectionDeadline<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.connection
+    }
+}
+impl std::ops::DerefMut for ConnectionDeadline<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.connection
     }
 }
 impl Drop for ConnectionDeadline<'_> {
@@ -57,6 +70,32 @@ impl Drop for ConnectionDeadline<'_> {
             tracing::error!(%error, "SQLite ingress busy handler reset failed");
         }
         IO_DEADLINE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Optional deadline wrapper so a caller can keep one `&Connection` whether a
+/// [`ConnectionDeadline`] is installed or not. Exclusive match arms avoid
+/// overlapping the guarded `&mut` with a plain borrow of the same connection.
+pub(super) enum DeadlineConn<'a> {
+    Guarded(ConnectionDeadline<'a>),
+    Plain(&'a Connection),
+}
+impl DeadlineConn<'_> {
+    pub(super) fn wrap(connection: &mut Connection, deadline: Option<Instant>) -> anyhow::Result<DeadlineConn<'_>> {
+        if let Some(deadline) = deadline {
+            Ok(DeadlineConn::Guarded(ConnectionDeadline::new(connection, deadline)?))
+        } else {
+            Ok(DeadlineConn::Plain(connection))
+        }
+    }
+}
+impl std::ops::Deref for DeadlineConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Guarded(guard) => guard,
+            Self::Plain(connection) => connection,
+        }
     }
 }
 
@@ -503,8 +542,8 @@ pub(super) async fn list(
     );
     remaining(deadline)?;
     crate::runtime::blocking::spawn_blocking(move || {
-        let connection = pool.write_until(deadline)?;
-        let _budget = ConnectionDeadline::new(&connection, deadline)?;
+        let mut connection = pool.write_until(deadline)?;
+        let connection = ConnectionDeadline::new(&mut connection, deadline)?;
         let transaction = connection.unchecked_transaction()?;
         let namespace = schema(&transaction)?;
         validate_owner(&transaction,&current,&scope.workspace_id,deadline)?;
@@ -608,8 +647,8 @@ pub(super) async fn read_event(
     );
     remaining(deadline)?;
     crate::runtime::blocking::spawn_blocking(move || {
-        let connection = pool.write_until(deadline)?;
-        let _budget = ConnectionDeadline::new(&connection, deadline)?;
+        let mut connection = pool.write_until(deadline)?;
+        let connection = ConnectionDeadline::new(&mut connection, deadline)?;
         let transaction = connection.unchecked_transaction()?;
         // SQLite measures every persisted column before Rust reads/decodes any
         // payload. The snapshot prevents a writer changing the row in between.
@@ -902,8 +941,8 @@ mod local {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<Arc<dyn IngressLifetime>>> {
             remaining(deadline)?;
             let namespace = {
-                let connection = pool.write_until(deadline)?;
-                let _budget = ConnectionDeadline::new(&connection, deadline)?;
+                let mut connection = pool.write_until(deadline)?;
+                let connection = ConnectionDeadline::new(&mut connection, deadline)?;
                 let transaction = connection.unchecked_transaction()?;
                 let namespace = schema(&transaction)?;
                 remaining(deadline)?;

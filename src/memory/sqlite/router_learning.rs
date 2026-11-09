@@ -48,8 +48,8 @@ impl SqliteMemory {
             check()?;
             // Serialize with message/telemetry writes and use this operation's
             // existing deadline for external SQLite contention, like history.
-            let connection = pool.write_until(deadline)?;
-            let _deadline = super::ingress_recovery::ConnectionDeadline::new(&connection, deadline)?;
+            let mut connection = pool.write_until(deadline)?;
+            let mut connection = super::ingress_recovery::ConnectionDeadline::new(&mut connection, deadline)?;
             let stop = Arc::clone(&cancelled);
             connection.progress_handler(1000, Some(move || Instant::now() >= deadline || stop.load(Ordering::Acquire)))?;
             check()?;

@@ -87,8 +87,8 @@ impl VerifiedDecision {
         thread.write_decisions(std::slice::from_ref(&self.record));
         let result = (|| {
             recovery_time_left(self.deadline)?;
-            let _budget = RecoveryReadBudget::new(&thread.conn, self.deadline)?;
-            let transaction = thread.conn.unchecked_transaction()?;
+            let conn = RecoveryReadBudget::new(&mut thread.conn, self.deadline)?;
+            let transaction = conn.unchecked_transaction()?;
             let row =
                 replay_record_on_connection_until(&transaction, &self.scope, &self.record.decision_id, self.deadline)?;
             recovery_time_left(self.deadline)?;
@@ -140,11 +140,11 @@ impl DecisionStoreWriter {
 }
 
 impl ReplayChain {
-    pub(super) fn finish(self, thread: &WriterThread) {
+    pub(super) fn finish(self, thread: &mut WriterThread) {
         let result = (|| {
             recovery_time_left(self.deadline)?;
-            let _budget = RecoveryReadBudget::new(&thread.conn, self.deadline)?;
-            let transaction = thread.conn.unchecked_transaction()?;
+            let conn = RecoveryReadBudget::new(&mut thread.conn, self.deadline)?;
+            let transaction = conn.unchecked_transaction()?;
             let mut rows = Vec::with_capacity(self.ids.len());
             for id in &self.ids {
                 rows.push(replay_record_on_connection_until(

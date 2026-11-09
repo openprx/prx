@@ -186,11 +186,11 @@ struct ExistingIngestion {
 impl SqliteWebhookRepository {
     fn new(db_path: PathBuf, workspace_id: String) -> Result<Self> {
         ensure_memory_schema(&db_path)?;
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open webhook repository {}", db_path.display()))?;
         // Same policy as the pooled connections onto this file: a lock held by
         // another writer makes this call wait (and warn), never fail.
-        crate::runtime::sqlite_pool::install_busy_handler(&conn)
+        crate::runtime::sqlite_pool::install_busy_handler(&mut conn)
             .context("failed to install webhook repository busy handler")?;
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;

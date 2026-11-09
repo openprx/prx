@@ -16,7 +16,7 @@ fn initialized() -> anyhow::Result<(Connection, String)> {
     Ok((connection, workspace))
 }
 
-fn commit_counter(connection: &Connection) -> anyhow::Result<Arc<AtomicUsize>> {
+fn commit_counter(connection: &mut Connection) -> anyhow::Result<Arc<AtomicUsize>> {
     let counter = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&counter);
     connection.commit_hook(Some(move || {
@@ -48,7 +48,7 @@ fn a_conflicting_chain_rolls_back_without_losing_its_neighbors() -> anyhow::Resu
         vec![new_parent, conflict].into_boxed_slice(),
         vec![record(&workspace)].into_boxed_slice(),
     ];
-    let counter = commit_counter(&connection)?;
+    let counter = commit_counter(&mut connection)?;
     let results = insert_ready(&mut connection, &batches)?;
     let mut results = results.into_iter();
     assert!(results.next().context("first chain")??.is_some());
@@ -78,7 +78,7 @@ fn an_sql_failure_rolls_back_the_whole_chain_but_keeps_valid_neighbors() -> anyh
         vec![parent, child].into_boxed_slice(),
         vec![record(&workspace)].into_boxed_slice(),
     ];
-    let counter = commit_counter(&connection)?;
+    let counter = commit_counter(&mut connection)?;
     let results = insert_ready(&mut connection, &batches)?;
     let mut results = results.into_iter();
     assert!(results.next().context("first chain")??.is_some());
@@ -122,7 +122,7 @@ fn the_real_writer_stops_batches_at_drain_and_capacity_before_notifying() -> any
     let mut connection = Connection::open(&path)?;
     store_schema::migrate(&mut connection)?;
     let workspace = store_schema::workspace_id(&connection)?.context("workspace")?;
-    let counter = commit_counter(&connection)?;
+    let counter = commit_counter(&mut connection)?;
     let events = Arc::new(CommittedNotifications {
         counter: Arc::clone(&counter),
         seen: parking_lot::Mutex::new(Vec::new()),

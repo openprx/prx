@@ -2114,7 +2114,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     // never be turned into an error by it: the busy *handler* retries for as
     // long as the lock is held (warning periodically) where a `busy_timeout`
     // would surface `SQLITE_BUSY` the moment it expired.
-    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;

@@ -2695,13 +2695,14 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             .with_context(|| format!("Failed to create xin directory: {}", parent.display()))?;
     }
 
-    let conn = Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
+    let mut conn =
+        Connection::open(&db_path).with_context(|| format!("Failed to open xin DB: {}", db_path.display()))?;
 
     // Concurrent task execution must queue behind the database lock, never be
     // turned into an error by it: the busy *handler* retries for as long as the
     // lock is held (warning periodically) where a `busy_timeout` would surface
     // `SQLITE_BUSY` the moment it expired.
-    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
 
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
@@ -2934,8 +2935,8 @@ mod tests {
     /// across a concurrent repository call or deliberately expire a lease.
     fn open_xin_test_connection(config: &Config) -> Connection {
         let db_path = config.workspace_dir.join("xin").join("tasks.db");
-        let conn = Connection::open(&db_path).unwrap();
-        crate::runtime::sqlite_pool::install_busy_handler(&conn).unwrap();
+        let mut conn = Connection::open(&db_path).unwrap();
+        crate::runtime::sqlite_pool::install_busy_handler(&mut conn).unwrap();
         conn
     }
 

@@ -23,7 +23,7 @@ use super::ingress_recovery;
 /// A reader snapshot makes SQLite return `SQLITE_BUSY` or a non-zero busy
 /// count. Waiting inside the handler would hold the writer until that reader
 /// released it, and a turn that needs the writer to finish the read never would.
-fn checkpoint_truncate(conn: &rusqlite::Connection) -> anyhow::Result<i64> {
+fn checkpoint_truncate(conn: &mut rusqlite::Connection) -> anyhow::Result<i64> {
     conn.busy_handler(Some(|_attempts: i32| false))?;
     let queried = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0));
     if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(conn) {
@@ -391,8 +391,8 @@ impl Memory for SqliteMemory {
             let mut last_busy = -1_i64;
             loop {
                 let outcome = {
-                    let conn = pool.write();
-                    checkpoint_truncate(&conn)
+                    let mut conn = pool.write();
+                    checkpoint_truncate(&mut conn)
                 };
                 match outcome {
                     Ok(0) => return Ok(()),

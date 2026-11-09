@@ -1733,13 +1733,13 @@ impl DecisionStoreReader {
             .ok_or(StoreError::RecoveryDeadline)?
             .pop();
         recovery_time_left(deadline)?;
-        let conn = match idle {
+        let mut conn = match idle {
             Some(conn) => conn,
             None => open_reader_connection(path, self.immutable)?,
         };
         recovery_time_left(deadline)?;
         let result = {
-            let _budget = RecoveryReadBudget::new(&conn, deadline)?;
+            let conn = RecoveryReadBudget::new(&mut conn, deadline)?;
             conn.execute_batch("PRAGMA query_only = ON;")?;
             recovery_time_left(deadline)?;
             let result = read(&conn);
@@ -2090,9 +2090,9 @@ fn open_reader_connection(path: &Path, immutable: bool) -> Result<Connection, St
 }
 
 fn open_reader(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
-    let conn = open_reader_connection(path, immutable)?;
+    let mut conn = open_reader_connection(path, immutable)?;
     conn.execute_batch("PRAGMA query_only = ON;")?;
-    crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
     Ok(conn)
 }
 
@@ -2441,7 +2441,7 @@ fn open_writer(path: &Path) -> Result<(Connection, SchemaState), StoreError> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
     // Reading the schema touches the file header and the schema table: a
     // corrupt file or not-a-database fails here.
     let version = store_schema::version(&conn)?;
@@ -2822,7 +2822,7 @@ fn run_writer(mut thread: WriterThread) {
             WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
             #[cfg(any(feature = "llm-router", test))]
             WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
-            WriterMessage::ReplayChain(read) => read.finish(&thread),
+            WriterMessage::ReplayChain(read) => read.finish(&mut thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
             WriterMessage::Imported(progress, imported) => match all_stored(&thread.conn, &imported) {
@@ -3151,20 +3151,30 @@ fn recovery_busy(_attempt: i32) -> bool {
 }
 
 struct RecoveryReadBudget<'a> {
-    connection: &'a Connection,
+    connection: &'a mut Connection,
     previous: Option<Instant>,
 }
 impl<'a> RecoveryReadBudget<'a> {
-    fn new(connection: &'a Connection, deadline: Instant) -> Result<Self, StoreError> {
+    fn new(connection: &'a mut Connection, deadline: Instant) -> Result<Self, StoreError> {
         recovery_time_left(deadline)?;
         let previous = RECOVERY_READ_DEADLINE.with(|cell| cell.replace(Some(deadline)));
-        let guard = Self { connection, previous };
         connection.busy_handler(Some(recovery_busy))?;
         connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
-        Ok(guard)
+        Ok(Self { connection, previous })
+    }
+}
+impl std::ops::Deref for RecoveryReadBudget<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.connection
+    }
+}
+impl std::ops::DerefMut for RecoveryReadBudget<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.connection
     }
 }
 impl Drop for RecoveryReadBudget<'_> {

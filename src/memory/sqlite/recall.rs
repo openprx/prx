@@ -107,7 +107,7 @@ impl SqliteMemory {
             .ok_or_else(|| anyhow::anyhow!("missing decision database name"))?;
         let read_path = parent.canonicalize()?.join(file_name);
         anyhow::ensure!(std::time::Instant::now() < deadline, "rehearsal count deadline expired");
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             read_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;

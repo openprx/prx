@@ -1303,11 +1303,11 @@ fn upsert_agent_identity_binding(
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
     // This writes the same brain.db the pooled memory store owns, so it must
     // agree with the pool on what a held lock means: wait for it (warning
     // periodically), never fail the binding upsert with `SQLITE_BUSY`.
-    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_identity_bindings (
             binding_id        TEXT PRIMARY KEY,

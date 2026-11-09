@@ -32,11 +32,11 @@ pub fn append_task_event_mirror_idempotent(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create memory directory: {}", parent.display()))?;
     }
-    let conn =
+    let mut conn =
         Connection::open(&db_path).with_context(|| format!("Failed to open memory DB: {}", db_path.display()))?;
     // Same policy as the pooled connections onto this file: a lock held by
     // another process makes this call wait (and warn), never fail.
-    crate::runtime::sqlite_pool::install_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS memory_events (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -244,13 +244,11 @@ impl SqliteMemory {
             move || -> anyhow::Result<Option<(MessageEvent, bool)>> {
                 // The mutation owns the genuine lease inside this blocking closure,
                 // including when its async waiter is cancelled.
-                let conn = match deadline {
+                let mut write = match deadline {
                     Some(deadline) => pool.write_until(deadline)?,
                     None => pool.write(),
                 };
-                let _budget = deadline
-                    .map(|deadline| ingress_recovery::ConnectionDeadline::new(&conn, deadline))
-                    .transpose()?;
+                let conn = ingress_recovery::DeadlineConn::wrap(&mut write, deadline)?;
                 let attested = match &mutation {
                     Some(AtomicIngressMutation::Input {
                         capsule,
@@ -449,8 +447,8 @@ impl SqliteMemory {
         let event = event.clone();
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = match deadline { Some(deadline) => pool.write_until(deadline)?, None => pool.write() };
-            let _budget = deadline.map(|deadline| ingress_recovery::ConnectionDeadline::new(&conn, deadline)).transpose()?;
+            let mut write = match deadline { Some(deadline) => pool.write_until(deadline)?, None => pool.write() };
+            let conn = ingress_recovery::DeadlineConn::wrap(&mut write, deadline)?;
             let tx = conn.unchecked_transaction()?;
             if let (Some(owner), Some(deadline)) = (&repair_owner, deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;

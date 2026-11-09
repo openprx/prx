@@ -265,7 +265,7 @@ impl SqliteMailboxStore {
         // create the main file means 0644 everywhere, and a later chmod of the
         // main file alone leaves the data readable by every local user.
         precreate_private(&path);
-        let conn =
+        let mut conn =
             Connection::open(&path).with_context(|| format!("failed to open mailbox database {}", path.display()))?;
         // A *bounded* busy handler, unlike the other stores here: the mailbox is
         // written from a request path, and its documented trade-off is that a
@@ -273,7 +273,7 @@ impl SqliteMailboxStore {
         // unbounded wait would mean a second process holding the file lock could
         // stall a chat pull indefinitely — the one outcome the trade-off was
         // chosen to avoid — and the tested error branch would never be reached.
-        crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
+        crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
         conn.execute_batch(SCHEMA)
             .with_context(|| format!("failed to migrate mailbox database {}", path.display()))?;
         add_missing_columns(&conn).with_context(|| format!("failed to migrate mailbox database {}", path.display()))?;
