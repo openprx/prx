@@ -8,6 +8,7 @@ use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskL
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::turn_source::TurnSourceProof;
 pub(crate) use crate::security::approval_ledger::pending::{
     DecisionApprovalReceipt, DecisionApprovalView, DecisionRevocationReceipt, PendingApprovalPage,
@@ -416,6 +417,30 @@ impl crate::tools::capability::execution_binding::DecisionApprovalRecorder for E
             owner.retain_pending(expires_at);
         }
         Ok(())
+    }
+    fn issued_binding(
+        &self,
+        public_name: &str,
+        scope: &RuntimeEnvelope,
+        child_scope: Option<Arc<crate::tools::capability::child::VerifiedChildScope>>,
+    ) -> anyhow::Result<crate::tools::capability::execution_binding::ExecutionBinding> {
+        let entry = self
+            .service
+            .catalog
+            .entry_for_public_name(public_name)
+            .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
+        let issued = crate::tools::capability::execution_binding::ExecutionBinding::issued(
+            self.context.decision_id(),
+            entry,
+            Arc::clone(&self.service.catalog),
+            scope.clone(),
+            public_name != "capability_search",
+        );
+        Ok(if public_name == "capability_search" {
+            issued.with_discovery_control_scope(child_scope)
+        } else {
+            issued.with_child_scope(child_scope)
+        })
     }
 }
 

@@ -275,6 +275,15 @@ pub(crate) trait DecisionApprovalRecorder: Send + Sync {
         path: &str,
     ) -> anyhow::Result<(String, crate::acl::approval_grant::RiskLevel)>;
     async fn record(&self, call: &VerifiedDecisionCall) -> anyhow::Result<()>;
+    /// Issue the authenticated execution binding for this turn's catalog.
+    /// Agent dispatch no longer carries the bindings map; the port is the
+    /// remaining producer of `decision_call` until R9.
+    fn issued_binding(
+        &self,
+        public_name: &str,
+        scope: &RuntimeEnvelope,
+        child_scope: Option<Arc<super::child::VerifiedChildScope>>,
+    ) -> anyhow::Result<ExecutionBinding>;
 }
 
 #[derive(Clone)]
@@ -292,6 +301,28 @@ impl DecisionApprovalPort {
     }
     pub(crate) async fn record(&self, call: &VerifiedDecisionCall) -> anyhow::Result<()> {
         self.0.record(call).await
+    }
+    pub(crate) fn issued_binding(
+        &self,
+        public_name: &str,
+        scope: &RuntimeEnvelope,
+        child_scope: Option<Arc<super::child::VerifiedChildScope>>,
+    ) -> anyhow::Result<ExecutionBinding> {
+        self.0.issued_binding(public_name, scope, child_scope)
+    }
+    pub(crate) async fn bind_call(
+        &self,
+        service: &ToolExecutionService,
+        scope: &RuntimeEnvelope,
+        descriptor: &ToolDescriptor,
+        command: &ToolExecutionCommand,
+        child_scope: Option<Arc<super::child::VerifiedChildScope>>,
+        schema_dialect: crate::tools::schema::ToolSchemaDialect,
+    ) -> anyhow::Result<VerifiedDecisionCall> {
+        self.0
+            .issued_binding(&descriptor.public_name, scope, child_scope)?
+            .bind_call(service, scope, descriptor, command, Some(self), schema_dialect)
+            .await
     }
 }
 impl std::fmt::Debug for DecisionApprovalPort {
