@@ -49,6 +49,11 @@ impl CleanupTracker {
         CURRENT_CLEANUP.scope(Arc::clone(self), work).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
     pub(crate) fn register(self: &Arc<Self>, cancel: CancellationToken) -> anyhow::Result<CleanupTicket> {
         let mut state = self.state.lock();
         // An unconfirmed write can still complete after its request ends.

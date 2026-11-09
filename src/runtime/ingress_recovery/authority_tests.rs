@@ -248,6 +248,46 @@ async fn recovery_legacy_mac_compatibility_is_exact() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_mac_runs_off_the_async_worker() -> anyhow::Result<()> {
+    let dir = directory()?;
+    let workspace = dir.path().canonicalize()?;
+    let memory = Arc::new(SqliteMemory::new(&workspace)?);
+    let rec = recorder(memory.clone(), &workspace).await?;
+    memory.clear_recovery_key_load_sites();
+    let runtime = std::thread::current().id();
+    let pending_during_load = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let owner = Arc::clone(&rec.owner);
+    let pending = Arc::clone(&pending_during_load);
+    memory.set_recovery_key_load_probe(move || {
+        pending.fetch_max(owner.pending_count(), std::sync::atomic::Ordering::SeqCst);
+    });
+    let event = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        rec.append(input(&workspace, "prx_run")?),
+    )
+    .await
+    .context("append deadlocked")??;
+    anyhow::ensure!(event.id > 0, "plane-on append did not persist");
+    let sites = memory.recovery_key_load_sites();
+    anyhow::ensure!(!sites.is_empty(), "append exercised no MAC key load");
+    for site in &sites {
+        anyhow::ensure!(
+            site.entry != runtime,
+            "MAC load entered on the current-thread runtime worker"
+        );
+        anyhow::ensure!(
+            site.exit != runtime,
+            "MAC load exited on the current-thread runtime worker"
+        );
+    }
+    anyhow::ensure!(
+        pending_during_load.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "cleanup tracking was not retained through MAC load"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn recovery_wrapped_backends_keep_duplicate_suppression() -> anyhow::Result<()> {
     for backend in ["sqlite", "lucid", "encrypted", "postgres_class"] {
