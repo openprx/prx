@@ -901,6 +901,7 @@ impl super::ingress_recovery::RecoveryScope {
         let state_key = &legacy.key;
         let journal = crate::agent::terminal::replay_requires_journal(state_key, &event, None)?;
         let store = if journal { None } else { Some(&legacy.store) };
+        let reader = &legacy.reader;
         let store_workspace_id: Arc<str> = match store {
             Some(store) => store.workspace_id().context("store workspace scope is missing")?,
             None => Arc::from(crate::agent::terminal::authenticated_replay_store_workspace(
@@ -908,10 +909,10 @@ impl super::ingress_recovery::RecoveryScope {
             )?),
         };
         let replay = match (store, bounded) {
-            (Some(store), Some((_, deadline, owner))) => {
+            (Some(_store), Some((_, deadline, owner))) => {
                 crate::agent::terminal::verify_terminal_replay_until(
                     self.memory.as_ref(),
-                    &store.reader(),
+                    reader,
                     state_key,
                     &store_workspace_id,
                     &workspace_id,
@@ -923,10 +924,10 @@ impl super::ingress_recovery::RecoveryScope {
                 )
                 .await?
             }
-            (Some(store), None) => {
+            (Some(_store), None) => {
                 crate::agent::terminal::verify_terminal_replay(
                     self.memory.as_ref(),
-                    &store.reader(),
+                    reader,
                     state_key,
                     &store_workspace_id,
                     &workspace_id,
@@ -991,9 +992,7 @@ impl super::ingress_recovery::RecoveryScope {
         let decision = replay.decision();
         let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
             .with_verified_resume(&replay);
-        let writer = store
-            .map(|store| store.writer().context("terminal rejoin writer is missing"))
-            .transpose()?;
+        let writer = legacy.writer.clone();
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
         let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
@@ -1137,7 +1136,7 @@ impl super::ingress_recovery::RecoveryScope {
         if journal {
             // Non-gating store projection: the journal rows above are the authority,
             // so every failure here is logged and never refuses the rejoin.
-            match legacy.store.writer() {
+            match legacy.writer.as_ref() {
                 Some(writer) => {
                     if writer.record_outcome(expected.clone()) != Enqueue::Queued {
                         tracing::warn!("rejoined outcome projection could not be queued");

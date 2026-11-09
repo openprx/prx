@@ -59,34 +59,50 @@ impl TurnDecisionService {
         let workspace_key = super::super::store_preparation::load_key(Arc::clone(&build.generation)).await?;
         let durable_key = config.causal_tree.enabled && workspace_key.is_some();
         let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
-        let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
-            &build.generation,
-            Arc::clone(&build.memory),
-            TurnSurfaceKind::Worker,
-            Arc::clone(&build.events),
-            None,
-            &recovery_owner,
-            workspace_key.clone(),
-        )
-        .await?;
-        let durable_events = if durable_key {
-            recovery.legacy_events().cloned()
+        let opened = if durable_key {
+            Some(
+                crate::runtime::ingress_recovery::open_advisory_store(
+                    &build.generation,
+                    Arc::clone(&build.memory),
+                    Arc::clone(&build.events),
+                    &recovery_owner,
+                )
+                .await?,
+            )
         } else {
             None
         };
+        let store = match &opened {
+            Some((store, _)) => Arc::clone(store),
+            None => {
+                super::super::store_preparation::open_store(
+                    Arc::clone(&build.generation),
+                    Arc::clone(&build.events),
+                    None,
+                    false,
+                )
+                .await?
+            }
+        };
+        let durable_events = opened.as_ref().map(|(_, events)| Arc::clone(events));
         let events: Arc<dyn CausalEventSink> = durable_events.as_ref().map_or_else(
             || Arc::clone(&build.events),
             |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
         );
-        let store = if durable_key {
-            recovery
-                .legacy_store()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("operator recovery store is unavailable"))?
-        } else {
-            super::super::store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&events), None, false)
-                .await?
-        };
+        let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
+            &build.generation,
+            Arc::clone(&build.memory),
+            TurnSurfaceKind::Worker,
+            None,
+            &recovery_owner,
+            workspace_key.clone(),
+            crate::runtime::ingress_recovery::PreparedAdvisory {
+                writer: opened.as_ref().and_then(|(store, _)| store.writer()),
+                events: durable_events.clone(),
+                store: opened.as_ref().map(|(store, _)| Arc::clone(store)),
+            },
+        )
+        .await?;
         let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
         let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
             .map_err(TurnServiceBuildError::PolicyFingerprint)?;

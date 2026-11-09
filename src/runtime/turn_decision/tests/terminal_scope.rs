@@ -516,14 +516,28 @@ async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery(
         "recovery must not retain the decision service"
     );
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let key = DecisionKey::load_existing(&generation.effective.workspace_dir).unwrap();
+    let observer = Arc::new(RecordingSink::default());
+    let (store, events) = crate::runtime::ingress_recovery::open_advisory_store(
+        &generation,
+        Arc::clone(&fixture.memory),
+        observer,
+        &cleanup,
+    )
+    .await
+    .expect("independent advisory store");
     let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
         &generation,
         Arc::clone(&fixture.memory),
         TurnSurfaceKind::AgentLoop,
-        Arc::new(RecordingSink::default()),
         None,
         &cleanup,
-        Some(DecisionKey::load_existing(&generation.effective.workspace_dir).unwrap()),
+        Some(key),
+        crate::runtime::ingress_recovery::PreparedAdvisory {
+            writer: store.writer(),
+            events: Some(events),
+            store: Some(store),
+        },
     )
     .await
     .expect("independent recovery initialization");

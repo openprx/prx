@@ -61,8 +61,19 @@ impl RepairSpies {
 #[derive(Clone)]
 pub(crate) struct LegacyEvidence {
     pub(crate) key: Arc<DecisionKey>,
-    pub(crate) store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+    pub(crate) reader: crate::causal_tree::store::DecisionStoreReader,
+    pub(crate) writer: Option<crate::causal_tree::store::DecisionStoreWriter>,
     pub(crate) events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+    pub(crate) store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+}
+
+/// Advisory ReadWrite store opened by a plane-on builder and passed into
+/// [`RecoveryScope::prepare`]. Recovery itself never opens ReadWrite.
+#[derive(Clone, Default)]
+pub(crate) struct PreparedAdvisory {
+    pub writer: Option<crate::causal_tree::store::DecisionStoreWriter>,
+    pub events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+    pub store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
 }
 
 impl LegacyEvidence {
@@ -78,6 +89,43 @@ impl LegacyEvidence {
                 _ => false,
             }
     }
+}
+
+/// Plane-on advisory builders open the ReadWrite store with the same ticket
+/// semantics as the former `prepare` path: `finish(result.is_ok())`.
+pub(crate) async fn open_advisory_store(
+    generation: &crate::config::ConfigGeneration,
+    memory: Arc<dyn Memory>,
+    observer: Arc<dyn crate::decision::telemetry::CausalEventSink>,
+    owner: &Arc<super::turn_cleanup::CleanupTracker>,
+) -> anyhow::Result<(
+    Arc<crate::causal_tree::store::CausalDecisionStore>,
+    Arc<super::causal_events::DurableCausalEventSink>,
+)> {
+    let config = &generation.effective;
+    let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
+        generation, memory, observer,
+    )?);
+    let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
+    let prepared_events = Arc::clone(&events);
+    let store = crate::causal_tree::store_preparation::open_store(
+        config.workspace_dir.clone(),
+        crate::causal_tree::store::Retention::days(
+            config.causal_tree.store.retention_days,
+            config.self_system.fitness.retention_days,
+        ),
+        events.clone(),
+        Some(crate::causal_tree::store::StoreMode::ReadWrite),
+        move |result| {
+            ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
+            ticket.finish(result.is_ok());
+        },
+    )
+    .await?;
+    if let Some(namespace) = store.workspace_id() {
+        events.bind_store_namespace(namespace)?;
+    }
+    Ok((store, events))
 }
 
 /// Recovery authentication plus optional plane-on legacy evidence.
@@ -122,30 +170,39 @@ impl RecoveryScope {
         }
     }
 
-    pub(super) fn legacy_store(&self) -> Option<&Arc<crate::causal_tree::store::CausalDecisionStore>> {
-        self.authority.legacy.as_ref().map(|legacy| &legacy.store)
-    }
-
     #[cfg(test)]
     pub(crate) fn spies(&self) -> &RepairSpies {
         &self.spies
     }
 
-    pub(super) fn legacy_events(&self) -> Option<&Arc<super::causal_events::DurableCausalEventSink>> {
+    #[cfg(test)]
+    pub(crate) fn legacy_store(&self) -> Option<&Arc<crate::causal_tree::store::CausalDecisionStore>> {
+        self.authority.legacy.as_ref().map(|legacy| &legacy.store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_events(&self) -> Option<&Arc<super::causal_events::DurableCausalEventSink>> {
         self.authority.legacy.as_ref().and_then(|legacy| legacy.events.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_writer(&self) -> Option<&crate::causal_tree::store::DecisionStoreWriter> {
+        self.authority.legacy.as_ref().and_then(|legacy| legacy.writer.as_ref())
     }
 
     /// Initialize durable recovery from pinned runtime inputs, without building
     /// a decision engine, catalog, or execution service. The caller supplies its
     /// single key-preparation result; missing authority never triggers a retry.
+    /// Plane-on builders pass the store they opened; this path never opens
+    /// ReadWrite and never calls [`DecisionKey::load_or_create`].
     pub(crate) async fn prepare(
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn Memory>,
         surface: crate::causal_tree::state::TurnSurfaceKind,
-        observer: Arc<dyn crate::decision::telemetry::CausalEventSink>,
         parent_grant: Option<&super::child_source::IssuedChildGrant>,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
         workspace_key: Option<Arc<DecisionKey>>,
+        advisory: PreparedAdvisory,
     ) -> anyhow::Result<Arc<Self>> {
         let config = &generation.effective;
         let recording = config.memory.event_recording_config();
@@ -165,42 +222,27 @@ impl RecoveryScope {
         .await?;
         let has_repository = memory.recovery_repository().is_some();
         let recordable = recording_on && (repository_ready || (plane && ledger && !has_repository));
-        // Plane-on ReadWrite open is unchanged: same inputs as today's store path.
-        let open_legacy = plane && workspace_key.is_some() && ledger && recording_on;
-        let legacy = if open_legacy {
-            let key = workspace_key.context("plane-on recovery store requires a workspace key")?;
-            let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
-                generation,
-                Arc::clone(&memory),
-                observer,
-            )?);
-            let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
-            let prepared_events = Arc::clone(&events);
-            let store = crate::causal_tree::store_preparation::open_store(
-                config.workspace_dir.clone(),
-                crate::causal_tree::store::Retention::days(
-                    config.causal_tree.store.retention_days,
-                    config.self_system.fitness.retention_days,
-                ),
-                events.clone(),
-                Some(crate::causal_tree::store::StoreMode::ReadWrite),
-                move |result| {
-                    ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
-                    // A failed store open also fails cleanup so the owner cannot report a clean drain.
-                    ticket.finish(result.is_ok());
-                },
-            )
-            .await?;
-            if let Some(namespace) = store.workspace_id() {
-                events.bind_store_namespace(namespace)?;
+        let PreparedAdvisory { writer, events, store } = advisory;
+        let legacy = match (
+            plane && workspace_key.is_some() && ledger && recording_on,
+            workspace_key,
+            store,
+        ) {
+            (true, Some(key), Some(store)) => {
+                if let Some(namespace) = store.workspace_id()
+                    && let Some(events) = &events
+                {
+                    events.bind_store_namespace(namespace)?;
+                }
+                Some(LegacyEvidence {
+                    key,
+                    reader: store.reader(),
+                    writer,
+                    events,
+                    store,
+                })
             }
-            Some(LegacyEvidence {
-                key,
-                store,
-                events: Some(events),
-            })
-        } else {
-            None
+            _ => None,
         };
         let scope = Arc::new(Self {
             memory,
@@ -234,7 +276,7 @@ impl RecoveryScope {
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
         let mut drained = true;
         let legacy = self.authority.legacy.as_ref();
-        if let Some(writer) = legacy.and_then(|legacy| legacy.store.writer()) {
+        if let Some(writer) = legacy.and_then(|legacy| legacy.writer.as_ref()) {
             #[cfg(test)]
             super::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
             let writer_drained = writer.drain(deadline).await;
