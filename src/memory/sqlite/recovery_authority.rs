@@ -23,6 +23,32 @@ fn recovery_key_gate_index(id: &str) -> usize {
     (hasher.finish() % RECOVERY_KEY_GATES as u64) as usize
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecoveryKeyLoadSite {
+    pub entry: std::thread::ThreadId,
+    pub exit: std::thread::ThreadId,
+}
+
+#[cfg(test)]
+pub(crate) type RecoveryKeyLoadProbe = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+struct RecoveryKeyLoadGuard {
+    sites: std::sync::Arc<parking_lot::Mutex<Vec<RecoveryKeyLoadSite>>>,
+    entry: std::thread::ThreadId,
+}
+
+#[cfg(test)]
+impl Drop for RecoveryKeyLoadGuard {
+    fn drop(&mut self) {
+        self.sites.lock().push(RecoveryKeyLoadSite {
+            entry: self.entry,
+            exit: std::thread::current().id(),
+        });
+    }
+}
+
 const MAX_SERIALIZED_FACTS: usize = 262_144;
 // Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
 // 40 KiB covers those strings, two 32-byte JSON digests, and structural keys.
@@ -593,6 +619,18 @@ impl SqliteMemory {
     /// Check, load and failure publication for one key id are serialized, so a
     /// queued caller never reloads a key after its failure was recorded.
     fn capsule_key(&self, id: &str) -> anyhow::Result<ring::hmac::Key> {
+        #[cfg(test)]
+        let _load_site = RecoveryKeyLoadGuard {
+            sites: std::sync::Arc::clone(&self.recovery_key_load_sites),
+            entry: std::thread::current().id(),
+        };
+        #[cfg(test)]
+        {
+            let probe = self.recovery_key_load_probe.lock().clone();
+            if let Some(probe) = probe {
+                probe();
+            }
+        }
         // The index is always below the fixed length; a miss cannot occur.
         let _serial = self
             .recovery_key_gates
@@ -631,6 +669,11 @@ impl SqliteMemory {
             .map_err(key_unavailable)?;
         let namespace = if established {
             let (namespace, id) = active(&tx)?;
+            if self.recovery_unusable.lock().contains(&id) {
+                return Err(anyhow::Error::new(RecoveryKeyUnavailable(format!(
+                    "recovery key {id} unusable"
+                ))));
+            }
             directory.load(&id).map_err(key_unavailable)?;
             // Every retained generation stays available, even during rotation.
             let mut stmt =
@@ -805,10 +848,12 @@ impl RecoveryRepository for SqliteMemory {
         bytes: &[u8],
     ) -> anyhow::Result<RecoveryTag> {
         anyhow::ensure!(bytes.len() <= MAX_SERIALIZED_FACTS, "oversized recovery MAC input");
-        let writer = self.pool.write();
         let id = match key_id {
             Some(id) => id.to_owned(),
-            None => active(&writer)?.1,
+            None => {
+                let writer = self.pool.write();
+                active(&writer)?.1
+            }
         };
         let key = self.capsule_key(&id)?;
         let signed = ring::hmac::sign(&key, &framed(domain.bytes(), bytes));

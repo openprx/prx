@@ -177,12 +177,15 @@ pub struct SqliteMemory {
     pool: Arc<SqliteConnectionPool>,
     #[cfg(test)]
     recovery_activation_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    recovery_key_load_sites: Arc<parking_lot::Mutex<Vec<recovery_authority::RecoveryKeyLoadSite>>>,
+    #[cfg(test)]
+    recovery_key_load_probe: Arc<parking_lot::Mutex<Option<recovery_authority::RecoveryKeyLoadProbe>>>,
     /// Set once when key material is unavailable; never cleared or retried.
     recovery_unavailable: Arc<std::sync::OnceLock<()>>,
     /// The one shared, once-only "unavailable" warning for this handle.
     recovery_warned: Arc<std::sync::OnceLock<()>>,
-    /// Capsule keys that failed to load (and the sentinel "" for an unusable
-    /// key directory). Remembered so no capsule retries them.
+    /// Capsule keys that failed to load. Remembered so no capsule retries them.
     recovery_unusable: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Serializes check, load and failure publication for this handle's activation.
     recovery_activation: Arc<parking_lot::Mutex<()>>,
@@ -409,6 +412,10 @@ impl SqliteMemory {
             recovery_key_gates: Default::default(),
             #[cfg(test)]
             recovery_activation_attempts: Default::default(),
+            #[cfg(test)]
+            recovery_key_load_sites: Default::default(),
+            #[cfg(test)]
+            recovery_key_load_probe: Default::default(),
             db_path,
             acl_enabled,
             embedder,
@@ -563,6 +570,18 @@ pub(crate) mod fixture_readback;
 
 #[cfg(test)]
 impl SqliteMemory {
+    pub(crate) fn clear_recovery_key_load_sites(&self) {
+        self.recovery_key_load_sites.lock().clear();
+    }
+
+    pub(crate) fn recovery_key_load_sites(&self) -> Vec<recovery_authority::RecoveryKeyLoadSite> {
+        self.recovery_key_load_sites.lock().clone()
+    }
+
+    pub(crate) fn set_recovery_key_load_probe(&self, probe: impl Fn() + Send + Sync + 'static) {
+        *self.recovery_key_load_probe.lock() = Some(Arc::new(probe));
+    }
+
     /// Seed a historical payload without changing its event identity.
     pub(crate) fn replace_event_payload_for_test(&self, event_id: &str, payload: &str) -> anyhow::Result<()> {
         let updated = self.pool.write().execute(

@@ -56,14 +56,11 @@ fn recovery_mac_bytes_are_unchanged() -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("fixture repository has no memory directory"))?;
     KeyDirectory::open(parent, true)?.install(&id, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(key_path(&memory, &id)?)?.permissions().mode() & 0o777,
-            0o600
-        );
-    }
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(key_path(&memory, &id)?)?.permissions().mode() & 0o777,
+        0o600
+    );
     let capsule = memory.recovery_mac(Some(&id), RecoveryMacDomain::CapsuleV3, b"fixed")?;
     assert_eq!(
         hex::encode(capsule.tag),
@@ -76,6 +73,102 @@ fn recovery_mac_bytes_are_unchanged() -> anyhow::Result<()> {
         "decaf66f760e0cf400435fa4a1e3235c281dd616b496baccf32400dd7e9b05f6"
     );
     assert_eq!(digest.key_id, id);
+    Ok(())
+}
+
+#[test]
+#[serial_test::serial(recovery_authority)]
+fn activation_refuses_key_already_marked_unusable() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, memory) = store()?;
+    let id = memory.activate_recovery_authority()?;
+    let path = key_path(&memory, &id)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+    let failed = memory.recovery_mac(None, RecoveryMacDomain::CapsuleV3, b"fixed");
+    anyhow::ensure!(
+        failed
+            .as_ref()
+            .err()
+            .is_some_and(|error| crate::memory::recovery_authority::is_key_unavailable(error)),
+        "mode 0644 load was not key-unavailable"
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let refused = memory.activate_recovery_authority();
+    anyhow::ensure!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| crate::memory::recovery_authority::is_key_unavailable(error)),
+        "activation accepted a key already marked unusable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial(recovery_authority)]
+async fn warm_handle_refuses_lost_historical_capsule_key() -> anyhow::Result<()> {
+    use crate::runtime::ingress_recovery::IngressRecorder;
+    let (dir, memory) = store()?;
+    let workspace = dir.path().to_owned();
+    let db_path = memory.db_path.clone();
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.clone();
+    config.causal_tree.enabled = true;
+    let cell_input = |run: &str, key: &str| -> anyhow::Result<crate::memory::MessageEventInput> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace.to_string_lossy(), "owner_id": "prx_user",
+            "source": "agent", "channel": "agent_api", "session_key": "prx_session",
+            "run_id": run, "idempotency_key": key, "role": "user",
+            "event_type": "message.created", "content": "recovery fixture", "visibility": "session"
+        }))?)
+    };
+    let prepare = |memory: Arc<dyn crate::memory::Memory>| {
+        let config = config.clone();
+        async move {
+            let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+            let ticket = tracker.register(tokio_util::sync::CancellationToken::new())?;
+            let result = IngressRecorder::prepare(memory, &config, &ticket).await;
+            ticket.finish(result.is_ok());
+            result?.context("recorder unavailable")
+        }
+    };
+    let memory = Arc::new(memory);
+    let first_recorder = prepare(memory.clone()).await?;
+    let first = first_recorder
+        .append(cell_input("prx-warm-1", "prx-warm-input-1")?)
+        .await?;
+    let retired = memory.activate_recovery_authority()?;
+    memory.rotate_recovery_authority()?;
+    memory.pool.write().execute_batch(
+        "DROP TRIGGER recovery_transport_tombstone;
+         DROP TABLE recovery_transport_index;
+         DROP TABLE recovery_tombstones;
+         DELETE FROM recovery_attestations;",
+    )?;
+    std::fs::remove_file(
+        db_path
+            .parent()
+            .context("memory directory")?
+            .join(".recovery_keys")
+            .join(format!("{retired}.key")),
+    )?;
+    let second_recorder = prepare(memory.clone()).await?;
+    let second = second_recorder
+        .append(cell_input("prx-warm-2", "prx-warm-input-2")?)
+        .await?;
+    anyhow::ensure!(
+        second.id > 0,
+        "chat append after a lost historical capsule key did not persist"
+    );
+    let decided: i64 = memory.pool.write().query_row(
+        "SELECT count(*) FROM message_events WHERE idempotency_key LIKE ?1",
+        params![format!("ingress:{}:%", first.event_id)],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        decided == 0,
+        "a lost historical capsule produced marker or outcome evidence"
+    );
     Ok(())
 }
 
