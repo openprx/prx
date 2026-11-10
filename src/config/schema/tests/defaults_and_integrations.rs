@@ -54,6 +54,211 @@ async fn invalid_cost_tariff_is_rejected_without_disclosing_key() {
     }
 }
 
+fn test_price() -> ModelPricing {
+    ModelPricing {
+        input: 1.0,
+        output: 2.0,
+        cache_write: 1.0,
+        cache_read: 0.5,
+    }
+}
+
+fn custom_endpoint_config(model: &str) -> Config {
+    Config {
+        default_provider: Some("custom:http://127.0.0.1:9/v1".into()),
+        default_model: Some(model.into()),
+        ..Config::default()
+    }
+}
+
+#[test]
+async fn mismatched_custom_cost_price_key_warns_with_expected_bare_model() {
+    let mut config = custom_endpoint_config("moonshotai/kimi-k2.5");
+    config
+        .cost
+        .prices
+        .insert("custom:http://127.0.0.1:9/v1/moonshotai/kimi-k2.5".into(), test_price());
+    config
+        .validate()
+        .expect("an unmatched price key is a warning, not an error");
+    let warnings = unmatched_cost_price_key_warnings(&config);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    assert!(
+        warning.contains(r#"[cost.prices."custom:http://127.0.0.1:9/v1/moonshotai/kimi-k2.5"]"#),
+        "{warning}"
+    );
+    assert!(warning.contains("matches no configured provider/model"), "{warning}");
+    assert!(
+        warning.contains("for custom provider 'custom:http://127.0.0.1:9/v1' model 'moonshotai/kimi-k2.5' the expected key is \"moonshotai/kimi-k2.5\""),
+        "{warning}"
+    );
+}
+
+#[test]
+async fn matching_custom_cost_price_key_produces_no_warning() {
+    let mut config = custom_endpoint_config("moonshotai/kimi-k2.5");
+    config.cost.prices.insert("moonshotai/kimi-k2.5".into(), test_price());
+    config.validate().expect("a matching price key loads");
+    assert_eq!(unmatched_cost_price_key_warnings(&config), Vec::<String>::new());
+}
+
+#[test]
+async fn mismatched_slashless_custom_cost_price_key_names_provider_model_expected_key() {
+    let mut config = custom_endpoint_config("kimi-k2.5");
+    config.cost.prices.insert("kimi-k2.5".into(), test_price());
+    let warnings = unmatched_cost_price_key_warnings(&config);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(
+            "for custom provider 'custom:http://127.0.0.1:9/v1' model 'kimi-k2.5' the expected key is \"custom:http://127.0.0.1:9/v1/kimi-k2.5\""
+        ),
+        "{}",
+        warnings[0]
+    );
+}
+
+#[test]
+async fn matching_slashless_custom_cost_price_key_produces_no_warning() {
+    let mut config = custom_endpoint_config("kimi-k2.5");
+    config
+        .cost
+        .prices
+        .insert("custom:http://127.0.0.1:9/v1/kimi-k2.5".into(), test_price());
+    assert_eq!(unmatched_cost_price_key_warnings(&config), Vec::<String>::new());
+}
+
+#[test]
+async fn kimi_code_and_openrouter_price_keys_follow_the_g6_rule() {
+    let mut kimi = Config {
+        default_provider: Some("kimi-code".into()),
+        default_model: Some("kimi-for-coding".into()),
+        ..Config::default()
+    };
+    kimi.cost.prices.insert("kimi-for-coding".into(), test_price());
+    let kimi_warnings = unmatched_cost_price_key_warnings(&kimi);
+    assert_eq!(kimi_warnings.len(), 1, "{kimi_warnings:?}");
+    assert!(
+        kimi_warnings[0].contains(r#"[cost.prices."kimi-for-coding"]"#),
+        "{}",
+        kimi_warnings[0]
+    );
+    kimi.cost.prices.clear();
+    kimi.cost
+        .prices
+        .insert("kimi-code/kimi-for-coding".into(), test_price());
+    assert_eq!(unmatched_cost_price_key_warnings(&kimi), Vec::<String>::new());
+
+    let mut openrouter = Config {
+        default_provider: Some("openrouter".into()),
+        default_model: Some("deepseek/deepseek-v3.2".into()),
+        ..Config::default()
+    };
+    openrouter
+        .cost
+        .prices
+        .insert("openrouter/deepseek/deepseek-v3.2".into(), test_price());
+    let openrouter_warnings = unmatched_cost_price_key_warnings(&openrouter);
+    assert_eq!(openrouter_warnings.len(), 1, "{openrouter_warnings:?}");
+    assert!(
+        openrouter_warnings[0].contains(r#"[cost.prices."openrouter/deepseek/deepseek-v3.2"]"#),
+        "{}",
+        openrouter_warnings[0]
+    );
+    openrouter.cost.prices.clear();
+    openrouter
+        .cost
+        .prices
+        .insert("deepseek/deepseek-v3.2".into(), test_price());
+    assert_eq!(unmatched_cost_price_key_warnings(&openrouter), Vec::<String>::new());
+}
+
+#[test]
+async fn usage_pricing_key_is_bare_model_when_the_model_contains_a_slash() {
+    assert_eq!(
+        usage_pricing_key("openrouter", "deepseek/deepseek-v3.2"),
+        "deepseek/deepseek-v3.2"
+    );
+    assert_eq!(
+        usage_pricing_key("kimi-code", "kimi-for-coding"),
+        "kimi-code/kimi-for-coding"
+    );
+    assert_eq!(
+        usage_pricing_key("custom:http://127.0.0.1:9/v1", "moonshotai/kimi-k2.5"),
+        "moonshotai/kimi-k2.5"
+    );
+    assert_eq!(
+        usage_pricing_key("custom:http://127.0.0.1:9/v1", "kimi-k2.5"),
+        "custom:http://127.0.0.1:9/v1/kimi-k2.5"
+    );
+}
+
+fn custom_slash_model_price_toml(price_key: &str) -> String {
+    format!(
+        "default_temperature = 0.7\n\
+         default_provider = \"custom:http://127.0.0.1:9/v1\"\n\
+         default_model = \"moonshotai/kimi-k2.5\"\n\
+         \n\
+         [cost.prices.{price_key:?}]\n\
+         input = 1.0\n\
+         output = 2.0\n\
+         cache_write = 1.0\n\
+         cache_read = 0.5\n"
+    )
+}
+
+#[test]
+async fn load_from_path_warns_when_a_cost_price_key_matches_no_configured_model() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+    let dir = tempfile::TempDir::new().expect("test: private config directory");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        custom_slash_model_price_toml("custom:http://127.0.0.1:9/v1/moonshotai/kimi-k2.5"),
+    )
+    .expect("test: write unmatched cost.prices config");
+    let config =
+        Config::load_from_path(&path, dir.path().join("workspace")).expect("an unmatched price key still loads");
+    let warnings = unmatched_cost_price_key_warnings(&config);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "price keys={:?} warnings={warnings:?}",
+        config.cost.prices.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        warnings[0].contains("the expected key is \"moonshotai/kimi-k2.5\""),
+        "{}",
+        warnings[0]
+    );
+    let (outcome, logs) = capture_logs(|| config.validate());
+    outcome.expect("an unmatched price key is a warning, not an error");
+    assert!(logs.contains("cost.prices key matches no configured model"), "{logs}");
+    assert!(
+        logs.contains(r#"[cost.prices."custom:http://127.0.0.1:9/v1/moonshotai/kimi-k2.5"]"#),
+        "{logs}"
+    );
+}
+
+#[test]
+async fn load_from_path_is_silent_when_the_cost_price_key_matches() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+    let dir = tempfile::TempDir::new().expect("test: private config directory");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, custom_slash_model_price_toml("moonshotai/kimi-k2.5"))
+        .expect("test: write matching cost.prices config");
+    let config = Config::load_from_path(&path, dir.path().join("workspace")).expect("a matching price key loads");
+    assert_eq!(
+        unmatched_cost_price_key_warnings(&config),
+        Vec::<String>::new(),
+        "price keys={:?}",
+        config.cost.prices.keys().collect::<Vec<_>>()
+    );
+    let (outcome, logs) = capture_logs(|| config.validate());
+    outcome.expect("a matching price key validates");
+    assert!(!logs.contains("cost.prices key matches no configured model"), "{logs}");
+}
+
 // ── Defaults ─────────────────────────────────────────────
 
 #[test]
