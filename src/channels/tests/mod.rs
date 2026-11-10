@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
-pub(super) async fn drive_disabled_engine_channel_entry(workspace: &std::path::Path) {
+pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::Path) {
     let mut config = Config::default();
     config.workspace_dir = workspace.to_owned();
     config.config_path = workspace.join("config.toml");

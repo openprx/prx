@@ -34,8 +34,6 @@ use crate::causal_tree::directive::SelectedReadPurpose;
 use crate::causal_tree::state::RouterHistoryReadBinding;
 use crate::memory::RouterHistoryWriteEvidence;
 #[cfg(test)]
-use crate::memory::router_history::RouterEmbedding;
-#[cfg(test)]
 use crate::memory::router_history::RouterReadScope;
 #[cfg(test)]
 use crate::memory::{RouterHistoryRead, RouterHistoryReadEvidence};
@@ -63,18 +61,12 @@ impl RouterModelReadmission {
 
 /// Unique phase ownership prevents reminting a read grant after an error or
 /// retry. It is moved to Reading before issuing the sole production grant.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Inline continuation preserves the allocation budget; boxing would add a routing allocation"
-)]
 #[cfg(test)]
 enum RoutingPhase {
-    Pending,
     Reading,
     Consumed {
         source: Arc<EmbeddedAgentSource>,
         transition: Arc<RouterTransition>,
-        embedding: Option<RouterEmbedding>,
         main_compaction: crate::config::AgentCompactionConfig,
     },
     Failed {
@@ -91,14 +83,6 @@ pub(crate) struct RouterContinuation<'a> {
 }
 #[cfg(test)]
 impl<'a> RouterContinuation<'a> {
-    #[cfg(test)]
-    pub(crate) const fn new(router: &'a crate::router::RouterEngine, source: Arc<EmbeddedAgentSource>) -> Self {
-        Self {
-            router,
-            original: source,
-            phase: RoutingPhase::Pending,
-        }
-    }
     #[cfg(test)]
     pub(super) const fn source(&self) -> &Arc<EmbeddedAgentSource> {
         match &self.phase {
@@ -124,13 +108,6 @@ impl<'a> RouterContinuation<'a> {
         match &self.phase {
             RoutingPhase::Consumed { main_compaction, .. } => Some(main_compaction),
             _ => None,
-        }
-    }
-    #[cfg(test)]
-    pub(crate) fn finish(mut self) -> (Arc<EmbeddedAgentSource>, Option<RouterEmbedding>) {
-        match &mut self.phase {
-            RoutingPhase::Consumed { source, embedding, .. } => (Arc::clone(source), embedding.take()),
-            _ => (Arc::clone(&self.original), None),
         }
     }
 }
@@ -331,7 +308,10 @@ impl TurnDecisionService {
         accounting: &accounting::TurnAccounting<'_>,
     ) -> anyhow::Result<(EngineDecision, Option<CausalState>)> {
         ensure!(
-            matches!(continuation.phase, RoutingPhase::Pending),
+            !matches!(
+                continuation.phase,
+                RoutingPhase::Consumed { .. } | RoutingPhase::Failed { .. } | RoutingPhase::Closed
+            ),
             "Router history phase already consumed"
         );
         continuation.phase = RoutingPhase::Reading;
@@ -744,16 +724,9 @@ impl TurnDecisionService {
                 remaining_budget,
                 deadline,
             });
-            let embedding = RouterEmbedding {
-                source_event_id: proof.source_event_id().context("Router source missing")?.to_owned(),
-                query_sha256,
-                domain,
-                vector,
-            };
             continuation.phase = RoutingPhase::Consumed {
                 source: admitted,
                 transition,
-                embedding: Some(embedding),
                 main_compaction,
             };
             Ok::<_, anyhow::Error>(next)

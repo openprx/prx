@@ -26,7 +26,7 @@ pub(crate) enum SelectedReadPurpose {
 #[derive(Debug, Clone)]
 pub(crate) enum TurnExecutionDirective {
     #[cfg(test)]
-    CollectApprovalArguments(super::approval_collection::DeferredArgumentProof),
+    CollectApprovalArguments,
     AnswerDirectly,
     Retrieve {
         #[cfg(test)]
@@ -172,7 +172,7 @@ pub(crate) fn directive_from_selection(
             {
                 return Err(DirectiveError::NotAdmitted);
             }
-            Ok(TurnExecutionDirective::CollectApprovalArguments(proof.clone()))
+            Ok(TurnExecutionDirective::CollectApprovalArguments)
         }
         Selection::Commit { candidate_id, .. } => {
             #[cfg(not(test))]

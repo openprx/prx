@@ -650,7 +650,7 @@ impl Provider for EngineOffWebhookProvider {
     }
 }
 
-pub(super) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::Path) {
+pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::Path) {
     let provider: Arc<dyn Provider> = Arc::new(EngineOffWebhookProvider);
     let mut config = webhook_test_config();
     config.workspace_dir = workspace.to_path_buf();

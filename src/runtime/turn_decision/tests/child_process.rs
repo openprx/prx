@@ -1149,7 +1149,6 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
                 assert!(answer, "unapproved delegation may only reach the explanatory model");
                 service.agent_execution_specs(&proof, &context)?;
             }
-            _ => panic!("unapproved delegation cannot dispatch"),
         }
         assert!(service.issue_child_grant(&proof, &context).is_err());
         assert_eq!(

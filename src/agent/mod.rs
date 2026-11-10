@@ -36,7 +36,7 @@ pub(crate) mod turn_context;
 pub(crate) mod turn_contracts;
 pub(crate) mod turn_engine;
 pub(crate) mod turn_request;
-mod turn_tests;
+pub(crate) mod turn_tests;
 
 #[cfg(test)]
 pub(crate) use turn_tests::admission as test_admission;

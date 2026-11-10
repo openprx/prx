@@ -152,7 +152,6 @@ impl TurnDecisionContext {
 #[derive(Clone, Copy)]
 enum ScoredPrediction {
     BuiltinChoice,
-    Action(&'static str, &'static str),
     Publication(&'static str),
 }
 
@@ -162,14 +161,6 @@ tokio::task_local! {
 
 pub(crate) fn with_scored_prediction<F: std::future::Future>(work: F) -> impl std::future::Future<Output = F::Output> {
     SCORED_PREDICTION.scope(ScoredPrediction::BuiltinChoice, Box::pin(work))
-}
-
-pub(crate) fn with_scored_action<F: std::future::Future>(
-    action: &'static str,
-    family: &'static str,
-    work: F,
-) -> impl std::future::Future<Output = F::Output> {
-    SCORED_PREDICTION.scope(ScoredPrediction::Action(action, family), Box::pin(work))
 }
 
 pub(crate) fn with_scored_publication<F: std::future::Future>(
@@ -202,10 +193,7 @@ pub(super) fn wrap_factory(
     let Ok(choice) = SCORED_PREDICTION.try_with(|choice| *choice) else {
         return original;
     };
-    let (action, family) = match choice {
-        ScoredPrediction::Action(action, family) => (action, family),
-        _ => ("answer", "none"),
-    };
+    let (action, family) = ("answer", "none");
     DecisionBackendFactory::from_slots(
         vec![Box::new(OrdinaryFixtureBackend {
             identity: BackendIdentity {

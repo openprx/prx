@@ -29,16 +29,6 @@ pub(in crate::runtime::turn_decision) struct DiscoveryAdmission {
 }
 
 impl TurnDecisionContext {
-    #[cfg(test)]
-    pub(in crate::runtime::turn_decision) fn has_discovery_admission(&self, reference: &CapabilityRef) -> bool {
-        self.discovery_admissions.get().is_some_and(|admissions| {
-            admissions
-                .lock()
-                .values()
-                .any(|admission| &admission.reference == reference)
-        })
-    }
-
     /// Terminal evidence only; callers must not treat these retained refs as
     /// authority after execution_closed. Live consumers recheck every offer.
     pub(crate) fn discovered_execution_refs(&self) -> Vec<CapabilityRef> {

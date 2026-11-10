@@ -19,6 +19,7 @@ impl std::fmt::Debug for DeferredArgumentProof {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeferredArgumentProof")
             .field("adapter", &self.adapter)
+            .field("state_fingerprint", &self.state_fingerprint)
             .finish_non_exhaustive()
     }
 }
@@ -47,14 +48,6 @@ impl DeferredArgumentProof {
     #[cfg(test)]
     pub(crate) const fn capability(&self) -> &CapabilityRef {
         &self.capability
-    }
-    #[cfg(test)]
-    pub(crate) const fn adapter(&self) -> ApprovalReviewAdapter {
-        self.adapter
-    }
-    #[cfg(test)]
-    pub(crate) fn state_fingerprint(&self) -> &str {
-        &self.state_fingerprint
     }
 }
 

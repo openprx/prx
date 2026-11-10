@@ -2,17 +2,10 @@
 //! decision key. The outer pending MAC also authenticates the ciphertext.
 use super::{PendingRecord, TurnDecisionService, VerifiedPendingDecisionApproval};
 use anyhow::Context;
-#[cfg(test)]
-use chacha20poly1305::AeadCore;
-#[cfg(test)]
-use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
-
-#[cfg(test)]
-use crate::security::approval_ledger::pending::EncryptedCall;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,35 +32,6 @@ impl TurnDecisionService {
                 .hmac(crate::decision::KeyDomain::ApprovalState, &[b"call-encryption-key-v1"]),
         );
         Ok(ChaCha20Poly1305::new(Key::from_slice(key.as_ref())))
-    }
-
-    #[cfg(test)]
-    pub(super) fn seal_pending_call(
-        &self,
-        record: &PendingRecord,
-        command: &crate::tools::ToolExecutionCommand,
-    ) -> anyhow::Result<EncryptedCall> {
-        let plain = Zeroizing::new(serde_json::to_vec(&StoredCall {
-            tool: command.name.clone(),
-            arguments: command.arguments.clone(),
-        })?);
-        let aad = associated_data(record)?;
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = self
-            .pending_call_cipher()?
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: plain.as_slice(),
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("approval call encryption failed"))?;
-        Ok(EncryptedCall {
-            version: 1,
-            nonce: nonce.into(),
-            ciphertext: hex::encode(ciphertext),
-        })
     }
 
     /// Input must already have passed pending/source/decision authentication.

@@ -104,35 +104,6 @@ impl CapabilityEntry {
                 && self.collects_exact_call())
     }
 
-    /// A directory plus one complete bundle revision identifies the native
-    /// import proposal surface without inferring a verb or granting execution.
-    /// The collector still decides whether the current request asks to import.
-    #[cfg(test)]
-    pub(crate) fn names_reviewed_bundle_target(&self, text: &str) -> bool {
-        if self.public_name != "skills_manage"
-            || !self.collects_exact_call()
-            || !text.contains("r1-")
-            || !self
-                .schema
-                .pointer("/properties/action/enum")
-                .and_then(Value::as_array)
-                .is_some_and(|actions| {
-                    actions
-                        .iter()
-                        .any(|action| action.as_str() == Some("lifecycle_import_executable"))
-                })
-            || !crate::decision::builtin::features::text_signals(text).path
-        {
-            return false;
-        }
-        let mut revisions = text
-            .split(|character: char| !(character.is_alphanumeric() || character == '-'))
-            .filter(|token| token.starts_with("r1-"))
-            .filter_map(|token| crate::skills::lifecycle::RevisionId::parse(token).ok());
-        let Some(revision) = revisions.next() else { return false };
-        revisions.all(|other| other == revision)
-    }
-
     /// The (lowercased) request names a grant-bound action of a collectable
     /// tool. Other actions need no approval collection: the model may call them
     /// in an ordinary turn, and collecting them would end in an error.

@@ -8,7 +8,7 @@
 mod ordinary_child_fixture;
 #[cfg(test)]
 pub(crate) use ordinary_child_fixture::{
-    with_inherited_scored_prediction, with_scored_action, with_scored_prediction, with_scored_publication,
+    with_inherited_scored_prediction, with_scored_prediction, with_scored_publication,
 };
 
 #[cfg(test)]
@@ -1330,7 +1330,7 @@ impl TurnDecisionContext {
         &mut self,
         proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
     ) {
-        self.directive = TurnExecutionDirective::CollectApprovalArguments(proof.clone());
+        self.directive = TurnExecutionDirective::CollectApprovalArguments;
         self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
@@ -1406,7 +1406,7 @@ impl TurnDecisionContext {
                 reply: render_terminal_directive(&self.directive)?,
             }),
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments(_) if !self.execution_closed.load(Ordering::Acquire) => {
+            TurnExecutionDirective::CollectApprovalArguments if !self.execution_closed.load(Ordering::Acquire) => {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
@@ -1418,7 +1418,7 @@ impl TurnDecisionContext {
                 Ok(TurnDisposition::Run)
             }
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments(_) => Err(DirectiveError::NotAdmitted),
+            TurnExecutionDirective::CollectApprovalArguments => Err(DirectiveError::NotAdmitted),
             TurnExecutionDirective::AnswerDirectly
             | TurnExecutionDirective::Execute { .. }
             | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
@@ -1438,15 +1438,14 @@ impl TurnDecisionContext {
         Ok(matches!(self.disposition()?, TurnDisposition::Run))
     }
 
+    #[cfg(not(test))]
     pub(crate) const fn pending_approval_id(&self) -> Option<DecisionId> {
-        #[cfg(test)]
-        {
-            matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
-        }
-        #[cfg(not(test))]
-        {
-            None
-        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_approval_id(&self) -> Option<DecisionId> {
+        matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
     }
 
     #[cfg(test)]
@@ -1460,15 +1459,15 @@ impl TurnDecisionContext {
             TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable".to_owned()),
             TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable".to_owned()),
             TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable".to_owned()),
-            TurnExecutionDirective::CollectApprovalArguments(_) => {
+            TurnExecutionDirective::CollectApprovalArguments => {
                 ("CollectApprovalArguments", "not_applicable".to_owned())
             }
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn carries_collect_directive_for_test(&self) -> bool {
-        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments(_))
+    pub(crate) const fn carries_collect_directive_for_test(&self) -> bool {
+        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments)
     }
 }
 
@@ -3107,7 +3106,7 @@ impl TurnDecisionService {
                         telemetry,
                     ));
                 }
-                TurnExecutionDirective::CollectApprovalArguments(_)
+                TurnExecutionDirective::CollectApprovalArguments
                 | TurnExecutionDirective::Clarify { .. }
                 | TurnExecutionDirective::RequestApproval { .. }
                 | TurnExecutionDirective::Refuse { .. } => {

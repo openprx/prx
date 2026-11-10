@@ -138,14 +138,6 @@ impl PendingRecord {
     }
 }
 
-#[cfg(test)]
-impl VerifiedPendingDecisionApproval {
-    /// The exact operations the pending call asks the owner to approve.
-    pub(crate) fn op_ids(&self) -> &[String] {
-        &self.record.op_ids
-    }
-}
-
 fn pending_decision_id(idempotency_key: Option<&str>) -> Option<DecisionId> {
     let key = idempotency_key?;
     let rest = key.strip_prefix("decision-approval:")?.strip_suffix(":pending")?;
