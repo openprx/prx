@@ -6,6 +6,16 @@ use super::{
 use crate::runtime::child_source::authority_journal;
 
 impl TurnDecisionService {
+    pub(crate) async fn record_opened_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: Arc<TurnDecisionContext>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        self.record_issued_decision(proof, (context, None), cancellation)
+            .await
+    }
+
     pub(super) async fn record_issued_decision(
         &self,
         proof: &dyn TurnSourceProof,

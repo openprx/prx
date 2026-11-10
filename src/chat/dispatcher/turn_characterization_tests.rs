@@ -401,7 +401,7 @@ pub(super) async fn admit_chat_fixture(
     action_tx: mpsc::Sender<Action>,
     cancellation: CancellationToken,
 ) -> ChatFixtureAdmission {
-    let admitted = admit_chat_fixture_with_config(
+    admit_chat_fixture_with_config(
         provider,
         registry,
         enabled_builtin_admission_config(workspace),
@@ -410,9 +410,7 @@ pub(super) async fn admit_chat_fixture(
         action_tx,
         cancellation,
     )
-    .await;
-    assert_enabled_builtin_selection(admitted.binding.decision_routing().expect("chat decision routing"));
-    admitted
+    .await
 }
 
 pub(super) async fn admit_chat_fixture_with_config(
@@ -568,6 +566,15 @@ async fn admit_chat_fixture_with_mode(
         .decide(&decisions, &CancellationToken::new())
         .await
         .expect("chat decision");
+    let routing = binding.decision_routing().expect("chat decision routing");
+    assert!(
+        routing.context.engine().prediction.is_none(),
+        "chat decide uses open_turn_context, which has no prediction port"
+    );
+    assert!(matches!(
+        routing.context.directive(),
+        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+    ));
     let context = crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private");
 
     ChatFixtureAdmission {

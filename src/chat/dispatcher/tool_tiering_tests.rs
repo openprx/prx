@@ -639,44 +639,127 @@ async fn chat_driver_does_not_publish_whole_registry_for_unrecognized_language()
     );
 }
 
+struct CountingProbe {
+    name: &'static str,
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CountingProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "named-tool dispatch probe"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(&self, _arguments: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.executions.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            success: true,
+            output: "named-tool-ok".to_owned(),
+            error: None,
+        })
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Core
+    }
+}
+
 #[tokio::test]
-async fn r4_builtin_named_tool_chat_answers_without_publishing_the_tool() {
-    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
     let workspace = tempfile::tempdir().unwrap();
-    let provider = Arc::new(CatalogRecordingProvider::new(None, None));
-    let (action_tx, _action_rx) = mpsc::channel::<Action>(128);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(CatalogRecordingProvider::new(None, Some(CORE_TOOL)));
+    let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
+    let cancellation = CancellationToken::new();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
+    config.causal_tree.enabled = false;
+    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
+    config.tool_tiering.always_include.push(CORE_TOOL.to_owned());
+    let mut tools = probe_tools(false);
+    tools.retain(|tool| tool.name() != CORE_TOOL);
+    tools.insert(
+        0,
+        Box::new(CountingProbe {
+            name: CORE_TOOL,
+            executions: Arc::clone(&executions),
+        }) as Box<dyn Tool>,
+    );
     let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
-        provider,
-        Some(probe_registry()),
+        provider.clone(),
+        Some(crate::agent::test_admission::registry_with_search(tools)),
         config,
         ("ollama", "tiering-model", None),
-        ("prx_builtin_named_tool", EXTENDED_TOOL),
-        action_tx,
-        CancellationToken::new(),
+        ("prx_named_tool", CORE_TOOL),
+        action_tx.clone(),
+        cancellation.clone(),
     )
     .await;
-    let routing = admitted.binding.decision_routing().expect("builtin chat decision");
+    let routing = admitted.binding.decision_routing().expect("named-tool chat decision");
+    assert!(
+        routing.context.engine().prediction.is_none(),
+        "chat decide uses open_turn_context with no prediction port"
+    );
     assert!(matches!(
         routing.context.directive(),
         crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
     ));
-    assert!(matches!(
-        routing.context.engine().selection,
-        crate::causal_tree::decision_select::Selection::Abstain {
-            action: crate::causal_tree::branch::CausalActionKind::Answer,
-            ..
-        }
-    ));
-    assert!(routing.context.execution_refs().is_empty());
-    assert!(routing.context.audit_hops().any(|hop| {
-        hop.prediction
-            .as_ref()
-            .is_some_and(|p| p.served_by == crate::decision::factory::ServedBy::Builtin)
-    }));
     assert!(admitted.binding.fixed_reply().expect("model-backed Answer").is_none());
-    routing.context.terminal_execution_trace();
+    let history = vec![
+        ChatMessage::system("tiering system"),
+        ChatMessage::user(CORE_TOOL),
+    ];
+    drive_start_turn_stream(
+        Some(admitted.binding),
+        None,
+        provider.clone(),
+        history.clone(),
+        history,
+        "tiering-model".to_owned(),
+        0.0,
+        None,
+        cancellation,
+        "prx_named_tool".to_owned(),
+        action_tx.clone(),
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
+        None,
+        crate::agent::turn_contracts::ChatMode::Edit,
+        Arc::new(crate::observability::noop::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
+    )
+    .await;
+    drop(action_tx);
+    let mut completed = false;
+    while let Some(action) = action_rx.recv().await {
+        match action {
+            Action::StreamFailed { err, .. } => panic!("named-tool chat turn failed: {err}"),
+            Action::StreamCompleted { .. } => completed = true,
+            _ => {}
+        }
+    }
+    assert!(completed, "named-tool fixture must complete an actual provider turn");
+    let offers = provider.offered.lock().clone();
+    let first = offers.first().expect("named-tool provider offer");
+    assert!(
+        contains(first, CORE_TOOL),
+        "named tool must be published to the provider: {first:?}"
+    );
+    assert_eq!(
+        executions.load(AtomicOrdering::SeqCst),
+        1,
+        "named tool must be dispatched"
+    );
 }
 
 #[tokio::test]

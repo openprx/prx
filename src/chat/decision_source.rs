@@ -854,7 +854,7 @@ impl ChatTurnBinding {
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
-        self.decide_mode(service, cancellation, false).await
+        self.issue_decision(service, cancellation, false).await
     }
 
     pub(super) async fn decide_resume(
@@ -862,10 +862,10 @@ impl ChatTurnBinding {
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
-        self.decide_mode(service, cancellation, true).await
+        self.issue_decision(service, cancellation, true).await
     }
 
-    async fn decide_mode(
+    async fn issue_decision(
         &self,
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
         cancellation: &tokio_util::sync::CancellationToken,
@@ -884,7 +884,10 @@ impl ChatTurnBinding {
                 let context = if resume {
                     service.decide_agent_resume(self, kind, cancellation).await?
                 } else {
-                    service.decide_agent_initial(self, kind, cancellation).await?
+                    let opened = service.open_turn_context(self, kind, cancellation).await?;
+                    service
+                        .record_opened_context(self, opened, cancellation)
+                        .await?
                 };
                 let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
@@ -2022,7 +2025,13 @@ pub(crate) mod admission_failure_tests {
             if enabled && mode != DecisionMode::Post {
                 let advice = advice.expect("pre/both analysis from actual chat decision");
                 assert_eq!(advice.decision_id, context.decision_id().to_string());
-                assert!(!advice.global.is_empty(), "real prediction answers must be projected");
+                // Chat decide no longer runs a prediction port; advice copies
+                // whatever answers the opened context has (none when engine-off
+                // construction is used).
+                assert!(
+                    context.engine().prediction.is_none(),
+                    "chat decide uses open_turn_context"
+                );
             } else {
                 assert!(advice.is_none());
             }

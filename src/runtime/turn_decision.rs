@@ -1966,9 +1966,10 @@ impl TurnDecisionService {
         })
     }
 
-    /// Build the turn context, G6 slice and SendLimits with the engine off:
-    /// no prediction port and no directive from selection. The turn engine
-    /// stamps the call budget from this context.
+    /// Build the turn context, G6 slice and SendLimits without a prediction
+    /// port or a directive from selection. Engine-on advice is projected
+    /// separately through `analyze_advisory`. The turn engine stamps the
+    /// call budget from this context.
     pub(crate) async fn open_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
@@ -1977,9 +1978,6 @@ impl TurnDecisionService {
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
-        }
-        if self.generation.effective.decision_engine.enabled {
-            return Err(AgentDecisionError::UnsupportedAction);
         }
         let event_namespace = self
             .store
@@ -2144,7 +2142,7 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        // R1a: keeps open_turn_context reachable; removed when R3a switches this entry.
+        // R1a: keeps open_turn_context reachable; removed when R3b switches agent entries.
         if cancellation.is_cancelled() && !self.generation.effective.decision_engine.enabled {
             return self.open_turn_context(proof, kind, cancellation).await;
         }
