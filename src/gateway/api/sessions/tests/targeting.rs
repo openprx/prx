@@ -790,6 +790,7 @@ async fn drive(
                     let decision = ConsoleDecisionTurn {
                         service: Arc::clone(&service),
                         context,
+                        advice: None,
                         proof: &proof,
                         cancellation,
                         provider_trace: None,

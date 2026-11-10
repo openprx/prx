@@ -459,6 +459,8 @@ pub struct DecisionBackendFactory {
     config_generation: u64,
     #[cfg(test)]
     prediction_port_calls: AtomicUsize,
+    #[cfg(test)]
+    workspace: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for DecisionBackendFactory {
@@ -688,6 +690,8 @@ impl DecisionBackendFactory {
     ) -> AccountedPrediction<'a> {
         #[cfg(test)]
         self.prediction_port_calls.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record_factory(&self.workspace);
         AccountedPrediction {
             factory: self,
             accounting,
@@ -776,9 +780,9 @@ impl DecisionBackendFactory {
         // would fail once enabled fails now. It reads local state only.
         let selected = match configured_selection(section) {
             None => None,
-            // A disabled plane builds no backend; it never opens the
-            // credential store (D-082 N-9).
-            Some(selection) if !section.enabled => {
+            // A disabled plane, and a disabled decision engine, build no
+            // backend; they never open the credential store (D-082 N-9).
+            Some(selection) if !section.enabled || !config.decision_engine.enabled => {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
                     &selection.provider,
@@ -875,6 +879,8 @@ impl DecisionBackendFactory {
             config_generation: deps.config_generation,
             #[cfg(test)]
             prediction_port_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            workspace: config.workspace_dir.clone(),
         })
     }
 
@@ -893,6 +899,8 @@ impl DecisionBackendFactory {
             config_generation: 0,
             #[cfg(test)]
             prediction_port_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            workspace: config.workspace_dir.clone(),
         }
     }
 
@@ -958,6 +966,7 @@ impl DecisionBackendFactory {
             secrets,
             config_generation: 0,
             prediction_port_calls: AtomicUsize::new(0),
+            workspace: std::path::PathBuf::new(),
         }
     }
 

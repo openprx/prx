@@ -622,6 +622,90 @@ fn test_connect_info() -> ConnectInfo<SocketAddr> {
     ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
 }
 
+struct EngineOffWebhookProvider;
+
+#[async_trait]
+impl Provider for EngineOffWebhookProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("ok".into())
+    }
+
+    async fn chat(
+        &self,
+        _request: crate::providers::ChatRequest<'_>,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<crate::providers::ChatResponse> {
+        Ok(crate::providers::ChatResponse {
+            text: Some("ok".into()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+pub(super) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::Path) {
+    let provider: Arc<dyn Provider> = Arc::new(EngineOffWebhookProvider);
+    let mut config = webhook_test_config();
+    config.workspace_dir = workspace.to_path_buf();
+    config.config_path = workspace.join("config.toml");
+    config.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider": "mock",
+            "model": "test-model",
+            "operations": ["chat"],
+            "native_tools": true,
+        }))
+        .expect("webhook model declaration"),
+    );
+    let mut state = AppState {
+        config: crate::config::new_shared(config),
+        provider,
+        model: "test-model".into(),
+        temperature: 0.0,
+        mem: Arc::new(SqliteMemory::new(workspace).expect("webhook sqlite")),
+        auto_save: false,
+        tools_registry: Arc::new(vec![]),
+        mcp_tool: None,
+        turn_runtime: None,
+        hooks: Arc::new(HookManager::new(workspace.to_path_buf())),
+        webhook_token_hash: None,
+        webhook_signing_secret: None,
+        pairing: Arc::new(PairingGuard::new(false, &[])),
+        trust_forwarded_headers: false,
+        rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+        idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+        whatsapp: None,
+        signal: None,
+        whatsapp_app_secret: None,
+        linq: None,
+        linq_signing_secret: None,
+        nextcloud_talk: None,
+        nextcloud_talk_webhook_secret: None,
+        observer: Arc::new(crate::observability::NoopObserver),
+        start_time: Instant::now(),
+        gateway_port: 0,
+        logs_broadcast_tx: broadcast::channel(16).0,
+        #[cfg(feature = "wasm-plugins")]
+        plugin_runtime: None,
+    };
+    install_webhook_turn_runtime(&mut state);
+    let _ = handle_webhook(
+        State(state),
+        test_connect_info(),
+        test_uri(),
+        HeaderMap::new(),
+        Bytes::from_static(br#"{"message":"hello","reply_target":"client-a"}"#),
+    )
+    .await;
+}
+
 fn webhook_test_config() -> Config {
     let mut config = Config::default();
     config.default_provider = Some("mock".to_owned());

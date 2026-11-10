@@ -244,6 +244,8 @@ pub fn check_decision_backend(
     credential: CredentialRef,
 ) -> Result<ResolvedModel, ResolutionError> {
     hosted_decision_rules(provider, model, &credential)?;
+    #[cfg(test)]
+    crate::decision_engine::access_spy::record(&config.workspace_dir, true);
     catalog::resolve(
         &catalog::Selection {
             provider,

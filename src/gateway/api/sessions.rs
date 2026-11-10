@@ -543,6 +543,7 @@ struct ConsoleTurnResult {
 struct ConsoleDecisionTurn<'a> {
     service: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionService>,
     context: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    advice: Option<crate::decision_engine::IntentAnalysis>,
     proof: &'a crate::gateway::decision_source::GatewayTurnProof,
     cancellation: tokio_util::sync::CancellationToken,
     provider_trace: Option<(
@@ -685,7 +686,7 @@ async fn run_console_runtime_turn(
     let loop_result = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
-            advice: None,
+            advice: decision.advice.clone(),
             channel_name: "console",
             scope: Some(&scope_ctx),
             mode: crate::agent::turn_contracts::ChatMode::default(),
@@ -2257,17 +2258,20 @@ async fn run_console_message_job_work(
                         .map_err(|_| "Console decision publication failed".to_owned())?;
                     let kind = crate::runtime::turn_decision::AgentTurnKind::SingleShot;
                     let context = match mode {
-                        ConsoleTurnMode::Message => service.decide_agent_initial(proof, kind, &cancellation).await,
+                        ConsoleTurnMode::Message => {
+                            service.open_issued_turn_context(proof, kind, &cancellation).await
+                        }
                         ConsoleTurnMode::Resume => service.decide_agent_resume(proof, kind, &cancellation).await,
                     }
                     .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
-                    Ok::<_, String>((service, context))
+                    let advice = service.analyze_advisory(&context, &cancellation).await;
+                    Ok::<_, String>((service, context, advice))
                 }
                 .await;
                 admitted.map_err(anyhow::Error::msg)
             }))
             .await;
-        let (service, context) = match admission {
+        let (service, context, advice) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
                 // No future is still polling admission. Close/drain its owned
@@ -2306,6 +2310,7 @@ async fn run_console_message_job_work(
             service: std::sync::Arc::clone(service),
             provider_trace,
             context,
+            advice,
             proof,
             cancellation: cancellation.clone(),
         }
@@ -2695,6 +2700,11 @@ pub async fn get_session_media(
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_disabled_engine_console_entry(workspace: &std::path::Path) {
+    tests::drive_disabled_engine_console_entry(workspace).await;
+}
+
+#[cfg(test)]
 mod tests {
     mod collection;
     mod targeting;
@@ -2709,6 +2719,55 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::broadcast;
+
+    pub(super) async fn drive_disabled_engine_console_entry(workspace: &std::path::Path) {
+        let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+            .expect("console engine-off cleanup");
+        cleanup
+            .run(Box::pin(async {
+                let mut config = Config::default();
+                config.workspace_dir = workspace.to_owned();
+                config.config_path = workspace.join("config.toml");
+                config.default_provider = Some("ollama".to_owned());
+                config.default_model = Some("test-model".to_owned());
+                config.providers.models.push(
+                    toml::from_str(
+                        "provider = \"ollama\"\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = false\n",
+                    )
+                    .expect("console model declaration"),
+                );
+                config.cost.prices.insert(
+                    "ollama/test-model".to_owned(),
+                    crate::config::schema::ModelPricing {
+                        input: 1.0,
+                        output: 1.0,
+                        cache_write: 1.0,
+                        cache_read: 1.0,
+                    },
+                );
+                let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+                let mut state = test_app_state_with_config(config, provider);
+                let envelope = console_runtime_envelope_for_workspace(
+                    workspace.to_string_lossy().to_string(),
+                    "console-engine-off",
+                    "console",
+                    "prx_user",
+                );
+                let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "hello").await;
+                let _ = run_console_message_job(
+                    runtime,
+                    state,
+                    "hello".to_string(),
+                    Vec::new(),
+                    ConsoleTurnSource::Message(proof),
+                    None,
+                )
+                .await;
+                Ok::<(), anyhow::Error>(())
+            }))
+            .await
+            .expect("console engine-off entry");
+    }
 
     #[test]
     fn console_error_kind_never_carries_error_text() {
@@ -3153,6 +3212,7 @@ mod tests {
                         let decision = ConsoleDecisionTurn {
                             service: service.clone(),
                             context,
+                            advice: None,
                             proof: &proof,
                             cancellation,
                             provider_trace: None,
@@ -3269,6 +3329,7 @@ mod tests {
                 let decision = ConsoleDecisionTurn {
                     service: Arc::clone(&service),
                     context,
+                    advice: None,
                     proof: &proof,
                     cancellation,
                     provider_trace: None,
@@ -3534,6 +3595,7 @@ mod tests {
                 let decision = ConsoleDecisionTurn {
                     service: service.clone(),
                     context,
+                    advice: None,
                     proof: &proof,
                     cancellation,
                     provider_trace: None,

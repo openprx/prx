@@ -355,3 +355,5 @@ impl InFlightTaskCompletion {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::drive_disabled_engine_channel_entry;

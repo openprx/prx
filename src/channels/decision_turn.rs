@@ -8,6 +8,7 @@ pub(super) struct ChannelDecisionTurn {
     service: Arc<TurnDecisionService>,
     proof: super::decision_source::ChannelTurnProof,
     context: Arc<TurnDecisionContext>,
+    advice: Option<crate::decision_engine::IntentAnalysis>,
     terminal: crate::runtime::turn_terminal::TurnTerminalGuard,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
     recalled_context: String,
@@ -117,12 +118,13 @@ impl ChannelDecisionTurn {
         let envelope = source.envelope().clone();
         let trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
         let context = service
-            .decide_agent_initial(
+            .open_issued_turn_context(
                 &proof,
                 crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                 cancellation,
             )
             .await?;
+        let advice = service.analyze_advisory(&context, cancellation).await;
         let terminal = crate::runtime::turn_terminal::TurnTerminalGuard::new(
             admission.take_terminal_ticket()?,
             Arc::clone(&service),
@@ -158,6 +160,7 @@ impl ChannelDecisionTurn {
             service,
             proof,
             context,
+            advice,
             terminal,
             envelope,
             recalled_context,
@@ -288,6 +291,9 @@ impl ChannelDecisionTurn {
             context: &self.context,
             proof: &self.proof,
         }
+    }
+    pub(super) fn advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
+        self.advice.clone()
     }
     pub(super) fn compaction(&self) -> &crate::config::AgentCompactionConfig {
         self.context.main_compaction()

@@ -767,7 +767,7 @@ async fn pre_and_both_preserve_disabled_serving_tools_and_fingerprint() {
 
 #[test]
 fn access_spies_observe_actual_store_and_credential_sites() {
-    use crate::providers::credentials::{ConfigCredentialSource, CredentialRef, CredentialSource};
+    use crate::providers::credentials::CredentialRef;
     let directory = tempfile::tempdir().unwrap();
     let spy = access_spy::AccessSpy::new(directory.path());
     let config = crate::config::Config {
@@ -775,9 +775,14 @@ fn access_spies_observe_actual_store_and_credential_sites() {
         ..Default::default()
     };
     SqliteTelemetryWriter::open(&directory.path().join("decision-engine.sqlite")).unwrap();
-    ConfigCredentialSource::new(&config)
-        .material(&CredentialRef::None)
-        .unwrap();
+    let catalog = crate::providers::selection::catalog_for(&config);
+    let _ = crate::providers::selection::check_decision_backend(
+        &config,
+        &catalog,
+        "ollama",
+        "prx-local-model",
+        CredentialRef::None,
+    );
     assert_eq!(spy.counts.stores.load(Ordering::SeqCst), 1);
     assert_eq!(spy.counts.credentials.load(Ordering::SeqCst), 1);
 }

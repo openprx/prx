@@ -1093,3 +1093,35 @@ async fn step_7_1_same_blocking_fixture_characterizes_cancellation_terminals() {
         Some("fixture user")
     );
 }
+
+pub(crate) async fn drive_disabled_engine_chat_entry(workspace: &std::path::Path) {
+    let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.config_path = workspace.join("config.toml");
+    let provider: Arc<dyn Provider> = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
+        chunks: vec!["ok".to_owned()],
+        reasoning: String::new(),
+        usage: reported_usage(1, 1),
+    }]));
+    let admitted = admit_chat_fixture_with_config(
+        provider,
+        None,
+        config,
+        ("ollama", "prx-local-model", None),
+        ("engine-off-chat", "hello"),
+        action_tx,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        admitted
+            .binding
+            .decision_routing()
+            .expect("chat decide issued")
+            .context
+            .engine()
+            .prediction
+            .is_none()
+    );
+}

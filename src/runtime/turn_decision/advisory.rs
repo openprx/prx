@@ -47,6 +47,10 @@ impl TurnDecisionService {
                         }
                     };
                     observations.register_status(&self.generation.effective.workspace_dir);
+                    #[cfg(test)]
+                    crate::decision_engine::access_spy::record_constructor(
+                        &self.generation.effective.workspace_dir,
+                    );
                     AdvisoryRuntime {
                         engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
                         cancellation,
@@ -83,6 +87,8 @@ impl TurnDecisionService {
         if !config.enabled || config.mode == DecisionMode::Post {
             return None;
         }
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record_constructor(&self.generation.effective.workspace_dir);
         // Analysis needs only validated answers. Defer store construction until
         // the final observation so telemetry I/O cannot extend its timeout.
         let engine = crate::decision_engine::causal_adapter::CausalEngine {

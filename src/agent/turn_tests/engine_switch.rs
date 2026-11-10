@@ -703,3 +703,224 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
         "discovered tool must be dispatched"
     );
 }
+
+fn engine_off_config(workspace: &std::path::Path) -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.config_path = workspace.join("config.toml");
+    config.default_provider = Some("ollama".to_owned());
+    config.default_model = Some("prx-local-model".to_owned());
+    config.memory.auto_save = false;
+    config.cost.prices.insert(
+        "ollama/prx-local-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.providers.models.push(crate::config::schema::ProviderModelConfig {
+        provider: "ollama".to_owned(),
+        model: Some("prx-local-model".to_owned()),
+        operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+        native_tools: Some(true),
+        vision_input: None,
+        streaming: None,
+        structured_output: None,
+        tool_schema_dialect: None,
+        tool_call_dialect: None,
+        context_window: None,
+    });
+    assert!(
+        !config.decision_engine.enabled,
+        "this cell runs with the decision engine off"
+    );
+    config
+}
+
+async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::config::Config) {
+    config.workspace_dir = workspace.to_owned();
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace).expect("agent sqlite"));
+    let provider = EngineOffProvider {
+        published: Arc::new(Mutex::new(Vec::new())),
+        responses: Mutex::new(
+            vec![ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            }]
+            .into(),
+        ),
+    };
+    let mut agent = crate::agent::agent::Agent::builder()
+        .runtime_config(config, "ollama")
+        .workspace_dir(workspace.to_owned())
+        .provider(Box::new(provider))
+        .tools(Vec::new())
+        .memory(memory)
+        .observer(Arc::new(crate::observability::NoopObserver))
+        .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+        .build()
+        .expect("agent entry");
+    let _ = agent.turn("hello").await;
+}
+
+/// Disabled engine never constructs a factory, telemetry store, or credential
+/// resolution on any production entry. Recovery still follows `[causal_tree]`.
+#[tokio::test]
+async fn disabled_engine_constructs_nothing() {
+    fn assert_cell(name: &str, workspace: &std::path::Path, spy: &crate::decision_engine::access_spy::AccessSpy) {
+        spy.assert_constructs_nothing(name);
+        assert!(
+            !workspace.join("decision-engine.sqlite").exists(),
+            "{name}: decision-engine.sqlite must not be created"
+        );
+    }
+
+    {
+        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        drive_agent_entry(workspace.path(), engine_off_config(workspace.path())).await;
+        assert_cell("agent", workspace.path(), &spy);
+    }
+    {
+        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        crate::chat::dispatcher::drive_disabled_engine_chat_entry(workspace.path()).await;
+        assert_cell("chat", workspace.path(), &spy);
+    }
+    {
+        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        crate::channels::drive_disabled_engine_channel_entry(workspace.path()).await;
+        assert_cell("channel", workspace.path(), &spy);
+    }
+    {
+        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        crate::gateway::drive_disabled_engine_webhook_entry(workspace.path()).await;
+        assert_cell("gateway", workspace.path(), &spy);
+    }
+    {
+        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        crate::gateway::drive_disabled_engine_console_entry(workspace.path()).await;
+        assert_cell("console", workspace.path(), &spy);
+    }
+
+    let workspace = tempfile::tempdir().expect("remote-keys workspace");
+    let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+    let mut config = engine_off_config(workspace.path());
+    config.causal_tree.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+    config.causal_tree.backend.remote_enabled = true;
+    config.causal_tree.backend.endpoint = "https://example.invalid/v1".into();
+    config.causal_tree.backend.model = "decision-model".into();
+    config.causal_tree.backend.credential_ref =
+        crate::causal_tree::config::CredentialRefSetting::Profile("cred-engine-off".into());
+    config.providers.models.push(
+        serde_json::from_value(serde_json::json!({
+            "provider": "custom:https://example.invalid/v1",
+            "model": "decision-model",
+            "operations": ["decision_endpoint"],
+        }))
+        .expect("decision model declaration"),
+    );
+    drive_agent_entry(workspace.path(), config).await;
+    spy.assert_constructs_nothing("causal_tree remote keys");
+    assert!(
+        workspace.path().join("self/causal_tree/decisions.db").exists()
+            || workspace.path().join("self/causal_tree").exists(),
+        "recovery stays on when [causal_tree].enabled is true"
+    );
+}
+
+/// Enabled engine projects an advisory brief and leaves the published tool
+/// surface identical to the disabled path.
+#[tokio::test]
+async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
+    async fn published_tools(enabled: bool) -> (Vec<String>, Vec<String>) {
+        let workspace = tempfile::tempdir().expect("brief workspace");
+        let mut config = engine_off_config(workspace.path());
+        config.decision_engine.enabled = enabled;
+        config.tool_tiering.always_include.push("project_tool".into());
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("brief sqlite"));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let systems = Arc::new(Mutex::new(Vec::new()));
+        struct BriefProvider {
+            published: Arc<Mutex<Vec<String>>>,
+            systems: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Provider for BriefProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: true,
+                    vision: false,
+                }
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                anyhow::bail!("fixture requires a structured request")
+            }
+            async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                *self.published.lock().expect("published") = request
+                    .tools
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|spec| spec.name.clone())
+                    .collect();
+                *self.systems.lock().expect("systems") = request
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == "system")
+                    .map(|message| message.content.clone())
+                    .collect();
+                Ok(ChatResponse {
+                    text: Some("ok".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+        }
+        let mut agent = crate::agent::agent::Agent::builder()
+            .runtime_config(config, "ollama")
+            .workspace_dir(workspace.path().to_owned())
+            .provider(Box::new(BriefProvider {
+                published: Arc::clone(&published),
+                systems: Arc::clone(&systems),
+            }))
+            .tools(vec![Box::new(RecordingTool {
+                name: "project_tool".to_owned(),
+                execution_order: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn Tool>])
+            .memory(memory)
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .build()
+            .expect("brief agent");
+        let _ = agent.turn("hello").await;
+        (
+            published.lock().expect("published").clone(),
+            systems.lock().expect("systems").clone(),
+        )
+    }
+    let (disabled_tools, disabled_systems) = published_tools(false).await;
+    let (enabled_tools, enabled_systems) = published_tools(true).await;
+    assert_eq!(disabled_tools, enabled_tools, "tool surface must not change");
+    assert!(
+        disabled_systems
+            .iter()
+            .all(|text| !text.contains("Decision advice (advisory only):")),
+        "disabled engine must not add a brief: {disabled_systems:?}"
+    );
+    assert!(
+        enabled_systems
+            .iter()
+            .any(|text| text.contains("Decision advice (advisory only):")),
+        "enabled engine must add a brief: {enabled_systems:?}"
+    );
+}

@@ -12,6 +12,8 @@ use std::{
 pub(crate) struct AccessCounts {
     pub stores: AtomicUsize,
     pub credentials: AtomicUsize,
+    pub factory: AtomicUsize,
+    pub constructor: AtomicUsize,
 }
 static SPIES: LazyLock<Mutex<HashMap<PathBuf, Weak<AccessCounts>>>> = LazyLock::new(Default::default);
 pub(crate) struct AccessSpy {
@@ -27,6 +29,29 @@ impl AccessSpy {
             counts,
         }
     }
+
+    pub fn assert_constructs_nothing(&self, cell: &str) {
+        assert_eq!(
+            self.counts.factory.load(Ordering::SeqCst),
+            0,
+            "{cell}: prediction_port must not run"
+        );
+        assert_eq!(
+            self.counts.constructor.load(Ordering::SeqCst),
+            0,
+            "{cell}: decision engine constructor must not run"
+        );
+        assert_eq!(
+            self.counts.stores.load(Ordering::SeqCst),
+            0,
+            "{cell}: SqliteTelemetryWriter::open must not run"
+        );
+        assert_eq!(
+            self.counts.credentials.load(Ordering::SeqCst),
+            0,
+            "{cell}: decision-backend credential resolver must not run"
+        );
+    }
 }
 impl Drop for AccessSpy {
     fn drop(&mut self) {
@@ -34,13 +59,26 @@ impl Drop for AccessSpy {
     }
 }
 pub(crate) fn record(workspace: &Path, credential: bool) {
-    let counts = SPIES.lock().get(workspace).and_then(Weak::upgrade);
-    if let Some(counts) = counts {
-        let counter = if credential {
+    bump(workspace, |counts| {
+        if credential {
             &counts.credentials
         } else {
             &counts.stores
-        };
-        counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+}
+
+pub(crate) fn record_factory(workspace: &Path) {
+    bump(workspace, |counts| &counts.factory);
+}
+
+pub(crate) fn record_constructor(workspace: &Path) {
+    bump(workspace, |counts| &counts.constructor);
+}
+
+fn bump(workspace: &Path, counter: impl FnOnce(&AccessCounts) -> &AtomicUsize) {
+    let counts = SPIES.lock().get(workspace).and_then(Weak::upgrade);
+    if let Some(counts) = counts {
+        counter(&counts).fetch_add(1, Ordering::SeqCst);
     }
 }

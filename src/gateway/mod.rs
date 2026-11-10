@@ -25,6 +25,8 @@
 
 mod agent_lifecycle;
 mod api;
+#[cfg(test)]
+pub(crate) use api::drive_disabled_engine_console_entry;
 mod compat;
 mod decision_cleanup;
 mod decision_runtime;
@@ -2649,7 +2651,7 @@ async fn run_gateway_chat_with_multimodal(
         .scope_admission(Box::pin(async {
             let service = turn_runtime.decision_slot.publish(&turn_runtime, state).await?;
             let context = service
-                .decide_agent_initial(
+                .open_issued_turn_context(
                     &gateway_proof,
                     crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                     &cancellation,
@@ -2873,7 +2875,7 @@ async fn run_gateway_chat_with_multimodal(
                     run_turn(
                         &mut history,
                         crate::agent::turn_request::TurnRequest {
-                            advice: None,
+                            advice: service.analyze_advisory(&context, &cancellation).await,
                             // no approval manager
                             channel_name: "webhook",
                             // no streaming delta sender
@@ -4010,3 +4012,5 @@ mod platform_test_transport;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::drive_disabled_engine_webhook_entry;

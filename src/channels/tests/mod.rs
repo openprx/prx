@@ -46,6 +46,91 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+pub(super) async fn drive_disabled_engine_channel_entry(workspace: &std::path::Path) {
+    let mut config = Config::default();
+    config.workspace_dir = workspace.to_owned();
+    config.config_path = workspace.join("config.toml");
+    config.default_provider = Some("test-provider".to_owned());
+    config.default_model = Some("test-model".to_owned());
+    config.cost.prices.insert(
+        "test-provider/test-model".to_owned(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let shared = crate::config::new_shared(config);
+    let generation = shared.pin();
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl;
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        config: shared,
+        config_generation: generation,
+        channels_by_name: Arc::new(channels_by_name),
+        provider: Arc::new(DummyProvider),
+        default_provider: Arc::new("test-provider".to_string()),
+        memory: Arc::new(crate::memory::SqliteMemory::new(workspace).expect("channel sqlite")),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf())),
+        model: Arc::new("test-model".to_string()),
+        temperature: 0.0,
+        auto_save_memory: false,
+        memory_event_recording: MemoryEventRecording::default(),
+        read_only_tool_concurrency_window: 2,
+        priority_scheduling_enabled: false,
+        low_priority_tools: Vec::new(),
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: None,
+        api_url: None,
+        reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+        interrupt_on_new_message: false,
+        multimodal: crate::config::MultimodalConfig::default(),
+        security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+        })),
+        provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(workspace.to_path_buf()),
+        tool_tiering: crate::config::ToolTieringConfig::default(),
+        signal_inbound_policy: None,
+        whatsapp_inbound_policy: None,
+        bot_names: vec!["prx".to_string()],
+        bot_uuids: vec![],
+        mention_only_by_channel: HashMap::new(),
+        group_reply_mode_by_channel: HashMap::new(),
+        smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        test_inbound_authorizer: None,
+    });
+    run_owned_channel_probe(
+        runtime_ctx,
+        traits::ChannelMessage {
+            id: "engine-off-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        },
+        CancellationToken::new(),
+    )
+    .await;
+}
+
 fn make_workspace() -> TempDir {
     let tmp = TempDir::new().unwrap();
     // Create minimal workspace files
