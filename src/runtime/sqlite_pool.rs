@@ -46,6 +46,8 @@
 //! process emits a periodic `warn!` for as long as it is held.
 
 use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -121,6 +123,8 @@ pub fn default_read_pool_size() -> usize {
 /// retries it logs, because an unbounded wait is only defensible while it can
 /// be seen from the outside.
 fn wait_for_database_lock(attempts: i32) -> bool {
+    #[cfg(test)]
+    notify_busy_wait_watch();
     let attempt = u64::try_from(attempts).unwrap_or(0);
     if attempt > 0 && attempt.is_multiple_of(BUSY_WARN_EVERY_ATTEMPTS) {
         tracing::warn!(
@@ -547,7 +551,7 @@ impl SqliteConnectionPool {
     pub fn write(&self) -> SqliteWriteGuard<'_> {
         if let Some(guard) = self.writer.try_lock() {
             self.metrics.write_acquisitions.fetch_add(1, Ordering::Relaxed);
-            return SqliteWriteGuard { pool: self, guard };
+            return self.hold_writer(guard);
         }
 
         // Another write is in flight. Wait it out without a deadline: SQLite
@@ -569,7 +573,7 @@ impl SqliteConnectionPool {
             waited_ms = waited.as_millis(),
             "SQLite writer busy; caller queued instead of failing"
         );
-        SqliteWriteGuard { pool: self, guard }
+        self.hold_writer(guard)
     }
 
     /// Acquire the writer within a caller-owned deadline. Ordinary writers
@@ -611,7 +615,16 @@ impl SqliteConnectionPool {
             "SQLite writer deadline elapsed"
         );
         self.metrics.write_acquisitions.fetch_add(1, Ordering::Relaxed);
-        Ok(SqliteWriteGuard { pool: self, guard })
+        Ok(self.hold_writer(guard))
+    }
+
+    #[allow(clippy::missing_const_for_fn)] // test builds bind a thread-local path here
+    fn hold_writer<'a>(&'a self, guard: MutexGuard<'a, Connection>) -> SqliteWriteGuard<'a> {
+        #[cfg(test)]
+        WRITE_DB_PATH.with(|cell| {
+            *cell.borrow_mut() = Some(Arc::clone(&self.db_path));
+        });
+        SqliteWriteGuard { pool: self, guard }
     }
 
     /// Snapshot the pool counters.
@@ -827,6 +840,71 @@ impl Drop for SqliteWriteGuard<'_> {
                 tracing::warn!(%error, "failed to roll back leftover SQLite write transaction");
             }
         }
+        #[cfg(test)]
+        WRITE_DB_PATH.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_DB_PATH: RefCell<Option<Arc<Path>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct BusyWaitWatch {
+    db_path: PathBuf,
+    waiting: mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+static BUSY_WAIT_WATCH: Mutex<Option<BusyWaitWatch>> = Mutex::new(None);
+
+#[cfg(test)]
+fn db_paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn notify_busy_wait_watch() {
+    let path = WRITE_DB_PATH.with(|cell| cell.borrow().clone());
+    let Some(path) = path else {
+        return;
+    };
+    let watch = BUSY_WAIT_WATCH.lock();
+    let Some(watch) = watch.as_ref() else {
+        return;
+    };
+    if db_paths_match(&path, &watch.db_path) {
+        let _ = watch.waiting.try_send(());
+    }
+}
+
+/// Observe the next SQLite busy-handler wait on `db_path` (BEGIN IMMEDIATE
+/// blocked by another pool's write lock). Unrelated databases leave the watch
+/// in place.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn arm_busy_wait_watch(db_path: PathBuf) -> (mpsc::Receiver<()>, BusyWaitWatchGuard) {
+    let (waiting, rx) = mpsc::sync_channel(1);
+    *BUSY_WAIT_WATCH.lock() = Some(BusyWaitWatch { db_path, waiting });
+    (rx, BusyWaitWatchGuard)
+}
+
+#[cfg(test)]
+pub(crate) struct BusyWaitWatchGuard;
+
+#[cfg(test)]
+impl Drop for BusyWaitWatchGuard {
+    fn drop(&mut self) {
+        *BUSY_WAIT_WATCH.lock() = None;
     }
 }
 
