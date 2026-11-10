@@ -689,6 +689,7 @@ async fn postgres_memory_fabric_conformance_from_env() {
     let link = mem
         .link_memory_source(MemoryLinkInput {
             agent_partition: None,
+            session_key: None,
             link_id: Some("link-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner-a".to_string()),

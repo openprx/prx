@@ -35,29 +35,47 @@ pub fn create_topic(
     project: Option<&str>,
     external_id: Option<&str>,
     fingerprint: &str,
+    ma_scope_id: Option<&str>,
 ) -> Result<String> {
     let now = Utc::now().to_rfc3339();
     let topic_id = Uuid::new_v4().to_string();
+    let guard = " WHERE (topics.ma_scope_id IS excluded.ma_scope_id OR EXISTS(SELECT 1 FROM agent_scopes o JOIN agent_scopes n ON n.scope_id=excluded.ma_scope_id WHERE o.scope_id=topics.ma_scope_id AND o.workspace_id=n.workspace_id AND o.owner_id=n.owner_id AND o.agent_key=n.agent_key AND o.incarnation=n.incarnation) OR (topics.ma_scope_id IS NULL AND excluded.ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE agent_key='m')) OR (excluded.ma_scope_id IS NULL AND EXISTS(SELECT 1 FROM agent_scopes o WHERE o.scope_id=topics.ma_scope_id AND o.agent_key='m')))";
+    let coalesce = "ma_scope_id = COALESCE(excluded.ma_scope_id, topics.ma_scope_id)";
 
     if let Some(external_id) = external_id {
         let external_project = canonical_project_for_external(project);
         let id: String = conn.query_row(
-            "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
-             ON CONFLICT(project, external_id) DO UPDATE SET updated_at = excluded.updated_at
-             RETURNING id",
-            params![&topic_id, title, external_project, external_id, fingerprint, &now, &now],
+            &format!(
+                "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at, ma_scope_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8)
+             ON CONFLICT(project, external_id) DO UPDATE SET updated_at = excluded.updated_at, {coalesce}
+             {guard}
+             RETURNING id"
+            ),
+            params![
+                &topic_id,
+                title,
+                external_project,
+                external_id,
+                fingerprint,
+                &now,
+                &now,
+                ma_scope_id
+            ],
             |row| row.get(0),
         )?;
         return Ok(id);
     }
 
     let id: String = conn.query_row(
-        "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)
-         ON CONFLICT(fingerprint) DO UPDATE SET updated_at = excluded.updated_at
-         RETURNING id",
-        params![&topic_id, title, project, external_id, fingerprint, &now, &now],
+        &format!(
+            "INSERT INTO topics (id, title, project, external_id, fingerprint, status, created_at, updated_at, ma_scope_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8)
+         ON CONFLICT(fingerprint) DO UPDATE SET updated_at = excluded.updated_at, {coalesce}
+         {guard}
+         RETURNING id"
+        ),
+        params![&topic_id, title, project, external_id, fingerprint, &now, &now, ma_scope_id],
         |row| row.get(0),
     )?;
     Ok(id)
@@ -240,7 +258,94 @@ pub fn query_topic_context(
     Ok(out)
 }
 
-pub fn resolve_topic(conn: &Connection, content: &str, principal: &Principal) -> Result<Option<String>> {
+fn topic_ma_scope(conn: &Connection, topic_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT ma_scope_id FROM topics WHERE id = ?1",
+        params![topic_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn writer_is_named(conn: &Connection, writer_scope: Option<&str>) -> Result<bool> {
+    let Some(scope) = writer_scope else {
+        return Ok(false);
+    };
+    let key: String = conn.query_row(
+        "SELECT agent_key FROM agent_scopes WHERE scope_id = ?1",
+        params![scope],
+        |row| row.get(0),
+    )?;
+    Ok(key.starts_with("n:"))
+}
+
+fn topic_scope_reusable(conn: &Connection, topic_id: &str, writer_scope: Option<&str>) -> Result<bool> {
+    let stored = topic_ma_scope(conn, topic_id)?;
+    match (stored.as_deref(), writer_scope) {
+        (None, None) => Ok(true),
+        (Some(stored), Some(writer)) if stored == writer => Ok(true),
+        (Some(stored), Some(writer)) => {
+            let same: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_scopes o
+                     JOIN agent_scopes n ON n.scope_id = ?2
+                     WHERE o.scope_id = ?1
+                       AND o.workspace_id = n.workspace_id
+                       AND o.owner_id = n.owner_id
+                       AND o.agent_key = n.agent_key
+                       AND o.incarnation = n.incarnation
+                 )",
+                params![stored, writer],
+                |row| row.get(0),
+            )?;
+            Ok(same)
+        }
+        (None, Some(writer)) => {
+            if writer_is_named(conn, Some(writer))? {
+                return Ok(false);
+            }
+            let is_main: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_scopes WHERE scope_id = ?1 AND agent_key = 'm')",
+                params![writer],
+                |row| row.get(0),
+            )?;
+            Ok(is_main)
+        }
+        (Some(stored), None) => {
+            let is_main: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_scopes WHERE scope_id = ?1 AND agent_key = 'm')",
+                params![stored],
+                |row| row.get(0),
+            )?;
+            Ok(is_main)
+        }
+    }
+}
+
+fn reuse_topic(
+    conn: &Connection,
+    topic_id: &str,
+    principal: &Principal,
+    writer_scope: Option<&str>,
+) -> Result<Option<String>> {
+    let real_id = resolve_alias(conn, topic_id)?;
+    if !topic_scope_reusable(conn, &real_id, writer_scope)? {
+        tracing::warn!("memory topic resolve skipped: conflicting topic is not the writer's incarnation");
+        return Ok(None);
+    }
+    if !writer_is_named(conn, writer_scope)? {
+        add_participant(conn, &real_id, &principal.user_id, "participant")?;
+    }
+    touch_topic(conn, &real_id)?;
+    Ok(Some(real_id))
+}
+
+pub fn resolve_topic(
+    conn: &Connection,
+    content: &str,
+    principal: &Principal,
+    writer_scope: Option<&str>,
+) -> Result<Option<String>> {
     if !needs_topic(content) {
         return Ok(None);
     }
@@ -252,10 +357,7 @@ pub fn resolve_topic(conn: &Connection, content: &str, principal: &Principal) ->
         let maybe_topic = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
 
         if let Some(topic) = maybe_topic {
-            let real_id = resolve_alias(conn, &topic.id)?;
-            add_participant(conn, &real_id, &principal.user_id, "participant")?;
-            touch_topic(conn, &real_id)?;
-            return Ok(Some(real_id));
+            return reuse_topic(conn, &topic.id, principal, writer_scope);
         }
     }
 
@@ -265,16 +367,36 @@ pub fn resolve_topic(conn: &Connection, content: &str, principal: &Principal) ->
         .into_iter()
         .find(|topic| normalize_title(&topic.title) == normalized_title)
     {
-        let real_id = resolve_alias(conn, &candidate.id)?;
-        add_participant(conn, &real_id, &principal.user_id, "participant")?;
-        touch_topic(conn, &real_id)?;
-        return Ok(Some(real_id));
+        return reuse_topic(conn, &candidate.id, principal, writer_scope);
     }
 
     let title = generate_topic_title(content);
     let fingerprint = topic_fingerprint(project.as_deref(), &title);
-    let topic_id = create_topic(conn, &title, project.as_deref(), external_id.as_deref(), &fingerprint)?;
-    add_participant(conn, &topic_id, &principal.user_id, "participant")?;
+    if let Some(existing) = find_topic_by_fingerprint(conn, &fingerprint)? {
+        return reuse_topic(conn, &existing.id, principal, writer_scope);
+    }
+    if let Some(external_id) = external_id.as_deref()
+        && let Some(existing) = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?
+    {
+        return reuse_topic(conn, &existing.id, principal, writer_scope);
+    }
+    let topic_id = match create_topic(
+        conn,
+        &title,
+        project.as_deref(),
+        external_id.as_deref(),
+        &fingerprint,
+        writer_scope,
+    ) {
+        Ok(topic_id) => topic_id,
+        Err(error) => {
+            tracing::warn!("memory topic resolve skipped: {error}");
+            return Ok(None);
+        }
+    };
+    if !writer_is_named(conn, writer_scope)? {
+        add_participant(conn, &topic_id, &principal.user_id, "participant")?;
+    }
     Ok(Some(topic_id))
 }
 
@@ -479,6 +601,7 @@ mod tests {
             Some("openpr"),
             Some("openpr#42"),
             "fp-1",
+            None,
         )
         .unwrap();
 
@@ -506,10 +629,10 @@ mod tests {
         let principal = base_principal("u-1");
         let content = "fix the failing openpr CI run and land the patch";
 
-        let id1 = resolve_topic(&conn, content, &principal)
+        let id1 = resolve_topic(&conn, content, &principal, None)
             .unwrap()
             .expect("topic must be created");
-        let id2 = resolve_topic(&conn, content, &principal)
+        let id2 = resolve_topic(&conn, content, &principal, None)
             .unwrap()
             .expect("topic must be reused");
         assert_eq!(id1, id2);
@@ -533,6 +656,7 @@ mod tests {
             Some("openpr"),
             Some("issue#42"),
             "fp-first",
+            None,
         )
         .unwrap();
 
@@ -542,6 +666,7 @@ mod tests {
             Some("openpr"),
             Some("issue#42"),
             "fp-second",
+            None,
         )
         .unwrap();
 
@@ -560,8 +685,16 @@ mod tests {
     #[test]
     fn find_topic_by_project_and_external_prevents_cross_project_mixup() {
         let (_tmp, conn) = setup_conn();
-        let first = create_topic(&conn, "OpenPR issue", Some("openpr"), Some("issue#42"), "fp-openpr").unwrap();
-        let second = create_topic(&conn, "LC issue", Some("lc"), Some("issue#42"), "fp-lc").unwrap();
+        let first = create_topic(
+            &conn,
+            "OpenPR issue",
+            Some("openpr"),
+            Some("issue#42"),
+            "fp-openpr",
+            None,
+        )
+        .unwrap();
+        let second = create_topic(&conn, "LC issue", Some("lc"), Some("issue#42"), "fp-lc", None).unwrap();
         assert_ne!(first, second);
 
         let openpr = find_topic_by_project_and_external(&conn, Some("openpr"), "issue#42").unwrap();
@@ -573,8 +706,16 @@ mod tests {
     #[test]
     fn create_topic_with_null_project_external_id_is_idempotent_via_global_sentinel() {
         let (_tmp, conn) = setup_conn();
-        let first = create_topic(&conn, "Global issue", None, Some("issue#900"), "fp-global-1").unwrap();
-        let second = create_topic(&conn, "Global issue duplicate", None, Some("issue#900"), "fp-global-2").unwrap();
+        let first = create_topic(&conn, "Global issue", None, Some("issue#900"), "fp-global-1", None).unwrap();
+        let second = create_topic(
+            &conn,
+            "Global issue duplicate",
+            None,
+            Some("issue#900"),
+            "fp-global-2",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(first, second);
 
@@ -594,11 +735,19 @@ mod tests {
     #[test]
     fn resolve_topic_prefers_project_scoped_external_id_match() {
         let (_tmp, conn) = setup_conn();
-        let openpr_id = create_topic(&conn, "OpenPR ticket", Some("openpr"), Some("issue#88"), "fp-openpr-88").unwrap();
-        let _lc_id = create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88").unwrap();
+        let openpr_id = create_topic(
+            &conn,
+            "OpenPR ticket",
+            Some("openpr"),
+            Some("issue#88"),
+            "fp-openpr-88",
+            None,
+        )
+        .unwrap();
+        let _lc_id = create_topic(&conn, "LC ticket", Some("lc"), Some("issue#88"), "fp-lc-88", None).unwrap();
 
         let principal = base_principal("u-2");
-        let resolved = resolve_topic(&conn, "openpr work on issue#88", &principal)
+        let resolved = resolve_topic(&conn, "openpr work on issue#88", &principal, None)
             .unwrap()
             .expect("topic should resolve");
         assert_eq!(resolved, openpr_id);
@@ -607,18 +756,19 @@ mod tests {
     #[test]
     fn resolve_topic_without_inferred_project_uses_global_sentinel_scope() {
         let (_tmp, conn) = setup_conn();
-        let global_id = create_topic(&conn, "Global ticket", None, Some("issue#101"), "fp-global-101").unwrap();
+        let global_id = create_topic(&conn, "Global ticket", None, Some("issue#101"), "fp-global-101", None).unwrap();
         let _project_id = create_topic(
             &conn,
             "OpenPR ticket",
             Some("openpr"),
             Some("issue#101"),
             "fp-openpr-101",
+            None,
         )
         .unwrap();
 
         let principal = base_principal("u-3");
-        let resolved = resolve_topic(&conn, "please help with issue#101 asap", &principal)
+        let resolved = resolve_topic(&conn, "please help with issue#101 asap", &principal, None)
             .unwrap()
             .expect("topic should resolve");
         assert_eq!(resolved, global_id);

@@ -25,6 +25,16 @@ use super::{SQLITE_DIALECT, SqliteMemory, sqlite_owner_read_principal, sqlite_re
 /// order. Operators override this with `[memory] vector_candidate_cap`.
 pub(super) const VECTOR_CANDIDATE_CAP: usize = 2_000;
 
+pub(super) struct PreparedEmbedding {
+    pub(super) bytes: Vec<u8>,
+    pub(super) hash: String,
+}
+
+enum WriteOutcome {
+    Done,
+    Retry,
+}
+
 /// Candidate count for one vector recall.
 ///
 /// The configured cap is authoritative — it is the number an operator tunes —
@@ -175,97 +185,117 @@ impl SqliteMemory {
         let isolated_owner = crate::memory::owner_predicate::isolated_store_owner(context)?;
         self.check_memory_safety(content, context).await?;
 
-        // Only long-lived categories need vector embeddings.
+        let partition = context.and_then(|ctx| ctx.agent_partition.clone());
+        let session_key = context.and_then(|ctx| ctx.session_key.clone());
         let needs_embedding = matches!(&category, MemoryCategory::Core | MemoryCategory::Custom(_));
-        let embedding_bytes = if needs_embedding {
-            self.get_or_compute_embedding(content)
-                .await?
-                .map(|emb| vector::vec_to_bytes(&emb))
-        } else {
-            None
-        };
-        let embedding_provider = embedding_bytes.as_ref().map(|_| self.embedding_provider_name());
-        let embedding_model = embedding_bytes.as_ref().map(|_| self.embedding_model_name());
-        let embedding_dimensions = embedding_bytes.as_ref().map(|_| self.embedding_dimensions_i64());
+        for attempt in 0..2_u8 {
+            let salt_scope = self
+                .salt_scope_for_write(partition.as_ref(), session_key.as_deref())
+                .await?;
+            let prepared = if needs_embedding {
+                self.embed_without_cache(content, salt_scope.as_deref()).await?
+            } else {
+                None
+            };
+            let embedding_bytes = prepared.as_ref().map(|item| item.bytes.clone());
+            let embedding_provider = prepared.as_ref().map(|_| self.embedding_provider_name());
+            let embedding_model = prepared.as_ref().map(|_| self.embedding_model_name());
+            let embedding_dimensions = prepared.as_ref().map(|_| self.embedding_dimensions_i64());
+            let cache_hash = prepared.as_ref().map(|item| item.hash.clone());
 
-        let pool = self.pool.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let sid = session_id.map(String::from);
-        let write_ctx = context.cloned();
-        let mut metadata = metadata.unwrap_or_default();
-        if let Some(owner) = isolated_owner.as_ref() {
-            // The row an isolated caller writes is attributed to its
-            // authenticated owner and nothing else.
-            metadata.owner_id = Some(owner.clone());
-        }
-        let owner_guard =
-            crate::memory::owner_predicate::store_conflict_guard(SQLITE_DIALECT, "memories", isolated_owner.is_some());
+            let pool = self.pool.clone();
+            let key = key.to_string();
+            let content = content.to_string();
+            let sid = session_id.map(String::from);
+            let write_ctx = context.cloned();
+            let mut metadata = metadata.clone().unwrap_or_default();
+            if let Some(owner) = isolated_owner.as_ref() {
+                metadata.owner_id = Some(owner.clone());
+            }
+            let owner_guard = crate::memory::owner_predicate::store_conflict_guard(
+                SQLITE_DIALECT,
+                "memories",
+                isolated_owner.is_some(),
+            );
+            let expected_salt = salt_scope.clone();
+            let cache_now = Local::now().to_rfc3339();
+            let provider_name = self.embedding_provider_name();
+            let model_name = self.embedding_model_name();
+            let dimensions = self.embedding_dimensions_i64();
+            let cache_max = i64::try_from(self.cache_max).unwrap_or(i64::MAX);
+            let cache_bytes = embedding_bytes.clone();
+            let isolated_owner = isolated_owner.clone();
+            let category = category.clone();
 
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = pool.write();
-            // R-MCPB F-4: an owner-isolated write — ownership check, guarded
-            // upsert and guarded metadata update — is one immediate
-            // transaction, so a refusal at any step leaves nothing behind.
-            // Non-isolated writes keep their historical autocommit statements.
-            let isolated_tx = isolated_owner
-                .as_ref()
-                .map(|_| rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate))
-                .transpose()?;
-            let now = Local::now().to_rfc3339();
-            let cat = Self::category_to_str(&category);
-            let id = Uuid::new_v4().to_string();
-
-            if let Some(ctx) = write_ctx {
-                // Checked before topic resolution so a refused write leaves no
-                // trace in the topic tables. The conflict guard below is the
-                // atomic backstop: another process (a session worker) may
-                // write the same database between this read and the upsert.
-                if let Some(owner) = isolated_owner.as_deref() {
-                    let stored_owner: Option<Option<String>> = conn
-                        .query_row(
-                            "SELECT owner_id FROM memories WHERE key = ?1",
-                            params![&key],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    if stored_owner.is_some_and(|stored| stored.as_deref() != Some(owner)) {
-                        return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
-                            key: key.clone(),
-                        }
-                        .into());
-                    }
-                }
-                let principal = sqlite_read_principal(&conn, &ctx);
-                let classified = classify_memory(&ctx, &content, &principal);
-                let topic_id = match resolve_topic(&conn, &content, &principal) {
-                    Ok(topic_id) => topic_id,
-                    Err(error) => {
-                        tracing::warn!("memory topic resolve failed: {error}");
-                        None
-                    }
-                };
-                let risk_json = serde_json::to_string(&classified.risk_signals)?;
-                let sender_id = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
-                    Some(principal.user_id)
+            let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<WriteOutcome> {
+                let conn = pool.write();
+                let tx = super::agent_migration::begin_immediate(&conn)?;
+                let now = Local::now().to_rfc3339();
+                let cat = Self::category_to_str(&category);
+                let id = Uuid::new_v4().to_string();
+                let bound_scope = if let Some(ctx) = write_ctx.as_ref() {
+                    super::agent_migration::resolve_input_scope(
+                        &tx,
+                        ctx.agent_partition.as_ref(),
+                        ctx.session_key.as_deref(),
+                        ctx.workspace_id.as_deref().unwrap_or(""),
+                        ctx.owner_id.as_deref(),
+                    )?
                 } else {
                     None
                 };
-                let explicit_sender_id = ctx.sender_id.or(sender_id);
-                let owner_id = metadata.owner_id.clone().or_else(|| explicit_sender_id.clone());
-                let chat_type = ctx
-                    .chat_type
-                    .map(|raw| ChatType::from_str(&raw).as_str().to_string());
+                if expected_salt.is_some() && bound_scope != expected_salt {
+                    return Ok(WriteOutcome::Retry);
+                }
 
-                let changed = conn.execute(
-                    &format!("INSERT INTO memories (
+                if let Some(ctx) = write_ctx {
+                    if let Some(owner) = isolated_owner.as_deref() {
+                        let stored_owner: Option<Option<String>> = tx
+                            .query_row(
+                                "SELECT owner_id FROM memories WHERE key = ?1",
+                                params![&key],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        if stored_owner.is_some_and(|stored| stored.as_deref() != Some(owner)) {
+                            return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
+                                key: key.clone(),
+                            }
+                            .into());
+                        }
+                    }
+                    let principal = sqlite_read_principal(&tx, &ctx);
+                    let classified = classify_memory(&ctx, &content, &principal);
+                    let topic_id = match resolve_topic(&tx, &content, &principal, bound_scope.as_deref()) {
+                        Ok(topic_id) => topic_id,
+                        Err(error) => {
+                            tracing::warn!("memory topic resolve failed: {error}");
+                            None
+                        }
+                    };
+                    let risk_json = serde_json::to_string(&classified.risk_signals)?;
+                    let sender_id = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
+                        Some(principal.user_id)
+                    } else {
+                        None
+                    };
+                    let explicit_sender_id = ctx.sender_id.or(sender_id);
+                    let owner_id = metadata.owner_id.clone().or_else(|| explicit_sender_id.clone());
+                    let chat_type = ctx
+                        .chat_type
+                        .map(|raw| ChatType::from_str(&raw).as_str().to_string());
+                    let scope_guard = super::agent_migration::scope_conflict_guard("memories", !owner_guard.is_empty());
+                    let coalesce = super::agent_migration::scope_coalesce_set("memories");
+
+                    let changed = tx.execute(
+                        &format!("INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
                         embedding_model, embedding_dimensions, created_at, updated_at,
                         session_id, workspace_id, owner_id, channel, chat_type, chat_id,
                         sender_id, raw_sender, topic_id, visibility, sensitivity,
-                        risk_signals, policy_version
+                        risk_signals, policy_version, ma_scope_id
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
@@ -286,50 +316,53 @@ impl SqliteMemory {
                         visibility = excluded.visibility,
                         sensitivity = excluded.sensitivity,
                         risk_signals = excluded.risk_signals,
-                        policy_version = excluded.policy_version{owner_guard}"),
-                    params![
-                        id,
-                        &key,
-                        &content,
-                        cat,
-                        embedding_bytes,
-                        embedding_provider,
-                        embedding_model,
-                        embedding_dimensions,
-                        now,
-                        now,
-                        sid,
-                        metadata.workspace_id.clone(),
-                        owner_id,
-                        ctx.channel,
-                        chat_type,
-                        ctx.chat_id,
-                        explicit_sender_id,
-                        ctx.raw_sender,
-                        topic_id,
-                        classified.visibility.as_str(),
-                        classified.sensitivity.as_str(),
-                        risk_json,
-                        classified.policy_version,
-                    ],
-                )?;
-                // The guard suppressed the update: the key exists under
-                // another owner (or none). Nothing was written.
-                if isolated_owner.is_some() && changed == 0 {
-                    return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
-                        key: key.clone(),
+                        policy_version = excluded.policy_version,
+                        {coalesce}{owner_guard}{scope_guard}"),
+                        params![
+                            id,
+                            &key,
+                            &content,
+                            cat,
+                            embedding_bytes,
+                            embedding_provider,
+                            embedding_model,
+                            embedding_dimensions,
+                            now,
+                            now,
+                            sid,
+                            metadata.workspace_id.clone(),
+                            owner_id,
+                            ctx.channel,
+                            chat_type,
+                            ctx.chat_id,
+                            explicit_sender_id,
+                            ctx.raw_sender,
+                            topic_id,
+                            classified.visibility.as_str(),
+                            classified.sensitivity.as_str(),
+                            risk_json,
+                            classified.policy_version,
+                            bound_scope,
+                        ],
+                    )?;
+                    if changed == 0 {
+                        return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
+                            key: key.clone(),
+                        }
+                        .into());
                     }
-                    .into());
-                }
-            } else {
-                conn.execute(
-                    "INSERT INTO memories (
+                } else {
+                    let coalesce = super::agent_migration::scope_coalesce_set("memories");
+                    let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
+                    let changed = tx.execute(
+                        &format!(
+                            "INSERT INTO memories (
                         id, key, content, category, embedding, embedding_provider,
                         embedding_model, embedding_dimensions, created_at, updated_at,
                         session_id, workspace_id, owner_id, agent_id, persona_id,
-                        source_event_id, source, channel, topic_id
+                        source_event_id, source, channel, topic_id, ma_scope_id
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
@@ -346,53 +379,55 @@ impl SqliteMemory {
                         source_event_id = excluded.source_event_id,
                         source = excluded.source,
                         channel = excluded.channel,
-                        topic_id = excluded.topic_id",
-                    params![
-                        id,
-                        &key,
-                        &content,
-                        cat,
-                        embedding_bytes,
-                        embedding_provider,
-                        embedding_model,
-                        embedding_dimensions,
-                        now,
-                        now,
-                        sid,
-                        metadata.workspace_id.clone(),
-                        metadata.owner_id.clone(),
-                        metadata.agent_id.clone(),
-                        metadata.persona_id.clone(),
-                        metadata.source_event_id.clone(),
-                        metadata.source.clone(),
-                        // FIX-P1-08: persist the originating channel so anonymous
-                        // principals can resolve channel scope on later recall.
-                        metadata.channel.clone(),
-                        metadata.topic_id.clone(),
-                    ],
-                )?;
-            }
+                        topic_id = excluded.topic_id,
+                        {coalesce}{scope_guard}"
+                        ),
+                        params![
+                            id,
+                            &key,
+                            &content,
+                            cat,
+                            embedding_bytes,
+                            embedding_provider,
+                            embedding_model,
+                            embedding_dimensions,
+                            now,
+                            now,
+                            sid,
+                            metadata.workspace_id.clone(),
+                            metadata.owner_id.clone(),
+                            metadata.agent_id.clone(),
+                            metadata.persona_id.clone(),
+                            metadata.source_event_id.clone(),
+                            metadata.source.clone(),
+                            metadata.channel.clone(),
+                            metadata.topic_id.clone(),
+                            bound_scope,
+                        ],
+                    )?;
+                    if changed == 0 {
+                        return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
+                            key: key.clone(),
+                        }
+                        .into());
+                    }
+                }
 
-            if metadata.workspace_id.is_some()
-                || metadata.owner_id.is_some()
-                || metadata.agent_id.is_some()
-                || metadata.persona_id.is_some()
-                || metadata.source_event_id.is_some()
-                || metadata.source.is_some()
-            {
-                // R-MCPB F-4: for an owner-isolated write the update is
-                // confined to the caller's own row (`?2` is its owner id), so
-                // a row another writer changed after the upsert is neither
-                // re-owned nor rewritten; that write is refused and rolled
-                // back instead.
-                let metadata_owner_guard = if isolated_owner.is_some() {
-                    " AND owner_id IS ?2"
-                } else {
-                    ""
-                };
-                let updated = conn.execute(
-                    &format!(
-                        "UPDATE memories
+                if metadata.workspace_id.is_some()
+                    || metadata.owner_id.is_some()
+                    || metadata.agent_id.is_some()
+                    || metadata.persona_id.is_some()
+                    || metadata.source_event_id.is_some()
+                    || metadata.source.is_some()
+                {
+                    let metadata_owner_guard = if isolated_owner.is_some() {
+                        " AND owner_id IS ?2"
+                    } else {
+                        ""
+                    };
+                    let updated = tx.execute(
+                        &format!(
+                            "UPDATE memories
                      SET workspace_id = ?1,
                          owner_id = COALESCE(?2, owner_id),
                          agent_id = ?3,
@@ -401,36 +436,49 @@ impl SqliteMemory {
                          source = ?6,
                          updated_at = ?7
                      WHERE key = ?8{metadata_owner_guard}"
-                    ),
-                    params![
-                        metadata.workspace_id,
-                        metadata.owner_id,
-                        metadata.agent_id,
-                        metadata.persona_id,
-                        metadata.source_event_id,
-                        metadata.source,
-                        Local::now().to_rfc3339(),
-                        &key,
-                    ],
-                )?;
-                if isolated_owner.is_some() && updated == 0 {
-                    return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
-                        key: key.clone(),
+                        ),
+                        params![
+                            metadata.workspace_id,
+                            metadata.owner_id,
+                            metadata.agent_id,
+                            metadata.persona_id,
+                            metadata.source_event_id,
+                            metadata.source,
+                            Local::now().to_rfc3339(),
+                            &key,
+                        ],
+                    )?;
+                    if isolated_owner.is_some() && updated == 0 {
+                        return Err(crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable {
+                            key: key.clone(),
+                        }
+                        .into());
                     }
-                    .into());
                 }
-            }
-            if let Some(tx) = isolated_tx {
+                if let (Some(hash), Some(bytes)) = (cache_hash, cache_bytes) {
+                    Self::insert_embedding_cache(
+                        &tx,
+                        &hash,
+                        &bytes,
+                        &provider_name,
+                        &model_name,
+                        dimensions,
+                        &cache_now,
+                        bound_scope.as_deref(),
+                        cache_max,
+                    )?;
+                }
                 tx.commit()?;
+                Ok(WriteOutcome::Done)
+            })
+            .await??;
+            match outcome {
+                WriteOutcome::Done => break,
+                WriteOutcome::Retry if attempt == 0 => continue,
+                WriteOutcome::Retry => return Err(crate::memory::AgentScopeRefused.into()),
             }
-
-            // D-026: no write is mirrored into the workspace Markdown files
-            // here. `MEMORY.md` is inlined into every surface's system prompt,
-            // so only a write the local operator made is mirrored, explicitly,
-            // through `Memory::mirror_operator_write`.
-            Ok(())
-        })
-        .await?
+        }
+        Ok(())
     }
 
     async fn check_memory_safety(&self, content: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<()> {
@@ -470,6 +518,136 @@ impl SqliteMemory {
             let _ = write!(hex, "{byte:02x}");
         }
         hex
+    }
+
+    /// SHA-256("ma:" + scope_id + NUL + text) as the partitioned cache key.
+    pub(super) fn scoped_content_hash(scope_id: Option<&str>, text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let Some(scope_id) = scope_id else {
+            return Self::content_hash(text);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"ma:");
+        hasher.update(scope_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub(super) async fn salt_scope_for_write(
+        &self,
+        partition: Option<&crate::memory::AgentPartition>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(partition) = partition.cloned() else {
+            return Ok(None);
+        };
+        let session_key = session_key.map(str::to_owned);
+        let pool = self.pool.clone();
+        crate::runtime::blocking::spawn_blocking(move || {
+            let conn = pool.write();
+            super::agent_migration::lookup_or_mint_write_scope(&conn, &partition, session_key.as_deref()).map(Some)
+        })
+        .await?
+    }
+
+    pub(super) async fn embed_without_cache(
+        &self,
+        text: &str,
+        scope_id: Option<&str>,
+    ) -> anyhow::Result<Option<PreparedEmbedding>> {
+        if self.embedder.dimensions() == 0 {
+            return Ok(None);
+        }
+        let hash = Self::scoped_content_hash(scope_id, text);
+        let provider_name = self.embedding_provider_name();
+        let model_name = self.embedding_model_name();
+        let dimensions = self.embedding_dimensions_i64();
+        let pool = self.pool.clone();
+        let hash_c = hash.clone();
+        let cached = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
+            let conn = pool.write();
+            Self::lookup_embedding_cache(&conn, &hash_c, &provider_name, &model_name, dimensions)
+        })
+        .await??;
+        let embedding = if let Some(embedding) = cached {
+            embedding
+        } else {
+            self.embedder.embed_one(text).await?
+        };
+        if embedding.len() != self.embedder.dimensions() {
+            anyhow::bail!(
+                "embedding dimension mismatch: provider={} model={} expected={} got={}",
+                self.embedding_provider_name(),
+                self.embedding_model_name(),
+                self.embedder.dimensions(),
+                embedding.len()
+            );
+        }
+        Ok(Some(PreparedEmbedding {
+            bytes: vector::vec_to_bytes(&embedding),
+            hash,
+        }))
+    }
+
+    fn lookup_embedding_cache(
+        conn: &Connection,
+        hash: &str,
+        provider: &str,
+        model: &str,
+        dimensions: i64,
+    ) -> anyhow::Result<Option<Vec<f32>>> {
+        let mut stmt = conn.prepare(
+            "SELECT embedding FROM embedding_cache
+                 WHERE content_hash = ?1
+                   AND provider = ?2
+                   AND model = ?3
+                   AND dimensions = ?4",
+        )?;
+        let blob: Option<Vec<u8>> = stmt
+            .query_row(params![hash, provider, model, dimensions], |row| row.get(0))
+            .ok();
+        let Some(bytes) = blob else {
+            return Ok(None);
+        };
+        let embedding = vector::bytes_to_vec(&bytes);
+        if embedding.len() == usize::try_from(dimensions).unwrap_or(usize::MAX) {
+            Ok(Some(embedding))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn insert_embedding_cache(
+        conn: &Connection,
+        hash: &str,
+        bytes: &[u8],
+        provider: &str,
+        model: &str,
+        dimensions: i64,
+        now: &str,
+        scope_id: Option<&str>,
+        cache_max: i64,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO embedding_cache (
+                    content_hash, embedding, provider, model, dimensions, created_at, accessed_at, ma_scope_id
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![hash, bytes, provider, model, dimensions, now, now, scope_id],
+        )?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
+        if count > cache_max {
+            let to_delete = count - cache_max;
+            conn.execute(
+                "DELETE FROM embedding_cache WHERE content_hash IN (
+                        SELECT content_hash FROM embedding_cache
+                        ORDER BY accessed_at ASC LIMIT ?1
+                    )",
+                params![to_delete],
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn content_sha256_hex(text: &str) -> String {
@@ -546,102 +724,38 @@ impl SqliteMemory {
         i64::try_from(self.embedder.dimensions()).unwrap_or(i64::MAX)
     }
 
-    /// Get embedding from cache, or compute + cache it
+    /// Get embedding from cache, or compute + cache it (unpartitioned hash).
     pub(super) async fn get_or_compute_embedding(&self, text: &str) -> anyhow::Result<Option<Vec<f32>>> {
-        if self.embedder.dimensions() == 0 {
-            return Ok(None); // Noop embedder
-        }
+        self.embed_and_cache(text, None).await
+    }
 
-        let hash = Self::content_hash(text);
+    async fn embed_and_cache(&self, text: &str, scope_id: Option<&str>) -> anyhow::Result<Option<Vec<f32>>> {
+        let Some(prepared) = self.embed_without_cache(text, scope_id).await? else {
+            return Ok(None);
+        };
+        let embedding = vector::bytes_to_vec(&prepared.bytes);
+        let pool = self.pool.clone();
         let now = Local::now().to_rfc3339();
         let provider_name = self.embedding_provider_name();
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
-
-        // Check cache (offloaded to blocking thread)
-        let pool = self.pool.clone();
-        let hash_c = hash.clone();
-        let now_c = now.clone();
-        let provider_c = provider_name.clone();
-        let model_c = model_name.clone();
-        let cached = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
-            let conn = pool.write();
-            let mut stmt = conn.prepare(
-                "SELECT embedding FROM embedding_cache
-                 WHERE content_hash = ?1
-                   AND provider = ?2
-                   AND model = ?3
-                   AND dimensions = ?4",
-            )?;
-            let blob: Option<Vec<u8>> = stmt
-                .query_row(params![hash_c, provider_c, model_c, dimensions], |row| row.get(0))
-                .ok();
-            if let Some(bytes) = blob {
-                // FIX-P0-26: touch the exact composite-key row, not every row
-                // sharing this content_hash.
-                conn.execute(
-                    "UPDATE embedding_cache SET accessed_at = ?1 \
-                     WHERE content_hash = ?2 AND provider = ?3 AND model = ?4 AND dimensions = ?5",
-                    params![now_c, hash_c, provider_c, model_c, dimensions],
-                )?;
-                let embedding = vector::bytes_to_vec(&bytes);
-                if embedding.len() == usize::try_from(dimensions).unwrap_or(usize::MAX) {
-                    return Ok(Some(embedding));
-                }
-            }
-            Ok(None)
-        })
-        .await??;
-
-        if cached.is_some() {
-            return Ok(cached);
-        }
-
-        // Compute the embedding. Remote providers await network I/O here; the
-        // default local provider is synchronous CPU work that offloads itself to
-        // the blocking pool once a batch is large enough to matter.
-        let embedding = self.embedder.embed_one(text).await?;
-        if embedding.len() != self.embedder.dimensions() {
-            anyhow::bail!(
-                "embedding dimension mismatch: provider={} model={} expected={} got={}",
-                provider_name,
-                model_name,
-                self.embedder.dimensions(),
-                embedding.len()
-            );
-        }
-        let bytes = vector::vec_to_bytes(&embedding);
-
-        // Store in cache + LRU eviction (offloaded to blocking thread)
-        let pool = self.pool.clone();
-        #[allow(clippy::cast_possible_wrap)]
-        let cache_max = self.cache_max as i64;
+        let cache_max = i64::try_from(self.cache_max).unwrap_or(i64::MAX);
+        let scope = scope_id.map(str::to_owned);
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = pool.write();
-            conn.execute(
-                "INSERT OR REPLACE INTO embedding_cache (
-                    content_hash, embedding, provider, model, dimensions, created_at, accessed_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![hash, bytes, provider_name, model_name, dimensions, now, now],
-            )?;
-            // Two-step LRU eviction: count first, then delete oldest if over limit.
-            // Avoids relying on MAX() as a scalar function in a LIMIT clause.
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM embedding_cache", [], |row| row.get(0))?;
-            if count > cache_max {
-                let to_delete = count - cache_max;
-                conn.execute(
-                    "DELETE FROM embedding_cache WHERE content_hash IN (
-                        SELECT content_hash FROM embedding_cache
-                        ORDER BY accessed_at ASC LIMIT ?1
-                    )",
-                    params![to_delete],
-                )?;
-            }
-            Ok(())
+            Self::insert_embedding_cache(
+                &conn,
+                &prepared.hash,
+                &prepared.bytes,
+                &provider_name,
+                &model_name,
+                dimensions,
+                &now,
+                scope.as_deref(),
+                cache_max,
+            )
         })
         .await??;
-
         Ok(Some(embedding))
     }
 
@@ -805,11 +919,11 @@ impl SqliteMemory {
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
         let pool = self.pool.clone();
-        let entries: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
+        let entries: Vec<(String, String, Option<String>)> = crate::runtime::blocking::spawn_blocking(move || {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let mut stmt = conn.prepare(
-                "SELECT id, content
+                "SELECT id, content, ma_scope_id
                  FROM memories
                  WHERE category NOT IN ('daily', 'conversation')
                    AND (
@@ -823,15 +937,19 @@ impl SqliteMemory {
                    )",
             )?;
             let rows = stmt.query_map(params![provider_name, model_name, dimensions], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
         })
         .await??;
 
         let mut count = 0;
-        for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+        for (id, content, scope) in &entries {
+            if let Ok(Some(emb)) = self.embed_and_cache(content, scope.as_deref()).await {
                 let bytes = vector::vec_to_bytes(&emb);
                 let pool = self.pool.clone();
                 let id = id.clone();
@@ -860,11 +978,11 @@ impl SqliteMemory {
         let model_name = self.embedding_model_name();
         let dimensions = self.embedding_dimensions_i64();
         let pool = self.pool.clone();
-        let chunks: Vec<(String, String)> = crate::runtime::blocking::spawn_blocking(move || {
+        let chunks: Vec<(String, String, Option<String>)> = crate::runtime::blocking::spawn_blocking(move || {
             let reader = pool.read()?;
             let conn = reader.connection()?;
             let mut stmt = conn.prepare(
-                "SELECT chunk_id, content
+                "SELECT chunk_id, content, ma_scope_id
                  FROM document_chunks
                  WHERE embedding IS NULL
                     OR embedding_provider IS NULL
@@ -875,14 +993,18 @@ impl SqliteMemory {
                     OR embedding_dimensions != ?3",
             )?;
             let rows = stmt.query_map(params![provider_name, model_name, dimensions], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
             Ok::<_, anyhow::Error>(rows.filter_map(std::result::Result::ok).collect())
         })
         .await??;
 
-        for (chunk_id, content) in &chunks {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+        for (chunk_id, content, scope) in &chunks {
+            if let Ok(Some(emb)) = self.embed_and_cache(content, scope.as_deref()).await {
                 let bytes = vector::vec_to_bytes(&emb);
                 let pool = self.pool.clone();
                 let chunk_id = chunk_id.clone();
@@ -1750,14 +1872,14 @@ impl SqliteMemory {
             // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
             // physically delete from `memories`; we record a trash row so it can be
             // restored within the grace window.
-            let row: Option<(String, String)> = conn
+            let row: Option<(String, String, Option<String>)> = conn
                 .query_row(
-                    "SELECT content, category FROM memories WHERE key = ?1",
+                    "SELECT content, category, ma_scope_id FROM memories WHERE key = ?1",
                     params![key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let Some((content, category)) = row else {
+            let Some((content, category, ma_scope_id)) = row else {
                 return Ok(None);
             };
             // Idempotency: if an unrestored trash entry already exists for this key,
@@ -1775,11 +1897,12 @@ impl SqliteMemory {
             let trash_id = format!("trash-{}", Uuid::now_v7());
             let now = Utc::now();
             let grace_until = now + chrono::Duration::days(i64::from(grace_days));
-            conn.execute(
+            let tx = super::agent_migration::begin_immediate(&conn)?;
+            tx.execute(
                 "INSERT INTO memory_trash (
-                    trash_id, memory_key, content, category, reason, trashed_at, grace_until
+                    trash_id, memory_key, content, category, reason, trashed_at, grace_until, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     trash_id,
                     key,
@@ -1788,8 +1911,10 @@ impl SqliteMemory {
                     reason,
                     now.to_rfc3339(),
                     grace_until.to_rfc3339(),
+                    ma_scope_id,
                 ],
             )?;
+            tx.commit()?;
             Ok(Some(trash_id))
         })
         .await?

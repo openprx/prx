@@ -108,7 +108,7 @@ pub(crate) async fn save_current_input(
 ) -> anyhow::Result<()> {
     let key = current_input_memory_key(run);
     fabric
-        .record_semantic_memory_from_event(&key, input, MemoryCategory::Conversation, None, event, None, None)
+        .record_semantic_memory_from_event(&key, input, MemoryCategory::Conversation, None, event, None, None, None)
         .await
 }
 

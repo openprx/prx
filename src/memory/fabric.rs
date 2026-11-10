@@ -534,7 +534,7 @@ impl MemoryFabric {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.record_semantic_memory_from_event(key, content, category, session_id, None, None, None)
+        self.record_semantic_memory_from_event(key, content, category, session_id, None, None, None, None)
             .await
     }
 
@@ -547,6 +547,7 @@ impl MemoryFabric {
         source_event_id: Option<&str>,
         agent_id: Option<&str>,
         persona_id: Option<&str>,
+        agent_partition: Option<crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         let category_label = category.to_string();
         self.memory
@@ -570,7 +571,6 @@ impl MemoryFabric {
         let _event = self
             .memory
             .append_memory_event(MemoryEventInput {
-                // CARRY 01b3-2 (W7, interim rule M3): record_semantic_memory_from_event has no partition input in part 0
                 agent_partition: None,
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
@@ -607,11 +607,11 @@ impl MemoryFabric {
             let link = self
                 .memory
                 .link_memory_source(MemoryLinkInput {
-                    // CARRY 01b3-3 (D4): record_semantic_memory_from_event link has no partition input in part 0
-                    agent_partition: None,
+                    agent_partition: agent_partition.clone(),
+                    session_key: session_id.map(str::to_string),
                     link_id: None,
                     workspace_id: self.workspace_id.clone(),
-                    owner_id: None,
+                    owner_id: agent_partition.as_ref().map(|partition| partition.owner_id.clone()),
                     memory_key: Some(key.to_string()),
                     memory_event_id: None,
                     message_event_id: source_event_id.map(str::to_string),
@@ -1063,6 +1063,7 @@ mod tests {
                 Some("message-event-1"),
                 Some("agent-a"),
                 Some("persona-a"),
+                None,
             )
             .await
             .unwrap();

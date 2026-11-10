@@ -1269,6 +1269,7 @@ async fn cli_saved_live_input_is_excluded_without_useful_feedback() {
             Some(&event.event_id),
             None,
             None,
+            None,
         )
         .await
         .unwrap();

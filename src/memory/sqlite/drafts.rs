@@ -12,20 +12,27 @@ impl SqliteMemory {
         let pool = self.pool.clone();
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryDraft> {
-            let mut conn = pool.write();
-            let tx = conn.transaction()?;
+            let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let draft_id = input.draft_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let category = Self::category_to_str(&input.category);
             let visibility = input.visibility.as_str().to_string();
+            let bound_scope = super::agent_migration::resolve_input_scope(
+                &tx,
+                input.agent_partition.as_ref(),
+                input.session_key.as_deref(),
+                &input.workspace_id,
+                input.owner_id.as_deref(),
+            )?;
 
             tx.execute(
                 "INSERT OR IGNORE INTO memory_drafts (
                     draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                     agent_id, persona_id, key, content, category, source_event_id,
-                    visibility, status, payload_json, created_at, updated_at
+                    visibility, status, payload_json, created_at, updated_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15, ?15)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15, ?15, ?16)",
                 params![
                     draft_id,
                     input.workspace_id,
@@ -42,7 +49,15 @@ impl SqliteMemory {
                     visibility,
                     input.payload_json,
                     now,
+                    bound_scope,
                 ],
+            )?;
+            super::agent_migration::refuse_if_stored_scope_differs(
+                &tx,
+                "memory_drafts",
+                "draft_id",
+                &draft_id,
+                &bound_scope,
             )?;
 
             let draft = tx.query_row(
@@ -62,9 +77,10 @@ impl SqliteMemory {
                 // is attributed and stays readable by its owner-isolated owner.
                 "INSERT INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, 'memory.draft.created', 'memory_drafts', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, 'memory.draft.created', 'memory_drafts', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         (SELECT ma_scope_id FROM memory_drafts WHERE draft_id = ?4))",
                 params![
                     Uuid::new_v4().to_string(),
                     draft.workspace_id,
@@ -158,8 +174,8 @@ impl SqliteMemory {
         };
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
-            let mut conn = pool.write();
-            let tx = conn.transaction()?;
+            let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
@@ -191,12 +207,16 @@ impl SqliteMemory {
             let now = Utc::now().to_rfc3339();
             let category = Self::category_to_str(&draft.category);
             let memory_id = Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO memories (
+            let coalesce = super::agent_migration::scope_coalesce_set("memories");
+            let scope_guard = super::agent_migration::scope_conflict_guard("memories", false);
+            let changed = tx.execute(
+                &format!(
+                    "INSERT INTO memories (
                     id, key, content, category, created_at, updated_at, session_id,
-                    workspace_id, owner_id, agent_id, persona_id, source_event_id, source, visibility
+                    workspace_id, owner_id, agent_id, persona_id, source_event_id, source, visibility, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'memory_draft', ?12)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'memory_draft', ?12,
+                         (SELECT ma_scope_id FROM memory_drafts WHERE draft_id = ?13))
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     category = excluded.category,
@@ -208,7 +228,9 @@ impl SqliteMemory {
                     persona_id = excluded.persona_id,
                     source_event_id = excluded.source_event_id,
                     source = excluded.source,
-                    visibility = excluded.visibility",
+                    visibility = excluded.visibility,
+                    {coalesce}{scope_guard}"
+                ),
                 params![
                     memory_id,
                     draft.key,
@@ -222,8 +244,14 @@ impl SqliteMemory {
                     draft.persona_id,
                     draft.source_event_id,
                     draft.visibility.as_str(),
+                    draft.draft_id,
                 ],
             )?;
+            if changed == 0 {
+                return Err(
+                    crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable { key: draft.key }.into(),
+                );
+            }
 
             tx.execute(
                 "UPDATE memory_drafts SET status = 'merged', updated_at = ?2 WHERE draft_id = ?1",
@@ -240,9 +268,10 @@ impl SqliteMemory {
                     // C03: see `create_memory_draft` - the owner goes in the column.
                     "INSERT INTO memory_events (
                         event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                        session_key, agent_id, persona_id, visibility, payload_json, created_at
+                        session_key, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             (SELECT ma_scope_id FROM memory_drafts WHERE draft_id = ?13))",
                     params![
                         Uuid::new_v4().to_string(),
                         draft.workspace_id,
@@ -263,6 +292,7 @@ impl SqliteMemory {
                         })
                         .to_string(),
                         Utc::now().to_rfc3339(),
+                        draft.draft_id,
                     ],
                 )?;
             }
@@ -293,8 +323,8 @@ impl SqliteMemory {
         };
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<MemoryDraft>> {
-            let mut conn = pool.write();
-            let tx = conn.transaction()?;
+            let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let mut draft = match tx.query_row(
                 "SELECT id, draft_id, workspace_id, owner_id, worker_run_id, parent_run_id, session_key,
                         agent_id, persona_id, key, content, category, source_event_id,
@@ -335,9 +365,10 @@ impl SqliteMemory {
                 // C03: see `create_memory_draft` - the owner goes in the column.
                 "INSERT INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, 'memory.draft.rejected', 'memory_drafts', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, 'memory.draft.rejected', 'memory_drafts', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         (SELECT ma_scope_id FROM memory_drafts WHERE draft_id = ?4))",
                 params![
                     Uuid::new_v4().to_string(),
                     draft.workspace_id,

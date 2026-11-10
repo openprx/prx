@@ -807,6 +807,7 @@ async fn document_ingest_chunks_searches_and_links_sources() {
     let link = mem
         .link_memory_source(MemoryLinkInput {
             agent_partition: None,
+            session_key: None,
             link_id: Some("link-1".to_string()),
             workspace_id: "workspace-a".to_string(),
             owner_id: Some("owner:workspace-a:telegram:alice".to_string()),
