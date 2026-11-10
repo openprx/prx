@@ -29,11 +29,3 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 [[profile.ci.overrides]]
 filter = 'binary(chat_pty_e2e) | binary(session_worker_stdin_protocol)'
 threads-required = 2
-
-# FU-FLAKE-PTY-RESUME: hosted CI killed this PTY test at 60 s (PR #141 rest-2
-# 128938005617; main 14264802 rest-2 128972973284). Delay is already cut to
-# 800 ms; keep a 2x terminate budget so fixture + PTY round trips fit a loaded
-# 2-core runner. Follows PRX-SLOW-01.
-[[profile.ci.overrides]]
-filter = 'test(=decision_resume::chat_queued_consumed_resume_releases_queue_and_processes_later_input)'
-slow-timeout = { period = "60s", terminate-after = 2 }

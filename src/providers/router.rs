@@ -7,6 +7,8 @@ use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision, valida
 use async_trait::async_trait;
 use std::collections::HashMap;
 #[cfg(any(test, feature = "test-mock"))]
+use std::path::PathBuf;
+#[cfg(any(test, feature = "test-mock"))]
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-mock"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -390,6 +392,12 @@ pub(crate) struct MockEnvProvider {
     delay_ms_per_chunk: u64,
     /// Prompt-substring keyed initial stream delay for visible-turn concurrency demos.
     delay_ms_by_prompt: Vec<(String, u64)>,
+    /// Prompt-substring keyed hold: keep the stream open while this path exists.
+    /// Format: `OPENPRX_MOCK_HOLD_WHILE_FILE=needle=/abs/path`. Before the first
+    /// chunk the mock writes `path` with a `.started` extension, then waits
+    /// until `path` is deleted. Tests wait on the started file (plain mode
+    /// buffers answer deltas until the stream ends).
+    hold_while_file: Vec<(String, PathBuf)>,
     /// `OPENPRX_MOCK_ERROR`: when set, every non-streaming call fails with this
     /// message instead of returning `response`. Lets a test drive the provider
     /// *failure* paths (retry / backoff / rate-limit handling) through the real
@@ -478,11 +486,7 @@ fn parse_mock_delay_ms_by_prompt(raw: &str) -> Vec<(String, u64)> {
 
 #[cfg(any(test, feature = "test-mock"))]
 fn mock_delay_ms_for_messages(rules: &[(String, u64)], messages: &[ChatMessage]) -> u64 {
-    let prompt = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .map_or("", |message| message.content.as_str());
+    let prompt = mock_last_user_prompt(messages);
     rules
         .iter()
         .find_map(|(needle, delay)| prompt.contains(needle).then_some(*delay))
@@ -490,18 +494,83 @@ fn mock_delay_ms_for_messages(rules: &[(String, u64)], messages: &[ChatMessage])
 }
 
 #[cfg(any(test, feature = "test-mock"))]
+fn mock_last_user_prompt(messages: &[ChatMessage]) -> &str {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map_or("", |message| message.content.as_str())
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+fn parse_mock_hold_while_file(raw: &str) -> Vec<(String, PathBuf)> {
+    raw.split([';', ','])
+        .filter_map(|entry| {
+            let (needle, path) = entry.split_once('=')?;
+            let needle = needle.trim();
+            let path = path.trim();
+            (!needle.is_empty() && !path.is_empty()).then(|| (needle.to_string(), PathBuf::from(path)))
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+fn mock_hold_path_for_messages(rules: &[(String, PathBuf)], messages: &[ChatMessage]) -> Option<PathBuf> {
+    let prompt = mock_last_user_prompt(messages);
+    rules
+        .iter()
+        .find(|(needle, _)| prompt.contains(needle.as_str()))
+        .map(|(_, path)| path.clone())
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+fn mock_hold_started_path(path: &std::path::Path) -> PathBuf {
+    let mut started = path.to_path_buf();
+    match started.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => {
+            started.set_extension(format!("{ext}.started"));
+        }
+        None => {
+            started.set_extension("started");
+        }
+    }
+    started
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+async fn mock_wait_while_path_exists(path: Option<&PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    let started = mock_hold_started_path(path);
+    if let Err(error) = std::fs::write(&started, b"holding") {
+        tracing::warn!(path = %started.display(), error = %error, "mock hold started file");
+    }
+    while path.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(any(test, feature = "test-mock"))]
 fn mock_stream_with_initial_delay(
     chunks: Vec<StreamResult<StreamChunk>>,
     delay_ms: u64,
+    hold_while: Option<PathBuf>,
 ) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
     use futures::StreamExt as _;
     futures::stream::iter(chunks)
         .enumerate()
-        .then(move |(idx, chunk)| async move {
-            if idx == 0 && delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        .then(move |(idx, chunk)| {
+            let hold_while = hold_while.clone();
+            async move {
+                if idx == 0 {
+                    mock_wait_while_path_exists(hold_while.as_ref()).await;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+                chunk
             }
-            chunk
         })
         .boxed()
 }
@@ -570,6 +639,10 @@ impl MockEnvProvider {
             .ok()
             .map(|raw| parse_mock_delay_ms_by_prompt(&raw))
             .unwrap_or_default();
+        let hold_while_file = std::env::var("OPENPRX_MOCK_HOLD_WHILE_FILE")
+            .ok()
+            .map(|raw| parse_mock_hold_while_file(&raw))
+            .unwrap_or_default();
         let error = std::env::var("OPENPRX_MOCK_ERROR")
             .ok()
             .map(|value| value.trim().to_string())
@@ -585,6 +658,7 @@ impl MockEnvProvider {
             flavor,
             delay_ms_per_chunk,
             delay_ms_by_prompt,
+            hold_while_file,
             error,
         }
     }
@@ -744,6 +818,7 @@ impl Provider for MockEnvProvider {
         let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
         let response = self.response.clone();
         let initial_delay = mock_delay_ms_for_messages(&self.delay_ms_by_prompt, messages);
+        let hold_while = mock_hold_path_for_messages(&self.hold_while_file, messages);
 
         // S5 P0-1: the SCRIPT path takes priority — emit chunks in script order, supporting a mix of
         // reasoning / tool / delta / is_final. flavor is only logged (actual protocol adaptation is the
@@ -779,14 +854,20 @@ impl Provider for MockEnvProvider {
             let chunk_delay = self.delay_ms_per_chunk;
             return futures::stream::iter(chunks)
                 .enumerate()
-                .then(move |(idx, c)| async move {
-                    if idx == 0 && initial_delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(initial_delay)).await;
+                .then(move |(idx, c)| {
+                    let hold_while = hold_while.clone();
+                    async move {
+                        if idx == 0 {
+                            mock_wait_while_path_exists(hold_while.as_ref()).await;
+                            if initial_delay > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(initial_delay)).await;
+                            }
+                        }
+                        if chunk_delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(chunk_delay)).await;
+                        }
+                        c
                     }
-                    if chunk_delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(chunk_delay)).await;
-                    }
-                    c
                 })
                 .boxed();
         }
@@ -804,6 +885,7 @@ impl Provider for MockEnvProvider {
             return mock_stream_with_initial_delay(
                 vec![Ok(StreamChunk::tool_call_chunk(calls)), Ok(StreamChunk::final_chunk())],
                 initial_delay,
+                hold_while,
             );
         }
 
@@ -823,6 +905,7 @@ impl Provider for MockEnvProvider {
                 Ok(StreamChunk::final_chunk()),
             ],
             initial_delay,
+            hold_while,
         )
     }
 
@@ -1075,6 +1158,34 @@ mod tests {
             5000
         );
         assert_eq!(mock_delay_ms_for_messages(&rules, &[ChatMessage::user("prompt C")]), 0);
+    }
+
+    #[test]
+    fn mock_hold_while_file_matches_last_user_message() {
+        let rules = parse_mock_hold_while_file("busy=/tmp/hold-a; other = /tmp/hold-b,ignored");
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("prompt busy"),
+            ChatMessage::assistant("old"),
+            ChatMessage::user("prompt other"),
+        ];
+
+        assert_eq!(
+            mock_hold_path_for_messages(&rules, &messages),
+            Some(PathBuf::from("/tmp/hold-b"))
+        );
+        assert_eq!(
+            mock_hold_path_for_messages(&rules, &[ChatMessage::user("prompt busy")]),
+            Some(PathBuf::from("/tmp/hold-a"))
+        );
+        assert_eq!(
+            mock_hold_path_for_messages(&rules, &[ChatMessage::user("prompt none")]),
+            None
+        );
+        assert_eq!(
+            mock_hold_started_path(std::path::Path::new("/tmp/prx_busy_resume_hold")),
+            PathBuf::from("/tmp/prx_busy_resume_hold.started")
+        );
     }
 
     #[test]
