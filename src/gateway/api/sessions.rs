@@ -440,6 +440,13 @@ async fn append_console_turn(
     } else {
         None
     };
+    if matches!(
+        envelope.agent_partition.as_ref().map(|partition| &partition.key),
+        Some(crate::memory::PartitionKey::Named { .. })
+    ) && event.is_none()
+    {
+        return Err(crate::memory::AgentScopeRefused.into());
+    }
     if durable_projection {
         let event = event
             .as_ref()
@@ -2012,6 +2019,13 @@ async fn submit_console_message(
                 "Input already accepted; execution was not repeated and outcome remains unconfirmed",
             );
         }
+        Err(error) if error.is::<crate::memory::AgentScopeRefused>() => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": { "code": "agent_scope_refused" } })),
+            )
+                .into_response();
+        }
         Err(_) => {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2248,7 +2262,14 @@ async fn run_console_message_job_work(
                     .await
                     .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
                 if !config.causal_tree.enabled {
-                    append_console_turn(&state, &runtime_envelope, "assistant", &reply, false, false)
+                    let record_event = matches!(
+                        runtime_envelope
+                            .agent_partition
+                            .as_ref()
+                            .map(|partition| &partition.key),
+                        Some(crate::memory::PartitionKey::Named { .. })
+                    );
+                    append_console_turn(&state, &runtime_envelope, "assistant", &reply, record_event, false)
                         .await
                         .map_err(|_| "Failed to persist assistant response".to_owned())?;
                 }
@@ -2393,7 +2414,13 @@ async fn run_console_message_job_work(
         };
 
         if !config.causal_tree.enabled {
-            if let Err(error) = append_console_turn(&state, &turn.envelope, "assistant", &reply, false, false).await {
+            let record_event = matches!(
+                turn.envelope.agent_partition.as_ref().map(|partition| &partition.key),
+                Some(crate::memory::PartitionKey::Named { .. })
+            );
+            if let Err(error) =
+                append_console_turn(&state, &turn.envelope, "assistant", &reply, record_event, false).await
+            {
                 tracing::error!("Failed to persist assistant session turn: {error}");
                 return Err("Failed to persist assistant response".to_string());
             }

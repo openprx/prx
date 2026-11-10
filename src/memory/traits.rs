@@ -38,6 +38,21 @@ impl std::fmt::Display for AgentScopeUnsupported {
 
 impl std::error::Error for AgentScopeUnsupported {}
 
+/// A Named or Main write whose agent scope cannot be derived unambiguously.
+///
+/// The transaction rolls back and nothing is stored. NULL is never written as a
+/// fallback (NULL is Main-visible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentScopeRefused;
+
+impl std::fmt::Display for AgentScopeRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("agent scope refused")
+    }
+}
+
+impl std::error::Error for AgentScopeRefused {}
+
 /// Where a recalled entry came from, as known to the backend that returned it.
 ///
 /// Not serialized: it is a runtime fact about the read, never wire data.

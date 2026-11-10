@@ -1,8 +1,8 @@
 //! Conversations, ingress recovery, message events and memory events.
 
 use crate::memory::traits::{
-    ChatProfile, ConversationSessionSummary, ConversationTurn, MemoryEvent, MemoryEventInput, MemoryPrincipal,
-    MessageEvent, MessageEventInput, PartitionKey, SessionContextQuery, SharedContextQuery,
+    AgentScopeRefused, ChatProfile, ConversationSessionSummary, ConversationTurn, MemoryEvent, MemoryEventInput,
+    MemoryPrincipal, MessageEvent, MessageEventInput, PartitionKey, SessionContextQuery, SharedContextQuery,
 };
 use chrono::Utc;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -328,17 +328,24 @@ impl SqliteMemory {
         let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
         let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
 
+        let bound_scope = super::agent_migration::resolve_input_scope(
+            tx,
+            input.agent_partition.as_ref(),
+            input.session_key.as_deref(),
+            &input.workspace_id,
+            input.owner_id.as_deref(),
+        )?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO message_events (
                 event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                 parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                 sender, recipient, role, event_type, source_ref_json, subject_ref_json,
                 goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
-                content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                content, content_hash, raw_payload_json, visibility, created_at, updated_at, ma_scope_id
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-                     ?30, ?31)",
+                     ?30, ?31, ?32)",
             params![
                 event_id,
                 input.idempotency_key,
@@ -370,7 +377,8 @@ impl SqliteMemory {
                 input.raw_payload_json,
                 visibility,
                 now,
-                now
+                now,
+                bound_scope
             ],
         )?;
 
@@ -408,13 +416,33 @@ impl SqliteMemory {
             )?
         };
 
+        let stored_scope: Option<String> = tx.query_row(
+            "SELECT ma_scope_id FROM message_events WHERE event_id = ?1",
+            params![event.event_id],
+            |row| row.get(0),
+        )?;
+        if stored_scope != bound_scope {
+            return Err(AgentScopeRefused.into());
+        }
         if inserted > 0 {
+            let mirror_scope = match (input.agent_partition.as_ref(), stored_scope) {
+                (_, Some(scope)) => Some(scope),
+                (Some(partition), None) => match &partition.key {
+                    PartitionKey::Named { .. } => return Err(AgentScopeRefused.into()),
+                    PartitionKey::Main => Some(super::agent_migration::resolve_write_scope(
+                        tx,
+                        partition,
+                        input.session_key.as_deref(),
+                    )?),
+                },
+                (None, None) => None,
+            };
             tx.execute(
                 "INSERT INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id, session_key,
-                    agent_id, persona_id, visibility, payload_json, created_at
+                    agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, 'message_events', ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, 'message_events', ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)",
                 params![
                     Uuid::new_v4().to_string(),
                     event.workspace_id,
@@ -425,7 +453,8 @@ impl SqliteMemory {
                     event.agent_id,
                     event.persona_id,
                     event.visibility.as_str(),
-                    Utc::now().to_rfc3339()
+                    Utc::now().to_rfc3339(),
+                    mirror_scope
                 ],
             )?;
         }
@@ -505,8 +534,9 @@ impl SqliteMemory {
                     updated_at = MAX(sessions.updated_at, excluded.updated_at)",
                 params![event.session_key, event.channel, event.sender, event.owner_id, event.created_at, preview])?;
             tx.execute("INSERT INTO conversation_turns
-                (session_key, owner_id, role, content, timestamp, message_id, message_event_id, agent_id, persona_id, visibility)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, 'session')",
+                (session_key, owner_id, role, content, timestamp, message_id, message_event_id, agent_id, persona_id, visibility, ma_scope_id)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, 'session',
+                    (SELECT ma_scope_id FROM message_events WHERE event_id = ?6))",
                 params![event.session_key, event.owner_id, event.role, event.content, event.created_at,
                     event.event_id, event.agent_id, event.persona_id])?;
             if let (Some(owner), Some(deadline)) = (&repair_owner, deadline) {

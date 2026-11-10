@@ -4,7 +4,9 @@
 use super::*;
 use crate::config::DelegateAgentConfig;
 use crate::config::agent_name::{AGENT_NAME_MAX_LEN, AgentName, AgentNameError, is_targetable};
-use crate::memory::{AgentPartition, AgentScopeUnsupported, Memory, MemoryPrincipal, NoneMemory, PartitionKey};
+use crate::memory::{
+    AgentPartition, AgentScopeRefused, AgentScopeUnsupported, Memory, MemoryPrincipal, NoneMemory, PartitionKey,
+};
 use crate::security::AutonomyLevel;
 use std::collections::BTreeSet;
 
@@ -1183,6 +1185,11 @@ const TARGET_MAIN_SCOPE: &str = "00000000-0000-4000-8000-0000000000d1";
 const TARGET_REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const CAPTURE_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b2-partition";
 const PARTITION_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b3-partition";
+const WRITE_SCOPE_PROVIDER: &str = "custom:http://127.0.0.1/prx-ma-01b3-1-scope";
+const FENCE_ERASE: &str = "00000000-0000-4000-8000-0000000000e1";
+const FENCE_MAIN_ERASE: &str = "00000000-0000-4000-8000-0000000000e2";
+const RETIRED_U: &str = "00000000-0000-4000-8000-0000000000a9";
+const WRONG_U: &str = "00000000-0000-4000-8000-0000000000a8";
 
 fn capture_provider_config(config: &mut Config, provider: &str, agent_cfg: DelegateAgentConfig) {
     config.default_provider = Some(provider.to_owned());
@@ -1558,6 +1565,361 @@ async fn agent_partition_reaches_every_writer_input() {
             }
         })
         .await;
+}
+
+fn brain(workspace: &str) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(std::path::Path::new(workspace).join("memory").join("brain.db"))
+        .expect("test: brain");
+    conn.pragma_update(None, "foreign_keys", "ON").expect("test: fk");
+    conn
+}
+
+fn seed_named_x(dir: &std::path::Path, workspace: &str, owner: &str, session: &str) {
+    let conn = rusqlite::Connection::open(dir.join("memory").join("brain.db")).expect("test: open store");
+    conn.pragma_update(None, "foreign_keys", "ON").expect("test: fk");
+    conn.execute(
+        "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'active', ?4)",
+        rusqlite::params![workspace, owner, TARGET_U, TARGET_REV],
+    )
+    .expect("test: incarnation x");
+    conn.execute(
+        "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'n:x', ?5, 1)",
+        rusqlite::params![TARGET_SCOPE, workspace, owner, session, TARGET_U],
+    )
+    .expect("test: scope x");
+}
+
+fn fence_scope(conn: &rusqlite::Connection, scope_id: &str, erase_id: &str) {
+    conn.execute(
+        "INSERT INTO agent_erase_fences VALUES (?1, ?2, 'draining', 2)",
+        rusqlite::params![scope_id, erase_id],
+    )
+    .expect("test: fence");
+}
+
+fn table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let sql = match table {
+        "message_events" | "conversation_turns" | "memory_events" | "memories" | "documents" | "document_chunks"
+        | "embedding_cache" | "memory_drafts" | "memory_trash" => {
+            format!("PRAGMA table_info({table})")
+        }
+        _ => panic!("test: unknown store {table}"),
+    };
+    let mut statement = conn.prepare(&sql).expect("test: pragma");
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("test: columns")
+        .map(|column| column.expect("test: column name"))
+        .collect()
+}
+
+fn scope_rows(conn: &rusqlite::Connection, sql: &str, session: &str) -> Vec<Option<String>> {
+    let mut statement = conn.prepare(sql).expect("test: prepare");
+    statement
+        .query_map([session], |row| row.get(0))
+        .expect("test: query")
+        .map(|value| value.expect("test: scope"))
+        .collect()
+}
+
+fn write_input(
+    workspace: &str,
+    owner: &str,
+    partition: Option<AgentPartition>,
+    session: Option<&str>,
+    content: &str,
+) -> crate::memory::MessageEventInput {
+    let mut input = digest_cell_input(partition);
+    input.workspace_id = workspace.to_owned();
+    input.owner_id = Some(owner.to_owned());
+    input.session_key = session.map(str::to_owned);
+    input.idempotency_key = None;
+    input.content = content.to_owned();
+    input
+}
+
+/// MA-01b3 part 1: transcript/event writers stamp the resolved agent scope.
+/// Real POST for Named X, Main mint (D-CR1), D-CR3 column probe, and refusals.
+#[tokio::test]
+async fn memory_writes_carry_scope() {
+    let fixture = fixture(|config| {
+        config.gateway.targeted_agents = true;
+        config.autonomy.level = AutonomyLevel::Full;
+        capture_provider_config(config, WRITE_SCOPE_PROVIDER, agent(false, &[]));
+    })
+    .await;
+    crate::providers::test_fixture::register(
+        WRITE_SCOPE_PROVIDER,
+        Arc::clone(&fixture.provider) as Arc<dyn crate::providers::Provider>,
+    );
+    let workspace = fixture
+        .state
+        .config
+        .pin()
+        .effective
+        .workspace_dir
+        .to_string_lossy()
+        .into_owned();
+    let owner = super::super::super::ApiPrincipal::of_token("prx-test-token").owner_id;
+    seed_named_x(std::path::Path::new(&workspace), &workspace, &owner, SESSION);
+    let conn = brain(&workspace);
+
+    const NINE: [&str; 9] = [
+        "message_events",
+        "conversation_turns",
+        "memory_events",
+        "memories",
+        "documents",
+        "document_chunks",
+        "embedding_cache",
+        "memory_drafts",
+        "memory_trash",
+    ];
+    let mut dcr3 = Vec::new();
+    for table in NINE {
+        let columns = table_columns(&conn, table);
+        assert!(
+            columns.iter().any(|column| column == "ma_scope_id"),
+            "{table} has ma_scope_id"
+        );
+        dcr3.push(format!("{table}: {}", columns.join(",")));
+    }
+    // D-CR3: no unambiguous FK identifies pre-01b3 targeted rows (target.rs has
+    // selector state only). Parent FKs (message_event_id, subject_id) serve D-CR2.
+    eprintln!("D-CR3 columns: {}", dcr3.join(" | "));
+
+    let (status, value) = post(
+        &fixture,
+        SESSION,
+        serde_json::json!({"message": "named-x", "agent": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Named POST: {value}");
+
+    let named_events = scope_rows(
+        &conn,
+        "SELECT ma_scope_id FROM message_events
+         WHERE session_key = ?1 AND role IN ('user', 'assistant')
+         ORDER BY id",
+        SESSION,
+    );
+    let named_turns = scope_rows(
+        &conn,
+        "SELECT ma_scope_id FROM conversation_turns
+         WHERE session_key = ?1 AND role IN ('user', 'assistant')
+         ORDER BY id",
+        SESSION,
+    );
+    let named_mirrors = scope_rows(
+        &conn,
+        "SELECT ma_scope_id FROM memory_events
+         WHERE session_key = ?1 AND subject_table = 'message_events'
+           AND event_type IN ('message', 'message.created')
+         ORDER BY id",
+        SESSION,
+    );
+    let named_user: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_events WHERE session_key = ?1 AND role = 'user' AND ma_scope_id = ?2",
+            rusqlite::params![SESSION, TARGET_SCOPE],
+            |row| row.get(0),
+        )
+        .expect("test: named user events");
+    let named_assistant: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_events WHERE session_key = ?1 AND role = 'assistant' AND ma_scope_id = ?2",
+            rusqlite::params![SESSION, TARGET_SCOPE],
+            |row| row.get(0),
+        )
+        .expect("test: named assistant events");
+    assert!(named_user >= 1, "Named POST wrote input message_events");
+    assert!(named_assistant >= 1, "Named POST wrote assistant message_events");
+    assert!(!named_events.is_empty(), "Named POST wrote message_events");
+    assert!(
+        named_events.iter().all(|scope| scope.as_deref() == Some(TARGET_SCOPE)),
+        "message_events row carries X's scope: {named_events:?}"
+    );
+    assert!(
+        named_turns.iter().all(|scope| scope.as_deref() == Some(TARGET_SCOPE)),
+        "conversation_turns row carries X's scope: {named_turns:?}"
+    );
+    assert!(
+        named_mirrors.iter().all(|scope| scope.as_deref() == Some(TARGET_SCOPE)),
+        "memory_events row carries X's scope: {named_mirrors:?}"
+    );
+    assert!(
+        named_events.iter().all(Option::is_some)
+            && named_turns.iter().all(Option::is_some)
+            && named_mirrors.iter().all(Option::is_some),
+        "Named X wrote zero NULL rows"
+    );
+
+    let main_incarnations: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM agent_incarnations WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = 'm'",
+            rusqlite::params![&workspace, &owner],
+            |row| row.get(0),
+        )
+        .expect("test: main incarnation count");
+    assert_eq!(main_incarnations, 0, "D-CR1: no Main incarnation before the Main POST");
+
+    let (status, value) = post(&fixture, SESSION, serde_json::json!({"message": "main-hi"})).await;
+    assert_eq!(status, StatusCode::OK, "Main POST: {value}");
+
+    let minted_u: String = conn
+        .query_row(
+            "SELECT incarnation FROM agent_incarnations
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = 'm' AND state = 'active'",
+            rusqlite::params![&workspace, &owner],
+            |row| row.get(0),
+        )
+        .expect("test: D-CR1 minted m");
+    let main_scopes: Vec<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT scope_id FROM agent_scopes
+                 WHERE workspace_id = ?1 AND owner_id = ?2 AND session_key = ?3 AND agent_key = 'm'",
+            )
+            .expect("test: main scopes");
+        statement
+            .query_map(rusqlite::params![&workspace, &owner, SESSION], |row| row.get(0))
+            .expect("test: main scope rows")
+            .map(|value| value.expect("test: scope id"))
+            .collect()
+    };
+    assert_eq!(main_scopes.len(), 1, "D-CR1: one Main scope");
+    let main_scope = main_scopes.first().expect("test: D-CR1 one Main scope");
+    let main_event_scope: Option<String> = conn
+        .query_row(
+            "SELECT ma_scope_id FROM message_events WHERE session_key = ?1 AND content = 'main-hi'",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .expect("test: main event");
+    assert_eq!(
+        main_event_scope.as_deref(),
+        Some(main_scope.as_str()),
+        "Main rows carry the minted scope"
+    );
+    assert_eq!(minted_u.len(), 36, "D-CR1 minted an incarnation UUID");
+
+    let events_before: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_events WHERE session_key = ?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .expect("test: count");
+    fence_scope(&conn, TARGET_SCOPE, FENCE_ERASE);
+    let (status, value) = post(
+        &fixture,
+        SESSION,
+        serde_json::json!({"message": "fenced-x", "agent": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "fenced Named: {value}");
+    assert_eq!(error_code(&value), Some("agent_scope_refused"));
+    let events_after: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_events WHERE session_key = ?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .expect("test: count after fence");
+    assert_eq!(events_after, events_before, "fenced Named wrote zero rows");
+
+    fence_scope(&conn, main_scope, FENCE_MAIN_ERASE);
+    let (status, value) = post(&fixture, SESSION, serde_json::json!({"message": "fenced-main"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "fenced Main: {value}");
+    assert_eq!(error_code(&value), Some("agent_scope_refused"));
+    let fenced_main: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_events WHERE content = 'fenced-main'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("test: fenced main rows");
+    assert_eq!(fenced_main, 0, "fenced Main wrote zero rows");
+
+    let named = named_partition(&workspace, &owner, "x", TARGET_U);
+    let envelope = crate::runtime::envelope::RuntimeEnvelope::console(workspace.clone(), SESSION.to_owned())
+        .with_agent_partition(named.clone())
+        .with_owner_id(owner.clone());
+    let error = append_console_turn(&fixture.state, &envelope, "user", "no-parent", false, false)
+        .await
+        .expect_err("test: Named missing parent event");
+    assert!(
+        error.downcast_ref::<AgentScopeRefused>().is_some(),
+        "W4 Named + missing parent: {error:#}"
+    );
+
+    conn.execute(
+        "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'retired', ?4)",
+        rusqlite::params![&workspace, &owner, RETIRED_U, TARGET_REV],
+    )
+    .expect("test: retired incarnation");
+    for (label, input) in [
+        (
+            "retired incarnation",
+            write_input(
+                &workspace,
+                &owner,
+                Some(named_partition(&workspace, &owner, "x", RETIRED_U)),
+                Some(SESSION),
+                "retired",
+            ),
+        ),
+        (
+            "wrong U",
+            write_input(
+                &workspace,
+                &owner,
+                Some(named_partition(&workspace, &owner, "x", WRONG_U)),
+                Some(SESSION),
+                "wrong-u",
+            ),
+        ),
+        (
+            "missing session_key",
+            write_input(&workspace, &owner, Some(named.clone()), None, "no-session"),
+        ),
+        (
+            "workspace mismatch",
+            write_input(
+                "other-workspace",
+                &owner,
+                Some(named.clone()),
+                Some(SESSION),
+                "mismatch",
+            ),
+        ),
+        (
+            "owner mismatch",
+            write_input(
+                &workspace,
+                "other-owner",
+                Some(named.clone()),
+                Some(SESSION),
+                "owner-mismatch",
+            ),
+        ),
+    ] {
+        let error = fixture.memory.append_message_event(input).await.expect_err(label);
+        assert!(
+            error.downcast_ref::<AgentScopeRefused>().is_some(),
+            "{label}: {error:#}"
+        );
+    }
+    for content in ["retired", "wrong-u", "no-session", "mismatch", "owner-mismatch"] {
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM message_events WHERE content = ?1",
+                [content],
+                |row| row.get(0),
+            )
+            .expect("test: leak");
+        assert_eq!(leaked, 0, "{content} wrote zero rows");
+    }
 }
 
 #[tokio::test]

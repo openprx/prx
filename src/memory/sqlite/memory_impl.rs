@@ -11,7 +11,7 @@ use crate::memory::traits::{
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
-use rusqlite::params;
+use rusqlite::{TransactionBehavior, params};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -531,7 +531,7 @@ impl Memory for SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = pool.write();
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO sessions (
                     session_key,
@@ -559,16 +559,30 @@ impl Memory for SqliteMemory {
                     &preview
                 ],
             )?;
+            let inherited_scope: Option<String> = if let Some(parent) = message_id.as_deref() {
+                let mut statement = tx.prepare("SELECT ma_scope_id FROM message_events WHERE event_id = ?1")?;
+                let parents: Vec<Option<String>> = statement
+                    .query_map([parent], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                match parents.as_slice() {
+                    [scope] => scope.clone(),
+                    [] => None,
+                    _ => return Err(crate::memory::AgentScopeRefused.into()),
+                }
+            } else {
+                None
+            };
             tx.execute(
-                "INSERT INTO conversation_turns (session_key, owner_id, role, content, timestamp, message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO conversation_turns (session_key, owner_id, role, content, timestamp, message_id, ma_scope_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     &session_key,
                     owner_id.as_deref(),
                     &role,
                     &content,
                     &timestamp,
-                    message_id.as_deref()
+                    message_id.as_deref(),
+                    inherited_scope
                 ],
             )?;
             tx.commit()?;
