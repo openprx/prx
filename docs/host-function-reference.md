@@ -1,129 +1,65 @@
 # Host Function Reference
 
-> **Package:** `prx:host@0.1.0`  
-> **WIT source:** `wit/host/`  
-> **Version:** 0.1
+Package `prx:host@0.1.0`. WIT sources live in `wit/host/`. The host also
+links `prx:host/websocket-outbound@0.1.0`, which has no file under `wit/host/`.
 
-This document is the authoritative reference for all host functions available to PRX WASM plugins. Each interface corresponds to a WIT file in `wit/host/`.
+Plugins are WebAssembly components. They call only the host interfaces their
+world imports (see [World matrix](#world-matrix)). A call without the matching
+permission returns an error string to the guest (reads on `kv` return empty
+instead). `log` and `config` are always granted to a trusted plugin.
+
+Nothing in this document is a filesystem, network, or WASI clock grant. Those
+are not host WIT interfaces.
 
 ---
 
 ## Table of Contents
 
-1. [`log` — Structured Logging](#1-log--structured-logging)
-2. [`config` — Plugin Configuration](#2-config--plugin-configuration)
-3. [`kv` — Key-Value Storage](#3-kv--key-value-storage)
-4. [`http-outbound` — Outbound HTTP](#4-http-outbound--outbound-http)
-5. [`memory` — Long-Term Memory](#5-memory--long-term-memory)
-6. [`events` — Event Bus](#6-events--event-bus)
+1. [`log`](#1-log)
+2. [`config`](#2-config)
+3. [`kv`](#3-kv)
+4. [`http-outbound`](#4-http-outbound)
+5. [`websocket-outbound`](#5-websocket-outbound)
+6. [`memory`](#6-memory)
+7. [`events`](#7-events)
+8. [World matrix](#world-matrix)
+9. [WIT sources](#wit-sources)
 
 ---
 
-## 1. `log` — Structured Logging
+## 1. `log`
 
 **Interface:** `prx:host/log`  
-**WIT file:** `wit/host/log.wit`  
-**Permission required:** None (always available)
-
-Emit structured log messages that integrate with PRX's tracing infrastructure. All log messages are tagged with the emitting plugin's name.
-
-### WIT Definition
+**WIT:** `wit/host/log.wit`  
+**Permission:** none (always granted)
 
 ```wit
 interface log {
-    enum level {
-        trace,
-        debug,
-        info,
-        warn,
-        error,
-    }
-
+    enum level { trace, debug, info, warn, error }
     log: func(level: level, message: string);
 }
 ```
 
-### Functions
+### `log`
 
-#### `log`
+| Parameter | Type |
+|-----------|------|
+| `level` | `level` (`trace`, `debug`, `info`, `warn`, `error`) |
+| `message` | `string` |
 
-Emit a log message at the specified severity level.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `level` | `level` | Severity level (see below) |
-| `message` | `string` | Log message text |
-
-**Returns:** nothing
-
-**Severity levels:**
-
-| Level | Value | Use case |
-|-------|-------|----------|
-| `trace` | 0 | Extremely verbose internal steps; disabled in production by default |
-| `debug` | 1 | Development-time debugging information |
-| `info` | 2 | Normal operational messages (most common) |
-| `warn` | 3 | Unexpected but recoverable situations |
-| `error` | 4 | Failures that affect plugin functionality |
-
-### PDK Usage
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-log::trace("entering hot path");
-log::debug(&format!("processing item: {id}"));
-log::info("operation completed successfully");
-log::warn(&format!("retrying after error: {e}"));
-log::error(&format!("fatal: {e}"));
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-host.log.trace("entering hot path")
-host.log.debug(f"processing item: {id}")
-host.log.info("operation completed successfully")
-host.log.warn(f"retrying after error: {e}")
-host.log.error(f"fatal: {e}")
-```
-
-**TypeScript:**
-
-```typescript
-import { log } from "@prx/pdk";
-log.trace("entering hot path");
-log.debug(`processing item: ${id}`);
-log.info("operation completed successfully");
-log.warn(`retrying after error: ${e}`);
-log.error(`fatal: ${e}`);
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/log"
-log.Trace("entering hot path")
-log.Debug("processing item: " + id)
-log.Info("operation completed successfully")
-log.Warn("retrying after error: " + e.Error())
-log.Error("fatal: " + e.Error())
-```
+**Returns:** nothing. Messages are emitted on the host tracing subscriber and
+tagged with the plugin name. An unknown level string is logged at `info`.
 
 ---
 
-## 2. `config` — Plugin Configuration
+## 2. `config`
 
 **Interface:** `prx:host/config`  
-**WIT file:** `wit/host/config.wit`  
-**Permission required:** `"config"` (always granted)
+**WIT:** `wit/host/config.wit`  
+**Permission:** none (always granted)
 
-Provides read-only access to plugin-specific configuration values defined in the `[config]` section of `plugin.toml`. Values are set at deploy time and cannot be changed at runtime.
-
-### WIT Definition
+Read-only copy of the `[config]` table in `plugin.toml`. Values are strings set
+at load. They do not change for a live instance.
 
 ```wit
 interface config {
@@ -132,95 +68,30 @@ interface config {
 }
 ```
 
-### Functions
+### `get`
 
-#### `get`
+| Parameter | Type |
+|-----------|------|
+| `key` | `string` |
 
-Get a single configuration value by key.
+**Returns:** `option<string>` — `none` when the key is absent.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `key` | `string` | Configuration key |
+### `get-all`
 
-**Returns:** `option<string>` — the value, or `none` if the key is not set
-
----
-
-#### `get-all`
-
-Get all configuration key-value pairs.
-
-**Returns:** `list<tuple<string, string>>` — all key-value pairs defined in `[config]`
-
-### PDK Usage
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-// Get a value (returns Option<String>)
-let api_key = config::get("api_key");
-
-// Get with a default fallback
-let timeout = config::get_or("timeout_ms", "5000");
-
-// Get all key-value pairs
-let all: Vec<(String, String)> = config::get_all();
-for (k, v) in &all {
-    log::debug(&format!("config: {k} = {v}"));
-}
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-value = host.config.get("api_key")               # Optional[str]
-value = host.config.get_or("timeout_ms", "5000") # str
-pairs = host.config.get_all()                    # list[tuple[str, str]]
-```
-
-**TypeScript:**
-
-```typescript
-import { config } from "@prx/pdk";
-const apiKey = config.get("api_key");              // string | undefined
-const timeout = config.getOr("timeout_ms", "5000"); // string
-const all = config.getAll();                       // [string, string][]
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/config"
-val, ok := config.Get("api_key")
-timeout := config.GetOr("timeout_ms", "5000")
-pairs := config.GetAll()  // [][2]string
-```
-
-### Example `plugin.toml`
-
-```toml
-[config]
-api_key       = "sk-..."
-base_url      = "https://api.example.com/v1"
-timeout_ms    = "5000"
-max_retries   = "3"
-debug         = "false"
-```
+**Returns:** `list<tuple<string, string>>` — every `[config]` pair.
 
 ---
 
-## 3. `kv` — Key-Value Storage
+## 3. `kv`
 
 **Interface:** `prx:host/kv`  
-**WIT file:** `wit/host/kv.wit`  
-**Permission required:** `"kv"`
+**WIT:** `wit/host/kv.wit`  
+**Permission:** `"kv"`
 
-Isolated persistent key-value storage. Each plugin has its own namespace — plugins cannot read or write each other's keys. Data persists across plugin reloads and PRX restarts.
-
-### WIT Definition
+Per-plugin in-memory map (`HashMap` in the adapter supervisor). Plugins cannot
+see each other's keys. The map is **not** written to disk. It survives a trap
+rebuild of the same adapter. It is empty after a process restart and after a
+new loaded generation (install, update, reload).
 
 ```wit
 interface kv {
@@ -231,176 +102,65 @@ interface kv {
 }
 ```
 
-### Functions
+### `get`
 
-#### `get`
+| Parameter | Type |
+|-----------|------|
+| `key` | `string` |
 
-Retrieve a value by key.
+**Returns:** `option<list<u8>>`. Missing key and a denied `"kv"` permission
+both return `none` (denied also logs a warning).
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `key` | `string` | Key to retrieve |
+### `set`
 
-**Returns:** `option<list<u8>>` — the raw bytes value, or `none` if the key does not exist
+| Parameter | Type |
+|-----------|------|
+| `key` | `string` |
+| `value` | `list<u8>` |
 
----
+**Returns:** `result<_, string>`. Errors:
 
-#### `set`
+- `"permission 'kv' denied for plugin '<name>'"`
+- `"permission 'kv' not yet granted for plugin '<name>' (optional, needs approval)"`
+- `"plugin KV quota exceeded: requested N bytes, limit M bytes"` — `N` is the
+  sum of every key and value byte after the write, including this key.
 
-Store a value. Overwrites any existing value for the key.
+Quota is `resources.max_kv_storage_mb` (default 10), counted as key bytes plus
+value bytes for the whole namespace. Overwriting a key credits the previous
+size.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `key` | `string` | Key to store |
-| `value` | `list<u8>` | Raw bytes to store |
+### `delete`
 
-**Returns:** `result<_, string>` — `ok(())` on success, `err(message)` on failure (e.g., storage limit exceeded)
+| Parameter | Type |
+|-----------|------|
+| `key` | `string` |
 
----
+**Returns:** `result<bool, string>` — `ok(true)` if the key existed. Permission
+errors as for `set`.
 
-#### `delete`
+### `list-keys`
 
-Delete a key.
+| Parameter | Type |
+|-----------|------|
+| `prefix` | `string` |
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `key` | `string` | Key to delete |
+**Returns:** `list<string>` in unspecified order. Empty prefix lists every key.
+A denied `"kv"` permission returns an empty list.
 
-**Returns:** `result<bool, string>` — `ok(true)` if the key existed and was deleted, `ok(false)` if the key did not exist, `err(message)` on storage error
-
----
-
-#### `list-keys`
-
-List all keys matching a prefix.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `prefix` | `string` | Key prefix to filter by; use `""` to list all keys |
-
-**Returns:** `list<string>` — all keys with the given prefix, in unspecified order
-
-### Notes
-
-- **Namespace isolation:** Keys are automatically namespaced per plugin. Two plugins can both have a key named `"state"` without conflict.
-- **Storage limit:** Controlled by `resources.max_kv_storage_mb` in `plugin.toml` (default: 10 MB). Writing data that exceeds the limit returns an error.
-- **Value type:** Raw bytes (`list<u8>`). Use PDK helpers for string and JSON serialization.
-- **Atomicity:** Individual `get`/`set`/`delete` operations are atomic. Multi-key transactions are not supported.
-
-### PDK Convenience Helpers
-
-The PDK adds `has`, `increment`, `get_str`/`set_str`, and `get_json`/`set_json` on top of the core WIT functions:
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-// Raw bytes
-kv::set("raw", b"hello world").unwrap();
-let bytes: Option<Vec<u8>> = kv::get("raw");
-let existed = kv::delete("raw").unwrap();  // bool
-let keys = kv::list_keys("prefix:");       // Vec<String>
-
-// String helpers
-kv::set_str("name", "Alice").unwrap();
-let name: Option<String> = kv::get_str("name");
-
-// JSON helpers (requires serde)
-kv::set_json("user", &my_struct).unwrap();
-let user: MyStruct = kv::get_json("user").unwrap();
-
-// Atomic counter (PDK wrapper using get+set)
-let count: i64 = kv::increment("call_count", 1).unwrap();
-
-// Existence check (PDK wrapper using get)
-let exists = kv::has("my_key");
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-
-host.kv.set("raw", b"hello")
-data: bytes | None = host.kv.get("raw")
-
-host.kv.set_str("name", "Alice")
-name: str | None = host.kv.get_str("name")
-
-host.kv.set_json("config", {"debug": True})
-obj = host.kv.get_json("config")
-
-existed = host.kv.delete("raw")   # bool
-keys = host.kv.list_keys("")       # list[str]
-count = host.kv.increment("calls", delta=1)  # int (new value)
-```
-
-**TypeScript:**
-
-```typescript
-import { kv } from "@prx/pdk";
-
-kv.set("raw", new Uint8Array([104, 101, 108, 108, 111]));
-const bytes = kv.get("raw");         // Uint8Array | undefined
-
-kv.setString("name", "Alice");
-const name = kv.getString("name");  // string | undefined
-
-kv.setJson("config", { debug: true });
-const config = kv.getJson<{ debug: boolean }>("config");
-
-kv.delete("raw");                   // boolean
-kv.listKeys("");                    // string[]
-kv.increment("calls", 1);          // number (new value)
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/kv"
-
-_ = kv.Set("raw", []byte("hello"))
-data, ok := kv.Get("raw")
-
-_ = kv.SetString("name", "Alice")
-name, ok := kv.GetString("name")
-
-_ = kv.SetJSON("state", jsonBytes)
-data, ok = kv.GetJSON("state")
-
-existed, err := kv.Delete("raw")
-keys := kv.ListKeys("")
-```
-
-### Example: Persistent Counter
-
-```rust
-pub fn execute_impl(args_json: &str) -> PluginResult {
-    // Increment call counter
-    let calls = kv::increment("total_calls", 1).unwrap_or(0);
-    log::info(&format!("Invocation #{calls}"));
-
-    // Store last invocation time
-    let now = clock::now_ms().to_string();
-    kv::set_str("last_call_ms", &now).unwrap();
-
-    // ... main logic ...
-    PluginResult::ok("done")
-}
-```
+There is no `increment`, `has`, or JSON helper in WIT. PDK wrappers that add
+those sit on top of `get`/`set`.
 
 ---
 
-## 4. `http-outbound` — Outbound HTTP
+## 4. `http-outbound`
 
 **Interface:** `prx:host/http-outbound`  
-**WIT file:** `wit/host/http.wit`  
-**Permission required:** `"http-outbound"` + `http_allowlist` in `plugin.toml`
+**WIT:** `wit/host/http.wit`  
+**Permission:** `"http-outbound"`
 
-Make controlled outbound HTTP requests. All URLs are validated against the plugin's `http_allowlist` (an empty list denies every URL), against the private-network guard and against the request budget before any network connection is made. `websocket-outbound` `connect` follows the same rules.
-
-### WIT Definition
+Every request is checked before any connection: permission, `http_allowlist`
+(empty denies every URL), the private-network address guard (including after
+DNS and on every redirect hop), and the request budget.
 
 ```wit
 interface http-outbound {
@@ -409,7 +169,6 @@ interface http-outbound {
         headers: list<tuple<string, string>>,
         body: list<u8>,
     }
-
     request: func(
         method: string,
         url: string,
@@ -419,200 +178,98 @@ interface http-outbound {
 }
 ```
 
-### Types
+### `request`
 
-#### `http-response`
+| Parameter | Type |
+|-----------|------|
+| `method` | `string` — `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` (case-insensitive) |
+| `url` | `string` — `http` or `https` only |
+| `headers` | `list<tuple<string, string>>` |
+| `body` | `option<list<u8>>` |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `status` | `u16` | HTTP status code (e.g., `200`, `404`, `500`) |
-| `headers` | `list<tuple<string, string>>` | Response headers as name-value pairs |
-| `body` | `list<u8>` | Response body as raw bytes |
+**Returns:** `result<http-response, string>`. Errors include:
 
-### Functions
+- permission denied / not yet granted
+- allowlist or address-guard rejection
+- `"plugin '<name>' exceeded max_http_requests_per_call (N)"`
+- `"plugin '<name>' exceeded max_http_requests_per_minute (N)"`
+- `"unsupported method: …"`
+- `"request failed: …"`, `"body read error: …"`
+- `"response body exceeds 16777216 bytes"` (16 MiB)
+- `"too many redirects (limit 5)"`
 
-#### `request`
+The per-call counter resets at the start of each guest invocation. The optional
+per-minute window is shared by every adapter of the plugin for the process
+lifetime (a trap rebuild does not reset it). Timeout is
+`resources.max_execution_time_ms`.
 
-Make an HTTP request.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `method` | `string` | HTTP method: `"GET"`, `"POST"`, `"PUT"`, `"PATCH"`, `"DELETE"`, `"HEAD"`, `"OPTIONS"` |
-| `url` | `string` | Full URL including scheme, host, and path |
-| `headers` | `list<tuple<string, string>>` | Request headers as name-value pairs |
-| `body` | `option<list<u8>>` | Request body bytes, or `none` for no body |
-
-**Returns:** `result<http-response, string>` — the response on success, or an error message on failure
-
-**Failure reasons:**
-
-- URL not in `http_allowlist`, or the allowlist is empty
-- URL with user info, or a scheme other than `http`/`https`
-- Target is a loopback, link-local, private (RFC 1918 / ULA), CGNAT, multicast, reserved or cloud-metadata address, as an IP literal, as any address the host name resolves to, or as a redirect target
-- A redirect hop outside the allowlist, or more than 5 redirects
-- Network error (DNS failure, connection refused, timeout)
-- Request count limit reached (`max_http_requests_per_call` per invocation, or `max_http_requests_per_minute` over a rolling minute)
-- Response body larger than 16 MiB
-
-### Declaring the Permission
-
-```toml
-[permissions]
-required = ["http-outbound"]
-
-# Required when using http-outbound: URL patterns, scheme://host[:port][/path-prefix][*].
-# Scheme and host (or a leading "*." for subdomains) match exactly; the path is a
-# prefix on a segment boundary. Empty denies everything.
-http_allowlist = [
-    "https://api.openweathermap.org/*",
-    "https://api.github.com/*",
-    "https://httpbin.org/*",
-]
-```
-
-### PDK Usage
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-// GET request
-let resp = http::get("https://api.example.com/data", &[]).unwrap();
-println!("Status: {}", resp.status);
-let body_str = resp.body_text();           // String (UTF-8 decoded)
-let json: serde_json::Value = resp.json().unwrap();
-
-// POST with JSON body
-let payload = serde_json::json!({ "city": "London" });
-let resp = http::post_json(
-    "https://api.example.com/weather",
-    &[("Authorization", "Bearer my-token")],
-    &payload,
-).unwrap();
-
-// Generic request
-let resp = http::request(
-    "DELETE",
-    "https://api.example.com/items/42",
-    &[
-        ("Authorization", "Bearer my-token"),
-        ("X-Request-Id", "abc-123"),
-    ],
-    None,  // no body
-).unwrap();
-
-// PUT with raw body
-let body = b"raw body bytes";
-let resp = http::request(
-    "PUT",
-    "https://api.example.com/blob/key",
-    &[("Content-Type", "application/octet-stream")],
-    Some(body),
-).unwrap();
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-
-# GET
-resp = host.http.get("https://api.example.com/data")
-print(resp.status)       # int
-print(resp.text())       # str
-print(resp.json())       # any (parsed JSON)
-
-# POST JSON
-resp = host.http.post_json(
-    "https://api.example.com/weather",
-    {"city": "London"},
-    headers=[("Authorization", "Bearer token")],
-)
-
-# Generic
-resp = host.http.request(
-    "DELETE",
-    "https://api.example.com/items/42",
-    headers=[("Authorization", "Bearer token")],
-    body=None,
-)
-```
-
-**TypeScript:**
-
-```typescript
-import { http } from "@prx/pdk";
-
-// GET
-const resp = http.get("https://api.example.com/data");
-const text = http.bodyText(resp);        // string
-const json = http.bodyJson<MyType>(resp); // MyType
-
-// POST JSON
-const resp2 = http.postJson(
-    "https://api.example.com/submit",
-    { key: "value" },
-    [["Authorization", "Bearer token"]],
-);
-
-// Generic
-const resp3 = http.request(
-    "DELETE",
-    "https://api.example.com/items/42",
-    [["Authorization", "Bearer token"]],
-    undefined,
-);
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/http"
-
-headers := [][2]string{{"Authorization", "Bearer token"}}
-
-// GET
-resp, err := http.Get("https://api.example.com/data", headers)
-fmt.Println(resp.Status, resp.BodyText())
-
-// POST JSON
-resp, err = http.PostJSON("https://api.example.com/submit", headers, jsonBody)
-
-// Generic
-resp, err = http.Request("DELETE", url, headers, nil)
-```
-
-### Error Handling
-
-```rust
-match http::get("https://api.example.com/data", &[]) {
-    Ok(resp) if resp.status == 200 => {
-        let json = resp.json().unwrap();
-        // handle success
-    }
-    Ok(resp) => {
-        log::warn(&format!("API returned status {}", resp.status));
-    }
-    Err(e) => {
-        // URL not in allowlist, network error, or limit exceeded
-        log::error(&format!("HTTP error: {e}"));
-        return PluginResult::err(format!("Request failed: {e}"));
-    }
-}
-```
+Allowlist pattern: `scheme://host[:port][/path-prefix][*]`. Scheme matches
+exactly. Host matches exactly, or as a subdomain when the pattern starts with
+`*.`. Port matches the pattern or the scheme default (80 / 443). Path is a
+prefix on a segment boundary. Userinfo, query and fragment are refused. An
+invalid pattern is a manifest load error.
 
 ---
 
-## 5. `memory` — Long-Term Memory
+## 5. `websocket-outbound`
+
+**Interface:** `prx:host/websocket-outbound`  
+**WIT file:** none (host-linked as `prx:host/websocket-outbound@0.1.0`)  
+**Permission:** `"websocket-outbound"`
+
+No world in `wit/worlds.wit` imports this interface. The host still registers
+it on every capability linker. A guest that wants it must import
+`prx:host/websocket-outbound` in its own WIT.
+
+The same allowlist, address guard and request budget as HTTP apply to
+`connect`. Schemes are `ws` and `wss` only. A websocket upgrade that answers
+with a redirect is an error. Timeout is `resources.max_execution_time_ms`.
+
+### `connect`
+
+`connect: func(url: string) -> result<u64, string>`
+
+**Returns:** a session id. Errors: permission, allowlist/guard/budget,
+`"invalid websocket URL: …"`, `"websocket URL has no host"`,
+`"websocket URL has no port"`, `"websocket connect failed: …"`,
+`"websocket connect timed out after Nms"`.
+
+### `send`
+
+`send: func(session-id: u64, message: string) -> result<_, string>`
+
+Sends a text frame. Timeout or send failure drops the session.
+Errors include `"websocket session N not found"`,
+`"websocket send timed out after Nms"`, `"websocket send failed: …"`.
+
+### `receive`
+
+`receive: func(session-id: u64) -> result<string, string>`
+
+Returns the next text frame, or a binary frame decoded as UTF-8. Ping/pong
+are skipped. Close or end of stream drops the session and returns
+`"websocket session N closed"`. Invalid UTF-8 binary returns
+`"websocket binary payload is not utf-8: …"`. Timeout drops the session.
+
+### `close`
+
+`close: func(session-id: u64) -> result<_, string>`
+
+Closes and drops the session. Timeout: `"websocket close timed out after Nms"`.
+
+`connect` spends one request from the HTTP/WebSocket budget. `send` /
+`receive` / `close` do not.
+
+---
+
+## 6. `memory`
 
 **Interface:** `prx:host/memory`  
-**WIT file:** `wit/host/memory.wit`  
-**Permission required:** `"memory"`
+**WIT:** `wit/host/memory.wit`  
+**Permission:** `"memory"`
 
-Access PRX's semantic memory system. Memories are indexed for similarity search, enabling recall by meaning rather than exact key match.
-
-### WIT Definition
+Writes go to the configured PRX memory backend with origin
+`plugin:<plugin-name>` and a generated key `plugin:<plugin-name>:<uuid>`.
 
 ```wit
 interface memory {
@@ -622,142 +279,42 @@ interface memory {
         category: string,
         importance: f64,
     }
-
     store: func(text: string, category: string) -> result<string, string>;
     recall: func(query: string, limit: u32) -> result<list<memory-entry>, string>;
 }
 ```
 
-### Types
+### `store`
 
-#### `memory-entry`
+| Parameter | Type |
+|-----------|------|
+| `text` | `string` |
+| `category` | `string` — `core`, `daily`, `conversation`, or a custom name |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | `string` | Unique entry identifier (UUID) |
-| `text` | `string` | The stored text |
-| `category` | `string` | Category label for filtering |
-| `importance` | `f64` | Relevance score (0.0–1.0), higher = more relevant to query |
+**Returns:** `result<string, string>` — the new entry key. Errors: permission,
+`"memory backend not configured"`, `"memory store failed: …"`.
 
-### Functions
+### `recall`
 
-#### `store`
+| Parameter | Type |
+|-----------|------|
+| `query` | `string` |
+| `limit` | `u32` |
 
-Store text in memory.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `text` | `string` | Text content to store |
-| `category` | `string` | Category label (e.g., `"fact"`, `"preference"`, `"entity"`) |
-
-**Returns:** `result<string, string>` — the new entry's ID on success, error message on failure
-
-**Category conventions:**
-
-| Category | Use for |
-|----------|---------|
-| `"fact"` | Objective facts |
-| `"preference"` | User preferences and settings |
-| `"decision"` | Decisions made |
-| `"entity"` | People, places, organizations |
-| `"other"` | Miscellaneous |
+**Returns:** `result<list<memory-entry>, string>`. `importance` is the backend
+score, or `0.0` when the backend omits one. Errors: permission,
+`"memory backend not configured"`, `"memory recall failed: …"`.
 
 ---
 
-#### `recall`
-
-Search memories by semantic similarity.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `query` | `string` | Natural language search query |
-| `limit` | `u32` | Maximum number of results to return |
-
-**Returns:** `result<list<memory-entry>, string>` — matching entries sorted by relevance descending, or error
-
-### PDK Usage
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-// Store a memory
-let id = memory::store("User prefers dark mode", "preference")
-    .map_err(|e| PluginResult::err(e))?;
-log::info(&format!("Stored memory: {id}"));
-
-// Recall by semantic query
-let entries = memory::recall("user interface preferences", 5)
-    .unwrap_or_default();
-
-for entry in &entries {
-    log::debug(&format!(
-        "[{:.2}] {}: {}",
-        entry.importance, entry.id, entry.text
-    ));
-}
-
-// Use top result
-if let Some(top) = entries.first() {
-    log::info(&format!("Best match: {}", top.text));
-}
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-
-# Store
-entry_id = host.memory.store("User prefers dark mode", category="preference")
-
-# Recall
-entries = host.memory.recall("user interface preferences", limit=5)
-for e in entries:
-    print(f"[{e.importance:.2f}] {e.id}: {e.text}")
-```
-
-**TypeScript:**
-
-```typescript
-import { memory } from "@prx/pdk";
-import type { MemoryEntry } from "@prx/pdk";
-
-// Store
-const id = memory.store("User prefers dark mode", "preference");
-
-// Recall
-const entries: MemoryEntry[] = memory.recall("user interface preferences", 5);
-entries.forEach(e => console.log(`[${e.importance.toFixed(2)}] ${e.text}`));
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/memory"
-
-// Store
-id, err := memory.Store("User prefers dark mode", "preference")
-
-// Recall
-entries, err := memory.Recall("user interface preferences", 5)
-for _, e := range entries {
-    // e.ID, e.Text, e.Category, e.Importance
-}
-```
-
----
-
-## 6. `events` — Event Bus
+## 7. `events`
 
 **Interface:** `prx:host/events`  
-**WIT file:** `wit/host/event.wit`  
-**Permission required:** `"events"`
+**WIT:** `wit/host/event.wit`  
+**Permission:** `"events"`
 
-Bounded fire-and-forget publish/subscribe event bus for inter-plugin communication and PRX lifecycle events. Each subscriber has a 1,024-event host queue; a slow consumer drops new events instead of growing process memory.
-
-### WIT Definition
+In-process publish/subscribe. Delivery is fire-and-forget. Slow subscribers
+drop events (queue capacity 1024).
 
 ```wit
 interface events {
@@ -767,226 +324,78 @@ interface events {
 }
 ```
 
-### Functions
+### `publish`
 
-#### `publish`
+| Parameter | Type |
+|-----------|------|
+| `topic` | `string` — 1..=256 bytes |
+| `payload` | `string` — JSON text, max 65536 bytes |
 
-Publish an event to a topic.
+**Returns:** `result<_, string>`. Errors: permission, topic length,
+`"event bus: payload size N exceeds maximum 65536 bytes"`,
+`"event bus: recursion depth limit (8) exceeded for topic '…'"`.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `topic` | `string` | Event topic (dot-separated, e.g., `"weather.update"`) |
-| `payload` | `string` | JSON-encoded event payload (max 64 KB) |
+When no event bus is configured, `publish` returns `ok` and drops the event.
 
-**Returns:** `result<_, string>` — `ok(())` on success, `err(message)` on failure
+### `subscribe`
 
-**Failure reasons:**
+| Parameter | Type |
+|-----------|------|
+| `topic-pattern` | `string` — exact topic, or a prefix wildcard ending in `.*` |
 
-- Payload exceeds 64 KB
-- Recursion limit reached (plugin publishing to itself)
+**Returns:** `result<u64, string>` — subscription id.
 
----
+`subscribe` requires a hook-capable instance with an event sink. Other worlds
+get `"event subscriptions require a hook-capable plugin event handler"`.
+Without a bus: `"event bus is not configured"`. At most 4096 active
+subscriptions in the process.
 
-#### `subscribe`
+Deliveries arrive on the hook `on-event` export; the event name is the topic.
 
-Subscribe to a topic pattern.
+### `unsubscribe`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `topic-pattern` | `string` | Topic pattern: exact (`"prx.lifecycle.tool_call"`) or wildcard (`"prx.lifecycle.*"`) |
+| Parameter | Type |
+|-----------|------|
+| `subscription-id` | `u64` |
 
-**Returns:** `result<u64, string>` — subscription ID on success (use with `unsubscribe`), error message on failure
-
-Subscriptions are supported only by hook-capable plugins, because those plugins export the `on-event` delivery contract. A real subscriber pump forwards bus messages into that export. Other plugin worlds receive an explicit error instead of a successful subscription that discards events. Subscriptions remain active until `unsubscribe`, plugin-generation replacement, or instance shutdown.
-
----
-
-#### `unsubscribe`
-
-Cancel one of your own subscriptions. A plugin can cancel only subscriptions it made; another plugin's ID is refused exactly like an unknown one.
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `subscription-id` | `u64` | Subscription ID returned by `subscribe` |
-
-**Returns:** `result<_, string>` — `ok(())` on success, `err(message)` if the ID is invalid
-
-### Topic Patterns
-
-| Pattern | Matches |
-|---------|---------|
-| `"weather.update"` | Exactly `weather.update` only |
-| `"weather.*"` | `weather.update`, `weather.alert`, `weather.clear`, etc. |
-| `"prx.lifecycle.*"` | All PRX lifecycle events |
-| `"*"` | All events (use with care) |
-
-### Built-in PRX Events
-
-| Topic | Description | Payload fields |
-|-------|-------------|---------------|
-| `prx.lifecycle.agent_start` | Agent loop started | `provider: string, model: string` |
-| `prx.lifecycle.agent_stop` | Agent loop stopped | emitter-specific |
-| `prx.lifecycle.llm_request` | Request sent to LLM | emitter-specific |
-| `prx.lifecycle.llm_response` | Response from LLM | emitter-specific |
-| `prx.lifecycle.tool_call_start` | Tool invocation starting | emitter-specific |
-| `prx.lifecycle.tool_call` | Tool invoked by LLM | emitter-specific |
-| `prx.lifecycle.turn_complete` | A turn finished | emitter-specific |
-| `prx.lifecycle.error` | Error occurred | `component: string, message: string` |
-
-These eight are the bridged native hook events (`agent_end` is published as `agent_stop`); the payload is the same JSON the `hooks.json` commands receive. Dot-style topics such as `tool.call` or `llm.request` are not published.
-
-### PDK Usage
-
-**Rust:**
-
-```rust
-use prx_pdk::prelude::*;
-
-// Publish
-events::publish("my.plugin.result", r#"{"status":"ok","count":42}"#).unwrap();
-
-// Publish with auto-serialized JSON
-events::publish_json("my.plugin.result", &serde_json::json!({
-    "status": "ok",
-    "count": 42,
-})).unwrap();
-
-// Subscribe and track subscription
-let sub_id = events::subscribe("prx.lifecycle.*").unwrap();
-// ... plugin logic ...
-events::unsubscribe(sub_id).unwrap();
-```
-
-**Python:**
-
-```python
-from prx_pdk import host
-
-# Publish
-host.events.publish("my.plugin.result", '{"status":"ok","count":42}')
-host.events.publish_json("my.plugin.result", {"status": "ok", "count": 42})
-
-# Subscribe
-sub_id = host.events.subscribe("prx.lifecycle.*")
-# ... plugin logic ...
-host.events.unsubscribe(sub_id)
-```
-
-**TypeScript:**
-
-```typescript
-import { events } from "@prx/pdk";
-
-// Publish
-events.publish("my.plugin.result", JSON.stringify({ status: "ok", count: 42 }));
-events.publishJson("my.plugin.result", { status: "ok", count: 42 });
-
-// Subscribe (returns bigint subscription ID)
-const subId = events.subscribe("prx.lifecycle.*");
-// ...
-events.unsubscribe(subId);
-```
-
-**Go:**
-
-```go
-import "github.com/openprx/prx-pdk-go/host/events"
-
-// Publish
-err := events.Publish("my.plugin.result", `{"status":"ok","count":42}`)
-err = events.PublishJSON("my.plugin.result", jsonPayload)
-
-// Subscribe
-id, err := events.Subscribe("prx.lifecycle.*")
-// ...
-err = events.Unsubscribe(id)
-```
-
-### Hook Integration
-
-Hook plugins receive declared lifecycle events and dynamic `subscribe` deliveries through the same `on-event` export. Dynamic deliveries use the topic as the event name.
-
-```rust
-// Hook plugin: event patterns are declared in plugin.toml
-// The host calls on-event for matching events
-pub fn on_event_impl(event: &str, payload_json: &str) -> Result<(), String> {
-    match event {
-        "tool.call" => {
-            let payload: serde_json::Value = serde_json::from_str(payload_json)
-                .unwrap_or_default();
-            let tool = payload["tool_name"].as_str().unwrap_or("unknown");
-            let _ = kv::increment(&format!("count:{tool}"), 1);
-        }
-        "error" => {
-            // Forward errors as a new event for monitoring plugins
-            events::publish("audit.error", payload_json).ok();
-        }
-        _ => {}
-    }
-    Ok(())
-}
-```
-
-### Constraints
-
-| Constraint | Value | Notes |
-|------------|-------|-------|
-| Max payload | 64 KB | Per event; JSON must be valid |
-| Delivery | Async, fire-and-forget | No delivery confirmation |
-| Ordering | Best-effort | Events may be reordered under load |
-| Recursion | Blocked | Plugin cannot receive events it published to itself |
+**Returns:** `result<_, string>`. Without a bus this is `ok`. Permission errors
+as for `publish`.
 
 ---
 
-## Appendix: Permission Quick Reference
+## World matrix
 
-| Permission | Interface | Worlds available in | Default |
-|------------|-----------|--------------------|---------|
-| (none) | `prx:host/log` | all | ✅ always granted |
-| `config` | `prx:host/config` | all | ✅ always granted |
-| `kv` | `prx:host/kv` | tool, middleware, hook, cron | ❌ must declare |
-| `events` | `prx:host/events` | all | ❌ must declare |
-| `http-outbound` | `prx:host/http-outbound` | tool, provider, storage | ❌ must declare |
-| `memory` | `prx:host/memory` | tool | ❌ must declare |
+`"import"` means `wit/worlds.wit` imports the interface. The guest still needs
+the permission (except `log` / `config`). `"host"` means the linker registers
+the interface even though the world does not import it.
 
-### World × Host Function Matrix
+| Interface | tool | middleware | hook | cron | provider | storage | channel | base-plugin |
+|-----------|------|------------|------|------|----------|---------|---------|-------------|
+| `log` | import | import | import | import | import | import | import | import |
+| `config` | import | import | import | import | import | import | import | import |
+| `kv` | import | import | import | import | — | — | — | import |
+| `http-outbound` | import | — | — | — | import | import | import | — |
+| `memory` | import | — | — | — | — | — | — | — |
+| `events` | import | import | import | import | import | import | import | — |
+| `websocket-outbound` | host | host | host | host | host | host | host | — |
 
-| Host function | `tool` | `middleware` | `hook` | `cron` | `provider` | `storage` |
-|---------------|--------|-------------|--------|--------|-----------|---------|
-| `log` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `config` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `kv` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| `http-outbound` | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| `memory` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `events` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-
-"✅" = interface is imported in the world (may still require `permissions.required` declaration).  
-"❌" = not available in this world.
+`base-plugin` has no exports. `channel` exports `channel-exports` and does not
+import `kv`.
 
 ---
 
-## Appendix: WIT Source Files
+## WIT sources
 
-All WIT definitions are in `wit/host/` relative to the PRX project root:
+Host:
 
-| File | Interface | Description |
-|------|-----------|-------------|
-| `wit/host/log.wit` | `prx:host/log` | Structured logging |
-| `wit/host/config.wit` | `prx:host/config` | Plugin configuration |
-| `wit/host/kv.wit` | `prx:host/kv` | Key-value storage |
-| `wit/host/http.wit` | `prx:host/http-outbound` | Outbound HTTP |
-| `wit/host/memory.wit` | `prx:host/memory` | Long-term memory |
-| `wit/host/event.wit` | `prx:host/events` | Event bus |
+| File | Interface |
+|------|-----------|
+| `wit/host/log.wit` | `prx:host/log` |
+| `wit/host/config.wit` | `prx:host/config` |
+| `wit/host/kv.wit` | `prx:host/kv` |
+| `wit/host/http.wit` | `prx:host/http-outbound` |
+| `wit/host/memory.wit` | `prx:host/memory` |
+| `wit/host/event.wit` | `prx:host/events` |
 
-World definitions (which interfaces are imported/exported per plugin type) are in `wit/worlds.wit`.
-
-Plugin export interfaces (what plugins must implement) are in `wit/plugin/`:
-
-| File | Interface | Capability |
-|------|-----------|-----------|
-| `wit/plugin/tool.wit` | `prx:plugin/tool-exports` | `tool` |
-| `wit/plugin/hook.wit` | `prx:plugin/hook-exports` | `hook` |
-| `wit/plugin/middleware.wit` | `prx:plugin/middleware-exports` | `middleware` |
-| `wit/plugin/cron.wit` | `prx:plugin/cron-exports` | `cron` |
-| `wit/plugin/provider.wit` | `prx:plugin/provider-exports` | `provider` |
-| `wit/plugin/storage.wit` | `prx:plugin/storage-exports` | `storage` |
+Worlds: `wit/worlds.wit`. Plugin exports: `wit/plugin/*.wit` (documented in
+[plugin-developer-guide.md](plugin-developer-guide.md)).
