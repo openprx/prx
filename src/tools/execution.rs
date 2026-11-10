@@ -672,6 +672,13 @@ impl ToolExecutionContext {
         self
     }
 
+    /// Attach the called-tool budget for a model turn.
+    #[must_use]
+    pub(crate) fn with_call_budget(mut self, budget: admission::CallTokenBudget) -> Self {
+        self.call_budget = Some(budget);
+        self
+    }
+
     /// Deny every call that would otherwise wait for approval.
     #[must_use]
     pub(crate) const fn with_pending_approval_denied(mut self) -> Self {

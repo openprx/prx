@@ -252,7 +252,7 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
     )
     .await;
     let resumed = service
-        .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
+        .open_issued_resume_turn_context(resume.as_ref(), AgentTurnKind::Repl, &cancel)
         .await
         .unwrap();
     let actual_context = ToolExecutionContext::new(envelope, resume.policy_chat_type());
@@ -297,7 +297,7 @@ async fn native_collection_with(http: bool, stalled_store: bool) {
     .await;
     assert!(
         service
-            .decide_agent_resume(replay.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_resume_turn_context(replay.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .is_err()
     );

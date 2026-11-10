@@ -644,7 +644,7 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
     )
     .await;
     let resumed = service
-        .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
+        .open_issued_resume_turn_context(resume.as_ref(), AgentTurnKind::Repl, &cancel)
         .await
         .expect("test: resume decision");
     assert_eq!(resumed.engine.state.routing_input.as_str(), resume_input);
@@ -700,7 +700,7 @@ async fn run(env: &Env, autonomy: AutonomyLevel, case: Case) {
     .await;
     assert!(
         service
-            .decide_agent_resume(replay.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_resume_turn_context(replay.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .is_err()
     );

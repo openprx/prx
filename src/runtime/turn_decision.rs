@@ -1986,7 +1986,8 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        self.open_turn_context_observed(proof, kind, cancellation, None).await
+        self.open_turn_context_observed(proof, kind, cancellation, None, None)
+            .await
     }
 
     /// Segment admission uses the same builder as a first turn, with the
@@ -1997,7 +1998,7 @@ impl TurnDecisionService {
         observation: Option<&segment_observation::SegmentObservation>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        self.open_turn_context_observed(proof, AgentTurnKind::SingleShot, cancellation, observation)
+        self.open_turn_context_observed(proof, AgentTurnKind::SingleShot, cancellation, observation, None)
             .await
     }
 
@@ -2007,6 +2008,7 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
         observation: Option<&segment_observation::SegmentObservation>,
+        resume: Option<pending_approval::AdmittedDecisionResume>,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
@@ -2048,6 +2050,11 @@ impl TurnDecisionService {
             &self.state_key,
         );
         let g6_slice = budget.budgets.tokens;
+        let resume_evidence = resume
+            .as_ref()
+            .map(|resume| resume.gate_evidence(self, proof))
+            .transpose()
+            .map_err(AgentDecisionError::PendingApproval)?;
         let trusted = TrustedState::from_runtime(TrustedParts {
             workspace_id: Arc::from(proof.workspace_id()),
             owner_id: Some(Arc::from(proof.owner_id())),
@@ -2056,7 +2063,7 @@ impl TurnDecisionService {
             task_id: proof.task_id().map(Arc::from),
             channel: None,
             source_event_id: proof.source_event_id().map(Arc::from),
-            causation_event_id: None,
+            causation_event_id: resume_evidence.as_ref().map(|evidence| Arc::clone(&evidence.causation)),
             surface: proof.surface(),
             side_effect_mode: match self.security.autonomy {
                 crate::security::AutonomyLevel::ReadOnly => crate::causal_tree::state::SideEffectMode::ReadOnly,
@@ -2072,6 +2079,9 @@ impl TurnDecisionService {
                 if proof.owner_isolated() {
                     constraints.push(crate::causal_tree::state::ConstraintCode::new("owner_isolated"));
                 }
+                if resume_evidence.is_some() {
+                    constraints.push(crate::causal_tree::state::ConstraintCode::new("resume_exact_call"));
+                }
                 if proof.intercepts_writes() {
                     constraints.push(crate::causal_tree::state::ConstraintCode::new("intercepts_writes"));
                 }
@@ -2083,7 +2093,9 @@ impl TurnDecisionService {
                 constraints
             },
             approval_pending: false,
-            approval_grants: Vec::new(),
+            approval_grants: resume_evidence
+                .as_ref()
+                .map_or_else(Vec::new, |evidence| evidence.grants.clone()),
             budgets: TurnBudgets {
                 tokens: g6_slice,
                 latency_ms: budget.budgets.latency_ms,
@@ -2101,6 +2113,15 @@ impl TurnDecisionService {
             resolved_model_id: Arc::from(model.model()),
         });
         let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
+        let goal = resume_evidence.as_ref().map_or_else(
+            || projected_input.clone(),
+            |evidence| {
+                let original = crate::multimodal::project_image_markers_for_routing(&evidence.original_request);
+                format!(
+                    "Resume the exact approved tool call for the original request below. Current hard gates and the single-use execution claim still apply. Original user request (data): {original}"
+                )
+            },
+        );
         let decision_id = DecisionId::new_runtime();
         let state = CausalState {
             trusted,
@@ -2109,12 +2130,14 @@ impl TurnDecisionService {
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),
             routing_input: RawRoutingInput::new(projected_input.clone()),
-            goal: RawRoutingInput::new(projected_input),
+            goal: RawRoutingInput::new(goal),
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
         let engine = EngineDecision::without_prediction(state, deadline, decision_id);
-        let call_fingerprints = BTreeMap::new();
+        let call_fingerprints = resume_evidence
+            .as_ref()
+            .map_or_else(BTreeMap::new, |evidence| evidence.calls.clone());
         let replayed_non_idempotent = BTreeSet::new();
         let gates = GateInputs {
             policy: &self.security,
@@ -2127,7 +2150,9 @@ impl TurnDecisionService {
             model_can_call_tools: self.model_can_call_tools(proof),
             decision_endpoint_ready: true,
             child_scope: proof.child_scope().map(|scope| scope.gate_inputs()),
-            verified_approval_calls: BTreeMap::new(),
+            verified_approval_calls: resume_evidence
+                .as_ref()
+                .map_or_else(BTreeMap::new, |evidence| evidence.approvals.clone()),
             call_fingerprints: &call_fingerprints,
             failed_call_counts: BTreeMap::new(),
             replayed_non_idempotent: &replayed_non_idempotent,
@@ -2137,7 +2162,7 @@ impl TurnDecisionService {
         Ok(Arc::new(TurnDecisionContext {
             _event_memory: event_memory,
             model_catalog: self.provider_catalog.release_pin(),
-            resume: None,
+            resume: resume.map(Arc::new),
             accounting: None,
             owner_filesystem,
             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
@@ -2192,7 +2217,7 @@ impl TurnDecisionService {
         self.record_issued_decision(proof, context, cancellation).await
     }
 
-    pub(crate) async fn decide_agent_resume(
+    pub(crate) async fn open_issued_resume_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
         kind: AgentTurnKind,
@@ -2209,21 +2234,10 @@ impl TurnDecisionService {
             .sessions_spawn
             .allow_recursive_delegation
             .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
-        let (mut context, telemetry) = self
-            .decide_agent_initial_inner(
-                proof,
-                kind,
-                cancellation,
-                Some(&admitted),
-                None,
-                #[cfg(feature = "llm-router")]
-                None,
-            )
+        let opened = self
+            .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
             .await?;
-        let owned = Arc::get_mut(&mut context).ok_or(AgentDecisionError::UnsupportedAction)?;
-        owned.resume = Some(Arc::new(admitted));
-        self.record_issued_decision(proof, (context, telemetry), cancellation)
-            .await
+        self.record_opened_context(proof, opened, cancellation).await
     }
 
     async fn decide_agent_initial_inner(

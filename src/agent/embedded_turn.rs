@@ -404,6 +404,9 @@ async fn run_work(
                 let (execution, context) =
                     service.bind_agent_execution(source, &decision, &context, &selected.specs)?;
                 let mut context = context;
+                context.call_budget = Some(crate::agent::send_admission::call_token_budget(
+                    &service, &decision, source,
+                )?);
                 context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
                 context.turn_surface = Some(std::sync::Arc::new(
                     crate::tools::surface_owner::build(crate::tools::surface_owner::SurfaceParts {

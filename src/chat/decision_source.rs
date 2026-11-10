@@ -857,15 +857,7 @@ impl ChatTurnBinding {
         self.issue_decision(service, cancellation, false).await
     }
 
-    pub(super) async fn decide_resume(
-        &self,
-        service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
-        self.issue_decision(service, cancellation, true).await
-    }
-
-    async fn issue_decision(
+    pub(super) async fn issue_decision(
         &self,
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
         cancellation: &tokio_util::sync::CancellationToken,
@@ -882,7 +874,9 @@ impl ChatTurnBinding {
             .get_or_try_init(|| async {
                 let kind = crate::runtime::turn_decision::AgentTurnKind::Repl;
                 let context = if resume {
-                    service.decide_agent_resume(self, kind, cancellation).await?
+                    service
+                        .open_issued_resume_turn_context(self, kind, cancellation)
+                        .await?
                 } else {
                     let opened = service.open_turn_context(self, kind, cancellation).await?;
                     service
@@ -1009,6 +1003,7 @@ impl ChatTurnBinding {
                 chat_type: self.policy_chat_type(),
                 tool_calls_allowed: decided.service.model_can_call_tools(self),
             },
+            crate::agent::send_admission::call_token_budget(&decided.service, &decided.context, self)?,
         );
         let outcome = decided
             .service
@@ -2148,7 +2143,12 @@ pub(crate) mod admission_failure_tests {
                 .is_err()
             );
             // Resume cannot reinterpret a cached initial decision or clear its mode.
-            assert!(binding.decide_resume(&service, &cancellation).await.is_err());
+            assert!(
+                binding
+                    .issue_decision(&service, &cancellation, true)
+                    .await
+                    .is_err()
+            );
             assert!(queued.verify_execution_mode(ChatMode::Edit).is_err());
             assert!(binding.intercepts_writes());
             service
@@ -2185,7 +2185,7 @@ pub(crate) mod admission_failure_tests {
         );
         assert!(
             operator
-                .decide_resume(&service, &tokio_util::sync::CancellationToken::new())
+                .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), true)
                 .await
                 .is_err()
         );
@@ -2293,7 +2293,7 @@ pub(crate) mod admission_failure_tests {
         let service = service(&fabric, &binding).await;
         assert!(
             binding
-                .decide_resume(&service, &tokio_util::sync::CancellationToken::new())
+                .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), true)
                 .await
                 .is_err()
         );

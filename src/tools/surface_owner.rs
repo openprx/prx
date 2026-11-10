@@ -8,7 +8,7 @@ use crate::config::ToolTieringConfig;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, SurfacePolicy};
-use crate::tools::execution::admission::TurnSurface;
+use crate::tools::execution::admission::{CallTokenBudget, TurnSurface};
 use crate::tools::execution::{
     DispatchOrigin, ToolExecutionContext, ToolExecutionDecision, ToolExecutionService, decide_tool_execution,
 };
@@ -37,11 +37,13 @@ pub(crate) fn model_turn_context(
     envelope: RuntimeEnvelope,
     chat_type: impl Into<String>,
     parts: SurfaceParts<'_>,
+    budget: CallTokenBudget,
 ) -> ToolExecutionContext {
     let chat_id = envelope.session_key.clone();
     let mut context = ToolExecutionContext::new(envelope, chat_type)
         .with_chat_id(&chat_id)
-        .with_dispatch_origin(DispatchOrigin::ModelTurn);
+        .with_dispatch_origin(DispatchOrigin::ModelTurn)
+        .with_call_budget(budget);
     context.turn_surface = Some(Arc::new(build(parts)));
     context
 }

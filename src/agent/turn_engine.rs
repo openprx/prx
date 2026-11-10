@@ -2116,6 +2116,8 @@ async fn run_turn_unguarded(
             ));
             execution_adapter.tool_execution_service = Some(execution);
             execution_adapter.tool_execution_context = bound_context;
+            execution_adapter.tool_execution_context.call_budget =
+                Some(super::send_admission::call_token_budget(service, context, proof)?);
             execution_adapter.tool_execution_context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
             execution_adapter.tool_execution_context.turn_surface =
                 Some(Arc::new(safety_surface.for_publication(&specs)));

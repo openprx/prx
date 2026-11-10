@@ -553,7 +553,7 @@ async fn exact_file_collection_with_legacy_events(
             .await;
             assert!(
                 service
-                    .decide_agent_resume(denied_resume.as_ref(), AgentTurnKind::Repl, &cancel)
+                    .open_issued_resume_turn_context(denied_resume.as_ref(), AgentTurnKind::Repl, &cancel)
                     .await
                     .is_err(),
                 "a denied review must not produce executable resume authority"
@@ -588,7 +588,7 @@ async fn exact_file_collection_with_legacy_events(
         assert_eq!(plan.policy_sender(), proof.policy_sender());
         assert!(plan.intercepts_writes());
         let plan_context = service
-            .decide_agent_resume(plan.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_resume_turn_context(plan.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
         assert!(matches!(
@@ -704,7 +704,7 @@ async fn exact_file_collection_with_legacy_events(
             context.retire_recursive_allowance();
         }
         let resumed = service
-            .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_resume_turn_context(resume.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
         if let Some(original) = initial_recursive_budget {
@@ -789,7 +789,7 @@ async fn exact_file_collection_with_legacy_events(
         .await;
         assert!(
             service
-                .decide_agent_resume(replay.as_ref(), AgentTurnKind::Repl, &cancel)
+                .open_issued_resume_turn_context(replay.as_ref(), AgentTurnKind::Repl, &cancel)
                 .await
                 .is_err()
         );
@@ -1110,7 +1110,7 @@ async fn fresh_chat_exact_mcp_write_collects_then_reviews_and_resumes_once() {
         )
         .await;
         let resumed = service
-            .decide_agent_resume(resume.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_resume_turn_context(resume.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
         assert!(

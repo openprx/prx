@@ -2261,7 +2261,11 @@ async fn run_console_message_job_work(
                         ConsoleTurnMode::Message => {
                             service.open_issued_turn_context(proof, kind, &cancellation).await
                         }
-                        ConsoleTurnMode::Resume => service.decide_agent_resume(proof, kind, &cancellation).await,
+                        ConsoleTurnMode::Resume => {
+                            service
+                                .open_issued_resume_turn_context(proof, kind, &cancellation)
+                                .await
+                        }
                     }
                     .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
                     let advice = service.analyze_advisory(&context, &cancellation).await;
@@ -2579,6 +2583,11 @@ async fn run_console_resume(
             chat_type: decision.proof.policy_chat_type(),
             tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
         },
+        crate::agent::send_admission::call_token_budget(
+            decision.service.as_ref(),
+            &decision.context,
+            decision.proof,
+        )?,
     );
     let outcome = decision
         .service

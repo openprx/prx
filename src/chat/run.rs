@@ -3119,11 +3119,9 @@ Retry with a compatible model: /provider {shown} <model>",
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
             child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input,resume_decision)?,
         ).await?;
-        let admission = if resume_decision {
-            admitted_binding.decide_resume(&turn_decisions, &cancellation).await
-        } else {
-            admitted_binding.decide(&turn_decisions, &cancellation).await
-        };
+        let admission = admitted_binding
+            .issue_decision(&turn_decisions, &cancellation, resume_decision)
+            .await;
         if let Err(error) = admission {
             if let Err(record_error) = admission_guard.finish_failure(
                 cancellation.is_cancelled(), &format!("decision admission failed: {error}"),

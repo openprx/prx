@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::execution::admission::TurnSurface;
+use crate::tools::execution::admission::{CallTokenBudget, TurnSurface};
 
 fn allow_service(fixture: &Fixture) -> ToolExecutionService {
     fixture.service("config_reload", vec![], ToolExecutionDecision::Allow, approved(), true)
@@ -275,6 +275,7 @@ async fn console_resume_replays_model_turn_with_surface() {
             chat_type: "dm",
             tool_calls_allowed: true,
         },
+        CallTokenBudget::new(|| u64::MAX, |_| Some(0)).with_spend(|| Some(u64::MAX), |_| Some(0)),
     );
     assert_eq!(context.dispatch_origin, crate::tools::DispatchOrigin::ModelTurn);
     assert!(context.turn_surface.is_some());

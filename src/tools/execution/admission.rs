@@ -327,7 +327,14 @@ pub(super) fn admit_called_tokens(
     name: &str,
 ) -> Result<(), (ToolExecutionStatus, String)> {
     let Some(budget) = &context.call_budget else {
-        return Ok(());
+        return if context.dispatch_origin == super::DispatchOrigin::ModelTurn {
+            Err((
+                ToolExecutionStatus::Denied,
+                format!("tool '{name}' has no call budget"),
+            ))
+        } else {
+            Ok(())
+        };
     };
     // A vanished descriptor is reported by resolution or by the stale recheck.
     let Some(descriptor) = service.current_descriptor(name) else {
@@ -367,7 +374,14 @@ pub(super) fn admit_called_spend(
     name: &str,
 ) -> Result<(), (ToolExecutionStatus, String)> {
     let Some(spend) = context.call_budget.as_ref().and_then(|budget| budget.spend.as_deref()) else {
-        return Ok(());
+        return if context.dispatch_origin == super::DispatchOrigin::ModelTurn {
+            Err((
+                ToolExecutionStatus::Denied,
+                format!("tool '{name}' has no call budget"),
+            ))
+        } else {
+            Ok(())
+        };
     };
     let Some(descriptor) = service.current_descriptor(name) else {
         return Ok(());
