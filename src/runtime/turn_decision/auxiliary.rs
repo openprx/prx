@@ -71,8 +71,10 @@ impl TurnDecisionService {
             matches!(context.disposition()?, TurnDisposition::Run),
             "auxiliary call requires a running decision"
         );
+        #[cfg(test)]
+        crate::causal_tree::logical_clock::visit_site("auxiliary_deadline");
         anyhow::ensure!(
-            std::time::Instant::now() < context.engine.deadline,
+            crate::causal_tree::logical_clock::now() < context.engine.deadline,
             "auxiliary decision deadline expired"
         );
         let original = self

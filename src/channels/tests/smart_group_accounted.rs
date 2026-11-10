@@ -204,6 +204,20 @@ async fn assert_classifier_and_main_receipts(
 }
 
 async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
+    exercise_accounted_classifier_after_main(content, verdict, |_| {}, None).await;
+}
+
+/// `after_main` runs after the production factory has built the main provider
+/// and before the turn, so a process-global fixture can steal the later
+/// classifier `create_provider_for` without rewriting the already-built main
+/// transport. `auxiliary_advance` spends logical time at the auxiliary
+/// deadline check so a fail-open skip can be forced without wall sleep.
+async fn exercise_accounted_classifier_after_main(
+    content: &str,
+    verdict: Verdict,
+    after_main: impl FnOnce(&str) + Send,
+    auxiliary_advance: Option<Duration>,
+) {
     let workspace = tempfile::tempdir().expect("smart-group workspace");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -228,244 +242,270 @@ async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
         })),
     };
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-    let outcome = std::panic::AssertUnwindSafe(async {
-        let mut config = Config::default();
-        config.workspace_dir = workspace.path().to_owned();
-        config.config_path = workspace.path().join("config.toml");
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
-        config.default_provider = Some(PROVIDER.to_owned());
-        config.default_model = Some(MAIN_MODEL.to_owned());
-        config.api_url = Some(endpoint.clone());
-        config.api_key = Some("prx-loopback-fixture-key".to_owned());
-        config.smart_group.classifier_provider = PROVIDER.to_owned();
-        config.smart_group.classifier_model = CLASSIFIER_MODEL.to_owned();
-        for (model, native_tools) in [(MAIN_MODEL, true), (CLASSIFIER_MODEL, false)] {
-            config.providers.models.push(
-                serde_json::from_value(json!({
-                    "provider": PROVIDER,
-                    "model": model,
-                    "operations": ["chat"],
-                    "native_tools": native_tools
-                }))
-                .expect("smart-group model declaration"),
-            );
-            config.cost.prices.insert(
-                format!("{PROVIDER}/{model}"),
-                crate::config::schema::ModelPricing {
-                    input: 0.001,
-                    output: 0.001,
-                    cache_write: 0.001,
-                    cache_read: 0.001,
-                },
-            );
-        }
-        let resolved = crate::providers::selection::check(
-            &config,
-            PROVIDER,
-            MAIN_MODEL,
-            &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
-            crate::providers::catalog::UnknownPolicy::Invocation,
-        )
-        .expect("actual selected smart-group main model");
-        let prepared_provider: Arc<dyn Provider> = Arc::from(
-            crate::providers::create_provider_for(
-                &resolved,
-                &crate::providers::selection::catalog_for(&config),
-                &config.reliability,
-                &config.cost,
-                &crate::providers::provider_runtime_options_from_config(&config),
+    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    if let Some(advance) = auxiliary_advance {
+        clock.arm_site("auxiliary_deadline", Duration::ZERO, advance);
+    }
+    crate::causal_tree::logical_clock::scope(clock, async move {
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let provider = format!("custom:{endpoint}");
+            let mut config = Config::default();
+            config.workspace_dir = workspace.path().to_owned();
+            config.config_path = workspace.path().join("config.toml");
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+            config.default_provider = Some(provider.clone());
+            config.default_model = Some(MAIN_MODEL.to_owned());
+            config.api_url = Some(endpoint.clone());
+            config.api_key = Some("prx-loopback-fixture-key".to_owned());
+            config.smart_group.classifier_provider = provider.clone();
+            config.smart_group.classifier_model = CLASSIFIER_MODEL.to_owned();
+            for (model, native_tools) in [(MAIN_MODEL, true), (CLASSIFIER_MODEL, false)] {
+                config.providers.models.push(
+                    serde_json::from_value(json!({
+                        "provider": provider,
+                        "model": model,
+                        "operations": ["chat"],
+                        "native_tools": native_tools
+                    }))
+                    .expect("smart-group model declaration"),
+                );
+                config.cost.prices.insert(
+                    format!("{provider}/{model}"),
+                    crate::config::schema::ModelPricing {
+                        input: 0.001,
+                        output: 0.001,
+                        cache_write: 0.001,
+                        cache_read: 0.001,
+                    },
+                );
+            }
+            let resolved = crate::providers::selection::check(
+                &config,
+                &provider,
+                MAIN_MODEL,
+                &crate::providers::catalog::Requirement::chat().with(crate::providers::catalog::Feature::NativeTools),
+                crate::providers::catalog::UnknownPolicy::Invocation,
             )
-            .expect("actual smart-group main provider factory"),
-        );
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let mut ctx = gate_test_ctx(
-            &workspace,
-            crate::security::AutonomyLevel::Supervised,
-            Arc::new(CountingMemory::default()),
-            channel_impl.clone(),
-        );
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("smart-group sqlite"));
-        let shared = crate::config::new_shared(config);
-        let context = Arc::get_mut(&mut ctx).expect("unique smart-group context");
-        context.config = Arc::clone(&shared);
-        context.config_generation = shared.pin();
-        context.default_provider = Arc::new(PROVIDER.to_owned());
-        context.provider = prepared_provider;
-        context.model = Arc::new(MAIN_MODEL.to_owned());
-        context.api_url = Some(endpoint);
-        context.api_key = Some("prx-loopback-fixture-key".to_owned());
-        context.memory = Arc::clone(&memory);
-        context.tools_registry = Arc::new(vec![
-            Box::new(crate::tools::stay_silent::StaySilentTool) as Box<dyn Tool>
-        ]);
-        context.workspace_dir = Arc::new(workspace.path().to_owned());
-        context.hooks = Arc::new(HookManager::new(workspace.path().to_owned()));
-        context.channels_by_name = Arc::new(HashMap::from([(
-            "test-channel".to_owned(),
-            channel_impl.clone() as Arc<dyn Channel>,
-        )]));
-        context
-            .group_reply_mode_by_channel
-            .insert("test-channel".to_owned(), crate::config::GroupReplyMode::Smart);
-        context.security = Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
-            security: Arc::new(crate::security::SecurityPolicy::from_config(
-                &shared.pin().effective.autonomy,
-                workspace.path(),
-            )),
-        }));
+            .expect("actual selected smart-group main model");
+            let prepared_provider: Arc<dyn Provider> = Arc::from(
+                crate::providers::create_provider_for(
+                    &resolved,
+                    &crate::providers::selection::catalog_for(&config),
+                    &config.reliability,
+                    &config.cost,
+                    &crate::providers::provider_runtime_options_from_config(&config),
+                )
+                .expect("actual smart-group main provider factory"),
+            );
+            after_main(&provider);
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let mut ctx = gate_test_ctx(
+                &workspace,
+                crate::security::AutonomyLevel::Supervised,
+                Arc::new(CountingMemory::default()),
+                channel_impl.clone(),
+            );
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("smart-group sqlite"));
+            let shared = crate::config::new_shared(config);
+            let context = Arc::get_mut(&mut ctx).expect("unique smart-group context");
+            context.config = Arc::clone(&shared);
+            context.config_generation = shared.pin();
+            context.default_provider = Arc::new(provider);
+            context.provider = prepared_provider;
+            context.model = Arc::new(MAIN_MODEL.to_owned());
+            context.api_url = Some(endpoint);
+            context.api_key = Some("prx-loopback-fixture-key".to_owned());
+            context.memory = Arc::clone(&memory);
+            context.tools_registry = Arc::new(vec![
+                Box::new(crate::tools::stay_silent::StaySilentTool) as Box<dyn Tool>
+            ]);
+            context.workspace_dir = Arc::new(workspace.path().to_owned());
+            context.hooks = Arc::new(HookManager::new(workspace.path().to_owned()));
+            context.channels_by_name = Arc::new(HashMap::from([(
+                "test-channel".to_owned(),
+                channel_impl.clone() as Arc<dyn Channel>,
+            )]));
+            context
+                .group_reply_mode_by_channel
+                .insert("test-channel".to_owned(), crate::config::GroupReplyMode::Smart);
+            context.security = Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::from_config(
+                    &shared.pin().effective.autonomy,
+                    workspace.path(),
+                )),
+            }));
 
-        let mut message = gate_test_message();
-        message.id = "prx-smart-group-accounted".to_owned();
-        message.sender = "prx_user".to_owned();
-        message.reply_target = "prx_group".to_owned();
-        message.content = content.to_owned();
-        message.chat_kind = crate::channels::traits::ChatKind::Group;
-        message.is_group_hint = true;
+            let mut message = gate_test_message();
+            message.id = "prx-smart-group-accounted".to_owned();
+            message.sender = "prx_user".to_owned();
+            message.reply_target = "prx_group".to_owned();
+            message.content = content.to_owned();
+            message.chat_kind = crate::channels::traits::ChatKind::Group;
+            message.is_group_hint = true;
 
-        let turn = cleanup.scope(channel_turn(ctx.clone(), message, CancellationToken::new()));
-        tokio::time::timeout(Duration::from_secs(5), turn)
-            .await
-            .expect("admitted smart-group turn must finish");
+            let turn = cleanup.scope(channel_turn(ctx.clone(), message, CancellationToken::new()));
+            tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .expect("admitted smart-group turn must finish");
 
-        if verdict != Verdict::No {
-            assert_classifier_and_main_receipts(
-                verdict,
-                content,
-                &requests,
-                workspace.path(),
-                memory.as_ref(),
-                &channel_impl,
-            )
-            .await;
-            return;
-        }
-        {
-            let captured = requests.lock();
-            assert_eq!(captured.len(), 1, "classifier NO must avoid the full agent loop");
-            assert_eq!(
-                captured[0].get("model").and_then(Value::as_str),
-                Some(CLASSIFIER_MODEL),
-                "the pinned resolver-selected classifier model must be used on wire"
+            if auxiliary_advance.is_some() {
+                let models: Vec<String> = requests
+                    .lock()
+                    .iter()
+                    .filter_map(|request| request.get("model").and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+                assert_eq!(
+                    models.first().map(String::as_str),
+                    Some(MAIN_MODEL),
+                    "an elapsed auxiliary deadline fail-opens into the main model: {models:?}"
+                );
+                assert!(
+                    models.iter().all(|model| model != CLASSIFIER_MODEL),
+                    "the classifier must not reach the wire after the auxiliary deadline: {models:?}"
+                );
+                return;
+            }
+            if verdict != Verdict::No {
+                assert_classifier_and_main_receipts(
+                    verdict,
+                    content,
+                    &requests,
+                    workspace.path(),
+                    memory.as_ref(),
+                    &channel_impl,
+                )
+                .await;
+                return;
+            }
+            {
+                let captured = requests.lock();
+                assert_eq!(captured.len(), 1, "classifier NO must avoid the full agent loop");
+                assert_eq!(
+                    captured[0].get("model").and_then(Value::as_str),
+                    Some(CLASSIFIER_MODEL),
+                    "the pinned resolver-selected classifier model must be used on wire"
+                );
+                assert!(
+                    captured[0]
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .is_some_and(|messages| messages.iter().any(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                                && message
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|content| content.contains("relevance gate"))
+                        })),
+                    "the one physical request must be the smart-group classifier"
+                );
+            }
+            assert!(
+                ctx.provider_cache.lock().is_empty(),
+                "the decision-owned classifier must not use the channel provider cache"
             );
             assert!(
-                captured[0]
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .is_some_and(|messages| messages.iter().any(|message| {
-                        message.get("role").and_then(Value::as_str) == Some("system")
-                            && message
-                                .get("content")
-                                .and_then(Value::as_str)
-                                .is_some_and(|content| content.contains("relevance gate"))
-                    })),
-                "the one physical request must be the smart-group classifier"
+                response_messages(&channel_impl.sent_messages.lock().await).is_empty(),
+                "an admitted classifier NO must emit no channel response"
+            );
+
+            let principal = crate::runtime::envelope::RuntimeEnvelope::channel_with_session(
+                workspace.path().to_string_lossy(),
+                "test-channel_prx_user",
+                "test-channel",
+                "prx_user",
+                "prx_group",
+                crate::memory::MemoryVisibility::Session,
+            )
+            .memory_principal();
+            let events = memory
+                .list_message_events_since(&principal, 0, 100)
+                .await
+                .expect("smart-group runtime events");
+            let input = events
+                .iter()
+                .find(|event| event.role == "user" && event.content == content)
+                .expect("durable smart-group input");
+            let auxiliary = events
+                .iter()
+                .find(|event| event.event_type == "provider.auxiliary.settled")
+                .expect("durable classifier auxiliary settlement");
+            let payload: Value = serde_json::from_str(
+                auxiliary
+                    .raw_payload_json
+                    .as_deref()
+                    .expect("classifier settlement payload"),
+            )
+            .expect("classifier settlement JSON");
+            assert_eq!(
+                payload.get("purpose").and_then(Value::as_str),
+                Some("smart_group_classifier")
+            );
+            assert_eq!(
+                payload.pointer("/provider_outcome/final_model").and_then(Value::as_str),
+                Some(CLASSIFIER_MODEL)
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == "turn.finalized")
+                    .count(),
+                1,
+                "the silent turn must finalize exactly once"
+            );
+            assert!(
+                events.iter().all(|event| event.role != "assistant"),
+                "classifier silence must not invent assistant history"
+            );
+
+            let connection = rusqlite::Connection::open_with_flags(
+                workspace.path().join("self/causal_tree/decisions.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("actual smart-group decision store");
+            let admitted: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM decisions WHERE source_event_id=?1",
+                    [input.event_id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("source-bound smart-group decisions");
+            assert!(admitted > 0, "the source decision must exist before classifier silence");
+
+            let rows: Vec<Value> = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))
+                .expect("classifier physical accounting journal")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("accounting row"))
+                .collect();
+            let dispatched: Vec<_> = rows.iter().filter(|row| row["event"] == "dispatched").collect();
+            assert_eq!(dispatched.len(), 1, "one classifier request must reserve once");
+            let attempt_id = dispatched[0]["attempt_id"].as_str().expect("classifier attempt id");
+            assert!(attempt_id.starts_with("smart_group_classifier:"));
+            assert!(
+                rows.iter()
+                    .any(|row| { row["event"] == "estimated_settled_v1" && row["attempt_id"] == attempt_id }),
+                "reported classifier usage must settle its reservation"
+            );
+        })
+        .catch_unwind()
+        .await;
+
+        let drained = cleanup
+            .drain(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        let listener_closed = server.close().await;
+        if drained.is_err() || listener_closed.is_err() || outcome.is_err() {
+            let retained = workspace.keep();
+            println!("PRX_SMART_GROUP_FAILURE_EVIDENCE={}", retained.display());
+            assert!(
+                drained.is_ok() && listener_closed.is_ok(),
+                "smart-group cleanup unconfirmed: cleanup={drained:?}, listener={listener_closed:?}"
             );
         }
-        assert!(
-            ctx.provider_cache.lock().is_empty(),
-            "the decision-owned classifier must not use the channel provider cache"
-        );
-        assert!(
-            response_messages(&channel_impl.sent_messages.lock().await).is_empty(),
-            "an admitted classifier NO must emit no channel response"
-        );
-
-        let principal = crate::runtime::envelope::RuntimeEnvelope::channel_with_session(
-            workspace.path().to_string_lossy(),
-            "test-channel_prx_user",
-            "test-channel",
-            "prx_user",
-            "prx_group",
-            crate::memory::MemoryVisibility::Session,
-        )
-        .memory_principal();
-        let events = memory
-            .list_message_events_since(&principal, 0, 100)
-            .await
-            .expect("smart-group runtime events");
-        let input = events
-            .iter()
-            .find(|event| event.role == "user" && event.content == content)
-            .expect("durable smart-group input");
-        let auxiliary = events
-            .iter()
-            .find(|event| event.event_type == "provider.auxiliary.settled")
-            .expect("durable classifier auxiliary settlement");
-        let payload: Value = serde_json::from_str(
-            auxiliary
-                .raw_payload_json
-                .as_deref()
-                .expect("classifier settlement payload"),
-        )
-        .expect("classifier settlement JSON");
-        assert_eq!(
-            payload.get("purpose").and_then(Value::as_str),
-            Some("smart_group_classifier")
-        );
-        assert_eq!(
-            payload.pointer("/provider_outcome/final_model").and_then(Value::as_str),
-            Some(CLASSIFIER_MODEL)
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.event_type == "turn.finalized")
-                .count(),
-            1,
-            "the silent turn must finalize exactly once"
-        );
-        assert!(
-            events.iter().all(|event| event.role != "assistant"),
-            "classifier silence must not invent assistant history"
-        );
-
-        let connection = rusqlite::Connection::open_with_flags(
-            workspace.path().join("self/causal_tree/decisions.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("actual smart-group decision store");
-        let admitted: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM decisions WHERE source_event_id=?1",
-                [input.event_id.as_str()],
-                |row| row.get(0),
-            )
-            .expect("source-bound smart-group decisions");
-        assert!(admitted > 0, "the source decision must exist before classifier silence");
-
-        let rows: Vec<Value> = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))
-            .expect("classifier physical accounting journal")
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("accounting row"))
-            .collect();
-        let dispatched: Vec<_> = rows.iter().filter(|row| row["event"] == "dispatched").collect();
-        assert_eq!(dispatched.len(), 1, "one classifier request must reserve once");
-        let attempt_id = dispatched[0]["attempt_id"].as_str().expect("classifier attempt id");
-        assert!(attempt_id.starts_with("smart_group_classifier:"));
-        assert!(
-            rows.iter()
-                .any(|row| { row["event"] == "estimated_settled_v1" && row["attempt_id"] == attempt_id }),
-            "reported classifier usage must settle its reservation"
-        );
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     })
-    .catch_unwind()
     .await;
-
-    let drained = cleanup
-        .drain(tokio::time::Instant::now() + Duration::from_secs(2))
-        .await;
-    let listener_closed = server.close().await;
-    if drained.is_err() || listener_closed.is_err() || outcome.is_err() {
-        let retained = workspace.keep();
-        println!("PRX_SMART_GROUP_FAILURE_EVIDENCE={}", retained.display());
-        assert!(
-            drained.is_ok() && listener_closed.is_ok(),
-            "smart-group cleanup unconfirmed: cleanup={drained:?}, listener={listener_closed:?}"
-        );
-    }
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
-    }
 }
 
 #[tokio::test]
@@ -524,6 +564,52 @@ async fn smart_group_classifier_failure_fails_open_and_persists_both_receipts() 
     exercise_accounted_classifier(
         "the deployment completed an hour ago across the project",
         Verdict::ClassifierFails,
+    )
+    .await;
+}
+
+/// In-process stand-in that answers without touching the loopback. A process-global
+/// fixture registered under the shared catalog name `openai` must not steal this
+/// test's uniquely named classifier or main provider.
+struct SwallowProvider;
+
+#[async_trait::async_trait]
+impl Provider for SwallowProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok("YES".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn smart_group_classifier_keeps_loopback_when_a_shared_openai_fixture_is_registered() {
+    let swallow: Arc<dyn Provider> = Arc::new(SwallowProvider);
+    let hold = Arc::clone(&swallow);
+    exercise_accounted_classifier_after_main(
+        "the deployment completed an hour ago across the project",
+        Verdict::Yes,
+        |_| {
+            crate::providers::test_fixture::register(PROVIDER, swallow);
+        },
+        None,
+    )
+    .await;
+    crate::providers::test_fixture::unregister(PROVIDER);
+    drop(hold);
+}
+
+#[tokio::test]
+async fn smart_group_classifier_is_skipped_when_the_auxiliary_deadline_elapses() {
+    exercise_accounted_classifier_after_main(
+        "the deployment completed an hour ago across the project",
+        Verdict::Yes,
+        |_| {},
+        Some(Duration::from_millis(600)),
     )
     .await;
 }
