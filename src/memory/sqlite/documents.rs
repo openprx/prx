@@ -3,10 +3,11 @@
 use super::vector;
 use crate::memory::principal::{OwnerPrincipal, Role};
 use crate::memory::traits::{
-    CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord, DocumentSearchResult,
-    MemoryLink, MemoryLinkInput, MemoryPrincipal, RetrievalTrace, RetrievalTraceInput,
+    AgentScopeRefused, CompactionRun, CompactionRunInput, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
+    DocumentSearchResult, MemoryLink, MemoryLinkInput, MemoryPrincipal, PartitionKey, RetrievalTrace,
+    RetrievalTraceInput,
 };
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rusqlite::{OptionalExtension, params};
 use uuid::Uuid;
 
@@ -83,7 +84,6 @@ impl SqliteMemory {
     }
 
     pub(super) async fn ingest_document_impl(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
-        let pool = self.pool.clone();
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedding_dimensions_i64();
@@ -98,34 +98,59 @@ impl SqliteMemory {
                     )
                 })
                 .collect();
-        let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
-        for (chunk_index, heading, content) in raw_chunks {
-            let embedding_bytes = if self.embedder.dimensions() == 0 {
-                None
-            } else {
-                self.get_or_compute_embedding(&content)
-                    .await?
-                    .map(|embedding| vector::vec_to_bytes(&embedding))
-            };
-            prepared_chunks.push((chunk_index, heading, content, embedding_bytes));
+        enum IngestOutcome {
+            Done(Box<DocumentRecord>),
+            Retry,
         }
+        for attempt in 0..2_u8 {
+            let salt_scope = self
+                .salt_scope_for_write(input.agent_partition.as_ref(), input.session_key.as_deref())
+                .await?;
+            let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
+            for (chunk_index, heading, content) in &raw_chunks {
+                let prepared = if self.embedder.dimensions() == 0 {
+                    None
+                } else {
+                    self.embed_without_cache(content, salt_scope.as_deref()).await?
+                };
+                prepared_chunks.push((*chunk_index, heading.clone(), content.clone(), prepared));
+            }
 
-        crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<DocumentRecord> {
-            let mut conn = pool.write();
-            let tx = conn.transaction()?;
-            let now = Utc::now().to_rfc3339();
-            let document_id = input.document_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            let content_sha256 = Self::content_sha256_hex(&input.content);
-            let visibility = input.visibility.as_str().to_string();
-            let chunk_count = prepared_chunks.len();
-
-            tx.execute(
-                "INSERT INTO documents (
+            let pool = self.pool.clone();
+            let input = input.clone();
+            let expected_salt = salt_scope.clone();
+            let embedding_provider = embedding_provider.clone();
+            let embedding_model = embedding_model.clone();
+            let cache_now = Local::now().to_rfc3339();
+            let cache_max = i64::try_from(self.cache_max).unwrap_or(i64::MAX);
+            let outcome = crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<IngestOutcome> {
+                let conn = pool.write();
+                let tx = super::agent_migration::begin_immediate(&conn)?;
+                let now = Utc::now().to_rfc3339();
+                let document_id = input.document_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+                let content_sha256 = Self::content_sha256_hex(&input.content);
+                let visibility = input.visibility.as_str().to_string();
+                let chunk_count = prepared_chunks.len();
+                let bound_scope = super::agent_migration::resolve_input_scope(
+                    &tx,
+                    input.agent_partition.as_ref(),
+                    input.session_key.as_deref(),
+                    &input.workspace_id,
+                    input.owner_id.as_deref(),
+                )?;
+                if expected_salt.is_some() && bound_scope != expected_salt {
+                    return Ok(IngestOutcome::Retry);
+                }
+                let coalesce = super::agent_migration::scope_coalesce_set("documents");
+                let scope_guard = super::agent_migration::scope_conflict_guard("documents", false);
+                let changed = tx.execute(
+                    &format!(
+                        "INSERT INTO documents (
                     document_id, workspace_id, owner_id, topic_id, task_id, source_message_event_id,
                     source_kind, source_uri, title, content_sha256, mime_type, visibility,
-                    metadata_json, chunk_count, created_at, updated_at
+                    metadata_json, chunk_count, created_at, updated_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?16)
                  ON CONFLICT(document_id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     owner_id = excluded.owner_id,
@@ -140,116 +165,153 @@ impl SqliteMemory {
                     visibility = excluded.visibility,
                     metadata_json = excluded.metadata_json,
                     chunk_count = excluded.chunk_count,
-                    updated_at = excluded.updated_at",
-                params![
-                    document_id,
-                    input.workspace_id,
-                    input.owner_id,
-                    input.topic_id,
-                    input.task_id,
-                    input.source_message_event_id,
-                    input.source_kind,
-                    input.source_uri,
-                    input.title,
-                    content_sha256,
-                    input.mime_type,
-                    visibility,
-                    input.metadata_json,
-                    i64::try_from(chunk_count).unwrap_or(i64::MAX),
-                    now,
-                ],
-            )?;
-            tx.execute(
-                "DELETE FROM document_chunks WHERE document_id = ?1",
-                params![document_id],
-            )?;
-
-            for (chunk_index, heading, content, embedding_bytes) in prepared_chunks {
-                let chunk_id = format!("{document_id}:chunk:{chunk_index}");
-                let source_anchor = format!("{document_id}#chunk-{chunk_index}");
-                let token_estimate = content.chars().count().div_ceil(4);
-                let chunk_hash = Self::content_sha256_hex(&content);
-                let chunk_embedding_provider = embedding_bytes.as_ref().map(|_| embedding_provider.clone());
-                let chunk_embedding_model = embedding_bytes.as_ref().map(|_| embedding_model.clone());
-                let chunk_embedding_dimensions = embedding_bytes.as_ref().map(|_| embedding_dimensions);
-                tx.execute(
-                    "INSERT INTO document_chunks (
-                        chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
-                        chunk_index, heading, content, content_sha256, embedding,
-                        embedding_provider, embedding_model, embedding_dimensions,
-                        source_anchor, token_estimate, created_at
-                     )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    updated_at = excluded.updated_at,
+                    {coalesce}{scope_guard}"
+                    ),
                     params![
-                        chunk_id,
                         document_id,
                         input.workspace_id,
                         input.owner_id,
                         input.topic_id,
                         input.task_id,
-                        i64::try_from(chunk_index).unwrap_or(i64::MAX),
-                        heading,
-                        content,
-                        chunk_hash,
-                        embedding_bytes,
-                        chunk_embedding_provider,
-                        chunk_embedding_model,
-                        chunk_embedding_dimensions,
-                        source_anchor,
-                        i64::try_from(token_estimate).unwrap_or(i64::MAX),
+                        input.source_message_event_id,
+                        input.source_kind,
+                        input.source_uri,
+                        input.title,
+                        content_sha256,
+                        input.mime_type,
+                        visibility,
+                        input.metadata_json,
+                        i64::try_from(chunk_count).unwrap_or(i64::MAX),
                         now,
+                        bound_scope,
                     ],
                 )?;
-            }
+                if changed == 0 {
+                    return Err(AgentScopeRefused.into());
+                }
+                if matches!(
+                    input.agent_partition.as_ref().map(|partition| &partition.key),
+                    Some(PartitionKey::Named { .. })
+                ) {
+                    let stored: Option<String> = tx.query_row(
+                        "SELECT ma_scope_id FROM documents WHERE document_id = ?1",
+                        params![document_id],
+                        |row| row.get(0),
+                    )?;
+                    if stored.is_none() {
+                        return Err(AgentScopeRefused.into());
+                    }
+                }
+                tx.execute(
+                    "DELETE FROM document_chunks WHERE document_id = ?1",
+                    params![document_id],
+                )?;
 
-            tx.execute(
-                // C03: the ingested document's own owner is recorded in the
-                // column, so a `session`/`private` ingest event is attributed.
-                // V02-R6: the turn's scoping keys are bound too, so the event is
-                // reachable through the `session`/`agent`/`private` arms of the
-                // read predicate instead of carrying unmatchable NULLs.
-                "INSERT INTO memory_events (
+                for (chunk_index, heading, content, prepared) in prepared_chunks {
+                    let chunk_id = format!("{document_id}:chunk:{chunk_index}");
+                    let source_anchor = format!("{document_id}#chunk-{chunk_index}");
+                    let token_estimate = content.chars().count().div_ceil(4);
+                    let chunk_hash = Self::content_sha256_hex(&content);
+                    let embedding_bytes = prepared.as_ref().map(|item| item.bytes.clone());
+                    let chunk_embedding_provider = prepared.as_ref().map(|_| embedding_provider.clone());
+                    let chunk_embedding_model = prepared.as_ref().map(|_| embedding_model.clone());
+                    let chunk_embedding_dimensions = prepared.as_ref().map(|_| embedding_dimensions);
+                    tx.execute(
+                        "INSERT INTO document_chunks (
+                        chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
+                        chunk_index, heading, content, content_sha256, embedding,
+                        embedding_provider, embedding_model, embedding_dimensions,
+                        source_anchor, token_estimate, created_at, ma_scope_id
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                             (SELECT ma_scope_id FROM documents WHERE document_id = ?2))",
+                        params![
+                            chunk_id,
+                            document_id,
+                            input.workspace_id,
+                            input.owner_id,
+                            input.topic_id,
+                            input.task_id,
+                            i64::try_from(chunk_index).unwrap_or(i64::MAX),
+                            heading,
+                            content,
+                            chunk_hash,
+                            embedding_bytes,
+                            chunk_embedding_provider,
+                            chunk_embedding_model,
+                            chunk_embedding_dimensions,
+                            source_anchor,
+                            i64::try_from(token_estimate).unwrap_or(i64::MAX),
+                            now,
+                        ],
+                    )?;
+                    if let Some(prepared) = prepared {
+                        Self::insert_embedding_cache(
+                            &tx,
+                            &prepared.hash,
+                            &prepared.bytes,
+                            &embedding_provider,
+                            &embedding_model,
+                            embedding_dimensions,
+                            &cache_now,
+                            bound_scope.as_deref(),
+                            cache_max,
+                        )?;
+                    }
+                }
+
+                tx.execute(
+                    "INSERT INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                    session_key, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, 'document.ingested', 'documents', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    Uuid::new_v4().to_string(),
-                    input.workspace_id,
-                    input.owner_id,
-                    document_id,
-                    input.session_key,
-                    input.agent_id,
-                    input.persona_id,
-                    input.visibility.as_str(),
-                    serde_json::json!({
-                        "owner_id": input.owner_id,
-                        "topic_id": input.topic_id,
-                        "task_id": input.task_id,
-                        "source_message_event_id": input.source_message_event_id,
-                        "chunk_count": chunk_count,
-                        "content_sha256": content_sha256
-                    })
-                    .to_string(),
-                    Utc::now().to_rfc3339(),
-                ],
-            )?;
+                 VALUES (?1, ?2, ?3, 'document.ingested', 'documents', ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         (SELECT ma_scope_id FROM documents WHERE document_id = ?4))",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        input.workspace_id,
+                        input.owner_id,
+                        document_id,
+                        input.session_key,
+                        input.agent_id,
+                        input.persona_id,
+                        input.visibility.as_str(),
+                        serde_json::json!({
+                            "owner_id": input.owner_id,
+                            "topic_id": input.topic_id,
+                            "task_id": input.task_id,
+                            "source_message_event_id": input.source_message_event_id,
+                            "chunk_count": chunk_count,
+                            "content_sha256": content_sha256
+                        })
+                        .to_string(),
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
 
-            let document = tx.query_row(
-                "SELECT id, document_id, workspace_id, owner_id, topic_id, task_id,
+                let document = tx.query_row(
+                    "SELECT id, document_id, workspace_id, owner_id, topic_id, task_id,
                         source_message_event_id, source_kind, source_uri, title,
                         content_sha256, mime_type, visibility, metadata_json,
                         chunk_count, created_at, updated_at
                  FROM documents
                  WHERE document_id = ?1
                  LIMIT 1",
-                params![document_id],
-                Self::document_from_row,
-            )?;
-            tx.commit()?;
-            Ok(document)
-        })
-        .await?
+                    params![document_id],
+                    Self::document_from_row,
+                )?;
+                tx.commit()?;
+                Ok(IngestOutcome::Done(Box::new(document)))
+            })
+            .await??;
+            match outcome {
+                IngestOutcome::Done(document) => return Ok(*document),
+                IngestOutcome::Retry if attempt == 0 => continue,
+                IngestOutcome::Retry => return Err(AgentScopeRefused.into()),
+            }
+        }
+        Err(AgentScopeRefused.into())
     }
 
     pub(super) async fn retrieve_decision_documents_impl(
@@ -480,14 +542,37 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryLink> {
             let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let link_id = input.link_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            conn.execute(
+            let bound_scope = super::agent_migration::resolve_input_scope(
+                &tx,
+                input.agent_partition.as_ref(),
+                input.session_key.as_deref(),
+                &input.workspace_id,
+                input.owner_id.as_deref(),
+            )?;
+            let document_scope: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT ma_scope_id FROM documents WHERE document_id = ?1",
+                    params![input.document_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let document_scope = document_scope.flatten();
+            if !super::agent_migration::scopes_compatible(&tx, document_scope.as_deref(), bound_scope.as_deref())? {
+                tracing::debug!(
+                    document_id = %input.document_id,
+                    "memory source link refused: document is not the writer's incarnation"
+                );
+                return Err(AgentScopeRefused.into());
+            }
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_links (
                     link_id, workspace_id, owner_id, memory_key, memory_event_id,
-                    message_event_id, document_id, chunk_id, link_type, payload_json, created_at
+                    message_event_id, document_id, chunk_id, link_type, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     link_id,
                     input.workspace_id,
@@ -500,9 +585,17 @@ impl SqliteMemory {
                     input.link_type,
                     input.payload_json,
                     now,
+                    bound_scope,
                 ],
             )?;
-            conn.query_row(
+            super::agent_migration::refuse_if_stored_scope_differs(
+                &tx,
+                "memory_links",
+                "link_id",
+                &link_id,
+                &bound_scope,
+            )?;
+            let link = tx.query_row(
                 "SELECT id, link_id, workspace_id, owner_id, memory_key, memory_event_id,
                         message_event_id, document_id, chunk_id, link_type, payload_json, created_at
                  FROM memory_links
@@ -510,8 +603,9 @@ impl SqliteMemory {
                  LIMIT 1",
                 params![link_id],
                 Self::memory_link_from_row,
-            )
-            .map_err(Into::into)
+            )?;
+            tx.commit()?;
+            Ok(link)
         })
         .await?
     }
@@ -524,6 +618,7 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<RetrievalTrace> {
             let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let trace_id = input.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let candidate_count = i64::try_from(input.candidate_count).unwrap_or(i64::MAX);
@@ -532,13 +627,23 @@ impl SqliteMemory {
             let budget_tokens = input
                 .budget_tokens
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
-            conn.execute(
-                "INSERT INTO retrieval_traces (
+            let bound_scope = super::agent_migration::resolve_input_scope(
+                &tx,
+                input.agent_partition.as_ref(),
+                input.session_key.as_deref(),
+                &input.workspace_id,
+                input.owner_id.as_deref(),
+            )?;
+            let coalesce = super::agent_migration::scope_coalesce_set("retrieval_traces");
+            let scope_guard = super::agent_migration::scope_conflict_guard("retrieval_traces", false);
+            let changed = tx.execute(
+                &format!(
+                    "INSERT INTO retrieval_traces (
                     trace_id, workspace_id, owner_id, session_key, agent_id, persona_id,
                     source, query, candidate_count, selected_count, dropped_count,
-                    budget_tokens, selected_json, dropped_json, payload_json, created_at
+                    budget_tokens, selected_json, dropped_json, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(trace_id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     owner_id = excluded.owner_id,
@@ -553,7 +658,9 @@ impl SqliteMemory {
                     budget_tokens = excluded.budget_tokens,
                     selected_json = excluded.selected_json,
                     dropped_json = excluded.dropped_json,
-                    payload_json = excluded.payload_json",
+                    payload_json = excluded.payload_json,
+                    {coalesce}{scope_guard}"
+                ),
                 params![
                     trace_id,
                     input.workspace_id,
@@ -571,9 +678,13 @@ impl SqliteMemory {
                     input.dropped_json,
                     input.payload_json,
                     now,
+                    bound_scope,
                 ],
             )?;
-            conn.query_row(
+            if changed == 0 {
+                return Err(AgentScopeRefused.into());
+            }
+            let trace = tx.query_row(
                 "SELECT id, trace_id, workspace_id, owner_id, session_key, agent_id,
                         persona_id, source, query, candidate_count, selected_count,
                         dropped_count, budget_tokens, selected_json, dropped_json,
@@ -583,8 +694,9 @@ impl SqliteMemory {
                  LIMIT 1",
                 params![trace_id],
                 Self::retrieval_trace_from_row,
-            )
-            .map_err(Into::into)
+            )?;
+            tx.commit()?;
+            Ok(trace)
         })
         .await?
     }
@@ -595,19 +707,30 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
             let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let source_message_count = i64::try_from(input.source_message_count).unwrap_or(i64::MAX);
             let source_token_estimate = i64::try_from(input.source_token_estimate).unwrap_or(i64::MAX);
-            conn.execute(
-                "INSERT INTO compaction_runs (
+            let bound_scope = super::agent_migration::resolve_input_scope(
+                &tx,
+                input.agent_partition.as_ref(),
+                input.session_key.as_deref(),
+                &input.workspace_id,
+                input.owner_id.as_deref(),
+            )?;
+            let coalesce = super::agent_migration::scope_coalesce_set("compaction_runs");
+            let scope_guard = super::agent_migration::scope_conflict_guard("compaction_runs", false);
+            let changed = tx.execute(
+                &format!(
+                    "INSERT INTO compaction_runs (
                     run_id, workspace_id, owner_id, session_key, agent_id, persona_id,
                     \"trigger\", mode, source_message_count, source_token_estimate,
                     summary, summary_memory_key, source_event_ids_json,
                     source_event_range_json, source_document_refs_json,
-                    fidelity_status, payload_json, created_at
+                    fidelity_status, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                  ON CONFLICT(run_id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     owner_id = excluded.owner_id,
@@ -624,7 +747,9 @@ impl SqliteMemory {
                     source_event_range_json = excluded.source_event_range_json,
                     source_document_refs_json = excluded.source_document_refs_json,
                     fidelity_status = excluded.fidelity_status,
-                    payload_json = excluded.payload_json",
+                    payload_json = excluded.payload_json,
+                    {coalesce}{scope_guard}"
+                ),
                 params![
                     run_id,
                     input.workspace_id,
@@ -644,9 +769,13 @@ impl SqliteMemory {
                     input.fidelity_status,
                     input.payload_json,
                     now,
+                    bound_scope,
                 ],
             )?;
-            conn.query_row(
+            if changed == 0 {
+                return Err(AgentScopeRefused.into());
+            }
+            let run = tx.query_row(
                 "SELECT id, run_id, workspace_id, owner_id, session_key, agent_id,
                         persona_id, \"trigger\", mode, source_message_count, source_token_estimate,
                         summary, summary_memory_key, source_event_ids_json,
@@ -657,8 +786,9 @@ impl SqliteMemory {
                  LIMIT 1",
                 params![run_id],
                 Self::compaction_run_from_row,
-            )
-            .map_err(Into::into)
+            )?;
+            tx.commit()?;
+            Ok(run)
         })
         .await?
     }

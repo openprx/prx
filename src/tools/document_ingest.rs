@@ -206,9 +206,8 @@ impl DocumentIngestRuntime {
                 mime_type,
                 visibility,
                 metadata_json: Some(metadata_json),
-                // V02-R6: the trusted scope's chat id is the turn's session key.
-                // A tool principal resolves no agent or persona
-                // (`parse_scope_principal`), so those stay unset here.
+                // MA-01b3: prefer `_zc_scope.session_key`; V02-R6 still falls
+                // back to chat_id inside `parse_scope_principal`.
                 session_key: principal.session_key,
                 agent_id: None,
                 persona_id: None,
