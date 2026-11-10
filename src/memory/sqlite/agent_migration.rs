@@ -4,9 +4,10 @@
 //! sessions whose channel is `console`. Nothing is guessed: a row whose
 //! workspace, owner or session cannot be proven stays NULL and is counted.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::SqliteMemory;
+use crate::memory::{AgentPartition, AgentScopeRefused, PartitionKey};
 
 /// Main (K=`m`) never depends on config: its revision is this constant's hash.
 const MAIN_REVISION_PREIMAGE: &str = "prx.ma.main.v1";
@@ -53,39 +54,161 @@ fn main_incarnation(conn: &Connection, workspace: &str, owner: &str) -> anyhow::
     Ok(incarnation)
 }
 
-/// The one unfenced Main scope for (W,O,S,U). G=1 is inserted only when the
-/// tuple has no scope at all; if every scope is fenced there is none to stamp.
-fn unfenced_scope(
+enum UnfencedScope {
+    Ready(String),
+    AllFenced,
+    Absent,
+}
+
+fn inspect_unfenced_scope(
     conn: &Connection,
     workspace: &str,
     owner: &str,
     session: &str,
+    agent_key: &str,
     incarnation: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<UnfencedScope> {
     let scopes = conn
         .prepare(
             "SELECT sc.scope_id, EXISTS(SELECT 1 FROM agent_erase_fences f WHERE f.scope_id = sc.scope_id)
              FROM agent_scopes sc
              WHERE sc.workspace_id = ?1 AND sc.owner_id = ?2 AND sc.session_key = ?3
-               AND sc.agent_key = 'm' AND sc.incarnation = ?4
+               AND sc.agent_key = ?4 AND sc.incarnation = ?5
              ORDER BY sc.generation",
         )?
-        .query_map(params![workspace, owner, session, incarnation], |row| {
+        .query_map(params![workspace, owner, session, agent_key, incarnation], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if let Some((scope, _)) = scopes.iter().find(|(_, fenced)| !fenced) {
-        return Ok(Some(scope.clone()));
+        return Ok(UnfencedScope::Ready(scope.clone()));
     }
-    if !scopes.is_empty() {
+    if scopes.is_empty() {
+        Ok(UnfencedScope::Absent)
+    } else {
+        Ok(UnfencedScope::AllFenced)
+    }
+}
+
+/// The one unfenced scope for (W,O,S,K,U). G=1 is inserted only when the tuple
+/// has no scope at all; if every scope is fenced there is none to stamp.
+fn unfenced_scope(
+    conn: &Connection,
+    workspace: &str,
+    owner: &str,
+    session: &str,
+    agent_key: &str,
+    incarnation: &str,
+) -> anyhow::Result<Option<String>> {
+    match inspect_unfenced_scope(conn, workspace, owner, session, agent_key, incarnation)? {
+        UnfencedScope::Ready(scope) => Ok(Some(scope)),
+        UnfencedScope::AllFenced => Ok(None),
+        UnfencedScope::Absent => {
+            let scope = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![scope, workspace, owner, session, agent_key, incarnation],
+            )?;
+            Ok(Some(scope))
+        }
+    }
+}
+
+fn require_session(session_key: Option<&str>) -> anyhow::Result<&str> {
+    session_key
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .ok_or_else(|| AgentScopeRefused.into())
+}
+
+/// Read-only lookup of the unfenced write scope. `Ok(None)` means it is safe
+/// to mint (Main incarnation or a missing unfenced scope). Refusal is typed.
+pub(super) fn lookup_write_scope(
+    conn: &Connection,
+    partition: &AgentPartition,
+    session_key: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let session = require_session(session_key)?;
+    let workspace = partition.workspace_id.as_str();
+    let owner = partition.owner_id.as_str();
+    match &partition.key {
+        PartitionKey::Main => {
+            let incarnation: Option<String> = conn
+                .query_row(
+                    "SELECT incarnation FROM agent_incarnations
+                     WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = 'm' AND state = 'active'",
+                    params![workspace, owner],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(incarnation) = incarnation else {
+                return Ok(None);
+            };
+            match inspect_unfenced_scope(conn, workspace, owner, session, "m", &incarnation)? {
+                UnfencedScope::Ready(scope) => Ok(Some(scope)),
+                UnfencedScope::AllFenced => Err(AgentScopeRefused.into()),
+                UnfencedScope::Absent => Ok(None),
+            }
+        }
+        PartitionKey::Named { name, incarnation } => {
+            let agent_key = format!("n:{}", name.as_str());
+            let incarnation = incarnation.to_string();
+            let state: Option<String> = conn
+                .query_row(
+                    "SELECT state FROM agent_incarnations
+                     WHERE workspace_id = ?1 AND owner_id = ?2 AND agent_key = ?3 AND incarnation = ?4",
+                    params![workspace, owner, &agent_key, &incarnation],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("active") {
+                return Err(AgentScopeRefused.into());
+            }
+            match inspect_unfenced_scope(conn, workspace, owner, session, &agent_key, &incarnation)? {
+                UnfencedScope::Ready(scope) => Ok(Some(scope)),
+                UnfencedScope::AllFenced => Err(AgentScopeRefused.into()),
+                UnfencedScope::Absent => Ok(None),
+            }
+        }
+    }
+}
+
+/// Get or create the unfenced write scope. Main mints the incarnation (CR1).
+/// Named requires an active incarnation. Never falls back to NULL.
+pub(super) fn resolve_write_scope(
+    tx: &Transaction<'_>,
+    partition: &AgentPartition,
+    session_key: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(scope) = lookup_write_scope(tx, partition, session_key)? {
+        return Ok(scope);
+    }
+    let session = require_session(session_key)?;
+    let workspace = partition.workspace_id.as_str();
+    let owner = partition.owner_id.as_str();
+    let (agent_key, incarnation) = match &partition.key {
+        PartitionKey::Main => ("m".to_owned(), main_incarnation(tx, workspace, owner)?),
+        PartitionKey::Named { name, incarnation } => (format!("n:{}", name.as_str()), incarnation.to_string()),
+    };
+    unfenced_scope(tx, workspace, owner, session, &agent_key, &incarnation)?.ok_or_else(|| AgentScopeRefused.into())
+}
+
+/// Writer-facing resolve: partition `None` keeps NULL; workspace/owner mismatch
+/// is refused.
+pub(super) fn resolve_input_scope(
+    tx: &Transaction<'_>,
+    partition: Option<&AgentPartition>,
+    session_key: Option<&str>,
+    workspace_id: &str,
+    owner_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(partition) = partition else {
         return Ok(None);
+    };
+    if partition.workspace_id != workspace_id || owner_id != Some(partition.owner_id.as_str()) {
+        return Err(AgentScopeRefused.into());
     }
-    let scope = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'm', ?5, 1)",
-        params![scope, workspace, owner, session, incarnation],
-    )?;
-    Ok(Some(scope))
+    resolve_write_scope(tx, partition, session_key).map(Some)
 }
 
 /// Stamp legacy console history with its owner's Main scope. Returns how many
@@ -115,7 +238,7 @@ pub(super) fn migrate_legacy_console(conn: &Connection) -> anyhow::Result<u64> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (workspace, owner, session) in tuples {
         let incarnation = main_incarnation(conn, &workspace, &owner)?;
-        let Some(scope) = unfenced_scope(conn, &workspace, &owner, &session, &incarnation)? else {
+        let Some(scope) = unfenced_scope(conn, &workspace, &owner, &session, "m", &incarnation)? else {
             continue;
         };
         let events = conn
