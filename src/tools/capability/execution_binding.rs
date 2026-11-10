@@ -214,6 +214,20 @@ impl ExecutionBinding {
         scope: &RuntimeEnvelope,
         descriptor: &ToolDescriptor,
     ) -> Result<(), ToolExecutionError> {
+        self.verify_admitted_descriptor(service, scope, descriptor)?;
+        self.verify_child_membership(service)
+    }
+
+    /// Scope, generation, schema and backend identity of the admitted
+    /// capability against the live descriptor. Child membership and child
+    /// catalog parity stay with 02c `admit_child` at dispatch; this check
+    /// remains on gateway-issued maps (MCP compat) that 02c never sees.
+    pub(crate) fn verify_admitted_descriptor(
+        &self,
+        service: &ToolExecutionService,
+        scope: &RuntimeEnvelope,
+        descriptor: &ToolDescriptor,
+    ) -> Result<(), ToolExecutionError> {
         let refuse = || ToolExecutionError::StaleCapability;
         if scope != &self.scope {
             return Err(refuse());
@@ -225,12 +239,7 @@ impl ExecutionBinding {
         {
             return Err(refuse());
         }
-        if let Some(child) = self.child_scope.as_ref() {
-            if !self.discovery_control && !child.gate_inputs().0.allowed.contains(&self.capability) {
-                return Err(refuse());
-            }
-            self.catalog.check_child_parity(service, child).map_err(|_| refuse())?;
-        } else {
+        if self.child_scope.is_none() {
             self.catalog.check_parity(service).map_err(|_| refuse())?;
         }
         let entry = self
@@ -252,6 +261,18 @@ impl ExecutionBinding {
         self.catalog
             .resolve(std::slice::from_ref(&self.capability))
             .map_err(|_| refuse())?;
+        Ok(())
+    }
+
+    fn verify_child_membership(&self, service: &ToolExecutionService) -> Result<(), ToolExecutionError> {
+        let refuse = || ToolExecutionError::StaleCapability;
+        let Some(child) = self.child_scope.as_ref() else {
+            return Ok(());
+        };
+        if !self.discovery_control && !child.gate_inputs().0.allowed.contains(&self.capability) {
+            return Err(refuse());
+        }
+        self.catalog.check_child_parity(service, child).map_err(|_| refuse())?;
         Ok(())
     }
 }
