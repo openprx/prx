@@ -2127,9 +2127,9 @@ fn open_recovery_reader_connection(path: &Path, immutable: bool) -> Result<Conne
 }
 
 fn open_recovery_reader(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
-    let conn = open_recovery_reader_connection(path, immutable)?;
+    let mut conn = open_recovery_reader_connection(path, immutable)?;
     conn.execute_batch("PRAGMA query_only = ON;")?;
-    crate::runtime::sqlite_pool::install_bounded_busy_handler(&conn)?;
+    crate::runtime::sqlite_pool::install_bounded_busy_handler(&mut conn)?;
     Ok(conn)
 }
 
@@ -2160,14 +2160,14 @@ fn read_with_wal_reprobe_until<T>(
 ) -> Result<T, StoreError> {
     recovery_time_left(deadline)?;
     let immutable = !wal_sidecar_present(path);
-    let conn = open_recovery_reader_connection(path, immutable)?;
+    let mut conn = open_recovery_reader_connection(path, immutable)?;
     #[cfg(test)]
     if immutable {
         wait_wal_reprobe_gate();
     }
     recovery_time_left(deadline)?;
     let result = {
-        let _budget = RecoveryReadBudget::new(&conn, deadline)?;
+        let conn = RecoveryReadBudget::new(&mut conn, deadline)?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
         recovery_time_left(deadline)?;
         let result = read(&conn);
@@ -2177,9 +2177,9 @@ fn read_with_wal_reprobe_until<T>(
     if immutable && wal_sidecar_present(path) {
         drop(conn);
         recovery_time_left(deadline)?;
-        let conn = open_recovery_reader_connection(path, false)?;
+        let mut conn = open_recovery_reader_connection(path, false)?;
         recovery_time_left(deadline)?;
-        let _budget = RecoveryReadBudget::new(&conn, deadline)?;
+        let conn = RecoveryReadBudget::new(&mut conn, deadline)?;
         conn.execute_batch("PRAGMA query_only = ON;")?;
         recovery_time_left(deadline)?;
         let result = read(&conn);
