@@ -1182,6 +1182,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::SourceParallel("tests/proptest-regressions"))),
+            ..ProptestConfig::default()
+        })]
         /// V6.13 (property): whatever surrounds them, and in whichever text
         /// field, the sentinel secrets never survive the projection. G-09 runs
         /// it with `PROPTEST_CASES=10000` (D-064, L-7).
@@ -1207,20 +1211,57 @@ mod tests {
         /// that matches its shape.
         #[test]
         fn every_projection_passes_the_state_v1_checker(state in any_state()) {
-            let candidates = state.derived.candidates();
-            let safety = candidates.iter().filter(|derived| is_safety(derived.candidate.action())).count();
-            match redacted_projection(&state) {
-                Ok((value, _)) => {
-                    prop_assert!(!candidates.is_empty());
-                    prop_assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
-                }
-                Err(ProjectionError::NoCandidates) => prop_assert!(candidates.is_empty()),
-                Err(ProjectionError::TooManySafetyCandidates { count }) => {
-                    prop_assert_eq!(count, safety);
-                    prop_assert!(safety > MAX_CANDIDATES);
-                }
-                Err(ProjectionError::Structured(error)) => prop_assert!(false, "structured: {}", error),
-            }
+            check_projection_passes_checker(&state)?;
         }
+    }
+
+    /// The assertion body of `every_projection_passes_the_state_v1_checker`.
+    fn check_projection_passes_checker(state: &CausalState) -> Result<(), proptest::test_runner::TestCaseError> {
+        let candidates = state.derived.candidates();
+        let safety = candidates
+            .iter()
+            .filter(|derived| is_safety(derived.candidate.action()))
+            .count();
+        match redacted_projection(state) {
+            Ok((value, _)) => {
+                prop_assert!(!candidates.is_empty());
+                prop_assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
+            }
+            Err(ProjectionError::NoCandidates) => prop_assert!(candidates.is_empty()),
+            Err(ProjectionError::TooManySafetyCandidates { count }) => {
+                prop_assert_eq!(count, safety);
+                prop_assert!(safety > MAX_CANDIDATES);
+            }
+            Err(ProjectionError::Structured(error)) => prop_assert!(false, "structured: {}", error),
+        }
+        Ok(())
+    }
+
+    /// Replaces the proptest-regressions seed of 2026-10-14 (commit 53848d1d),
+    /// which was `cc 15c406e2…`, shrunk to one unavailable `Answer` candidate
+    /// with target `None`, an empty summary and an empty goal, routing input
+    /// and observed state, lineage `First`, `built_at_ms` 1000, and two
+    /// exclusions, with no constraints and zero budgets. Its namespace is
+    /// `Ns8::of` under the fixture key, the derivation the strategy uses for
+    /// an `Answer`/`None` candidate (namespace `ns0`, index 0). The seed's
+    /// namespace bytes were key-derived and were never reproducible: every
+    /// replay builds a fresh random key, so they change on every run.
+    #[test]
+    fn every_projection_passes_the_state_v1_checker_regression_answer_none() {
+        let key = key();
+        let mut state = state(&key, "");
+        state.goal = RawRoutingInput::new(String::new());
+        state.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0);
+        let mut answer = candidate(&key, CausalActionKind::Answer, CapabilityTarget::None, Some("ns0"));
+        answer.summary = Arc::from("");
+        answer.available = false;
+        state.derived = derived(vec![answer]);
+        let mut parts = state.trusted.parts().clone();
+        parts.constraints = Vec::new();
+        parts.budgets.tokens = 0;
+        parts.budgets.latency_ms = 0;
+        parts.budgets.micro_usd = 0;
+        state.trusted = TrustedState::from_runtime(parts);
+        check_projection_passes_checker(&state).expect("test: state v1 checker");
     }
 }

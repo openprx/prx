@@ -302,6 +302,10 @@ fn out_of_range() -> impl Strategy<Value = f64> {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/proptest-regressions/proptest_decision_validate.txt"))),
+        ..ProptestConfig::default()
+    })]
     /// Every value that validates is the exact value received.
     #[test]
     fn validated_values_equal_input_bits(raw in weights(MAX_OPTIONS), confidence in 0.0_f64..=1.0) {

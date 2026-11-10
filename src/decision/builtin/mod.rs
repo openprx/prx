@@ -1892,7 +1892,95 @@ mod tests {
         format!("{:?}", answer_and_validate(&request).answers)
     }
 
+    /// The assertion body of `every_layout_combination_is_invariant`.
+    fn check_layout_invariance(
+        request: usize,
+        script: usize,
+        bits: u8,
+        seed: u64,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let script = SCRIPTS[script];
+        let mut layout = Layout::from_bits(bits);
+        // Glued only for the scripts written without spaces; drawn as
+        // spaced otherwise, so no case is rejected.
+        layout.glued &= !script.spaced;
+        let segments = &requests()[request];
+        let key = key();
+        let reference = answers_for(&key, &render(segments, None, 0, Layout::SPACED));
+        let variant = render(segments, Some(&script), seed, layout);
+        prop_assert_eq!(
+            answers_for(&key, &variant),
+            reference,
+            "request {} in {}, {:?}: {:?}",
+            request,
+            script.name,
+            layout,
+            variant
+        );
+        Ok(())
+    }
+
+    /// The assertion body of `generated_path_shapes_read_alike_in_every_script_and_layout`.
+    fn check_path_shape_invariance(
+        prefix: PathPrefix,
+        names: &[String],
+        extension: Option<&str>,
+        script: usize,
+        bits: u8,
+        seed: u64,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let script = SCRIPTS[script];
+        let mut layout = Layout::from_bits(bits);
+        // Glued only for the scripts written without spaces; drawn as
+        // spaced otherwise, so no case is rejected.
+        layout.glued &= !script.spaced;
+        // The ruled residuals are drawn with ASCII names instead.
+        let residual = prefix == PathPrefix::Bare
+            && layout.glued
+            && layout.localized
+            && (names.len() == 1 || (names.len() == 2 && extension.is_none()));
+        layout.localized &= !residual;
+        let path = format!(" {} ", path_text(prefix, names, extension));
+        let segments = [
+            Segment::Words("open"),
+            Segment::Structure(&path),
+            Segment::Words("and show it"),
+        ];
+        let key = key();
+        let reference = answers_for(&key, &render(&segments, None, 0, Layout::SPACED));
+        let variant = render(&segments, Some(&script), seed, layout);
+        prop_assert_eq!(
+            answers_for(&key, &variant),
+            reference,
+            "{:?} in {}, {:?}: {:?}",
+            path,
+            script.name,
+            layout,
+            variant
+        );
+        Ok(())
+    }
+
+    /// Replaces the proptest-regressions seed of 2026-10-14 (commit 53848d1d):
+    /// request 7, script 4, no layout bits, letter seed 752737997882130078.
+    #[test]
+    fn every_layout_combination_is_invariant_regression_request7_script4() {
+        check_layout_invariance(7, 4, 0, 752_737_997_882_130_078).expect("test: layout invariance");
+    }
+
+    /// Replaces the proptest-regressions seed of 2026-10-14 (commit 53848d1d):
+    /// a bare path `a` with no extension, script 0, no layout bits, seed 0.
+    #[test]
+    fn generated_path_shapes_read_alike_in_every_script_and_layout_regression_bare_a() {
+        check_path_shape_invariance(PathPrefix::Bare, &["a".to_string()], None, 0, 0, 0)
+            .expect("test: path shape invariance");
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::SourceParallel("tests/proptest-regressions"))),
+            ..ProptestConfig::default()
+        })]
         /// D-061 amendment 3 (property): for any request, script, combination
         /// of layouts and letter seed, the answers are those of the English
         /// text as written.
@@ -1903,24 +1991,7 @@ mod tests {
             bits in 0..16_u8,
             seed in any::<u64>(),
         ) {
-            let script = SCRIPTS[script];
-            let mut layout = Layout::from_bits(bits);
-            // Glued only for the scripts written without spaces; drawn as
-            // spaced otherwise, so no case is rejected.
-            layout.glued &= !script.spaced;
-            let segments = &requests()[request];
-            let key = key();
-            let reference = answers_for(&key, &render(segments, None, 0, Layout::SPACED));
-            let variant = render(segments, Some(&script), seed, layout);
-            prop_assert_eq!(
-                answers_for(&key, &variant),
-                reference,
-                "request {} in {}, {:?}: {:?}",
-                request,
-                script.name,
-                layout,
-                variant
-            );
+            check_layout_invariance(request, script, bits, seed)?;
         }
 
         /// D-061 amendment 4 (property): a generated path of any shape
@@ -1940,31 +2011,7 @@ mod tests {
             bits in 0..16_u8,
             seed in any::<u64>(),
         ) {
-            let script = SCRIPTS[script];
-            let mut layout = Layout::from_bits(bits);
-            // Glued only for the scripts written without spaces; drawn as
-            // spaced otherwise, so no case is rejected.
-            layout.glued &= !script.spaced;
-            // The ruled residuals are drawn with ASCII names instead.
-            let residual = prefix == PathPrefix::Bare
-                && layout.glued
-                && layout.localized
-                && (names.len() == 1 || (names.len() == 2 && extension.is_none()));
-            layout.localized &= !residual;
-            let path = format!(" {} ", path_text(prefix, &names, extension.as_deref()));
-            let segments = [Segment::Words("open"), Segment::Structure(&path), Segment::Words("and show it")];
-            let key = key();
-            let reference = answers_for(&key, &render(&segments, None, 0, Layout::SPACED));
-            let variant = render(&segments, Some(&script), seed, layout);
-            prop_assert_eq!(
-                answers_for(&key, &variant),
-                reference,
-                "{:?} in {}, {:?}: {:?}",
-                path,
-                script.name,
-                layout,
-                variant
-            );
+            check_path_shape_invariance(prefix, &names, extension.as_deref(), script, bits, seed)?;
         }
     }
 
@@ -2538,6 +2585,10 @@ mod tests {
     static PROPERTY_KEY: std::sync::LazyLock<Arc<DecisionKey>> = std::sync::LazyLock::new(key);
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::SourceParallel("tests/proptest-regressions"))),
+            ..ProptestConfig::default()
+        })]
         /// Every request shape the protocol allows, over random states,
         /// candidate sets and question sets, gets a builtin answer that
         /// passes the CDP-01 validator.

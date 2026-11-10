@@ -667,6 +667,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::SourceParallel("tests/proptest-regressions"))),
+            ..ProptestConfig::default()
+        })]
         #[test]
         fn risk_and_uncertainty_are_score_monotone(
             choice in 0.0_f64..=1.0,

@@ -41,3 +41,8 @@ prx_chat_*.md
 # Local collaboration handoff artifacts
 /collab-inbox/
 /collab-outbox/
+
+# Guard: proptest seeds must persist under tests/proptest-regressions/ (committed and replayed).
+# A root-level proptest-regressions/ is a misconfiguration. Do not add tests/proptest-regressions/
+# here: those seeds are committed. A new failure seed must become a named #[test] next to its block.
+/proptest-regressions/

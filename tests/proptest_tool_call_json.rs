@@ -2,6 +2,10 @@ use openprx::providers::ToolCall;
 use proptest::prelude::*;
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/proptest-regressions/proptest_tool_call_json.txt"))),
+        ..ProptestConfig::default()
+    })]
     #[test]
     fn tool_call_json_roundtrip_preserves_fields(
         id in "[a-zA-Z0-9_-]{1,64}",

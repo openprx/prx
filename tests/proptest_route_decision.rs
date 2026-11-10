@@ -2,6 +2,10 @@ use openprx::llm::route_decision::{RouteDecision, SelectionStrategy};
 use proptest::prelude::*;
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct("tests/proptest-regressions/proptest_route_decision.txt"))),
+        ..ProptestConfig::default()
+    })]
     #[test]
     fn route_decision_single_candidate_preserves_selection(
         provider in "[a-z][a-z0-9_-]{0,31}",
