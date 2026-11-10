@@ -30,6 +30,7 @@ pub(crate) mod logical_clock;
 pub(crate) mod outcome;
 pub mod projection;
 pub(crate) mod questions;
+pub(crate) mod refusal;
 pub(crate) mod report_catalog;
 pub mod state;
 pub mod store;

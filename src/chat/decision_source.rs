@@ -1503,7 +1503,7 @@ pub(crate) mod admission_failure_tests {
         use crate::causal_tree::directive::TurnExecutionDirective;
         let (directive, reason) = match context.directive() {
             TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
-            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.as_str()),
+            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.as_str()),
             TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
             TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
             TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),
@@ -1629,7 +1629,7 @@ pub(crate) mod admission_failure_tests {
         use crate::causal_tree::directive::TurnExecutionDirective;
         let (directive, reason) = match context.directive() {
             TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
-            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.as_str()),
+            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.as_str()),
             TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
             TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
             TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),

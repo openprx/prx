@@ -45,6 +45,8 @@ pub(crate) enum TurnExecutionDirective {
     },
     Refuse {
         policy_code: String,
+        /// Configuration hint computed at selection; `None` keeps the generic sentence.
+        user_hint: Option<String>,
     },
 }
 
@@ -57,7 +59,8 @@ const APPROVAL_UNAVAILABLE_REPLY: &str =
     "This action needs owner approval, which this surface cannot collect; nothing was run.";
 
 /// Render only terminal dispositions that need no provider or capability call.
-/// Reason codes are internal diagnostics and never enter the reply text.
+/// Security and policy-internal reason codes stay out of the reply. Configuration
+/// reasons append one plain hint line after the generic refusal sentence.
 pub(crate) fn render_terminal_directive(
     directive: &TurnExecutionDirective,
 ) -> Result<std::borrow::Cow<'static, str>, DirectiveError> {
@@ -80,14 +83,9 @@ pub(crate) fn render_terminal_directive(
             approval_scope.decision_id,
             approval_scope.effect.as_str(),
         ))),
-        TurnExecutionDirective::Refuse { policy_code } => {
-            // The internal code stays in the log; the reply never discloses policy detail.
+        TurnExecutionDirective::Refuse { policy_code, user_hint } => {
             tracing::debug!(policy_code = %policy_code, "rendering terminal refusal");
-            Ok(std::borrow::Cow::Borrowed(if policy_code == "approval_requires_call" {
-                APPROVAL_UNAVAILABLE_REPLY
-            } else {
-                "I can't complete this request under the current policy."
-            }))
+            Ok(super::refusal::render_refusal_reply(policy_code, user_hint.as_deref()))
         }
         _ => Err(DirectiveError::ActionMismatch),
     }
@@ -295,6 +293,7 @@ pub(crate) fn directive_from_selection(
                 }),
                 CausalActionKind::Refuse => Ok(TurnExecutionDirective::Refuse {
                     policy_code: (*reason_code).into(),
+                    user_hint: super::refusal::RefusalReason::classify(reason_code, decision).user_hint(),
                 }),
                 _ => Err(DirectiveError::ActionMismatch),
             }
@@ -398,6 +397,7 @@ mod tests {
             },
             TurnExecutionDirective::Refuse {
                 policy_code: hidden.to_string(),
+                user_hint: None,
             },
         ] {
             let reply = render_terminal_directive(&directive).expect("terminal reply");
@@ -412,6 +412,16 @@ mod tests {
                 "Could you narrow your request so I can finish it in time?"
             ))
         );
+        let priced = render_terminal_directive(&TurnExecutionDirective::Refuse {
+            policy_code: "no_legal_path".to_string(),
+            user_hint: Some(
+                r#"Reason: model deepseek/deepseek-v3.2 has no price; add [cost.prices."deepseek/deepseek-v3.2"]"#
+                    .to_string(),
+            ),
+        })
+        .expect("unpriced refusal reply");
+        assert!(priced.contains(crate::causal_tree::refusal::GENERIC_REFUSAL_REPLY));
+        assert!(priced.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#));
         assert!(matches!(
             render_terminal_directive(&TurnExecutionDirective::AnswerDirectly),
             Err(DirectiveError::ActionMismatch)
@@ -584,7 +594,7 @@ mod tests {
                 approval_expires_at: Utc::now() + chrono::Duration::minutes(1),
                 discovery_limit: 4,
             }),
-            Ok(TurnExecutionDirective::Refuse { policy_code }) if policy_code == "deadline_exceeded"
+            Ok(TurnExecutionDirective::Refuse { policy_code, .. }) if policy_code == "deadline_exceeded"
         ));
     }
 }

@@ -392,12 +392,14 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             .expect("exclusive context after close check")
             .directive = TurnExecutionDirective::Refuse {
             policy_code: "HIDDEN-CAP-9V".to_string(),
+            user_hint: None,
         };
         let TurnDisposition::Close { reply } = answer_context.disposition().expect("fixed close reply") else {
             panic!("refusal must close");
         };
         assert_eq!(reply, "I can't complete this request under the current policy.");
         assert!(!reply.contains("HIDDEN-CAP-9V"));
+        assert!(!reply.contains("Reason:"), "{reply}");
         assert_eq!(
             close_directive_turn(Arc::clone(&answer_context), &close_spy)
                 .await

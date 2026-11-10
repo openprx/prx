@@ -74,6 +74,7 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         prior_hops: Vec::new(),
         directive: TurnExecutionDirective::Refuse {
             policy_code: "hop_stopped".to_owned(),
+            user_hint: None,
         },
         main_compaction: crate::config::AgentCompactionConfig::default(),
         hop_ids: vec![decision_id],

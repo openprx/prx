@@ -740,7 +740,7 @@ mod tests {
                             crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code } => {
                                 ("Clarify", reason_code.as_str())
                             }
-                            crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code } => {
+                            crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code, .. } => {
                                 ("Refuse", policy_code.as_str())
                             }
                             crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly => {
