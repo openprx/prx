@@ -212,9 +212,11 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- Push the branch and open a (draft) PR so CI runs; review runs in parallel with CI.
-- When CI is green and the review approves: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly. If there is a conflict, rebase the branch and repeat.
-- Budget: 30–50 minutes per round from start to a pushed `main`. There is no merge queue and no post-submit stage.
+- The unit of work is one module: one branch and one PR with the whole module done. Settle every open design value before coding; stop and ask instead of inventing one.
+- While coding, push checkpoint commits to the branch only. Do not open a PR, run CI or request review mid-way.
+- When the module passes the local gates (including real-component tests and break-the-fix checks), open the PR. CI is the only full gate; review starts only after CI is green.
+- One review by a different model; fix every finding, Lows included, on the same PR.
+- After the review passes: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage.
 - Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
 
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)

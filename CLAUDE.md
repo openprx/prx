@@ -8,9 +8,9 @@ Use **Rust 2024 edition** (`edition = "2024"` in Cargo.toml) for all new code.
 
 ## Build & Test
 
-Fast development flow: each round, from start to a pushed `main`, takes 30–50 minutes.
+Module flow: the unit of work is one module, built by one lane on one branch and delivered in one PR with the whole module done. Settle every open design value before coding. Push only checkpoint commits while coding; open the PR when the module is complete.
 
-Run this local inner loop on a warm, persistent target. Scope it to what changed:
+When the module is written, run these local gates on a warm, persistent target, scoped to what changed:
 
 ```bash
 source ~/.cargo/env
@@ -19,6 +19,8 @@ cargo clippy --all-targets -- -D warnings          # add --all-features only for
 cargo test --lib <module::path>                    # the task's named tests + the touched module
 cargo test --test architecture_boundaries          # fast boundary guard
 ```
+
+Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes), and for every key fix a break-the-fix check: break the production code and show the test fails.
 
 Do not run the full `cargo test --all-features` suite, mutation batches or stress loops locally. PR CI is the full gate.
 
@@ -193,7 +195,7 @@ Add to `Cargo.toml` or `clippy.toml`:
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: develop on a feature branch. Push the branch and let PR CI (the full gate) and review run in parallel. When CI is green and the review approves, rebase locally onto `origin/main`. If there is no conflict, push `main` directly. If there is a conflict, rebase the branch first. There is no merge queue and no post-submit stage. A red `main` becomes the next task.
+- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model; every finding, Lows included, is fixed on the same PR. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. A red `main` becomes the next task.
 
 ## Commit Style
 
