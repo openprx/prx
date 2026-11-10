@@ -498,6 +498,11 @@ to enter interactive mode.
 The message may be given either as a positional argument (UNIX-style) or with \
 -m/--message; they are equivalent and mutually exclusive.
 
+A single-shot turn that the policy refuses still prints the reply on stdout \
+and exits 2 (distinct from 1, a command or runtime failure). Configuration \
+refusals append one `Reason:` line; security and policy-internal refusals \
+stay on the generic sentence.
+
 Examples:
   prx agent 'What is 2+2?'              # positional message (UNIX-style)
   prx agent -m 'What is 2+2?'           # same, via -m/--message
@@ -1640,7 +1645,7 @@ fn resolve_max_blocking_threads() -> usize {
 }
 
 #[allow(unsafe_code)]
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Build the runtime explicitly (instead of using `#[tokio::main]`) so
     // that we can bound how long runtime drop waits for blocking threads.
     // See `RUNTIME_SHUTDOWN_TIMEOUT` above for the rationale.
@@ -1651,16 +1656,33 @@ fn main() -> Result<()> {
     // and it fails by deadlock, not rejection: once every slot is held, further
     // `spawn_blocking` calls queue forever with no timeout.
     let max_blocking_threads = resolve_max_blocking_threads();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(max_blocking_threads)
         .build()
-        .context("failed to build tokio runtime")?;
+        .context("failed to build tokio runtime")
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     // Publish the real cap so blocking-pool saturation is measured against it.
     openprx::runtime::blocking::configure(max_blocking_threads);
     let result = runtime.block_on(async_main());
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-    result
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            let code = openprx::agent::agent_cli_exit_code(Some(&err));
+            if code == openprx::agent::AGENT_REFUSAL_EXIT_CODE {
+                return std::process::ExitCode::from(code);
+            }
+            eprintln!("Error: {err:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]

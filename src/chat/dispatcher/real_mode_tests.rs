@@ -199,7 +199,7 @@ async fn admit_start_turn_fixture(
     use crate::causal_tree::directive::TurnExecutionDirective;
     let prerequisite = match context.directive() {
         TurnExecutionDirective::Clarify { reason_code } => Some(("Clarify", reason_code.as_str())),
-        TurnExecutionDirective::Refuse { policy_code } => Some(("Refuse", policy_code.as_str())),
+        TurnExecutionDirective::Refuse { policy_code, .. } => Some(("Refuse", policy_code.as_str())),
         _ => None,
     };
     if let Some((directive, reason)) = prerequisite {

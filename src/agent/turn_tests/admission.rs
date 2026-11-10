@@ -430,7 +430,7 @@ impl AdmittedTurn {
             use crate::causal_tree::directive::TurnExecutionDirective as Directive;
             let (kind, code) = match admitted.context.directive() {
                 Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
-                Directive::Refuse { policy_code } => ("Refuse", Some(policy_code.as_str())),
+                Directive::Refuse { policy_code, .. } => ("Refuse", Some(policy_code.as_str())),
                 Directive::Execute { .. } => ("Execute", None),
                 Directive::AnswerDirectly => ("AnswerDirectly", None),
                 Directive::Retrieve { .. } => ("Retrieve", None),
@@ -532,7 +532,7 @@ impl AdmittedTurn {
             use crate::causal_tree::directive::TurnExecutionDirective as Directive;
             let (kind, code) = match admitted.context.directive() {
                 Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
-                Directive::Refuse { policy_code } => ("Refuse", Some(policy_code.as_str())),
+                Directive::Refuse { policy_code, .. } => ("Refuse", Some(policy_code.as_str())),
                 Directive::Execute { .. } => ("Execute", None),
                 Directive::AnswerDirectly => ("AnswerDirectly", None),
                 Directive::Retrieve { .. } => ("Retrieve", None),

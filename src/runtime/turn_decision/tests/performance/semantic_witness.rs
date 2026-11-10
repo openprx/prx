@@ -1019,7 +1019,7 @@ fn capture_expected(
         TurnExecutionDirective::Clarify { reason_code } => {
             json!({"kind":"clarify","reason":reason_code})
         }
-        TurnExecutionDirective::Refuse { policy_code } => {
+        TurnExecutionDirective::Refuse { policy_code, .. } => {
             json!({"kind":"refuse","reason":policy_code})
         }
         _ => panic!("unconsumed Read or fabricated approval/child context"),

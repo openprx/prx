@@ -25,6 +25,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 #[test]
+fn refused_single_shot_uses_distinct_nonzero_exit_code() {
+    use crate::agent::{AGENT_REFUSAL_EXIT_CODE, AgentTurnRefused, agent_cli_exit_code};
+    assert_eq!(AGENT_REFUSAL_EXIT_CODE, 2);
+    assert_ne!(AGENT_REFUSAL_EXIT_CODE, 0);
+    assert_ne!(AGENT_REFUSAL_EXIT_CODE, 1);
+    let refused = anyhow::Error::from(AgentTurnRefused);
+    assert_eq!(agent_cli_exit_code(Some(&refused)), AGENT_REFUSAL_EXIT_CODE);
+    assert_eq!(agent_cli_exit_code(None), 0);
+    assert_eq!(agent_cli_exit_code(Some(&anyhow::anyhow!("provider failed"))), 1);
+    assert!(
+        crate::causal_tree::refusal::render_refusal_reply(
+            "no_legal_path",
+            Some(r#"Reason: model x has no price; add [cost.prices."x"]"#),
+        )
+        .contains(r#"[cost.prices."x"]"#)
+    );
+}
+
+#[test]
 fn agent_turn_envelope_preserves_caller_scope_and_cli_defaults() {
     let scoped = RuntimeEnvelope::agent("workspace-a", "xin:step-a")
         .with_owner_id("owner-a")
@@ -416,7 +435,7 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
     )
     .await;
     match admission.decision().context.directive() {
-        crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code } => {
+        crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code, .. } => {
             assert_eq!(policy_code, "no_legal_path");
         }
         other => panic!("read-only shell request must refuse with no_legal_path: {other:?}"),

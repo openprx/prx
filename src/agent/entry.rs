@@ -23,6 +23,24 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Distinct process status for a refused single-shot `prx agent` turn.
+/// `1` remains a generic command failure.
+pub const AGENT_REFUSAL_EXIT_CODE: u8 = crate::causal_tree::refusal::AGENT_REFUSAL_EXIT_CODE;
+
+/// A single-shot CLI turn closed as Refuse after the reply was written to stdout.
+#[derive(Debug, thiserror::Error)]
+#[error("agent turn refused")]
+pub struct AgentTurnRefused;
+
+/// Map a CLI agent result to a process status. Refusal is 2; other errors stay 1.
+pub fn agent_cli_exit_code(error: Option<&anyhow::Error>) -> u8 {
+    match error {
+        None => 0,
+        Some(error) if error.is::<AgentTurnRefused>() => AGENT_REFUSAL_EXIT_CODE,
+        Some(_) => 1,
+    }
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG) and enters either single-shot or
@@ -1934,6 +1952,12 @@ pub(crate) async fn run_with_runtime_envelope(
                         final_output = reply.to_string();
                         if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false) {
                             println!("{reply}");
+                            if matches!(
+                                decision.directive(),
+                                crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }
+                            ) {
+                                return Err(AgentTurnRefused.into());
+                            }
                         }
                         return Ok::<(), anyhow::Error>(());
                     }

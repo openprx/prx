@@ -41,7 +41,17 @@ async fn refused_unpriced_turn_logs_once_and_never_calls_the_provider() -> anyho
     async {
         for turn in 1..=2 {
             let reply = agent.turn("What is 2 + 2?").await?;
-            assert_eq!(reply, "I can't complete this request under the current policy.");
+            assert!(
+                reply.contains("I can't complete this request under the current policy."),
+                "{reply}"
+            );
+            assert!(
+                reply.contains(
+                    r#"Reason: model deepseek/deepseek-v3.2 has no price; add [cost.prices."deepseek/deepseek-v3.2"]"#
+                ),
+                "{reply}"
+            );
+            assert_eq!(crate::agent::AGENT_REFUSAL_EXIT_CODE, 2);
             let log = std::fs::read_to_string(&log_path)?;
             assert_eq!(
                 log.matches("G6 budget admission refuses unpriced model").count(),
