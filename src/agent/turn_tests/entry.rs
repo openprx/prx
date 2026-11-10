@@ -30,7 +30,7 @@ fn refused_single_shot_uses_distinct_nonzero_exit_code() {
     assert_eq!(AGENT_REFUSAL_EXIT_CODE, 2);
     assert_ne!(AGENT_REFUSAL_EXIT_CODE, 0);
     assert_ne!(AGENT_REFUSAL_EXIT_CODE, 1);
-    let refused = anyhow::Error::from(AgentTurnRefused);
+    let refused = anyhow::Error::from(AgentTurnRefused { reply: String::new() });
     assert_eq!(agent_cli_exit_code(Some(&refused)), AGENT_REFUSAL_EXIT_CODE);
     assert_eq!(agent_cli_exit_code(None), 0);
     assert_eq!(agent_cli_exit_code(Some(&anyhow::anyhow!("provider failed"))), 1);
@@ -454,7 +454,7 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
     );
     drop(admission);
 
-    let reply = run_with_runtime_envelope(
+    let err = run_with_runtime_envelope(
         config.clone(),
         Some("Run the shell command: echo hi".to_string()),
         None,
@@ -465,7 +465,11 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
         None,
     )
     .await
-    .expect("test: a refused turn still returns its terminal text");
+    .expect_err("test: a refused CLI turn is Err(AgentTurnRefused)");
+    let reply = &err
+        .downcast_ref::<crate::agent::AgentTurnRefused>()
+        .expect("test: a refused turn still returns its terminal text")
+        .reply;
     assert!(!reply.contains(crate::providers::credential_probe::PROBE_REPLY));
     assert!(!cli_agent_probe_saw_a_chat_request(&probe), "refused before the model");
     assert!(!config.workspace_dir.join("f112-readonly-ran.txt").exists());

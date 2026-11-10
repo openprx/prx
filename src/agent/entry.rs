@@ -28,9 +28,14 @@ use uuid::Uuid;
 pub const AGENT_REFUSAL_EXIT_CODE: u8 = crate::causal_tree::refusal::AGENT_REFUSAL_EXIT_CODE;
 
 /// A single-shot CLI turn closed as Refuse after the reply was written to stdout.
+/// The close reply is already on stdout; `Display` stays generic so the CLI
+/// mapper can exit 2 without reprinting it.
 #[derive(Debug, thiserror::Error)]
 #[error("agent turn refused")]
-pub struct AgentTurnRefused;
+pub struct AgentTurnRefused {
+    /// Terminal close text already printed on the CLI path.
+    pub reply: String,
+}
 
 /// Map a CLI agent result to a process status. Refusal is 2; other errors stay 1.
 pub fn agent_cli_exit_code(error: Option<&anyhow::Error>) -> u8 {
@@ -1956,7 +1961,10 @@ pub(crate) async fn run_with_runtime_envelope(
                                 decision.directive(),
                                 crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }
                             ) {
-                                return Err(AgentTurnRefused.into());
+                                return Err(AgentTurnRefused {
+                                    reply: final_output.clone(),
+                                }
+                                .into());
                             }
                         }
                         return Ok::<(), anyhow::Error>(());

@@ -404,7 +404,10 @@ mod tests {
     fn unpriced_hint_does_not_echo_a_redacted_secret() {
         let reason = unpriced_reason("openrouter:sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop");
         let hint = reason.user_hint().expect("unpriced has a hint");
-        assert!(!hint.contains("sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop"), "{hint}");
+        assert!(
+            !hint.contains("sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop"),
+            "{hint}"
+        );
         assert!(hint.contains("Reason:"), "{hint}");
     }
 }
