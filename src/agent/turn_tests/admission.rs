@@ -373,7 +373,28 @@ impl AdmittedTurn {
     }
 
     /// Opt-in Q61/Q62 mechanics admission; legacy Builtin fixtures are unchanged.
+    ///
+    /// Decision latency is logical: wall preemption must not spend the
+    /// production `extra_latency_budget_ms`. Callers that already installed a
+    /// clock keep it; otherwise this helper installs one.
     pub(crate) async fn configured_mechanics(
+        config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+        endpoint: &str,
+        provider: &dyn crate::providers::Provider,
+    ) -> Self {
+        let clock = crate::causal_tree::logical_clock::capture()
+            .unwrap_or_else(crate::causal_tree::logical_clock::ManualClock::new);
+        crate::causal_tree::logical_clock::scope(
+            clock,
+            Self::configured_mechanics_on_current_clock(config, input, registry, memory, endpoint, provider),
+        )
+        .await
+    }
+
+    async fn configured_mechanics_on_current_clock(
         mut config: crate::config::Config,
         input: &str,
         registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
@@ -996,4 +1017,103 @@ async fn channel_admission_retains_recorded_transport_identity() {
     assert_eq!(recorded.channel.as_deref(), Some("wacli"));
     assert_eq!(recorded.sender.as_deref(), Some("prx_user"));
     assert_eq!(recorded.run_id.as_deref(), Some(proof.run_id()));
+}
+
+fn mechanics_http_stall() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        crate::config::Config::default()
+            .causal_tree
+            .policy
+            .extra_latency_budget_ms
+            .saturating_add(1),
+    )
+}
+
+async fn stalled_mechanics_driver() -> (
+    tempfile::TempDir,
+    crate::config::Config,
+    Arc<dyn crate::memory::Memory>,
+    Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    super::ScriptedProvider,
+    crate::agent::agent::native_decision_fixture::Driver,
+    String,
+) {
+    let workspace = tempfile::tempdir().expect("mechanics stall workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("mechanics stall memory"));
+    let registry = registry_with_search(vec![Box::new(super::DelayTool::new(
+        "native_probe",
+        1,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    ))]);
+    let provider = super::ScriptedProvider::from_text_responses(vec!["done"]);
+    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
+        .await
+        .expect("owned mechanics decision listener");
+    driver.stall_next_response(mechanics_http_stall());
+    let endpoint = driver.endpoint().to_owned();
+    (workspace, config, memory, registry, provider, driver, endpoint)
+}
+
+fn panic_text(payload: &dyn std::any::Any) -> String {
+    if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else {
+        "non-string panic".to_string()
+    }
+}
+
+/// Old setup (no logical clock): a >250 ms decision-HTTP stall spends the
+/// production extra_latency_budget_ms and the fixture panics at Execute.
+#[tokio::test]
+async fn configured_mechanics_on_wall_clock_expires_when_decision_http_stalls_past_budget() {
+    use futures::FutureExt as _;
+    assert!(
+        !crate::causal_tree::logical_clock::installed(),
+        "BtF control must run on the wall clock"
+    );
+    let (_workspace, config, memory, registry, provider, driver, endpoint) = stalled_mechanics_driver().await;
+    driver
+        .run_factory(true, || async move {
+            let caught = std::panic::AssertUnwindSafe(AdmittedTurn::configured_mechanics_on_current_clock(
+                config,
+                "Use native_probe.",
+                registry,
+                memory,
+                &endpoint,
+                &provider,
+            ))
+            .catch_unwind()
+            .await;
+            let message = panic_text(caught.expect_err("wall-clock stall must miss Execute").as_ref());
+            assert!(
+                message.contains("deadline_exceeded"),
+                "old path must fail on the production latency budget: {message}"
+            );
+        })
+        .await;
+}
+
+/// After the fix, the same stall does not charge logical decision time.
+#[tokio::test]
+async fn configured_mechanics_reaches_execute_when_decision_http_stalls_past_budget() {
+    let (_workspace, config, memory, registry, provider, driver, endpoint) = stalled_mechanics_driver().await;
+    driver
+        .run_factory(true, || async move {
+            let _admission = AdmittedTurn::configured_mechanics(
+                config,
+                "Use native_probe.",
+                registry,
+                memory,
+                &endpoint,
+                &provider,
+            )
+            .await;
+        })
+        .await;
 }
