@@ -3322,10 +3322,15 @@ mod tests {
                         &cancellation,
                     )
                     .await?;
-                assert!(matches!(
-                    context.directive(),
-                    crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-                ));
+                assert!(
+                    matches!(
+                        context.engine().selection,
+                        crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                    ),
+                    "console plain message must commit Answer: {:?}",
+                    context.engine().selection
+                );
                 let decision = ConsoleDecisionTurn {
                     service: Arc::clone(&service),
                     context,

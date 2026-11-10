@@ -10,7 +10,7 @@ pub(crate) mod oversized_reply;
 pub(crate) mod recovery_commit;
 mod replay;
 #[cfg(test)]
-pub(crate) use replay::reseal_payload_for_test;
+pub(crate) use replay::{recorded_pre_switch_request_approval_closes, reseal_payload_for_test};
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{
     REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
@@ -586,16 +586,15 @@ impl Drop for SkillPinGuard {
 
 /// Whether the turn ended waiting for an approval rather than with an answer.
 /// Those turns are reported as `Completed` by their entrypoints, so the signal
-/// comes from the decision: an approval directive, an approval collection, or a
-/// tool attempt that is awaiting approval.
-fn skill_awaiting_approval(
+/// comes from 02a ledger state: an approval collection proof, a pending
+/// decision event, or a tool attempt that is awaiting approval.
+pub(super) fn skill_awaiting_approval(
     decision: &DecisionSettlementRef,
     trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
 ) -> bool {
-    use crate::causal_tree::directive::TurnExecutionDirective;
     let context = &decision.context;
-    matches!(context.directive(), TurnExecutionDirective::RequestApproval { .. })
-        || context.approval_collection_proof().is_some()
+    context.approval_collection_proof().is_some()
+        || context.collected_pending_event().is_some()
         || trace.map_or_else(
             || context.terminal_execution_trace().awaiting_approval_attempts,
             |trace| trace.awaiting_approval_attempts,
@@ -1543,10 +1542,12 @@ mod tests {
             if enabled {
                 assert!(
                     matches!(
-                        context.directive(),
-                        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+                        context.engine().selection,
+                        crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
                     ),
-                    "fixture requires an admitted Answer"
+                    "fixture requires real scoped retrieval to authorize Answer: {:?}",
+                    context.engine().selection
                 );
             }
             if draft.status == TurnTerminalStatus::Silent {
@@ -1720,6 +1721,63 @@ mod tests {
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         (terminal_id, owner_id)
+    }
+
+    #[tokio::test]
+    async fn skill_awaiting_approval_reads_ledger_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let mut draft = completed_commit("prx_awaiting_ledger");
+        let _service =
+            bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut draft, &CostConfig::default()).await;
+        let mut decision = draft.decision.expect("fixture settlement");
+        assert!(
+            !skill_awaiting_approval(&decision, None),
+            "an ordinary completed turn is not awaiting approval"
+        );
+        let cap = decision.context.execution_refs().iter().next().cloned().unwrap_or_else(|| {
+            crate::causal_tree::branch::CapabilityRef {
+                id: crate::causal_tree::branch::CapabilityId::new(
+                    crate::causal_tree::branch::CapabilityTarget::NativeTool,
+                    "test",
+                    "probe",
+                )
+                .expect("test capability id"),
+                fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
+                generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
+            }
+        });
+        Arc::get_mut(&mut decision.context)
+            .expect("fixture settlement uniquely owns its context")
+            .install_collection_proof_for_test(
+                crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
+                    cap,
+                    crate::causal_tree::approval_collection::ApprovalReviewAdapter::ChatOwnerReview,
+                    "0".repeat(64),
+                ),
+            );
+        assert!(
+            skill_awaiting_approval(&decision, None),
+            "an approval-collection proof on the 02a ledger path is awaiting approval"
+        );
+
+        let mut draft_attempts = completed_commit("prx_awaiting_attempts");
+        let _service = bind_terminal_fixture(
+            temp.path(),
+            Arc::clone(&memory),
+            &mut draft_attempts,
+            &CostConfig::default(),
+        )
+        .await;
+        let decision_attempts = draft_attempts.decision.expect("attempts settlement");
+        let snapshot = crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
+            awaiting_approval_attempts: 1,
+            ..Default::default()
+        };
+        assert!(
+            skill_awaiting_approval(&decision_attempts, Some(&snapshot)),
+            "a sealed trace with awaiting_approval_attempts is ledger-visible awaiting approval"
+        );
     }
 
     fn terminal_fixture_principal(workspace: &Path, scope: &MessageEventScope) -> MemoryPrincipal {

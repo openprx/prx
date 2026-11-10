@@ -3530,10 +3530,12 @@ pub(crate) mod tests {
             if configured_endpoint.is_some() {
                 assert!(
                     matches!(
-                        admitted.decision().context.directive(),
-                        crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
+                        admitted.decision().context.engine().selection,
+                        crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Delegate
                     ),
-                    "configured parent must receive actual issued delegation"
+                    "configured parent must receive actual issued delegation: {:?}",
+                    admitted.decision().context.engine().selection
                 );
             }
             let mut history = vec![crate::providers::ChatMessage::user(input)];

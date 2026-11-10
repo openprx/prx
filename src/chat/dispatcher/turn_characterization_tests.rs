@@ -351,10 +351,12 @@ fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDe
     );
     assert!(
         matches!(
-            decision.context.directive(),
-            crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+            decision.context.engine().selection,
+            crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
         ),
-        "step 7.1 must issue the intended direct-answer directive"
+        "step 7.1 must commit Answer: {:?}",
+        decision.context.engine().selection
     );
 }
 
@@ -571,10 +573,6 @@ async fn admit_chat_fixture_with_mode(
         routing.context.engine().prediction.is_none(),
         "chat decide uses open_turn_context, which has no prediction port"
     );
-    assert!(matches!(
-        routing.context.directive(),
-        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-    ));
     let context = crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private");
 
     ChatFixtureAdmission {
@@ -668,7 +666,7 @@ async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed
         &owner,
         admitted.fabric.clone(),
     );
-    assert!(admitted.binding.fixed_reply().unwrap().is_some());
+    assert!(admitted.binding.fixed_reply().unwrap().is_none());
     drive_start_turn_stream(
         Some(Arc::clone(&admitted.binding)),
         None,

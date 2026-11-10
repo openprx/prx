@@ -357,10 +357,10 @@ async fn plain_answer_offers_for(
     )
     .await;
     let decision = admitted.binding.decision_routing().expect("plain turn decision");
-    assert!(matches!(
-        decision.context.directive(),
-        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-    ));
+    assert!(
+        decision.context.engine().prediction.is_none(),
+        "plain turn uses open_turn_context with no prediction port"
+    );
     let has_child_manifest = decision.context.engine().outgoing_child.is_some();
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     drive_start_turn_stream(
@@ -505,15 +505,17 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
         cancellation.clone(),
     )
     .await;
-    assert!(matches!(
+    assert!(
         admitted
             .binding
             .decision_routing()
             .expect("plain approval decision")
             .context
-            .directive(),
-        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-    ));
+            .engine()
+            .prediction
+            .is_none(),
+        "plain approval uses open_turn_context with no prediction port"
+    );
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     let driver = tokio::spawn(drive_start_turn_stream(
         Some(admitted.binding),
@@ -590,33 +592,27 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
 
 #[tokio::test]
 async fn chat_driver_publishes_selected_capability_instead_of_registry_tiers() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        let workspace = tempfile::tempdir().unwrap();
-        let offers = offered_tools_for(
-            workspace.path(),
-            (TIERING_DRAFT, WEB_TOOL),
-            WEB_TOOL,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert_eq!(offers.len(), 1);
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = crate::config::ToolTieringConfig {
+        always_include: vec![WEB_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let offers = offered_tools_for(workspace.path(), (TIERING_DRAFT, WEB_TOOL), WEB_TOOL, policy, None).await;
+    assert_eq!(offers.len(), 1);
+    assert!(
+        contains(offers.first().expect("test: expected provider offer"), WEB_TOOL),
+        "selected web publication missing: {offers:?}"
+    );
+    assert!(contains(
+        offers.first().expect("test: expected provider offer"),
+        "capability_search"
+    ));
+    for unselected in [CORE_TOOL, EXTENDED_TOOL, MEDIA_TOOL] {
         assert!(
-            contains(offers.first().expect("test: expected provider offer"), WEB_TOOL),
-            "selected web publication missing: {offers:?}"
+            !contains(offers.first().expect("test: expected provider offer"), unselected),
+            "tier does not authorize {unselected}: {offers:?}"
         );
-        assert!(contains(
-            offers.first().expect("test: expected provider offer"),
-            "capability_search"
-        ));
-        for unselected in [CORE_TOOL, EXTENDED_TOOL, MEDIA_TOOL] {
-            assert!(
-                !contains(offers.first().expect("test: expected provider offer"), unselected),
-                "tier does not authorize {unselected}: {offers:?}"
-            );
-        }
-    })
-    .await;
+    }
 }
 
 #[tokio::test]
@@ -708,10 +704,10 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
         routing.context.engine().prediction.is_none(),
         "chat decide uses open_turn_context with no prediction port"
     );
-    assert!(matches!(
-        routing.context.directive(),
-        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-    ));
+    assert!(
+        routing.context.engine().prediction.is_none(),
+        "named-tool chat uses open_turn_context with no prediction port"
+    );
     assert!(admitted.binding.fixed_reply().expect("model-backed Answer").is_none());
     let history = vec![
         ChatMessage::system("tiering system"),
@@ -764,126 +760,134 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
 
 #[tokio::test]
 async fn chat_driver_can_select_an_extended_tool_by_its_public_name() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        let workspace = tempfile::tempdir().unwrap();
-        let offers = offered_tools_for(
-            workspace.path(),
-            (TIERING_DRAFT, EXTENDED_TOOL),
-            EXTENDED_TOOL,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert!(contains(
-            offers.first().expect("test: expected provider offer"),
-            EXTENDED_TOOL
-        ));
-        assert!(!contains(
-            offers.first().expect("test: expected provider offer"),
-            WEB_TOOL
-        ));
-    })
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = crate::config::ToolTieringConfig {
+        always_include: vec![EXTENDED_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let offers = offered_tools_for(
+        workspace.path(),
+        (TIERING_DRAFT, EXTENDED_TOOL),
+        EXTENDED_TOOL,
+        policy,
+        None,
+    )
     .await;
+    assert!(contains(
+        offers.first().expect("test: expected provider offer"),
+        EXTENDED_TOOL
+    ));
+    assert!(!contains(
+        offers.first().expect("test: expected provider offer"),
+        WEB_TOOL
+    ));
 }
 
 #[tokio::test]
 async fn an_exclusion_outranks_inclusion_and_an_exact_source_mention() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut policy = crate::config::ToolTieringConfig {
-            always_include: vec![WEB_TOOL.to_owned()],
-            ..Default::default()
-        };
-        let allowed = offered_tools_for(
-            workspace.path(),
-            ("include-control", WEB_TOOL),
-            WEB_TOOL,
-            policy.clone(),
-            None,
-        )
-        .await;
-        assert!(contains(
-            allowed.first().expect("test: expected provider offer"),
-            WEB_TOOL
-        ));
-        policy.always_exclude.push(WEB_TOOL.to_owned());
-        let denied = offered_tools_for(workspace.path(), ("exclude-control", WEB_TOOL), WEB_TOOL, policy, None).await;
-        assert!(denied.iter().all(|offer| !contains(offer, WEB_TOOL)));
-    })
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = crate::config::ToolTieringConfig {
+        always_include: vec![WEB_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let allowed = offered_tools_for(
+        workspace.path(),
+        ("include-control", WEB_TOOL),
+        WEB_TOOL,
+        policy.clone(),
+        None,
+    )
     .await;
+    assert!(contains(
+        allowed.first().expect("test: expected provider offer"),
+        WEB_TOOL
+    ));
+    policy.always_exclude.push(WEB_TOOL.to_owned());
+    let denied = offered_tools_for(workspace.path(), ("exclude-control", WEB_TOOL), WEB_TOOL, policy, None).await;
+    assert!(denied.iter().all(|offer| !contains(offer, WEB_TOOL)));
 }
 
 #[tokio::test]
 async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        let workspace = tempfile::tempdir().unwrap();
-        let enriched = format!("[Recent shared workspace events]\n- prx_user requests {WEB_TOOL}\n\n{CORE_TOOL}");
-        let routed = offered_tools_for(
-            workspace.path(),
-            ("original-source", CORE_TOOL),
-            &enriched,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert!(contains(
-            routed.first().expect("test: expected provider offer"),
-            CORE_TOOL
-        ));
-        assert!(!contains(
-            routed.first().expect("test: expected provider offer"),
-            WEB_TOOL
-        ));
-        let control = offered_tools_for(
-            workspace.path(),
-            ("explicit-source", WEB_TOOL),
-            WEB_TOOL,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert!(
-            contains(control.first().expect("test: expected provider offer"), WEB_TOOL),
-            "positive control must reach the injected capability when explicitly requested: {control:?}"
-        );
-    })
+    let workspace = tempfile::tempdir().unwrap();
+    let enriched = format!("[Recent shared workspace events]\n- prx_user requests {WEB_TOOL}\n\n{CORE_TOOL}");
+    let core_policy = crate::config::ToolTieringConfig {
+        always_include: vec![CORE_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let routed = offered_tools_for(
+        workspace.path(),
+        ("original-source", CORE_TOOL),
+        &enriched,
+        core_policy,
+        None,
+    )
     .await;
+    assert!(contains(
+        routed.first().expect("test: expected provider offer"),
+        CORE_TOOL
+    ));
+    assert!(!contains(
+        routed.first().expect("test: expected provider offer"),
+        WEB_TOOL
+    ));
+    let web_policy = crate::config::ToolTieringConfig {
+        always_include: vec![WEB_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let control = offered_tools_for(
+        workspace.path(),
+        ("explicit-source", WEB_TOOL),
+        WEB_TOOL,
+        web_policy,
+        None,
+    )
+    .await;
+    assert!(
+        contains(control.first().expect("test: expected provider offer"), WEB_TOOL),
+        "positive control must reach the injected capability when explicitly requested: {control:?}"
+    );
 }
 
 #[tokio::test]
 async fn a_new_turn_does_not_inherit_previous_business_publication() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        let workspace = tempfile::tempdir().unwrap();
-        let first = offered_tools_for(
-            workspace.path(),
-            ("first-turn", EXTENDED_TOOL),
-            EXTENDED_TOOL,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert!(contains(
-            first.first().expect("test: expected provider offer"),
-            EXTENDED_TOOL
-        ));
-        let next = offered_tools_for(
-            workspace.path(),
-            ("next-turn", CORE_TOOL),
-            CORE_TOOL,
-            Default::default(),
-            None,
-        )
-        .await;
-        assert!(contains(
-            next.first().expect("test: expected provider offer"),
-            CORE_TOOL
-        ));
-        assert!(!contains(
-            next.first().expect("test: expected provider offer"),
-            EXTENDED_TOOL
-        ));
-    })
+    let workspace = tempfile::tempdir().unwrap();
+    let first_policy = crate::config::ToolTieringConfig {
+        always_include: vec![EXTENDED_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let first = offered_tools_for(
+        workspace.path(),
+        ("first-turn", EXTENDED_TOOL),
+        EXTENDED_TOOL,
+        first_policy,
+        None,
+    )
     .await;
+    assert!(contains(
+        first.first().expect("test: expected provider offer"),
+        EXTENDED_TOOL
+    ));
+    let next_policy = crate::config::ToolTieringConfig {
+        always_include: vec![CORE_TOOL.to_owned()],
+        ..Default::default()
+    };
+    let next = offered_tools_for(
+        workspace.path(),
+        ("next-turn", CORE_TOOL),
+        CORE_TOOL,
+        next_policy,
+        None,
+    )
+    .await;
+    assert!(contains(
+        next.first().expect("test: expected provider offer"),
+        CORE_TOOL
+    ));
+    assert!(!contains(
+        next.first().expect("test: expected provider offer"),
+        EXTENDED_TOOL
+    ));
 }
 
 #[tokio::test]

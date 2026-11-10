@@ -26,6 +26,168 @@ const COLLECTION_DOMAIN: &[u8] = b"terminal-replay-collected-pending-v1";
 const COLLECTION_DECLINED_DOMAIN: &[u8] = b"terminal-replay-collected-declined-v1";
 const RESUME_DOMAIN: &[u8] = b"terminal-replay-resume-claim-v1";
 
+/// Recorded pre-switch execution kind, mapped from `DecisionReplayRecord`.
+/// Capture never reads `TurnDecisionContext::directive()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedDirective {
+    CollectApprovalArguments,
+    Answer,
+    Retrieve,
+    Discover,
+    Execute,
+    Delegate,
+    Clarify { reason_code: String },
+    RequestApproval { decision_id: String, effect: String },
+    Refuse { policy_code: String },
+}
+
+const APPROVAL_UNAVAILABLE_REPLY: &str =
+    "This action needs owner approval, which this surface cannot collect; nothing was run.";
+
+fn hop_candidates(
+    hop: &crate::causal_tree::decision_engine::EngineDecision,
+) -> &[crate::causal_tree::branch::CausalCandidate] {
+    match &hop.candidates {
+        crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
+        crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals,
+    }
+}
+
+fn recorded_from_hop(
+    row: &DecisionReplayRecord,
+    hop: &crate::causal_tree::decision_engine::EngineDecision,
+) -> anyhow::Result<RecordedDirective> {
+    use crate::causal_tree::decision_select::Selection;
+    Ok(match row.decision.directive_kind.as_str() {
+        "collect_approval_arguments" => RecordedDirective::CollectApprovalArguments,
+        "answer" => RecordedDirective::Answer,
+        "retrieve" => RecordedDirective::Retrieve,
+        "discover" => RecordedDirective::Discover,
+        "use_tool" => RecordedDirective::Execute,
+        "delegate" => RecordedDirective::Delegate,
+        "clarify" => RecordedDirective::Clarify {
+            reason_code: row.decision.abstention_reason.clone().unwrap_or_default(),
+        },
+        "request_approval" => {
+            let effect = match &hop.selection {
+                Selection::RequestApproval {
+                    pending_candidate_id, ..
+                } => hop_candidates(hop)
+                    .iter()
+                    .find(|candidate| candidate.candidate_id() == pending_candidate_id)
+                    .map(|candidate| candidate.side_effect().as_str().to_owned())
+                    .unwrap_or_default(),
+                _ => row.decision.abstention_reason.clone().unwrap_or_default(),
+            };
+            RecordedDirective::RequestApproval {
+                decision_id: row.decision.decision_id.to_string(),
+                effect,
+            }
+        }
+        "refuse" => RecordedDirective::Refuse {
+            policy_code: row.decision.abstention_reason.clone().unwrap_or_default(),
+        },
+        other => anyhow::bail!("unrecognized recorded directive_kind {other}"),
+    })
+}
+
+fn render_recorded_terminal(directive: &RecordedDirective) -> anyhow::Result<std::borrow::Cow<'static, str>> {
+    match directive {
+        RecordedDirective::Clarify { reason_code } => Ok(std::borrow::Cow::Borrowed(match reason_code.as_str() {
+            "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
+            "insufficient_evidence" | "retrieve_evidence" => {
+                "I could not obtain enough supporting information. What source should I use?"
+            }
+            "hop_stopped" => {
+                "Capability selection stopped without a usable next step. Please specify the action or tool you need."
+            }
+            "commit_threshold_or_margin" => "Which result and supporting source should I use for this request?",
+            "discover_capability" => "Which action would you like me to take?",
+            "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
+            _ => "Could you clarify the result you want?",
+        })),
+        RecordedDirective::RequestApproval { decision_id, effect } => Ok(std::borrow::Cow::Owned(format!(
+            "Approval is required for decision {decision_id} (effect: {effect}). Review this decision before resuming it. The operation has not run."
+        ))),
+        RecordedDirective::Refuse { policy_code } => {
+            tracing::debug!(policy_code = %policy_code, "rendering recorded terminal refusal");
+            Ok(std::borrow::Cow::Borrowed(
+                if policy_code == "approval_requires_call" {
+                    APPROVAL_UNAVAILABLE_REPLY
+                } else {
+                    "I can't complete this request under the current policy."
+                },
+            ))
+        }
+        _ => anyhow::bail!("recorded directive is not a terminal close"),
+    }
+}
+
+fn recorded_fixed_close(
+    recorded: &RecordedDirective,
+    status: TurnTerminalStatus,
+    has_provider: bool,
+    assistant: Option<&str>,
+) -> anyhow::Result<bool> {
+    match recorded {
+        RecordedDirective::Clarify { .. }
+        | RecordedDirective::RequestApproval { .. }
+        | RecordedDirective::Refuse { .. } => {
+            let reply = render_recorded_terminal(recorded)?;
+            Ok(status == TurnTerminalStatus::Completed && !has_provider && assistant == Some(reply.as_ref()))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn recorded_run_capabilities(recorded: &RecordedDirective, link: &DecisionSettlementRef) -> Vec<String> {
+    match recorded {
+        RecordedDirective::Execute => {
+            let mut ids: Vec<_> = link
+                .context
+                .execution_refs()
+                .iter()
+                .map(|reference| reference.id.as_str().to_owned())
+                .chain(
+                    link.context
+                        .discovered_execution_refs()
+                        .iter()
+                        .map(|reference| reference.id.as_str().to_owned()),
+                )
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        }
+        RecordedDirective::Delegate => link
+            .context
+            .execution_refs()
+            .iter()
+            .map(|reference| reference.id.as_str().to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn recorded_pre_switch_request_approval_closes(
+    decision_id: &str,
+    effect: &str,
+    assistant: &str,
+) -> bool {
+    let recorded = RecordedDirective::RequestApproval {
+        decision_id: decision_id.to_owned(),
+        effect: effect.to_owned(),
+    };
+    recorded_fixed_close(
+        &recorded,
+        TurnTerminalStatus::Completed,
+        false,
+        Some(assistant),
+    )
+    .unwrap_or(false)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayHop {
@@ -240,6 +402,7 @@ impl PreparedReplay {
             router.validate_source(&source)?;
         }
         let mut hops = Vec::with_capacity(link.context.hop_ids().len());
+        let mut last_recorded = None;
         for (position, hop) in link.context.audit_hops().enumerate() {
             let row = if REPLAY_EVIDENCE_AUTHORITY {
                 read_journal_replay_record(
@@ -286,28 +449,25 @@ impl PreparedReplay {
             if let Some(router) = &mut router_read {
                 router.capture_row(&row)?;
             }
+            last_recorded = Some(recorded_from_hop(&row, hop)?);
             hops.push(ReplayHop {
                 decision_id: hop.decision_id.to_string(),
                 digest: row.digest,
             });
         }
         anyhow::ensure!(!hops.is_empty() && hops.len() <= 5, "invalid decision replay chain");
+        let recorded_directive = last_recorded.context("decision replay chain has no recorded directive")?;
         // Completion can legitimately outlive the decision-stage deadline.
-        // Inspect the issued directive without issuing a fresh execution lease.
-        let fixed_close = match link.context.directive() {
-            directive @ (crate::causal_tree::directive::TurnExecutionDirective::Clarify { .. }
-            | crate::causal_tree::directive::TurnExecutionDirective::RequestApproval { .. }
-            | crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }) => {
-                let reply = crate::causal_tree::directive::render_terminal_directive(directive)?;
-                commit.status == TurnTerminalStatus::Completed
-                    && commit.provider_outcome.is_none()
-                    && commit
-                        .history
-                        .as_ref()
-                        .is_some_and(|history| history.assistant_content == reply)
-            }
-            _ => false,
-        };
+        // Inspect the recorded hop without issuing a fresh execution lease.
+        let fixed_close = recorded_fixed_close(
+            &recorded_directive,
+            commit.status,
+            commit.provider_outcome.is_some(),
+            commit
+                .history
+                .as_ref()
+                .map(|history| history.assistant_content.as_str()),
+        )?;
         if let Some(router) = &router_read {
             router.validate_complete()?;
             router.validate_serving(
@@ -465,30 +625,7 @@ impl PreparedReplay {
             assistant: None,
             fixed_close,
             resume_claim,
-            run_capabilities: match link.context.directive() {
-                crate::causal_tree::directive::TurnExecutionDirective::Execute { allowed_capability_ids } => {
-                    let mut ids: Vec<_> = allowed_capability_ids
-                        .iter()
-                        .map(|id| id.as_str().to_owned())
-                        .chain(
-                            link.context
-                                .discovered_execution_refs()
-                                .iter()
-                                .map(|reference| reference.id.as_str().to_owned()),
-                        )
-                        .collect();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                }
-                crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. } => link
-                    .context
-                    .execution_refs()
-                    .iter()
-                    .map(|reference| reference.id.as_str().to_owned())
-                    .collect(),
-                _ => Vec::new(),
-            },
+            run_capabilities: recorded_run_capabilities(&recorded_directive, link),
         }))
     }
 

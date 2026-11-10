@@ -434,9 +434,12 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
         ("ollama", "prx-local-model"),
     )
     .await;
-    match admission.decision().context.directive() {
-        crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code, .. } => {
-            assert_eq!(policy_code, "no_legal_path");
+    match &admission.decision().context.engine().selection {
+        crate::causal_tree::decision_select::Selection::Abstain {
+            action: crate::causal_tree::branch::CausalActionKind::Refuse,
+            reason_code,
+        } => {
+            assert_eq!(*reason_code, "no_legal_path");
         }
         other => panic!("read-only shell request must refuse with no_legal_path: {other:?}"),
     }
@@ -624,36 +627,41 @@ for line in sys.stdin:
     };
     let input = "call mcp__prx_server__write with path remote.txt and content \"approved exact contents\"";
     let admission = admit(input).await;
-    let directive = admission.decision().context.directive();
-    assert!(
+    fn closes_for_unavailable_approval(selection: &crate::causal_tree::decision_select::Selection) -> bool {
         matches!(
-            directive,
-            crate::causal_tree::directive::TurnExecutionDirective::Clarify { .. }
-                | crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }
-        ),
-        "an exact approval-required write must close, not answer or execute: {directive:?}"
-    );
-    assert_eq!(
-        crate::causal_tree::directive::render_terminal_directive(directive).expect("test: terminal text"),
-        "This action needs owner approval, which this surface cannot collect; nothing was run."
+            selection,
+            crate::causal_tree::decision_select::Selection::Abstain {
+                reason_code: "approval_requires_call",
+                ..
+            } | crate::causal_tree::decision_select::Selection::RequestApproval {
+                reason_code: "approval_requires_call",
+                ..
+            }
+        )
+    }
+    let selection = &admission.decision().context.engine().selection;
+    assert!(
+        closes_for_unavailable_approval(selection),
+        "an exact approval-required write must close, not answer or execute: {selection:?}"
     );
     // A bare alias match earlier in the family must not hide the full name.
     let mixed = admit("call mcp__prx_server__write with path remote.txt then search the result").await;
-    assert_eq!(
-        crate::causal_tree::directive::render_terminal_directive(mixed.decision().context.directive())
-            .expect("test: mixed prompt closes with a terminal text"),
-        "This action needs owner approval, which this surface cannot collect; nothing was run."
+    assert!(
+        closes_for_unavailable_approval(&mixed.decision().context.engine().selection),
+        "mixed prompt must close for unavailable approval: {:?}",
+        mixed.decision().context.engine().selection
     );
     // Bare server-side tool names are ordinary words: prose still answers.
     for prose in ["write a poem about spring", "search the docs for the release notes"] {
         let admission = admit(prose).await;
         assert!(
             matches!(
-                admission.decision().context.directive(),
-                crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+                admission.decision().context.engine().selection,
+                crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                    if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
             ),
             "{prose:?} must still answer: {:?}",
-            admission.decision().context.directive()
+            admission.decision().context.engine().selection
         );
     }
     assert!(!marker.exists(), "the MCP server saw an unapproved write call");

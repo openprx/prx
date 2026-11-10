@@ -34,6 +34,15 @@ impl DeferredArgumentProof {
             state_fingerprint,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn issue_for_test(
+        capability: CapabilityRef,
+        adapter: ApprovalReviewAdapter,
+        state_fingerprint: String,
+    ) -> Self {
+        Self::issue(capability, adapter, state_fingerprint)
+    }
     pub(crate) const fn capability(&self) -> &CapabilityRef {
         &self.capability
     }

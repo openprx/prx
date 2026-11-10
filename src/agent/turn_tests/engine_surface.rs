@@ -2017,10 +2017,12 @@ async fn published_child_tools(tiering: crate::config::ToolTieringConfig, input:
                     .await;
                     assert!(
                         matches!(
-                            admitted.decision().context.directive(),
-                            crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
+                            admitted.decision().context.engine().selection,
+                            crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Delegate
                         ),
-                        "actual parent Delegate required"
+                        "actual parent Delegate required: {:?}",
+                        admitted.decision().context.engine().selection
                     );
                     assert!(
                         admitted.decision().context.ordinary_fixture_prediction_verified(),

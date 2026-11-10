@@ -2,7 +2,11 @@
 
 //! Restart regressions use the real SQLite memory and decision stores.
 use super::*;
-use crate::chat::decision_source::{ChatAdmissionMode, ChatProviderBinding};
+use crate::agent::terminal::{
+    TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus,
+    TurnTerminalTelemetry,
+};
+use crate::chat::decision_source::{ChatAdmissionMode, ChatProviderBinding, ChatTurnBinding};
 use crate::memory::ingress_recovery::IngressCapsule;
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use crate::memory::{MessageEvent, MessageEventInput, SqliteMemory};
@@ -183,6 +187,53 @@ async fn drain_legacy_fixture_decisions(service: &crate::runtime::turn_decision:
     );
 }
 
+/// After the switch, `open_turn_context` admits a Run turn. Persist a completed
+/// terminal through `finalize_turn` instead of `close()`, which requires Close.
+async fn persist_completed_chat(
+    binding: &ChatTurnBinding,
+    fabric: &MemoryFabric,
+    workspace: &Path,
+    history_commit_len: usize,
+) -> TurnTerminalReceipt {
+    assert!(
+        binding.fixed_reply().unwrap().is_none(),
+        "open_turn_context admits a Run turn; Close is no longer the disabled-engine terminal"
+    );
+    let run = binding.envelope().run_id.as_deref().expect("completed chat has a run");
+    let started_at = chrono::Utc::now();
+    let scope = binding.envelope().message_scope();
+    let receipt = binding
+        .commit_terminal(
+            fabric,
+            TurnTerminalDraft {
+                decision: binding.settlement_ref(run).unwrap(),
+                terminal_id: run.to_owned(),
+                history_scope: Some(scope.clone().with_sender("prx_runtime").with_recipient("local-user")),
+                scope,
+                status: TurnTerminalStatus::Completed,
+                history: Some(TurnHistoryProjection {
+                    assistant_content: "done".to_owned(),
+                    history_commit_len,
+                }),
+                provider_outcome: None,
+                telemetry: TurnTerminalTelemetry {
+                    summary: "chat decision closed".to_owned(),
+                    started_at,
+                    finished_at: chrono::Utc::now(),
+                },
+                delivery_intent: TurnDeliveryIntent::Reply {
+                    target: "terminal:local-user".to_owned(),
+                },
+            },
+            &config_at(workspace).cost,
+            workspace,
+        )
+        .await
+        .unwrap();
+    binding.rejoin_recovery_terminal(run).await.unwrap();
+    receipt
+}
+
 async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &CleanupScope) -> MessageEvent {
     cleanup
         .scope_admission(async {
@@ -194,9 +245,8 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
             let service = publish(memory.clone(), generation).await.unwrap();
             let cancel = CancellationToken::new();
             binding.decide(&service, &cancel).await.unwrap();
-            assert!(binding.fixed_reply().unwrap().is_some());
             let fabric = MemoryFabric::new(memory.clone(), workspace.to_string_lossy());
-            let receipt = binding.close(&fabric, 2, chrono::Utc::now(), &cancel).await.unwrap();
+            let receipt = persist_completed_chat(&binding, &fabric, workspace, 2).await;
             if !matches!(fault, Fault::None) {
                 let key = crate::decision::DecisionKey::load_or_create(workspace).unwrap();
                 let mut payload: serde_json::Value =
@@ -345,7 +395,7 @@ async fn chat_drained_service_releases_ingress_lease_before_restart() {
             let cancel = CancellationToken::new();
             binding.decide(&service, &cancel).await?;
             let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
-            binding.close(&fabric, 2, chrono::Utc::now(), &cancel).await?;
+            let _ = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             guard.handoff();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             assert!(service.drain_writes(deadline).await, "first service writes must drain");

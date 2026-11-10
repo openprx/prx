@@ -734,48 +734,15 @@ mod tests {
                     }.publish(crate::causal_tree::state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
                     let context = service.decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
-                    let crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly = context.directive()
-                    else {
-                        let (directive, reason) = match context.directive() {
-                            crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code } => {
-                                ("Clarify", reason_code.as_str())
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::Refuse { policy_code, .. } => {
-                                ("Refuse", policy_code.as_str())
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly => {
-                                ("AnswerDirectly", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::Execute { .. } => {
-                                ("Execute", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::Retrieve { .. } => {
-                                ("Retrieve", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::Discover { .. } => {
-                                ("Discover", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::RequestApproval { .. } => {
-                                ("RequestApproval", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_) => {
-                                ("CollectApprovalArguments", "not_applicable")
-                            }
-                            crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. } => {
-                                ("Delegate", "not_applicable")
-                            }
-                        };
-                        let reason = match reason {
-                            "insufficient_evidence"
-                            | "commit_threshold_or_margin"
-                            | "no_legal_path"
-                            | "retrieve_evidence"
-                            | "hop_stopped"
-                            | "not_applicable" => reason,
-                            _ => "unclassified",
-                        };
-                        anyhow::bail!("gateway fixture parent directive={directive} reason_code={reason}");
-                    };
+                    anyhow::ensure!(
+                        matches!(
+                            context.engine().selection,
+                            crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                        ),
+                        "gateway fixture parent must commit Answer: {:?}",
+                        context.engine().selection
+                    );
                     assert!(
                         context
                             .engine()

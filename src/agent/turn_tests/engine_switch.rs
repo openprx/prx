@@ -924,3 +924,24 @@ async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
         "enabled engine must add a brief: {enabled_systems:?}"
     );
 }
+
+#[test]
+fn recorded_pre_switch_directive_replays_unchanged() {
+    let decision_id = "dec-1";
+    let effect = "local_write";
+    let reply = format!(
+        "Approval is required for decision {decision_id} (effect: {effect}). Review this decision before resuming it. The operation has not run."
+    );
+    assert!(
+        crate::agent::terminal::recorded_pre_switch_request_approval_closes(decision_id, effect, &reply),
+        "a recorded RequestApproval hop with its rendered reply must still close"
+    );
+    assert!(
+        !crate::agent::terminal::recorded_pre_switch_request_approval_closes(
+            decision_id,
+            effect,
+            "Could you clarify the result you want?"
+        ),
+        "a RequestApproval hop must not close on a Clarify reply"
+    );
+}

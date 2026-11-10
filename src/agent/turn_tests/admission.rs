@@ -427,31 +427,6 @@ impl AdmittedTurn {
             .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
             .is_err()
         {
-            use crate::causal_tree::directive::TurnExecutionDirective as Directive;
-            let (kind, code) = match admitted.context.directive() {
-                Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
-                Directive::Refuse { policy_code, .. } => ("Refuse", Some(policy_code.as_str())),
-                Directive::Execute { .. } => ("Execute", None),
-                Directive::AnswerDirectly => ("AnswerDirectly", None),
-                Directive::Retrieve { .. } => ("Retrieve", None),
-                Directive::Discover { .. } => ("Discover", None),
-                Directive::Delegate { .. } => ("Delegate", None),
-                Directive::RequestApproval { .. } => ("RequestApproval", None),
-                Directive::CollectApprovalArguments(_) => ("CollectApprovalArguments", None),
-            };
-            let reason = match code {
-                Some("commit_threshold_or_margin") => "commit_threshold_or_margin",
-                Some("insufficient_evidence") => "insufficient_evidence",
-                Some("no_legal_path") => "no_legal_path",
-                Some("hop_stopped") => "hop_stopped",
-                Some("deadline_exceeded") => "deadline_exceeded",
-                Some("expired_before_prediction") => "expired_before_prediction",
-                Some("decision_failed") => "decision_failed",
-                Some("all_gated") => "all_gated",
-                Some("choice_outside_legal_set") => "choice_outside_legal_set",
-                Some(_) => "unclassified_code",
-                None => "not_applicable",
-            };
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine
                 .pre_commit
@@ -478,7 +453,8 @@ impl AdmittedTurn {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.selection,
                 engine.fallback_cause,
                 engine.elapsed_ms,
                 engine.request_compiled,
@@ -529,26 +505,6 @@ impl AdmittedTurn {
             .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
             .is_err()
         {
-            use crate::causal_tree::directive::TurnExecutionDirective as Directive;
-            let (kind, code) = match admitted.context.directive() {
-                Directive::Clarify { reason_code } => ("Clarify", Some(reason_code.as_str())),
-                Directive::Refuse { policy_code, .. } => ("Refuse", Some(policy_code.as_str())),
-                Directive::Execute { .. } => ("Execute", None),
-                Directive::AnswerDirectly => ("AnswerDirectly", None),
-                Directive::Retrieve { .. } => ("Retrieve", None),
-                Directive::Discover { .. } => ("Discover", None),
-                Directive::Delegate { .. } => ("Delegate", None),
-                Directive::RequestApproval { .. } => ("RequestApproval", None),
-                Directive::CollectApprovalArguments(_) => ("CollectApprovalArguments", None),
-            };
-            let reason = match code {
-                Some("commit_threshold_or_margin") => "commit_threshold_or_margin",
-                Some("insufficient_evidence") => "insufficient_evidence",
-                Some("no_legal_path") => "no_legal_path",
-                Some("hop_stopped") => "hop_stopped",
-                Some(_) => "unclassified_code",
-                None => "not_applicable",
-            };
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine
                 .pre_commit
@@ -575,7 +531,8 @@ impl AdmittedTurn {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; directive={kind} reason={reason} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                engine.selection,
                 engine.fallback_cause,
                 engine.elapsed_ms,
                 engine.request_compiled,

@@ -393,13 +393,6 @@ async fn run_work(
         let guard = guard.with_child_cleanup(confirmed);
         let result = child_cleanup
             .run(async {
-                anyhow::ensure!(
-                    matches!(
-                        decision.directive(),
-                        crate::causal_tree::directive::TurnExecutionDirective::Delegate { .. }
-                    ),
-                    "configured delegation was not admitted by the decision service"
-                );
                 let selected = service.agent_execution_specs(source, &decision)?;
                 anyhow::ensure!(
                     selected.specs.iter().any(|spec| spec.name == "sessions_spawn"),

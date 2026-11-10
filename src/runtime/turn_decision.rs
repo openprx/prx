@@ -1261,6 +1261,15 @@ impl TurnDecisionContext {
         &self.engine.state.trusted.parts().constraints
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_collection_proof_for_test(
+        &mut self,
+        proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
+    ) {
+        self.engine.selection =
+            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
+    }
+
     /// Exact final-gated parent execution metadata. Reading these references
     /// grants no dispatch lease; the constrained reader must recheck scope,
     /// generation, security and approval at its execution boundary.

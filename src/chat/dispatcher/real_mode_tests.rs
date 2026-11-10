@@ -196,23 +196,11 @@ async fn admit_start_turn_fixture(
         crate::chat::decision_source::ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
     let context = binding.decide(&service, &CancellationToken::new()).await?;
-    use crate::causal_tree::directive::TurnExecutionDirective;
-    let prerequisite = match context.directive() {
-        TurnExecutionDirective::Clarify { reason_code } => Some(("Clarify", reason_code.as_str())),
-        TurnExecutionDirective::Refuse { policy_code, .. } => Some(("Refuse", policy_code.as_str())),
-        _ => None,
-    };
-    if let Some((directive, reason)) = prerequisite {
-        let reason = match reason {
-            "insufficient_evidence"
-            | "commit_threshold_or_margin"
-            | "no_legal_path"
-            | "hop_stopped"
-            | "choice_outside_legal_set"
-            | "all_gated" => reason,
-            _ => "unclassified",
-        };
-        eprintln!("PRX_Q42_ADMISSION directive={directive} reason_code={reason}");
+    if context.engine().prediction.is_some() {
+        eprintln!(
+            "PRX_Q42_ADMISSION unexpected prediction on open_turn_context: {:?}",
+            context.engine().selection
+        );
     }
     Ok(binding)
 }

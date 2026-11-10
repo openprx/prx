@@ -136,8 +136,9 @@ async fn exercise_grounding_request(
                     .await;
                     assert_eq!(
                         matches!(
-                            admission.decision().context.directive(),
-                            crate::causal_tree::directive::TurnExecutionDirective::Execute { .. }
+                            admission.decision().context.engine().selection,
+                            crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
+                                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::UseTool
                         ),
                         explicit_execution
                     );
