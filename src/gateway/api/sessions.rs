@@ -2252,9 +2252,7 @@ async fn run_console_message_job_work(
                         .map_err(|_| "Console decision publication failed".to_owned())?;
                     let kind = crate::runtime::turn_decision::AgentTurnKind::SingleShot;
                     let context = match mode {
-                        ConsoleTurnMode::Message => {
-                            service.open_issued_turn_context(proof, kind, &cancellation).await
-                        }
+                        ConsoleTurnMode::Message => service.open_issued_turn_context(proof, kind, &cancellation).await,
                         ConsoleTurnMode::Resume => {
                             service
                                 .open_issued_resume_turn_context(proof, kind, &cancellation)
@@ -2557,11 +2555,7 @@ async fn run_console_resume(
             chat_type: decision.proof.policy_chat_type(),
             tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
         },
-        crate::agent::send_admission::call_token_budget(
-            decision.service.as_ref(),
-            &decision.context,
-            decision.proof,
-        )?,
+        crate::agent::send_admission::call_token_budget(decision.service.as_ref(), &decision.context, decision.proof)?,
     );
     let outcome = decision
         .service

@@ -48,9 +48,7 @@ impl TurnDecisionService {
                     };
                     observations.register_status(&self.generation.effective.workspace_dir);
                     #[cfg(test)]
-                    crate::decision_engine::access_spy::record_constructor(
-                        &self.generation.effective.workspace_dir,
-                    );
+                    crate::decision_engine::access_spy::record_constructor(&self.generation.effective.workspace_dir);
                     AdvisoryRuntime {
                         engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
                         cancellation,

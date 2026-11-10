@@ -709,10 +709,7 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
         "named-tool chat uses open_turn_context with no prediction port"
     );
     assert!(admitted.binding.fixed_reply().expect("model-backed Answer").is_none());
-    let history = vec![
-        ChatMessage::system("tiering system"),
-        ChatMessage::user(CORE_TOOL),
-    ];
+    let history = vec![ChatMessage::system("tiering system"), ChatMessage::user(CORE_TOOL)];
     drive_start_turn_stream(
         Some(admitted.binding),
         None,
@@ -872,14 +869,7 @@ async fn a_new_turn_does_not_inherit_previous_business_publication() {
         always_include: vec![CORE_TOOL.to_owned()],
         ..Default::default()
     };
-    let next = offered_tools_for(
-        workspace.path(),
-        ("next-turn", CORE_TOOL),
-        CORE_TOOL,
-        next_policy,
-        None,
-    )
-    .await;
+    let next = offered_tools_for(workspace.path(), ("next-turn", CORE_TOOL), CORE_TOOL, next_policy, None).await;
     assert!(contains(
         next.first().expect("test: expected provider offer"),
         CORE_TOOL

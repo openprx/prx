@@ -404,21 +404,22 @@ async fn run_turn_ignores_recorded_collect_directive() {
         )
         .await
         .expect("disabled engine opens a turn context");
-    let cap = context
-        .execution_refs()
-        .iter()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
-            id: crate::causal_tree::branch::CapabilityId::new(
-                crate::causal_tree::branch::CapabilityTarget::NativeTool,
-                "test",
-                "probe",
-            )
-            .expect("test capability id"),
-            fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
-            generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
-        });
+    let cap =
+        context
+            .execution_refs()
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
+                id: crate::causal_tree::branch::CapabilityId::new(
+                    crate::causal_tree::branch::CapabilityTarget::NativeTool,
+                    "test",
+                    "probe",
+                )
+                .expect("test capability id"),
+                fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
+                generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
+            });
     Arc::get_mut(&mut context)
         .expect("opened context is uniquely owned")
         .install_collect_directive_for_test(
@@ -1072,18 +1073,21 @@ fn engine_off_config(workspace: &std::path::Path) -> crate::config::Config {
             cache_read: 1.0,
         },
     );
-    config.providers.models.push(crate::config::schema::ProviderModelConfig {
-        provider: "ollama".to_owned(),
-        model: Some("prx-local-model".to_owned()),
-        operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
-        native_tools: Some(true),
-        vision_input: None,
-        streaming: None,
-        structured_output: None,
-        tool_schema_dialect: None,
-        tool_call_dialect: None,
-        context_window: None,
-    });
+    config
+        .providers
+        .models
+        .push(crate::config::schema::ProviderModelConfig {
+            provider: "ollama".to_owned(),
+            model: Some("prx-local-model".to_owned()),
+            operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+            native_tools: Some(true),
+            vision_input: None,
+            streaming: None,
+            structured_output: None,
+            tool_schema_dialect: None,
+            tool_call_dialect: None,
+            context_window: None,
+        });
     assert!(
         !config.decision_engine.enabled,
         "this cell runs with the decision engine off"

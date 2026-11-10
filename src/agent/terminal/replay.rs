@@ -111,13 +111,11 @@ fn render_recorded_terminal(directive: &RecordedDirective) -> anyhow::Result<std
         ))),
         RecordedDirective::Refuse { policy_code } => {
             tracing::debug!(policy_code = %policy_code, "rendering recorded terminal refusal");
-            Ok(std::borrow::Cow::Borrowed(
-                if policy_code == "approval_requires_call" {
-                    APPROVAL_UNAVAILABLE_REPLY
-                } else {
-                    "I can't complete this request under the current policy."
-                },
-            ))
+            Ok(std::borrow::Cow::Borrowed(if policy_code == "approval_requires_call" {
+                APPROVAL_UNAVAILABLE_REPLY
+            } else {
+                "I can't complete this request under the current policy."
+            }))
         }
         _ => anyhow::bail!("recorded directive is not a terminal close"),
     }
@@ -170,22 +168,12 @@ fn recorded_run_capabilities(recorded: &RecordedDirective, link: &DecisionSettle
 }
 
 #[cfg(test)]
-pub(crate) fn recorded_pre_switch_request_approval_closes(
-    decision_id: &str,
-    effect: &str,
-    assistant: &str,
-) -> bool {
+pub(crate) fn recorded_pre_switch_request_approval_closes(decision_id: &str, effect: &str, assistant: &str) -> bool {
     let recorded = RecordedDirective::RequestApproval {
         decision_id: decision_id.to_owned(),
         effect: effect.to_owned(),
     };
-    recorded_fixed_close(
-        &recorded,
-        TurnTerminalStatus::Completed,
-        false,
-        Some(assistant),
-    )
-    .unwrap_or(false)
+    recorded_fixed_close(&recorded, TurnTerminalStatus::Completed, false, Some(assistant)).unwrap_or(false)
 }
 
 #[derive(Serialize, Deserialize)]

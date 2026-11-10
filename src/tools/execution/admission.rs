@@ -328,10 +328,7 @@ pub(super) fn admit_called_tokens(
 ) -> Result<(), (ToolExecutionStatus, String)> {
     let Some(budget) = &context.call_budget else {
         return if context.dispatch_origin == super::DispatchOrigin::ModelTurn {
-            Err((
-                ToolExecutionStatus::Denied,
-                format!("tool '{name}' has no call budget"),
-            ))
+            Err((ToolExecutionStatus::Denied, format!("tool '{name}' has no call budget")))
         } else {
             Ok(())
         };
@@ -375,10 +372,7 @@ pub(super) fn admit_called_spend(
 ) -> Result<(), (ToolExecutionStatus, String)> {
     let Some(spend) = context.call_budget.as_ref().and_then(|budget| budget.spend.as_deref()) else {
         return if context.dispatch_origin == super::DispatchOrigin::ModelTurn {
-            Err((
-                ToolExecutionStatus::Denied,
-                format!("tool '{name}' has no call budget"),
-            ))
+            Err((ToolExecutionStatus::Denied, format!("tool '{name}' has no call budget")))
         } else {
             Ok(())
         };

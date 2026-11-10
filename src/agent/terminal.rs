@@ -1734,8 +1734,13 @@ mod tests {
             !skill_awaiting_approval(&decision, None),
             "an ordinary completed turn is not awaiting approval"
         );
-        let cap = decision.context.execution_refs().iter().next().cloned().unwrap_or_else(|| {
-            crate::causal_tree::branch::CapabilityRef {
+        let cap = decision
+            .context
+            .execution_refs()
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
                 id: crate::causal_tree::branch::CapabilityId::new(
                     crate::causal_tree::branch::CapabilityTarget::NativeTool,
                     "test",
@@ -1744,8 +1749,7 @@ mod tests {
                 .expect("test capability id"),
                 fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
                 generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
-            }
-        });
+            });
         Arc::get_mut(&mut decision.context)
             .expect("fixture settlement uniquely owns its context")
             .install_collection_proof_for_test(

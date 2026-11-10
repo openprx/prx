@@ -880,19 +880,11 @@ async fn default_config_heavy_task_dispatches_sessions_spawn() {
         .unwrap();
     let _response = agent.turn("please fix this bug for me").await.unwrap();
     assert!(
-        offered
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|name| name == "sessions_spawn"),
+        offered.lock().unwrap().iter().any(|name| name == "sessions_spawn"),
         "provider spy must see sessions_spawn in tools: {:?}",
         offered.lock().unwrap()
     );
-    assert_eq!(
-        calls.lock().unwrap().len(),
-        1,
-        "MockSessionsSpawnTool must run once"
-    );
+    assert_eq!(calls.lock().unwrap().len(), 1, "MockSessionsSpawnTool must run once");
 }
 
 #[tokio::test]

@@ -2800,10 +2800,7 @@ impl ToolExecutionService {
         // needs a human approval at every autonomy level, also where policy
         // would allow it. Deny stays Deny.
         let decision = if decision != ToolExecutionDecision::Deny
-            && crate::security::approval_operation::requires_explicit_grant(
-                &descriptor.public_name,
-                &command.arguments,
-            )
+            && crate::security::approval_operation::requires_explicit_grant(&descriptor.public_name, &command.arguments)
         {
             ToolExecutionDecision::Ask
         } else {

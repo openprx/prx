@@ -874,9 +874,7 @@ impl ChatTurnBinding {
                         .await?
                 } else {
                     let opened = service.open_turn_context(self, kind, cancellation).await?;
-                    service
-                        .record_opened_context(self, opened, cancellation)
-                        .await?
+                    service.record_opened_context(self, opened, cancellation).await?
                 };
                 let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
@@ -2103,12 +2101,7 @@ pub(crate) mod admission_failure_tests {
                 .is_err()
             );
             // Resume cannot reinterpret a cached initial decision or clear its mode.
-            assert!(
-                binding
-                    .issue_decision(&service, &cancellation, true)
-                    .await
-                    .is_err()
-            );
+            assert!(binding.issue_decision(&service, &cancellation, true).await.is_err());
             assert!(queued.verify_execution_mode(ChatMode::Edit).is_err());
             assert!(binding.intercepts_writes());
             service

@@ -2497,21 +2497,10 @@ async fn assessment_send_over_budget_is_refused_before_provider() {
                 vision: false,
             }
         }
-        async fn chat_with_system(
-            &self,
-            _: Option<&str>,
-            _: &str,
-            _: &str,
-            _: f64,
-        ) -> anyhow::Result<String> {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
             anyhow::bail!("test: assessment fixture does not use chat_with_system")
         }
-        async fn chat(
-            &self,
-            _: crate::providers::ChatRequest<'_>,
-            _: &str,
-            _: f64,
-        ) -> anyhow::Result<ChatResponse> {
+        async fn chat(&self, _: crate::providers::ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
             self.sends.fetch_add(1, Ordering::SeqCst);
             crate::agent::send_admission::TEST_TOKEN_CAP.set(0);
             Ok(ChatResponse {
@@ -2533,12 +2522,10 @@ async fn assessment_send_over_budget_is_refused_before_provider() {
     let provider = FirstSendDrainsG6 {
         sends: Arc::clone(&sends),
     };
-    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
-        crate::agent::turn_tests::RecordingTool {
-            name: "file_read".to_owned(),
-            execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
-        },
-    )]);
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(crate::agent::turn_tests::RecordingTool {
+        name: "file_read".to_owned(),
+        execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })]);
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
         config,
         "read the file",
@@ -2547,10 +2534,7 @@ async fn assessment_send_over_budget_is_refused_before_provider() {
     .await;
     let mut adapter = admission.adapter();
     adapter.verify_chat_completion = true;
-    let mut history = vec![
-        ChatMessage::system("sys"),
-        ChatMessage::user("read the file"),
-    ];
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("read the file")];
     let error = run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
@@ -2590,9 +2574,6 @@ async fn assessment_send_over_budget_is_refused_before_provider() {
     )
     .await
     .expect_err("the assessment send must be refused");
-    assert!(
-        format!("{error:#}").contains("provider send refused"),
-        "{error:#}"
-    );
+    assert!(format!("{error:#}").contains("provider send refused"), "{error:#}");
     assert_eq!(sends.load(Ordering::SeqCst), 1);
 }

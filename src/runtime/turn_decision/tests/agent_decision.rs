@@ -992,4 +992,3 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 }
-

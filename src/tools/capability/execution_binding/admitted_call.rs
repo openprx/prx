@@ -75,16 +75,10 @@ impl ToolExecutionService {
         if admitted.backend_name != descriptor.backend_name {
             return Err(refuse());
         }
-        let admitted_fingerprint = tool_spec_fingerprint(
-            &admitted.public_name,
-            &admitted.description,
-            &admitted.parameters,
-        );
-        let live_fingerprint = tool_spec_fingerprint(
-            &descriptor.public_name,
-            &descriptor.description,
-            &descriptor.parameters,
-        );
+        let admitted_fingerprint =
+            tool_spec_fingerprint(&admitted.public_name, &admitted.description, &admitted.parameters);
+        let live_fingerprint =
+            tool_spec_fingerprint(&descriptor.public_name, &descriptor.description, &descriptor.parameters);
         if admitted_fingerprint != live_fingerprint {
             return Err(refuse());
         }
@@ -95,19 +89,17 @@ impl ToolExecutionService {
             generation: CatalogGeneration(admitted_fingerprint.0),
         };
         let owner = envelope.resolved_owner_id();
-        let (operation, risk) = match crate::security::approval_operation::grant_op_for_call(
-            &descriptor.public_name,
-            &command.arguments,
-        ) {
-            Some(crate::security::approval_operation::GrantOp::Command(operation)) => {
-                (operation, crate::acl::approval_grant::RiskLevel::High)
-            }
-            Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),
-            _ => (
-                descriptor.public_name.clone(),
-                crate::acl::approval_grant::RiskLevel::High,
-            ),
-        };
+        let (operation, risk) =
+            match crate::security::approval_operation::grant_op_for_call(&descriptor.public_name, &command.arguments) {
+                Some(crate::security::approval_operation::GrantOp::Command(operation)) => {
+                    (operation, crate::acl::approval_grant::RiskLevel::High)
+                }
+                Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),
+                _ => (
+                    descriptor.public_name.clone(),
+                    crate::acl::approval_grant::RiskLevel::High,
+                ),
+            };
         let digest = admitted_call_digest(
             "",
             &capability,

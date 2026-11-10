@@ -1263,8 +1263,7 @@ impl TurnDecisionContext {
         &mut self,
         proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
     ) {
-        self.engine.selection =
-            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
+        self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
     #[cfg(test)]
@@ -1273,8 +1272,7 @@ impl TurnDecisionContext {
         proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
     ) {
         self.directive = TurnExecutionDirective::CollectApprovalArguments(proof.clone());
-        self.engine.selection =
-            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
+        self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
     #[cfg(test)]
@@ -1346,8 +1344,7 @@ impl TurnDecisionContext {
             | TurnExecutionDirective::Refuse { .. } => Ok(TurnDisposition::Close {
                 reply: render_terminal_directive(&self.directive)?,
             }),
-            TurnExecutionDirective::CollectApprovalArguments(_)
-            | TurnExecutionDirective::AnswerDirectly
+            TurnExecutionDirective::CollectApprovalArguments(_) | TurnExecutionDirective::AnswerDirectly
                 if !self.execution_closed.load(Ordering::Acquire) =>
             {
                 Ok(TurnDisposition::Run)
@@ -3669,4 +3666,3 @@ pub(crate) fn selected_custom_memory_read_scope(
 
 #[cfg(test)]
 mod selected_custom_memory_scope_tests;
-
