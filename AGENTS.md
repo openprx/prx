@@ -203,7 +203,6 @@ When uncertain, classify as higher risk.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
     - If docs entry points changed, keep all in-tree entry points aligned.
 6. **Respect queue hygiene**
-    - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
 
 ### 6.1 Branch / Commit / PR Flow (Required)
@@ -212,12 +211,12 @@ All contributors (human or agent) must follow the same collaboration flow:
 
 - Create and work from a non-`main` branch.
 - Commit changes to that branch with clear, scoped commit messages.
-- The unit of work is one module: one branch and one PR with the whole module done. Settle every open design value before coding; stop and ask instead of inventing one.
+- The unit of work is one module: one branch and one PR with the whole module done. No stacked PRs. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one.
 - While coding, push checkpoint commits to the branch only. Do not open a PR, run CI or request review mid-way.
-- When the module passes the local gates (including real-component tests and break-the-fix checks), open the PR. CI is the only full gate; review starts only after CI is green.
-- One review by a different model; fix every finding, Lows included, on the same PR.
+- When the module passes the local gates (including real-component tests and break-the-fix checks), open the PR (not a draft). CI is the only full gate; review starts only after CI is green.
+- One review by a different model: it reads the code and runs at most two break-the-fix checks. Fix every finding, Lows included, on the same PR; no follow-up cards.
 - After the review passes: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage.
-- Branch deletion after merge is optional; long-lived branches are allowed when intentionally maintained.
+- A red `main` becomes the next task.
 
 ### 6.2 Worktree Workflow (Required for Multi-Track Agent Work)
 
@@ -307,18 +306,9 @@ cargo test --lib <module::path>                 # named tests + the touched modu
 cargo test --test architecture_boundaries
 ```
 
-Do not run the full suite, mutation batches or stress loops locally.
+Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes) and a break-the-fix check for every key fix.
 
-Preferred local pre-PR validation path (recommended, not required):
-
-```bash
-./dev/ci.sh all
-```
-
-Notes:
-
-- Local Docker-based CI is strongly recommended when Docker is available.
-- Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
+Do not run the full suite, mutation batches, stress loops or a local full CI (`./dev/ci.sh all`) locally. PR CI is the only full gate.
 
 Additional expectations by change type:
 

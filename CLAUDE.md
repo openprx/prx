@@ -8,7 +8,7 @@ Use **Rust 2024 edition** (`edition = "2024"` in Cargo.toml) for all new code.
 
 ## Build & Test
 
-Module flow: the unit of work is one module, built by one lane on one branch and delivered in one PR with the whole module done. Settle every open design value before coding. Push only checkpoint commits while coding; open the PR when the module is complete.
+Module flow: the unit of work is one module, built by one lane on one branch and delivered in one PR with the whole module done. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one. Push only checkpoint commits while coding; open the PR (not a draft) when the module is complete.
 
 When the module is written, run these local gates on a warm, persistent target, scoped to what changed:
 
@@ -195,7 +195,7 @@ Add to `Cargo.toml` or `clippy.toml`:
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model; every finding, Lows included, is fixed on the same PR. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. A red `main` becomes the next task.
+- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model (code reading plus at most two break-the-fix checks); every finding, Lows included, is fixed on the same PR, with no follow-up cards. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. A red `main` becomes the next task.
 
 ## Commit Style
 
