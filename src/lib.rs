@@ -114,6 +114,7 @@ pub(crate) mod causal_tree;
 pub mod channels;
 #[allow(private_interfaces)]
 pub mod chat;
+pub mod cli_tracing;
 pub mod compliance;
 pub mod config;
 pub mod cost;
@@ -731,6 +732,7 @@ mod module_ownership_tests {
             "mod causal_tree;",
             "mod channels;",
             "mod chat;",
+            "mod cli_tracing;",
             "mod config;",
             "mod cost;",
             "mod cron;",

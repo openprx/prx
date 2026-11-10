@@ -702,7 +702,8 @@ pub(super) fn observability_template(spec: Spec) -> String {
 
 [observability]
 backend = "log"
-# level = "info"
+# Tracing level is RUST_LOG. Unset, foreground commands (agent, chat, go)
+# default to warn on stderr; daemon, gateway, and channel start keep info.
 # otlp_endpoint = ""
 
 [runtime]

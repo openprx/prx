@@ -50,6 +50,7 @@ curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | 
 export PATH="$HOME/.local/bin:$PATH"
 prx init --interactive
 prx daemon
+prx agent 'What is 2+2?'
 ```
 
 Windows PowerShell:
@@ -59,6 +60,12 @@ irm https://github.com/openprx/prx/releases/latest/download/install.ps1 | iex
 prx init --interactive
 prx daemon
 ```
+
+Foreground commands (`prx agent`, `prx chat`, `prx go`, and other commands
+whose stdout is the product) default to `warn`-level tracing on stderr, so a
+scripted `prx agent 'What is 2+2?'` prints only the reply. Raise the level
+with `RUST_LOG=info`. `prx daemon`, `prx gateway`, and `prx channel start`
+keep `info` on their current destination.
 
 The installer downloads a platform-specific binary from
 [GitHub Releases](https://github.com/openprx/prx/releases), verifies its SHA-256

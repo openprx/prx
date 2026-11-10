@@ -91,8 +91,8 @@ use dialoguer::{Input, Password};
 use openprx::{
     CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, FitnessCommands,
     IntegrationCommands, MigrateCommands, ServiceCommands, SkillCommands, XinCommands, acl, agent, auth, channels,
-    chat, config, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, handle_xin_command, integrations, memory,
-    migration, providers, runtime, security, service, session_worker, skills,
+    chat, cli_tracing, config, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, handle_xin_command,
+    integrations, memory, migration, providers, runtime, security, service, session_worker, skills,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -106,6 +106,46 @@ fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
         return Err("temperature must be between 0.0 and 2.0".to_string());
     }
     Ok(t)
+}
+
+const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
+    match command {
+        Commands::Init { .. } => cli_tracing::CliCommand::Init,
+        Commands::Go { .. } => cli_tracing::CliCommand::Go,
+        Commands::Agent { .. } => cli_tracing::CliCommand::Agent,
+        Commands::Chat { .. } => cli_tracing::CliCommand::Chat,
+        Commands::Gateway { .. } => cli_tracing::CliCommand::Gateway,
+        Commands::Daemon { .. } => cli_tracing::CliCommand::Daemon,
+        Commands::Service { .. } => cli_tracing::CliCommand::Service,
+        Commands::Doctor { .. } => cli_tracing::CliCommand::Doctor,
+        Commands::Status => cli_tracing::CliCommand::Status,
+        Commands::Tasks { .. } => cli_tracing::CliCommand::Tasks,
+        Commands::Memory { .. } => cli_tracing::CliCommand::Memory,
+        Commands::Evolution { .. } => cli_tracing::CliCommand::Evolution,
+        #[cfg(feature = "wasm-plugins")]
+        Commands::Plugin { .. } => cli_tracing::CliCommand::Plugin,
+        Commands::Cost { .. } => cli_tracing::CliCommand::Cost,
+        Commands::Fitness { .. } => cli_tracing::CliCommand::Fitness,
+        Commands::Cron { .. } => cli_tracing::CliCommand::Cron,
+        Commands::Xin { .. } => cli_tracing::CliCommand::Xin,
+        Commands::Causal { .. } => cli_tracing::CliCommand::Causal,
+        Commands::Models { .. } => cli_tracing::CliCommand::Models,
+        Commands::Providers { .. } => cli_tracing::CliCommand::Providers,
+        Commands::Routes { .. } => cli_tracing::CliCommand::Routes,
+        Commands::Channel {
+            channel_command: ChannelCommands::Start,
+        } => cli_tracing::CliCommand::ChannelStart,
+        Commands::Channel { .. } => cli_tracing::CliCommand::ChannelManage,
+        Commands::Integrations { .. } => cli_tracing::CliCommand::Integrations,
+        Commands::Skills { .. } => cli_tracing::CliCommand::Skills,
+        Commands::Migrate { .. } => cli_tracing::CliCommand::Migrate,
+        Commands::Auth { .. } => cli_tracing::CliCommand::Auth,
+        Commands::Approval { .. } => cli_tracing::CliCommand::Approval,
+        Commands::Audit { .. } => cli_tracing::CliCommand::Audit,
+        Commands::Config { .. } => cli_tracing::CliCommand::Config,
+        Commands::SessionWorker { .. } => cli_tracing::CliCommand::SessionWorker,
+        Commands::Completions { .. } => cli_tracing::CliCommand::Completions,
+    }
 }
 
 // CLI dispatch remains binary-owned; every runtime subsystem it calls is owned
@@ -1678,33 +1718,18 @@ async fn async_main() -> Result<()> {
         return init_cli::run(&cli).await;
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
-    // For `chat` subcommand, we build a reloadable subscriber so tracing can
-    // move to chat.log before configuration is loaded. `--config-dir`, when
-    // set above, selects that directory; then OPENPRX_CONFIG_DIR, then ~/.openprx/chat.log.
-    // Startup INFO/WARN lines written behind the alternate screen would
-    // otherwise reappear as a wall of stale output when the user exits the TUI.
-    let use_stderr = matches!(
-        cli.command,
-        Commands::Chat { .. }
-            | Commands::Config { .. }
-            | Commands::Models { .. }
-            | Commands::Providers { .. }
-            | Commands::Routes { .. }
-            | Commands::Integrations { .. }
-            | Commands::Audit { .. }
-            | Commands::Causal { .. }
-            | Commands::Cost { .. }
-            | Commands::Evolution { .. }
-            | Commands::Skills { .. }
-    );
-    #[cfg(feature = "wasm-plugins")]
-    let use_stderr = use_stderr || matches!(&cli.command, Commands::Plugin { .. });
-    if use_stderr {
+    // Initialize logging. RUST_LOG always wins when set. Otherwise foreground
+    // commands (agent, chat, go, ...) default to warn on stderr so a scripted
+    // `prx agent 'What is 2+2?'` prints only the reply on stdout. Long-running
+    // services (daemon, gateway, channel start) keep info on the process
+    // default writer. Chat still uses a reloadable stderr subscriber so
+    // tracing can move to chat.log before configuration is loaded.
+    let tracing_defaults = cli_tracing_command(&cli.command).defaults();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(tracing_defaults.filter));
+    if tracing_defaults.write_stderr {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::util::SubscriberInitExt as _;
 
-        let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let stderr_writer = tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr);
         let fmt_layer: ChatFmtLayer = tracing_subscriber::fmt::Layer::default().with_writer(stderr_writer);
         let (reload_layer, reload_handle) = tracing_subscriber::reload::Layer::new(fmt_layer);
@@ -1719,9 +1744,7 @@ async fn async_main() -> Result<()> {
             eprintln!("failed to set default tracing subscriber: {e}");
         }
     } else {
-        let subscriber = fmt::Subscriber::builder()
-            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-            .finish();
+        let subscriber = fmt::Subscriber::builder().with_env_filter(env_filter).finish();
         if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
             eprintln!("failed to set default tracing subscriber: {e}");
         }

@@ -34,6 +34,16 @@ ignored, and the versioned replacement: write `schema_version = 2` alongside
 `enabled = false` to keep the plane disabled. Loading does not rewrite the file;
 a structured save writes the canonical versioned form.
 
+## Tracing and `RUST_LOG`
+
+Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, and other
+commands whose stdout is the product) default to `warn` when `RUST_LOG` is
+unset, and they write tracing only to stderr. `prx daemon`, `prx gateway`,
+and `prx channel start` keep the previous `info` default on their current
+destination. Set `RUST_LOG=info` (or a more specific filter such as
+`RUST_LOG=openprx::prompt_cache=debug`) to raise the level. Durable audit
+records written to files or the database are independent of this filter.
+
 ## Quick Setup
 
 ```bash
