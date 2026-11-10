@@ -100,7 +100,23 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[heartbeat]` | `interval_minutes = 30`; `active_hours = [8, 23]`; `prompt = "Check HEARTBEAT.md and follow instructions."` |
 | `[xin]` | `interval_minutes = 5`; `stale_timeout_minutes = 60`; `adopt_legacy_tasks = false` |
 | `[cron]` | `max_run_history = 50` |
-| `[channels_config]` | `cli = true`; optional tables `telegram`, `discord`, `slack`, `mattermost`, `webhook`, `imessage`, `signal`, `whatsapp`, `wacli`, `linq`, `nextcloud_talk`, `email`, `irc`, `lark`, `dingtalk`, `qq`, `ramflux`. `[channels_config.matrix]` is removed. Channel credentials have no safe default |
+| `[channels_config]` | `cli = true`. Optional tables below. `[channels_config.matrix]` is removed. Channel credentials have no safe default |
+| `[channels_config.telegram]` | `bot_token` and `allowed_users` required; `stream_mode = "off"` (`"partial"` to edit a draft); `draft_update_interval_ms = 1000`; `interrupt_on_new_message = false`; `mention_only = false`; `group_reply_mode` unset (derived from `mention_only`: `true` → `"mention-only"`, `false` → `"off"`; set `"smart"` for model-decided group replies) |
+| `[channels_config.discord]` | `bot_token` required; `guild_id` unset; `allowed_users = []`; `listen_to_bots = false`; `mention_only = false`; `group_reply_mode` unset (same derivation as telegram) |
+| `[channels_config.slack]` | `bot_token` required; `app_token` unset; `channel_id` unset; `allowed_users = []`; `mention_only = false` |
+| `[channels_config.mattermost]` | `url` and `bot_token` required; `channel_id` unset; `allowed_users = []`; `thread_replies` unset (runtime `true`); `mention_only` unset (runtime `false`) |
+| `[channels_config.webhook]` | `port` required; `secret` unset |
+| `[channels_config.imessage]` | `allowed_contacts` required; `mention_only = false` |
+| `[channels_config.signal]` | `account` required; `http_url = "http://localhost:8080"`; `mode` unset (runtime `"rest"`; `"native"` ignores `http_url` and uses `daemon_http_port` or 16866); `cli_path`/`data_dir`/`daemon_http_port`/`group_id` unset; `daemon_mode` ignored; `allowed_from = []`; `ignore_attachments = false`; `ignore_stories = false`; `startup_timeout_ms = 30000`; `dm_policy = "allowlist"`; `group_policy = "allowlist"`; `group_allow_from = []`; `mention_only = false`; `storm_protection.dedupe_ttl_secs = 60`, `min_reply_interval_secs = 2`, `abnormal_threshold = 10`, `abnormal_window_secs = 60`, `breaker_duration_secs = 300` |
+| `[channels_config.whatsapp]` | Cloud: `phone_number_id`/`access_token`/`verify_token`; Web: `session_path`. `app_secret`/`pair_phone`/`pair_code`/`ws_url`/`read_pool_size` unset; `allowed_numbers = []` (alias `allowed_from`); `dm_policy = "allowlist"`; `group_policy = "allowlist"`; `group_allow_from = []`; `mention_only = false`; `group_reply_mode` unset (same derivation as telegram) |
+| `[channels_config.wacli]` | `webhook_listen = "127.0.0.1:16868"`; `webhook_path = "/wacli"`; `webhook_secret` unset; `allow_unsigned_loopback = false`; `allowed_from = ["*"]`; `cli_path`/`store_dir`/`bot_jid`/`bot_number`/`bot_lid` unset; `self_chat_mode = false`; `outbound_media_workspace_only = false`; `mention_only = false`; `group_reply_mode` unset (same derivation as telegram). Legacy `host`/`port` are refused at load |
+| `[channels_config.linq]` | `api_token` and `from_phone` required; `signing_secret` unset; `allowed_senders = []`; `mention_only = false` |
+| `[channels_config.nextcloud_talk]` | `base_url` and `app_token` required; `webhook_secret` unset; `allowed_users = []`; `mention_only = false` |
+| `[channels_config.email]` | `imap_host`, `smtp_host`, `username`, `password`, `from_address` required; `imap_port = 993`; `imap_folder = "INBOX"`; `smtp_port = 465`; `smtp_tls = true`; `idle_timeout_secs = 1740` (alias `poll_interval_secs`); `allowed_senders = []` |
+| `[channels_config.irc]` | `server` and `nickname` required; `port = 6697`; `username` unset; `channels = []`; `allowed_users = []`; `mention_only = false`; `server_password`/`nickserv_password`/`sasl_password` unset; `verify_tls` unset (runtime `true`) |
+| `[channels_config.lark]` | `app_id` and `app_secret` required; `encrypt_key`/`verification_token` unset; `allowed_users = []`; `use_feishu = false`; `receive_mode = "websocket"`; `port` unset; `mention_only = false`. `receive_mode = "webhook"` requires `verification_token` at load |
+| `[channels_config.dingtalk]` | `client_id` and `client_secret` required; `allowed_users = []`; `mention_only = false` |
+| `[channels_config.qq]` | `app_id` and `app_secret` required; `allowed_users = []`; `mention_only = false` |
 | `[channels_config.ramflux]` | `socket_path` unset; `authorization_mode = "follow_rf"`; `max_in_flight_per_conversation = 1`; `on_new_message = "queue"`; `turn_wall_clock_secs = 120`; `encrypt_at_rest = true`; `surface_limits.max_blocks = 32`, `max_actions = 16`, `max_bytes = 65536`; `attachment_fetch.max_bytes = 5242880`, `max_per_turn = 4`; `allowed_block_types` the built-in surface set (Text, Markdown, Heading, KeyValue, Metric, List, TableFallback, Form, Input, Select, Progress, LogStream, Warning, Error, Success, Approval, ActionGroup, FilePreview, Fallback); `accounts = {}`. An account may set `system_prompt_file`, `model`, `provider`, `scope_profile`, `cross_conversation_retrieval` |
 | `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
 | `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = false` |
@@ -1469,7 +1485,7 @@ PRX configuration initialized (full)
   Previous configuration archived to /home/you/.openprx/config.d.pre-0.8.126-20260914101500123
   Preserved 4 explicit setting(s): memory.embedding_provider, ...
   Added 2 new default(s) this version ships: memory.vector_candidate_cap, ...
-  Reset 1 unset setting(s) to refreshed defaults: agent.max_tool_iterations
+  Reset 1 unset setting(s) to refreshed defaults: agent.compaction.reserve_tokens
 ```
 
 ##### What `--force` does to each key
