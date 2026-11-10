@@ -1,34 +1,57 @@
 //! One purpose-bound history hop inside the original Agent decision chain.
 //! No constructor here can be reached through backend predictions or wire data.
+#[cfg(test)]
 mod embedding;
-use crate::memory::router_history::{RouterEmbedding, RouterReadScope};
-
-use super::accounting;
+#[cfg(test)]
 use super::router_replay_facts::{RouterReadFacts, provider_binding};
 
+#[cfg(test)]
+use super::accounting;
+#[cfg(test)]
 use super::{
-    AgentDecisionError, AgentTurnKind, Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityRef, CapabilityTarget,
-    CausalDecisionEngine, CausalEventKind, CausalState, Context, DecisionId, DecisionKey, DecisionRecordBuilder,
-    DecisionScope, DecisionTokenReservation, DerivedState, DirectiveContext, DiscoveredRefs, EngineDecision,
-    EngineInputs, GateInputs, HopLineage, Instant, KeyDomain, Memory, NonZeroU8, ObservedState, ObservedStep,
-    ObservedStepKind, ObservedStepStatus, PinnedCatalogRehearsal, RehearsalPorts, RequestLimits, Requirement,
-    TrustedState, TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
-    UnknownPolicy, directive_from_selection, effective_agent_exclusions,
+    AgentDecisionError, BTreeMap, BTreeSet, CausalEventKind, CausalState, DecisionRecordBuilder, DecisionScope,
+    DecisionTokenReservation, DerivedState, DirectiveContext, EngineDecision, GateInputs, KeyDomain, NonZeroU8,
+    ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus, RequestLimits, Requirement, TrustedState,
+    TurnDecisionService, TurnExecutionDirective, TurnSourceProof, UnknownPolicy, directive_from_selection,
+    effective_agent_exclusions,
 };
-use crate::agent::embedded_source::{EmbeddedAgentSource, SelectedEmbeddedModel};
+use super::{Arc, CancellationToken, Context, Instant, Memory};
+#[cfg(test)]
+use super::{CapabilityRef, CapabilityTarget, DecisionId, DecisionKey, HopLineage, TurnBudgets, TurnDecisionContext};
+#[cfg(test)]
+use super::{CausalDecisionEngine, DiscoveredRefs, EngineInputs, PinnedCatalogRehearsal, RehearsalPorts};
+#[cfg(test)]
+use crate::agent::embedded_source::EmbeddedAgentSource;
+#[cfg(test)]
+use crate::agent::embedded_source::SelectedEmbeddedModel;
+#[cfg(test)]
 use crate::causal_tree::branch::CausalActionKind;
+#[cfg(test)]
 use crate::causal_tree::decision_select::Selection;
+#[cfg(test)]
 use crate::causal_tree::directive::SelectedReadPurpose;
+#[cfg(test)]
 use crate::causal_tree::state::RouterHistoryReadBinding;
-use crate::memory::{RouterHistoryRead, RouterHistoryReadEvidence, RouterHistoryWriteEvidence};
+use crate::memory::RouterHistoryWriteEvidence;
+#[cfg(test)]
+use crate::memory::router_history::RouterEmbedding;
+#[cfg(test)]
+use crate::memory::router_history::RouterReadScope;
+#[cfg(test)]
+use crate::memory::{RouterHistoryRead, RouterHistoryReadEvidence};
+#[cfg(test)]
 use anyhow::ensure;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 pub(crate) struct RouterModelReadmission {
     source: Arc<EmbeddedAgentSource>,
     selected: SelectedEmbeddedModel,
 }
+#[cfg(test)]
 impl RouterModelReadmission {
+    #[cfg(test)]
     pub(crate) fn consume_for(self, source: &Arc<EmbeddedAgentSource>) -> anyhow::Result<SelectedEmbeddedModel> {
         ensure!(
             Arc::ptr_eq(&self.source, source),
@@ -44,6 +67,7 @@ impl RouterModelReadmission {
     clippy::large_enum_variant,
     reason = "Inline continuation preserves the allocation budget; boxing would add a routing allocation"
 )]
+#[cfg(test)]
 enum RoutingPhase {
     Pending,
     Reading,
@@ -59,12 +83,15 @@ enum RoutingPhase {
     Closed,
 }
 
+#[cfg(test)]
 pub(crate) struct RouterContinuation<'a> {
     router: &'a crate::router::RouterEngine,
     original: Arc<EmbeddedAgentSource>,
     phase: RoutingPhase,
 }
+#[cfg(test)]
 impl<'a> RouterContinuation<'a> {
+    #[cfg(test)]
     pub(crate) const fn new(router: &'a crate::router::RouterEngine, source: Arc<EmbeddedAgentSource>) -> Self {
         Self {
             router,
@@ -72,12 +99,14 @@ impl<'a> RouterContinuation<'a> {
             phase: RoutingPhase::Pending,
         }
     }
+    #[cfg(test)]
     pub(super) const fn source(&self) -> &Arc<EmbeddedAgentSource> {
         match &self.phase {
             RoutingPhase::Consumed { source, .. } => source,
             _ => &self.original,
         }
     }
+    #[cfg(test)]
     pub(super) fn transition(&self) -> Option<Arc<RouterTransition>> {
         match &self.phase {
             RoutingPhase::Consumed { transition, .. } | RoutingPhase::Failed { transition } => {
@@ -86,15 +115,18 @@ impl<'a> RouterContinuation<'a> {
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(super) const fn failed(&self) -> bool {
         matches!(self.phase, RoutingPhase::Failed { .. })
     }
+    #[cfg(test)]
     pub(super) const fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
         match &self.phase {
             RoutingPhase::Consumed { main_compaction, .. } => Some(main_compaction),
             _ => None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn finish(mut self) -> (Arc<EmbeddedAgentSource>, Option<RouterEmbedding>) {
         match &mut self.phase {
             RoutingPhase::Consumed { source, embedding, .. } => (Arc::clone(source), embedding.take()),
@@ -105,6 +137,7 @@ impl<'a> RouterContinuation<'a> {
 
 /// Private consumed facts, never reconstructed from a public terminal receipt.
 /// Replay facts are exported only after comparison with the retained engine hops.
+#[cfg(test)]
 pub(super) struct RouterTransition {
     read_id: DecisionId,
     selected_id: crate::causal_tree::branch::CandidateId,
@@ -124,6 +157,7 @@ pub(super) struct RouterTransition {
 /// The job owns both the actual backend future and its cleanup ticket. Dropping
 /// an awaiting caller detaches this job, not SQLite's inner blocking join. The
 /// owner can drain it until the actual backend has returned.
+#[cfg(test)]
 async fn read_owned(
     memory: Arc<dyn Memory>,
     evidence: RouterHistoryReadEvidence,
@@ -184,9 +218,11 @@ pub(crate) async fn commit_training_owned(
     .context("Router history write owner task failed")?
 }
 
+#[cfg(test)]
 impl TurnDecisionService {
     /// An independent durable first row makes a forced drop after a read
     /// observable without inventing a terminal or resetting the decision.
+    #[cfg(test)]
     async fn persist_router_read_owned(
         &self,
         decision: &EngineDecision,
@@ -271,6 +307,7 @@ impl TurnDecisionService {
 
     /// Returns the actual first hop and an optional next state. A non-Retrieve
     /// selection closes normally and cannot authorize a history read.
+    #[cfg(test)]
     pub(super) async fn router_history_hop(
         &self,
         state: &CausalState,
@@ -284,6 +321,7 @@ impl TurnDecisionService {
             .map_err(AgentDecisionError::Router)
     }
 
+    #[cfg(test)]
     async fn router_history_hop_inner(
         &self,
         state: &CausalState,
@@ -805,6 +843,7 @@ fn history_diagnostic_point(
     )
 }
 
+#[cfg(test)]
 fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
     // Use the existing backend with runtime CPU dispatch; keep the v1 stream.
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
@@ -830,6 +869,7 @@ fn snapshot_digest(read: &RouterHistoryRead) -> [u8; 32] {
     bytes
 }
 
+#[cfg(test)]
 impl RouterTransition {
     pub(super) fn replay_facts(
         &self,
@@ -969,6 +1009,7 @@ impl RouterTransition {
         })
     }
 }
+#[cfg(test)]
 const fn budgets(value: TurnBudgets) -> [u64; 3] {
     [value.tokens, value.latency_ms, value.micro_usd]
 }

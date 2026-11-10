@@ -1,14 +1,24 @@
 //! Paid embedding used only after the selected, persisted Router history read.
+#[cfg(test)]
 use crate::decision::budget::DecisionAttemptReceipt;
+#[cfg(test)]
 use crate::decision::{DecisionKey, KeyDomain};
+#[cfg(test)]
 use crate::llm::route_decision::TokenUsage;
+#[cfg(test)]
 use crate::providers::attempt_accounting::{self, AttemptAccounting, AttemptReceipt, PhysicalKind, PhysicalRequest};
+#[cfg(test)]
 use crate::runtime::decision_accounting::{AccountingScope, OwnedReceipt, PhysicalEstimate};
+#[cfg(test)]
 use anyhow::ensure;
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
 use std::{sync::Arc, time::Instant};
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 struct RouterEmbeddingAccounting {
     scope: Arc<AccountingScope>,
     key: Arc<DecisionKey>,
@@ -19,7 +29,9 @@ struct RouterEmbeddingAccounting {
     query: [u8; 32],
     deadline: Instant,
 }
+#[cfg(test)]
 impl attempt_accounting::sealed::AccountingOwner for RouterEmbeddingAccounting {}
+#[cfg(test)]
 #[async_trait]
 impl AttemptAccounting for RouterEmbeddingAccounting {
     fn deadline(&self) -> Instant {
@@ -68,11 +80,14 @@ impl AttemptAccounting for RouterEmbeddingAccounting {
         }))
     }
 }
+#[cfg(test)]
 struct RouterEmbeddingReceipt {
     receipt: Box<OwnedReceipt>,
     deadline: Instant,
 }
+#[cfg(test)]
 impl attempt_accounting::sealed::Receipt for RouterEmbeddingReceipt {}
+#[cfg(test)]
 #[async_trait]
 impl AttemptReceipt for RouterEmbeddingReceipt {
     fn deadline(&self) -> Instant {
@@ -86,6 +101,7 @@ impl AttemptReceipt for RouterEmbeddingReceipt {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn embed_selected(
     configured: crate::memory::ConfiguredPaidEmbedding,

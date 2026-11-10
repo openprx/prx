@@ -208,6 +208,7 @@ impl RouterEngine {
             .ok_or_else(|| anyhow::anyhow!("Router history is absent"))
     }
 
+    #[cfg(test)]
     pub(crate) fn rank_scoped_history(
         &self,
         source: &dyn crate::runtime::turn_source::TurnSourceProof,

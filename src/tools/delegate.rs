@@ -1508,6 +1508,7 @@ impl DelegateLoopResources {
         {
             let turn = &mut child_turn;
             turn.project_history(history.len() + 1);
+            #[cfg(test)]
             if turn.is_close()? {
                 loop_cleanup.run(async { Ok(()) }).await?;
                 let reply = turn

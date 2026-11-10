@@ -182,15 +182,18 @@ impl TurnDecisionService {
         }
         let mut families = Vec::new();
         for decision in context.audit_hops() {
-            if let CandidateSet::Legal {
-                discoverable_families, ..
-            } = &decision.candidates
-            {
-                for family in discoverable_families.iter() {
-                    if !families.contains(&family) {
-                        families.push(family);
+            match &decision.candidates {
+                CandidateSet::Legal {
+                    discoverable_families, ..
+                } => {
+                    for family in discoverable_families.iter() {
+                        if !families.contains(&family) {
+                            families.push(family);
+                        }
                     }
                 }
+                #[cfg(test)]
+                CandidateSet::NoLegalPath { .. } => {}
             }
         }
         let view = self.catalog_view();

@@ -25,7 +25,7 @@ impl TurnDecisionService {
         self.record_opened_context(proof, opened, cancellation).await
     }
 
-    pub(crate) async fn open_issued_segment_turn_context(
+    pub(in crate::runtime) async fn open_issued_segment_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
         observation: Option<&super::segment_observation::SegmentObservation>,
@@ -121,6 +121,7 @@ impl TurnDecisionService {
                 return Err(AgentDecisionError::Cancelled);
             }
         }
+        #[cfg(test)]
         if matches!(context.directive, TurnExecutionDirective::RequestApproval { .. }) {
             self.record_pending_decision_approval(proof, &context)
                 .await

@@ -72,6 +72,7 @@ pub(crate) struct CapabilityEntry {
 impl CapabilityEntry {
     /// A concrete read-only Skill uses this native loader. Keep registry target
     /// representation inside the catalog; decision ranking only needs the fact.
+    #[cfg(test)]
     pub(crate) fn loads_read_only_skill(&self, skill: &Self) -> bool {
         self.effect == SideEffectClass::ReadOnly
             && skill.effect == SideEffectClass::ReadOnly
@@ -106,6 +107,7 @@ impl CapabilityEntry {
     /// A directory plus one complete bundle revision identifies the native
     /// import proposal surface without inferring a verb or granting execution.
     /// The collector still decides whether the current request asks to import.
+    #[cfg(test)]
     pub(crate) fn names_reviewed_bundle_target(&self, text: &str) -> bool {
         if self.public_name != "skills_manage"
             || !self.collects_exact_call()
@@ -134,6 +136,7 @@ impl CapabilityEntry {
     /// The (lowercased) request names a grant-bound action of a collectable
     /// tool. Other actions need no approval collection: the model may call them
     /// in an ordinary turn, and collecting them would end in an error.
+    #[cfg(test)]
     pub(crate) fn names_collectable_action(&self, folded_text: &str) -> bool {
         self.collects_exact_call()
             && (self.public_name != "skills_manage"

@@ -207,6 +207,7 @@ fn decision_settlement_snapshot(
     settlement.lock().clone()
 }
 
+#[cfg(test)]
 struct CliDecisionClose<'a> {
     terminal_guard: Option<&'a crate::runtime::turn_terminal::TurnTerminalGuard>,
     service: &'a crate::runtime::turn_decision::TurnDecisionService,
@@ -218,6 +219,7 @@ struct CliDecisionClose<'a> {
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::runtime::turn_decision::CloseTurnPorts for CliDecisionClose<'_> {
     type Receipt = crate::agent::terminal::TurnTerminalReceipt;
@@ -2061,6 +2063,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     terminal_guard
                         .set(guard)
                         .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
+                    #[cfg(test)]
                     if let Some(reply) = decision.close_reply()? {
                         let ports = CliDecisionClose {
                             terminal_guard: terminal_guard.get(),
@@ -2534,6 +2537,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                     )?
                     .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
+                    #[cfg(test)]
                     if let Some(reply) = decision.close_reply()? {
                         if history.is_empty() {
                             history.push(ChatMessage::system(""));

@@ -1,16 +1,22 @@
 //! Construct outgoing authority from exact mentions or admitted discoveries.
 use super::{
-    Arc, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogView, CausalState, ChildExecutionPolicy, Context,
-    DecisionId, DiscoveredRefs, Exposure, Ordering, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective,
-    TurnSourceProof, TurnSurfaceKind,
+    Arc, CapabilityRef, ChildExecutionPolicy, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService,
+    TurnExecutionDirective, TurnSourceProof,
 };
-use crate::tools::capability::child::{AuthorityEnvelope, CapabilityConstraints};
+#[cfg(test)]
+use super::{
+    BTreeSet, CapabilityAvailabilityLevel, CatalogView, CausalState, DecisionId, DiscoveredRefs, TurnSurfaceKind,
+};
+#[cfg(test)]
+use crate::tools::capability::child::AuthorityEnvelope;
+use crate::tools::capability::child::CapabilityConstraints;
 use std::time::Duration;
 
 /// Durability verification is a correctness gate with its own bound. It must
 /// not share the decision latency budget (`extra_latency_budget_ms`).
 const DELEGATION_DURABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
 pub(super) struct OutgoingDelegation {
     pub parent: CapabilityConstraints,
     pub requested: Vec<CapabilityRef>,
@@ -25,8 +31,10 @@ pub(super) fn publication_cost(
     delegator: bool,
 ) -> Option<crate::causal_tree::branch::CostEstimate> {
     use crate::causal_tree::branch::CausalActionKind;
-    let super::CandidateSet::Legal { candidates, .. } = &decision.candidates else {
-        return None;
+    let candidates = match &decision.candidates {
+        super::CandidateSet::Legal { candidates, .. } => candidates,
+        #[cfg(test)]
+        super::CandidateSet::NoLegalPath { .. } => return None,
     };
     let action = if delegator {
         CausalActionKind::Delegate
@@ -41,6 +49,7 @@ pub(super) fn publication_cost(
 }
 
 impl TurnDecisionService {
+    #[cfg(test)]
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
         if proof.surface() != TurnSurfaceKind::AgentLoop
@@ -214,6 +223,7 @@ impl TurnDecisionService {
         )?))
     }
 
+    #[cfg(test)]
     pub(super) fn outgoing_delegation(
         &self,
         proof: &dyn TurnSourceProof,

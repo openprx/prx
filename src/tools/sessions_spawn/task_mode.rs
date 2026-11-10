@@ -403,6 +403,7 @@ pub(super) async fn run_sub_agent_task(
                 .await?
                 .with_child_cleanup(cleanup_confirmed);
                 let _ = segment_admitted.send(());
+                #[cfg(test)]
                 if child_turn.is_close()? {
                     loop_cleanup.run(async { Ok(()) }).await?;
                     let reply = child_turn

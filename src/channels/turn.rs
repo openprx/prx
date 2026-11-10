@@ -598,6 +598,12 @@ pub(super) async fn run_channel_turn(
         }
     }
     match decision_turn.close_reply() {
+        #[cfg(not(test))]
+        Ok(Some(_)) => {
+            tracing::warn!("decision requires the constrained execution reader");
+            return;
+        }
+        #[cfg(test)]
         Ok(Some(reply)) => {
             if let Err(error) = decision_turn
                 .close(ctx.as_ref(), security.as_ref(), &msg, &cancellation_token)

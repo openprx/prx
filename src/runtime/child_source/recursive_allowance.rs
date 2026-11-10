@@ -222,6 +222,7 @@ impl Drop for ContextAllowance {
 }
 
 impl RecursiveAllowance {
+    #[cfg(test)]
     pub(in crate::runtime) fn retain_pending(self: &Arc<Self>, expires_at: chrono::DateTime<chrono::Utc>) {
         let remaining = (expires_at - chrono::Utc::now()).to_std().unwrap_or_default();
         let Some(deadline) = std::time::Instant::now().checked_add(remaining) else {

@@ -328,10 +328,11 @@ async fn run_turn_unguarded(
     // FIX-P0-30/31: attribution of the final returning turn. Each provider call
     // overwrites this with that turn's real serving provider/model + attempts;
     // the value at the returning turn is handed back to the caller.
-    let mut last_turn_trace = ToolLoopTrace {
-        decision_brief_sha256: decision_brief_sha256.clone(),
-        ..Default::default()
-    };
+    let mut last_turn_trace = ToolLoopTrace::default();
+    #[cfg(test)]
+    {
+        last_turn_trace.decision_brief_sha256 = decision_brief_sha256.clone();
+    }
     let mut usage_accumulator = ProviderUsageAccumulator::new();
     // FIX #2: sticky cross-turn fallback flag. `last_turn_trace` is overwritten
     // every turn, so a fallback on an intermediate (tool-call) turn would be lost
@@ -1176,6 +1177,7 @@ async fn run_turn_unguarded(
                     )
                     .unwrap_or_else(|| provider.tool_schema_dialect_for(&trace.final_model));
                 last_turn_trace = ToolLoopTrace {
+                    #[cfg(test)]
                     decision_brief_sha256: decision_brief_sha256.clone(),
                     prepared_parameters: std::mem::take(&mut last_turn_trace.prepared_parameters),
                     final_provider: Some(trace.final_provider),

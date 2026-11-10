@@ -2767,6 +2767,7 @@ fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions(
     ) -> PendingOrderedProviderTurnCommit {
         PendingOrderedProviderTurnCommit {
             context: PerTurnContext {
+                #[cfg(test)]
                 cancellation: CancellationToken::new(),
                 turn_binding: None,
                 fixed_reply: None,

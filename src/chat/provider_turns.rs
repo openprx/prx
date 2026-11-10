@@ -73,6 +73,7 @@ pub(super) struct ProviderTurnCompletionContext {
 
 #[cfg(feature = "terminal-tui")]
 pub(super) struct PerTurnContext {
+    #[cfg(test)]
     pub(super) cancellation: CancellationToken,
     pub(super) turn_binding: Option<Arc<decision_source::ChatTurnBinding>>,
     /// The disposition captured before provider execution can seal the
@@ -932,6 +933,7 @@ async fn commit_completed_provider_turn(
         let Some(binding) = pending.turn_binding.as_ref() else {
             return false;
         };
+        #[cfg(test)]
         match binding
             .close(
                 memory_fabric,
@@ -946,6 +948,12 @@ async fn commit_completed_provider_turn(
                 tracing::error!(error = %error, "Chat fixed terminal commit failed");
                 return false;
             }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (binding, memory_fabric, history_commit_len, reply);
+            tracing::error!("decision requires the constrained execution reader");
+            return false;
         }
     } else {
         let provider_outcome = if let Some(binding) = pending.turn_binding.as_ref() {

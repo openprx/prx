@@ -257,6 +257,7 @@ impl ChannelDecisionTurn {
         Ok(self.context.close_reply()?.map(|reply| reply.into_owned()))
     }
 
+    #[cfg(test)]
     pub(super) async fn close(
         &self,
         ctx: &super::ChannelRuntimeContext,
@@ -326,12 +327,14 @@ impl ChannelDecisionTurn {
     }
 }
 
+#[cfg(test)]
 struct ChannelClose<'a> {
     turn: &'a ChannelDecisionTurn,
     ctx: &'a super::ChannelRuntimeContext,
     security: &'a crate::security::SecurityPolicy,
     message: &'a super::traits::ChannelMessage,
 }
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::runtime::turn_decision::CloseTurnPorts for ChannelClose<'_> {
     type Receipt = TurnTerminalReceipt;

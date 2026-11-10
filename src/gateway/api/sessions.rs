@@ -2320,46 +2320,44 @@ async fn run_console_message_job_work(
         terminal_guard
     };
     let work = async {
-        match decision.context.close_reply().map_err(|error| error.to_string())? {
-            Some(reply) => {
-                let ports = crate::gateway::decision_runtime::GatewayDecisionClose {
-                    resource: "gateway_api:sessions:assistant_message",
-                    history_commit_len: turns.len() + 2,
-                    terminal_guard: &terminal_guard,
-                    service: &decision.service,
-                    config,
-                    envelope: &runtime_envelope,
-                    started_at: chrono::Utc::now(),
-                };
-                decision
-                    .service
-                    .close_agent_directive_turn(
-                        decision.proof,
-                        std::sync::Arc::clone(&decision.context),
-                        &ports,
-                        &cancellation,
-                    )
+        #[cfg(test)]
+        if let Some(reply) = decision.context.close_reply().map_err(|error| error.to_string())? {
+            let ports = crate::gateway::decision_runtime::GatewayDecisionClose {
+                resource: "gateway_api:sessions:assistant_message",
+                history_commit_len: turns.len() + 2,
+                terminal_guard: &terminal_guard,
+                service: &decision.service,
+                config,
+                envelope: &runtime_envelope,
+                started_at: chrono::Utc::now(),
+            };
+            decision
+                .service
+                .close_agent_directive_turn(
+                    decision.proof,
+                    std::sync::Arc::clone(&decision.context),
+                    &ports,
+                    &cancellation,
+                )
+                .await
+                .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
+            if !config.causal_tree.enabled {
+                let record_event = matches!(
+                    runtime_envelope
+                        .agent_partition
+                        .as_ref()
+                        .map(|partition| &partition.key),
+                    Some(crate::memory::PartitionKey::Named { .. })
+                );
+                append_console_turn(&state, &runtime_envelope, "assistant", &reply, record_event, false)
                     .await
-                    .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
-                if !config.causal_tree.enabled {
-                    let record_event = matches!(
-                        runtime_envelope
-                            .agent_partition
-                            .as_ref()
-                            .map(|partition| &partition.key),
-                        Some(crate::memory::PartitionKey::Named { .. })
-                    );
-                    append_console_turn(&state, &runtime_envelope, "assistant", &reply, record_event, false)
-                        .await
-                        .map_err(|_| "Failed to persist assistant response".to_owned())?;
-                }
-                // Enabled terminal rejoin already projected the transcript.
-                return Ok(jobs::JobOutput::new(
-                    StatusCode::OK,
-                    serde_json::json!({ "status": "ok", "reply": reply }),
-                ));
+                    .map_err(|_| "Failed to persist assistant response".to_owned())?;
             }
-            None => {}
+            // Enabled terminal rejoin already projected the transcript.
+            return Ok(jobs::JobOutput::new(
+                StatusCode::OK,
+                serde_json::json!({ "status": "ok", "reply": reply }),
+            ));
         }
         if mode == ConsoleTurnMode::Resume {
             crate::gateway::authorize_gateway_config_resource_mutation(

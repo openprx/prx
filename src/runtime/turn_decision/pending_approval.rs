@@ -3,7 +3,9 @@
 mod h2;
 mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
-use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
+use crate::acl::approval_grant::{ApprovalGrantV2, RiskLevel, WitnessKeyring};
+#[cfg(test)]
+use crate::acl::approval_grant::{DecisionApprovalBinding, Subject};
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
@@ -89,6 +91,7 @@ impl TurnDecisionService {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn record_pending_decision_approval(
         &self,
         proof: &dyn TurnSourceProof,
@@ -210,10 +213,12 @@ impl TurnDecisionService {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn persist_pending_record(&self, record: PendingRecord, source: &MessageEvent) -> anyhow::Result<()> {
         self.persist_pending_record_receipt(record, source).await.map(|_| ())
     }
 
+    #[cfg(test)]
     async fn persist_pending_record_receipt(
         &self,
         record: PendingRecord,
@@ -826,6 +831,7 @@ impl TurnDecisionService {
 pub(super) struct ResumeGateEvidence {
     /// Authenticated original source content, still untrusted decision data.
     pub(super) original_request: Arc<str>,
+    #[cfg(test)]
     pub(super) candidate_reference: crate::causal_tree::branch::CapabilityRef,
     pub(super) calls: std::collections::BTreeMap<crate::causal_tree::branch::CandidateId, [u8; 32]>,
     pub(super) approvals:
@@ -918,6 +924,7 @@ impl AdmittedDecisionResume {
         };
         Ok(ResumeGateEvidence {
             original_request: Arc::from(self.prepared.approval.pending().source().content.as_str()),
+            #[cfg(test)]
             candidate_reference: reference.clone(),
             calls: BTreeMap::from([
                 (CandidateId::new(CausalActionKind::UseTool, entry.family, None), digest),
@@ -947,6 +954,7 @@ impl TurnDecisionService {
     /// Chain digests of recorded decisions, read from the authority journal.
     /// The async decision store is a projection and may lag the journal, so it
     /// is never consulted. A missing journal row is a refusal.
+    #[cfg(test)]
     pub(super) async fn journal_decision_digests(
         &self,
         store_workspace: &str,

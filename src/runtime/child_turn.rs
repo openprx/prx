@@ -1,5 +1,7 @@
 //! Source-bound decision and terminal ownership for one child execution segment.
-use super::turn_decision::{CloseTurnPorts, TurnDecisionContext, TurnDecisionService, TurnDisposition};
+#[cfg(test)]
+use super::turn_decision::CloseTurnPorts;
+use super::turn_decision::{TurnDecisionContext, TurnDecisionService, TurnDisposition};
 use super::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use crate::agent::terminal::{
     TurnDeliveryIntent, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus, TurnTerminalTelemetry,
@@ -169,6 +171,7 @@ impl ChildSegmentTurn {
 
     pub(crate) fn is_close(&self) -> anyhow::Result<bool> {
         match self.decision.disposition()? {
+            #[cfg(test)]
             TurnDisposition::Close { .. } => Ok(true),
             TurnDisposition::Run => Ok(false),
         }
@@ -237,15 +240,24 @@ impl ChildSegmentTurn {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn close(&self, cancellation: &CancellationToken) -> anyhow::Result<Option<String>> {
-        let TurnDisposition::Close { reply } = self.decision.disposition()? else {
+        #[cfg(not(test))]
+        {
+            let _ = (self.decision.disposition()?, cancellation);
             return Ok(None);
-        };
-        self.service
-            .close_agent_directive_turn(self.proof.as_ref(), Arc::clone(&self.decision), self, cancellation)
-            .await
-            .map_err(|error| error.context(super::turn_cleanup::CleanupIncomplete))?;
-        Ok(Some(reply.to_string()))
+        }
+        #[cfg(test)]
+        {
+            let TurnDisposition::Close { reply } = self.decision.disposition()? else {
+                return Ok(None);
+            };
+            self.service
+                .close_agent_directive_turn(self.proof.as_ref(), Arc::clone(&self.decision), self, cancellation)
+                .await
+                .map_err(|error| error.context(super::turn_cleanup::CleanupIncomplete))?;
+            Ok(Some(reply.to_string()))
+        }
     }
 
     fn proposal(
@@ -304,6 +316,7 @@ impl ChildSegmentTurn {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl CloseTurnPorts for ChildSegmentTurn {
     type Receipt = TurnTerminalReceipt;

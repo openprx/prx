@@ -117,6 +117,7 @@ impl Drop for GatewayDecisionSlot {
     }
 }
 
+#[cfg(test)]
 pub(super) struct GatewayDecisionClose<'a> {
     pub(super) resource: &'static str,
     pub(super) history_commit_len: usize,
@@ -127,6 +128,7 @@ pub(super) struct GatewayDecisionClose<'a> {
     pub(super) started_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::runtime::turn_decision::CloseTurnPorts for GatewayDecisionClose<'_> {
     type Receipt = crate::agent::terminal::TurnTerminalReceipt;

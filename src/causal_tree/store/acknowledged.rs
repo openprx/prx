@@ -1,16 +1,18 @@
 //! Commit and read back an owned decision in one writer-queue operation.
-#[cfg(any(feature = "llm-router", test))]
-use super::{DecisionRecord, IncompleteReason, TrySendError, emit_incomplete, lineage_of, same_turn_chain};
+#[cfg(test)]
+use super::DecisionRecord;
 use super::{
     DecisionReplayRecord, DecisionScope, DecisionStoreWriter, RecoveryReadBudget, StoreError, WriterMessage,
     WriterThread, recovery_scope_bounds, recovery_time_left, replay_record_on_connection_until,
 };
-#[cfg(any(feature = "llm-router", test))]
+#[cfg(test)]
+use super::{IncompleteReason, TrySendError, emit_incomplete, lineage_of, same_turn_chain};
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
-#[cfg(any(feature = "llm-router", test))]
+#[cfg(test)]
 pub(super) struct VerifiedDecision {
     #[cfg(test)]
     clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
@@ -25,6 +27,7 @@ impl DecisionStoreWriter {
     /// The returned row is decoded from SQLite after commit, with the same
     /// scope, digest and bounds as a recovery read. Queue admission is bounded;
     /// expiry never turns a late write into permission to continue the read.
+    #[cfg(test)]
     pub(crate) async fn record_and_replay(
         &self,
         mut record: DecisionRecord,
@@ -66,7 +69,7 @@ impl DecisionStoreWriter {
     }
 }
 
-#[cfg(any(feature = "llm-router", test))]
+#[cfg(test)]
 impl VerifiedDecision {
     pub(super) fn finish(self, thread: &mut WriterThread) {
         #[cfg(test)]

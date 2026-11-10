@@ -1,17 +1,22 @@
 //! Convert a gated selection into a narrow runtime execution directive.
 
+#[cfg(test)]
 use chrono::{DateTime, Utc};
 
-use super::branch::{
-    CandidateId, CapabilityId, CapabilityRef, CapabilityTarget, CausalActionKind, OpId, SideEffectClass,
-};
-use super::candidate_generator::{CandidateSet, PendingApproval};
+use super::branch::{CandidateId, CapabilityId, CapabilityTarget, CausalActionKind};
+#[cfg(test)]
+use super::branch::{CapabilityRef, OpId, SideEffectClass};
+use super::candidate_generator::CandidateSet;
+#[cfg(test)]
+use super::candidate_generator::PendingApproval;
 use super::decision_engine::EngineDecision;
 use super::decision_select::Selection;
 use super::gates::GateOutcome;
+#[cfg(test)]
 use super::ids::DecisionId;
 use crate::tools::capability::child::ChildCapabilityManifest;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectedReadPurpose {
     QueryEvidence,
@@ -20,15 +25,21 @@ pub(crate) enum SelectedReadPurpose {
 
 #[derive(Debug, Clone)]
 pub(crate) enum TurnExecutionDirective {
+    #[cfg(test)]
     CollectApprovalArguments(super::approval_collection::DeferredArgumentProof),
     AnswerDirectly,
     Retrieve {
+        #[cfg(test)]
         sources: Vec<CapabilityRef>,
+        #[cfg(test)]
         purpose: SelectedReadPurpose,
     },
     Discover {
+        #[cfg(test)]
         families: Vec<CapabilityTarget>,
+        #[cfg(test)]
         query: String,
+        #[cfg(test)]
         limit: usize,
     },
     Execute {
@@ -37,12 +48,15 @@ pub(crate) enum TurnExecutionDirective {
     Delegate {
         manifest: ChildCapabilityManifest,
     },
+    #[cfg(test)]
     Clarify {
         reason_code: String,
     },
+    #[cfg(test)]
     RequestApproval {
         approval_scope: ApprovalScope,
     },
+    #[cfg(test)]
     Refuse {
         policy_code: String,
         /// Configuration hint computed at selection; `None` keeps the generic sentence.
@@ -52,19 +66,23 @@ pub(crate) enum TurnExecutionDirective {
 
 /// The longest an approval request may stay open: an approval scope expiring
 /// later than this after issue is refused as mismatched.
+#[cfg(test)]
 const MAX_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
 
 /// An exactly named approval-required action on a surface with no owner review.
+#[cfg(test)]
 const APPROVAL_UNAVAILABLE_REPLY: &str =
     "This action needs owner approval, which this surface cannot collect; nothing was run.";
 
 /// Render only terminal dispositions that need no provider or capability call.
 /// Security and policy-internal reason codes stay out of the reply. Configuration
 /// reasons append one plain hint line after the generic refusal sentence.
+#[cfg(test)]
 pub(crate) fn render_terminal_directive(
     directive: &TurnExecutionDirective,
 ) -> Result<std::borrow::Cow<'static, str>, DirectiveError> {
     match directive {
+        #[cfg(test)]
         TurnExecutionDirective::Clarify { reason_code } => Ok(std::borrow::Cow::Borrowed(match reason_code.as_str() {
             "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
             "insufficient_evidence" | "retrieve_evidence" => {
@@ -78,11 +96,13 @@ pub(crate) fn render_terminal_directive(
             "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
             _ => "Could you clarify the result you want?",
         })),
+        #[cfg(test)]
         TurnExecutionDirective::RequestApproval { approval_scope } => Ok(std::borrow::Cow::Owned(format!(
             "Approval is required for decision {} (effect: {}). Review this decision before resuming it. The operation has not run.",
             approval_scope.decision_id,
             approval_scope.effect.as_str(),
         ))),
+        #[cfg(test)]
         TurnExecutionDirective::Refuse { policy_code, user_hint } => {
             tracing::debug!(policy_code = %policy_code, "rendering terminal refusal");
             Ok(super::refusal::render_refusal_reply(policy_code, user_hint.as_deref()))
@@ -91,6 +111,7 @@ pub(crate) fn render_terminal_directive(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovalScope {
     pub decision_id: DecisionId,
@@ -109,7 +130,9 @@ pub(crate) struct ApprovalScope {
 pub(crate) struct DirectiveContext {
     /// The service must supply the same pinned generation at the execution boundary.
     pub current_generation: super::branch::CatalogGeneration,
+    #[cfg(test)]
     pub approval_expires_at: DateTime<Utc>,
+    #[cfg(test)]
     pub discovery_limit: usize,
 }
 
@@ -119,6 +142,7 @@ pub(crate) enum DirectiveError {
     NotAdmitted,
     #[error("selected action cannot be converted to a directive")]
     ActionMismatch,
+    #[cfg(test)]
     #[error("approval scope is incomplete or changed after admission")]
     ApprovalScopeMismatch,
     #[error("delegation manifest is absent or invalid")]
@@ -139,6 +163,7 @@ pub(crate) fn directive_from_selection(
         return Err(DirectiveError::NotAdmitted);
     }
     match &decision.selection {
+        #[cfg(test)]
         Selection::CollectApprovalArguments(proof) => {
             if proof.capability().generation != context.current_generation
                 || decision.prediction.is_some()
@@ -149,20 +174,24 @@ pub(crate) fn directive_from_selection(
             }
             Ok(TurnExecutionDirective::CollectApprovalArguments(proof.clone()))
         }
-        Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => {
-            let CandidateSet::Legal {
-                candidates,
-                discoverable_families,
-                ..
-            } = &decision.candidates
-            else {
-                return Err(DirectiveError::NotAdmitted);
+        Selection::Commit { candidate_id, .. } => {
+            #[cfg(not(test))]
+            let CandidateSet::Legal { candidates, .. } = &decision.candidates;
+            #[cfg(test)]
+            let (candidates, discoverable_families) = match &decision.candidates {
+                CandidateSet::Legal {
+                    candidates,
+                    discoverable_families,
+                    ..
+                } => (candidates, discoverable_families),
+                CandidateSet::NoLegalPath { .. } => return Err(DirectiveError::NotAdmitted),
             };
             let candidate = candidates
                 .iter()
                 .find(|item| item.candidate_id() == candidate_id)
                 .ok_or(DirectiveError::NotAdmitted)?;
             require_pass(candidate_id, decision)?;
+            #[cfg(test)]
             if matches!(decision.selection, Selection::Recover { .. })
                 && !matches!(
                     candidate.action(),
@@ -174,7 +203,9 @@ pub(crate) fn directive_from_selection(
             match candidate.action() {
                 CausalActionKind::Answer => Ok(TurnExecutionDirective::AnswerDirectly),
                 CausalActionKind::Retrieve => Ok(TurnExecutionDirective::Retrieve {
+                    #[cfg(test)]
                     sources: candidate.required_capabilities().to_vec(),
+                    #[cfg(test)]
                     purpose: if decision.state.trusted.router_history().is_some() {
                         SelectedReadPurpose::RouterHistory
                     } else {
@@ -185,6 +216,7 @@ pub(crate) fn directive_from_selection(
                     // The builtin's language-neutral candidate searches all
                     // eligible families. A concrete selected family remains
                     // valid for exact recovery and issuer revalidation.
+                    #[cfg(test)]
                     families: selected_discovery_family(decision)?.map_or_else(
                         || match discoverable_families.iter().collect::<Vec<_>>() {
                             families if !families.is_empty() => families,
@@ -192,7 +224,9 @@ pub(crate) fn directive_from_selection(
                         },
                         |family| vec![family],
                     ),
+                    #[cfg(test)]
                     query: decision.state.routing_input.as_str().to_string(),
+                    #[cfg(test)]
                     limit: match context.discovery_limit {
                         1..=64 => context.discovery_limit,
                         _ => return Err(DirectiveError::ActionMismatch),
@@ -238,6 +272,55 @@ pub(crate) fn directive_from_selection(
                 _ => Err(DirectiveError::ActionMismatch),
             }
         }
+        #[cfg(test)]
+        Selection::Recover { candidate_id, .. } => {
+            let CandidateSet::Legal {
+                candidates,
+                discoverable_families,
+                ..
+            } = &decision.candidates
+            else {
+                return Err(DirectiveError::NotAdmitted);
+            };
+            let candidate = candidates
+                .iter()
+                .find(|item| item.candidate_id() == candidate_id)
+                .ok_or(DirectiveError::NotAdmitted)?;
+            require_pass(candidate_id, decision)?;
+            if !matches!(
+                candidate.action(),
+                CausalActionKind::Answer | CausalActionKind::Retrieve | CausalActionKind::Discover
+            ) {
+                return Err(DirectiveError::ActionMismatch);
+            }
+            match candidate.action() {
+                CausalActionKind::Answer => Ok(TurnExecutionDirective::AnswerDirectly),
+                CausalActionKind::Retrieve => Ok(TurnExecutionDirective::Retrieve {
+                    sources: candidate.required_capabilities().to_vec(),
+                    purpose: if decision.state.trusted.router_history().is_some() {
+                        SelectedReadPurpose::RouterHistory
+                    } else {
+                        SelectedReadPurpose::QueryEvidence
+                    },
+                }),
+                CausalActionKind::Discover => Ok(TurnExecutionDirective::Discover {
+                    families: selected_discovery_family(decision)?.map_or_else(
+                        || match discoverable_families.iter().collect::<Vec<_>>() {
+                            families if !families.is_empty() => families,
+                            _ => vec![candidate.target()],
+                        },
+                        |family| vec![family],
+                    ),
+                    query: decision.state.routing_input.as_str().to_string(),
+                    limit: match context.discovery_limit {
+                        1..=64 => context.discovery_limit,
+                        _ => return Err(DirectiveError::ActionMismatch),
+                    },
+                }),
+                _ => Err(DirectiveError::ActionMismatch),
+            }
+        }
+        #[cfg(test)]
         Selection::RequestApproval {
             terminal_id,
             pending_candidate_id,
@@ -283,6 +366,7 @@ pub(crate) fn directive_from_selection(
                 },
             })
         }
+        #[cfg(test)]
         Selection::Abstain { action, reason_code } => {
             let candidate_id = CandidateId::new(*action, CapabilityTarget::None, None);
             require_pass(&candidate_id, decision)?;
@@ -303,6 +387,15 @@ pub(crate) fn directive_from_selection(
 
 /// The low-utility recovery may inspect only the validated chosen family.
 /// This narrows metadata search; it grants no execution authority.
+#[cfg(not(test))]
+pub(crate) const fn selected_discovery_family(
+    decision: &EngineDecision,
+) -> Result<Option<CapabilityTarget>, DirectiveError> {
+    let _ = decision;
+    Ok(None)
+}
+
+#[cfg(test)]
 pub(crate) fn selected_discovery_family(decision: &EngineDecision) -> Result<Option<CapabilityTarget>, DirectiveError> {
     if !matches!(
         decision.selection,
@@ -350,6 +443,7 @@ pub(crate) fn selected_discovery_family(decision: &EngineDecision) -> Result<Opt
 fn require_pass(candidate_id: &CandidateId, decision: &EngineDecision) -> Result<(), DirectiveError> {
     let (admitted, report) = match &decision.candidates {
         CandidateSet::Legal { candidates, report, .. } => (candidates, report),
+        #[cfg(test)]
         CandidateSet::NoLegalPath { terminals, report, .. } => (terminals, report),
     };
     if admitted
@@ -367,6 +461,7 @@ fn require_pass(candidate_id: &CandidateId, decision: &EngineDecision) -> Result
     }
 }
 
+#[cfg(test)]
 fn pending_approval<'a>(
     set: &'a CandidateSet,
     terminal_id: &CandidateId,
@@ -377,6 +472,7 @@ fn pending_approval<'a>(
             .get(terminal_id)?
             .iter()
             .find(|item| item.candidate.candidate_id() == pending_id),
+        #[cfg(test)]
         CandidateSet::NoLegalPath { approval_only, .. } => approval_only.iter().find(|item| {
             item.candidate.candidate_id() == pending_id
                 && CandidateId::new(CausalActionKind::RequestApproval, item.candidate.target(), None) == *terminal_id

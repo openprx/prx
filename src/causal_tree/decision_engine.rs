@@ -2,8 +2,11 @@
 //! The service owns hop/retrieval orchestration and the execution boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(test)]
 mod approval_selection_tests;
@@ -18,50 +21,80 @@ use super::branch::{
     ApprovalRequirement, CandidateId, CandidateSpec, CapabilityRef, CapabilityTarget, CausalActionKind,
     CausalCandidate, CostEstimate, SideEffectClass,
 };
-use super::candidate_generator::{
-    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs, DiscoveryFamilies, is_retrieval_source,
-};
+#[cfg(test)]
+use super::candidate_generator::{CandidatePolicy, CausalCandidateGenerator, DiscoveredRefs, is_retrieval_source};
+use super::candidate_generator::{CandidateSet, DiscoveryFamilies};
+#[cfg(test)]
 use super::config::CausalTreeConfig;
 #[cfg(test)]
+use super::decision_rehearsal::RehearsalError;
+#[cfg(test)]
 use super::decision_rehearsal::RehearsalEvidence;
-use super::decision_rehearsal::{BoundedRehearsal, RehearsalContext, RehearsalError, RehearsalPorts};
-use super::decision_score::{
-    CandidatePrediction, CandidateScore, CausalBranchScorer, ExtractionError, PredictionEvidence, ScoreError,
-    ScoreInputs, ScorerWeights,
-};
-use super::decision_select::{CausalSelector, SelectError, Selection, SelectorContext, terminal_abstain};
+#[cfg(test)]
+use super::decision_rehearsal::{BoundedRehearsal, RehearsalContext, RehearsalPorts};
+use super::decision_score::CandidateScore;
+#[cfg(test)]
+use super::decision_score::{CandidatePrediction, CausalBranchScorer, PredictionEvidence, ScoreInputs, ScorerWeights};
+#[cfg(test)]
+use super::decision_score::{ExtractionError, ScoreError};
+#[cfg(test)]
+use super::decision_select::SelectError;
+use super::decision_select::Selection;
+#[cfg(test)]
+use super::decision_select::{CausalSelector, SelectorContext, terminal_abstain};
+#[cfg(test)]
 use super::directive::{DirectiveContext, TurnExecutionDirective, directive_from_selection};
-use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
+#[cfg(test)]
+use super::gates::GateError;
+#[cfg(test)]
+use super::gates::{GateInputs, HardGates};
+use super::gates::{GateOutcome, GateReport};
 use super::ids::DecisionId;
-use super::questions::{CompileError, CompiledQuestionRequest, CompilerPolicy, QuestionCompiler};
+use super::questions::CompileError;
+#[cfg(test)]
+use super::questions::{CompiledQuestionRequest, CompilerPolicy, QuestionCompiler};
+use super::state::{CausalState, DuplicateCandidate};
+#[cfg(test)]
 use super::state::{
-    CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, ObservedStepKind, ObservedStepStatus,
-    SideEffectMode, TrustedParts,
+    DerivedCandidate, DerivedState, ObservedStepKind, ObservedStepStatus, SideEffectMode, TrustedParts,
 };
+#[cfg(test)]
 use crate::capability::CapabilityAvailabilityLevel;
+#[cfg(test)]
 use crate::decision::DecisionError;
 #[cfg(test)]
 use crate::decision::factory::DecisionBackendFactory;
 use crate::decision::factory::PredictionResult;
+#[cfg(test)]
 use crate::decision::telemetry::CausalLineage;
+#[cfg(test)]
 use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, RequestLimits, ValidatedDecision};
+#[cfg(test)]
 use crate::security::{AutonomyLevel, SecurityPolicy};
+#[cfg(test)]
 use crate::tools::capability::catalog::{CatalogView, Exposure};
-use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest, ChildManifestError};
+#[cfg(test)]
+use crate::tools::capability::child::CapabilityConstraints;
+use crate::tools::capability::child::{ChildCapabilityManifest, ChildManifestError};
+#[cfg(test)]
 use crate::tools::capability::search::CatalogSearch;
+#[cfg(test)]
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
 /// Borrowed prediction port owned by the engine domain. Its producer keeps
 /// physical accounting and transport outside the engine; no boxed future is
 /// introduced on builtin/cache or physical paths by this contract.
 pub(crate) mod prediction_sealed {
+    #[cfg(test)]
     pub(crate) trait Producer {}
 }
 
+#[cfg(test)]
 fn decision_now() -> Instant {
     super::logical_clock::now()
 }
 
+#[cfg(test)]
 pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
     fn remaining_budget(&self) -> Option<(u64, u64)>;
     fn terminal_fallback_cause(&self, result: &PredictionResult) -> Option<FallbackCause>;
@@ -72,6 +105,7 @@ pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sy
     ) -> impl std::future::Future<Output = Result<PredictionResult, DecisionError>> + Send + 'a;
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct EngineInputs<'a, 'catalog, P: PredictionPort> {
     pub state: &'a CausalState,
@@ -125,17 +159,20 @@ pub(crate) struct EngineDecision {
     pub request_compiled: bool,
     /// Code-only, numeric answers copied from the sealed validated response.
     /// Score legends and question bodies can contain user text and are omitted.
+    #[cfg(test)]
     pub audit_trace: Option<PredictionAuditTrace>,
     /// Why a conservative terminal fallback was selected. Retained for the decision record.
     pub fallback_cause: Option<FallbackCause>,
     pub scores: BTreeMap<CandidateId, CandidateScore>,
     /// Real scorer invocations, excluding zero placeholders after fallback.
+    #[cfg(test)]
     pub scored_count: usize,
     #[cfg(test)]
     pub rehearsal: BTreeMap<CandidateId, RehearsalEvidence>,
     pub post_rehearsal: GateReport,
     pub pre_commit: GateReport,
     /// Exact call inputs used by the final gate pass.
+    #[cfg(test)]
     pub call_fingerprints: BTreeMap<CandidateId, [u8; 32]>,
     /// A new sealed strict subset derived from the current turn's authority.
     pub outgoing_child: Option<ChildCapabilityManifest>,
@@ -144,6 +181,7 @@ pub(crate) struct EngineDecision {
 
 /// The validated backend answer as bounded audit data. Every key is a sealed
 /// question or option id, never model-authored text.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct PredictionAuditTrace {
     pub(crate) state_fingerprint: String,
@@ -156,6 +194,7 @@ pub(crate) struct PredictionAuditTrace {
     pub(crate) redacted_projection: Option<String>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for PredictionAuditTrace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PredictionAuditTrace")
@@ -167,6 +206,7 @@ impl std::fmt::Debug for PredictionAuditTrace {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) enum PredictionAuditAnswer {
     Choice {
@@ -184,6 +224,7 @@ pub(crate) enum PredictionAuditAnswer {
     },
 }
 
+#[cfg(test)]
 impl PredictionAuditTrace {
     fn capture(
         decision: &ValidatedDecision,
@@ -246,6 +287,7 @@ impl PredictionAuditTrace {
 /// A candidate set and derived state bound to the exact inputs of one hop.
 /// The runtime can compare its evidence before allowing another backend call,
 /// then consume the same preparation without regenerating candidates.
+#[cfg(test)]
 pub(crate) struct PreparedHop<'a, 'catalog, P: PredictionPort> {
     started_at: Instant,
     inputs: EngineInputs<'a, 'catalog, P>,
@@ -257,11 +299,14 @@ pub(crate) struct PreparedHop<'a, 'catalog, P: PredictionPort> {
     resume_target: Option<&'a CapabilityRef>,
 }
 
+#[cfg(test)]
 impl<P: PredictionPort> PreparedHop<'_, '_, P> {
+    #[cfg(test)]
     pub(crate) const fn candidate_count(&self) -> usize {
         self.all.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn evidence_fingerprint(&self) -> String {
         self.state.evidence_fingerprint(self.inputs.key)
     }
@@ -269,16 +314,19 @@ impl<P: PredictionPort> PreparedHop<'_, '_, P> {
     /// Candidate IDs do not encode the exact bound capability ref. A
     /// same-family discovery may change a legal candidate body without
     /// changing its ID, so the hop loop checks both forms of progress.
+    #[cfg(test)]
     pub(crate) fn candidate_bodies_changed_from(&self, prior: &CausalState) -> bool {
         self.state.derived.candidates() != prior.derived.candidates()
     }
 
+    #[cfg(test)]
     pub(crate) fn candidate_bodies_changed_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
         self.candidate_bodies_changed_from(&prior.state)
     }
 
     /// Selected discovery can authenticate an unchanged exact candidate.
     /// Compare borrowed readiness proofs, without creating new candidate sets.
+    #[cfg(test)]
     pub(crate) fn gained_direct_candidate_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
         gained_direct_candidate(
             &self.candidates,
@@ -313,6 +361,7 @@ pub(crate) struct RetrievalIssueError;
 
 /// Private fields prevent storage authority from being assembled by callers.
 /// The runtime phase, not this type alone, enforces exactly one issuance.
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 pub(crate) struct SelectedRouterReadGrant {
     decision_id: DecisionId,
@@ -326,8 +375,10 @@ pub(crate) struct SelectedRouterReadGrant {
     deadline: Instant,
 }
 
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 impl SelectedRouterReadGrant {
+    #[cfg(test)]
     pub(crate) fn matches_source(
         &self,
         workspace: &str,
@@ -342,6 +393,7 @@ impl SelectedRouterReadGrant {
             && self.run.as_ref() == run
             && Some(self.source.as_ref()) == source
     }
+    #[cfg(test)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -378,6 +430,7 @@ impl EngineDecision {
         let answer_id = answer.candidate_id().clone();
         let gates = GateReport {
             outcomes: BTreeMap::from([(answer_id.clone(), GateOutcome::Passed)]),
+            #[cfg(test)]
             gate_set_hash: [0; 32],
         };
         Self {
@@ -389,7 +442,9 @@ impl EngineDecision {
                 discoverable_families: DiscoveryFamilies::default(),
                 candidates: vec![answer],
                 exact_mentions: BTreeSet::new(),
+                #[cfg(test)]
                 truncated: Vec::new(),
+                #[cfg(test)]
                 approval_scopes: BTreeMap::new(),
                 report: gates.clone(),
             },
@@ -401,14 +456,17 @@ impl EngineDecision {
             exploration_propensities: BTreeMap::new(),
             prediction: None,
             request_compiled: false,
+            #[cfg(test)]
             audit_trace: None,
             fallback_cause: None,
             scores: BTreeMap::new(),
+            #[cfg(test)]
             scored_count: 0,
             #[cfg(test)]
             rehearsal: BTreeMap::new(),
             post_rehearsal: gates.clone(),
             pre_commit: gates,
+            #[cfg(test)]
             call_fingerprints: BTreeMap::new(),
             outgoing_child: None,
             outgoing_parent_allowed: None,
@@ -417,6 +475,7 @@ impl EngineDecision {
 
     /// The engine owns the backend attempt evidence; downstream directives
     /// may use this verdict only to narrow a selected recovery.
+    #[cfg(test)]
     pub(crate) fn served_prediction_succeeded(&self) -> bool {
         self.prediction
             .as_ref()
@@ -425,6 +484,7 @@ impl EngineDecision {
 
     /// Admit one exact read-only retrieval source after final-gated selection.
     /// The runtime still checks the source proof and deadline at the read.
+    #[cfg(test)]
     pub(crate) fn validate_selected_retrieval(
         &self,
         catalog: &CatalogView<'_>,
@@ -438,6 +498,7 @@ impl EngineDecision {
             .map(|(family, _)| family)
     }
 
+    #[cfg(test)]
     fn selected_retrieval(
         &self,
         catalog: &CatalogView<'_>,
@@ -484,6 +545,7 @@ impl EngineDecision {
 
     /// Runtime calls this only while consuming its unique Pending routing
     /// phase. The opaque grant cannot be constructed from a caller enum.
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) fn issue_selected_router_read(
         &self,
@@ -515,6 +577,7 @@ impl EngineDecision {
 
     /// Issue exact refs only after final-gated conversion selected Discover.
     /// The search is local metadata work over the same pinned filtered view.
+    #[cfg(test)]
     pub(crate) fn issue_selected_discovery(
         &self,
         catalog: &CatalogView<'_>,
@@ -591,9 +654,13 @@ impl EngineDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackCause {
+    #[cfg(test)]
     NoLegalPath,
+    #[cfg(test)]
     ExpiredBeforePrediction,
+    #[cfg(test)]
     DecisionFailed,
+    #[cfg(test)]
     DeadlineExceeded,
     HopStopped,
 }
@@ -602,34 +669,45 @@ pub(crate) enum FallbackCause {
 pub(crate) enum EngineError {
     #[error("state fingerprint serialization failed")]
     Fingerprint(#[source] serde_json::Error),
+    #[cfg(test)]
     #[error(transparent)]
     Gates(#[from] GateError),
     #[error(transparent)]
     Derived(#[from] DuplicateCandidate),
     #[error(transparent)]
     Compiler(#[from] CompileError),
+    #[cfg(test)]
     #[error(transparent)]
     Extraction(#[from] ExtractionError),
+    #[cfg(test)]
     #[error(transparent)]
     Rehearsal(#[from] RehearsalError),
+    #[cfg(test)]
     #[error(transparent)]
     Score(#[from] ScoreError),
+    #[cfg(test)]
     #[error(transparent)]
     Selection(#[from] SelectError),
+    #[cfg(test)]
     #[error("candidate body or approval scope changed within the pinned turn")]
     CandidateDrift,
+    #[cfg(test)]
     #[error("candidate effect understates a pinned capability effect")]
     EffectUnderstated,
+    #[cfg(test)]
     #[error("an admitted candidate has no cost or latency estimate")]
     MissingEstimate,
+    #[cfg(test)]
     #[error("outgoing child authority does not match this turn")]
     InvalidDelegation,
     #[error(transparent)]
     ChildManifest(#[from] ChildManifestError),
 }
 
+#[cfg(test)]
 pub(crate) struct CausalDecisionEngine;
 
+#[cfg(test)]
 impl CausalDecisionEngine {
     #[cfg(test)]
     pub(crate) async fn decide_once<P: PredictionPort>(
@@ -638,6 +716,7 @@ impl CausalDecisionEngine {
         Self::decide_prepared(Self::prepare_hop(inputs)?).await
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_hop<'a, 'catalog, P: PredictionPort>(
         inputs: &EngineInputs<'a, 'catalog, P>,
     ) -> Result<PreparedHop<'a, 'catalog, P>, EngineError> {
@@ -646,6 +725,7 @@ impl CausalDecisionEngine {
 
     /// Only a caller with authenticated, current-snapshot resume evidence may
     /// restore this exact candidate. All normal preparation and gates remain.
+    #[cfg(test)]
     pub(crate) fn prepare_hop_with_resume_target<'a, 'catalog, P: PredictionPort>(
         inputs: &EngineInputs<'a, 'catalog, P>,
         resume_target: Option<&'a crate::causal_tree::branch::CapabilityRef>,
@@ -725,6 +805,7 @@ impl CausalDecisionEngine {
 
     /// Select a freshly gated terminal after a read hop stops. This path
     /// consumes a terminal-only preparation and never calls a backend.
+    #[cfg(test)]
     pub(crate) fn decide_terminal_prepared<P: PredictionPort>(
         prepared: PreparedHop<'_, '_, P>,
     ) -> Result<EngineDecision, EngineError> {
@@ -739,6 +820,7 @@ impl CausalDecisionEngine {
     }
 
     /// A forced gate closure cannot enter confidence recovery.
+    #[cfg(test)]
     pub(crate) fn decide_terminal_for_reason<P: PredictionPort>(
         prepared: PreparedHop<'_, '_, P>,
         reason: &'static str,
@@ -830,6 +912,7 @@ impl CausalDecisionEngine {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn decide_prepared<P: PredictionPort>(
         prepared: PreparedHop<'_, '_, P>,
     ) -> Result<EngineDecision, EngineError> {
@@ -1185,6 +1268,7 @@ impl CausalDecisionEngine {
     }
 }
 
+#[cfg(test)]
 fn remaining_budget<P: PredictionPort>(
     inputs: &EngineInputs<'_, '_, P>,
     state: &CausalState,
@@ -1206,6 +1290,7 @@ fn remaining_budget<P: PredictionPort>(
     remaining
 }
 
+#[cfg(test)]
 fn derive_outgoing_child(
     decision_id: DecisionId,
     decision_key: &DecisionKey,
@@ -1240,6 +1325,7 @@ fn derive_outgoing_child(
         .map_err(EngineError::from)
 }
 
+#[cfg(test)]
 pub(crate) fn authority_within_policy(
     parent: &CapabilityConstraints,
     trusted: &TrustedParts,
@@ -1258,6 +1344,7 @@ pub(crate) fn authority_within_policy(
         && parent.authority.remaining_depth <= max_depth
 }
 
+#[cfg(test)]
 fn validate_delegation_refs(
     parent: &CapabilityConstraints,
     catalog: &CatalogView<'_>,
@@ -1287,6 +1374,7 @@ fn validate_delegation_refs(
     Ok(())
 }
 
+#[cfg(test)]
 const fn is_terminal(action: CausalActionKind) -> bool {
     matches!(
         action,
@@ -1294,6 +1382,7 @@ const fn is_terminal(action: CausalActionKind) -> bool {
     )
 }
 
+#[cfg(test)]
 fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<DerivedState, DuplicateCandidate> {
     let CandidateSet::Legal {
         candidates,
@@ -1342,6 +1431,7 @@ fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<Derived
     )
 }
 
+#[cfg(test)]
 fn gate_candidates(set: &CandidateSet) -> Result<Vec<CausalCandidate>, EngineError> {
     let mut all = Vec::new();
     let mut seen = BTreeMap::<CandidateId, CausalCandidate>::new();
@@ -1385,6 +1475,7 @@ fn gate_candidates(set: &CandidateSet) -> Result<Vec<CausalCandidate>, EngineErr
     Ok(all)
 }
 
+#[cfg(test)]
 fn validate_effect(candidate: &CausalCandidate, catalog: &CatalogView<'_>) -> Result<(), EngineError> {
     for reference in candidate.required_capabilities() {
         if reference.generation != catalog.generation() {
@@ -1408,6 +1499,7 @@ fn validate_effect(candidate: &CausalCandidate, catalog: &CatalogView<'_>) -> Re
 
 /// A later pass may narrow a candidate, never restore one that failed after
 /// rehearsal. Approval OpIds must match in both passes.
+#[cfg(test)]
 fn meet_gate_reports(post: &GateReport, mut current: GateReport) -> Result<GateReport, EngineError> {
     if post.gate_set_hash != current.gate_set_hash || post.outcomes.len() != current.outcomes.len() {
         return Err(EngineError::CandidateDrift);
@@ -1435,6 +1527,7 @@ fn meet_gate_reports(post: &GateReport, mut current: GateReport) -> Result<GateR
 }
 
 /// Preserve the runtime's lazy evidence, candidate-body, readiness order.
+#[cfg(test)]
 pub(crate) fn discovery_has_no_progress(
     same_evidence: impl FnOnce() -> bool,
     same_candidate_bodies: impl FnOnce() -> bool,
@@ -1443,6 +1536,7 @@ pub(crate) fn discovery_has_no_progress(
     same_evidence() && same_candidate_bodies() && !gained_direct_readiness()
 }
 
+#[cfg(test)]
 fn gained_direct_candidate(
     current: &CandidateSet,
     previous: &CandidateSet,
@@ -1467,6 +1561,7 @@ fn gained_direct_candidate(
     })
 }
 
+#[cfg(test)]
 fn candidate_is_direct(
     candidate: &CausalCandidate,
     catalog: &CatalogView<'_>,
@@ -1505,6 +1600,7 @@ fn candidate_is_direct(
     })
 }
 
+#[cfg(test)]
 fn exact_candidate_without_discovery_is_current(
     candidate: &CausalCandidate,
     catalog: &CatalogView<'_>,
@@ -1526,6 +1622,7 @@ fn exact_candidate_without_discovery_is_current(
         })
 }
 
+#[cfg(test)]
 fn selector_context(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
@@ -1572,6 +1669,7 @@ fn selector_context(
 
 /// A named Skill and its registered read-only loader describe one operation.
 /// Distinct skills remain distinct even when they share that loader.
+#[cfg(test)]
 fn single_exact_capability(catalog: &CatalogView<'_>, routing_input: &str) -> bool {
     let folded = routing_input.to_lowercase();
     catalog
@@ -1582,6 +1680,7 @@ fn single_exact_capability(catalog: &CatalogView<'_>, routing_input: &str) -> bo
         == 1
 }
 
+#[cfg(test)]
 fn selector_context_for_state(
     state: &CausalState,
     set: &CandidateSet,
@@ -1654,6 +1753,7 @@ fn selector_context_for_state(
     context
 }
 
+#[cfg(test)]
 fn selector_context_for_config(
     set: &CandidateSet,
     catalog: &CatalogView<'_>,
@@ -1702,6 +1802,7 @@ fn selector_context_for_config(
     context
 }
 
+#[cfg(test)]
 fn empty_evidence() -> PredictionEvidence {
     PredictionEvidence {
         candidates: BTreeMap::<CandidateId, CandidatePrediction>::new(),
@@ -1715,6 +1816,7 @@ fn empty_evidence() -> PredictionEvidence {
     }
 }
 
+#[cfg(test)]
 fn terminal_evidence(set: &CandidateSet) -> PredictionEvidence {
     let mut evidence = empty_evidence();
     if let CandidateSet::Legal { candidates, .. } = set {
@@ -1736,6 +1838,7 @@ fn terminal_evidence(set: &CandidateSet) -> PredictionEvidence {
     evidence
 }
 
+#[cfg(test)]
 fn lineage(trusted: &super::state::TrustedParts) -> CausalLineage {
     CausalLineage {
         workspace_id: Arc::clone(&trusted.workspace_id),

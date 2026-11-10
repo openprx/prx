@@ -29,6 +29,7 @@ pub(in crate::runtime::turn_decision) struct DiscoveryAdmission {
 }
 
 impl TurnDecisionContext {
+    #[cfg(test)]
     pub(in crate::runtime::turn_decision) fn has_discovery_admission(&self, reference: &CapabilityRef) -> bool {
         self.discovery_admissions.get().is_some_and(|admissions| {
             admissions

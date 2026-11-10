@@ -54,6 +54,7 @@ impl RouterHistoryDomain {
 }
 
 /// Authenticated source binding for a history read, independent of selection.
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 pub(crate) struct RouterReadScope {
     event_id: String,
@@ -63,8 +64,10 @@ pub(crate) struct RouterReadScope {
     deadline: Instant,
 }
 
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 impl RouterReadScope {
+    #[cfg(test)]
     pub(crate) fn from_source(
         source: &dyn crate::runtime::turn_source::TurnSourceProof,
         domain: RouterHistoryDomain,
@@ -134,6 +137,7 @@ pub struct RouterHistoryReadEvidence {
 }
 
 impl RouterHistoryReadEvidence {
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) fn from_scope(
         scope: RouterReadScope,

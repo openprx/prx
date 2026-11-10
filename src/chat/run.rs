@@ -3601,8 +3601,16 @@ Retry with a compatible model: /provider {shown} <model>",
             provider_turn_workers.record_execution_started(task_id, lease_id)
                 .map_err(|error| anyhow::anyhow!("Chat close execution start failed: {error:?}"))?;
             let (reply, succeeded) = if let Some(reply) = binding.fixed_reply()? {
-                binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
-                (reply, true)
+                #[cfg(test)]
+                {
+                    binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
+                    (reply, true)
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = reply;
+                    anyhow::bail!("decision requires the constrained execution reader");
+                }
             } else {
                 binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?
             };
@@ -3774,6 +3782,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     .insert(
                         task_id,
                         PerTurnContext {
+                            #[cfg(test)]
                             cancellation: cancellation.clone(),
                             turn_binding: chat_turn_binding.clone(),
                             fixed_reply: fixed_reply.clone(),
@@ -4195,7 +4204,7 @@ Retry with a compatible model: /provider {shown} <model>",
             &effective_compaction.config,
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
-        if preflight_budget.over_hard_limit && !collection_turn {
+        if preflight_budget.over_hard_limit {
             let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);

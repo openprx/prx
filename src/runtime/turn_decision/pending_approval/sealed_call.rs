@@ -2,11 +2,16 @@
 //! decision key. The outer pending MAC also authenticates the ciphertext.
 use super::{PendingRecord, TurnDecisionService, VerifiedPendingDecisionApproval};
 use anyhow::Context;
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
-use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+#[cfg(test)]
+use chacha20poly1305::AeadCore;
+#[cfg(test)]
+use chacha20poly1305::aead::OsRng;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+#[cfg(test)]
 use crate::security::approval_ledger::pending::EncryptedCall;
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +41,7 @@ impl TurnDecisionService {
         Ok(ChaCha20Poly1305::new(Key::from_slice(key.as_ref())))
     }
 
+    #[cfg(test)]
     pub(super) fn seal_pending_call(
         &self,
         record: &PendingRecord,

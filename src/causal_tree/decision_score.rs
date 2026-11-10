@@ -3,21 +3,29 @@
 //! This module is independent of the `llm-router`-only legacy scorer. The
 //! decision service consumes these scores after the post-rehearsal gates.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use super::branch::{CandidateId, CapabilityTarget, CausalActionKind, SideEffectClass};
+#[cfg(test)]
 use super::candidate_generator::CandidateSet;
+#[cfg(test)]
 use super::config::ScoringConfig;
+#[cfg(test)]
 use super::questions::{CompiledQuestionRequest, hash_candidate_set};
+#[cfg(test)]
 use crate::decision::{
     CandidateQuestion, DecisionAnswer, GlobalQuestion, OmissionReason, OptionId, QuestionId, ScoreAnswer,
     ValidatedDecision,
 };
 
 pub(crate) const SCORER_VERSION: &str = "scorer-v1";
+#[cfg(test)]
 const VERSION: &str = SCORER_VERSION;
 
 /// Prediction features extracted from a validated decision response.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CandidatePrediction {
     pub choice_probability: f64,
@@ -31,6 +39,7 @@ pub(crate) struct CandidatePrediction {
 
 /// Global abstention evidence and normalized per-candidate features. Choice
 /// confidence is deliberately separate from each candidate's probability.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct PredictionEvidence {
     pub candidates: BTreeMap<CandidateId, CandidatePrediction>,
@@ -43,6 +52,7 @@ pub(crate) struct PredictionEvidence {
     pub needs_fresh_state: f64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ExtractionError {
     #[error("decision response belongs to another request")]
@@ -59,7 +69,9 @@ pub(crate) enum ExtractionError {
     DuplicateCandidate,
 }
 
+#[cfg(test)]
 impl PredictionEvidence {
+    #[cfg(test)]
     pub(crate) fn extract(
         decision: &ValidatedDecision,
         compiled: &CompiledQuestionRequest,
@@ -170,6 +182,7 @@ impl PredictionEvidence {
     }
 }
 
+#[cfg(test)]
 const fn is_terminal(action: CausalActionKind) -> bool {
     matches!(
         action,
@@ -177,6 +190,7 @@ const fn is_terminal(action: CausalActionKind) -> bool {
     )
 }
 
+#[cfg(test)]
 const fn risk_floor(effect: SideEffectClass) -> f64 {
     match effect {
         SideEffectClass::ReadOnly => 0.0,
@@ -188,6 +202,7 @@ const fn risk_floor(effect: SideEffectClass) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn choice(
     decision: &ValidatedDecision,
     compiled: &CompiledQuestionRequest,
@@ -215,6 +230,7 @@ fn choice(
     }
 }
 
+#[cfg(test)]
 fn noul(decision: &ValidatedDecision, id: QuestionId) -> Result<f64, ExtractionError> {
     match decision.answer(&id) {
         Some(DecisionAnswer::Noul(answer)) => Ok(answer.probability_true.get()),
@@ -223,6 +239,7 @@ fn noul(decision: &ValidatedDecision, id: QuestionId) -> Result<f64, ExtractionE
     }
 }
 
+#[cfg(test)]
 fn score_answer(decision: &ValidatedDecision, id: QuestionId) -> Result<(f64, f64), ExtractionError> {
     match decision.answer(&id) {
         Some(DecisionAnswer::Score(answer)) => Ok(normalized_score(answer)),
@@ -231,6 +248,7 @@ fn score_answer(decision: &ValidatedDecision, id: QuestionId) -> Result<(f64, f6
     }
 }
 
+#[cfg(test)]
 fn normalized_score(answer: &ScoreAnswer) -> (f64, f64) {
     let max_level = answer.distribution.len().saturating_sub(1) as f64;
     if max_level == 0.0 {
@@ -249,6 +267,7 @@ fn normalized_score(answer: &ScoreAnswer) -> (f64, f64) {
 
 /// The scorer's immutable policy snapshot. Positive weights sum to one;
 /// penalties are independently bounded so each input stays interpretable.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ScorerWeights {
     pub version: &'static str,
@@ -263,6 +282,7 @@ pub(crate) struct ScorerWeights {
     pub w_rehearsal: f64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ScoreError {
     #[error("unsupported scorer version")]
@@ -273,7 +293,9 @@ pub(crate) enum ScoreError {
     NonFinite,
 }
 
+#[cfg(test)]
 impl ScorerWeights {
+    #[cfg(test)]
     pub(crate) fn effective(config: &ScoringConfig) -> Result<Self, ScoreError> {
         if config.version.as_deref().is_some_and(|version| version != VERSION) {
             return Err(ScoreError::Version);
@@ -317,6 +339,7 @@ impl ScorerWeights {
 
 /// Trusted costs and bounded read-only rehearsal evidence, normalized by
 /// the scorer against this turn's remaining budgets.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScoreInputs {
     pub estimated_micro_usd: u64,
@@ -332,9 +355,12 @@ pub(crate) struct CandidateScore {
     pub execution_utility: f64,
 }
 
+#[cfg(test)]
 pub(crate) struct CausalBranchScorer;
 
+#[cfg(test)]
 impl CausalBranchScorer {
+    #[cfg(test)]
     pub(crate) fn score(
         prediction: CandidatePrediction,
         inputs: ScoreInputs,
@@ -386,6 +412,7 @@ impl CausalBranchScorer {
     }
 }
 
+#[cfg(test)]
 fn normalized_ratio(estimate: u64, remaining: u64) -> f64 {
     if remaining == 0 {
         f64::from(estimate != 0)

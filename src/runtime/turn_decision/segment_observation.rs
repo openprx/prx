@@ -3,7 +3,7 @@
 use super::AgentDecisionError;
 use crate::causal_tree::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::runtime::turn_source::OwnedTurnSourceProof;
+use crate::runtime::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use anyhow::{Context, ensure};
 use std::sync::Arc;
 use std::time::Instant;

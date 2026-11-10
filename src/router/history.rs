@@ -63,6 +63,7 @@ impl RouterHistory {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn query_deadline(&self, turn_deadline: std::time::Instant) -> Result<std::time::Instant> {
         let local = crate::causal_tree::logical_clock::now()
             .checked_add(self.query_timeout)
@@ -106,6 +107,7 @@ impl RouterHistory {
 
     /// Rank a complete authorized history domain, keeping provider/model pairs
     /// distinct. Failed records still count toward the original KNN threshold.
+    #[cfg(test)]
     pub(crate) async fn scoped_similarity(
         &self,
         read: &crate::memory::RouterHistoryRead,

@@ -291,6 +291,7 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 /// signal is aggregated, kept deliberately lightweight).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolLoopTrace {
+    #[cfg(test)]
     pub decision_brief_sha256: Option<String>,
     /// Parameters prepared by real request serializers, in preparation order.
     pub prepared_parameters: Vec<crate::providers::catalog::parameters::ResolvedParameters>,

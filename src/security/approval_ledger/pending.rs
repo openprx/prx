@@ -4,7 +4,9 @@ use super::keys::{ApprovalAuthority, DecisionAuthority};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject};
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
-use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
+#[cfg(test)]
+use crate::memory::MemoryFabric;
+use crate::memory::{MessageEvent, MessageEventScope};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -327,6 +329,7 @@ impl ApprovalLedger<'_> {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn persist_pending_record_receipt(
         &self,
         record: PendingRecord,

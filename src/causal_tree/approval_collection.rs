@@ -23,6 +23,7 @@ impl std::fmt::Debug for DeferredArgumentProof {
     }
 }
 impl DeferredArgumentProof {
+    #[cfg(test)]
     pub(super) const fn issue(
         capability: CapabilityRef,
         adapter: ApprovalReviewAdapter,
@@ -43,12 +44,15 @@ impl DeferredArgumentProof {
     ) -> Self {
         Self::issue(capability, adapter, state_fingerprint)
     }
+    #[cfg(test)]
     pub(crate) const fn capability(&self) -> &CapabilityRef {
         &self.capability
     }
+    #[cfg(test)]
     pub(crate) const fn adapter(&self) -> ApprovalReviewAdapter {
         self.adapter
     }
+    #[cfg(test)]
     pub(crate) fn state_fingerprint(&self) -> &str {
         &self.state_fingerprint
     }

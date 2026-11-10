@@ -119,6 +119,7 @@ impl DurableCausalEventSink {
 
     /// A source-bound admission may defer only its own ordinary events. Drain
     /// overrides that preference; deferral expires at the admission deadline.
+    #[cfg(test)]
     pub(super) fn defer_ordinary_persistence(&self, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
         self.deferral.begin(lineage, deadline)
     }
@@ -140,6 +141,7 @@ impl DurableCausalEventSink {
     /// Admission is the cancellation boundary: an admitted verified event
     /// persists as completion telemetry even if the caller later cancels.
     /// Queue or store failure never changes an already committed close.
+    #[cfg(test)]
     pub(super) fn emit_applied(&self, application: VerifiedDirectiveApplication) {
         let (event, idempotency_key, original_generation) = application.into_parts();
         let lineage = event.lineage.clone();

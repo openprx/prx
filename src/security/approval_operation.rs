@@ -280,6 +280,7 @@ fn skills_manage_lifecycle_operation(
 
 /// The `skills_manage` actions the tool accepts only under a grant bound to
 /// their target. A unit test pins this list to the table above.
+#[cfg(test)]
 pub(crate) const SKILLS_MANAGE_GRANT_BOUND_ACTIONS: [&str; 12] = [
     "lifecycle_publish",
     "lifecycle_rollback",

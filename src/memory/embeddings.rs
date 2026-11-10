@@ -92,6 +92,7 @@ impl LocalHashEmbedding {
     /// The source-owned Router path never launches a detached blocking job.
     /// Cooperative checkpoints bound cancellation latency while retaining the
     /// exact feature hashing and normalization of the ordinary embedding API.
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) async fn embed_router_until(
         &self,

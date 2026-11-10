@@ -182,6 +182,7 @@ impl ChildCompletionPort {
         turn.complete(outcome, trace).await.map(|_| ())
     }
 
+    #[cfg(test)]
     pub(crate) async fn close(
         &self,
         turn: &crate::runtime::child_turn::ChildSegmentTurn,

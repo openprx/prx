@@ -114,6 +114,7 @@ pub(crate) async fn chat_traced(
     .await
     .map_err(|_| AccountingRefusal)?
 }
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 pub(crate) async fn embed(
     provider: &dyn crate::memory::embeddings::EmbeddingProvider,

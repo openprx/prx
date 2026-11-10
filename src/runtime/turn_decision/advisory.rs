@@ -98,6 +98,7 @@ impl TurnDecisionService {
                 .iter()
                 .map(|candidate| candidate.candidate_id().key())
                 .collect::<Vec<_>>(),
+            #[cfg(test)]
             _ => Vec::new(),
         };
         let mut answers = BTreeMap::new();

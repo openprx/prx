@@ -1,28 +1,36 @@
 //! Bounded metadata-only rehearsal. These probes cannot execute a candidate,
 //! refresh a catalog, read a Skill body, or grant selection authority.
 
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::time::Duration;
 
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
 use super::branch::{
     CandidateId, CapabilityRef, CapabilityTarget, CatalogGeneration, CausalActionKind, CausalCandidate, SideEffectClass,
 };
+#[cfg(test)]
 use crate::tools::capability::catalog::CatalogView;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PinnedCount {
     pub generation: CatalogGeneration,
     pub present: u32,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("rehearsal probe unavailable")]
 pub(crate) struct ProbeUnavailable;
 
 /// The adapter resolves an opaque query reference locally and returns only a
 /// count. Neither query text nor memory content crosses this interface.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait MemoryProbe: Send + Sync {
     async fn count_hits(
@@ -36,6 +44,7 @@ pub(crate) trait MemoryProbe: Send + Sync {
 
 /// Reads availability from the pinned catalog snapshot. Implementations must
 /// not refresh MCP, start a process, or discover another generation.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait CatalogProbe: Send + Sync {
     async fn availability(
@@ -46,6 +55,7 @@ pub(crate) trait CatalogProbe: Send + Sync {
 }
 
 /// Reads cataloged Skill metadata only; no body loader is exposed.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait SkillProbe: Send + Sync {
     async fn metadata(
@@ -55,12 +65,14 @@ pub(crate) trait SkillProbe: Send + Sync {
     ) -> Result<PinnedCount, ProbeUnavailable>;
 }
 
+#[cfg(test)]
 pub(crate) struct RehearsalPorts<'a> {
     pub memory: Option<&'a dyn MemoryProbe>,
     pub catalog: Option<&'a dyn CatalogProbe>,
     pub skill: Option<&'a dyn SkillProbe>,
 }
 
+#[cfg(test)]
 pub(crate) struct RehearsalContext<'a> {
     pub principal: &'a str,
     pub query_ref: [u8; 32],
@@ -70,6 +82,7 @@ pub(crate) struct RehearsalContext<'a> {
     pub deadline: tokio::time::Instant,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RehearsalStatus {
     MemoryHits { hits: u32, limit: u32 },
@@ -80,6 +93,7 @@ pub(crate) enum RehearsalStatus {
     TimedOut,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RehearsalEvidence {
     pub status: RehearsalStatus,
@@ -88,7 +102,9 @@ pub(crate) struct RehearsalEvidence {
     pub bounded_delta: f64,
 }
 
+#[cfg(test)]
 impl RehearsalEvidence {
+    #[cfg(test)]
     fn new(status: RehearsalStatus) -> Self {
         let bounded_delta = match status {
             RehearsalStatus::MemoryHits { hits, limit } if limit > 0 => {
@@ -107,15 +123,19 @@ impl RehearsalEvidence {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RehearsalError {
     #[error("rehearsal candidate ids must be unique")]
     DuplicateCandidate,
 }
 
+#[cfg(test)]
 pub(crate) struct BoundedRehearsal;
 
+#[cfg(test)]
 impl BoundedRehearsal {
+    #[cfg(test)]
     pub(crate) async fn run(
         candidates: &[CausalCandidate],
         catalog: &CatalogView<'_>,
@@ -137,6 +157,7 @@ impl BoundedRehearsal {
 
 /// The stage cap, and never longer than the decision deadline.
 /// A logical clock spends the cap in logical time.
+#[cfg(test)]
 async fn stage_wait<T>(
     context: &RehearsalContext<'_>,
     stage_deadline: tokio::time::Instant,
@@ -153,6 +174,7 @@ async fn stage_wait<T>(
     }
 }
 
+#[cfg(test)]
 async fn probe_one(
     candidate: &CausalCandidate,
     catalog: &CatalogView<'_>,

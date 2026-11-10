@@ -53,9 +53,12 @@ pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router
 mod latency_snapshot;
 #[cfg(feature = "llm-router")]
 mod routing;
+#[cfg(all(test, feature = "llm-router"))]
+pub(crate) use routing::RouterModelReadmission;
 #[cfg(feature = "llm-router")]
-pub(crate) use routing::{RouterModelReadmission, commit_training_owned};
+pub(crate) use routing::commit_training_owned;
 
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 #[inline(never)]
 fn boxed_router_history_field<'a, F>(
@@ -69,6 +72,7 @@ where
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,34 +86,47 @@ use crate::capability::CapabilityAvailabilityLevel;
 use crate::causal_tree::branch::{
     CandidateSpec, CapabilityRef, CapabilityTarget, CatalogGeneration, CausalActionKind, CausalCandidate,
 };
-use crate::causal_tree::candidate_generator::{CandidateSet, DiscoveredRefs};
-use crate::causal_tree::decision_engine::{
-    CausalDecisionEngine, DiscoveryIssueError, EngineDecision, EngineError, EngineInputs, RetrievalIssueError,
-};
+use crate::causal_tree::candidate_generator::CandidateSet;
+#[cfg(test)]
+use crate::causal_tree::candidate_generator::DiscoveredRefs;
+#[cfg(test)]
+use crate::causal_tree::decision_engine::{CausalDecisionEngine, EngineInputs};
+use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, EngineError, RetrievalIssueError};
+#[cfg(test)]
 use crate::causal_tree::decision_rehearsal::RehearsalPorts;
+#[cfg(test)]
 use crate::causal_tree::decision_rehearsal::{CatalogProbe, MemoryProbe, PinnedCount, ProbeUnavailable, SkillProbe};
-use crate::causal_tree::directive::{
-    DirectiveContext, DirectiveError, TurnExecutionDirective, directive_from_selection, render_terminal_directive,
-    selected_discovery_family,
-};
+#[cfg(test)]
+use crate::causal_tree::directive::render_terminal_directive;
+#[cfg(test)]
+use crate::causal_tree::directive::{DirectiveContext, directive_from_selection};
+use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective, selected_discovery_family};
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::outcome::{DecisionRecordBuilder, OutcomeCorrelator, RecordBuildError, TerminalFacts};
 use crate::causal_tree::state::{
-    CausalState, DeliveryConstraints, DerivedState, HopLineage, ObservedArtifact, ObservedArtifactKind, ObservedState,
-    ObservedStep, ObservedStepKind, ObservedStepStatus, RawRoutingInput, TrustedParts, TrustedState, TurnBudgets,
-    TurnSurfaceKind,
+    CausalState, DeliveryConstraints, DerivedState, HopLineage, RawRoutingInput, TrustedParts, TrustedState,
+    TurnBudgets, TurnSurfaceKind,
 };
+#[cfg(test)]
+use crate::causal_tree::state::{ObservedArtifact, ObservedArtifactKind};
+#[cfg(test)]
+use crate::causal_tree::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Enqueue, Retention, StoreError, StoreMode};
 use crate::config::ConfigGeneration;
+#[cfg(test)]
+use crate::decision::RequestLimits;
+#[cfg(test)]
 use crate::decision::builtin::weights::STALE_ARTIFACT_MS;
 use crate::decision::factory::{
     BackendPlaneStatus, DecisionBackendFactory, DecisionTransports, FactoryBuildError, FactoryDeps,
 };
 use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage};
-use crate::decision::{DecisionKey, KeyDomain, RequestLimits};
+use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::Memory;
+#[cfg(test)]
 use crate::memory::principal::MemoryWriteContext;
+#[cfg(test)]
 use crate::memory::traits::DecisionMemoryHit;
 use crate::providers::catalog::{CatalogView as ProviderCatalogView, Requirement, ResolvedModel, UnknownPolicy};
 use crate::security::SecurityPolicy;
@@ -279,12 +296,14 @@ pub(crate) struct DecisionPlaneStatus {
 
 /// Metadata-only rehearsal over the already pinned, filtered catalog view.
 /// It never refreshes MCP or starts a discovery process.
+#[cfg(test)]
 struct PinnedCatalogRehearsal<'view, 'catalog> {
     catalog: &'view CatalogView<'catalog>,
 }
 
 /// A query and visibility scope captured by the authenticated CLI ingress.
 /// The opaque probe arguments can only name this exact source-owned query.
+#[cfg(test)]
 struct ScopedMemoryRehearsal<'a> {
     memory: &'a dyn Memory,
     scope: &'a MemoryWriteContext,
@@ -293,6 +312,7 @@ struct ScopedMemoryRehearsal<'a> {
     key: &'a DecisionKey,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl MemoryProbe for ScopedMemoryRehearsal<'_> {
     async fn count_hits(
@@ -316,7 +336,9 @@ impl MemoryProbe for ScopedMemoryRehearsal<'_> {
     }
 }
 
+#[cfg(test)]
 impl PinnedCatalogRehearsal<'_, '_> {
+    #[cfg(test)]
     fn count(
         &self,
         generation: CatalogGeneration,
@@ -346,6 +368,7 @@ impl PinnedCatalogRehearsal<'_, '_> {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl CatalogProbe for PinnedCatalogRehearsal<'_, '_> {
     async fn availability(
@@ -357,6 +380,7 @@ impl CatalogProbe for PinnedCatalogRehearsal<'_, '_> {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl SkillProbe for PinnedCatalogRehearsal<'_, '_> {
     async fn metadata(
@@ -400,6 +424,7 @@ impl TurnDecisionService {
             .with_surface(&self.publication_policy)
     }
 
+    #[cfg(test)]
     fn emit_agent_phase(
         &self,
         proof: &dyn TurnSourceProof,
@@ -690,6 +715,7 @@ pub(crate) struct TurnDecisionContext {
     main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     execution_closed: Arc<AtomicBool>,
+    #[cfg(test)]
     approval_collection_started: AtomicBool,
     collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
     discovery_offers: std::sync::OnceLock<Arc<parking_lot::Mutex<discovery::DiscoveryOffers>>>,
@@ -704,7 +730,7 @@ pub(crate) struct TurnDecisionContext {
     execution_refs: BTreeSet<CapabilityRef>,
     #[cfg(test)]
     selected_retrieved: Vec<ObservedArtifact>,
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(test, feature = "llm-router"))]
     router_transition: Option<Arc<routing::RouterTransition>>,
 }
 
@@ -721,12 +747,16 @@ fn unprompted_admission_ids(
 }
 
 pub(crate) enum TurnDisposition {
-    Close { reply: std::borrow::Cow<'static, str> },
+    #[cfg(test)]
+    Close {
+        reply: std::borrow::Cow<'static, str>,
+    },
     Run,
 }
 
 /// CDP-23 supplies the durable terminal adapter. The service passes no caller
 /// chosen scope, terminal ID, or reply text across this boundary.
+#[cfg(test)]
 #[async_trait::async_trait]
 pub(crate) trait CloseTurnPorts: Send + Sync {
     type Receipt: Send;
@@ -814,6 +844,7 @@ impl TurnDecisionService {
     /// Close an authenticated fixed terminal through its owning service.
     /// Applied telemetry is queued only after a matching durable receipt;
     /// persistence failure is reported as incomplete and remains retryable.
+    #[cfg(test)]
     pub(crate) async fn close_agent_directive_turn<P>(
         &self,
         proof: &dyn TurnSourceProof,
@@ -851,86 +882,95 @@ impl TurnDecisionService {
                 && context.hop_ids().last().copied() == Some(context.decision_id()),
             "closing decision does not match its source-owned turn"
         );
-        let TurnDisposition::Close { reply } = context.disposition()? else {
+        #[cfg(not(test))]
+        {
+            let _ = (ports, cancellation);
             anyhow::bail!("decision requires the constrained execution reader");
-        };
-        anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
-        let eligible = self.generation.effective.causal_tree.enabled
-            && self.durable_key
-            && self.recordable
-            && context.record_admitted.load(Ordering::Acquire)
-            && self.store.mode() == StoreMode::ReadWrite
-            && self.durable_events.is_some();
-        if eligible {
-            self.settlement_ref(Arc::clone(&context))?
-                .validate_durable_chain()
-                .await?;
         }
-        anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
-        let receipt = ports.finalize_closed_turn(Arc::clone(&context), &reply).await?;
-        // Cancellation can leave an actually committed marker. Do not claim
-        // application from this cancelled helper or pretend to undo that I/O.
-        anyhow::ensure!(
-            !cancellation.is_cancelled(),
-            "terminal close was cancelled after finalization"
-        );
-        if eligible {
-            let facts = TerminalFacts::from_receipt(&context, &receipt)?;
-            anyhow::ensure!(
-                facts.is_completed_local_close(),
-                "terminal receipt is not a completed local close"
-            );
-            let key = format!("turn:{}:final", receipt.terminal_id);
-            let stored = self
-                .memory
-                .find_message_event_by_idempotency_key(proof.workspace_id(), &key)
-                .await?
-                .context("terminal receipt is not in the owning service memory")?;
-            anyhow::ensure!(
-                serde_json::to_value(&stored)? == serde_json::to_value(&receipt.terminal_event)?,
-                "terminal receipt differs from its committed marker"
-            );
+        #[cfg(test)]
+        {
+            let TurnDisposition::Close { reply } = context.disposition()? else {
+                anyhow::bail!("decision requires the constrained execution reader");
+            };
+            anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
+            let eligible = self.generation.effective.causal_tree.enabled
+                && self.durable_key
+                && self.recordable
+                && context.record_admitted.load(Ordering::Acquire)
+                && self.store.mode() == StoreMode::ReadWrite
+                && self.durable_events.is_some();
+            if eligible {
+                self.settlement_ref(Arc::clone(&context))?
+                    .validate_durable_chain()
+                    .await?;
+            }
+            anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
+            let receipt = ports.finalize_closed_turn(Arc::clone(&context), &reply).await?;
+            // Cancellation can leave an actually committed marker. Do not claim
+            // application from this cancelled helper or pretend to undo that I/O.
             anyhow::ensure!(
                 !cancellation.is_cancelled(),
-                "terminal close was cancelled before application"
+                "terminal close was cancelled after finalization"
             );
-            let event = CausalEvent {
-                kind: CausalEventKind::DirectiveApplied,
-                lineage: CausalLineage {
-                    workspace_id: Arc::from(proof.workspace_id()),
-                    owner_id: Some(Arc::from(proof.owner_id())),
-                    session_key: Some(Arc::from(proof.session_key())),
-                    run_id: Some(Arc::from(proof.run_id())),
-                    source_event_id: proof.source_event_id().map(Arc::from),
-                    causation_event_id: Some(Arc::from(stored.event_id)),
-                    decision_id: Some(Arc::from(context.decision_id().to_string())),
-                    ..CausalLineage::default()
-                },
-                fields: CausalEventFields {
-                    item_count: Some(1),
-                    ..CausalEventFields::default()
-                },
-            };
-            let application = VerifiedDirectiveApplication {
-                event,
-                idempotency_key: format!("causal:{}:directive-applied", context.decision_id()),
-                original_generation: None,
-            };
-            anyhow::ensure!(
-                !cancellation.is_cancelled(),
-                "terminal close was cancelled before queue admission"
-            );
-            self.durable_events
-                .as_ref()
-                .context("applied event sink is unavailable")?
-                .emit_applied(application);
+            if eligible {
+                let facts = TerminalFacts::from_receipt(&context, &receipt)?;
+                anyhow::ensure!(
+                    facts.is_completed_local_close(),
+                    "terminal receipt is not a completed local close"
+                );
+                let key = format!("turn:{}:final", receipt.terminal_id);
+                let stored = self
+                    .memory
+                    .find_message_event_by_idempotency_key(proof.workspace_id(), &key)
+                    .await?
+                    .context("terminal receipt is not in the owning service memory")?;
+                anyhow::ensure!(
+                    serde_json::to_value(&stored)? == serde_json::to_value(&receipt.terminal_event)?,
+                    "terminal receipt differs from its committed marker"
+                );
+                anyhow::ensure!(
+                    !cancellation.is_cancelled(),
+                    "terminal close was cancelled before application"
+                );
+                let event = CausalEvent {
+                    kind: CausalEventKind::DirectiveApplied,
+                    lineage: CausalLineage {
+                        workspace_id: Arc::from(proof.workspace_id()),
+                        owner_id: Some(Arc::from(proof.owner_id())),
+                        session_key: Some(Arc::from(proof.session_key())),
+                        run_id: Some(Arc::from(proof.run_id())),
+                        source_event_id: proof.source_event_id().map(Arc::from),
+                        causation_event_id: Some(Arc::from(stored.event_id)),
+                        decision_id: Some(Arc::from(context.decision_id().to_string())),
+                        ..CausalLineage::default()
+                    },
+                    fields: CausalEventFields {
+                        item_count: Some(1),
+                        ..CausalEventFields::default()
+                    },
+                };
+                let application = VerifiedDirectiveApplication {
+                    event,
+                    idempotency_key: format!("causal:{}:directive-applied", context.decision_id()),
+                    original_generation: None,
+                };
+                anyhow::ensure!(
+                    !cancellation.is_cancelled(),
+                    "terminal close was cancelled before queue admission"
+                );
+                self.durable_events
+                    .as_ref()
+                    .context("applied event sink is unavailable")?
+                    .emit_applied(application);
+            }
+            Ok(receipt)
         }
-        Ok(receipt)
     }
 }
 
 /// Derive parent execution metadata from exactly one final-gated selection.
 /// This private conversion issues no executor lease or dispatch authority.
+#[cfg(test)]
 fn selected_execute_refs(
     decision: &EngineDecision,
     directive: &TurnExecutionDirective,
@@ -996,13 +1036,14 @@ fn selected_execute_refs(
 /// approval policy. Delegators additionally require the sealed child manifest
 /// retained by this exact decision.
 fn exact_delegator_ref(decision: &EngineDecision, reference: &CapabilityRef) -> bool {
-    let CandidateSet::Legal {
-        candidates,
-        exact_mentions,
-        ..
-    } = &decision.candidates
-    else {
-        return false;
+    let (candidates, exact_mentions) = match &decision.candidates {
+        CandidateSet::Legal {
+            candidates,
+            exact_mentions,
+            ..
+        } => (candidates, exact_mentions),
+        #[cfg(test)]
+        CandidateSet::NoLegalPath { .. } => return false,
     };
     candidates.iter().any(|candidate| {
         candidate.action() == CausalActionKind::Delegate
@@ -1017,6 +1058,7 @@ fn direct_answer_refs(
     gates: &GateInputs<'_>,
     selected_discovery_refs: &BTreeSet<CapabilityRef>,
 ) -> BTreeSet<CapabilityRef> {
+    #[cfg(test)]
     let fallback_answer = matches!(
         decision.selection,
         crate::causal_tree::decision_select::Selection::Abstain {
@@ -1024,6 +1066,8 @@ fn direct_answer_refs(
             ..
         }
     );
+    #[cfg(not(test))]
+    let fallback_answer = false;
     if fallback_answer || !gates.model_can_call_tools {
         return BTreeSet::new();
     }
@@ -1107,6 +1151,7 @@ fn discovery_source_guards_clear(state: &CausalState) -> bool {
     discovery_source_guards_clear_in(state, None)
 }
 
+#[cfg(test)]
 fn discovery_source_guards_clear_in(state: &CausalState, family: Option<CapabilityTarget>) -> bool {
     !state.trusted.parts().approval_pending
         && !state.derived.candidates().iter().any(|candidate| {
@@ -1114,6 +1159,7 @@ fn discovery_source_guards_clear_in(state: &CausalState, family: Option<Capabili
         })
 }
 
+#[cfg(test)]
 fn discovery_can_answer(decision: &EngineDecision) -> bool {
     selected_discovery_family(decision).is_ok_and(|family| discovery_source_guards_clear_in(&decision.state, family))
         && decision
@@ -1126,7 +1172,7 @@ impl TurnDecisionContext {
     /// Only already-issued Router work may finish its fixed close after the
     /// caller cancels. This is persistence cleanup, never an execution lease.
     pub(crate) const fn router_cleanup_close(&self) -> bool {
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         {
             self.router_transition.is_some()
                 && matches!(
@@ -1134,18 +1180,24 @@ impl TurnDecisionContext {
                     TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
                 )
         }
-        #[cfg(not(feature = "llm-router"))]
+        #[cfg(not(all(test, feature = "llm-router")))]
         {
             false
         }
     }
 
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(feature = "llm-router", test))]
     pub(crate) fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
         self.router_transition
             .as_ref()
             .map(|transition| transition.replay_facts(self, key))
             .transpose()
+    }
+
+    #[cfg(all(feature = "llm-router", not(test)))]
+    pub(crate) const fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
+        let _ = key;
+        Ok(None)
     }
 
     #[cfg(not(feature = "llm-router"))]
@@ -1224,11 +1276,16 @@ impl TurnDecisionContext {
     /// Tool and child actions need their execution trace before settlement.
     pub(crate) const fn terminal_outcome_target(&self) -> Option<&'static str> {
         match &self.engine.selection {
-            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. }
-            | crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => {
+            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => {
                 Some(candidate_id.target().as_str())
             }
+            #[cfg(test)]
+            crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => {
+                Some(candidate_id.target().as_str())
+            }
+            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Abstain { .. } => Some("none"),
+            #[cfg(test)]
             _ => None,
         }
     }
@@ -1243,7 +1300,9 @@ impl TurnDecisionContext {
                 .is_some_and(crate::tools::capability::execution_trace::ExecutionTrace::is_sealed)
                 .then_some(CausalActionKind::UseTool),
             TurnExecutionDirective::Delegate { .. } => Some(CausalActionKind::Delegate),
+            #[cfg(test)]
             TurnExecutionDirective::Clarify { .. } => Some(CausalActionKind::Clarify),
+            #[cfg(test)]
             TurnExecutionDirective::Refuse { .. } => Some(CausalActionKind::Refuse),
             _ => None,
         }
@@ -1301,6 +1360,7 @@ impl TurnDecisionContext {
         &self,
     ) -> Option<&crate::causal_tree::approval_collection::DeferredArgumentProof> {
         match &self.engine.selection {
+            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof) => Some(proof),
             _ => None,
         }
@@ -1339,14 +1399,17 @@ impl TurnDecisionContext {
 
     pub(crate) fn disposition(&self) -> Result<TurnDisposition, DirectiveError> {
         match &self.directive {
+            #[cfg(test)]
             TurnExecutionDirective::Clarify { .. }
             | TurnExecutionDirective::RequestApproval { .. }
             | TurnExecutionDirective::Refuse { .. } => Ok(TurnDisposition::Close {
                 reply: render_terminal_directive(&self.directive)?,
             }),
-            TurnExecutionDirective::CollectApprovalArguments(_) | TurnExecutionDirective::AnswerDirectly
-                if !self.execution_closed.load(Ordering::Acquire) =>
-            {
+            #[cfg(test)]
+            TurnExecutionDirective::CollectApprovalArguments(_) if !self.execution_closed.load(Ordering::Acquire) => {
+                Ok(TurnDisposition::Run)
+            }
+            TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
@@ -1354,8 +1417,9 @@ impl TurnDecisionContext {
             {
                 Ok(TurnDisposition::Run)
             }
-            TurnExecutionDirective::CollectApprovalArguments(_)
-            | TurnExecutionDirective::AnswerDirectly
+            #[cfg(test)]
+            TurnExecutionDirective::CollectApprovalArguments(_) => Err(DirectiveError::NotAdmitted),
+            TurnExecutionDirective::AnswerDirectly
             | TurnExecutionDirective::Execute { .. }
             | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
             _ => Err(DirectiveError::ActionMismatch),
@@ -1364,6 +1428,7 @@ impl TurnDecisionContext {
 
     pub(crate) fn close_reply(&self) -> Result<Option<std::borrow::Cow<'static, str>>, DirectiveError> {
         match self.disposition()? {
+            #[cfg(test)]
             TurnDisposition::Close { reply } => Ok(Some(reply)),
             TurnDisposition::Run => Ok(None),
         }
@@ -1373,10 +1438,18 @@ impl TurnDecisionContext {
         Ok(matches!(self.disposition()?, TurnDisposition::Run))
     }
 
-    pub(crate) fn pending_approval_id(&self) -> Option<DecisionId> {
-        matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
+    pub(crate) const fn pending_approval_id(&self) -> Option<DecisionId> {
+        #[cfg(test)]
+        {
+            matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn diagnostic_directive_kind(&self) -> (&'static str, String) {
         match &self.directive {
             TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.clone()),
@@ -1402,10 +1475,12 @@ impl TurnDecisionContext {
 /// Whether a finished memory read lets the turn answer: new evidence always
 /// does; a completed read that found nothing does only for a message that asks
 /// for something. A blank message has nothing to answer and stays closed.
+#[cfg(test)]
 fn read_finishes_retrieval(observed: &MemoryHopObservation, routing_input: &str) -> bool {
     observed.fresh_read || (observed.completed_ok && !routing_input.trim().is_empty())
 }
 
+#[cfg(test)]
 struct MemoryHopObservation {
     state: CausalState,
     fresh_read: bool,
@@ -1431,6 +1506,7 @@ pub(crate) enum AgentDecisionError {
     Directive(#[from] DirectiveError),
     #[error("decision deadline cannot be represented")]
     Deadline,
+    #[cfg(test)]
     #[error("decision action has no Agent execution port")]
     UnsupportedAction,
     #[error(transparent)]
@@ -1451,7 +1527,7 @@ pub(crate) enum AgentDecisionError {
     EventMemory(#[source] anyhow::Error),
     #[error("durable ingress recovery is not ready")]
     IngressRecovery(#[source] anyhow::Error),
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(test, feature = "llm-router"))]
     #[error("Router purpose-bound decision failed")]
     Router(#[source] anyhow::Error),
     #[error("previous segment observation could not be verified")]
@@ -1477,6 +1553,7 @@ pub(crate) enum AgentDiscoveryError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Selected(#[from] DiscoveryIssueError),
+    #[cfg(test)]
     #[error("selected discovery exceeds the configured decision hop limit")]
     HopLimit,
 }
@@ -1491,10 +1568,13 @@ pub(crate) enum AgentRetrievalError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Selected(#[from] RetrievalIssueError),
+    #[cfg(test)]
     #[error("selected evidence read exceeded the pinned decision deadline")]
     Deadline,
+    #[cfg(test)]
     #[error("selected evidence read exceeds the configured decision hop limit")]
     HopLimit,
+    #[cfg(test)]
     #[error("selected evidence read failed")]
     Backend(#[source] anyhow::Error),
 }
@@ -1502,6 +1582,7 @@ pub(crate) enum AgentRetrievalError {
 /// Convert selected read results into bounded runtime observations. A row's
 /// source_event_id is stored metadata, not an authenticated event receipt.
 /// The retrieval step itself receives a runtime-issued event id separately.
+#[cfg(test)]
 fn memory_artifacts_from_selected_read(
     hits: &[DecisionMemoryHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1533,6 +1614,7 @@ fn memory_artifacts_from_selected_read(
         .collect()
 }
 
+#[cfg(test)]
 fn document_artifacts_from_selected_read(
     hits: &[crate::memory::traits::DecisionDocumentHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1561,6 +1643,7 @@ fn document_artifacts_from_selected_read(
         .collect()
 }
 
+#[cfg(test)]
 fn session_artifacts_from_selected_read(
     hits: &[crate::memory::traits::DecisionSessionHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1805,6 +1888,7 @@ impl TurnDecisionService {
 
     /// A selected Discover can inspect only the pinned catalog view for this
     /// exact source turn. It does not publish refs to the tool executor.
+    #[cfg(test)]
     fn discover_selected_agent_refs(
         &self,
         proof: &dyn TurnSourceProof,
@@ -1844,6 +1928,7 @@ impl TurnDecisionService {
         Ok(refs)
     }
 
+    #[cfg(test)]
     async fn retrieve_selected_agent_evidence(
         &self,
         proof: &dyn TurnSourceProof,
@@ -1956,6 +2041,7 @@ impl TurnDecisionService {
     /// A backend failure or deadline becomes a failed/cancelled read step for
     /// the fresh local terminal. Provenance and selection failures stay hard.
     /// Row metadata cannot mint an event receipt.
+    #[cfg(test)]
     async fn observe_selected_agent_memory(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2037,7 +2123,7 @@ impl TurnDecisionService {
 
     /// Segment admission uses the same builder as a first turn, with the
     /// previous segment's verified observation folded into the trusted state.
-    pub(crate) async fn open_segment_turn_context(
+    pub(in crate::runtime) async fn open_segment_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
         observation: Option<&segment_observation::SegmentObservation>,
@@ -2174,7 +2260,7 @@ impl TurnDecisionService {
             predicted: None,
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),
-            routing_input: RawRoutingInput::new(projected_input.clone()),
+            routing_input: RawRoutingInput::new(projected_input),
             goal: RawRoutingInput::new(goal),
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
@@ -2217,6 +2303,7 @@ impl TurnDecisionService {
             main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             approval_collection_started: AtomicBool::new(false),
             collected_approval_result: std::sync::OnceLock::new(),
             discovery_offers: std::sync::OnceLock::new(),
@@ -2229,7 +2316,7 @@ impl TurnDecisionService {
             execution_refs,
             #[cfg(test)]
             selected_retrieved: Vec::new(),
-            #[cfg(feature = "llm-router")]
+            #[cfg(all(test, feature = "llm-router"))]
             router_transition: None,
         }))
     }
@@ -2238,6 +2325,7 @@ impl TurnDecisionService {
     /// Selected evidence reads and catalog discoveries feed bounded dependent
     /// hops. Selected Execute is retained as exact immutable metadata;
     /// dispatch remains owned by the later constrained execution reader.
+    #[cfg(test)]
     pub(crate) async fn decide_agent_initial(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2285,6 +2373,7 @@ impl TurnDecisionService {
         self.record_opened_context(proof, opened, cancellation).await
     }
 
+    #[cfg(test)]
     async fn decide_agent_initial_inner(
         &self,
         proof: &dyn TurnSourceProof,
@@ -3246,6 +3335,7 @@ impl TurnDecisionService {
         Err(AgentDecisionError::UnsupportedAction)
     }
 
+    #[cfg(test)]
     async fn observed_capability_latency(
         &self,
         owner_id: &str,

@@ -1,9 +1,13 @@
 //! Opt-in, deterministic exploration among gated read-only decisions.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use super::branch::{CandidateId, CapabilityTarget, CausalActionKind, CausalCandidate, SideEffectClass};
+#[cfg(test)]
 use super::config::{EvaluationConfig, ExplorationMode};
+#[cfg(test)]
 use crate::decision::{DecisionKey, KeyDomain};
 
 /// Candidate facts from the pinned catalog and validated prediction. The
@@ -11,13 +15,16 @@ use crate::decision::{DecisionKey, KeyDomain};
 /// nominal read-only effect may hide delivery, process or child operations.
 /// Treat any semantic risk at or above one half as too high for exploration;
 /// this conservative local threshold does not depend on a model risk label.
+#[cfg(test)]
 pub(crate) struct CandidateFacts<'a> {
     pub candidate: &'a CausalCandidate,
     pub semantic_risk: f64,
 }
 
+#[cfg(test)]
 const EXPLORATION_RISK_CEILING: f64 = 0.5;
 
+#[cfg(test)]
 pub(crate) fn eligible(facts: &CandidateFacts<'_>, config: &EvaluationConfig) -> bool {
     config.exploration == ExplorationMode::ReadOnly
         && config.exploration_rate.is_finite()
@@ -42,6 +49,7 @@ pub(crate) fn eligible(facts: &CandidateFacts<'_>, config: &EvaluationConfig) ->
 /// Draw only after all contenders have passed eligibility and selector checks.
 /// The first contender is the deterministic top candidate; input ordering
 /// beyond that cannot change the draw or the recorded distribution.
+#[cfg(test)]
 pub(crate) fn choose(
     key: &DecisionKey,
     decision_id: &str,

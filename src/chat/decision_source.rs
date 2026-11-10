@@ -844,6 +844,7 @@ impl ChatTurnBinding {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn decide(
         &self,
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
@@ -933,6 +934,7 @@ impl ChatTurnBinding {
 
     /// Persist a fixed directive without inventing provider execution. The
     /// caller must separately commit ordered session history and deliver it.
+    #[cfg(test)]
     pub(super) async fn close(
         &self,
         fabric: &crate::memory::MemoryFabric,
@@ -1279,6 +1281,7 @@ impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
 }
 
 /// Only the owning binding supplies source scope and settlement authority.
+#[cfg(test)]
 struct ChatDecisionClose<'a> {
     binding: &'a ChatTurnBinding,
     fabric: &'a crate::memory::MemoryFabric,
@@ -1286,6 +1289,7 @@ struct ChatDecisionClose<'a> {
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::runtime::turn_decision::CloseTurnPorts for ChatDecisionClose<'_> {
     type Receipt = crate::agent::terminal::TurnTerminalReceipt;

@@ -10,6 +10,7 @@
 //! the test has not advanced logical time. Timeout helpers on this path wait
 //! on logical time, so they do not sleep until that epoch.
 
+#[cfg(test)]
 use std::future::Future;
 use std::time::Instant;
 
@@ -198,11 +199,6 @@ pub(crate) fn installed() -> bool {
     current().is_some()
 }
 
-#[cfg(not(test))]
-pub(crate) const fn installed() -> bool {
-    false
-}
-
 /// Applies a test stall or logical advance armed on the current clock.
 /// Unarmed tests return immediately. Production does not call this.
 #[cfg(test)]
@@ -222,6 +218,7 @@ pub(crate) async fn apply_test_stall() {
 
 /// Waits for `call` until `deadline`. With a clock installed the wait follows
 /// logical time. The error means the deadline elapsed.
+#[cfg(test)]
 pub(crate) async fn timeout_at_std<T>(deadline: Instant, call: impl Future<Output = T>) -> Result<T, ()> {
     #[cfg(test)]
     if let Some(clock) = current() {
@@ -233,6 +230,7 @@ pub(crate) async fn timeout_at_std<T>(deadline: Instant, call: impl Future<Outpu
 }
 
 /// Whether `deadline` (a tokio instant built from a decision deadline) has elapsed.
+#[cfg(test)]
 pub(crate) fn tokio_deadline_reached(deadline: tokio::time::Instant) -> bool {
     #[cfg(test)]
     if let Some(clock) = current() {
@@ -242,9 +240,6 @@ pub(crate) fn tokio_deadline_reached(deadline: tokio::time::Instant) -> bool {
 }
 
 /// Engine phase hook; only the installed logical test clock can advance time.
-#[cfg(not(test))]
-pub(crate) const fn checkpoint(_name: &'static str) {}
-
 #[cfg(test)]
 pub(crate) fn checkpoint(checkpoint_name: &'static str) {
     #[cfg(test)]

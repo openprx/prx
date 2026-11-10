@@ -3798,6 +3798,7 @@ pub(crate) fn enforce_command_contract(
 /// function returns only schema-normalized effect arguments, with no grant or
 /// runtime scope injected. The normal executor authors those fields only after
 /// approval; the pending-call digest binds its source separately.
+#[cfg(test)]
 pub(crate) fn normalize_collection_arguments(
     arguments: &serde_json::Value,
     descriptor: &ToolDescriptor,

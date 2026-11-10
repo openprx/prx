@@ -316,6 +316,7 @@ pub(crate) fn create_configured_embedder(config: &crate::config::Config) -> Conf
 
 /// A paid Router target produced from exactly the memory embedding resolver.
 /// Credential ownership stays in that resolver and the concrete provider.
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 pub(crate) struct ConfiguredPaidEmbedding {
     pub provider: String,
@@ -324,6 +325,7 @@ pub(crate) struct ConfiguredPaidEmbedding {
     pub embedder: Arc<dyn embeddings::EmbeddingProvider>,
 }
 
+#[cfg(test)]
 #[cfg(feature = "llm-router")]
 pub(crate) fn configured_paid_embedder(
     config: &crate::config::Config,

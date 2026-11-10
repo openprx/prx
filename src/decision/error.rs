@@ -49,6 +49,7 @@ impl DecisionError {
     /// decision. This is distinct from transport, service, circuit and budget
     /// failures, for which the deterministic builtin remains a valid fallback.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn is_semantic_validation_failure(&self) -> bool {
         matches!(self, Self::InvalidResponse(_) | Self::ModelVersionMismatch)
     }

@@ -1,12 +1,15 @@
 //! Complete source-bound execution for the public embedded Agent API.
 use super::Agent;
+#[cfg(test)]
+use crate::agent::terminal::TurnTerminalReceipt;
 use crate::agent::terminal::{
-    TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus,
-    TurnTerminalTelemetry,
+    TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalStatus, TurnTerminalTelemetry,
 };
 use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopOutcome, ToolLoopRuntimeAdapter};
 use crate::providers::{ChatMessage, ConversationMessage};
-use crate::runtime::turn_decision::{CloseTurnPorts, TurnDecisionContext, TurnDecisionService};
+#[cfg(test)]
+use crate::runtime::turn_decision::CloseTurnPorts;
+use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::runtime::turn_terminal::TurnTerminalGuard;
 use anyhow::Context;
@@ -89,6 +92,7 @@ impl Drop for HistoryWriteback<'_> {
 }
 
 struct Terminal<'a> {
+    #[cfg(test)]
     guard: &'a TurnTerminalGuard,
     service: &'a TurnDecisionService,
     decision: &'a Arc<TurnDecisionContext>,
@@ -129,6 +133,7 @@ impl Terminal<'_> {
         })
     }
 }
+#[cfg(test)]
 #[async_trait::async_trait]
 impl CloseTurnPorts for Terminal<'_> {
     type Receipt = TurnTerminalReceipt;
@@ -329,6 +334,7 @@ async fn run_work(
         // errors that may contain the private content being saved.
         tracing::warn!("embedded Agent user memory promotion failed");
     }
+    #[cfg(test)]
     if let Some(reply) = decision.close_reply()? {
         let reply = reply.into_owned();
         // A fixed close adds the raw user input and the final reply after
@@ -339,6 +345,7 @@ async fn run_work(
             .checked_add(2)
             .context("embedded Agent history length overflow")?;
         let ports = Terminal {
+            #[cfg(test)]
             guard: &guard,
             service: &service,
             decision: &decision,
@@ -445,6 +452,7 @@ async fn run_work(
             .checked_add(1)
             .context("embedded Agent history length overflow")?;
         let ports = Terminal {
+            #[cfg(test)]
             guard: &guard,
             service: &service,
             decision: &decision,
@@ -647,6 +655,7 @@ async fn run_work(
     // Only its completed history is authoritative for this projection.
     let history_commit_len = agent.history.len();
     let ports = Terminal {
+        #[cfg(test)]
         guard: &guard,
         service: &service,
         decision: &decision,

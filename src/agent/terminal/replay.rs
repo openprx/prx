@@ -44,11 +44,13 @@ enum RecordedDirective {
 const APPROVAL_UNAVAILABLE_REPLY: &str =
     "This action needs owner approval, which this surface cannot collect; nothing was run.";
 
+#[cfg(test)]
 fn hop_candidates(
     hop: &crate::causal_tree::decision_engine::EngineDecision,
 ) -> &[crate::causal_tree::branch::CausalCandidate] {
     match &hop.candidates {
         crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
+        #[cfg(test)]
         crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals,
     }
 }
@@ -57,6 +59,7 @@ fn recorded_from_hop(
     row: &DecisionReplayRecord,
     hop: &crate::causal_tree::decision_engine::EngineDecision,
 ) -> anyhow::Result<RecordedDirective> {
+    #[cfg(test)]
     use crate::causal_tree::decision_select::Selection;
     Ok(match row.decision.directive_kind.as_str() {
         "collect_approval_arguments" => RecordedDirective::CollectApprovalArguments,
@@ -69,6 +72,7 @@ fn recorded_from_hop(
             reason_code: row.decision.abstention_reason.clone().unwrap_or_default(),
         },
         "request_approval" => {
+            #[cfg(test)]
             let effect = match &hop.selection {
                 Selection::RequestApproval {
                     pending_candidate_id, ..
@@ -78,6 +82,11 @@ fn recorded_from_hop(
                     .map(|candidate| candidate.side_effect().as_str().to_owned())
                     .unwrap_or_default(),
                 _ => row.decision.abstention_reason.clone().unwrap_or_default(),
+            };
+            #[cfg(not(test))]
+            let effect = {
+                let _ = hop;
+                row.decision.abstention_reason.clone().unwrap_or_default()
             };
             RecordedDirective::RequestApproval {
                 decision_id: row.decision.decision_id.to_string(),

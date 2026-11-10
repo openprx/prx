@@ -117,6 +117,7 @@ pub fn rank_models(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn rank_models_scoped(
     intent: &RouterIntent,
     estimated_tokens: usize,

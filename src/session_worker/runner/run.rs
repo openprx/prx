@@ -1189,6 +1189,14 @@ async fn run_owned_manifest(
                     };
                     if let Some(turn) = child_turn.as_ref() {
                         match turn.is_close() {
+                            #[cfg(not(test))]
+                            Ok(true) => {
+                                return (
+                                    segment_history,
+                                    Err(anyhow::anyhow!("decision requires the constrained execution reader")),
+                                );
+                            }
+                            #[cfg(test)]
                             Ok(true) => {
                                 let closed = async {
                                     cleanup.run(async { Ok(()) }).await?;

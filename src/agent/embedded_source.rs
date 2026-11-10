@@ -22,6 +22,7 @@ pub(crate) struct SelectedEmbeddedModel {
 }
 
 impl SelectedEmbeddedModel {
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) const fn choice(&self) -> &super::entry::AgentModelChoice {
         &self.choice
@@ -485,6 +486,7 @@ impl Drop for EmbeddedAdmissionGuard {
 /// readback. No public constructor or caller-supplied raw metadata entrance exists.
 #[cfg(feature = "llm-router")]
 pub(crate) struct VerifiedEmbeddedInputMetadata {
+    #[cfg(test)]
     sequence: i64,
     event_id: String,
     workspace: String,
@@ -530,6 +532,7 @@ impl VerifiedEmbeddedInputMetadata {
         }
         anyhow::ensure!(event.id > 0, "embedded input sequence is not durable");
         Ok(Self {
+            #[cfg(test)]
             sequence: event.id,
             event_id: event.event_id.clone(),
             workspace: event.workspace_id.clone(),
@@ -547,6 +550,7 @@ impl VerifiedEmbeddedInputMetadata {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn sequence(&self) -> i64 {
         self.sequence
     }
@@ -593,6 +597,7 @@ impl EmbeddedAgentSource {
         Ok(router.has_history() && task.intent != super::classifier::TaskIntent::Delegate && task.model_hint.is_none())
     }
 
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) fn prepare_router_selection(
         &self,
@@ -626,6 +631,7 @@ impl EmbeddedAgentSource {
         self.binding.bind_selected_model(choice)
     }
 
+    #[cfg(test)]
     #[cfg(feature = "llm-router")]
     pub(crate) fn with_admitted_router_selection(
         self: &Arc<Self>,

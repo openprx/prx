@@ -1,13 +1,17 @@
 //! Optional historical latency estimates must not delay turn admission.
+#[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::time::Duration;
 
+#[cfg(test)]
 pub(super) async fn read<E: std::fmt::Debug + Send + 'static>(
     lookup: impl FnOnce() -> Result<BTreeMap<String, u32>, E> + Send + 'static,
 ) -> BTreeMap<String, u32> {
     finish(crate::runtime::blocking::spawn_blocking(lookup)).await
 }
 
+#[cfg(test)]
 async fn finish<E: std::fmt::Debug + Send + 'static>(
     mut task: tokio::task::JoinHandle<Result<BTreeMap<String, u32>, E>>,
 ) -> BTreeMap<String, u32> {

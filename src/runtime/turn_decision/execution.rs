@@ -8,13 +8,14 @@ pub(crate) use ordinary_process::OrdinaryProcessLaunch;
 
 use super::{
     Arc, BTreeMap, BTreeSet, CancellationToken, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope,
-    CausalDecisionStore, CausalEventSink, ConfigGeneration, Context, DecisionBackendFactory, DecisionKey,
-    DirectiveContext, Exposure, FactoryDeps, GateInputs, Memory, Ordering, SecurityPolicy, StoreMode, Tool,
-    ToolExecutionService, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnLoopRuntime,
-    TurnServiceBuild, TurnServiceBuildError, TurnSourceProof, TurnSurfaceKind, directive_from_selection,
-    effective_agent_exclusions, pinned_policy_version, validate_agent_retrieval_provenance,
+    CausalDecisionStore, CausalEventSink, ConfigGeneration, Context, DecisionBackendFactory, DecisionKey, Exposure,
+    FactoryDeps, GateInputs, Memory, Ordering, SecurityPolicy, StoreMode, Tool, ToolExecutionService,
+    TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnLoopRuntime, TurnServiceBuild,
+    TurnServiceBuildError, TurnSourceProof, TurnSurfaceKind, effective_agent_exclusions, pinned_policy_version,
+    validate_agent_retrieval_provenance,
 };
 use crate::causal_tree::candidate_generator::CandidateSet;
+use crate::causal_tree::directive::{DirectiveContext, directive_from_selection};
 use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::tools::ToolSpec;
 
@@ -848,10 +849,13 @@ impl TurnDecisionService {
             context.catalog_generation() == catalog.generation(),
             "decision catalog changed"
         );
+        #[cfg(test)]
         let abstention_answer;
         let selected_id = match &context.engine.selection {
-            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. }
-            | crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
+            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
+            #[cfg(test)]
+            crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
+            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Abstain {
                 action: crate::causal_tree::branch::CausalActionKind::Answer,
                 ..
@@ -863,10 +867,13 @@ impl TurnDecisionService {
                 );
                 &abstention_answer
             }
+            #[cfg(test)]
             _ => anyhow::bail!("decision has no executable selection"),
         };
-        let CandidateSet::Legal { candidates, .. } = &context.engine.candidates else {
-            anyhow::bail!("decision has no admitted candidate set");
+        let candidates = match &context.engine.candidates {
+            CandidateSet::Legal { candidates, .. } => candidates,
+            #[cfg(test)]
+            CandidateSet::NoLegalPath { .. } => anyhow::bail!("decision has no admitted candidate set"),
         };
         let selected = candidates
             .iter()
@@ -936,7 +943,9 @@ impl TurnDecisionService {
                     &context.engine,
                     &DirectiveContext {
                         current_generation: catalog.generation(),
+                        #[cfg(test)]
                         approval_expires_at: chrono::Utc::now(),
+                        #[cfg(test)]
                         discovery_limit: 1,
                     },
                 )?;
