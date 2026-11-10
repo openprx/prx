@@ -127,23 +127,27 @@ fn later_input_and_exit(session: &mut TrackedSession) {
 // This covers the same foreground completion path while allowing the following
 // model turn; successful catalog-changing imports are covered separately below.
 fn approve_and_resume_publish_failure() -> (HarnessGuard, SessionGuard, String) {
-    approve_and_resume_publish_failure_with_delay("")
+    approve_and_resume_publish_failure_with_env(&[])
 }
 
-fn approve_and_resume_publish_failure_with_delay(delay: &str) -> (HarnessGuard, SessionGuard, String) {
+fn approve_and_resume_publish_failure_with_env(extra_env: &[(&str, &str)]) -> (HarnessGuard, SessionGuard, String) {
     let (guard, _, _) = import_fixture();
+    approve_and_resume_publish_failure_with_env_on(guard, extra_env)
+}
+
+fn approve_and_resume_publish_failure_with_env_on(
+    guard: HarnessGuard,
+    extra_env: &[(&str, &str)],
+) -> (HarnessGuard, SessionGuard, String) {
     let arguments =
         serde_json::json!({"action": "lifecycle_publish", "proposal_id": format!("prop-{}", "0".repeat(32))});
     let tool_call = format!("skills_manage:{arguments}");
-    let mut sg = spawn_chat_in(
-        &guard,
-        &["--plain"],
-        &[
-            ("OPENPRX_MOCK_TOOL_CALL", &tool_call),
-            ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
-            ("OPENPRX_MOCK_DELAY_MS_BY_PROMPT", delay),
-        ],
-    );
+    let mut env = vec![
+        ("OPENPRX_MOCK_TOOL_CALL", tool_call.as_str()),
+        ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
+    ];
+    env.extend_from_slice(extra_env);
+    let mut sg = spawn_chat_in(&guard, &["--plain"], &env);
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
@@ -241,16 +245,34 @@ fn chat_resume_consumed_decision_in_same_chat_refuses_and_processes_later_input(
     assert_publish_attempts(&guard, 1);
 }
 
+fn wait_for_path(path: &std::path::Path, total: Duration) {
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timeout waiting for {} after {total:?}", path.display());
+}
+
 #[test]
 #[serial(prx_chat_pty)]
 fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
-    // FU-FLAKE-PTY-RESUME: the delay only has to outlast the /resume-decision +
-    // /queue round trip (~30 ms on qaa). 800 ms keeps the "1 queued, 1 running"
-    // read reliable on a loaded hosted runner; 5000 ms was paid twice (busy turn
-    // and the later "hi") and blew the nextest 60 s budget.
-    let (guard, mut sg, decision_id) = approve_and_resume_publish_failure_with_delay("prx_busy_resume_turn=800");
+    // Event hold, not a sleep: the mock keeps the busy turn open while
+    // `prx_busy_resume_hold` exists and writes `*.started` when it begins
+    // waiting. /queue is sent only after that file appears, so the resume is
+    // queued behind a turn that cannot finish early (FU-FLAKE-PTY-RESUME-HANG).
+    let (guard, _, _) = import_fixture();
+    let hold_path = guard.workspace_dir.join("prx_busy_resume_hold");
+    let started_path = guard.workspace_dir.join("prx_busy_resume_hold.started");
+    std::fs::write(&hold_path, b"hold").expect("busy-turn hold file");
+    let hold_spec = format!("prx_busy_resume_turn={}", hold_path.display());
+    let (guard, mut sg, decision_id) =
+        approve_and_resume_publish_failure_with_env_on(guard, &[("OPENPRX_MOCK_HOLD_WHILE_FILE", &hold_spec)]);
     let session = sg.session();
-    session.send("hi prx_busy_resume_turn\r").expect("start delayed turn");
+    session.send("hi prx_busy_resume_turn\r").expect("start held turn");
+    wait_for_path(&started_path, TURN_TIMEOUT);
     session.send("/queue\r").expect("inspect running turn");
     read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 1 running.", TURN_TIMEOUT);
     session
@@ -258,8 +280,9 @@ fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
         .expect("queue consumed resume behind running turn");
     session.send("/queue\r").expect("inspect queued resume");
     // Prove the resume actually waited behind a running turn, rather than
-    // relying on the fixture delay alone to establish the interleaving.
+    // relying on a fixture delay to establish the interleaving.
     read_until_with_dsr(session, "Main queue: 1 queued (0 priority), 1 running.", TURN_TIMEOUT);
+    std::fs::remove_file(&hold_path).expect("release busy-turn hold");
     read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
     session.send("/queue\r").expect("inspect released queue");
     read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 0 running.", TURN_TIMEOUT);
