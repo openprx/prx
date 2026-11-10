@@ -3293,6 +3293,12 @@ thread_local! {
     static RECOVERY_READ_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_RECOVERY_HANDLER_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECOVERY_BUSY_INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn recovery_time_left(deadline: Instant) -> Result<std::time::Duration, StoreError> {
     deadline
         .checked_duration_since(crate::causal_tree::logical_clock::deadline_now(deadline))
@@ -3319,12 +3325,20 @@ impl<'a> RecoveryReadBudget<'a> {
     fn new(connection: &'a mut Connection, deadline: Instant) -> Result<Self, StoreError> {
         recovery_time_left(deadline)?;
         let previous = RECOVERY_READ_DEADLINE.with(|cell| cell.replace(Some(deadline)));
-        connection.busy_handler(Some(recovery_busy))?;
-        connection.progress_handler(
+        let guard = Self { connection, previous };
+        guard.connection.busy_handler(Some(recovery_busy))?;
+        #[cfg(test)]
+        {
+            RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(true));
+            if FAIL_RECOVERY_HANDLER_INSTALL.with(std::cell::Cell::take) {
+                return Err(StoreError::RecoveryUnavailable);
+            }
+        }
+        guard.connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
-        Ok(Self { connection, previous })
+        Ok(guard)
     }
 }
 impl std::ops::Deref for RecoveryReadBudget<'_> {
@@ -3347,7 +3361,29 @@ impl Drop for RecoveryReadBudget<'_> {
             tracing::error!(%error, "decision recovery busy handler reset failed");
         }
         RECOVERY_READ_DEADLINE.with(|cell| cell.set(self.previous));
+        #[cfg(test)]
+        RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(false));
     }
+}
+
+#[cfg(test)]
+fn fail_next_recovery_handler_install() {
+    FAIL_RECOVERY_HANDLER_INSTALL.with(|cell| cell.set(true));
+}
+
+#[cfg(test)]
+fn recovery_read_deadline() -> Option<Instant> {
+    RECOVERY_READ_DEADLINE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn set_recovery_read_deadline(value: Option<Instant>) {
+    RECOVERY_READ_DEADLINE.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+fn recovery_deadline_busy_installed() -> bool {
+    RECOVERY_BUSY_INSTALLED.with(std::cell::Cell::get)
 }
 
 struct RecoveryJsonReader<'a> {

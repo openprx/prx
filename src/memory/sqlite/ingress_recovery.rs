@@ -17,6 +17,12 @@ thread_local! {
     static IO_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_HANDLER_INSTALL: Cell<bool> = const { Cell::new(false) };
+    static DEADLINE_BUSY_INSTALLED: Cell<bool> = const { Cell::new(false) };
+}
+
 fn wait_for_lock(_attempt: i32) -> bool {
     let left = IO_DEADLINE
         .with(Cell::get)
@@ -42,12 +48,20 @@ impl<'a> ConnectionDeadline<'a> {
     pub(super) fn new(connection: &'a mut Connection, deadline: Instant) -> anyhow::Result<Self> {
         remaining(deadline)?;
         let previous = IO_DEADLINE.with(|cell| cell.replace(Some(deadline)));
-        connection.busy_handler(Some(wait_for_lock))?;
-        connection.progress_handler(
+        let guard = Self { connection, previous };
+        guard.connection.busy_handler(Some(wait_for_lock))?;
+        #[cfg(test)]
+        {
+            DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(true));
+            if FAIL_HANDLER_INSTALL.with(Cell::take) {
+                anyhow::bail!("test: handler install failed");
+            }
+        }
+        guard.connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
-        Ok(Self { connection, previous })
+        Ok(guard)
     }
 }
 impl std::ops::Deref for ConnectionDeadline<'_> {
@@ -70,6 +84,8 @@ impl Drop for ConnectionDeadline<'_> {
             tracing::error!(%error, "SQLite ingress busy handler reset failed");
         }
         IO_DEADLINE.with(|cell| cell.set(self.previous));
+        #[cfg(test)]
+        DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
     }
 }
 
@@ -1199,4 +1215,43 @@ pub(super) fn validate_owner(
     _deadline: Instant,
 ) -> anyhow::Result<()> {
     anyhow::bail!("SQLite ingress repair requires supported local Unix file locks")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct ResetDeadlineGuard;
+
+    impl Drop for ResetDeadlineGuard {
+        fn drop(&mut self) {
+            IO_DEADLINE.with(|cell| cell.set(None));
+            FAIL_HANDLER_INSTALL.with(|cell| cell.set(false));
+            DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
+        }
+    }
+
+    #[test]
+    fn connection_deadline_install_failure_restores_previous_deadline() {
+        let _reset = ResetDeadlineGuard;
+        let mut connection = Connection::open_in_memory().expect("test: memory db");
+        let previous = Instant::now() + Duration::from_secs(9);
+        IO_DEADLINE.with(|cell| cell.set(Some(previous)));
+        FAIL_HANDLER_INSTALL.with(|cell| cell.set(true));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert!(
+            ConnectionDeadline::new(&mut connection, deadline).is_err(),
+            "test: install must fail"
+        );
+        assert_eq!(
+            IO_DEADLINE.with(Cell::get),
+            Some(previous),
+            "test: thread-local deadline restored to previous"
+        );
+        assert!(
+            !DEADLINE_BUSY_INSTALLED.with(Cell::get),
+            "test: deadline busy handler removed"
+        );
+    }
 }

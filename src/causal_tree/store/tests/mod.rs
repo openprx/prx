@@ -1210,3 +1210,34 @@ async fn a_newer_schema_opens_read_only() {
 }
 
 mod files_and_recovery;
+
+#[test]
+fn recovery_read_budget_install_failure_restores_previous_deadline() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::set_recovery_read_deadline(None);
+            super::FAIL_RECOVERY_HANDLER_INSTALL.with(|cell| cell.set(false));
+            super::RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(false));
+        }
+    }
+    let _reset = Reset;
+    let mut connection = Connection::open_in_memory().unwrap();
+    let previous = Instant::now() + std::time::Duration::from_secs(9);
+    super::set_recovery_read_deadline(Some(previous));
+    super::fail_next_recovery_handler_install();
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    assert!(
+        super::RecoveryReadBudget::new(&mut connection, deadline).is_err(),
+        "test: recovery handler install must fail"
+    );
+    assert_eq!(
+        super::recovery_read_deadline(),
+        Some(previous),
+        "test: thread-local deadline restored to previous"
+    );
+    assert!(
+        !super::recovery_deadline_busy_installed(),
+        "test: recovery busy handler removed"
+    );
+}
