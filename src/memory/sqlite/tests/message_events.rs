@@ -1002,8 +1002,11 @@ async fn concurrent_child_start_writers_do_not_surface_sqlite_busy() {
         let completed = std::sync::Arc::clone(&completed);
         let child = index + 1;
         threads.push(std::thread::spawn(move || {
-            let result =
-                runtime.block_on(memory.append_message_event(child_segment_input(AUTHORITY, child, &format!("child-{child} start"))));
+            let result = runtime.block_on(memory.append_message_event(child_segment_input(
+                AUTHORITY,
+                child,
+                &format!("child-{child} start"),
+            )));
             if result.is_ok() {
                 completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1076,9 +1079,7 @@ fn wait_for_competing_write(
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(
-                "timed out waiting for a competing commit or a writer blocked at BEGIN IMMEDIATE".to_string(),
-            );
+            return Err("timed out waiting for a competing commit or a writer blocked at BEGIN IMMEDIATE".to_string());
         }
         match waiting.recv_timeout(remaining.min(std::time::Duration::from_millis(20))) {
             Ok(()) => return Ok(()),
