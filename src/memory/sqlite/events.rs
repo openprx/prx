@@ -5,7 +5,7 @@ use crate::memory::traits::{
     MessageEvent, MessageEventInput, PartitionKey, SessionContextQuery, SharedContextQuery,
 };
 use chrono::Utc;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -262,7 +262,14 @@ impl SqliteMemory {
                 let keys = attested
                     .map(|_| KeyDirectory::open(key_root.as_deref().context("missing memory directory")?, false))
                     .transpose()?;
-                let tx = conn.unchecked_transaction()?;
+                // BEGIN IMMEDIATE takes the WAL write lock before any read.
+                // BEGIN DEFERRED pins a snapshot on the first SELECT (the
+                // tombstone fence when it runs); a second opener that commits
+                // then makes this INSERT return SQLITE_BUSY_SNAPSHOT /
+                // "database is locked" without the busy handler — the
+                // spawn_batch child-start failure against another pool on
+                // brain.db.
+                let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
                 if let (Some(owner), Some(deadline)) = (&repair_owner, repair_deadline) {
                     ingress_recovery::validate_owner(&tx, owner, &input.workspace_id, deadline)?;
                 }
@@ -280,6 +287,8 @@ impl SqliteMemory {
                         _ => Err(crate::memory::ingress_recovery::StableKeyTombstoned.into()),
                     };
                 }
+                #[cfg(test)]
+                hold_append_snapshot_for_test(&tx)?;
                 let (event, inserted) = Self::append_event_row(&tx, input, deadline.is_some())?;
                 if let Some(operation) = &mutation {
                     ingress_recovery::after_append(&tx, operation, &event, inserted)?;
@@ -449,7 +458,7 @@ impl SqliteMemory {
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let mut write = match deadline { Some(deadline) => pool.write_until(deadline)?, None => pool.write() };
             let conn = ingress_recovery::DeadlineConn::wrap(&mut write, deadline)?;
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
             if let (Some(owner), Some(deadline)) = (&repair_owner, deadline) {
                 ingress_recovery::validate_owner(&tx, owner, &event.workspace_id, deadline)?;
                 ingress_recovery::check_receipt_size(&tx, &event.event_id, None, &event.workspace_id)?;
@@ -1849,4 +1858,64 @@ impl SqliteMemory {
         })
         .await?
     }
+}
+
+#[cfg(test)]
+struct AppendSnapshotHoldInner {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static APPEND_SNAPSHOT_HOLD: parking_lot::Mutex<Option<AppendSnapshotHoldInner>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct AppendSnapshotHold {
+    pub entered: std::sync::mpsc::Receiver<()>,
+    pub release: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct AppendSnapshotHoldGuard;
+
+#[cfg(test)]
+impl Drop for AppendSnapshotHoldGuard {
+    fn drop(&mut self) {
+        *APPEND_SNAPSHOT_HOLD.lock() = None;
+    }
+}
+
+/// Park the first append after its snapshot read so a concurrent opener can
+/// commit. `BEGIN DEFERRED` then fails the INSERT with SQLITE_BUSY_SNAPSHOT;
+/// `BEGIN IMMEDIATE` already holds the write lock, so the others wait.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn arm_append_snapshot_hold() -> (AppendSnapshotHold, AppendSnapshotHoldGuard) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    *APPEND_SNAPSHOT_HOLD.lock() = Some(AppendSnapshotHoldInner {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (
+        AppendSnapshotHold {
+            entered: entered_rx,
+            release: release_tx,
+        },
+        AppendSnapshotHoldGuard,
+    )
+}
+
+#[cfg(test)]
+fn hold_append_snapshot_for_test(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    let Some(hold) = APPEND_SNAPSHOT_HOLD.lock().take() else {
+        return Ok(());
+    };
+    // The tombstone fence is a no-op without an idempotency key, so pin a
+    // snapshot here: WAL then returns SQLITE_BUSY_SNAPSHOT on INSERT if
+    // another pool committed in between.
+    let _: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    let _ = hold.entered.send(());
+    let _ = hold.release.recv_timeout(std::time::Duration::from_secs(60));
+    Ok(())
 }

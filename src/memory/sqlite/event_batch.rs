@@ -34,7 +34,7 @@ impl SqliteMemory {
                 // commit even if its async caller is cancelled.
                 let _permit = permit;
                 let connection = pool.write();
-                let tx = connection.unchecked_transaction()?;
+                let tx = rusqlite::Transaction::new_unchecked(&connection, rusqlite::TransactionBehavior::Immediate)?;
                 let mut results = Vec::with_capacity(count);
                 for input in inputs {
                     if let Err(error) = input.validate() {

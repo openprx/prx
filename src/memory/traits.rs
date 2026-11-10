@@ -818,7 +818,15 @@ mod message_event_contract_tests {
             assert!(sqlite_append.contains(field), "SQLite append must carry {field}");
             assert!(postgres_append.contains(field), "Postgres append must carry {field}");
         }
-        assert!(sqlite_append.contains("let tx = conn.unchecked_transaction()?"));
+        assert!(
+            sqlite_append.contains("Transaction::new_unchecked")
+                && sqlite_append.contains("TransactionBehavior::Immediate"),
+            "SQLite append must BEGIN IMMEDIATE so a concurrent opener cannot SQLITE_BUSY the child-start write"
+        );
+        assert!(
+            !sqlite_append.contains("let tx = conn.unchecked_transaction()?"),
+            "SQLite append must not BEGIN DEFERRED"
+        );
         assert!(postgres_append.contains("let mut tx = client.transaction()?"));
         assert!(sqlite_append.contains("tx.commit()?"));
         assert!(postgres_append.contains("tx.commit()?"));

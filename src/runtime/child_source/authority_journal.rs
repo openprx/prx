@@ -206,8 +206,11 @@ fn open_writer(workspace: &Path) -> anyhow::Result<Connection> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let conn = Connection::open(&path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mut conn = Connection::open(&path)?;
+    // Same policy as pooled stores: wait out a held lock instead of a 5s
+    // busy_timeout that surfaces SQLITE_BUSY ("database is locked") to a
+    // concurrently starting spawn_batch member.
+    crate::runtime::sqlite_pool::install_busy_handler(&mut conn)?;
     conn.execute_batch(
         "PRAGMA synchronous=FULL;
          CREATE TABLE IF NOT EXISTS authority (run TEXT PRIMARY KEY, entry TEXT NOT NULL);
@@ -235,7 +238,7 @@ struct Write<'a> {
 
 /// One transaction, `INSERT OR IGNORE`, then readback equality for every row.
 fn write_entries(conn: &mut Connection, writes: &[Write<'_>]) -> anyhow::Result<()> {
-    let transaction = conn.transaction()?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for write in writes {
         transaction.execute(write.insert, (write.key, write.entry))?;
         let stored: String = transaction.query_row(write.select, [write.key], |row| row.get(0))?;
