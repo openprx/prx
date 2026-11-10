@@ -220,3 +220,25 @@ async fn delegated_approval_inherits_explicit_context_and_rejects_wrong_decider(
     ));
     channel_approval::clear("parent-turn");
 }
+
+/// Literal golden of the supervised `approval.request` JSON-RPC bytes. Non-deterministic
+/// `id` and `params.approval_id` are replaced with placeholders before compare.
+/// Unchanged through R8a-R9.
+#[tokio::test]
+async fn payload_bytes_unchanged_by_switch() {
+    let mut host = supervised_host().await;
+    let mut request = request();
+    request.expires_at_ms = Some(4_000_000_000_000);
+    let pending = spawn_outcome(host.channel.approval_gate(), "conv-1", "turn-1", request);
+    let frame = approval_frame(&mut host).await;
+    let mut golden_frame = frame.clone();
+    golden_frame["id"] = json!("prx-golden");
+    golden_frame["params"]["approval_id"] = json!("00000000-0000-0000-0000-000000000001");
+    let bytes = serde_json::to_vec(&golden_frame).expect("test: golden bytes");
+    const GOLDEN: &[u8] = br#"{"id":"prx-golden","jsonrpc":"2.0","method":"approval.request","params":{"approval_id":"00000000-0000-0000-0000-000000000001","args_hash":"5b68a82fbffcd61b5da3a80a9e6f24e41dd8c6df737924934d0fde8bfce8506a","arguments_redacted":{"api_key":"[REDACTED]","command":"echo hi"},"conversation_id":"conv-1","expires_at_ms":4000000000000,"risk":"high","tool_name":"shell","turn_id":"turn-1"}}"#;
+    assert_eq!(bytes, GOLDEN, "ramflux approval.request bytes changed by the switch");
+    ack(&mut host, &frame).await;
+    host.send(&decision(9, &frame["params"]["approval_id"], "denied"))
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), pending).await;
+}

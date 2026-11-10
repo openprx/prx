@@ -356,6 +356,145 @@ async fn disabled_entry_turn_has_finite_call_budget() {
     assert_eq!(decision.service.prediction_port_calls(), before);
 }
 
+struct CollectIgnoreProvider {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for CollectIgnoreProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("fixture requires a structured request")
+    }
+    async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ChatResponse {
+            text: Some("done".into()),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        })
+    }
+}
+
+/// A Collect directive in the opened context does not take the collection
+/// path: the provider is called once and no collection lease starts.
+/// Re-inserting `context.disposition()?` Collect at `run_turn` start fails this cell.
+#[tokio::test]
+async fn run_turn_ignores_recorded_collect_directive() {
+    let workspace = tempfile::tempdir().expect("collect-ignore workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    assert!(
+        !config.decision_engine.enabled,
+        "this cell runs with the decision engine off"
+    );
+    let admitted = AdmittedTurn::with_config(config, "answer the user", Arc::new(Vec::new())).await;
+    let decision = admitted.decision();
+    let mut context = decision
+        .service
+        .open_turn_context(
+            decision.proof,
+            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("disabled engine opens a turn context");
+    let cap = context
+        .execution_refs()
+        .iter()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
+            id: crate::causal_tree::branch::CapabilityId::new(
+                crate::causal_tree::branch::CapabilityTarget::NativeTool,
+                "test",
+                "probe",
+            )
+            .expect("test capability id"),
+            fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
+            generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
+        });
+    Arc::get_mut(&mut context)
+        .expect("opened context is uniquely owned")
+        .install_collect_directive_for_test(
+            crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
+                cap,
+                crate::causal_tree::approval_collection::ApprovalReviewAdapter::ChatOwnerReview,
+                "0".repeat(64),
+            ),
+        );
+    assert!(
+        matches!(
+            context.disposition().expect("collect directive is readable"),
+            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
+        ),
+        "the fixture must carry a Collect directive"
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = CollectIgnoreProvider {
+        calls: Arc::clone(&calls),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("answer the user")];
+    let opened = TurnDecision {
+        service: decision.service,
+        context: &context,
+        proof: decision.proof,
+    };
+    run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "wacli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: opened,
+        },
+        TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: Arc::new(Vec::<Box<dyn Tool>>::new()),
+            observer: &crate::observability::NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admitted.adapter()),
+            memory: admitted.memory_runtime(),
+        },
+        TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .expect("run_turn ignores a recorded Collect directive");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Collect in context must not skip the provider turn"
+    );
+    assert!(
+        !context.approval_collection_started_for_test(),
+        "Collect in context must not start a collection lease"
+    );
+}
+
 struct SpawnFixtureChannel;
 
 #[async_trait]

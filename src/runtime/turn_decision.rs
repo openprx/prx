@@ -1270,6 +1270,21 @@ impl TurnDecisionContext {
             crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_collect_directive_for_test(
+        &mut self,
+        proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
+    ) {
+        self.directive = TurnExecutionDirective::CollectApprovalArguments(proof.clone());
+        self.engine.selection =
+            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn approval_collection_started_for_test(&self) -> bool {
+        self.approval_collection_started.load(Ordering::Acquire)
+    }
+
     /// Exact final-gated parent execution metadata. Reading these references
     /// grants no dispatch lease; the constrained reader must recheck scope,
     /// generation, security and approval at its execution boundary.

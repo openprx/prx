@@ -2489,12 +2489,7 @@ async fn drive_start_turn_stream(
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
     // provider/tool iteration itself remains exclusively in agent::turn_engine.
-    if let Some(config) = compaction_config.as_ref()
-        && !matches!(
-            routing.context.directive(),
-            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_)
-        )
-    {
+    if let Some(config) = compaction_config.as_ref() {
         let budget = crate::agent::context_budget::plan_context_budget(
             &history,
             config,

@@ -586,15 +586,14 @@ impl Drop for SkillPinGuard {
 
 /// Whether the turn ended waiting for an approval rather than with an answer.
 /// Those turns are reported as `Completed` by their entrypoints, so the signal
-/// comes from 02a ledger state: an approval collection proof, a pending
-/// decision event, or a tool attempt that is awaiting approval.
+/// comes from 02a ledger state: a pending decision event, or a tool attempt
+/// that is awaiting approval.
 pub(super) fn skill_awaiting_approval(
     decision: &DecisionSettlementRef,
     trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
 ) -> bool {
     let context = &decision.context;
-    context.approval_collection_proof().is_some()
-        || context.collected_pending_event().is_some()
+    context.collected_pending_event().is_some()
         || trace.map_or_else(
             || context.terminal_execution_trace().awaiting_approval_attempts,
             |trace| trace.awaiting_approval_attempts,
@@ -1757,8 +1756,8 @@ mod tests {
                 ),
             );
         assert!(
-            skill_awaiting_approval(&decision, None),
-            "an approval-collection proof on the 02a ledger path is awaiting approval"
+            !skill_awaiting_approval(&decision, None),
+            "a collection proof is not 02a ledger state; pending events and trace attempts are"
         );
 
         let mut draft_attempts = completed_commit("prx_awaiting_attempts");

@@ -211,7 +211,7 @@ pub(super) fn admission(
                 Selection::RequestApproval { reason_code, .. } => {
                     json!({"kind":"request_approval","reason":code(reason_code)?})
                 }
-                Selection::CollectApprovalArguments(_) => json!({"kind":"collect_approval_arguments"}),
+                Selection::CollectApprovalArguments(_) => json!({"kind":"ignored"}),
                 Selection::Abstain { action, reason_code } => {
                     json!({"kind":"abstain","action":action.as_str(),"reason":code(reason_code)?})
                 }
