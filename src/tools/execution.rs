@@ -589,6 +589,9 @@ impl ToolExecutionContext {
     pub(crate) fn h2_origin(&self) -> Option<&Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>> {
         self.h2_metadata.as_ref().and_then(|metadata| metadata.origin.as_ref())
     }
+    pub(crate) fn h2_review(&self) -> Option<&crate::runtime::h2_entry::LocalOwnerReview> {
+        self.h2_metadata.as_ref().and_then(|metadata| metadata.review.as_ref())
+    }
     fn normalize_h2_metadata(&mut self) {
         if self.h2_metadata.as_ref().is_some_and(|metadata| {
             metadata.controlled_case.is_none() && metadata.origin.is_none() && metadata.review.is_none()
@@ -2486,6 +2489,13 @@ impl ToolExecutionService {
             } else {
                 context.decision_approval.as_ref().and_then(|port| {
                     port.issued_binding(&command.name, &context.envelope, context.child_scope.clone())
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                tool = %command.name,
+                                "trace binding lookup failed"
+                            );
+                        })
                         .ok()
                 })
             };
@@ -2618,30 +2628,6 @@ impl ToolExecutionService {
             }
         }
 
-        if let Some(bindings) = &context.execution_bindings {
-            let verified = bindings
-                .get(&command.name)
-                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
-                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                .and_then(|binding| binding.verify(self, &context.envelope, &descriptor));
-            if let Err(error) = verified {
-                let error = error.to_string();
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    None,
-                    ToolExecutionStatus::StaleCapability,
-                    format!("Error: {error}"),
-                    None,
-                    Some(error),
-                    None,
-                    started,
-                );
-            }
-        }
-
         // V02-R9 / OQ-21: an owner-isolated origin runs only tools that enforce
         // per-owner isolation. Keyed on the envelope rather than a channel name,
         // so every isolated origin inherits it, and decided before policy so no
@@ -2713,7 +2699,7 @@ impl ToolExecutionService {
         }
 
         let h2_invocation = match async {
-            use crate::runtime::h2_entry::EntryAction;
+            use crate::runtime::h2_entry::{EntryAction, EntryInvocation};
             let requested = command.name == "skills_manage"
                 && command
                     .arguments
@@ -2739,16 +2725,37 @@ impl ToolExecutionService {
             if !requested {
                 return Ok::<_, anyhow::Error>(None);
             }
-            context
+            let origin = context
                 .h2_origin()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("experiment action has no actual controlled source"))?;
-            context
+            let binding = context
                 .execution_bindings
                 .as_ref()
                 .and_then(|bindings| bindings.get(&command.name))
                 .ok_or_else(|| anyhow::anyhow!("experiment action has no exact execution binding"))?;
-            Ok(None)
+            let verified = binding
+                .bind_call(
+                    self,
+                    &context.envelope,
+                    &descriptor,
+                    &command,
+                    context.decision_approval.as_ref(),
+                    context.schema_dialect,
+                )
+                .await?;
+            // Only execution after the original approval can consume this port.
+            // The initial pending call still needs to be recorded first.
+            if context.decision_resume.is_none()
+                && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
+            {
+                return Ok(None);
+            }
+            Ok(Some(EntryInvocation::from_verified(
+                origin,
+                &verified,
+                context.h2_review().cloned(),
+            )?))
         }
         .await
         {
@@ -2776,7 +2783,14 @@ impl ToolExecutionService {
         // needs a human approval at every autonomy level, also where policy
         // would allow it. Deny stays Deny.
         let decision = if decision != ToolExecutionDecision::Deny
-            && crate::security::approval_operation::requires_explicit_grant(&descriptor.public_name, &command.arguments)
+            && (crate::security::approval_operation::requires_explicit_grant(
+                &descriptor.public_name,
+                &command.arguments,
+            ) || context
+                .execution_bindings
+                .as_ref()
+                .and_then(|bindings| bindings.get(&command.name))
+                .is_some_and(|binding| binding.requires_approval()))
         {
             ToolExecutionDecision::Ask
         } else {
@@ -2918,8 +2932,8 @@ impl ToolExecutionService {
                         .await
                         .map(Some)
                 } else if let Some(port) = context.decision_approval.as_ref() {
-                    // Agent bind no longer assigns the map; the stamped port
-                    // still mints decision_call until R9.
+                    // Map-None callers (admission_matrix, operator) still mint
+                    // decision_call through the stamped port until R9.
                     port.bind_call(
                         self,
                         &context.envelope,
@@ -3265,39 +3279,6 @@ impl ToolExecutionService {
                 started,
             );
         }
-        if let Some(bindings) = &context.execution_bindings {
-            let verified = bindings
-                .get(&command.name)
-                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
-                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                .and_then(|binding| binding.verify(self, &context.envelope, &descriptor));
-            if let Err(error) = verified {
-                let abandonment = self
-                    .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
-                    .await;
-                let (status, error) = match abandonment {
-                    Ok(()) => (ToolExecutionStatus::StaleCapability, error.to_string()),
-                    Err(error) => (ToolExecutionStatus::Indeterminate, error),
-                };
-                if let Some(observation) = exact_call {
-                    observation.complete(status);
-                }
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    Some(decision),
-                    status,
-                    format!("Error: {error}"),
-                    None,
-                    Some(error),
-                    Some(preparation),
-                    started,
-                );
-            }
-        }
-
         // The resolved Arc is immutable for the in-flight call even if a
         // dynamic catalog refresh changes future descriptor snapshots.
         let backend = resolved.backend;
