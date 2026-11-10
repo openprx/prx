@@ -20,6 +20,10 @@ pub(crate) fn register(label: &str, provider: Arc<dyn Provider>) {
     fixtures().lock().insert(label.to_owned(), Arc::downgrade(&provider));
 }
 
+pub(crate) fn unregister(label: &str) {
+    fixtures().lock().remove(label);
+}
+
 pub(crate) fn build(label: &str) -> Option<Box<dyn Provider>> {
     let provider = fixtures().lock().get(label).and_then(Weak::upgrade)?;
     Some(Box::new(ForwardProvider(provider)))
