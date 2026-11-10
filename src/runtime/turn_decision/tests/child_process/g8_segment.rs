@@ -671,14 +671,15 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .await?;
         let routing = first.routing();
         assert!(
-            matches!(routing.context.directive(), TurnExecutionDirective::Execute { .. }),
-            "child Execute refused: selection={:?}; fallback={:?}; candidates={:?}; scores={:?}; post={:?}; final={:?}",
+            matches!(
+                routing.context.disposition().expect("admitted child disposition"),
+                crate::runtime::turn_decision::TurnDisposition::Run
+            ) && matches!(routing.context.directive(), TurnExecutionDirective::AnswerDirectly)
+                && routing.context.engine.prediction.is_none(),
+            "ungated child is Direct-surface Run: selection={:?}; directive={:?}; fallback={:?}",
             routing.context.engine.selection,
+            routing.context.directive(),
             routing.context.engine.fallback_cause,
-            routing.context.engine.candidates,
-            routing.context.engine.scores,
-            routing.context.engine.post_rehearsal,
-            routing.context.engine.pre_commit,
         );
         let original = [
             routing

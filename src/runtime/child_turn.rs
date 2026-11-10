@@ -5,13 +5,9 @@ use crate::agent::terminal::{
     TurnDeliveryIntent, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus, TurnTerminalTelemetry,
 };
 use crate::agent::turn_contracts::{ToolLoopOutcome, ToolLoopRuntimeAdapter, ToolLoopTrace};
+use anyhow::Context;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-#[cfg(test)]
-tokio::task_local! {
-    pub(crate) static SEGMENT_GATE_SPY: Arc<std::sync::atomic::AtomicUsize>;
-}
 
 pub(crate) struct ChildSegmentTurn {
     service: Arc<TurnDecisionService>,
@@ -74,10 +70,8 @@ impl ChildSegmentTurn {
             service.model_can_call_tools(proof.as_ref()),
             false,
         );
-        #[cfg(test)]
-        let _ = SEGMENT_GATE_SPY.try_with(|spy| spy.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
         let decision = service
-            .decide_agent_segment(proof.as_ref(), previous_observation.as_deref(), cancellation)
+            .open_issued_segment_turn_context(proof.as_ref(), previous_observation.as_deref(), cancellation)
             .await?;
         let recall_memory = fabric.memory();
         let recall_scope = crate::agent::context_recall::RecallScope::from_envelope(
@@ -130,6 +124,11 @@ impl ChildSegmentTurn {
             usage_collector,
             route,
         } = admission;
+        let mut execution = execution;
+        execution.call_budget = Some(
+            crate::agent::send_admission::call_token_budget(&service, &decision, proof.as_ref())
+                .context("segment call budget")?,
+        );
         // This owner is outside the segment's child-drain scope. Registering
         // inside that scope would make it wait for its own terminal guard.
         let provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());

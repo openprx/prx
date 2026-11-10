@@ -1,7 +1,7 @@
 #![cfg(unix)]
-use super::probe::{with_prepared_worker_manifest, with_worker_probe_manifest};
+use super::probe::with_prepared_worker_manifest;
 use crate::runtime::child_source::authority_journal;
-use crate::session_worker::runner::run::{run_validated_manifest, verify_worker_parent_authority};
+use crate::session_worker::runner::run::verify_worker_parent_authority;
 use anyhow::Result;
 
 #[tokio::test]
@@ -260,28 +260,21 @@ async fn launch_v3_refuses_launch_parent_sealed_for_another_run() -> Result<()> 
 }
 
 #[tokio::test]
-async fn worker_segment_admission_still_runs_the_gate() -> Result<()> {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    let tmp = tempfile::tempdir()?;
-    let provider = crate::providers::credential_probe::CredentialProbe::start_replying("prx child reply").await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let spy = Arc::clone(&calls);
-    with_worker_probe_manifest(&tmp, provider.custom_provider(), false, |worker| async move {
-        let config = worker.config_dir.to_string_lossy().to_string();
-        let result = crate::runtime::child_turn::SEGMENT_GATE_SPY
-            .scope(spy, run_validated_manifest(worker, None, Some(&config)))
-            .await?;
-        assert!(result.success, "{:?}", result.error);
-        Ok(())
-    })
-    .await?;
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "one real gate call for the one segment"
-    );
+async fn worker_segment_admission_without_gate_still_refuses_outside_manifest_call() -> Result<()> {
+    use crate::tools::execution::{ToolExecutionCommand, ToolExecutionStatus};
+    let child = crate::agent::turn_tests::engine_switch::admit_bound_child_segment().await;
+    let execution = child.turn.adapter().tool_execution_context;
+    assert!(execution.child_scope.is_some() && execution.child_pin.is_some());
+    let outside = child
+        .service
+        .execution()
+        .execute(
+            ToolExecutionCommand::new("project_tool", serde_json::json!({})),
+            execution,
+            None,
+        )
+        .await;
+    assert_eq!(outside.status, ToolExecutionStatus::StaleCapability);
+    child.shutdown().await;
     Ok(())
 }

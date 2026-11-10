@@ -204,41 +204,10 @@ enum WorkerSegmentSource {
 
 struct WorkerChildSegments {
     source: WorkerSegmentSource,
-    admission: LegacyGatedAdmission,
+    service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     completion: ChildCompletionPort,
     fabric: MemoryFabric,
     owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
-}
-
-/// Temporary admission adapter; every segment still executes the decision gate.
-struct LegacyGatedAdmission {
-    service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
-}
-
-impl LegacyGatedAdmission {
-    async fn admit(
-        &self,
-        source: (
-            Arc<crate::runtime::turn_source::OwnedTurnSourceProof>,
-            crate::tools::ToolExecutionContext,
-        ),
-        fabric: MemoryFabric,
-        config: Arc<Config>,
-        owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
-        cancel: &CancellationToken,
-        completion: &ChildCompletionPort,
-    ) -> Result<crate::runtime::child_turn::ChildSegmentTurn> {
-        crate::runtime::child_turn::ChildSegmentTurn::admit(
-            Arc::clone(&self.service),
-            source,
-            fabric,
-            config,
-            owner,
-            cancel,
-            Some(Arc::clone(&completion.usage)),
-        )
-        .await
-    }
 }
 
 impl WorkerChildSegments {
@@ -275,18 +244,19 @@ impl WorkerChildSegments {
             }
             WorkerSegmentSource::Operator { sequence, authority } => {
                 authority.verify()?;
-                let source = sequence.lock().await.record(input, &self.admission.service).await?;
+                let source = sequence.lock().await.record(input, &self.service).await?;
                 (source, Arc::clone(&authority.snapshots().generation.effective))
             }
         };
         Ok(boxed_worker_segments(|| {
-            self.admission.admit(
+            crate::runtime::child_turn::ChildSegmentTurn::admit(
+                Arc::clone(&self.service),
                 source,
                 self.fabric.clone(),
                 config,
                 &self.owner,
                 cancel,
-                &self.completion,
+                Some(Arc::clone(&self.completion.usage)),
             )
         })
         .await?
@@ -1043,9 +1013,7 @@ async fn run_owned_manifest(
                 ),
                 provider: Arc::clone(&provider),
             },
-            admission: LegacyGatedAdmission {
-                service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
-            },
+            service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
             fabric: decision_fabric
                 .as_ref()
                 .context("worker decision storage missing")?
@@ -1065,9 +1033,7 @@ async fn run_owned_manifest(
                 sequence: tokio::sync::Mutex::new(authority.segments()?),
                 authority: Arc::clone(authority),
             },
-            admission: LegacyGatedAdmission {
-                service: Arc::clone(child_service.as_ref().context("ordinary worker service missing")?),
-            },
+            service: Arc::clone(child_service.as_ref().context("ordinary worker service missing")?),
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("ordinary worker cleanup owner missing")?,
             completion: ChildCompletionPort {
@@ -1097,9 +1063,7 @@ async fn run_owned_manifest(
                 sequence: tokio::sync::Mutex::new(authority.segments()?),
                 authority: Arc::clone(authority),
             },
-            admission: LegacyGatedAdmission {
-                service: Arc::clone(child_service.as_ref().context("operator worker service missing")?),
-            },
+            service: Arc::clone(child_service.as_ref().context("operator worker service missing")?),
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("operator worker cleanup owner missing")?,
             completion: ChildCompletionPort {

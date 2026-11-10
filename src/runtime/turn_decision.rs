@@ -1986,6 +1986,28 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        self.open_turn_context_observed(proof, kind, cancellation, None).await
+    }
+
+    /// Segment admission uses the same builder as a first turn, with the
+    /// previous segment's verified observation folded into the trusted state.
+    pub(crate) async fn open_segment_turn_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        observation: Option<&segment_observation::SegmentObservation>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        self.open_turn_context_observed(proof, AgentTurnKind::SingleShot, cancellation, observation)
+            .await
+    }
+
+    async fn open_turn_context_observed(
+        &self,
+        proof: &dyn TurnSourceProof,
+        kind: AgentTurnKind,
+        cancellation: &CancellationToken,
+        observation: Option<&segment_observation::SegmentObservation>,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
         }
@@ -2082,7 +2104,7 @@ impl TurnDecisionService {
         let decision_id = DecisionId::new_runtime();
         let state = CausalState {
             trusted,
-            observed: segment_observation::initial_observations(None, deadline, cancellation)?,
+            observed: segment_observation::initial_observations(observation, deadline, cancellation)?,
             predicted: None,
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),

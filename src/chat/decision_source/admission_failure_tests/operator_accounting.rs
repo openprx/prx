@@ -284,14 +284,14 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                 );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
-                    1,
-                    "configured slot must perform exactly one actual HTTP request"
+                    0,
+                    "ungated child admission does not call the decision backend"
                 );
                 assert!(
-                    turn.is_close()?,
-                    "missing decision answers must fall back to a fixed local close"
+                    !turn.is_close()?,
+                    "ungated child is Direct-surface Run: {:?}",
+                    turn.routing().context.directive()
                 );
-                assert!(turn.close(&cancellation).await?.is_some());
                 drop(turn);
                 Ok::<_, anyhow::Error>(())
             })

@@ -26,6 +26,18 @@ impl TurnDecisionService {
         self.record_opened_context(proof, opened, cancellation).await
     }
 
+    pub(crate) async fn open_issued_segment_turn_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        observation: Option<&super::segment_observation::SegmentObservation>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        let opened = self
+            .open_segment_turn_context(proof, observation, cancellation)
+            .await?;
+        self.record_opened_context(proof, opened, cancellation).await
+    }
+
     pub(super) async fn record_issued_decision(
         &self,
         proof: &dyn TurnSourceProof,

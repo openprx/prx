@@ -1,9 +1,9 @@
 //! Immediate, confirmed predecessor observations for a serial child task.
 //! This is live runtime evidence, not a history read or new execution authority.
-use super::{AgentDecisionError, AgentTurnKind, TurnDecisionContext, TurnDecisionService};
+use super::AgentDecisionError;
 use crate::causal_tree::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::runtime::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
+use crate::runtime::turn_source::OwnedTurnSourceProof;
 use anyhow::{Context, ensure};
 use std::sync::Arc;
 use std::time::Instant;
@@ -268,42 +268,6 @@ fn project_trace(
         ));
     }
     Ok(steps)
-}
-
-impl TurnDecisionService {
-    pub(in crate::runtime) async fn decide_agent_segment(
-        &self,
-        proof: &OwnedTurnSourceProof,
-        observation: Option<&SegmentObservation>,
-        cancellation: &CancellationToken,
-    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        let context = self
-            .decide_agent_segment_initial_work(proof, observation, cancellation)
-            .await?;
-        self.record_issued_decision(proof, context, cancellation).await
-    }
-
-    #[inline(never)]
-    fn decide_agent_segment_initial_work<'a>(
-        &'a self,
-        proof: &'a OwnedTurnSourceProof,
-        observation: Option<&'a SegmentObservation>,
-        cancellation: &'a CancellationToken,
-    ) -> std::pin::Pin<
-        Box<
-            impl std::future::Future<Output = Result<super::accounting::AdmissionDecision, AgentDecisionError>> + Send + 'a,
-        >,
-    > {
-        Box::pin(self.decide_agent_initial_inner(
-            proof,
-            AgentTurnKind::SingleShot,
-            cancellation,
-            None,
-            observation,
-            #[cfg(feature = "llm-router")]
-            None,
-        ))
-    }
 }
 
 pub(super) fn initial_observations(

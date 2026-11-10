@@ -1820,8 +1820,8 @@ impl Tool for ChildSurfaceProbe {
             )
             .await?;
             anyhow::ensure!(
-                child.routing().context.ordinary_fixture_prediction_verified(),
-                "actual child Mock prediction required"
+                child.routing().context.engine().prediction.is_none(),
+                "ungated child has no engine prediction"
             );
             let child_routing = child.routing();
             let child_selection = child_routing
@@ -2130,6 +2130,7 @@ async fn a_spawned_sub_agent_inherits_the_parent_channels_tool_exclusions() {
     );
     let mut unrestricted = crate::config::ToolTieringConfig::default();
     unrestricted.channel_exclude.clear();
+    unrestricted.always_include = vec!["gateway".to_owned(), "nodes".to_owned()];
     for target in ["gateway", "nodes"] {
         let offered = published_child_tools(unrestricted.clone(), target).await;
         assert!(
