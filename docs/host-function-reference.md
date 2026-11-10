@@ -332,12 +332,15 @@ interface events {
 | `payload` | `string` — max 65536 bytes; the host does not parse it as JSON |
 
 **Returns:** `result<_, string>`. Errors: permission, topic length,
-`"event bus: payload size N exceeds maximum 65536 bytes"`.
+`"event bus: payload size N exceeds maximum 65536 bytes"`,
+`"event bus: recursion depth limit (8) exceeded for topic '…'"`.
 
-Guest `publish` always starts at depth 0. The depth-8 helper is not applied
-across guest deliveries: the hook pump forwards topic and payload only, so a
-hook that republishes to a topic it is subscribed to is not stopped by that
-helper.
+A guest `publish` while handling a delivered event of depth `d` is issued at
+depth `d` (the hook pump forwards `EventMessage.depth` into that invocation),
+so the next delivery is at `d+1`. A publish outside any event delivery is
+depth 0. Nested guest republish to a subscribed topic is rejected at depth 8
+with the recursion-limit error above; the host logs that rejection at warn
+without the payload.
 
 When no event bus is configured, `publish` returns `ok` and drops the event.
 

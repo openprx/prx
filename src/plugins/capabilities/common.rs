@@ -199,7 +199,12 @@ pub fn register_event_host_functions(linker: &mut wasmtime::component::Linker<Ho
                         }
                         Some(bus) => {
                             let bus = bus.clone();
-                            match bus.publish(&topic, &payload).await {
+                            // A delivered event already stored the previous
+                            // publish depth plus one as `EventMessage.depth`.
+                            // Publishing at that value issues the next event
+                            // at d+1. No delivery (top-level) is depth 0.
+                            let depth = store.data().current_event_depth.unwrap_or(0);
+                            match bus.publish_with_depth(&topic, &payload, depth).await {
                                 Ok(()) => Ok((Ok(()),)),
                                 Err(e) => Ok((Err(e),)),
                             }

@@ -34,12 +34,20 @@ pub struct WasmHook {
     events: HashSet<String>,
     supervisor: Arc<Supervisor>,
     invocation_state: Arc<HookInvocationState>,
+    /// Clone of the pump sink, so tests can subscribe the real pump without
+    /// going through the guest `subscribe` host function.
+    #[cfg(test)]
+    event_sink: tokio::sync::mpsc::Sender<crate::plugins::event_bus::EventMessage>,
 }
 
 #[derive(Default)]
 struct HookInvocationState {
     count: AtomicU64,
     last_event: RwLock<Option<String>>,
+    /// Depth of the last delivery that entered the guest. Test-only: production
+    /// diagnostics do not publish it.
+    #[cfg(test)]
+    last_depth: RwLock<Option<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +68,9 @@ struct OnEventCall {
     plugin_name: String,
     event: String,
     payload_json: String,
+    /// Depth of this delivery: `Some` for bus-pumped events (`EventMessage.depth`),
+    /// `None` for a top-level lifecycle `on_event` (guest `publish` is depth 0).
+    depth: Option<u32>,
     /// Counted when the supervisor enters the guest, never for a delivery
     /// it refuses (quarantined, or dead awaiting a rebuild).
     invocation_state: Arc<HookInvocationState>,
@@ -94,10 +105,16 @@ impl OnEventCall {
             plugin_name,
             event,
             payload_json,
+            depth,
             invocation_state,
         } = self;
         invocation_state.count.fetch_add(1, Ordering::Relaxed);
         *invocation_state.last_event.write() = Some(event.clone());
+        #[cfg(test)]
+        {
+            *invocation_state.last_depth.write() = depth;
+        }
+        store.data_mut().current_event_depth = depth;
         // Navigate to the exported interface with compatibility fallback.
         let Some(iface_idx) = HOOK_INTERFACES
             .iter()
@@ -123,7 +140,9 @@ impl OnEventCall {
         ];
         let mut results = [wasmtime::component::Val::Bool(false)];
 
-        if let Err(e) = func.call_async(&mut *store, &params, &mut results).await {
+        let call_result = func.call_async(&mut *store, &params, &mut results).await;
+        store.data_mut().current_event_depth = None;
+        if let Err(e) = call_result {
             return super::recovery::unwound(store, &e, || format!("hook '{plugin_name}' on-event error: {e}"));
         }
         match results.first() {
@@ -155,6 +174,8 @@ impl WasmHook {
         event_bus: Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>,
     ) -> PluginResult<Self> {
         let (event_sink, mut event_receiver) = tokio::sync::mpsc::channel(GUEST_EVENT_QUEUE_CAPACITY);
+        #[cfg(test)]
+        let test_event_sink = event_sink.clone();
         // Every store the adapter ever builds shares this sink, so a
         // subscription registered before a rebuild keeps delivering after it.
         let respawn = Respawn::new(
@@ -190,6 +211,7 @@ impl WasmHook {
                     &pump_plugin_name,
                     &message.topic,
                     &message.payload,
+                    Some(message.depth),
                 )
                 .await;
             }
@@ -200,6 +222,8 @@ impl WasmHook {
             events,
             supervisor,
             invocation_state,
+            #[cfg(test)]
+            event_sink: test_event_sink,
         })
     }
 
@@ -219,8 +243,19 @@ impl WasmHook {
             &self.plugin_name,
             event,
             payload_json,
+            None,
         )
         .await
+    }
+
+    #[cfg(test)]
+    fn event_sink(&self) -> tokio::sync::mpsc::Sender<crate::plugins::event_bus::EventMessage> {
+        self.event_sink.clone()
+    }
+
+    #[cfg(test)]
+    fn last_delivery_depth(&self) -> Option<u32> {
+        *self.invocation_state.last_depth.read()
     }
 
     pub fn plugin_name(&self) -> &str {
@@ -259,6 +294,7 @@ async fn deliver(
     plugin_name: &str,
     event: &str,
     payload_json: &str,
+    depth: Option<u32>,
 ) -> PluginResult<()> {
     if !supervisor.admit_payload("on-event", event.len().saturating_add(payload_json.len())) {
         return Ok(());
@@ -269,6 +305,7 @@ async fn deliver(
             plugin_name: plugin_name.to_string(),
             event: event.to_string(),
             payload_json: payload_json.to_string(),
+            depth,
             invocation_state: Arc::clone(invocation_state),
         })
         .await
@@ -533,6 +570,136 @@ max_execution_time_ms = {timeout_ms}
                 "a refused delivery is not an invocation"
             );
             assert_eq!(diagnostics.last_event.as_deref(), Some(EVENT));
+        }
+    }
+
+    mod event_depth {
+        use super::super::*;
+        use crate::plugins::event_bus::{EventBus, MAX_RECURSION_DEPTH};
+        use std::sync::Arc;
+        use tokio::time::{Duration, timeout};
+
+        fn audit_manifest() -> PluginManifest {
+            toml::from_str(
+                r#"
+[plugin]
+name = "audit-hook"
+version = "0.1.0"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "hook"
+name = "audit"
+
+[[capabilities.events]]
+pattern = "prx.lifecycle.*"
+
+[permissions]
+required = ["log", "kv", "events"]
+optional = []
+
+[resources]
+max_fuel = 1000000000
+max_memory_mb = 8
+max_execution_time_ms = 5000
+"#,
+            )
+            .expect("test: audit hook manifest parses")
+        }
+
+        async fn audit_hook_with_bus(event_bus: Arc<EventBus>) -> WasmHook {
+            let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasmtime engine");
+            let wasm =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/audit-hook/plugin.wasm");
+            let bytes = std::fs::read(wasm).expect("test: the committed hook fixture is readable");
+            let component =
+                wasmtime::component::Component::from_binary(&engine, &bytes).expect("test: the fixture is a component");
+            let granted = ["log", "kv", "events"].into_iter().map(str::to_string).collect();
+            let events = std::iter::once("prx.lifecycle.*".to_string()).collect();
+            WasmHook::new(
+                &engine,
+                &component,
+                &audit_manifest(),
+                granted,
+                events,
+                None,
+                Some(event_bus),
+            )
+            .await
+            .expect("test: the fixture instantiates")
+        }
+
+        async fn subscribe_hook(bus: &Arc<EventBus>, hook: &WasmHook, pattern: &str) {
+            bus.subscribe_pump("audit-hook", pattern, hook.event_sink())
+                .await
+                .expect("test: pump subscription");
+        }
+
+        /// The hook pump forwards `EventMessage.depth` into the guest
+        /// invocation so a later `publish` can carry it.
+        #[tokio::test]
+        async fn the_hook_pump_delivers_event_depth_into_the_guest_invocation() {
+            let bus = Arc::new(EventBus::new());
+            let hook = audit_hook_with_bus(Arc::clone(&bus)).await;
+            subscribe_hook(&bus, &hook, "depth.probe").await;
+
+            bus.publish_with_depth("depth.probe", "{}", 3)
+                .await
+                .expect("test: probe publish");
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if hook.last_delivery_depth() == Some(4) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("test: the pump must deliver depth 4 (publish 3 stored as 4)");
+            assert_eq!(hook.diagnostics().invocation_count, 1);
+            assert_eq!(hook.diagnostics().last_event.as_deref(), Some("depth.probe"));
+        }
+
+        /// A real WASM hook that republishes to its own topic stops when the
+        /// existing depth limit rejects the next publish. Invocations equal
+        /// the number of successful publishes (0..=MAX) plus the delivery
+        /// whose republish is rejected.
+        #[tokio::test]
+        async fn a_hook_that_republishes_to_its_own_topic_stops_at_the_depth_limit() {
+            let bus = Arc::new(EventBus::new());
+            let hook = audit_hook_with_bus(Arc::clone(&bus)).await;
+            subscribe_hook(&bus, &hook, "loop.cascade").await;
+
+            bus.publish("loop.cascade", "{}").await.expect("test: seed the cascade");
+
+            let expected = u64::from(MAX_RECURSION_DEPTH).saturating_add(1);
+            let counted = timeout(Duration::from_secs(5), async {
+                let mut last = 0u64;
+                let mut stable_rounds = 0u8;
+                loop {
+                    let n = hook.diagnostics().invocation_count;
+                    assert!(
+                        n <= expected.saturating_add(8),
+                        "cascade exceeded the depth limit: {n} invocations"
+                    );
+                    if n == last && n >= expected {
+                        stable_rounds = stable_rounds.saturating_add(1);
+                        if stable_rounds >= 32 {
+                            return n;
+                        }
+                    } else {
+                        last = n;
+                        stable_rounds = 0;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("test: cascade must stop before the timeout (does not hang)");
+            assert_eq!(
+                counted, expected,
+                "invocations must equal MAX_RECURSION_DEPTH+1 (allowed publish depths 0..=MAX, then one rejected hop)"
+            );
         }
     }
 }
