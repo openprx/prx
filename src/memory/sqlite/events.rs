@@ -239,6 +239,8 @@ impl SqliteMemory {
             .map(|_| self.repair_owner(&input.workspace_id))
             .transpose()?;
         let key_root = self.db_path.parent().map(std::path::Path::to_path_buf);
+        #[cfg(test)]
+        let db_path = self.db_path.clone();
 
         Box::pin(crate::runtime::blocking::spawn_blocking(
             move || -> anyhow::Result<Option<(MessageEvent, bool)>> {
@@ -288,7 +290,7 @@ impl SqliteMemory {
                     };
                 }
                 #[cfg(test)]
-                hold_append_snapshot_for_test(&tx)?;
+                hold_append_snapshot_for_test(&input, &db_path)?;
                 let (event, inserted) = Self::append_event_row(&tx, input, deadline.is_some())?;
                 if let Some(operation) = &mutation {
                     ingress_recovery::after_append(&tx, operation, &event, inserted)?;
@@ -1862,6 +1864,9 @@ impl SqliteMemory {
 
 #[cfg(test)]
 struct AppendSnapshotHoldInner {
+    db_path: std::path::PathBuf,
+    run_id: String,
+    idempotency_key: String,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
@@ -1885,15 +1890,24 @@ impl Drop for AppendSnapshotHoldGuard {
     }
 }
 
-/// Park the first append after its snapshot read so a concurrent opener can
-/// commit. `BEGIN DEFERRED` then fails the INSERT with SQLITE_BUSY_SNAPSHOT;
-/// `BEGIN IMMEDIATE` already holds the write lock, so the others wait.
+/// Park the matching child-segment append after its real tombstone-fence
+/// SELECT so a concurrent opener can commit. Unrelated appends leave the
+/// hook in place. `BEGIN DEFERRED` then fails the INSERT with
+/// SQLITE_BUSY_SNAPSHOT; `BEGIN IMMEDIATE` already holds the write lock,
+/// so the others wait.
 #[cfg(test)]
 #[must_use]
-pub(crate) fn arm_append_snapshot_hold() -> (AppendSnapshotHold, AppendSnapshotHoldGuard) {
+pub(crate) fn arm_append_snapshot_hold(
+    db_path: std::path::PathBuf,
+    run_id: impl Into<String>,
+    idempotency_key: impl Into<String>,
+) -> (AppendSnapshotHold, AppendSnapshotHoldGuard) {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     *APPEND_SNAPSHOT_HOLD.lock() = Some(AppendSnapshotHoldInner {
+        db_path,
+        run_id: run_id.into(),
+        idempotency_key: idempotency_key.into(),
         entered: entered_tx,
         release: release_rx,
     });
@@ -1907,14 +1921,31 @@ pub(crate) fn arm_append_snapshot_hold() -> (AppendSnapshotHold, AppendSnapshotH
 }
 
 #[cfg(test)]
-fn hold_append_snapshot_for_test(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
-    let Some(hold) = APPEND_SNAPSHOT_HOLD.lock().take() else {
+fn hold_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn hold_append_snapshot_for_test(input: &MessageEventInput, db_path: &std::path::Path) -> anyhow::Result<()> {
+    let mut slot = APPEND_SNAPSHOT_HOLD.lock();
+    let matched = slot.as_ref().is_some_and(|hold| {
+        input.run_id.as_deref() == Some(hold.run_id.as_str())
+            && input.idempotency_key.as_deref() == Some(hold.idempotency_key.as_str())
+            && hold_paths_match(&hold.db_path, db_path)
+    });
+    if !matched {
         return Ok(());
-    };
-    // The tombstone fence is a no-op without an idempotency key, so pin a
-    // snapshot here: WAL then returns SQLITE_BUSY_SNAPSHOT on INSERT if
-    // another pool committed in between.
-    let _: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))?;
+    }
+    let hold = slot
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("test: snapshot hold vanished after identity match"))?;
+    drop(slot);
     let _ = hold.entered.send(());
     let _ = hold.release.recv_timeout(std::time::Duration::from_secs(60));
     Ok(())

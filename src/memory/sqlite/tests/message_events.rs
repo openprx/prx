@@ -957,10 +957,12 @@ async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
 /// same shape as a spawn_batch member plus a second opener on that file
 /// (gateway `test_app_state`).
 ///
-/// Writer 0 parks after a snapshot read. Writers 1..N-1 then commit. WAL
-/// `BEGIN DEFERRED` makes writer 0's INSERT return SQLITE_BUSY_SNAPSHOT /
-/// "database is locked" without the busy handler. `BEGIN IMMEDIATE` already
-/// holds the write lock, so the others wait and every writer succeeds.
+/// Writer 0 parks after the real stable-key tombstone fence. The test then
+/// waits until a competing write has committed or a contender is blocked at
+/// `BEGIN IMMEDIATE` (fail on timeout). WAL `BEGIN DEFERRED` makes writer 0's
+/// INSERT return SQLITE_BUSY_SNAPSHOT / "database is locked" without the busy
+/// handler. `BEGIN IMMEDIATE` already holds the write lock, so the others wait
+/// and every writer succeeds.
 ///
 /// MUTATION GUARD: restore `unchecked_transaction()` (BEGIN DEFERRED) on the
 /// append path and writer 0 fails with SQLITE_BUSY instead of waiting.
@@ -968,36 +970,31 @@ async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
 async fn concurrent_child_start_writers_do_not_surface_sqlite_busy() {
     let tmp = tempfile::TempDir::new().unwrap();
     const WRITERS: usize = 8;
+    const AUTHORITY: &str = "batch-busy";
     // Open every pool before parking writer 0: creating them after the hold
     // can outlast the snapshot wait on a loaded builder, drop the release
     // receiver, and panic on send.
     let mut memories: Vec<SqliteMemory> = (0..WRITERS)
         .map(|_| SqliteMemory::new(tmp.path()).expect("test: child writer pool"))
         .collect();
+    let db_path = memories[0].db_path.clone();
+    let first_run = format!("child-segment:{AUTHORITY}:0");
+    let first_key = format!("{first_run}:input");
     let runtime = tokio::runtime::Handle::current();
-    let (hold, _guard) = super::super::events::arm_append_snapshot_hold();
+    let (hold, _hold_guard) = super::super::events::arm_append_snapshot_hold(db_path.clone(), first_run, first_key);
+    let (waiting, _busy_guard) = crate::runtime::sqlite_pool::arm_busy_wait_watch(db_path);
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let first = memories.remove(0);
     let first_thread = {
         let runtime = runtime.clone();
         std::thread::spawn(move || {
-            let mut input = message_input(
-                "prx_workspace",
-                "child-0 start",
-                MemoryVisibility::Workspace,
-                None,
-                Some("prx_session"),
-                Some("prx_user"),
-            );
-            input.owner_id = Some("prx_user".to_string());
-            input.run_id = Some("child-0".to_string());
-            runtime.block_on(first.append_message_event(input))
+            runtime.block_on(first.append_message_event(child_segment_input(AUTHORITY, 0, "child-0 start")))
         })
     };
     hold.entered
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("test: first writer must pin a WAL snapshot");
+        .expect("test: first writer must pin a WAL snapshot at the real fence");
 
     let mut threads = Vec::with_capacity(WRITERS - 1);
     for (index, memory) in memories.into_iter().enumerate() {
@@ -1005,26 +1002,17 @@ async fn concurrent_child_start_writers_do_not_surface_sqlite_busy() {
         let completed = std::sync::Arc::clone(&completed);
         let child = index + 1;
         threads.push(std::thread::spawn(move || {
-            let mut input = message_input(
-                "prx_workspace",
-                &format!("child-{child} start"),
-                MemoryVisibility::Workspace,
-                None,
-                Some("prx_session"),
-                Some("prx_user"),
-            );
-            input.owner_id = Some("prx_user".to_string());
-            input.run_id = Some(format!("child-{child}"));
-            let result = runtime.block_on(memory.append_message_event(input));
-            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result =
+                runtime.block_on(memory.append_message_event(child_segment_input(AUTHORITY, child, &format!("child-{child} start"))));
+            if result.is_ok() {
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             result
         }));
     }
-    let wait_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
-    while completed.load(std::sync::atomic::Ordering::SeqCst) < WRITERS - 1 && std::time::Instant::now() < wait_until {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    let conflict = wait_for_competing_write(&completed, &waiting);
     hold.release.send(()).expect("test: release first writer");
+    conflict.unwrap_or_else(|error| panic!("test: {error}"));
 
     let mut locked = Vec::new();
     match first_thread.join().expect("test: child writer thread") {
@@ -1056,6 +1044,53 @@ async fn concurrent_child_start_writers_do_not_surface_sqlite_busy() {
         locked.is_empty(),
         "no child start writer may fail with SQLITE_BUSY: {locked:?}"
     );
+}
+
+fn child_segment_input(authority: &str, segment: usize, content: &str) -> MessageEventInput {
+    let run = format!("child-segment:{authority}:{segment}");
+    let mut input = message_input(
+        "prx_workspace",
+        content,
+        MemoryVisibility::Workspace,
+        None,
+        Some("prx_session"),
+        Some("prx_user"),
+    );
+    input.owner_id = Some("prx_user".to_string());
+    input.run_id = Some(run.clone());
+    input.idempotency_key = Some(format!("{run}:input"));
+    input.subject = Some(crate::memory::traits::MessageEventSubject::Task(format!(
+        "task-{authority}"
+    )));
+    input
+}
+
+fn wait_for_competing_write(
+    committed: &std::sync::atomic::AtomicUsize,
+    waiting: &std::sync::mpsc::Receiver<()>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if committed.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "timed out waiting for a competing commit or a writer blocked at BEGIN IMMEDIATE".to_string(),
+            );
+        }
+        match waiting.recv_timeout(remaining.min(std::time::Duration::from_millis(20))) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if committed.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    return Ok(());
+                }
+                return Err("busy-wait watch dropped before a competing write committed".to_string());
+            }
+        }
+    }
 }
 
 fn sqlite_busy(text: &str) -> bool {
