@@ -1,14 +1,16 @@
 #![cfg(test)]
 use super::*;
 
-/// The scoped upsert carries the conflict guard, and the guard is the one
-/// rendered by the shared seam: an isolated write cannot re-own a row even
-/// when another process writes it between the ownership check and the
-/// upsert. The rendering itself is pinned by
+/// The scoped upsert carries the owner conflict guard, and the guard is
+/// the one rendered by the shared seam: an isolated write cannot re-own a
+/// row even when another process writes it between the ownership check and
+/// the upsert. Guard G (appendix D / H2) is appended with `AND` onto that
+/// same WHERE; `changed == 0` (owner or scope) maps to `KeyNotAvailable`.
+/// The owner-guard rendering itself is pinned by
 /// `owner_predicate::tests::store_conflict_guard_is_empty_unless_the_write_is_owner_isolated`.
 ///
-/// MUTATION GUARD: drop `{owner_guard}` from the statement, or the
-/// zero-rows refusal after it, and this goes red.
+/// MUTATION GUARD: drop `{owner_guard}` from the statement, drop
+/// `{scope_guard}`, or drop the zero-rows refusal after it, and this goes red.
 #[test]
 fn scoped_store_upsert_carries_the_owner_conflict_guard_and_refuses_a_suppressed_update() {
     let production = r9_production_source();
@@ -17,15 +19,22 @@ fn scoped_store_upsert_carries_the_owner_conflict_guard_and_refuses_a_suppressed
         "test: the sqlite backend production source is not empty"
     );
     assert!(
-        production.contains("policy_version = excluded.policy_version{owner_guard}\"),"),
-        "the scoped upsert must end with the owner conflict guard"
+        production.contains("{coalesce}{owner_guard}{scope_guard}"),
+        "the scoped upsert must keep the owner conflict guard and append guard G"
     );
     assert!(
-        production.contains("store_conflict_guard(SQLITE_DIALECT, \"memories\", isolated_owner.is_some())"),
+        production.contains("owner_predicate::store_conflict_guard(")
+            && production.contains("SQLITE_DIALECT,")
+            && production.contains("\"memories\",")
+            && production.contains("isolated_owner.is_some()"),
         "the guard must come from the shared owner-isolation seam"
     );
     assert!(
-        production.contains("if isolated_owner.is_some() && changed == 0 {"),
+        production.contains("scope_conflict_guard(\"memories\", !owner_guard.is_empty())"),
+        "guard G must AND onto an existing owner WHERE"
+    );
+    assert!(
+        production.contains("if changed == 0 {"),
         "a suppressed update must be reported, not silently accepted"
     );
 }
