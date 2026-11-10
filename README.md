@@ -61,11 +61,14 @@ prx init --interactive
 prx daemon
 ```
 
-Foreground commands (`prx agent`, `prx chat`, `prx go`, and other commands
-whose stdout is the product) default to `warn`-level tracing on stderr, so a
-scripted `prx agent 'What is 2+2?'` prints only the reply. Raise the level
-with `RUST_LOG=info`. `prx daemon`, `prx gateway`, and `prx channel start`
-keep `info` on their current destination.
+Foreground commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
+`prx status`, and other commands whose stdout is the product) default to
+`warn`-level tracing on stderr, so a scripted `prx agent 'What is 2+2?'`
+prints only the reply. Those commands previously wrote tracing to stdout.
+`RUST_LOG` can raise or lower the level (`RUST_LOG=info`, `RUST_LOG=error`).
+Interactive `prx chat` writes the same filter to `chat.log` (WARN+ by
+default). `prx daemon`, `prx gateway`, and `prx channel start` keep `info`
+on their current destination.
 
 The installer downloads a platform-specific binary from
 [GitHub Releases](https://github.com/openprx/prx/releases), verifies its SHA-256

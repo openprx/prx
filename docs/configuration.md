@@ -36,13 +36,17 @@ a structured save writes the canonical versioned form.
 
 ## Tracing and `RUST_LOG`
 
-Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, and other
-commands whose stdout is the product) default to `warn` when `RUST_LOG` is
-unset, and they write tracing only to stderr. `prx daemon`, `prx gateway`,
-and `prx channel start` keep the previous `info` default on their current
-destination. Set `RUST_LOG=info` (or a more specific filter such as
-`RUST_LOG=openprx::prompt_cache=debug`) to raise the level. Durable audit
-records written to files or the database are independent of this filter.
+Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
+`prx status`, and other commands whose stdout is the product) default to
+`warn` when `RUST_LOG` is unset, and they write tracing only to stderr
+(they previously used stdout, except the few commands that already logged
+to stderr). `prx daemon`, `prx gateway`, and `prx channel start` keep the
+previous `info` default on their current destination. `RUST_LOG` can raise
+or lower the level (`RUST_LOG=info`, `RUST_LOG=error`, or a more specific
+filter such as `RUST_LOG=openprx::prompt_cache=debug`). Interactive
+`prx chat` applies the same filter to `chat.log`, so that file records
+WARN+ by default unless `RUST_LOG` raises it. Durable audit records
+written to files or the database are independent of this filter.
 
 ## Quick Setup
 

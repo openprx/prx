@@ -3622,6 +3622,138 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// Oracle is clap argv, not a copy of `cli_tracing_command`. Mapping
+    /// `Commands::Gateway` to `CliCommand::Agent` fails the gateway row.
+    fn commands_coverage_tag(command: &Commands) -> &'static str {
+        match command {
+            Commands::Init { .. } => "Init",
+            Commands::Go { .. } => "Go",
+            Commands::Agent { .. } => "Agent",
+            Commands::Chat { .. } => "Chat",
+            Commands::Gateway { .. } => "Gateway",
+            Commands::Daemon { .. } => "Daemon",
+            Commands::Service { .. } => "Service",
+            Commands::Doctor { .. } => "Doctor",
+            Commands::Status => "Status",
+            Commands::Tasks { .. } => "Tasks",
+            Commands::Memory { .. } => "Memory",
+            Commands::Evolution { .. } => "Evolution",
+            #[cfg(feature = "wasm-plugins")]
+            Commands::Plugin { .. } => "Plugin",
+            Commands::Cost { .. } => "Cost",
+            Commands::Fitness { .. } => "Fitness",
+            Commands::Cron { .. } => "Cron",
+            Commands::Xin { .. } => "Xin",
+            Commands::Causal { .. } => "Causal",
+            Commands::Models { .. } => "Models",
+            Commands::Providers { .. } => "Providers",
+            Commands::Routes { .. } => "Routes",
+            Commands::Channel {
+                channel_command: ChannelCommands::Start,
+            } => "ChannelStart",
+            Commands::Channel { .. } => "ChannelManage",
+            Commands::Integrations { .. } => "Integrations",
+            Commands::Skills { .. } => "Skills",
+            Commands::Migrate { .. } => "Migrate",
+            Commands::Auth { .. } => "Auth",
+            Commands::Approval { .. } => "Approval",
+            Commands::Audit { .. } => "Audit",
+            Commands::Config { .. } => "Config",
+            Commands::SessionWorker { .. } => "SessionWorker",
+            Commands::Completions { .. } => "Completions",
+        }
+    }
+
+    #[test]
+    fn cli_tracing_clap_argv_maps_every_command() {
+        let cases: &[(&[&str], cli_tracing::CliCommand)] = &[
+            (&["prx", "init"], cli_tracing::CliCommand::Init),
+            (&["prx", "go"], cli_tracing::CliCommand::Go),
+            (&["prx", "agent"], cli_tracing::CliCommand::Agent),
+            (&["prx", "chat"], cli_tracing::CliCommand::Chat),
+            (&["prx", "gateway"], cli_tracing::CliCommand::Gateway),
+            (&["prx", "daemon"], cli_tracing::CliCommand::Daemon),
+            (&["prx", "service", "status"], cli_tracing::CliCommand::Service),
+            (&["prx", "doctor"], cli_tracing::CliCommand::Doctor),
+            (&["prx", "status"], cli_tracing::CliCommand::Status),
+            (&["prx", "tasks", "list"], cli_tracing::CliCommand::Tasks),
+            (&["prx", "memory", "reindex"], cli_tracing::CliCommand::Memory),
+            (&["prx", "evolution", "status"], cli_tracing::CliCommand::Evolution),
+            (&["prx", "cost"], cli_tracing::CliCommand::Cost),
+            (&["prx", "fitness", "status"], cli_tracing::CliCommand::Fitness),
+            (&["prx", "cron", "list"], cli_tracing::CliCommand::Cron),
+            (&["prx", "xin", "status"], cli_tracing::CliCommand::Xin),
+            (&["prx", "causal", "status"], cli_tracing::CliCommand::Causal),
+            (&["prx", "models"], cli_tracing::CliCommand::Models),
+            (&["prx", "providers"], cli_tracing::CliCommand::Providers),
+            (&["prx", "routes", "list"], cli_tracing::CliCommand::Routes),
+            (&["prx", "channel", "start"], cli_tracing::CliCommand::ChannelStart),
+            (&["prx", "channel", "list"], cli_tracing::CliCommand::ChannelManage),
+            (&["prx", "integrations"], cli_tracing::CliCommand::Integrations),
+            (&["prx", "skills", "list"], cli_tracing::CliCommand::Skills),
+            (&["prx", "migrate", "status"], cli_tracing::CliCommand::Migrate),
+            (
+                &["prx", "auth", "login", "--provider", "openai-codex"],
+                cli_tracing::CliCommand::Auth,
+            ),
+            (&["prx", "approval", "list"], cli_tracing::CliCommand::Approval),
+            (&["prx", "audit", "attest-eu-ai-act"], cli_tracing::CliCommand::Audit),
+            (&["prx", "config", "show"], cli_tracing::CliCommand::Config),
+            (&["prx", "session-worker"], cli_tracing::CliCommand::SessionWorker),
+            (&["prx", "completions", "bash"], cli_tracing::CliCommand::Completions),
+        ];
+        #[cfg(feature = "wasm-plugins")]
+        let plugin_case: &[(&[&str], cli_tracing::CliCommand)] =
+            &[(&["prx", "plugin", "list"], cli_tracing::CliCommand::Plugin)];
+        #[cfg(not(feature = "wasm-plugins"))]
+        let plugin_case: &[(&[&str], cli_tracing::CliCommand)] = &[];
+
+        let mut seen = Vec::new();
+        for (argv, want) in cases.iter().chain(plugin_case.iter()) {
+            let cli = Cli::try_parse_from(*argv).unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+            assert_eq!(cli_tracing_command(&cli.command), *want, "{argv:?}");
+            seen.push(commands_coverage_tag(&cli.command));
+        }
+        let mut expected_tags = vec![
+            "Init",
+            "Go",
+            "Agent",
+            "Chat",
+            "Gateway",
+            "Daemon",
+            "Service",
+            "Doctor",
+            "Status",
+            "Tasks",
+            "Memory",
+            "Evolution",
+            "Cost",
+            "Fitness",
+            "Cron",
+            "Xin",
+            "Causal",
+            "Models",
+            "Providers",
+            "Routes",
+            "ChannelStart",
+            "ChannelManage",
+            "Integrations",
+            "Skills",
+            "Migrate",
+            "Auth",
+            "Approval",
+            "Audit",
+            "Config",
+            "SessionWorker",
+            "Completions",
+        ];
+        #[cfg(feature = "wasm-plugins")]
+        expected_tags.push("Plugin");
+        expected_tags.sort_unstable();
+        seen.sort_unstable();
+        assert_eq!(seen, expected_tags);
+    }
+
     /// E-4 (RED before PMM-E): a secret on the command line draws a warning
     /// that names the alternative and never repeats the secret; the stdin
     /// and environment alternatives draw none.

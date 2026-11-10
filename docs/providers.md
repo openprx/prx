@@ -1346,7 +1346,8 @@ provider/model rows are retained; additional pairs accumulate in `other`.
 Read the process-local counters in `daemon_state.json` under `prompt_cache`,
 `prx doctor`, or Console Overview. They reset on process restart. Doctor reports
 baseline facts as OK items without hit-rate warnings. Enable per-round debug
-events with `RUST_LOG=openprx::prompt_cache=debug` (foreground commands default
-to `warn` when `RUST_LOG` is unset); events contain redacted
+events with `RUST_LOG=openprx::prompt_cache=debug` (`RUST_LOG` can raise or
+lower the level; foreground commands default to `warn` when it is unset);
+events contain redacted
 provider/model labels, hashes and usage counts, without prompts, schemas or
 conversation identifiers.

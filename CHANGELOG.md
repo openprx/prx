@@ -25,11 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `prx agent`, `prx chat`, `prx go`, and other foreground commands default to
-  `warn`-level tracing on stderr when `RUST_LOG` is unset, so
-  `prx agent 'What is 2+2?'` prints only the reply on stdout. `RUST_LOG` still
-  raises the level. `prx daemon`, `prx gateway`, and `prx channel start` keep
-  `info` on their current destination. Durable audit records are unchanged.
+- `prx agent`, `prx chat`, `prx go`, `prx doctor`, `prx status`, and other
+  foreground commands default to `warn`-level tracing on stderr when
+  `RUST_LOG` is unset, so `prx agent 'What is 2+2?'` prints only the reply
+  on stdout. Those commands previously wrote tracing to stdout (except the
+  few that already used stderr). `RUST_LOG` can raise or lower the level.
+  Interactive `prx chat` writes the same filter to `chat.log`, so that file
+  records WARN+ by default unless `RUST_LOG` raises it. `prx daemon`,
+  `prx gateway`, and `prx channel start` keep `info` on their current
+  destination. Durable audit records are unchanged.
 
 - The ramflux channel honours the host-supplied `turn_id` on outbound frames
   and cancel, while retaining fresh internal run UUIDs.

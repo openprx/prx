@@ -1,8 +1,9 @@
 //! Single-shot `prx agent` keeps stdout as the reply line.
 //!
 //! Requires `--features test-mock` so the in-process mock provider can answer
-//! without a network. `RUST_LOG` is unset: the default warn filter must hide
-//! INFO tracing (and INFO tool-audit lines) from both stdout and stderr.
+//! without a network. With `RUST_LOG` unset, the default warn filter must hide
+//! INFO tracing (and INFO tool-audit lines) from both stdout and stderr. With
+//! `RUST_LOG=info`, INFO must appear on stderr and still not on stdout.
 #![cfg(feature = "test-mock")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -46,8 +47,7 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-#[test]
-fn single_shot_agent_stdout_is_exactly_the_reply_and_stderr_has_no_info() {
+fn run_single_shot_agent(rust_log: Option<&str>) -> std::process::Output {
     let home = tempfile::tempdir().expect("home");
     let config_dir = home.path().join("config");
     std::fs::create_dir_all(config_dir.join("workspace")).expect("dirs");
@@ -85,7 +85,8 @@ cache_read = 0.0
 "#,
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_prx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
         .arg("--config-dir")
         .arg(&config_dir)
         .arg("agent")
@@ -104,10 +105,16 @@ cache_read = 0.0
         .env("OPENPRX_MOCK_RESPONSE", REPLY)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run prx agent");
+        .stdin(Stdio::null());
+    if let Some(filter) = rust_log {
+        command.env("RUST_LOG", filter);
+    }
+    command.output().expect("run prx agent")
+}
 
+#[test]
+fn single_shot_agent_stdout_is_exactly_the_reply_and_stderr_has_no_info() {
+    let output = run_single_shot_agent(None);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -127,5 +134,26 @@ cache_read = 0.0
     assert!(
         !stderr_plain.to_ascii_lowercase().contains("tool execution audited"),
         "INFO tool-audit lines must not appear at the default level: {stderr_plain:?}"
+    );
+}
+
+#[test]
+fn single_shot_agent_rust_log_info_writes_info_to_stderr_not_stdout() {
+    let output = run_single_shot_agent(Some("info"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "prx agent failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.as_ref(),
+        format!("{REPLY}\n"),
+        "stdout must be exactly the reply line; stderr={stderr:?}"
+    );
+    let stderr_plain = strip_ansi(&stderr);
+    assert!(
+        stderr_plain.contains("INFO"),
+        "RUST_LOG=info must write INFO tracing to stderr: {stderr_plain:?}"
     );
 }
