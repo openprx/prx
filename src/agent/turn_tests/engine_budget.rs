@@ -2479,3 +2479,120 @@ async fn off_mode_preflight_trims_without_silent_summary() {
         "Off mode must not silently insert a compaction summary"
     );
 }
+
+/// The execution-requirement assessment is admitted before the provider. After
+/// the main send, a drained G6 remainder refuses the assessment and does not
+/// call the provider again.
+#[tokio::test]
+async fn assessment_send_over_budget_is_refused_before_provider() {
+    let _reset = crate::agent::send_admission::HookReset;
+    struct FirstSendDrainsG6 {
+        sends: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FirstSendDrainsG6 {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("test: assessment fixture does not use chat_with_system")
+        }
+        async fn chat(
+            &self,
+            _: crate::providers::ChatRequest<'_>,
+            _: &str,
+            _: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            crate::agent::send_admission::TEST_TOKEN_CAP.set(0);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![crate::providers::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "file_read".to_owned(),
+                    arguments: r#"{"path":"README.md"}"#.to_owned(),
+                }],
+                reasoning_content: None,
+            })
+        }
+    }
+
+    let workspace = TempDir::new().expect("assessment budget workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_path_buf();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let provider = FirstSendDrainsG6 {
+        sends: Arc::clone(&sends),
+    };
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
+        crate::agent::turn_tests::RecordingTool {
+            name: "file_read".to_owned(),
+            execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
+        },
+    )]);
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
+        config,
+        "read the file",
+        Arc::clone(&tools_registry),
+    )
+    .await;
+    let mut adapter = admission.adapter();
+    adapter.verify_chat_completion = true;
+    let mut history = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("read the file"),
+    ];
+    let error = run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            advice: None,
+            channel_name: "cli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule {
+                read_only_tool_concurrency_window: 2,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry,
+            observer: &NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(adapter),
+            memory: crate::agent::turn_request::ToolLoopMemory::none(),
+        },
+        crate::agent::turn_request::TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .expect_err("the assessment send must be refused");
+    assert!(
+        format!("{error:#}").contains("provider send refused"),
+        "{error:#}"
+    );
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+}

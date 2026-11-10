@@ -1496,3 +1496,12 @@ fn compaction_provenance_matches_a_redacted_uncapped_reply_event() {
         &event("another reply".to_string())
     ));
 }
+
+/// Compaction summarizer stays exempt from `admit_provider_send` only while
+/// both input and stored-output caps are literals (FU-02c-AUX-SENDS (a)-(c)).
+#[test]
+fn compaction_aux_send_exemption_caps_input_and_output() {
+    assert_eq!(COMPACTION_MAX_SOURCE_CHARS, 12_000);
+    assert_eq!(COMPACTION_MAX_SUMMARY_CHARS, 8_000);
+    assert_eq!(MEMORY_FLUSH_MAX_CHARS, 3_200);
+}

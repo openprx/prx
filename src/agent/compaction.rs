@@ -25,7 +25,7 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 pub(super) const COMPACTION_MAX_SUMMARY_CHARS: usize = 8_000;
 
 /// 🟡 Behavior-limits Phase 1: raised 800 -> 3200 (4x).
-const MEMORY_FLUSH_MAX_CHARS: usize = 3_200;
+pub(super) const MEMORY_FLUSH_MAX_CHARS: usize = 3_200;
 
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     let mut transcript = String::new();
@@ -1075,6 +1075,11 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         return Ok(None);
     }
 
+    // FU-02c-AUX-SENDS: compaction summarizer is exempt from admit_provider_send.
+    // (a) tools is None (`chat_with_system`). (b) input is capped by
+    // COMPACTION_MAX_SOURCE_CHARS and stored output by COMPACTION_MAX_SUMMARY_CHARS
+    // / MEMORY_FLUSH_MAX_CHARS. (c) `compaction_aux_send_exemption_caps_input_and_output`
+    // pins both literals. (d) the follow-up stays open for spend settlement.
     let mut replacement = Vec::new();
     if config.memory_flush {
         let flush_prompt = format!(

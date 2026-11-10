@@ -1523,6 +1523,14 @@ async fn run_turn_unguarded(
                     ))
                     .await?;
                 }
+                super::send_admission::admit_provider_send(
+                    service,
+                    context,
+                    proof,
+                    &messages,
+                    None,
+                    runtime_adapter.tool_execution_context.schema_dialect,
+                )?;
                 let trace = Box::pin(
                     super::turn_assessment::AssessmentCall {
                         provider,
@@ -1646,6 +1654,14 @@ async fn run_turn_unguarded(
                     let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
                     let mut review_repair_attempted = false;
                     loop {
+                    super::send_admission::admit_provider_send(
+                        service,
+                        context,
+                        proof,
+                        &assessment_messages,
+                        None,
+                        runtime_adapter.tool_execution_context.schema_dialect,
+                    )?;
                     if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
                         Box::pin(record_assessment_request(fabric, scope.clone(), provider_name, model, purpose, &assessment_messages)).await?;
                     }
