@@ -40,7 +40,7 @@ without `continue-on-error` (S5 P0-4) — any new unsuppressed advisory blocks `
 
 Instead, please report them responsibly:
 
-1. **Email**: Send details to the maintainers via GitHub private vulnerability reporting
+1. **Email**: Send details to info@sylvode.org
 2. **GitHub**: Use [GitHub Security Advisories](https://github.com/openprx/prx/security/advisories/new)
 
 ### What to Include
