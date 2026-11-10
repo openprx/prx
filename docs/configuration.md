@@ -50,6 +50,94 @@ ignored, and the versioned replacement: write `schema_version = 2` alongside
 `enabled = false` to keep the plane disabled. Loading does not rewrite the file;
 a structured save writes the canonical versioned form.
 
+## Section index
+
+Every omitted field takes the default in this index. Nested structs use the
+same omitted-field defaults. `workspace_dir` and `config_path` are computed
+and are not written. `enabled` keys listed under Removed Configuration Keys
+and the module-gate family are absorbed on load; they are not live switches.
+
+### Root keys
+
+| Key | Default |
+| --- | --- |
+| `default_provider`, `default_model` | unset (do not pin the catalog) |
+| `default_temperature` | `0.7` |
+| `api_key`, `api_url` | unset |
+| `model_settings` | `{}` |
+| `agents` | `{}` |
+| `identity_bindings`, `user_policies`, `model_routes`, `embedding_routes` | `[]` |
+
+### Tables
+
+| Section | Keys and defaults |
+| --- | --- |
+| `[observability]` | `backend = "none"`; `otel_endpoint` unset; `otel_service_name` unset (collector name `"prx"` when backend is `otel`) |
+| `[autonomy]` | `level = "full"`; `workspace_only = true`; built-in `forbidden_paths`; `max_cost_per_day_cents = 500`; `acknowledge_unrestricted_profile = false`; `[autonomy.scopes] default = "allow"`, `rules = []`, `assign_owners = []`. A rule may set `user`/`channel`/`chat_type` and `tools_allow`/`tools_deny`/`send_allow`/`send_deny`/`assign_allow`/`assign_deny` (all empty when omitted) |
+| `[runtime]` | `kind = "native"`; `shell_env_allowlist = []`; `managed_cgroup_root` unset; `reasoning_enabled` unset; `codex_stream_idle_timeout_secs` unset; `codex_reasoning_effort` unset; `max_blocking_threads` unset (derived, floor 2048); `long_task_warn_secs` unset (900); `idle_hang_secs` unset (1800) |
+| `[runtime.docker]` | `image = "alpine:3.20"`; `network = "none"`; `memory_limit_mb = 512`; `cpu_limit = 1.0`; `read_only_rootfs = true`; `mount_workspace = true`; `allowed_workspace_roots = []` |
+| `[reliability]` | `provider_retries = 2`; `provider_backoff_ms = 500`; `fallback_providers = []`; `acknowledge_single_provider_risk = false`; `api_keys = []`; `model_fallbacks = {}`; `channel_initial_backoff_secs = 2`; `channel_max_backoff_secs = 60`; `scheduler_poll_secs = 15`; `scheduler_retries = 2` |
+| `[reliability.circuit_breaker]` | `enabled = true`; `failure_threshold = 5`; `open_secs = 30`; `max_open_secs = 300` |
+| `[scheduler]` | `max_tasks = 64`; `claim_lease_secs = 90` |
+| `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]` |
+| `[agent.compaction]` | `mode = "switch"`; `reserve_tokens = 4096`; `keep_recent_messages = 12`; `memory_flush = true`; `max_context_tokens = 128000` |
+| `[agent.compaction.os_paging]` | `eviction_threshold = 0.70`; `proactive_retrieval = true`; `max_recalled_pages = 10`; `retrieval_injection_role = "system"`; `keep_recent_messages = 12`. Exact `switch` handoffs skip paging |
+| `[sessions_spawn]` | `allow_recursive_delegation = false`; `max_recursive_depth = 1`; `default_mode = "task"`; `process_memory_strategy = "shared_fabric"`; `worker_workspace_root` unset; `cleanup_on_complete = true` |
+| `[chat]` | `max_concurrent_visible_turns = 2` |
+| `[chat.daemon]` | `url = ""` (derived from `[gateway]`); `token = ""` |
+| `[self_system]` | `fitness_interval_hours = 24` (accepted, unused for scheduling); `evolution_interval_hours = 24`; `evolution_config_path` unset; `evolution_debug_raw = false`; `evolution_judge_timeout_secs = 180`; `evolution_model_max_tokens = 16384`; `evolution_model_max_micro_usd = 0` |
+| `[self_system.fitness]` | `auto_run = true`; `timezone = "UTC"`; `run_at = "00:10"`; `retention_days = 180`; `max_backfill_days = 7`; `min_samples = 5`; `min_coverage = 0.60` |
+| `[skills]` | `open_skills_dir` unset (`$HOME/open-skills` when used); `openclaw_skills_dir` unset (`$HOME/.openprx/openclaw-skills/` when used) |
+| `[skill_rag]` | `top_k = 32` |
+| `[plugins]` | `enabled = false` |
+| `[skills_lifecycle]` | `enabled = false`; `mode = "draft_only"`; `owner_scope` required when enabled; `storage_dir = "self/skill-lifecycle"`; `require_holdout = true`; `min_cases_floor = 3`; `max_concurrent_evaluations = 1`; `max_proposals_per_cycle = 1`; `max_edit_tokens = 300`; `max_edit_fraction = 0.20`; `allow_executable_proposals = false`; `suites = []` |
+| `[[model_routes]]` | `hint`, `provider`, `model` required; `api_key`/`credential_ref` unset; flattened model settings |
+| `[[embedding_routes]]` | `hint`, `provider`, `model` required; `dimensions` unset; `api_key`/`credential_ref` unset |
+| `[query_classification]` | `rules = []`. A rule: `hint` required; `keywords = []`; `patterns = []`; `min_length`/`max_length` unset; `priority = 0` |
+| `[task_routing]` | `default_intent = "simple"`; `rules = []`. A rule: `keywords = []`; `intent = "simple"`; `model_hint`/`sub_agent_model` unset; `priority = 0` |
+| `[router]` | `alpha = 0.0`; `beta = 0.5`; `gamma = 0.3`; `delta = 0.1`; `epsilon = 0.1`; `knn_min_records = 10`; `knn_k = 7`; `models = []`. A model: `model_id`/`provider` required; `cost_per_million_tokens = 0`; `max_context = 1000000`; `reserved_output_tokens` unset; `latency_ms = 2000`; `categories = []`; `elo_rating = 1000`. See [router.md](router.md) |
+| `[smart_group]` | `classifier_provider = ""`; `classifier_model = ""`; `classifier_timeout_secs = 5`; `classifier_temperature = 0.0`; `classifier_max_context_messages = 3` |
+| `[heartbeat]` | `interval_minutes = 30`; `active_hours = [8, 23]`; `prompt = "Check HEARTBEAT.md and follow instructions."` |
+| `[xin]` | `interval_minutes = 5`; `stale_timeout_minutes = 60`; `adopt_legacy_tasks = false` |
+| `[cron]` | `max_run_history = 50` |
+| `[channels_config]` | `cli = true`; optional tables `telegram`, `discord`, `slack`, `mattermost`, `webhook`, `imessage`, `signal`, `whatsapp`, `wacli`, `linq`, `nextcloud_talk`, `email`, `irc`, `lark`, `dingtalk`, `qq`, `ramflux`. `[channels_config.matrix]` is removed. Channel credentials have no safe default |
+| `[channels_config.ramflux]` | `socket_path` unset; `authorization_mode = "follow_rf"`; `max_in_flight_per_conversation = 1`; `on_new_message = "queue"`; `turn_wall_clock_secs = 120`; `encrypt_at_rest = true`; `surface_limits.max_blocks = 32`, `max_actions = 16`, `max_bytes = 65536`; `attachment_fetch.max_bytes = 5242880`, `max_per_turn = 4`; `allowed_block_types` the built-in surface set (Text, Markdown, Heading, KeyValue, Metric, List, TableFallback, Form, Input, Select, Progress, LogStream, Warning, Error, Success, Approval, ActionGroup, FilePreview, Fallback); `accounts = {}`. An account may set `system_prompt_file`, `model`, `provider`, `scope_profile`, `cross_conversation_retrieval` |
+| `[memory]` | `backend = "sqlite"`; `auto_save = true`; `acl_enabled = false`; `legacy_conversation_turns_visible = true`; `archive_after_days = 7`; `purge_after_days = 30`; `conversation_retention_days = 3`; `daily_retention_days = 7`; `embedding_provider = "local"`; `embedding_model = "prx-local-hash-v1"`; `embedding_dimensions = 384`; `vector_weight = 0.7`; `keyword_weight = 0.3`; `min_relevance_score = 0.4`; `embedding_cache_size = 10000`; `vector_candidate_cap = 2000`; `auto_hydrate = true`; `sqlite_open_timeout_secs` unset; `sqlite_read_pool_size` unset; `lucid_cmd` unset (`lucid`); `lucid_budget` unset (200); `lucid_recall_timeout_ms = 5000`; `lucid_store_timeout_ms = 3000`; `lucid_local_hit_threshold = 3`; `lucid_failure_cooldown_ms = 60000` |
+| `[memory.events]` | `record_user_messages = true`; `record_assistant_messages = true`; `record_tool_events = false` |
+| `[memory.semantic]` | `auto_promote_user_messages = true`; `auto_promote_assistant_messages = false`; `min_chars = 30` |
+| `[[identity_bindings]]` | `user_id`, `channel`, `channel_account` required; `display_name` unset |
+| `[[user_policies]]` | `user_id` required; `role = "guest"`; `projects = []`; `visibility_ceiling = "private"`; `blocked_patterns = []` |
+| `[storage.provider.config]` | `provider = ""`; `db_url` unset (aliases `dbURL`, `database_url`, `databaseUrl`); `schema = "public"`; `table = "memories"`; `connect_timeout_secs` unset (15s handshake); `pool_max_size = 32` |
+| `[tunnel]` | `provider = "none"`; `cloudflare`/`tailscale`/`ngrok`/`custom` unset. Cloudflare needs `token`; Tailscale `funnel = false`, `hostname` unset; ngrok `auth_token` required, `domain` unset; custom `start_command` required, `health_url`/`url_pattern` unset |
+| `[gateway]` | `port = 16830`; `host = "127.0.0.1"`; `require_pairing = true`; `allow_public_bind = false`; `paired_tokens = []`; `pair_rate_limit_per_minute = 10`; `webhook_rate_limit_per_minute = 60`; `api_rate_limit_per_minute = 60`; `trust_forwarded_headers = false`; `rate_limit_max_keys = 10000`; `idempotency_ttl_secs = 300`; `idempotency_max_keys = 10000`; `channel_webhook_dedup_ttl_secs = 86400`; `targeted_agents = false` |
+| `[webhook]` | `bind = "0.0.0.0:16899"`; `token` unset (required when enabled); `signing_secret` unset |
+| `[composio]` | `api_key` unset; `entity_id = "default"` |
+| `[mcp]` | `servers = {}`; `workspace_servers = "off"` (`http_only` or `stdio` to widen). A server: `transport = "stdio"`; `command`/`url` unset; `args = []`; `env = {}`; `startup_timeout_ms = 10000`; `request_timeout_ms = 30000`; `tool_name_prefix = "mcp"`; `allow_tools`/`deny_tools = []`; `working_dir` unset |
+| `[mcp_server]` | `bind = "127.0.0.1:16831"`; `require_auth = true`; `exposed_tools` the read-only set (`memory_search`, `memory_recall`, `memory_get`, `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`); `allowed_origins = ["claude.ai", "openai.com", "localhost"]`; `rate_limit_rps = 10`; JWT fields unset; `jwt_jwks_cache_ttl_secs = 300`; `jwt_algorithms = ["RS256"]` |
+| `[a2a]` | `bind = "127.0.0.1:16832"`; `agent_id = "prx-default"`; `spiffe_id = "spiffe://prx-local/agent/prx-default"`; `discovery_advertised = false`; `allowed_peer_issuers = []`; `handoff_nonce_ttl_seconds = 3600`; `card_signing_key_path` unset; `card_ttl_seconds = 3600`; `card_jwks_uri` unset; `trusted_trust_domains = []`; `spiffe_trust_bundle_pem` unset; `spiffe_strict_validation = false` |
+| `[auth]` | `codex_auth_json_auto_import = false`; `codex_auth_json_path` the platform Codex `auth.json` |
+| `[secrets]` | `encrypt = true` |
+| `[browser]` | `allowed_domains = []` (`web_fetch`); `computer_use.api_key` unset (retained for secret handling; browser automation tools are gone) |
+| `[http_request]` | `max_response_size = 1000000`; `timeout_secs = 30` |
+| `[multimodal]` | `max_images = 4`; `max_image_size_mb = 5`; `allow_remote_fetch = false` |
+| `[web_search]` | `provider = "duckduckgo"`; `brave_api_key` unset; `max_results = 15`; `timeout_secs = 15`; `fetch_max_chars = 50000` |
+| `[proxy]` | `http_proxy`/`https_proxy`/`all_proxy` unset; `no_proxy = []`; `scope = "zeroclaw"`; `services = []` |
+| `[identity]` | `format = "openclaw"`; `aieos_path` unset; `aieos_inline` unset |
+| `[cost]` | `daily_limit_usd = 10.0`; `monthly_limit_usd = 100.0`; `warn_at_percent = 80`; `allow_override = false`; `prices = {}` (each price: `input`/`output`/`cache_write`/`cache_read = 0`) |
+| `[nodes]` | `request_timeout_ms = 15000`; `retry_max = 2`; `nodes = []`. A node: `id`, `endpoint`, `bearer_token` required; `hmac_secret` unset; `timeout_ms`/`retry_max` unset |
+| `[nodes.server]` | `listen_addr = "127.0.0.1:8787"`; `bearer_token = ""`; `hmac_secret` unset; `sandbox_root = "."`; `exec_timeout_ms = 15000`; `max_output_bytes = 1048576`; `max_concurrent_tasks = 8`; `task_result_ttl_ms = 3600000`; `allowed_commands = ["echo"]`; `blocked_commands = []`; `tls_required = true`; `tls_cert`/`tls_key` unset |
+| `[agents.<name>]` | `provider`/`model` required; `system_prompt`/`api_key`/`credential_ref`/`temperature`/`identity_dir`/`memory_scope`/`spawn_enabled`/`autonomy` unset; `max_depth = 8`; `agentic = false`; `allowed_tools = []`; `enabled = true` |
+| `[media]` | `audio_provider = "none"`; `audio_model = "whisper"`; `audio_ollama_url = "http://localhost:11434"`; `video_provider = "none"`; `video_max_frames = 4`; `max_audio_size_mb = 20`; `max_video_size_mb = 50` |
+| `[causal_tree]` | local plane enabled by default; remote processing opt-in. Versioned `enabled = false` keeps it off. See [decision-plane.md](decision-plane.md) |
+| `[decision_engine]` | `enabled = false`; `mode = "pre"`; `prompt_budget_tokens = 300`; `candidates = 5`; `timeout_ms = 1500`; `telemetry_cap = 1000`; `observe_queue = 64`; `backend` unset |
+| `[security.audit]` | `log_path = "audit.log"`; `max_size_mb = 100` |
+| `[security]` | `workspace_hooks` omitted when off |
+| `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
+| `[compliance.eu_ai_act]` | classification `status = "unclassified"`; `owner`/`assessed_at` unset; `incident_store_path` unset; declaration fields all optional/empty |
+| `[tool_tiering]` | `always_include = []`; `always_exclude = []`; `channel_exclude` the operations/development set; `model_allowlists = {}` |
+| `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
+| `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
+
 ## Tracing and `RUST_LOG`
 
 Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
@@ -725,8 +813,10 @@ TUI chat, both agent CLIs, gateway turns, standalone IM channels, delegated
 agents, and process-isolated session workers.
 
 An unrestricted profile is always explicit: set `workspace_only = false`,
-clear `forbidden_paths`, and widen both ceilings deliberately. `prx doctor`
-warns when all four unrestricted choices are active together.
+clear `forbidden_paths`, and set `max_cost_per_day_cents = 4294967295`
+(`u32::MAX`). `prx doctor` warns when those three are active together
+unless `acknowledge_unrestricted_profile = true`. There is no hourly action
+cap.
 
 ### Decision admission and autonomy
 
@@ -1201,8 +1291,20 @@ The `sessions_spawn` tool also no longer accepts `max_iterations` or
 `timeout_seconds`; task-mode and process-mode sub-agents share the same
 unbounded execution contract.
 
-A key that is merely **misspelled** is still a hard error. Only the exact paths
-above are absorbed, so `max_actions_per_hourr` still stops the load with
+A key that is merely **misspelled** is still a hard error. The exact paths
+above are absorbed, and so is a second family of removed **module gates**
+(boolean switches that used to turn whole capabilities on). Those include
+`modules.*` (`memory`, `channels`, `network`, `security`, `scheduler`,
+`agent`, `identity`, `routing`, `tools`, `integrations`, `nodes`, `cost`,
+`observability`), plus `cost.enabled`, `heartbeat.enabled`,
+`query_classification.enabled`, `task_routing.enabled`, `scheduler.enabled`,
+`xin.enabled`, `http_request.enabled`, `web_search.enabled`,
+`multimodal.enabled`, `skills.enabled`, `skills.auto_discover`,
+`skill_rag.enabled`, `sessions_spawn.enabled`, `self_system.enabled`,
+`webhook.enabled`, `memory.events.enabled`, `nodes.enabled`,
+`router.enabled`, `composio.enabled`, `channels_config.wacli.enabled`,
+`security.audit.enabled`, and `agent.compaction.os_paging.enabled`. A typo
+such as `max_actions_per_hourr` still stops the load with
 `Unknown configuration path(s)`.
 
 ## Workspace Files
@@ -1226,7 +1328,7 @@ These files are automatically injected into the agent context at startup.
 | Backend | Description |
 |---------|-------------|
 | **SQLite** | Default, local, FTS5 full-text search + vector search |
-| **Lucid** | Lightweight markdown-based memory |
+| **Lucid** | Local SQLite store plus a Lucid executable for remote recall |
 | **PostgreSQL** | Scalable, multi-user |
 | **Markdown** | File-based, human-readable |
 
@@ -1367,7 +1469,7 @@ PRX configuration initialized (full)
   Previous configuration archived to /home/you/.openprx/config.d.pre-0.8.126-20260914101500123
   Preserved 4 explicit setting(s): memory.embedding_provider, ...
   Added 2 new default(s) this version ships: memory.vector_candidate_cap, ...
-  Reset 1 unset setting(s) to refreshed defaults: agent.max_iterations
+  Reset 1 unset setting(s) to refreshed defaults: agent.max_tool_iterations
 ```
 
 ##### What `--force` does to each key
@@ -1869,9 +1971,12 @@ which is a file path), so the table stays complete.
 | Webhook, tunnel, daemon | `webhook.token`, `webhook.signing_secret`, `tunnel.cloudflare.token`, `tunnel.ngrok.auth_token`, `chat.daemon.token` |
 | Remote nodes | `nodes.nodes[].bearer_token`, `nodes.nodes[].hmac_secret`, `nodes.server.bearer_token`, `nodes.server.hmac_secret` (and the accepted alias `token` of both `bearer_token` fields) |
 
-Not recognized as secrets: a credential inside MCP server `args`, inside
-`tunnel.custom.start_command`, or in a URL's query string (`?token=`); only
-URL userinfo is redacted. Keep credentials in the registered fields.
+Not recognized as **encrypted secret slots**: a credential inside MCP server
+`args` or `tunnel.custom.start_command`. Keep credentials in the registered
+fields. Endpoint URL values (`api_url` and the other URL keys) are **masked
+on read**, not encrypted: userinfo, every query value, valueless query
+parameters, and the fragment become `[redacted]`. That masking is separate
+from the encrypted secret store.
 
 `prx-node --config` pointed at the PRX configuration file decrypts only the
 `nodes.server` credentials, with the `.secret_key` beside that file; it never
@@ -3012,7 +3117,18 @@ sequence exhaustion refuses a new waiter. This in-process suspension safeguard
 is separate from durable decision review, claim and one-use execution authority;
 it does not extend approvals to another entry point.
 
-Admitted Cron/Xin model turns now obtain a source-bound decision after recording their raw input. Enabled mode requires an exact durable owner-scoped event; disabled mode may use in-memory input without inventing an event ID. The proof pins task/run/configuration, actual provider/model selection and creator execution actor. Selected decisions drive recall, constrained execution and terminal settlement. Operator-created tasks retain the existing CLI execution tuple and semantic mirror eligibility; other tasks retain their creator-derived context and effective policy. Admission does not enable interactive clarification or an approval delivery channel.
+Admitted Cron/Xin model turns obtain a source-bound decision after recording
+their raw input. Enabled mode requires an exact durable owner-scoped event;
+disabled mode may use in-memory input without inventing an event ID. The
+proof pins task/run/configuration, actual provider/model selection and
+creator execution actor. Prompt recall on that Agent path is independent
+scoped recall (owner, workspace, session), not a decision-selected memory
+set; `[memory]` recording and promotion keys stay the memory owner.
+Constrained execution and terminal settlement follow the admitted decision.
+Operator-created tasks retain the existing CLI execution tuple and semantic
+mirror eligibility; other tasks retain their creator-derived context and
+effective policy. Admission does not enable interactive clarification or an
+approval delivery channel.
 
 ## Skill lifecycle guide
 
