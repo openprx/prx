@@ -537,8 +537,14 @@ fn mock_hold_started_path(path: &std::path::Path) -> PathBuf {
     started
 }
 
+/// Upper bound for a test-mock hold. A leftover file (panic before
+/// `remove_file`, or a test that never releases) must not spin until
+/// the 2-minute turn timeout; after this cap the stream proceeds.
 #[cfg(any(test, feature = "test-mock"))]
-async fn mock_wait_while_path_exists(path: Option<&PathBuf>) {
+const MOCK_HOLD_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(any(test, feature = "test-mock"))]
+async fn mock_wait_while_path_exists(path: Option<&PathBuf>, max_wait: std::time::Duration) {
     let Some(path) = path else {
         return;
     };
@@ -546,8 +552,17 @@ async fn mock_wait_while_path_exists(path: Option<&PathBuf>) {
     if let Err(error) = std::fs::write(&started, b"holding") {
         tracing::warn!(path = %started.display(), error = %error, "mock hold started file");
     }
-    while path.exists() {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let hold = async {
+        while path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    if tokio::time::timeout(max_wait, hold).await.is_err() {
+        tracing::warn!(
+            path = %path.display(),
+            max_wait = ?max_wait,
+            "mock hold timed out; proceeding"
+        );
     }
 }
 
@@ -564,7 +579,7 @@ fn mock_stream_with_initial_delay(
             let hold_while = hold_while.clone();
             async move {
                 if idx == 0 {
-                    mock_wait_while_path_exists(hold_while.as_ref()).await;
+                    mock_wait_while_path_exists(hold_while.as_ref(), MOCK_HOLD_MAX_WAIT).await;
                     if delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -858,7 +873,7 @@ impl Provider for MockEnvProvider {
                     let hold_while = hold_while.clone();
                     async move {
                         if idx == 0 {
-                            mock_wait_while_path_exists(hold_while.as_ref()).await;
+                            mock_wait_while_path_exists(hold_while.as_ref(), MOCK_HOLD_MAX_WAIT).await;
                             if initial_delay > 0 {
                                 tokio::time::sleep(std::time::Duration::from_millis(initial_delay)).await;
                             }
@@ -1519,5 +1534,20 @@ mod tests {
                 .capabilities_for("hint:tools", ProviderRequestMode::NonStreaming)
                 .native_tool_calling
         );
+    }
+
+    #[tokio::test]
+    async fn mock_wait_while_path_exists_proceeds_after_cap() {
+        let dir = tempfile::tempdir().expect("hold dir");
+        let path = dir.path().join("never_deleted");
+        std::fs::write(&path, b"hold").expect("hold file");
+        let cap = std::time::Duration::from_millis(50);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mock_wait_while_path_exists(Some(&path), cap),
+        )
+        .await
+        .expect("cap must complete the wait");
+        assert!(path.exists(), "cap proceeds without deleting the hold file");
     }
 }

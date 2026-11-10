@@ -245,15 +245,28 @@ fn chat_resume_consumed_decision_in_same_chat_refuses_and_processes_later_input(
     assert_publish_attempts(&guard, 1);
 }
 
-fn wait_for_path(path: &std::path::Path, total: Duration) {
+fn wait_for_path(session: &mut TrackedSession, path: &std::path::Path, total: Duration) {
     let deadline = std::time::Instant::now() + total;
-    while std::time::Instant::now() < deadline {
+    let mut buf = [0u8; 4096];
+    let mut pending = String::new();
+    loop {
         if path.exists() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        match session.try_read(&mut buf) {
+            Ok(0) => panic!("PTY hit EOF before {} appeared", path.display()),
+            Ok(n) => ack_all_dsr_with_pending(session, &buf[..n], &mut pending),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("PTY read error before {}: {e}", path.display()),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout waiting for {} after {total:?}",
+            path.display()
+        );
     }
-    panic!("timeout waiting for {} after {total:?}", path.display());
 }
 
 #[test]
@@ -272,7 +285,7 @@ fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
         approve_and_resume_publish_failure_with_env_on(guard, &[("OPENPRX_MOCK_HOLD_WHILE_FILE", &hold_spec)]);
     let session = sg.session();
     session.send("hi prx_busy_resume_turn\r").expect("start held turn");
-    wait_for_path(&started_path, TURN_TIMEOUT);
+    wait_for_path(session, &started_path, TURN_TIMEOUT);
     session.send("/queue\r").expect("inspect running turn");
     read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 1 running.", TURN_TIMEOUT);
     session
