@@ -363,7 +363,6 @@ async fn config_toml_roundtrip() {
             mattermost: None,
             webhook: None,
             imessage: None,
-            matrix: None,
             signal: None,
             whatsapp: None,
             wacli: None,

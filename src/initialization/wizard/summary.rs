@@ -87,10 +87,6 @@ pub(super) fn print_summary(config: &Config) {
     if config.channels_config.imessage.is_some() {
         channels.push("iMessage");
     }
-    #[cfg(feature = "channel-matrix")]
-    if config.channels_config.matrix.is_some() {
-        channels.push("Matrix");
-    }
     if config.channels_config.email.is_some() {
         channels.push("Email");
     }

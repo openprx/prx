@@ -26,10 +26,7 @@ advisories are explicitly ignored in `deny.toml` with documented justification.
 
 | Advisory | Crate | Reason |
 |----------|-------|--------|
-| RUSTSEC-2024-0388 | derivative 2.2.0 | Transitive via matrix-sdk-indexeddb, only used on wasm browser target |
 | RUSTSEC-2025-0141 | bincode 2.0.1 | Transitive via probe-rs; upstream project considered complete |
-| RUSTSEC-2026-0173 | proc-macro-error2 2.0.1 | Transitive via matrix-sdk; no maintained replacement is available upstream |
-| RUSTSEC-2026-0247 | bitmaps 3.2.1 | Transitive via matrix-sdk → imbl; no direct dependency |
 
 CI enforcement: `sec-audit.yml` job `deny / advisories` runs `cargo deny check advisories`
 without `continue-on-error` (S5 P0-4) — any new unsuppressed advisory blocks `main` merges.

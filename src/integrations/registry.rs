@@ -100,18 +100,6 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             status_fn: |_| IntegrationStatus::Planned,
         },
         IntegrationEntry {
-            name: "Matrix",
-            description: "Matrix protocol (Element)",
-            category: IntegrationCategory::Chat,
-            status_fn: |c| {
-                if c.channels_config.matrix.is_some() {
-                    IntegrationStatus::Configured
-                } else {
-                    IntegrationStatus::Unconfigured
-                }
-            },
-        },
-        IntegrationEntry {
             name: "Nostr",
             description: "Decentralized DMs (NIP-04)",
             category: IntegrationCategory::Chat,
@@ -744,7 +732,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use crate::config::schema::{IMessageConfig, StreamMode, TelegramConfig};
 
     #[test]
     fn registry_has_entries() {
@@ -841,31 +829,6 @@ mod tests {
         let entries = all_integrations();
         let im = entries.iter().find(|e| e.name == "iMessage").unwrap();
         assert!(matches!((im.status_fn)(&config), IntegrationStatus::Unconfigured));
-    }
-
-    #[test]
-    fn matrix_is_configured_when_config_present() {
-        let mut config = Config::default();
-        config.channels_config.matrix = Some(MatrixConfig {
-            homeserver: "https://m.org".into(),
-            access_token: "tok".into(),
-            user_id: None,
-            device_id: None,
-            room_id: "!r:m".into(),
-            allowed_users: vec![],
-            mention_only: false,
-        });
-        let entries = all_integrations();
-        let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Configured));
-    }
-
-    #[test]
-    fn matrix_is_unconfigured_when_config_absent() {
-        let config = Config::default();
-        let entries = all_integrations();
-        let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
-        assert!(matches!((mx.status_fn)(&config), IntegrationStatus::Unconfigured));
     }
 
     #[test]

@@ -1914,9 +1914,9 @@ mod tests {
     }
 
     /// The MCP HTTP transport speaks TLS to an `https://` URL in every build,
-    /// not only when another dependency (the Matrix SDK) happens to enable
-    /// rustls on the shared reqwest 0.13 crate. Without a TLS backend the
-    /// client refuses the scheme and never connects.
+    /// not only when another dependency happens to enable rustls on the shared
+    /// reqwest 0.13 crate. Without a TLS backend the client refuses the scheme
+    /// and never connects.
     #[tokio::test]
     async fn the_mcp_http_transport_speaks_tls_to_an_https_url() {
         let (port, first_bytes) = first_bytes_listener().await;

@@ -1684,7 +1684,7 @@ below).
   `a2a.card_jwks_uri` (published in the public Agent Card, so userinfo
   there is refused at load), `channels_config.mattermost.url`,
   `channels_config.nextcloud_talk.base_url`,
-  `channels_config.matrix.homeserver`, `channels_config.signal.http_url`,
+  `channels_config.signal.http_url`,
   `channels_config.whatsapp.ws_url`) are shown with their URL userinfo, every
   query value (whatever the parameter is called), every valueless query
   parameter and the fragment replaced: `custom:http://alice:pw@host/v1?sig=x#t`
@@ -1825,7 +1825,7 @@ which is a file path), so the table stays complete.
 | Provider | `api_key`, `agents.<name>.api_key`, `model_routes[].api_key`, `embedding_routes[].api_key`, `reliability.api_keys[]` |
 | Tool and storage | `composio.api_key`, `browser.computer_use.api_key`, `web_search.brave_api_key`, `storage.provider.config.db_url` (and its accepted aliases `dbURL`, `database_url`, `databaseUrl`) |
 | Gateway and MCP | `gateway.paired_tokens[]`, `mcp.servers.<name>.env.<var>` (every value, whatever the variable is called) |
-| Channels | `channels_config.telegram.bot_token`, `discord.bot_token`, `slack.bot_token`, `slack.app_token`, `mattermost.bot_token`, `matrix.access_token`, `dingtalk.client_secret`, `email.password`, `irc.server_password`, `irc.nickserv_password`, `irc.sasl_password`, `lark.app_secret`, `lark.encrypt_key`, `lark.verification_token`, `linq.api_token`, `linq.signing_secret`, `nextcloud_talk.app_token`, `nextcloud_talk.webhook_secret`, `qq.app_secret`, `wacli.webhook_secret`, `webhook.secret`, `whatsapp.access_token`, `whatsapp.app_secret`, `whatsapp.verify_token` (all under `channels_config.`) |
+| Channels | `channels_config.telegram.bot_token`, `discord.bot_token`, `slack.bot_token`, `slack.app_token`, `mattermost.bot_token`, `dingtalk.client_secret`, `email.password`, `irc.server_password`, `irc.nickserv_password`, `irc.sasl_password`, `lark.app_secret`, `lark.encrypt_key`, `lark.verification_token`, `linq.api_token`, `linq.signing_secret`, `nextcloud_talk.app_token`, `nextcloud_talk.webhook_secret`, `qq.app_secret`, `wacli.webhook_secret`, `webhook.secret`, `whatsapp.access_token`, `whatsapp.app_secret`, `whatsapp.verify_token` (all under `channels_config.`) |
 | Webhook, tunnel, daemon | `webhook.token`, `webhook.signing_secret`, `tunnel.cloudflare.token`, `tunnel.ngrok.auth_token`, `chat.daemon.token` |
 | Remote nodes | `nodes.nodes[].bearer_token`, `nodes.nodes[].hmac_secret`, `nodes.server.bearer_token`, `nodes.server.hmac_secret` (and the accepted alias `token` of both `bearer_token` fields) |
 
@@ -2188,8 +2188,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    so it can read the stored credentials, and it receives its `env` values;
    this holds whether or not it has any `env`, D-045), and any change of an
    MCP server `url`, a remote
-   node `endpoint`, the Mattermost `url`, Matrix
-   `homeserver`, Signal `http_url`, WhatsApp `ws_url`, Nextcloud Talk
+   node `endpoint`, the Mattermost `url`, Signal `http_url`, WhatsApp `ws_url`, Nextcloud Talk
    `base_url`, IRC `server`, email `imap_host`/`smtp_host`,
    `observability.otel_endpoint`, `chat.daemon.url` or a proxy URL
    (`proxy.http_proxy`, `proxy.https_proxy`, `proxy.all_proxy`: every
@@ -2217,7 +2216,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    direction-aware: only their widening direction is high risk, and the
    narrowing direction stays low.
    - A channel's listening scope (`discord.guild_id`, `slack.channel_id`,
-     `mattermost.channel_id`, `matrix.room_id`, `signal.group_id`,
+     `mattermost.channel_id`, `signal.group_id`,
      `irc.channels`) moved, dropped or given a new channel is
      `access_grant_changed`, unless the channel's sender allow-list is
      narrower than any scope: it has no `"*"`, and names senders (or is

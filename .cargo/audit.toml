@@ -2,8 +2,6 @@
 ignore = [
     # bincode v2.0.1 via probe-rs — project considered complete
     "RUSTSEC-2025-0141",
-    # derivative unmaintained — matrix-sdk-indexeddb transitive，仅 wasm 路径 (cargo-audit denies unmaintained; cargo-deny does not match this, so deny.toml omits it)
-    "RUSTSEC-2024-0388",
     # pin-utils unmaintained — async-imap transitive (0.11 and 0.12), macro-only crate considered complete
     "RUSTSEC-2026-0441",
 ]

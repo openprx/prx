@@ -1734,7 +1734,6 @@ fn has_supervised_channels(config: &Config) -> bool {
         slack,
         mattermost,
         imessage,
-        matrix,
         signal,
         whatsapp,
         email,
@@ -1768,7 +1767,6 @@ fn has_supervised_channels(config: &Config) -> bool {
         || slack.is_some()
         || mattermost.is_some()
         || imessage.is_some()
-        || matrix.is_some()
         || signal.is_some()
         || whatsapp.is_some()
         || email.is_some()

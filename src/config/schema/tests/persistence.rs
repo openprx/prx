@@ -680,6 +680,42 @@ async fn a_stored_sign_events_setting_loads_with_a_deprecation_warning() {
     }
 }
 
+/// Matrix support was removed. A stored `[channels_config.matrix]` table must
+/// keep the config loading with a removal warning, while a misspelled key
+/// elsewhere in the same file is still refused.
+#[test]
+async fn a_stored_matrix_channel_table_loads_with_a_removal_warning() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+    let dir = tempfile::TempDir::new().expect("test: temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "default_temperature = 0.7\n\n[channels_config.matrix]\nhomeserver = \"https://matrix.org\"\naccess_token = \"tok\"\nroom_id = \"!ops:matrix.org\"\nallowed_users = []\n",
+    )
+    .expect("test: write config");
+    let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+    loaded.expect("test: a stored matrix channel table still loads");
+    assert!(
+        logs.contains("channels_config.matrix")
+            && logs.contains("Ignoring removed configuration key")
+            && logs.contains("Matrix support was removed"),
+        "the retired matrix table must be reported as removed: {logs}"
+    );
+
+    std::fs::write(
+        &path,
+        "default_temperature = 0.7\n\n[channels_config.matrix]\nhomeserver = \"https://matrix.org\"\naccess_token = \"tok\"\nroom_id = \"!ops:matrix.org\"\nallowed_users = []\n\n[autonomy]\nlevel = \"full\"\nmax_actions_per_hourr = 20\n",
+    )
+    .expect("test: write config");
+    let error = Config::load_from_path(&path, dir.path().join("workspace"))
+        .expect_err("a typo beside a retired matrix table must still be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("autonomy.max_actions_per_hourr"),
+        "the misspelled key must be named, got: {message}"
+    );
+}
+
 /// `[agent] tool_dispatcher` never reached the runtime, which picks the
 /// wire form from the provider's capabilities. A stored value loads with a
 /// deprecation warning and is ignored.

@@ -687,13 +687,6 @@ fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
 
 fn check_channel_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "channels";
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        items.push(DiagItem::warn(
-            cat,
-            "Matrix is configured but unavailable in this build; rebuild with `--features channel-matrix`",
-        ));
-    }
     let configured = configured_channel_names(config);
     if configured.is_empty() {
         items.push(DiagItem::warn(cat, "no IM channels are configured"));
@@ -721,10 +714,6 @@ fn configured_channel_names(config: &Config) -> Vec<&'static str> {
     }
     if config.channels_config.webhook.is_some() {
         names.push("webhook");
-    }
-    #[cfg(feature = "channel-matrix")]
-    if config.channels_config.matrix.is_some() {
-        names.push("matrix");
     }
     if config.channels_config.signal.is_some() {
         names.push("signal");
@@ -1757,7 +1746,6 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         || cc.discord.is_some()
         || cc.slack.is_some()
         || cc.imessage.is_some()
-        || cc.matrix.is_some()
         || cc.whatsapp.is_some()
         || cc.wacli.is_some()
         || cc.nextcloud_talk.is_some()
@@ -3458,32 +3446,6 @@ mod tests {
                 .iter()
                 .any(|item| item.message.contains("configured channels: wacli"))
         );
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    #[test]
-    fn configured_matrix_is_reported_as_unavailable_without_the_feature() {
-        let mut config = Config::default();
-        config.channels_config.matrix = Some(crate::config::MatrixConfig {
-            homeserver: "https://matrix.example.com".into(),
-            access_token: "fixture-token".into(),
-            user_id: Some("@prx_bot:matrix.example.com".into()),
-            device_id: Some("PRXDEVICE".into()),
-            room_id: "!prx_channel:matrix.example.com".into(),
-            allowed_users: vec!["@prx_user:matrix.example.com".into()],
-            mention_only: false,
-        });
-
-        let mut items = Vec::new();
-        check_channel_runtime(&config, &mut items);
-
-        let unavailable = items
-            .iter()
-            .find(|item| item.message.contains("Matrix is configured but unavailable"))
-            .expect("default build must report configured Matrix as unavailable");
-        assert_eq!(unavailable.severity, Severity::Warn);
-        assert!(unavailable.message.contains("--features channel-matrix"));
-        assert!(!configured_channel_names(&config).contains(&"matrix"));
     }
 
     #[test]

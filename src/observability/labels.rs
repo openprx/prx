@@ -39,7 +39,6 @@ const KNOWN_CHANNEL_LABELS: &[&str] = &[
     "mattermost",
     "webhook",
     "imessage",
-    "matrix",
     "signal",
     "whatsapp",
     "wacli",

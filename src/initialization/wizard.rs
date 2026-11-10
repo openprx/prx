@@ -2,8 +2,6 @@
 
 #[cfg(test)]
 use crate::auth::profiles::AuthProfilesStore;
-#[cfg(feature = "channel-matrix")]
-use crate::config::MatrixConfig;
 use crate::config::init::Spec;
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
@@ -58,7 +56,6 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         slack,
         mattermost,
         imessage,
-        matrix: _,
         signal,
         whatsapp,
         email,
@@ -76,7 +73,6 @@ const fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || slack.is_some()
         || mattermost.is_some()
         || imessage.is_some()
-        || (cfg!(feature = "channel-matrix") && channels.matrix.is_some())
         || signal.is_some()
         || whatsapp.is_some()
         || email.is_some()

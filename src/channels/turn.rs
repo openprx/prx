@@ -304,7 +304,7 @@ pub(super) async fn run_channel_turn(
 
     // ── Inbound side-effect gate (FIX-P0-10/11/12) ──────────────────────────
     // Every channel (telegram/discord/slack/signal/whatsapp/lark/qq/mattermost/
-    // irc/dingtalk/matrix/imessage/wacli/…) funnels through this single function,
+    // irc/dingtalk/imessage/wacli/…) funnels through this single function,
     // so gating here covers all transports at once. Appending the inbound turn
     // persists conversation history (append_conversation_turn) — a real side
     // effect that must respect autonomy. We use a Low/read-style judgement: under

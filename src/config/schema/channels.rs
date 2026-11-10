@@ -23,8 +23,6 @@ pub struct ChannelsConfig {
     pub webhook: Option<WebhookConfig>,
     /// iMessage channel configuration (macOS only).
     pub imessage: Option<IMessageConfig>,
-    /// Matrix channel configuration.
-    pub matrix: Option<MatrixConfig>,
     /// Signal channel configuration.
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
@@ -61,7 +59,6 @@ impl Default for ChannelsConfig {
             mattermost: None,
             webhook: None,
             imessage: None,
-            matrix: None,
             signal: None,
             whatsapp: None,
             wacli: None,
@@ -200,28 +197,6 @@ pub struct WebhookConfig {
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
-    /// When true, only process group messages that mention the bot.
-    #[serde(default)]
-    pub mention_only: bool,
-}
-
-/// Matrix channel configuration.
-#[derive(Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MatrixConfig {
-    /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
-    pub homeserver: String,
-    /// Matrix access token for the bot account.
-    pub access_token: String,
-    /// Optional Matrix user ID (e.g. `"@bot:matrix.org"`).
-    #[serde(default)]
-    pub user_id: Option<String>,
-    /// Optional Matrix device ID.
-    #[serde(default)]
-    pub device_id: Option<String>,
-    /// Matrix room ID to listen in (e.g. `"!abc123:matrix.org"`).
-    pub room_id: String,
-    /// Allowed Matrix user IDs. Empty = deny all.
-    pub allowed_users: Vec<String>,
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,

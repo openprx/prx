@@ -5,14 +5,11 @@ configured with DM/group policies.
 
 ## Supported Channels
 
-Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord · Slack · iMessage · Matrix · IRC · Email · DingTalk · Lark/Feishu · QQ · Mattermost · Nextcloud Talk · LinQ · Ramflux · CLI
+Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord · Slack · iMessage · IRC · Email · DingTalk · Lark/Feishu · QQ · Mattermost · Nextcloud Talk · LinQ · Ramflux · CLI
 
-Matrix is an opt-in source-build channel and is not included in default or
-release binaries. Build it with
-`cargo build --release --locked --bin prx --features channel-matrix`; the
-onboarding wizard offers Matrix only in that build. If a default binary loads
-an existing `[channels_config.matrix]` section, `prx doctor` and channel startup
-report that Matrix is unavailable instead of silently ignoring it.
+The Matrix channel has been removed. External messaging goes through ramflux.
+An existing `[channels_config.matrix]` section is ignored with a warning at
+load, and the section can be deleted.
 
 ## Ramflux
 

@@ -146,7 +146,6 @@
         "irc": null,
         "lark": null,
         "linq": null,
-        "matrix": null,
         "mattermost": null,
         "nextcloud_talk": null,
         "qq": null,
@@ -1396,17 +1395,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/LinqConfig"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "matrix": {
-          "description": "Matrix channel configuration.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MatrixConfig"
             },
             {
               "type": "null"
@@ -3155,58 +3143,6 @@
       "required": [
         "api_token",
         "from_phone"
-      ]
-    },
-    "MatrixConfig": {
-      "description": "Matrix channel configuration.",
-      "type": "object",
-      "properties": {
-        "access_token": {
-          "description": "Matrix access token for the bot account.",
-          "type": "string"
-        },
-        "allowed_users": {
-          "description": "Allowed Matrix user IDs. Empty = deny all.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "device_id": {
-          "description": "Optional Matrix device ID.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "homeserver": {
-          "description": "Matrix homeserver URL (e.g. `\"https://matrix.org\"`).",
-          "type": "string"
-        },
-        "mention_only": {
-          "description": "When true, only process group messages that mention the bot.",
-          "type": "boolean",
-          "default": false
-        },
-        "room_id": {
-          "description": "Matrix room ID to listen in (e.g. `\"!abc123:matrix.org\"`).",
-          "type": "string"
-        },
-        "user_id": {
-          "description": "Optional Matrix user ID (e.g. `\"@bot:matrix.org\"`).",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "homeserver",
-        "access_token",
-        "room_id",
-        "allowed_users"
       ]
     },
     "MattermostConfig": {

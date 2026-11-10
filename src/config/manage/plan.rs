@@ -1174,7 +1174,7 @@ fn drops_entries(before: &[String], after: &[String]) -> bool {
 
 /// Whether a sender allow-list is narrower than any listening scope: it has
 /// no `"*"`, and it names senders or, where the channel reads an empty list
-/// as "nobody" (Discord, Slack, Mattermost, Matrix, IRC), is empty. Signal
+/// as "nobody" (Discord, Slack, Mattermost, IRC), is empty. Signal
 /// reads an empty `allowed_from` through its DM and group policies, so an
 /// empty list there does not count as narrow.
 fn names_its_senders(allow_list: &[String], empty_admits_nobody: bool) -> bool {
@@ -1222,13 +1222,6 @@ fn listen_scope_widenings(before: &Config, after: &Config, reasons: &mut Vec<Ris
             optional_scope_widens(b.channel_id.as_deref(), a.channel_id.as_deref()),
             names_its_senders(&a.allowed_users, true),
             "channels_config.mattermost.channel_id",
-        );
-    }
-    if let (Some(b), Some(a)) = (&b.matrix, &a.matrix) {
-        push(
-            b.room_id.trim() != a.room_id.trim(),
-            names_its_senders(&a.allowed_users, true),
-            "channels_config.matrix.room_id",
         );
     }
     if let (Some(b), Some(a)) = (&b.signal, &a.signal) {
@@ -1787,7 +1780,6 @@ mod tests {
             vec![key("mcp"), key("servers"), key("remote"), key("url")],
             vec![key("nodes"), key("nodes"), PathElem::Index(0), key("endpoint")],
             vec![key("channels_config"), key("mattermost"), key("url")],
-            vec![key("channels_config"), key("matrix"), key("homeserver")],
             vec![key("channels_config"), key("signal"), key("http_url")],
             vec![key("channels_config"), key("whatsapp"), key("ws_url")],
             vec![key("observability"), key("otel_endpoint")],
@@ -2225,7 +2217,6 @@ mod tests {
             "chat.daemon.url",
             "nodes.nodes[0].endpoint",
             "observability.otel_endpoint",
-            "channels_config.matrix.homeserver",
             "channels_config.whatsapp.ws_url",
         ] {
             assert!(
@@ -2583,17 +2574,6 @@ mod tests {
                 },
                 |c| c.channels_config.mattermost.as_mut().expect("t").channel_id = Some("c2".into()),
                 None,
-            ),
-            (
-                "matrix room moved, everybody admitted",
-                |c| {
-                    c.channels_config.matrix = Some(section(serde_json::json!({
-                        "homeserver": "http://127.0.0.1:1", "access_token": "t",
-                        "room_id": "!a:x", "allowed_users": ["*"]
-                    })));
-                },
-                |c| c.channels_config.matrix.as_mut().expect("t").room_id = "!b:x".into(),
-                Some("channels_config.matrix.room_id"),
             ),
             (
                 "irc channel joined, everybody admitted",

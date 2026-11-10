@@ -1,5 +1,3 @@
-#[cfg(feature = "channel-matrix")]
-use super::MatrixConfig;
 use super::{
     ChannelsConfig, Confirm, DingTalkConfig, DiscordConfig, Duration, IMessageConfig, Input, IrcConfig, LarkConfig,
     LarkReceiveMode, LinqConfig, QQConfig, Result, Select, SlackConfig, StreamMode, TelegramConfig, Value,
@@ -27,8 +25,6 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
         Discord,
         Slack,
         IMessage,
-        #[cfg(feature = "channel-matrix")]
-        Matrix,
         WhatsApp,
         Linq,
         Irc,
@@ -43,8 +39,6 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
         ChannelMenuChoice::Discord,
         ChannelMenuChoice::Slack,
         ChannelMenuChoice::IMessage,
-        #[cfg(feature = "channel-matrix")]
-        ChannelMenuChoice::Matrix,
         ChannelMenuChoice::WhatsApp,
         ChannelMenuChoice::Linq,
         ChannelMenuChoice::Irc,
@@ -89,15 +83,6 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ configured"
                     } else {
                         "— macOS only"
-                    }
-                ),
-                #[cfg(feature = "channel-matrix")]
-                ChannelMenuChoice::Matrix => format!(
-                    "Matrix     {}",
-                    if config.matrix.is_some() {
-                        "✅ connected"
-                    } else {
-                        "— self-hosted chat"
                     }
                 ),
                 ChannelMenuChoice::WhatsApp => format!(
@@ -502,113 +487,6 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
                     style("✅").green().bold(),
                     style(&contacts_str).cyan()
                 );
-            }
-            #[cfg(feature = "channel-matrix")]
-            ChannelMenuChoice::Matrix => {
-                // ── Matrix ──
-                println!();
-                println!(
-                    "  {} {}",
-                    style("Matrix Setup").white().bold(),
-                    style("— self-hosted, federated chat").dim()
-                );
-                print_bullet("You need a Matrix account and an access token.");
-                print_bullet("Get a token via Element → Settings → Help & About → Access Token.");
-                println!();
-
-                let homeserver: String = Input::new()
-                    .with_prompt("  Homeserver URL (e.g. https://matrix.org)")
-                    .interact_text()?;
-
-                if homeserver.trim().is_empty() {
-                    println!("  {} Skipped", style("→").dim());
-                    continue;
-                }
-
-                let access_token: String = Input::new().with_prompt("  Access token").interact_text()?;
-
-                if access_token.trim().is_empty() {
-                    println!("  {} Skipped — token required", style("→").dim());
-                    continue;
-                }
-
-                // Test connection (run entirely in separate thread — Response must be used/dropped there)
-                let hs = homeserver.trim_end_matches('/');
-                print!("  {} Testing connection... ", style("⏳").dim());
-                let hs_owned = hs.to_string();
-                let access_token_clone = access_token.clone();
-                let thread_result = std::thread::spawn(move || {
-                    let client = reqwest::blocking::Client::new();
-                    let resp = client
-                        .get(format!("{hs_owned}/_matrix/client/v3/account/whoami"))
-                        .header("Authorization", format!("Bearer {access_token_clone}"))
-                        .send()?;
-                    let ok = resp.status().is_success();
-
-                    if !ok {
-                        return Ok::<_, reqwest::Error>((false, None, None));
-                    }
-
-                    let payload: Value = resp.json().unwrap_or(Value::Null);
-                    let user_id = payload
-                        .get("user_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-                    let device_id = payload
-                        .get("device_id")
-                        .and_then(|value| value.as_str())
-                        .map(|value| value.to_string());
-
-                    Ok::<_, reqwest::Error>((true, user_id, device_id))
-                })
-                .join();
-
-                let (detected_user_id, detected_device_id) = match thread_result {
-                    Ok(Ok((true, user_id, device_id))) => {
-                        println!("\r  {} Connection verified        ", style("✅").green().bold());
-
-                        if device_id.is_none() {
-                            println!(
-                                "  {} Homeserver did not return device_id from whoami. If E2EE decryption fails, set channels.matrix.device_id manually in config.toml.",
-                                style("⚠️").yellow().bold()
-                            );
-                        }
-
-                        (user_id, device_id)
-                    }
-                    _ => {
-                        println!(
-                            "\r  {} Connection failed — check homeserver URL and token",
-                            style("❌").red().bold()
-                        );
-                        continue;
-                    }
-                };
-
-                let room_id: String = Input::new()
-                    .with_prompt("  Room ID (e.g. !abc123:matrix.org)")
-                    .interact_text()?;
-
-                let users_str: String = Input::new()
-                    .with_prompt("  Allowed users (comma-separated @user:server, or * for all)")
-                    .default("*".into())
-                    .interact_text()?;
-
-                let allowed_users = if users_str.trim() == "*" {
-                    vec!["*".into()]
-                } else {
-                    users_str.split(',').map(|s| s.trim().to_string()).collect()
-                };
-
-                config.matrix = Some(MatrixConfig {
-                    homeserver: homeserver.trim_end_matches('/').to_string(),
-                    access_token,
-                    user_id: detected_user_id,
-                    device_id: detected_device_id,
-                    room_id,
-                    allowed_users,
-                    mention_only: false,
-                });
             }
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
@@ -1376,10 +1254,6 @@ pub(super) fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.imessage.is_some() {
         active.push("iMessage");
-    }
-    #[cfg(feature = "channel-matrix")]
-    if config.matrix.is_some() {
-        active.push("Matrix");
     }
     if config.whatsapp.is_some() {
         active.push("WhatsApp");

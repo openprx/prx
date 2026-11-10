@@ -349,7 +349,7 @@ distinct types and source-owned access scopes; see the
 [backend support matrix](decision-plane.md#candidate-memory-backend-support).
 
 IM channel sessions (Signal, Telegram, Discord, WhatsApp/wacli, Slack,
-Mattermost, iMessage, Matrix …) additionally run under `channel_exclude`, which
+Mattermost, iMessage …) additionally run under `channel_exclude`, which
 hides the operations/development surface from a conversation partner:
 
 `wasm_plugins_manage`, `wasm_plugin_reload`, `wasm_plugins_status`,

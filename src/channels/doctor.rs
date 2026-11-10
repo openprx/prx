@@ -1,7 +1,5 @@
 //! Channel status, channel CLI commands and health checks.
 
-#[cfg(feature = "channel-matrix")]
-use super::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
 use super::WhatsAppWebChannel;
 use super::service::bind_telegram_identity;
@@ -23,10 +21,6 @@ pub fn channel_configuration_statuses(config: &Config) -> Vec<(&'static str, boo
         ("Mattermost", config.channels_config.mattermost.is_some()),
         ("Webhook", config.channels_config.webhook.is_some()),
         ("iMessage", config.channels_config.imessage.is_some()),
-        (
-            "Matrix",
-            cfg!(feature = "channel-matrix") && config.channels_config.matrix.is_some(),
-        ),
         ("Signal", config.channels_config.signal.is_some()),
         ("WhatsApp", config.channels_config.whatsapp.is_some()),
         ("Wacli", config.channels_config.wacli.is_some()),
@@ -54,9 +48,6 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             println!("  ✅ CLI (always available)");
             for (name, configured) in channel_configuration_statuses(config) {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
-            }
-            if !cfg!(feature = "channel-matrix") {
-                println!("  ℹ️ Matrix channel support is disabled in this build (enable `channel-matrix`).");
             }
             println!("\nTo start channels: prx channel start");
             println!("To check health:    prx channel doctor");
@@ -143,28 +134,6 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(("iMessage", Arc::new(IMessageChannel::new(im.allowed_contacts.clone()))));
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push((
-            "Matrix",
-            Arc::new(MatrixChannel::new_with_session_hint(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-            )),
-        ));
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        tracing::warn!(
-            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix health check."
-        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {

@@ -12,7 +12,6 @@ pub(super) const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.dingtalk",
     "channel.discord",
     "channel.lark",
-    "channel.matrix",
     "channel.mattermost",
     "channel.nextcloud_talk",
     "channel.qq",

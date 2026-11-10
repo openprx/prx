@@ -344,11 +344,6 @@ pub static SECRET_PATHS: &[SecretPath] = &[
         SecretDomain::Channel,
     ),
     other(
-        "channels_config.matrix.access_token",
-        &[Key("channels_config"), Key("matrix"), Key("access_token")],
-        SecretDomain::Channel,
-    ),
-    other(
         "channels_config.nextcloud_talk.app_token",
         &[Key("channels_config"), Key("nextcloud_talk"), Key("app_token")],
         SecretDomain::Channel,
@@ -574,10 +569,6 @@ pub static ENDPOINT_PATHS: &[EndpointPath] = &[
         &[Key("channels_config"), Key("mattermost"), Key("url")],
     ),
     recipient_url(
-        "channels_config.matrix.homeserver",
-        &[Key("channels_config"), Key("matrix"), Key("homeserver")],
-    ),
-    recipient_url(
         "channels_config.signal.http_url",
         &[Key("channels_config"), Key("signal"), Key("http_url")],
     ),
@@ -786,11 +777,6 @@ pub static ACCESS_CONTROL_PATHS: &[AccessControlPath] = &[
         "channels_config.imessage.allowed_contacts",
         &[Key("channels_config"), Key("imessage"), Key("allowed_contacts")],
         "channels/imessage.rs",
-    ),
-    access(
-        "channels_config.matrix.allowed_users",
-        &[Key("channels_config"), Key("matrix"), Key("allowed_users")],
-        "channels/matrix.rs",
     ),
     access(
         "channels_config.signal.allowed_from",
@@ -1689,12 +1675,6 @@ api_token = "sentinel-linq-api"
 from_phone = "+10000000000"
 signing_secret = "sentinel-linq-signing"
 
-[channels_config.matrix]
-homeserver = "http://127.0.0.1:1"
-access_token = "sentinel-matrix"
-room_id = "!room:matrix.invalid"
-allowed_users = []
-
 [channels_config.nextcloud_talk]
 base_url = "http://127.0.0.1:1"
 app_token = "sentinel-nextcloud-app"
@@ -1783,12 +1763,6 @@ bot_token = "mattermost-token"
 [channels_config.nextcloud_talk]
 base_url = "http://nc:userinfo-sentinel-nextcloud@127.0.0.1:23"
 app_token = "nextcloud-token"
-
-[channels_config.matrix]
-homeserver = "http://mx:userinfo-sentinel-matrix@127.0.0.1:24"
-access_token = "matrix-token"
-room_id = "!room:matrix.invalid"
-allowed_users = []
 
 [channels_config.signal]
 account = "+10000000000"
@@ -3863,7 +3837,6 @@ output = 1.0
             "channels_config.irc" => d(channels.irc.as_ref()?),
             "channels_config.lark" => d(channels.lark.as_ref()?),
             "channels_config.linq" => d(channels.linq.as_ref()?),
-            "channels_config.matrix" => d(channels.matrix.as_ref()?),
             "channels_config.nextcloud_talk" => d(channels.nextcloud_talk.as_ref()?),
             "channels_config.qq" => d(channels.qq.as_ref()?),
             "channels_config.wacli" => d(channels.wacli.as_ref()?),

@@ -1,7 +1,5 @@
 //! Channel runtime start-up.
 
-#[cfg(feature = "channel-matrix")]
-use super::MatrixChannel;
 #[cfg(test)]
 use super::SecurityGen;
 #[cfg(feature = "whatsapp-web")]
@@ -205,25 +203,6 @@ pub async fn start_channels_with_config(
 
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(Arc::new(IMessageChannel::new(im.allowed_contacts.clone())));
-    }
-
-    #[cfg(feature = "channel-matrix")]
-    if let Some(ref mx) = config.channels_config.matrix {
-        channels.push(Arc::new(MatrixChannel::new_with_session_hint(
-            mx.homeserver.clone(),
-            mx.access_token.clone(),
-            mx.room_id.clone(),
-            mx.allowed_users.clone(),
-            mx.user_id.clone(),
-            mx.device_id.clone(),
-        )));
-    }
-
-    #[cfg(not(feature = "channel-matrix"))]
-    if config.channels_config.matrix.is_some() {
-        tracing::warn!(
-            "Matrix channel is configured but this build was compiled without `channel-matrix`; skipping Matrix runtime startup."
-        );
     }
 
     if let Some(ref sig) = config.channels_config.signal {

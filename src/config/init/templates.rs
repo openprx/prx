@@ -179,12 +179,6 @@ cli = true                          # enable the interactive CLI channel
 # app_token = ""
 # allowed_users = []
 
-# [channels_config.matrix]
-# homeserver_url = "https://matrix.org"
-# user_id = "@bot:matrix.org"
-# access_token = ""
-# allowed_rooms = []
-
 # [channels_config.lark]
 # app_id = ""
 # app_secret = ""

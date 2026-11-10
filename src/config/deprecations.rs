@@ -64,6 +64,10 @@ const REASON_NO_ITERATION_LIMIT: &str = "prx no longer stops a progressing agent
 /// Conversation retention is governed by the model-aware token budget.
 const REASON_TOKEN_BUDGETED_HISTORY: &str = "prx no longer drops conversation history after an arbitrary message count; retention is governed by the configured context-token budget";
 
+/// The Matrix channel was removed; external messaging goes through ramflux.
+const REASON_MATRIX_REMOVED: &str = "Matrix support was removed; the [channels_config.matrix] section is ignored and \
+                                     can be deleted (external messaging now goes through ramflux)";
+
 /// The key described an enforcement that never existed.
 const REASON_NEVER_ENFORCED: &str = "this limit was never enforced by any code path and has been removed rather than \
                                      left as a false assurance";
@@ -213,6 +217,12 @@ pub(crate) const DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
         path: &["channels_config", "message_timeout_secs"],
         shape: DeprecatedShape::Field,
         reason: REASON_NO_TIMEOUT,
+    },
+    // ── [channels_config.matrix]: the Matrix channel was removed ───────────
+    DeprecatedKey {
+        path: &["channels_config", "matrix"],
+        shape: DeprecatedShape::Section,
+        reason: REASON_MATRIX_REMOVED,
     },
     // ── [security.audit]: signing that was never implemented (INT-2B) ─────
     DeprecatedKey {

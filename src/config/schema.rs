@@ -378,7 +378,6 @@ redacted_debug! {
     IrcConfig => "channels_config.irc",
     LarkConfig => "channels_config.lark",
     LinqConfig => "channels_config.linq",
-    MatrixConfig => "channels_config.matrix",
     NextcloudTalkConfig => "channels_config.nextcloud_talk",
     QQConfig => "channels_config.qq",
     WacliConfig => "channels_config.wacli",

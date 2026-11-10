@@ -74,12 +74,11 @@ why its current contents remain cohesive. Future growth still requires review.
 | 5,060 | `src/causal_tree/store.rs` | Owns the decision store schema, migrations, repositories, and persistence tests as one backend boundary. |
 | 5,058 | `src/providers/compatible.rs` | Owns the OpenAI-compatible HTTP/SSE wire family, dialect normalization, stream parser, and protocol fixtures. |
 
-The same tracked-file command without the `vendor` exclusion also finds three
-upstream copies: `vendor/matrix-sdk-0.19.1/src/room/mod.rs` (5,836 lines),
-`vendor/matrix-sdk-0.19.1/src/client/mod.rs` (5,812), and
-`vendor/matrix-sdk-0.19.1/src/test_utils/mocks/mod.rs` (5,308). Their source
-ownership and decomposition remain upstream; PRX does not refactor vendored
-code as part of this migration.
+At the time of this review the tracked-file command without the `vendor`
+exclusion also found three upstream copies of the Matrix SDK (`room/mod.rs`,
+`client/mod.rs`, `test_utils/mocks/mod.rs`, 5,836 / 5,812 / 5,308 lines). They
+were removed with the Matrix channel; PRX does not refactor vendored code as
+part of this migration.
 
 ## Finding 103 split status (2026-10-20)
 

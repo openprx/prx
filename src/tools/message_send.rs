@@ -2038,14 +2038,14 @@ mod tests {
 
         let result = tool
             .execute(json!({
-                "action": "send", "channel": "matrix", "target": "12345", "message": "hi"
+                "action": "send", "channel": "carrier-pigeon", "target": "12345", "message": "hi"
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
-        assert!(error.contains("Unknown channel 'matrix'"), "got: {error}");
+        assert!(error.contains("Unknown channel 'carrier-pigeon'"), "got: {error}");
         assert!(error.contains("Available channels: dummy, telegram"), "got: {error}");
         assert!(
             current_sent.lock().await.is_empty(),

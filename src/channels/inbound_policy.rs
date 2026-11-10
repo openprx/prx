@@ -219,9 +219,6 @@ pub(super) fn collect_mention_only_by_channel(config: &Config) -> HashMap<String
     if let Some(imessage) = config.channels_config.imessage.as_ref() {
         mention_only.insert("imessage".to_string(), imessage.mention_only);
     }
-    if let Some(matrix) = config.channels_config.matrix.as_ref() {
-        mention_only.insert("matrix".to_string(), matrix.mention_only);
-    }
     if let Some(signal) = config.channels_config.signal.as_ref() {
         mention_only.insert("signal".to_string(), signal.mention_only);
     }

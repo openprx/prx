@@ -50,7 +50,6 @@ pub async fn get_channels_status(State(state): State<AppState>) -> Json<Channels
     push_channel("mattermost", config.channels_config.mattermost.is_some());
     push_channel("webhook", config.channels_config.webhook.is_some());
     push_channel("imessage", config.channels_config.imessage.is_some());
-    push_channel("matrix", config.channels_config.matrix.is_some());
     push_channel("signal", config.channels_config.signal.is_some());
     push_channel("whatsapp", config.channels_config.whatsapp.is_some());
     push_channel("wacli", config.channels_config.wacli.is_some());
@@ -717,14 +716,17 @@ mod tests {
 
         let (status, body) = post_raw(
             &base_url,
-            "matrix",
+            "carrier-pigeon",
             Some(TOKEN),
             serde_json::json!({"recipient": RECIPIENT, "message": "nowhere"}),
         )
         .await;
 
         assert_eq!(status, 404, "test: body was {body}");
-        assert!(body.contains("Unknown channel 'matrix'"), "test: body was {body}");
+        assert!(
+            body.contains("Unknown channel 'carrier-pigeon'"),
+            "test: body was {body}"
+        );
         assert!(body.contains("Available channels:"), "test: body was {body}");
         assert!(body.contains(CHANNEL), "test: body was {body}");
         assert!(channel.deliveries().await.is_empty(), "expected an empty value");
@@ -836,14 +838,17 @@ mod tests {
 
         let (status, body) = post_raw(
             &base_url,
-            "matrix",
+            "carrier-pigeon",
             Some(TOKEN),
             serde_json::json!({"recipient": RECIPIENT, "message": "nowhere"}),
         )
         .await;
 
         assert_eq!(status, 404, "test: body was {body}");
-        assert!(body.contains("Unknown channel 'matrix'"), "test: body was {body}");
+        assert!(
+            body.contains("Unknown channel 'carrier-pigeon'"),
+            "test: body was {body}"
+        );
         server.abort();
     }
 

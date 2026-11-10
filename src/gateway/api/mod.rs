@@ -470,9 +470,6 @@ pub(super) fn configured_channel_names(config: &Config) -> Vec<String> {
     if config.channels_config.imessage.is_some() {
         channels.push("imessage".to_string());
     }
-    if config.channels_config.matrix.is_some() {
-        channels.push("matrix".to_string());
-    }
     if config.channels_config.signal.is_some() {
         channels.push("signal".to_string());
     }

@@ -20,13 +20,12 @@ class SourceSizeTests(unittest.TestCase):
             self.assertEqual([(x['path'], x['lines']) for x in result['violations']],
                              [('nested/bad.tsx', 5001), ('script', 5001)])
 
-    def test_missing_invalid_and_vendor(self):
+    def test_missing_and_invalid_are_violations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'bad.rs').write_bytes(b'\xff')
-            result = inspect(root, ['missing.rs', 'bad.rs', 'vendor/matrix-sdk-0.19.1/generated.rs'])
+            result = inspect(root, ['missing.rs', 'bad.rs'])
             self.assertEqual(len(result['violations']), 2)
-            self.assertEqual(result['excluded_vendored'], 1)
 
     def test_escaping_symlink_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

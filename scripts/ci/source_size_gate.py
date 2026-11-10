@@ -10,9 +10,6 @@ import sys
 LIMIT = 5000
 EXTENSIONS = frozenset('c cc cjs cpp css go h html in js jsx mjs proto ps1 py rs sh svelte tmpl ts tsx wit'.split())
 BUILD_NAMES = frozenset(('Dockerfile', 'Makefile', 'Justfile', 'makefile', 'justfile', 'compose.yml', 'compose.yaml', 'docker-compose.yml', 'docker-compose.yaml'))
-# The vendored Matrix SDK retains its upstream license and origin. New vendor
-# trees are scanned as first-party until their provenance is explicitly added.
-VENDOR_ROOTS = (('vendor', 'matrix-sdk-0.19.1'),)
 
 
 def is_declared_source(path):
@@ -26,12 +23,8 @@ def inspect(root, paths):
     root = root.resolve()
     violations = []
     checked = 0
-    excluded = []
     for name in paths:
         relative = Path(name)
-        if any(relative.parts[:len(vendor)] == vendor for vendor in VENDOR_ROOTS):
-            excluded.append(name)
-            continue
         path = root / relative
         try:
             if path.is_symlink():
@@ -48,7 +41,7 @@ def inspect(root, paths):
                 violations.append({'path': name, 'lines': count, 'bytes': len(data), 'limit': LIMIT, 'reason': 'line limit exceeded'})
         except (OSError, UnicodeError, ValueError) as exc:
             violations.append({'path': name, 'reason': str(exc), 'limit': LIMIT})
-    return {'checked': checked, 'excluded_vendored': len(excluded), 'violations': violations}
+    return {'checked': checked, 'violations': violations}
 
 
 def main():
