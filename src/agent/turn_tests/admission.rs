@@ -1090,7 +1090,10 @@ async fn configured_mechanics_on_wall_clock_expires_when_decision_http_stalls_pa
             ))
             .catch_unwind()
             .await;
-            let message = panic_text(caught.expect_err("wall-clock stall must miss Execute").as_ref());
+            let message = match caught {
+                Err(payload) => panic_text(payload.as_ref()),
+                Ok(_) => panic!("wall-clock stall must miss Execute"),
+            };
             assert!(
                 message.contains("deadline_exceeded"),
                 "old path must fail on the production latency budget: {message}"
