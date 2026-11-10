@@ -81,3 +81,108 @@ impl Default for CostConfig {
         }
     }
 }
+
+/// The `[cost.prices]` map key `G6` uses for `provider`/`model`.
+///
+/// A model id that already contains `/` is the key; otherwise `{provider}/{model}`.
+/// That is why a `custom:<url>` row whose model is `moonshotai/kimi-k2.5` looks
+/// up `[cost.prices."moonshotai/kimi-k2.5"]`, while `kimi-code`/`kimi-for-coding`
+/// looks up `[cost.prices."kimi-code/kimi-for-coding"]`.
+#[must_use]
+pub(crate) fn usage_pricing_key(provider: &str, model: &str) -> String {
+    if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    }
+}
+
+/// Whether `price_key` is the override `G6` would apply when looking up `lookup_key`.
+///
+/// Exact match wins; otherwise a key that carries URL userinfo matches when its
+/// redacted spelling equals the lookup key's (the same rule as `G6`).
+#[must_use]
+pub(crate) fn cost_price_key_matches(price_key: &str, lookup_key: &str) -> bool {
+    if price_key == lookup_key {
+        return true;
+    }
+    price_key.contains('@')
+        && crate::providers::redact_endpoint_userinfo(price_key)
+            == crate::providers::redact_endpoint_userinfo(lookup_key)
+}
+
+/// Warnings for `[cost.prices]` keys `G6` would never look up for a configured
+/// provider/model. Existing configs keep loading: this is a warning, not an error.
+/// For a custom provider the text names the expected key.
+#[must_use]
+pub(crate) fn unmatched_cost_price_key_warnings(config: &super::Config) -> Vec<String> {
+    if config.cost.prices.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut lookups = Vec::new();
+    for (provider, model) in crate::config::manage::validate::selected_models(config) {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            continue;
+        }
+        if !seen.insert((provider.clone(), model.clone())) {
+            continue;
+        }
+        let key = usage_pricing_key(&provider, &model);
+        lookups.push((provider, model, key));
+    }
+    let mut custom_expected = Vec::new();
+    let mut seen_custom = std::collections::BTreeSet::new();
+    for (provider, model, expected) in &lookups {
+        if !matches!(
+            crate::providers::classify_provider(provider),
+            crate::providers::ProviderIdentity::ByoEndpoint { .. }
+        ) {
+            continue;
+        }
+        if seen_custom.insert(expected.clone()) {
+            custom_expected.push((provider.clone(), model.clone(), expected.clone()));
+        }
+    }
+    let custom_clause = custom_expected_clause(&custom_expected);
+    let mut keys: Vec<&str> = config.cost.prices.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let mut warnings = Vec::new();
+    for price_key in keys {
+        if lookups
+            .iter()
+            .any(|(_, _, lookup)| cost_price_key_matches(price_key, lookup))
+        {
+            continue;
+        }
+        let shown = crate::providers::redact_endpoint_userinfo(price_key);
+        let shown = shown.as_ref();
+        let mut message = format!(
+            "[cost.prices.{shown:?}] matches no configured provider/model; G6 looks up the bare model id when the model contains '/', otherwise {{provider}}/{{model}}"
+        );
+        if let Some(clause) = custom_clause.as_deref() {
+            message.push_str("; ");
+            message.push_str(clause);
+        }
+        warnings.push(message);
+    }
+    warnings
+}
+
+fn custom_expected_clause(custom_expected: &[(String, String, String)]) -> Option<String> {
+    if custom_expected.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = custom_expected
+        .iter()
+        .map(|(provider, model, expected)| {
+            format!(
+                "for custom provider '{}' model '{}' the expected key is {:?}",
+                crate::providers::redact_endpoint_userinfo(provider),
+                crate::providers::redact_endpoint_userinfo(model),
+                crate::providers::redact_endpoint_userinfo(expected).as_ref()
+            )
+        })
+        .collect();
+    Some(named.join("; "))
+}

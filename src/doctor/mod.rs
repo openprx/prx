@@ -1342,6 +1342,9 @@ fn check_model_selection(config: &Config, items: &mut Vec<DiagItem>) {
             items.push(DiagItem::ok(cat, notice));
         }
     }
+    for warning in crate::config::schema::unmatched_cost_price_key_warnings(config) {
+        items.push(DiagItem::warn("cost", warning));
+    }
 
     match crate::config::model_settings::warnings(config) {
         Ok(warnings) => items.extend(warnings.into_iter().map(|warning| DiagItem::warn(cat, warning))),
@@ -2625,6 +2628,43 @@ mod tests {
         assert!(items.iter().any(|item| {
             item.severity == Severity::Warn && item.message.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#)
         }));
+    }
+
+    #[test]
+    fn doctor_warns_when_a_cost_price_key_matches_no_configured_model() {
+        let mut config = Config::default();
+        config.default_provider = Some("custom:http://127.0.0.1:9/v1".into());
+        config.default_model = Some("moonshotai/kimi-k2.5".into());
+        config.cost.prices.insert(
+            "custom:http://127.0.0.1:9/v1/moonshotai/kimi-k2.5".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_write: 1.0,
+                cache_read: 0.5,
+            },
+        );
+        let mut items = Vec::new();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().any(|item| {
+            item.severity == Severity::Warn
+                && item.category == "cost"
+                && item.message.contains("expected key is \"moonshotai/kimi-k2.5\"")
+        }));
+
+        config.cost.prices.clear();
+        config.cost.prices.insert(
+            "moonshotai/kimi-k2.5".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_write: 1.0,
+                cache_read: 0.5,
+            },
+        );
+        items.clear();
+        check_model_selection(&config, &mut items);
+        assert!(items.iter().all(|item| item.category != "cost"));
     }
 
     #[test]

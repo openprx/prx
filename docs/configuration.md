@@ -2244,6 +2244,10 @@ setting, never a secret.
 | a negative or non-finite `cost.prices` input, output, cache-write or cache-read amount | loaded; mixed signs could cancel into a free usage estimate | `cost.prices entry N FIELD must be finite and nonnegative` (no price key or URL credential is printed) | set every component to a finite amount of at least zero; remove an entry if pricing is unknown |
 | `security.audit.max_size_mb = 0` | rotated the audit log on every record, keeping only the last few | `security.audit.max_size_mb must be at least 1` | set 1 or more (the default is 100) |
 
+A `[cost.prices]` key that matches no configured provider/model still loads.
+Configuration load logs a warning and `prx doctor` reports it; the process does
+not refuse the file. See [`[cost.prices]` keys](#costprices-keys).
+
 Two `[[model_routes]]` entries with the same `hint`, or a `hint` containing
 whitespace, are refused at load too; see "Model descriptors and the
 resolver" in [providers.md](providers.md).
@@ -3007,6 +3011,27 @@ with their own owners (see the top of this page). Child-session capability
 parity and PRX-to-PRX messaging are planned; they are not current behaviour.
 
 A single-shot `prx agent 'msg'` (or `prx agent -m`) turn that closes as a policy refusal still prints the reply on stdout and exits `2`. Exit `1` remains a command or runtime failure. Configuration-actionable refusals (missing price or tariff, exhausted budget, invalid configured price) append one `Reason:` line after the generic sentence. Gate codes that also cover channel eligibility, stale capability references, or decision-transport failure stay on the generic sentence, as do security and policy-internal refusals (including approval internals). A child turn's close reply is the parent tool result, so the same hint reaches `delegate` / `sessions_spawn` callers. Interactive `prx agent` prints the reply and continues.
+
+### `[cost.prices]` keys
+
+`[cost.prices]` is an operator-override table. G6 looks up a key with this
+exact rule: if the model id already contains `/`, the key is that model id;
+otherwise the key is `{provider}/{model}`. A credentialed URL in the key
+matches the same way G6 does (exact key, then a userinfo-redacted spelling).
+
+That is why hosted rows differ:
+
+- `kimi-code` / `kimi-for-coding` → `[cost.prices."kimi-code/kimi-for-coding"]`
+- `openrouter` / `deepseek/deepseek-v3.2` → `[cost.prices."deepseek/deepseek-v3.2"]`
+  (do not prepend `openrouter/`)
+- `custom:<url>` / `moonshotai/kimi-k2.5` → `[cost.prices."moonshotai/kimi-k2.5"]`
+  (the bare model id, not `custom:<url>/moonshotai/kimi-k2.5`)
+- `custom:<url>` / `kimi-k2.5` → `[cost.prices."custom:<url>/kimi-k2.5"]`
+
+A key that matches no configured provider/model under that rule is a warning
+at load and in `prx doctor`, not a load error. For a `custom:<url>` provider
+the warning names the expected key. Duplicate redacted keys and non-finite
+or negative amounts remain load errors (table above).
 
 ### Workspace cost report
 

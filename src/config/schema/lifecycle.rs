@@ -816,6 +816,9 @@ impl Config {
         self.validate_provider_tool_dialects()?;
         self.validate_provider_models()?;
         self.validate_cost_price_keys()?;
+        for warning in super::unmatched_cost_price_key_warnings(self) {
+            tracing::warn!(warning = %warning, "cost.prices key matches no configured model");
+        }
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {

@@ -656,11 +656,7 @@ pub(crate) fn pricing_warning(
     ) {
         return None;
     }
-    let key = if model.contains('/') {
-        model.to_string()
-    } else {
-        format!("{provider}/{model}")
-    };
+    let key = crate::config::schema::usage_pricing_key(provider, model);
     let key = crate::security::redaction::redact_provider_text(&key);
     let provider = crate::security::redaction::redact_provider_text(provider);
     let model = crate::security::redaction::redact_provider_text(model);

@@ -1535,11 +1535,7 @@ fn fixture_price(config: &mut Config, catalog: &CatalogView) {
     )
     .expect("test: actual resolved pricing identity");
     let model = resolved.model();
-    let pricing_key = if model.contains('/') {
-        model.to_owned()
-    } else {
-        format!("{}/{model}", resolved.provider_label())
-    };
+    let pricing_key = openprx::config::schema::usage_pricing_key(resolved.provider_label(), model);
     config.cost.prices.insert(
         pricing_key,
         openprx::config::schema::ModelPricing {

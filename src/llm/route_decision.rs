@@ -259,11 +259,7 @@ pub(crate) fn usage_cost_resolution(
     cache_read_input_tokens: u64,
     cost_config: &crate::config::schema::CostConfig,
 ) -> UsagePrice {
-    let pricing_key = if model.contains('/') {
-        model.to_string()
-    } else {
-        format!("{provider}/{model}")
-    };
+    let pricing_key = crate::config::schema::usage_pricing_key(provider, model);
     // Outcomes are persisted with URL userinfo redacted, and a `[cost].prices`
     // key may spell the provider as configured, credentials included. The
     // rule is deterministic: the exact key wins; otherwise the key whose
