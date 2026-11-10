@@ -2628,6 +2628,31 @@ impl ToolExecutionService {
             }
         }
 
+        if let Some(bindings) = &context.execution_bindings {
+            if context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()) {
+                let verified = bindings
+                    .get(&command.name)
+                    .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                    .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+                if let Err(error) = verified {
+                    let error = error.to_string();
+                    return self.finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        None,
+                        ToolExecutionStatus::StaleCapability,
+                        format!("Error: {error}"),
+                        None,
+                        Some(error),
+                        None,
+                        started,
+                    );
+                }
+            }
+        }
+
         // V02-R9 / OQ-21: an owner-isolated origin runs only tools that enforce
         // per-owner isolation. Keyed on the envelope rather than a channel name,
         // so every isolated origin inherits it, and decided before policy so no
@@ -3278,6 +3303,39 @@ impl ToolExecutionService {
                 Some(preparation),
                 started,
             );
+        }
+        if let Some(bindings) = &context.execution_bindings {
+            if context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()) {
+                let verified = bindings
+                    .get(&command.name)
+                    .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                    .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+                if let Err(error) = verified {
+                    let abandonment = self
+                        .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
+                        .await;
+                    let (status, error) = match abandonment {
+                        Ok(()) => (ToolExecutionStatus::StaleCapability, error.to_string()),
+                        Err(error) => (ToolExecutionStatus::Indeterminate, error),
+                    };
+                    if let Some(observation) = exact_call {
+                        observation.complete(status);
+                    }
+                    return self.finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        Some(decision),
+                        status,
+                        format!("Error: {error}"),
+                        None,
+                        Some(error),
+                        Some(preparation),
+                        started,
+                    );
+                }
+            }
         }
         // The resolved Arc is immutable for the in-flight call even if a
         // dynamic catalog refresh changes future descriptor snapshots.
