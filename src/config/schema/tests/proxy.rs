@@ -71,3 +71,32 @@ async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
         "a proxy change moves the generation"
     );
 }
+
+/// Old configs may still name the retired Matrix proxy selector. It must load,
+/// the selector must be ignored (never routed), and a typo must still fail.
+#[test]
+async fn a_retired_matrix_proxy_selector_loads_ignored_and_a_typo_is_refused() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+    let dir = tempfile::TempDir::new().expect("test: temp dir");
+    let path = dir.path().join("config.toml");
+    let old = "default_temperature = 0.7\n\n[proxy]\nhttp_proxy = \"http://127.0.0.1:7890\"\nscope = \"services\"\nservices = [\"channel.matrix\", \"channel.telegram\"]\n";
+    std::fs::write(&path, old).expect("test: write config");
+
+    let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
+    let config = loaded.expect("test: an old channel.matrix proxy selector still loads");
+    assert!(
+        logs.contains("Matrix support was removed"),
+        "the retired selector must be reported as removed: {logs}"
+    );
+    assert!(!config.proxy.should_apply_to_service("channel.matrix"));
+    assert!(config.proxy.should_apply_to_service("channel.telegram"));
+
+    std::fs::write(&path, old.replace("channel.telegram", "channle.telegram")).expect("test: write config");
+    let error = Config::load_from_path(&path, dir.path().join("workspace"))
+        .expect_err("a typo proxy selector must still be refused")
+        .to_string();
+    assert!(
+        error.contains("channle.telegram"),
+        "the misspelled selector must be named, got: {error}"
+    );
+}

@@ -28,6 +28,11 @@ pub(super) const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "decision.compatible_http",
 ];
 
+/// Selectors of removed channels. An old config may still name them: they are
+/// dropped with a warning at validation and never route traffic. Any other
+/// unknown selector is still refused.
+pub(super) const RETIRED_PROXY_SERVICE_SELECTORS: &[&str] = &["channel.matrix"];
+
 pub(super) const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
     "provider.*",
     "channel.*",
@@ -126,6 +131,13 @@ impl ProxyConfig {
         }
 
         for selector in self.normalized_services() {
+            if is_retired_proxy_service_selector(&selector) {
+                tracing::warn!(
+                    selector = %selector,
+                    "Ignoring removed proxy service selector: Matrix support was removed; the selector can be deleted from proxy.services"
+                );
+                continue;
+            }
             if !is_supported_proxy_service_selector(&selector) {
                 anyhow::bail!(
                     "Unsupported proxy service selector '{selector}'. Use tool `proxy_config` action `list_services` for valid values"
@@ -156,6 +168,7 @@ impl ProxyConfig {
 
                 self.normalized_services()
                     .iter()
+                    .filter(|selector| !is_retired_proxy_service_selector(selector))
                     .any(|selector| service_selector_matches(selector, &service_key))
             }
         }
@@ -300,6 +313,12 @@ pub(super) fn normalize_comma_values(values: Vec<String>) -> Vec<String> {
     output.sort_unstable();
     output.dedup();
     output
+}
+
+pub(super) fn is_retired_proxy_service_selector(selector: &str) -> bool {
+    RETIRED_PROXY_SERVICE_SELECTORS
+        .iter()
+        .any(|retired| retired.eq_ignore_ascii_case(selector))
 }
 
 pub(super) fn is_supported_proxy_service_selector(selector: &str) -> bool {

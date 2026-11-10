@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - BREAKING (operators): the Matrix channel and its vendored SDK were removed,
   including the `channel-matrix` feature and the `matrix-sdk` dependency.
   Existing `[channels_config.matrix]` sections are ignored with one warning at
-  load; delete them from configuration. Use ramflux for external messaging.
+  load; delete them from configuration. Values in a stale section are not kept after
+  the next config save. Remove `channel.matrix` from `proxy.services` too; it is
+  ignored with a warning and never routes traffic. Use ramflux for external
+  messaging.
 - BREAKING (operators): automix reply escalation was removed in 0.8.171.
   `[router.automix]` is ignored with one warning at load; remove this section
   from operator configuration. Turns return the serving model's reply without

@@ -180,4 +180,4 @@ The locked graph resolves that parent to 1.0.10. The bridge exports only
 The version bans still reject older root bundles. A fresh raw scan with no
 ignored advisories reports zero vulnerabilities on this graph. It still
 reports informational warnings; the existing bincode policy
-exception is separate and were not closed by this review.
+exception is separate and was not closed by this review.

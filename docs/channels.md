@@ -9,7 +9,9 @@ Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord ·
 
 The Matrix channel has been removed. External messaging goes through ramflux.
 An existing `[channels_config.matrix]` section is ignored with a warning at
-load, and the section can be deleted.
+load, and the section can be deleted. Values in the stale section are not kept
+after the next config save. A `channel.matrix` entry in `proxy.services` is
+ignored the same way.
 
 ## Ramflux
 
