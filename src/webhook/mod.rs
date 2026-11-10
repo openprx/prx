@@ -365,6 +365,7 @@ impl SqliteWebhookRepository {
                     event.project.as_deref(),
                     Some(&event.external_id),
                     &fingerprint,
+                    None,
                 )?
             }
         };
