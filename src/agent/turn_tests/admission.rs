@@ -1076,6 +1076,13 @@ fn panic_text(payload: &dyn std::any::Any) -> String {
         .unwrap_or_else(|| "non-string panic".to_string())
 }
 
+#[inline(never)]
+fn boxed_mechanics_work<'a>(
+    work: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(work)
+}
+
 /// Old setup (no logical clock): a >250 ms decision-HTTP stall spends the
 /// production extra_latency_budget_ms and the fixture panics at Execute.
 #[tokio::test]
@@ -1097,24 +1104,35 @@ async fn configured_mechanics_on_wall_clock_expires_when_decision_http_stalls_pa
     } = fixture;
     driver
         .run_factory(true, || async move {
-            let caught = std::panic::AssertUnwindSafe(AdmittedTurn::configured_mechanics_on_current_clock(
-                config,
-                "Use native_probe.",
-                registry,
-                memory,
-                &endpoint,
-                &provider,
-            ))
-            .catch_unwind()
-            .await;
-            let message = match caught {
-                Err(payload) => panic_text(payload.as_ref()),
-                Ok(_) => panic!("wall-clock stall must miss Execute"),
-            };
-            assert!(
-                message.contains("deadline_exceeded"),
-                "old path must fail on the production latency budget: {message}"
-            );
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .expect("mechanics cleanup owner");
+            cleanup
+                .run(boxed_mechanics_work(async move {
+                    let caught = std::panic::AssertUnwindSafe(AdmittedTurn::configured_mechanics_on_current_clock(
+                        config,
+                        "Use native_probe.",
+                        registry,
+                        memory,
+                        &endpoint,
+                        &provider,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    let message = match caught {
+                        Err(payload) => panic_text(payload.as_ref()),
+                        Ok(_) => panic!("wall-clock stall must miss Execute"),
+                    };
+                    assert!(
+                        message.contains("deadline_exceeded"),
+                        "old path must fail on the production latency budget: {message}"
+                    );
+                    Ok(())
+                }))
+                .await
+                .expect("mechanics cleanup drain");
         })
         .await;
 }
@@ -1134,15 +1152,26 @@ async fn configured_mechanics_reaches_execute_when_decision_http_stalls_past_bud
     } = fixture;
     driver
         .run_factory(true, || async move {
-            let _admission = AdmittedTurn::configured_mechanics(
-                config,
-                "Use native_probe.",
-                registry,
-                memory,
-                &endpoint,
-                &provider,
+            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
+                None,
+                tokio_util::sync::CancellationToken::new(),
             )
-            .await;
+            .expect("mechanics cleanup owner");
+            cleanup
+                .run(boxed_mechanics_work(async move {
+                    let _admission = AdmittedTurn::configured_mechanics(
+                        config,
+                        "Use native_probe.",
+                        registry,
+                        memory,
+                        &endpoint,
+                        &provider,
+                    )
+                    .await;
+                    Ok(())
+                }))
+                .await
+                .expect("mechanics cleanup drain");
         })
         .await;
 }
