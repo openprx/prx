@@ -256,7 +256,8 @@ fn refine_budget(decision: &EngineDecision) -> Option<RefusalReason> {
 
 fn unpriced_reason(resolved_model: &str) -> RefusalReason {
     let resolved_model = crate::security::redaction::redact_secrets(resolved_model);
-    let (provider, model) = match resolved_model.split_once(':') {
+    // `resolved_model` is `{provider_label}:{model}`; custom URLs contain colons.
+    let (provider, model) = match resolved_model.rsplit_once(':') {
         Some((provider, model)) => (provider, model),
         None => ("", resolved_model.as_str()),
     };
@@ -387,6 +388,13 @@ mod tests {
             RefusalReason::UnpricedModel { model, price_key } => {
                 assert_eq!(model, "kimi-for-coding");
                 assert_eq!(price_key, "kimi-code/kimi-for-coding");
+            }
+            other => panic!("expected unpriced, got {other:?}"),
+        }
+        match unpriced_reason("custom:http://127.0.0.1:9/v1:prx-unpriced-fixture") {
+            RefusalReason::UnpricedModel { model, price_key } => {
+                assert_eq!(model, "prx-unpriced-fixture");
+                assert_eq!(price_key, "custom:http://127.0.0.1:9/v1/prx-unpriced-fixture");
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
