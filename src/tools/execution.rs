@@ -2629,30 +2629,28 @@ impl ToolExecutionService {
         }
 
         if let Some(bindings) = &context.execution_bindings {
-            if context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()) {
-                let verified = bindings
-                    .get(&command.name)
-                    .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                    .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
-                if let Err(error) = verified {
-                    let error = error.to_string();
-                    return self.finish(
-                        &command,
-                        &context,
-                        input_sha256,
-                        Some(descriptor),
-                        None,
-                        ToolExecutionStatus::StaleCapability,
-                        format!("Error: {error}"),
-                        None,
-                        Some(error),
-                        None,
-                        started,
-                    );
-                }
+            let verified = bindings
+                .get(&command.name)
+                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+            if let Err(error) = verified {
+                let error = error.to_string();
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    None,
+                    ToolExecutionStatus::StaleCapability,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    None,
+                    started,
+                );
             }
         }
-
         // V02-R9 / OQ-21: an owner-isolated origin runs only tools that enforce
         // per-owner isolation. Keyed on the envelope rather than a channel name,
         // so every isolated origin inherits it, and decided before policy so no
@@ -2941,37 +2939,23 @@ impl ToolExecutionService {
             runtime_approval_granted = true;
         } else if decision == ToolExecutionDecision::Ask && context.decision_resume.is_none() {
             let decision_call = match async {
-                if let Some(bindings) = context.execution_bindings.as_ref() {
-                    let binding = bindings
-                        .get(&command.name)
-                        .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
-                    binding
-                        .bind_call(
-                            self,
-                            &context.envelope,
-                            &descriptor,
-                            &command,
-                            context.decision_approval.as_ref(),
-                            context.schema_dialect,
-                        )
-                        .await
-                        .map(Some)
-                } else if let Some(port) = context.decision_approval.as_ref() {
-                    // Map-None callers (admission_matrix, operator) still mint
-                    // decision_call through the stamped port until R9.
-                    port.bind_call(
+                let Some(bindings) = context.execution_bindings.as_ref() else {
+                    return Ok(None);
+                };
+                let binding = bindings
+                    .get(&command.name)
+                    .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
+                binding
+                    .bind_call(
                         self,
                         &context.envelope,
                         &descriptor,
                         &command,
-                        context.child_scope.clone(),
+                        context.decision_approval.as_ref(),
                         context.schema_dialect,
                     )
                     .await
                     .map(Some)
-                } else {
-                    Ok(None)
-                }
             }
             .await
             {
@@ -3305,36 +3289,35 @@ impl ToolExecutionService {
             );
         }
         if let Some(bindings) = &context.execution_bindings {
-            if context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()) {
-                let verified = bindings
-                    .get(&command.name)
-                    .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
-                    .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
-                if let Err(error) = verified {
-                    let abandonment = self
-                        .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
-                        .await;
-                    let (status, error) = match abandonment {
-                        Ok(()) => (ToolExecutionStatus::StaleCapability, error.to_string()),
-                        Err(error) => (ToolExecutionStatus::Indeterminate, error),
-                    };
-                    if let Some(observation) = exact_call {
-                        observation.complete(status);
-                    }
-                    return self.finish(
-                        &command,
-                        &context,
-                        input_sha256,
-                        Some(descriptor),
-                        Some(decision),
-                        status,
-                        format!("Error: {error}"),
-                        None,
-                        Some(error),
-                        Some(preparation),
-                        started,
-                    );
+            let verified = bindings
+                .get(&command.name)
+                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
+                .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
+            if let Err(error) = verified {
+                let abandonment = self
+                    .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
+                    .await;
+                let (status, error) = match abandonment {
+                    Ok(()) => (ToolExecutionStatus::StaleCapability, error.to_string()),
+                    Err(error) => (ToolExecutionStatus::Indeterminate, error),
+                };
+                if let Some(observation) = exact_call {
+                    observation.complete(status);
                 }
+                return self.finish(
+                    &command,
+                    &context,
+                    input_sha256,
+                    Some(descriptor),
+                    Some(decision),
+                    status,
+                    format!("Error: {error}"),
+                    None,
+                    Some(error),
+                    Some(preparation),
+                    started,
+                );
             }
         }
         // The resolved Arc is immutable for the in-flight call even if a

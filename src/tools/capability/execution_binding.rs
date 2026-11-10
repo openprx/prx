@@ -335,20 +335,6 @@ impl DecisionApprovalPort {
     ) -> anyhow::Result<ExecutionBinding> {
         self.0.issued_binding(public_name, scope, child_scope)
     }
-    pub(crate) async fn bind_call(
-        &self,
-        service: &ToolExecutionService,
-        scope: &RuntimeEnvelope,
-        descriptor: &ToolDescriptor,
-        command: &ToolExecutionCommand,
-        child_scope: Option<Arc<super::child::VerifiedChildScope>>,
-        schema_dialect: crate::tools::schema::ToolSchemaDialect,
-    ) -> anyhow::Result<VerifiedDecisionCall> {
-        self.0
-            .issued_binding(&descriptor.public_name, scope, child_scope)?
-            .bind_call(service, scope, descriptor, command, Some(self), schema_dialect)
-            .await
-    }
 }
 impl std::fmt::Debug for DecisionApprovalPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
