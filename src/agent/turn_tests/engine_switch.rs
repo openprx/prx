@@ -580,3 +580,126 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         .await;
     assert_eq!(outside.status, ToolExecutionStatus::StaleCapability);
 }
+
+/// Default engine-off surface: a Searchable tool is offered after
+/// `capability_search` and then dispatched.
+#[tokio::test]
+async fn default_config_discovered_tool_is_published_then_dispatched() {
+    let workspace = tempfile::tempdir().expect("discovered-tool workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    assert!(
+        !config.decision_engine.enabled,
+        "this cell runs with the decision engine off"
+    );
+    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
+    config.autonomy.level = crate::security::AutonomyLevel::Full;
+    config.tool_tiering.always_include.push("capability_search".into());
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
+        name: "discovered_probe".to_owned(),
+        execution_order: Arc::clone(&dispatches),
+    }) as Box<dyn Tool>]);
+    let admitted = AdmittedTurn::with_config(config, "find discovered_probe", Arc::clone(&registry)).await;
+    let decision = admitted.decision();
+    let context = decision
+        .service
+        .open_turn_context(
+            decision.proof,
+            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("disabled engine opens a turn context");
+    let opened = TurnDecision {
+        service: decision.service,
+        context: &context,
+        proof: decision.proof,
+    };
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let provider = EngineOffProvider {
+        published: Arc::clone(&published),
+        responses: Mutex::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "search-1".into(),
+                        name: "capability_search".into(),
+                        arguments: serde_json::json!({"query": "discovered_probe", "limit": 1}).to_string(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "discovered_probe".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]
+            .into(),
+        ),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("find discovered_probe")];
+    run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "wacli",
+            scope: None,
+            mode: ChatMode::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: opened,
+        },
+        TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: registry,
+            observer: &crate::observability::NoopObserver,
+            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(admitted.adapter()),
+            memory: admitted.memory_runtime(),
+        },
+        TurnDelivery {
+            cancellation: None,
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .expect("discovered-tool turn completes");
+    assert!(
+        published
+            .lock()
+            .expect("published tools")
+            .iter()
+            .any(|name| name == "discovered_probe"),
+        "discovered tool must be published after search: {:?}",
+        published.lock().expect("published tools")
+    );
+    assert_eq!(
+        *dispatches.lock().expect("dispatch log"),
+        vec!["discovered_probe".to_owned()],
+        "discovered tool must be dispatched"
+    );
+}

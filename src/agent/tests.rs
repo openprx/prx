@@ -810,13 +810,65 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
     Ok(())
 }
 
+struct SpawnSpyProvider {
+    offered: Arc<Mutex<Vec<String>>>,
+    responses: Mutex<Vec<ChatResponse>>,
+}
+
+#[async_trait]
+impl Provider for SpawnSpyProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> Result<String> {
+        anyhow::bail!("spawn spy uses the native tool loop")
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
+        if self.offered.lock().unwrap().is_empty() {
+            *self.offered.lock().unwrap() = request
+                .tools
+                .unwrap_or(&[])
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+        }
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            return Ok(text_response("spawned"));
+        }
+        Ok(responses.remove(0))
+    }
+}
+
 #[tokio::test]
-async fn r4_builtin_heavy_task_clarifies_without_sessions_spawn() {
-    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+async fn default_config_heavy_task_dispatches_sessions_spawn() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let provider = Box::new(FailingProvider);
+    let offered = Arc::new(Mutex::new(Vec::new()));
+    let provider = Box::new(SpawnSpyProvider {
+        offered: Arc::clone(&offered),
+        responses: Mutex::new(vec![
+            tool_response(vec![ToolCall {
+                id: "spawn-1".into(),
+                name: "sessions_spawn".into(),
+                arguments: r#"{"action":"spawn"}"#.into(),
+            }]),
+            text_response("spawned"),
+        ]),
+    });
     let (memory, workspace) = make_sqlite_memory();
-    let config = default_causal_runtime_config(workspace.path());
+    let mut config = default_causal_runtime_config(workspace.path());
+    config.tool_tiering.always_include.push("sessions_spawn".into());
     let mut agent = Agent::builder()
         .runtime_config(config, "ollama")
         .provider(provider)
@@ -824,26 +876,22 @@ async fn r4_builtin_heavy_task_clarifies_without_sessions_spawn() {
         .memory(memory)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .task_routing_config(TaskRoutingConfig {
-            default_intent: TaskRoutingIntentConfig::Simple,
-            rules: vec![TaskRoutingRule {
-                keywords: vec!["fix".into(), "deploy".into()],
-                intent: TaskRoutingIntentConfig::Delegate,
-                model_hint: None,
-                sub_agent_model: Some("prx-local-model".into()),
-                priority: 10,
-            }],
-        })
         .build()
         .unwrap();
-    let response = agent.turn("please fix this bug for me").await.unwrap();
-    assert_eq!(
-        response,
-        "Which result and supporting source should I use for this request?"
-    );
+    let _response = agent.turn("please fix this bug for me").await.unwrap();
     assert!(
-        calls.lock().unwrap().is_empty(),
-        "the builtin must not delegate below its bar"
+        offered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name == "sessions_spawn"),
+        "provider spy must see sessions_spawn in tools: {:?}",
+        offered.lock().unwrap()
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "MockSessionsSpawnTool must run once"
     );
 }
 

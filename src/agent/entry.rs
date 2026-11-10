@@ -2017,12 +2017,13 @@ pub(crate) async fn run_with_runtime_envelope(
                         super::scheduled_source::begin_decision()?;
                     }
                     let decision = service
-                        .decide_agent_initial(
+                        .open_issued_turn_context(
                             proof,
                             crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                             shutdown,
                         )
                         .await?;
+                    let advice = service.analyze_advisory(&decision, shutdown).await;
                     *decision_settlement.lock() = Some(service.terminal_settlement_ref(Arc::clone(&decision))?);
                     let cleanup_ticket = if scheduled_admission.is_some() {
                         scheduled_input_guard
@@ -2096,10 +2097,10 @@ pub(crate) async fn run_with_runtime_envelope(
                         }
                         return Ok::<(), anyhow::Error>(());
                     }
-                    (service, proof, decision, route_decision)
+                    (service, proof, decision, route_decision, advice)
                 };
 
-                let (decision_service, decision_proof, decision_context, route_decision) = &decision_turn;
+                let (decision_service, decision_proof, decision_context, route_decision, advice) = &decision_turn;
                 let decision_proof = *decision_proof;
                 let selected_skills = decision_service.agent_prompt_skills(decision_proof, decision_context)?;
                 let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
@@ -2182,7 +2183,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
-                                advice: None,
+                                advice: advice.clone(),
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),
@@ -2498,11 +2499,14 @@ pub(crate) async fn run_with_runtime_envelope(
                     fabric_scope = runtime_envelope
                         .message_scope()
                         .with_recipient(format!("{provider_name}/{model_name}"));
-                    let decision =
-                        match service
-                            .decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::Repl, shutdown)
-                            .await
-                        {
+                    let decision = match service
+                        .open_issued_turn_context(
+                            &proof,
+                            crate::runtime::turn_decision::AgentTurnKind::Repl,
+                            shutdown,
+                        )
+                        .await
+                    {
                             Ok(decision) => decision,
                             Err(error) => {
                                 admission_guard.finish_failure(
@@ -2513,6 +2517,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 return Err(anyhow::Error::from(error));
                             }
                         };
+                    let advice = service.analyze_advisory(&decision, shutdown).await;
                     let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
                     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
                         provider_name,
@@ -2580,6 +2585,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         route_decision,
                         terminal_guard,
                         retained_provider_trace,
+                        advice,
                     )
                 };
                 let (
@@ -2589,6 +2595,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     route_decision,
                     terminal_guard,
                     retained_provider_trace,
+                    advice,
                 ) = &decision_turn;
                 let decision_settlement = Some(decision_service.terminal_settlement_ref(Arc::clone(decision_context))?);
 
@@ -2653,7 +2660,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
-                                advice: None,
+                                advice: advice.clone(),
                                 channel_name: "cli",
                                 scope: None,
                                 mode: ChatMode::default(),

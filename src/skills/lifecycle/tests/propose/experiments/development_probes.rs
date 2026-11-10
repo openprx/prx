@@ -52,8 +52,7 @@ fn probe_plan(
 }
 
 #[tokio::test]
-async fn r4_builtin_skill_solver_cannot_read_its_instruction_file() -> Result<()> {
-    // pinned until P-DECISION-SCORER-01 recalibrates the builtin scorer
+async fn default_config_skill_solver_reads_its_instruction_file() -> Result<()> {
     let f = fixture();
     let pattern = usable_pattern(&f);
     let server = Server::start(false).await?;
@@ -62,22 +61,11 @@ async fn r4_builtin_skill_solver_cannot_read_its_instruction_file() -> Result<()
         let suite = suite(&f);
         let service = service(&f, &suite);
         let (plan, inputs) = probe_plan(&f, &service, &config, pattern.pattern_id)?;
-        let error = run_stage(&service, &config, &plan, "baseline-probe", &inputs["baseline-probe"])
-            .await
-            .expect_err("a solver without its required read must not qualify");
-        assert!(error.to_string().contains("physical usage is unresolved"), "{error:#}");
-        let journal = service.inspect_experiment(&plan.spec().id, plan.digest())?;
-        assert!(!journal.state.stages["baseline-probe"].successful());
-        // Unsettled physical usage retains the evidence without a Settled journal entry.
-        let receipt: DevelopmentProbeReceipt = serde_json::from_slice(&std::fs::read(
-            f.store
-                .root()
-                .join("experiment-evidence")
-                .join(plan.spec().id.as_str())
-                .join("baseline-probe.json"),
-        )?)?;
-        assert!(!receipt.complete());
-        assert!(receipt.cases.iter().all(|case| case.run.hydrations.is_empty()));
+        let journal = run_stage(&service, &config, &plan, "baseline-probe", &inputs["baseline-probe"]).await?;
+        assert!(
+            journal.state.stages["baseline-probe"].successful(),
+            "the stage qualifies when the solver can read its instruction file"
+        );
         let bodies = server.bodies.lock();
         let solver = bodies
             .iter()
@@ -91,16 +79,12 @@ async fn r4_builtin_skill_solver_cannot_read_its_instruction_file() -> Result<()
                     })
                 })
             })
-            .expect("the real builtin fallback Answer must reach the serving model");
+            .expect("the solver request must reach the serving model");
         assert!(
-            !solver["tools"].as_array().is_some_and(|tools| tools
+            solver["tools"].as_array().is_some_and(|tools| tools
                 .iter()
                 .any(|tool| tool["function"]["parameters"]["properties"]["name"]["const"] == "Deploy helper")),
-            "the fallback Answer cannot offer the instruction-read alias: {solver}"
-        );
-        assert!(
-            receipt.cases.iter().any(|case| !case.run.failure_detail.is_empty()),
-            "the scripted solver cannot complete its required instruction read"
+            "the solver body must offer the skill_read alias: {solver}"
         );
         Ok(())
     }

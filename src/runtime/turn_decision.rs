@@ -1049,9 +1049,10 @@ fn direct_answer_refs(
             let selected_discovery = !delegation
                 && matches!(entry.exposure, Exposure::Searchable)
                 && selected_discovery_refs.contains(&reference);
-            if (!directly_exposed && !exact_delegation && !selected_discovery)
-                || (delegation && decision.outgoing_child.is_none())
-            {
+            if !directly_exposed && !exact_delegation && !selected_discovery {
+                return None;
+            }
+            if delegation && decision.outgoing_child.is_none() && !directly_exposed {
                 return None;
             }
             if trusted.constraints.iter().any(|code| {

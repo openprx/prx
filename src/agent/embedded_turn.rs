@@ -273,7 +273,7 @@ async fn run_work(
             .await
     } else {
         service
-            .decide_agent_initial(
+            .open_issued_turn_context(
                 source.as_ref(),
                 crate::runtime::turn_decision::AgentTurnKind::Repl,
                 cancellation,
@@ -283,7 +283,7 @@ async fn run_work(
     };
     #[cfg(not(feature = "llm-router"))]
     let issued = service
-        .decide_agent_initial(
+        .open_issued_turn_context(
             source.as_ref(),
             crate::runtime::turn_decision::AgentTurnKind::Repl,
             cancellation,
@@ -582,7 +582,7 @@ async fn run_work(
         .run(crate::agent::turn_engine::run_turn(
             &mut history.wire,
             crate::agent::turn_request::TurnRequest {
-                advice: None,
+                advice: service.analyze_advisory(&decision, cancellation).await,
                 channel_name: "agent_api",
                 scope: None,
                 mode: crate::agent::turn_contracts::ChatMode::default(),

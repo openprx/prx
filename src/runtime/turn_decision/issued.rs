@@ -16,6 +16,16 @@ impl TurnDecisionService {
             .await
     }
 
+    pub(crate) async fn open_issued_turn_context(
+        &self,
+        proof: &dyn TurnSourceProof,
+        kind: super::AgentTurnKind,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        let opened = self.open_turn_context(proof, kind, cancellation).await?;
+        self.record_opened_context(proof, opened, cancellation).await
+    }
+
     pub(super) async fn record_issued_decision(
         &self,
         proof: &dyn TurnSourceProof,
