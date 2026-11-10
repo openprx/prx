@@ -7,7 +7,6 @@ use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskL
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
-use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::turn_source::TurnSourceProof;
 pub(crate) use crate::security::approval_ledger::pending::{
     DecisionApprovalReceipt, DecisionApprovalView, DecisionRevocationReceipt, PendingApprovalPage,
@@ -306,238 +305,6 @@ impl TurnDecisionService {
     }
 }
 
-/// The execution adapter owns only a reference to the issued turn. It cannot
-/// supply a new decision, operation set, actor or source event.
-pub(super) struct ExecutionApprovalRecorder {
-    pub(super) h2_origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
-    pub(super) service: Arc<TurnDecisionService>,
-    pub(super) context: Arc<TurnDecisionContext>,
-}
-
-#[async_trait::async_trait]
-impl crate::tools::capability::execution_binding::DecisionApprovalRecorder for ExecutionApprovalRecorder {
-    async fn file_operation(&self, tool: &str, path: &str) -> anyhow::Result<(String, RiskLevel)> {
-        use std::sync::atomic::Ordering;
-        anyhow::ensure!(
-            matches!(tool, "file_write" | "file_edit")
-                && self.context.service_id == self.service.service_id
-                && !self.context.execution_closed.load(Ordering::Acquire),
-            "file approval scope is unavailable"
-        );
-        let entry = self
-            .service
-            .catalog
-            .entry_for_public_name(tool)
-            .context("file capability missing")?;
-        anyhow::ensure!(
-            self.context
-                .execution_refs
-                .iter()
-                .any(|reference| reference.id == entry.id
-                    && reference.fingerprint == entry.fingerprint
-                    && reference.generation == entry.generation)
-                || self.context.discovery_admission(tool).is_some_and(|admission| {
-                    admission.reference.id == entry.id
-                        && admission.reference.fingerprint == entry.fingerprint
-                        && admission.reference.generation == entry.generation
-                }),
-            "file capability was not selected or admitted from discovery"
-        );
-        self.service.check_live_parity()?;
-        let operation = self
-            .service
-            .scoped_file_operation(self.context.owner_filesystem.as_ref(), tool, path)
-            .await?;
-        self.service.check_live_parity()?;
-        anyhow::ensure!(
-            !self.context.execution_closed.load(Ordering::Acquire),
-            "file approval turn closed"
-        );
-        Ok(operation)
-    }
-    async fn record(
-        &self,
-        call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
-    ) -> anyhow::Result<()> {
-        let Some((record, source)) = self
-            .service
-            .prepare_pending_execution_call(&self.context, call, self.h2_origin.as_deref())
-            .await?
-        else {
-            return Ok(());
-        };
-        let expires_at = record.expires_at;
-        self.service
-            .approval_ledger()
-            .persist_pending_record_receipt(record, &source)
-            .await?;
-        if let Some(owner) = self.context.recursive_allowance.get() {
-            owner.retain_pending(expires_at);
-        }
-        Ok(())
-    }
-    fn issued_binding(
-        &self,
-        public_name: &str,
-        scope: &RuntimeEnvelope,
-        child_scope: Option<Arc<crate::tools::capability::child::VerifiedChildScope>>,
-    ) -> anyhow::Result<crate::tools::capability::execution_binding::ExecutionBinding> {
-        let entry = self
-            .service
-            .catalog
-            .entry_for_public_name(public_name)
-            .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
-        let issued = crate::tools::capability::execution_binding::ExecutionBinding::issued(
-            self.context.decision_id(),
-            entry,
-            Arc::clone(&self.service.catalog),
-            scope.clone(),
-            public_name != "capability_search",
-        );
-        Ok(if public_name == "capability_search" {
-            issued.with_discovery_control_scope(child_scope)
-        } else {
-            issued.with_child_scope(child_scope)
-        })
-    }
-}
-
-impl TurnDecisionService {
-    async fn prepare_pending_execution_call(
-        &self,
-        context: &Arc<TurnDecisionContext>,
-        call: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
-        h2_origin: Option<&crate::runtime::h2_entry::VerifiedEntryOrigin>,
-    ) -> anyhow::Result<Option<(PendingRecord, MessageEvent)>> {
-        use std::sync::atomic::Ordering;
-        let trusted = context.engine.state.trusted.parts();
-        let scope = call.scope();
-        let resolved_owner = scope.resolved_owner_id();
-        anyhow::ensure!(
-            !context.execution_closed.load(Ordering::Acquire)
-                && context.execution_trace.get().is_some_and(|trace| !trace.is_sealed())
-                && call.binding().decision_id == context.decision_id().to_string()
-                && call.binding().catalog_generation == self.catalog.generation().0
-                && (context.execution_refs.contains(call.capability())
-                    || context.has_discovery_admission(call.capability()))
-                && trusted.workspace_id.as_ref() == scope.workspace_id
-                && trusted.owner_id.as_deref() == Some(resolved_owner.as_str())
-                && trusted.session_key.as_deref() == Some(scope.session_key.as_str())
-                && trusted.run_id.as_deref() == scope.run_id.as_deref()
-                && trusted.task_id.as_deref() == scope.task_id.as_deref()
-                && trusted.source_event_id.as_deref() == scope.source_message_event_id.as_deref()
-                && context.source_actor_matches(scope.channel.as_deref(), scope.sender.as_deref()),
-            "approval call differs from its active selected decision"
-        );
-        self.check_live_parity()?;
-        self.settlement_ref(Arc::clone(context))?
-            .validate_durable_chain()
-            .await?;
-        let entries = self.catalog.resolve(std::slice::from_ref(call.capability()))?;
-        let entry = entries.first().context("approval capability missing")?;
-        anyhow::ensure!(!call.operation().is_empty(), "approval operation scope missing");
-        let source_id = scope
-            .source_message_event_id
-            .as_deref()
-            .context("approval source missing")?;
-        let owner = resolved_owner.as_str();
-        let source = self
-            .memory
-            .find_owned_message_event(&scope.workspace_id, owner, source_id)
-            .await?
-            .context("approval source is not durable")?;
-        anyhow::ensure!(
-            source.role == "user"
-                && source.event_type == "message.created"
-                && source.session_key.as_deref() == Some(scope.session_key.as_str())
-                && source.run_id == scope.run_id
-                && crate::runtime::turn_source::subject_task_id(source.subject.as_ref()) == scope.task_id.as_deref()
-                && source.config_generation_id == scope.config_generation_id
-                && source.config_source_revision == scope.config_source_revision
-                && context.source_actor_matches(source.channel.as_deref(), source.sender.as_deref())
-                && crate::runtime::turn_source::recorded_input_matches(
-                    trusted.surface,
-                    &source,
-                    context.engine.state.routing_input.as_str()
-                ),
-            "approval call source differs from admitted input"
-        );
-        let key = format!("decision-approval:{}:pending", context.decision_id());
-        if self
-            .memory
-            .find_message_event_by_idempotency_key(&scope.workspace_id, &key)
-            .await?
-            .is_some()
-        {
-            let previous = self
-                .load_pending_decision_approval(owner, &scope.session_key, context.decision_id())
-                .await?;
-            anyhow::ensure!(
-                &previous.record().binding == call.binding(),
-                "decision already awaits a different call"
-            );
-            return Ok(None);
-        }
-        let store_workspace = self.store.workspace_id().context("approval store missing")?;
-        let decision_digests = self
-            .journal_decision_digests(
-                &store_workspace,
-                owner,
-                context.hop_ids(),
-                "approval decision is not durable",
-            )
-            .await?;
-        let channel = scope.channel.as_deref().context("approval channel missing")?;
-        let sender = scope.sender.as_deref().context("approval sender missing")?;
-        let principal = crate::memory::principal::OwnerPrincipal::new(
-            &scope.workspace_id,
-            channel,
-            sender,
-            &scope.session_key,
-            vec![crate::memory::principal::Role::Anonymous],
-        );
-        let mut record = PendingRecord {
-            h2_origin: h2_origin.map(|origin| Box::new(origin.record().clone())),
-            subject: Subject {
-                agent_id: format!("prx:agent:{channel}"),
-                principal_id: principal.principal_id,
-                owner_id: owner.to_owned(),
-                workspace_id: scope.workspace_id.clone(),
-                session_key: Some(scope.session_key.clone()),
-            },
-            binding: call.binding().clone(),
-            source_event_id: source.event_id.clone(),
-            source_mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"source", &serde_json::to_vec(&source)?]),
-            run_id: scope.run_id.clone().context("approval run missing")?,
-            decision_digests,
-            policy_version: self.policy_version.to_string(),
-            capabilities: vec![(
-                call.capability().id.as_str().to_owned(),
-                call.capability().fingerprint.0,
-                call.capability().generation.0,
-            )],
-            op_ids: vec![call.operation().to_owned()],
-            effect: entry.effect.as_str().to_owned(),
-            risk: Some(call.risk()),
-            schema_dialect: Some(call.schema_dialect()),
-            sealed_call: None,
-            expires_at: h2_origin.map_or_else(
-                || Utc::now() + chrono::Duration::minutes(5),
-                |origin| {
-                    origin
-                        .record()
-                        .authority_expires_at
-                        .min(Utc::now() + chrono::Duration::minutes(5))
-                },
-            ),
-        };
-        record.sealed_call = Some(self.seal_pending_call(&record, call.command())?);
-        Ok(Some((record, source)))
-    }
-}
-
 /// Source-authenticated, normalized original call, ready for a new constrained
 /// resume decision. This is deliberately not an executor permit.
 pub(super) struct PreparedDecisionResume {
@@ -554,7 +321,7 @@ impl TurnDecisionService {
         mut command: crate::tools::ToolExecutionCommand,
     ) -> anyhow::Result<PreparedDecisionResume> {
         use crate::security::approval_operation::{GrantOp, grant_op_for_call};
-        use crate::tools::capability::execution_binding::{CallDigestSource, decision_call_digest};
+        use crate::tools::capability::execution_binding::{CallDigestSource, admitted_call_digest};
         let approval = self
             .load_reviewed_decision_approval(owner, session, decision_id)
             .await?;
@@ -654,7 +421,7 @@ impl TurnDecisionService {
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        let digest = decision_call_digest(
+        let digest = admitted_call_digest(
             &record.binding.decision_id,
             &capability,
             CallDigestSource {

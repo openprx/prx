@@ -1,6 +1,6 @@
 //! Decision and terminal ownership for an admitted channel turn.
 use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalReceipt};
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService, TurnDisposition};
+use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
 use std::sync::Arc;
 
@@ -136,10 +136,7 @@ impl ChannelDecisionTurn {
             None,
         )?
         .with_provider_trace(Arc::clone(&trace), route.clone());
-        let recalled_context = if matches!(
-            context.disposition()?,
-            crate::runtime::turn_decision::TurnDisposition::Run
-        ) {
+        let recalled_context = if context.is_run()? {
             crate::agent::context_recall::scoped_recall(
                 turn_memory.as_ref(),
                 &crate::agent::context_recall::RecallScope::from_envelope(
@@ -257,10 +254,7 @@ impl ChannelDecisionTurn {
     }
 
     pub(super) fn close_reply(&self) -> anyhow::Result<Option<String>> {
-        Ok(match self.context.disposition()? {
-            TurnDisposition::Close { reply } => Some(reply.into_owned()),
-            TurnDisposition::Run => None,
-        })
+        Ok(self.context.close_reply()?.map(|reply| reply.into_owned()))
     }
 
     pub(super) async fn close(

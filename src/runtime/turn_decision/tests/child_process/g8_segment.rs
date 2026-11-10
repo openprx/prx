@@ -637,7 +637,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         let child_proof = Arc::new(binding.source_proof(&grant, &receipt, &child_provider)?);
         let execution_context = receipt.execution_context(&child_proof)?;
         // Adapter-produced context: no bindings, surface or decision context.
-        assert!(execution_context.execution_bindings.is_none() && execution_context.turn_surface.is_none());
+        assert!(execution_context.admitted_binding.is_none() && execution_context.turn_surface.is_none());
         assert!(execution_context.child_scope.is_some() && execution_context.child_pin.is_some());
         let mut unscoped = execution_context.clone();
         unscoped.child_scope = None;

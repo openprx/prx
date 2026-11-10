@@ -4,7 +4,7 @@ use super::pending::scope_from_source;
 use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, RiskLevel, Subject, WitnessKeyring};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MemoryFabric, MessageEvent};
-use crate::tools::capability::execution_binding::{CallDigestSource, decision_call_digest};
+use crate::tools::capability::execution_binding::{CallDigestSource, admitted_call_digest};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ impl RunCallAuthority {
             .context("approval run missing")?
             .to_owned();
         let argument_hash = serde_json::json!(hex::encode(Sha256::digest(serde_json::to_vec(arguments)?)));
-        let bound_call = decision_call_digest("", capability, source, &argument_hash, operation, risk)?;
+        let bound_call = admitted_call_digest("", capability, source, &argument_hash, operation, risk)?;
         let mut digest = Sha256::new();
         digest.update(b"prx.call.approval.v1");
         digest.update(bound_call);

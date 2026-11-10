@@ -1364,6 +1364,42 @@ impl TurnDecisionContext {
             _ => Err(DirectiveError::ActionMismatch),
         }
     }
+
+    pub(crate) fn close_reply(&self) -> Result<Option<std::borrow::Cow<'static, str>>, DirectiveError> {
+        match self.disposition()? {
+            TurnDisposition::Close { reply } => Ok(Some(reply)),
+            TurnDisposition::Run => Ok(None),
+        }
+    }
+
+    pub(crate) fn is_run(&self) -> Result<bool, DirectiveError> {
+        Ok(matches!(self.disposition()?, TurnDisposition::Run))
+    }
+
+    pub(crate) fn pending_approval_id(&self) -> Option<DecisionId> {
+        matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
+    }
+
+    pub(crate) fn diagnostic_directive_kind(&self) -> (&'static str, String) {
+        match &self.directive {
+            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.clone()),
+            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.clone()),
+            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable".to_owned()),
+            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable".to_owned()),
+            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable".to_owned()),
+            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable".to_owned()),
+            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable".to_owned()),
+            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable".to_owned()),
+            TurnExecutionDirective::CollectApprovalArguments(_) => {
+                ("CollectApprovalArguments", "not_applicable".to_owned())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn carries_collect_directive_for_test(&self) -> bool {
+        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments(_))
+    }
 }
 
 /// Whether a finished memory read lets the turn answer: new evidence always

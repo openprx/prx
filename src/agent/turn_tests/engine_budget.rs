@@ -304,10 +304,7 @@ async fn small_native_schema_fixture(excluded: bool) {
                         .is_empty()
                 );
                 assert!(decision.context.execution_refs().is_empty());
-                assert!(matches!(
-                    decision.context.disposition().unwrap(),
-                    crate::runtime::turn_decision::TurnDisposition::Run
-                ));
+                assert!(decision.context.is_run().unwrap());
             } else {
                 let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
                     "selection":format!("{:?}", hop.selection),
@@ -529,10 +526,7 @@ async fn configured_small_native_schema_fixture() {
                             .agent_execution_specs(decision.proof, decision.context)
                             .is_err()
                     );
-                    assert!(matches!(
-                        decision.context.disposition().unwrap(),
-                        crate::runtime::turn_decision::TurnDisposition::Close { .. }
-                    ));
+                    assert!(!decision.context.is_run().unwrap());
                 } else {
                     let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
                     "selection":format!("{:?}", hop.selection),

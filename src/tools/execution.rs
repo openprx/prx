@@ -558,12 +558,10 @@ pub struct ToolExecutionContext {
     /// durable pending decision exists. Set for targeted agent turns, which
     /// have no resumable approval until MA-04.
     pub(crate) pending_approval_denied: bool,
-    pub(crate) decision_approval: Option<super::capability::execution_binding::DecisionApprovalPort>,
     pub(crate) execution_trace: Option<super::capability::execution_trace::ExecutionTrace>,
-    /// None is retained for non-model service callers. A constrained model
-    /// request carries even an empty map, so absence cannot widen its surface.
-    pub(crate) execution_bindings:
-        Option<Arc<std::collections::BTreeMap<String, super::capability::execution_binding::ExecutionBinding>>>,
+    /// Admission-time pin for MCP schema-drift (gateway compat). Agent turns
+    /// leave this empty; H2 uses `verify_admitted_call` against the service catalog.
+    pub(crate) admitted_binding: Option<super::capability::execution_binding::ExecutionBinding>,
     pub envelope: RuntimeEnvelope,
     pub chat_type: String,
     pub chat_id: String,
@@ -637,10 +635,9 @@ impl ToolExecutionContext {
             child_scope: None,
             child_pin: None,
             call_budget: None,
-            decision_approval: None,
             decision_resume: None,
             pending_approval_denied: false,
-            execution_bindings: None,
+            admitted_binding: None,
             execution_trace: None,
             envelope,
             chat_type: chat_type.into(),
@@ -1227,7 +1224,6 @@ pub struct ToolApprovalRequest {
     pub command: ToolExecutionCommand,
     pub descriptor: ToolDescriptor,
     pub context: ToolExecutionContext,
-    pub(crate) decision_call: Option<super::capability::execution_binding::VerifiedDecisionCall>,
 }
 
 /// Approval result. Runtime-only grant material is never accepted from the
@@ -1841,6 +1837,12 @@ impl ToolExecutionService {
     #[must_use]
     pub fn current_descriptor(&self, public_name: &str) -> Option<ToolDescriptor> {
         self.resolve(public_name).map(|resolved| resolved.descriptor)
+    }
+
+    /// Snapshot taken when the service was built; schema drift compares this
+    /// to the live descriptor.
+    pub(crate) fn admitted_descriptor(&self, public_name: &str) -> Option<&ToolDescriptor> {
+        self.catalog.descriptor(public_name)
     }
 
     pub(crate) fn current_descriptor_with_binding(
@@ -2500,26 +2502,7 @@ impl ToolExecutionService {
         cancellation: Option<CancellationToken>,
     ) -> ToolExecutionOutcome {
         let pending = context.execution_trace.as_ref().map(|trace| {
-            let map_binding = context
-                .execution_bindings
-                .as_ref()
-                .and_then(|bindings| bindings.get(&command.name));
-            let port_binding = if map_binding.is_some() {
-                None
-            } else {
-                context.decision_approval.as_ref().and_then(|port| {
-                    port.issued_binding(&command.name, &context.envelope, context.child_scope.clone())
-                        .inspect_err(|e| {
-                            tracing::warn!(
-                                error = %e,
-                                tool = %command.name,
-                                "trace binding lookup failed"
-                            );
-                        })
-                        .ok()
-                })
-            };
-            let binding = map_binding.or(port_binding.as_ref());
+            let binding = context.admitted_binding.as_ref();
             trace.begin(
                 &command.operation_id,
                 binding.map(|binding| binding.capability_id()),
@@ -2648,10 +2631,9 @@ impl ToolExecutionService {
             }
         }
 
-        if let Some(bindings) = &context.execution_bindings {
-            let verified = bindings
-                .get(&command.name)
-                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+        if let Some(binding) = &context.admitted_binding {
+            let verified = (context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .then_some(binding)
                 .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
                 .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
             if let Err(error) = verified {
@@ -2772,21 +2754,9 @@ impl ToolExecutionService {
                 .h2_origin()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("experiment action has no actual controlled source"))?;
-            let binding = context
-                .execution_bindings
-                .as_ref()
-                .and_then(|bindings| bindings.get(&command.name))
-                .ok_or_else(|| anyhow::anyhow!("experiment action has no exact execution binding"))?;
-            let verified = binding
-                .bind_call(
-                    self,
-                    &context.envelope,
-                    &descriptor,
-                    &command,
-                    context.decision_approval.as_ref(),
-                    context.schema_dialect,
-                )
-                .await?;
+            let verified = self
+                .verify_admitted_call(&context.envelope, &descriptor, &command)
+                .map_err(|_| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
             // Only execution after the original approval can consume this port.
             // The initial pending call still needs to be recorded first.
             if context.decision_resume.is_none()
@@ -2830,14 +2800,10 @@ impl ToolExecutionService {
         // needs a human approval at every autonomy level, also where policy
         // would allow it. Deny stays Deny.
         let decision = if decision != ToolExecutionDecision::Deny
-            && (crate::security::approval_operation::requires_explicit_grant(
+            && crate::security::approval_operation::requires_explicit_grant(
                 &descriptor.public_name,
                 &command.arguments,
-            ) || context
-                .execution_bindings
-                .as_ref()
-                .and_then(|bindings| bindings.get(&command.name))
-                .is_some_and(|binding| binding.requires_approval()))
+            )
         {
             ToolExecutionDecision::Ask
         } else {
@@ -2962,83 +2928,11 @@ impl ToolExecutionService {
             }
             runtime_approval_granted = true;
         } else if decision == ToolExecutionDecision::Ask && context.decision_resume.is_none() {
-            let decision_call = match async {
-                let Some(bindings) = context.execution_bindings.as_ref() else {
-                    return Ok(None);
-                };
-                let binding = bindings
-                    .get(&command.name)
-                    .ok_or_else(|| anyhow::anyhow!("approval execution binding missing"))?;
-                binding
-                    .bind_call(
-                        self,
-                        &context.envelope,
-                        &descriptor,
-                        &command,
-                        context.decision_approval.as_ref(),
-                        context.schema_dialect,
-                    )
-                    .await
-                    .map(Some)
-            }
-            .await
-            {
-                Ok(call) => call,
-                Err(error) => {
-                    let error = error.to_string();
-                    return self.finish(
-                        &command,
-                        &context,
-                        input_sha256,
-                        Some(descriptor),
-                        Some(decision),
-                        ToolExecutionStatus::StaleCapability,
-                        format!("Error: {error}"),
-                        None,
-                        Some(error),
-                        None,
-                        started,
-                    );
-                }
-            };
-            if let Some(call) = &decision_call {
-                let pending = match &context.decision_approval {
-                    Some(port) => port.record(call).await,
-                    None => Err(anyhow::anyhow!("decision approval persistence unavailable")),
-                };
-                let (status, reason) = match pending {
-                    Ok(()) => (
-                        ToolExecutionStatus::AwaitingApproval,
-                        format!(
-                            "Approval is required for decision {}. The operation has not run.",
-                            call.binding().decision_id
-                        ),
-                    ),
-                    Err(error) => (
-                        ToolExecutionStatus::ApprovalDenied,
-                        format!("decision approval unavailable: {error}"),
-                    ),
-                };
-                return self.finish(
-                    &command,
-                    &context,
-                    input_sha256,
-                    Some(descriptor),
-                    Some(decision),
-                    status,
-                    reason.clone(),
-                    None,
-                    (status != ToolExecutionStatus::AwaitingApproval).then_some(reason),
-                    None,
-                    started,
-                );
-            }
             let (approval, ledger_route) = self
                 .resolve_ordinary_approval(ToolApprovalRequest {
                     command: command.clone(),
                     descriptor: descriptor.clone(),
                     context: context.clone(),
-                    decision_call,
                 })
                 .await;
             match approval {
@@ -3312,10 +3206,9 @@ impl ToolExecutionService {
                 started,
             );
         }
-        if let Some(bindings) = &context.execution_bindings {
-            let verified = bindings
-                .get(&command.name)
-                .filter(|_| context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+        if let Some(binding) = &context.admitted_binding {
+            let verified = (context.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()))
+                .then_some(binding)
                 .ok_or(super::capability::execution_binding::ToolExecutionError::StaleCapability)
                 .and_then(|binding| binding.verify_admitted_descriptor(self, &context.envelope, &descriptor));
             if let Err(error) = verified {
@@ -3378,10 +3271,7 @@ impl ToolExecutionService {
                         },
                         super::capability::execution_binding::scope_dispatch_binding(
                             if backend.root_name() == "mcp_call" {
-                                context
-                                    .execution_bindings
-                                    .as_ref()
-                                    .and_then(|bindings| bindings.get(&command.name))
+                                context.admitted_binding.as_ref()
                             } else {
                                 None
                             },

@@ -20,7 +20,7 @@ fn surface_context(
         channel,
         |_| eligible,
     )));
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     context
 }
 

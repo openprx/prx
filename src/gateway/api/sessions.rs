@@ -2322,8 +2322,8 @@ async fn run_console_message_job_work(
         terminal_guard
     };
     let work = async {
-        match decision.context.disposition().map_err(|error| error.to_string())? {
-            crate::runtime::turn_decision::TurnDisposition::Close { reply } => {
+        match decision.context.close_reply().map_err(|error| error.to_string())? {
+            Some(reply) => {
                 let ports = crate::gateway::decision_runtime::GatewayDecisionClose {
                     resource: "gateway_api:sessions:assistant_message",
                     history_commit_len: turns.len() + 2,
@@ -2361,7 +2361,7 @@ async fn run_console_message_job_work(
                     serde_json::json!({ "status": "ok", "reply": reply }),
                 ));
             }
-            crate::runtime::turn_decision::TurnDisposition::Run => {}
+            None => {}
         }
         if mode == ConsoleTurnMode::Resume {
             crate::gateway::authorize_gateway_config_resource_mutation(

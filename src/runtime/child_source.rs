@@ -1397,7 +1397,7 @@ impl ChildProviderBinding {
                     );
                 }
                 None => anyhow::ensure!(
-                    caller.context().execution_bindings.is_none(),
+                    caller.context().admitted_binding.is_none(),
                     "ordinary model child has no issued publication snapshot"
                 ),
             }

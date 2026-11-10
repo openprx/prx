@@ -210,7 +210,7 @@ async fn model_without_native_tools_gets_no_tool_surface() {
         "private",
     )
     .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn);
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     context.turn_surface = Some(Arc::new(surface));
     let outcome = service
         .execute(

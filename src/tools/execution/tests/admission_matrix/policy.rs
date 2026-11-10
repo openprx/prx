@@ -59,7 +59,7 @@ async fn supervised_ask_without_resolver_is_denied_not_executed() {
     let service = autonomy_service(&fixture, "config_reload", AutonomyLevel::Supervised);
     let context = context();
     assert!(context.approval_ledger.is_none());
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     let outcome = service.execute(command(1), context, None).await;
     assert_eq!(outcome.decision, Some(ToolExecutionDecision::Ask));
     assert_eq!(outcome.status, ToolExecutionStatus::ApprovalDenied);
@@ -82,7 +82,7 @@ async fn child_call_ask_binds_to_child_context() {
         .await
         .unwrap();
     child.envelope.source_message_event_id = Some(source.event_id.clone());
-    assert!(child.execution_bindings.is_none());
+    assert!(child.admitted_binding.is_none());
     let fixture = fixture();
     let service = autonomy_service(&fixture, "config_reload", AutonomyLevel::Supervised);
     assert_eq!(
@@ -148,7 +148,7 @@ async fn child_call_ask_binds_to_child_context() {
 async fn full_mode_executes_non_read_only_without_approval() {
     let path = tempfile::tempdir().unwrap();
     let context = ledger_context(path.path()).await;
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     for (name, args) in non_read_only_calls() {
         let fixture = fixture();
         let service = autonomy_service(&fixture, name, AutonomyLevel::Full);
@@ -171,7 +171,7 @@ async fn full_mode_executes_non_read_only_without_approval() {
 async fn explicit_grant_call_asks_in_full_mode() {
     let path = tempfile::tempdir().unwrap();
     let mut context = ledger_context(path.path()).await;
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     let fixture = fixture();
     let tool = RecordingTool {
         root_name: "skills_manage",
@@ -220,7 +220,7 @@ async fn explicit_grant_call_asks_in_full_mode() {
 async fn policy_deny_refused_without_backend_call() {
     let path = tempfile::tempdir().unwrap();
     let context = ledger_context(path.path()).await;
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     for (name, args) in [
         (
             "file_write",
@@ -258,7 +258,7 @@ async fn policy_deny_refused_without_backend_call() {
 async fn readonly_autonomy_denies_every_non_read_only_class() {
     let path = tempfile::tempdir().unwrap();
     let context = ledger_context(path.path()).await;
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     for (name, args) in non_read_only_calls() {
         let fixture = fixture();
         let service = autonomy_service(&fixture, name, AutonomyLevel::ReadOnly);

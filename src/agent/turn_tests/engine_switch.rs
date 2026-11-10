@@ -383,7 +383,7 @@ impl Provider for CollectIgnoreProvider {
 
 /// A Collect directive in the opened context does not take the collection
 /// path: the provider is called once and no collection lease starts.
-/// Re-inserting `context.disposition()?` Collect at `run_turn` start fails this cell.
+/// Re-inserting a Collect match at `run_turn` start fails this cell.
 #[tokio::test]
 async fn run_turn_ignores_recorded_collect_directive() {
     let workspace = tempfile::tempdir().expect("collect-ignore workspace");
@@ -429,10 +429,7 @@ async fn run_turn_ignores_recorded_collect_directive() {
             ),
         );
     assert!(
-        matches!(
-            context.directive(),
-            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_)
-        ),
+        context.carries_collect_directive_for_test(),
         "the fixture must carry a Collect directive"
     );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

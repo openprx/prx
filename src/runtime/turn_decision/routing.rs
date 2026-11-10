@@ -185,37 +185,6 @@ pub(crate) async fn commit_training_owned(
 }
 
 impl TurnDecisionService {
-    pub(crate) async fn decide_embedded_router_initial(
-        &self,
-        source: Arc<EmbeddedAgentSource>,
-        router: &crate::router::RouterEngine,
-        cancellation: &CancellationToken,
-    ) -> Result<
-        (
-            Arc<TurnDecisionContext>,
-            Arc<EmbeddedAgentSource>,
-            Option<RouterEmbedding>,
-        ),
-        AgentDecisionError,
-    > {
-        let mut continuation = RouterContinuation::new(router, Arc::clone(&source));
-        let context = self
-            .decide_agent_initial_inner(
-                source.as_ref(),
-                AgentTurnKind::Repl,
-                cancellation,
-                None,
-                None,
-                Some(&mut continuation),
-            )
-            .await?;
-        let (admitted, embedding) = continuation.finish();
-        let context = self
-            .record_issued_decision(admitted.as_ref(), context, cancellation)
-            .await?;
-        Ok((context, admitted, embedding))
-    }
-
     /// An independent durable first row makes a forced drop after a read
     /// observable without inventing a terminal or resetting the decision.
     async fn persist_router_read_owned(

@@ -2061,7 +2061,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     terminal_guard
                         .set(guard)
                         .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
-                    if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
+                    if let Some(reply) = decision.close_reply()? {
                         let ports = CliDecisionClose {
                             terminal_guard: terminal_guard.get(),
                             service,
@@ -2534,7 +2534,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                     )?
                     .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
-                    if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
+                    if let Some(reply) = decision.close_reply()? {
                         if history.is_empty() {
                             history.push(ChatMessage::system(""));
                         }

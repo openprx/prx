@@ -197,13 +197,6 @@ impl AgentToolApprovalStrategy {
 #[async_trait::async_trait]
 impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
     async fn resolve(&self, request: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision {
-        if request.decision_call.is_some() {
-            // A generic tool approval must not erase the pinned decision/call
-            // scope. The durable decision resume adapter owns this transition.
-            return crate::tools::ToolApprovalDecision::Denied {
-                reason: "decision-bound approval requires durable review and resume".to_owned(),
-            };
-        }
         let Some(manager) = self.manager.as_ref() else {
             return crate::tools::ToolApprovalDecision::Denied {
                 reason: "approval required but no approval resolver is available".to_string(),

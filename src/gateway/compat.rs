@@ -554,10 +554,7 @@ fn bind_mcp_execution_context(
         context.envelope.clone(),
         true,
     );
-    context.execution_bindings = Some(Arc::new(std::collections::BTreeMap::from([(
-        tool_name.to_string(),
-        binding,
-    )])));
+    context.admitted_binding = Some(binding);
     context.execution_trace = Some(crate::tools::capability::execution_trace::ExecutionTrace::default());
     Ok(context)
 }

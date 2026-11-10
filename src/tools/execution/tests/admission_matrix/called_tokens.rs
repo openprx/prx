@@ -10,7 +10,7 @@ const CONFIG_RELOAD: &str = "config_reload";
 fn budget_context(budget: CallTokenBudget) -> ToolExecutionContext {
     let mut context = context();
     context.call_budget = Some(budget);
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     assert!(context.turn_surface.is_none());
     context
 }

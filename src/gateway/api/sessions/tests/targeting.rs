@@ -781,10 +781,7 @@ async fn drive(
                         .await
                         .expect("test: decision");
                     assert!(
-                        matches!(
-                            context.disposition(),
-                            Ok(crate::runtime::turn_decision::TurnDisposition::Run)
-                        ),
+                        context.is_run().expect("test: admitted turn"),
                         "the turn must reach the tool loop, not collection or a direct reply"
                     );
                     let decision = ConsoleDecisionTurn {

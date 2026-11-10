@@ -2703,7 +2703,7 @@ async fn run_gateway_chat_with_multimodal(
     )?;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
-            if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = context.disposition()? {
+            if let Some(reply) = context.close_reply()? {
                 let ports = decision_runtime::GatewayDecisionClose {
                     resource: "gateway:webhook:message_event:assistant",
                     history_commit_len: 2,

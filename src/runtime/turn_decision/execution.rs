@@ -469,7 +469,6 @@ impl TurnDecisionService {
         let (service, mut execution_context) =
             self.bind_execution(proof, context, execution_context, &selected.specs)?;
         execution_context.schema_dialect = dialect;
-        execution_context.decision_approval = None;
         execution_context.set_h2_origin(proof.h2_entry_origin().cloned());
         execution_context.set_h2_review(self.resume_local_owner_review(context, proof)?);
         execution_context.decision_resume = Some(crate::tools::capability::execution_binding::DecisionResumePort::new(
@@ -537,7 +536,6 @@ impl TurnDecisionService {
                 && envelope.config_source_revision.as_deref() == Some(proof.config_source_revision()),
             "execution scope differs from the authenticated decision source"
         );
-        let mut bindings = BTreeMap::new();
         for spec in specs {
             let discovered = context.discovery_admission(&spec.name);
             let expected = if let Some(selected) = selected.specs.iter().find(|item| item.name == spec.name) {
@@ -568,27 +566,6 @@ impl TurnDecisionService {
                     && spec.description == expected.description
                     && spec.parameters == expected.parameters,
                 "execution schema differs from the admitted definition"
-            );
-            let entry = self
-                .catalog
-                .entry_for_public_name(&spec.name)
-                .context("execution binding has no catalog entry")?;
-            let binding = crate::tools::capability::execution_binding::ExecutionBinding::issued(
-                context.decision_id(),
-                entry,
-                Arc::clone(&self.catalog),
-                envelope.clone(),
-                selected.specs.iter().any(|item| item.name == spec.name) || discovered.is_some(),
-            )
-            .with_required_approval(discovered.as_ref().is_some_and(|admission| admission.requires_approval));
-            let binding = if spec.name == "capability_search" {
-                binding.with_discovery_control_scope(proof.child_scope().cloned())
-            } else {
-                binding.with_child_scope(proof.child_scope().cloned())
-            };
-            anyhow::ensure!(
-                bindings.insert(spec.name.clone(), binding).is_none(),
-                "duplicate execution binding"
             );
         }
         self.verify_console_filesystem_context(proof, context)?;
@@ -665,15 +642,6 @@ impl TurnDecisionService {
             None
         };
         execution_context.decision_resume = None;
-        execution_context.execution_bindings = Some(Arc::new(bindings));
-        execution_context.decision_approval =
-            Some(crate::tools::capability::execution_binding::DecisionApprovalPort::new(
-                Arc::new(super::pending_approval::ExecutionApprovalRecorder {
-                    h2_origin: proof.h2_entry_origin().cloned(),
-                    service: Arc::clone(self),
-                    context: Arc::clone(context),
-                }),
-            ));
         let trace = context.execution_trace.get_or_init(Default::default);
         trace.bind_exact_call_key(Arc::clone(&self.state_key))?;
         execution_context.execution_trace = Some(trace.clone());

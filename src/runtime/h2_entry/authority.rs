@@ -109,7 +109,7 @@ impl EntryInvocation {
     }
     pub(crate) fn from_verified(
         origin: Arc<VerifiedEntryOrigin>,
-        verified: &crate::tools::capability::execution_binding::VerifiedDecisionCall,
+        verified: &crate::tools::capability::execution_binding::VerifiedExecutionCall,
         local_review: Option<LocalOwnerReview>,
     ) -> Result<Arc<Self>> {
         let command = verified.command();
@@ -126,10 +126,10 @@ impl EntryInvocation {
             action,
             tool: command.name.clone(),
             args_sha256: arguments_digest(&command.arguments)?,
-            call_digest: hex::encode(verified.binding().call_digest),
+            call_digest: hex::encode(verified.call_digest()),
             capability: verified.capability().id.as_str().into(),
             capability_generation: hex::encode(verified.capability().generation.0),
-            catalog_generation: hex::encode(verified.binding().catalog_generation),
+            catalog_generation: hex::encode(verified.catalog_generation()),
             actor: scope.resolved_owner_id(),
             workspace: scope.workspace_id.clone(),
             session: scope.session_key.clone(),

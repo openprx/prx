@@ -6,7 +6,7 @@ use crate::agent::terminal::{
 };
 use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopOutcome, ToolLoopRuntimeAdapter};
 use crate::providers::{ChatMessage, ConversationMessage};
-use crate::runtime::turn_decision::{CloseTurnPorts, TurnDecisionContext, TurnDecisionService, TurnDisposition};
+use crate::runtime::turn_decision::{CloseTurnPorts, TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::runtime::turn_terminal::TurnTerminalGuard;
 use anyhow::Context;
@@ -267,20 +267,14 @@ async fn run_work(
     };
     let started_at = chrono::Utc::now();
     #[cfg(feature = "llm-router")]
-    let issued = if let Some(router) = agent.router.as_ref().filter(|_| history_route) {
-        service
-            .decide_embedded_router_initial(source, router, cancellation)
-            .await
-    } else {
-        service
-            .open_issued_turn_context(
-                source.as_ref(),
-                crate::runtime::turn_decision::AgentTurnKind::Repl,
-                cancellation,
-            )
-            .await
-            .map(|decision| (decision, source, None))
-    };
+    let issued = service
+        .open_issued_turn_context(
+            source.as_ref(),
+            crate::runtime::turn_decision::AgentTurnKind::Repl,
+            cancellation,
+        )
+        .await
+        .map(|decision| (decision, source, None));
     #[cfg(not(feature = "llm-router"))]
     let issued = service
         .open_issued_turn_context(
@@ -335,7 +329,7 @@ async fn run_work(
         // errors that may contain the private content being saved.
         tracing::warn!("embedded Agent user memory promotion failed");
     }
-    if let TurnDisposition::Close { reply } = decision.disposition()? {
+    if let Some(reply) = decision.close_reply()? {
         let reply = reply.into_owned();
         // A fixed close adds the raw user input and the final reply after
         // durable terminal commit; record that projected final length.

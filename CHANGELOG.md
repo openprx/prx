@@ -123,10 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures instead of 200 with empty or partial results. `POST /api/skills/install`
   installs disabled and returns `skill.enabled`.
 
-- **Known behaviour:** with the default builtin decision plane, named-tool chat
-  turns, heavy-task delegation to `sessions_spawn`, discovered tools, and skill
-  experiment instruction reads fall back to Answer or Clarify without tool
-  execution. `P-DECISION-SCORER-01` tracks builtin scorer recalibration.
+- **BREAKING (operators):** the decision plane no longer gates execution. The
+  decision engine is off by default. `[causal_tree]` backend keys are read as
+  fallback by `[decision_engine]`. G6's grouped native-file token-sum predicate
+  is retired; per-call token admission enforces the called tool's own estimate.
 
 - Honor exact approved decision resumes, close expired or text-less decisions locally, and keep confidence fallback answers free of tool execution authority.
 

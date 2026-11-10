@@ -263,7 +263,7 @@ async fn channel_force_ask_precedes_ledger_and_effective_full_skips_it() {
 async fn supervised_every_non_read_only_class_waits() {
     let path = tempfile::tempdir().unwrap();
     let context = ledger_context(path.path()).await;
-    assert!(context.execution_bindings.is_none());
+    assert!(context.admitted_binding.is_none());
     let calls = [
         (
             "file_write",
@@ -967,7 +967,7 @@ async fn spawn_without_parent_authority_is_refused() {
     let operator = crate::chat::dispatcher::chat_tool_execution_context(&policy, None, None, "operator-control");
     assert!(operator.is_local_operator());
     assert!(operator.child_scope.is_none() && operator.child_pin.is_none() && operator.child_grant.is_none());
-    assert!(operator.execution_bindings.is_none() && operator.turn_surface.is_none());
+    assert!(operator.admitted_binding.is_none() && operator.turn_surface.is_none());
     for (index, name) in ["delegate", "sessions_spawn"].into_iter().enumerate() {
         assert_eq!(
             case.call(name, operator.clone()).await,

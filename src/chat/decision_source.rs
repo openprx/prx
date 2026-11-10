@@ -675,12 +675,7 @@ impl ChatTurnBinding {
         Ok(outcome)
     }
     pub(super) fn pending_decision_id(&self) -> Option<crate::causal_tree::ids::DecisionId> {
-        let decided = self.decision.get()?;
-        matches!(
-            decided.context.directive(),
-            crate::causal_tree::directive::TurnExecutionDirective::RequestApproval { .. }
-        )
-        .then(|| decided.context.decision_id())
+        self.decision.get()?.context.pending_approval_id()
     }
 
     pub(super) fn is_decided(&self) -> bool {
@@ -919,10 +914,7 @@ impl ChatTurnBinding {
         let Some(decided) = self.decision.get() else {
             return Ok(None);
         };
-        match decided.context.disposition()? {
-            crate::runtime::turn_decision::TurnDisposition::Close { reply } => Ok(Some(reply.into_owned())),
-            crate::runtime::turn_decision::TurnDisposition::Run => Ok(None),
-        }
+        Ok(decided.context.close_reply()?.map(|reply| reply.into_owned()))
     }
 
     pub(super) fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
@@ -1490,19 +1482,8 @@ pub(crate) mod admission_failure_tests {
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let context = binding.decide(&service, &cancellation).await?;
-        use crate::causal_tree::directive::TurnExecutionDirective;
-        let (directive, reason) = match context.directive() {
-            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
-            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.as_str()),
-            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
-            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
-            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),
-            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable"),
-            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable"),
-            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable"),
-            TurnExecutionDirective::CollectApprovalArguments(_) => ("CollectApprovalArguments", "not_applicable"),
-        };
-        let reason = match reason {
+        let (directive, reason) = context.diagnostic_directive_kind();
+        let reason = match reason.as_str() {
             "insufficient_evidence"
             | "commit_threshold_or_margin"
             | "no_legal_path"
@@ -1511,7 +1492,7 @@ pub(crate) mod admission_failure_tests {
             | "choice_outside_legal_set"
             | "approval_only"
             | "deadline_exceeded"
-            | "not_applicable" => reason,
+            | "not_applicable" => reason.as_str(),
             _ => "unclassified",
         };
         eprintln!("PRX_Q47_PARENT_ADMISSION directive={directive} reason_code={reason}");
@@ -1616,19 +1597,8 @@ pub(crate) mod admission_failure_tests {
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let context = binding.decide(&service, &cancellation).await?;
-        use crate::causal_tree::directive::TurnExecutionDirective;
-        let (directive, reason) = match context.directive() {
-            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.as_str()),
-            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.as_str()),
-            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable"),
-            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable"),
-            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable"),
-            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable"),
-            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable"),
-            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable"),
-            TurnExecutionDirective::CollectApprovalArguments(_) => ("CollectApprovalArguments", "not_applicable"),
-        };
-        let reason = match reason {
+        let (directive, reason) = context.diagnostic_directive_kind();
+        let reason = match reason.as_str() {
             "insufficient_evidence"
             | "commit_threshold_or_margin"
             | "no_legal_path"
@@ -1637,7 +1607,7 @@ pub(crate) mod admission_failure_tests {
             | "choice_outside_legal_set"
             | "approval_only"
             | "deadline_exceeded"
-            | "not_applicable" => reason,
+            | "not_applicable" => reason.as_str(),
             _ => "unclassified",
         };
         let specs = service
