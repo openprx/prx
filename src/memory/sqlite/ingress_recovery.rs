@@ -18,9 +18,29 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandlerFailStage {
+    BeforeBusy,
+    AfterBusy,
+    AfterProgress,
+}
+
+#[cfg(test)]
 thread_local! {
-    static FAIL_HANDLER_INSTALL: Cell<bool> = const { Cell::new(false) };
+    static FAIL_HANDLER_STAGE: Cell<Option<HandlerFailStage>> = const { Cell::new(None) };
     static DEADLINE_BUSY_INSTALLED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn handler_fail_due(stage: HandlerFailStage) -> bool {
+    FAIL_HANDLER_STAGE.with(|cell| {
+        if cell.get() == Some(stage) {
+            cell.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn wait_for_lock(_attempt: i32) -> bool {
@@ -49,18 +69,25 @@ impl<'a> ConnectionDeadline<'a> {
         remaining(deadline)?;
         let previous = IO_DEADLINE.with(|cell| cell.replace(Some(deadline)));
         let guard = Self { connection, previous };
+        #[cfg(test)]
+        if handler_fail_due(HandlerFailStage::BeforeBusy) {
+            anyhow::bail!("test: handler install failed");
+        }
         guard.connection.busy_handler(Some(wait_for_lock))?;
         #[cfg(test)]
-        {
-            DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(true));
-            if FAIL_HANDLER_INSTALL.with(Cell::take) {
-                anyhow::bail!("test: handler install failed");
-            }
+        DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(true));
+        #[cfg(test)]
+        if handler_fail_due(HandlerFailStage::AfterBusy) {
+            anyhow::bail!("test: handler install failed");
         }
         guard.connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
+        #[cfg(test)]
+        if handler_fail_due(HandlerFailStage::AfterProgress) {
+            anyhow::bail!("test: handler install failed");
+        }
         Ok(guard)
     }
 }
@@ -80,12 +107,16 @@ impl Drop for ConnectionDeadline<'_> {
         if let Err(error) = self.connection.progress_handler(0, None::<fn() -> bool>) {
             tracing::error!(%error, "SQLite ingress progress handler reset failed");
         }
-        if let Err(error) = crate::runtime::sqlite_pool::install_busy_handler(self.connection) {
-            tracing::error!(%error, "SQLite ingress busy handler reset failed");
+        match crate::runtime::sqlite_pool::install_busy_handler(self.connection) {
+            Ok(()) => {
+                #[cfg(test)]
+                DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
+            }
+            Err(error) => {
+                tracing::error!(%error, "SQLite ingress busy handler reset failed");
+            }
         }
         IO_DEADLINE.with(|cell| cell.set(self.previous));
-        #[cfg(test)]
-        DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
     }
 }
 
@@ -1227,7 +1258,7 @@ mod tests {
     impl Drop for ResetDeadlineGuard {
         fn drop(&mut self) {
             IO_DEADLINE.with(|cell| cell.set(None));
-            FAIL_HANDLER_INSTALL.with(|cell| cell.set(false));
+            FAIL_HANDLER_STAGE.with(|cell| cell.set(None));
             DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
         }
     }
@@ -1235,23 +1266,30 @@ mod tests {
     #[test]
     fn connection_deadline_install_failure_restores_previous_deadline() {
         let _reset = ResetDeadlineGuard;
-        let mut connection = Connection::open_in_memory().expect("test: memory db");
-        let previous = Instant::now() + Duration::from_secs(9);
-        IO_DEADLINE.with(|cell| cell.set(Some(previous)));
-        FAIL_HANDLER_INSTALL.with(|cell| cell.set(true));
-        let deadline = Instant::now() + Duration::from_secs(60);
-        assert!(
-            ConnectionDeadline::new(&mut connection, deadline).is_err(),
-            "test: install must fail"
-        );
-        assert_eq!(
-            IO_DEADLINE.with(Cell::get),
-            Some(previous),
-            "test: thread-local deadline restored to previous"
-        );
-        assert!(
-            !DEADLINE_BUSY_INSTALLED.with(Cell::get),
-            "test: deadline busy handler removed"
-        );
+        for stage in [
+            HandlerFailStage::BeforeBusy,
+            HandlerFailStage::AfterBusy,
+            HandlerFailStage::AfterProgress,
+        ] {
+            let mut connection = Connection::open_in_memory().expect("test: memory db");
+            let previous = Instant::now() + Duration::from_secs(9);
+            IO_DEADLINE.with(|cell| cell.set(Some(previous)));
+            FAIL_HANDLER_STAGE.with(|cell| cell.set(Some(stage)));
+            DEADLINE_BUSY_INSTALLED.with(|cell| cell.set(false));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            assert!(
+                ConnectionDeadline::new(&mut connection, deadline).is_err(),
+                "test: install must fail at {stage:?}"
+            );
+            assert_eq!(
+                IO_DEADLINE.with(Cell::get),
+                Some(previous),
+                "test: thread-local deadline restored to previous at {stage:?}"
+            );
+            assert!(
+                !DEADLINE_BUSY_INSTALLED.with(Cell::get),
+                "test: deadline busy handler removed at {stage:?}"
+            );
+        }
     }
 }

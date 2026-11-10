@@ -3294,9 +3294,30 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandlerFailStage {
+    BeforeBusy,
+    AfterBusy,
+    AfterProgress,
+}
+
+#[cfg(test)]
 thread_local! {
-    static FAIL_RECOVERY_HANDLER_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_RECOVERY_HANDLER_STAGE: std::cell::Cell<Option<HandlerFailStage>> =
+        const { std::cell::Cell::new(None) };
     static RECOVERY_BUSY_INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn recovery_handler_fail_due(stage: HandlerFailStage) -> bool {
+    FAIL_RECOVERY_HANDLER_STAGE.with(|cell| {
+        if cell.get() == Some(stage) {
+            cell.set(None);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn recovery_time_left(deadline: Instant) -> Result<std::time::Duration, StoreError> {
@@ -3326,18 +3347,25 @@ impl<'a> RecoveryReadBudget<'a> {
         recovery_time_left(deadline)?;
         let previous = RECOVERY_READ_DEADLINE.with(|cell| cell.replace(Some(deadline)));
         let guard = Self { connection, previous };
+        #[cfg(test)]
+        if recovery_handler_fail_due(HandlerFailStage::BeforeBusy) {
+            return Err(StoreError::RecoveryUnavailable);
+        }
         guard.connection.busy_handler(Some(recovery_busy))?;
         #[cfg(test)]
-        {
-            RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(true));
-            if FAIL_RECOVERY_HANDLER_INSTALL.with(std::cell::Cell::take) {
-                return Err(StoreError::RecoveryUnavailable);
-            }
+        RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(true));
+        #[cfg(test)]
+        if recovery_handler_fail_due(HandlerFailStage::AfterBusy) {
+            return Err(StoreError::RecoveryUnavailable);
         }
         guard.connection.progress_handler(
             1_000,
             Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
         )?;
+        #[cfg(test)]
+        if recovery_handler_fail_due(HandlerFailStage::AfterProgress) {
+            return Err(StoreError::RecoveryUnavailable);
+        }
         Ok(guard)
     }
 }
@@ -3357,18 +3385,22 @@ impl Drop for RecoveryReadBudget<'_> {
         if let Err(error) = self.connection.progress_handler(0, None::<fn() -> bool>) {
             tracing::error!(%error, "decision recovery progress handler reset failed");
         }
-        if let Err(error) = crate::runtime::sqlite_pool::install_bounded_busy_handler(self.connection) {
-            tracing::error!(%error, "decision recovery busy handler reset failed");
+        match crate::runtime::sqlite_pool::install_bounded_busy_handler(self.connection) {
+            Ok(()) => {
+                #[cfg(test)]
+                RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(false));
+            }
+            Err(error) => {
+                tracing::error!(%error, "decision recovery busy handler reset failed");
+            }
         }
         RECOVERY_READ_DEADLINE.with(|cell| cell.set(self.previous));
-        #[cfg(test)]
-        RECOVERY_BUSY_INSTALLED.with(|cell| cell.set(false));
     }
 }
 
 #[cfg(test)]
-fn fail_next_recovery_handler_install() {
-    FAIL_RECOVERY_HANDLER_INSTALL.with(|cell| cell.set(true));
+fn fail_recovery_handler_at(stage: HandlerFailStage) {
+    FAIL_RECOVERY_HANDLER_STAGE.with(|cell| cell.set(Some(stage)));
 }
 
 #[cfg(test)]
