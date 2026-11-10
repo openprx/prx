@@ -2,6 +2,22 @@
 
 OpenPRX uses `~/.openprx/config.toml` as the main configuration file.
 
+Turn work has several independent owners. Do not treat the causal plane or the
+advisory decision engine as owning everything:
+
+- **Prompt recall** is independent scoped recall (owner, workspace, session). It
+  is not selected by the decision engine.
+- **Tool surface** is built by the surface owner: registry ∩ ACL ∩
+  `always_exclude` / channel exclusions ∩ model allowlist ∩ catalog eligibility.
+  The surface is built even when the advisory engine is off.
+- **Targeted gateway turns** (`[gateway] targeted_agents`, default `false`) use
+  a named memory partition (`name` + incarnation), not Main's history. The
+  switch is pre-release.
+- **Causal admission** (`[causal_tree]`) is separate from the **advisory
+  decision engine** (`[decision_engine]`, default `enabled = false`).
+- **Recovery** needs the original workspace decision key together with the
+  database. Keep those backups together.
+
 For decision admission, backend gates, inspection and rollback, see the
 [decision plane reference](decision-plane.md).
 
@@ -38,10 +54,9 @@ a structured save writes the canonical versioned form.
 
 Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
 `prx status`, and other commands whose stdout is the product) default to
-`warn` when `RUST_LOG` is unset, and they write tracing only to stderr
-(they previously used stdout, except the few commands that already logged
-to stderr). `prx daemon`, `prx gateway`, and `prx channel start` keep the
-previous `info` default on their current destination. `RUST_LOG` can raise
+`warn` when `RUST_LOG` is unset, and they write tracing only to stderr.
+`prx daemon`, `prx gateway`, `prx channel start`, and the session-worker
+process keep the `info` default on their current destination. `RUST_LOG` can raise
 or lower the level (`RUST_LOG=info`, `RUST_LOG=error`, or a more specific
 filter such as `RUST_LOG=openprx::prompt_cache=debug`). Interactive
 `prx chat` applies the same filter to `chat.log`, so that file records
@@ -332,11 +347,9 @@ configuration compatibility and no longer controls scheduling.
 ```toml
 # ~/.openprx/config.toml
 
-[general]
 default_provider = "anthropic"
 default_model = "claude-opus-4-6"
-temperature = 0.3
-max_history = 200
+default_temperature = 0.3
 
 # [gateway] has no request timeout. An HTTP request that starts an agent turn
 # is allowed to take as long as the turn takes; the gateway runs such work as a
@@ -381,8 +394,10 @@ max_history = 200
 # target answers 409 `agent_disabled` and never runs as the main agent.
 # A named target on a memory backend that does not keep agent scope answers
 # 409 `agent_backend_unsupported` after the disabled and unknown checks.
-# `targeted_agents` is pre-release and test-only until MA-01h. While it is on, targeted turns share Main's history and cannot be erased. Do not enable it.
-# Default: false.
+# `targeted_agents` is pre-release (default false). While true, a named target
+# uses its own memory partition (agent name + incarnation), not Main's history.
+# A memory backend that does not keep agent scope answers 409
+# `agent_backend_unsupported`.
 # targeted_agents = false
 
 [runtime]
@@ -543,8 +558,9 @@ priority_scheduling_enabled = false
 # listed here — adding it would demote every cron action, not just background runs.
 low_priority_tools = ["sessions_spawn", "delegate"]
 
-# Per-turn capability policy. `always_include` prefers direct publication;
-# `always_exclude` removes names before decision admission. `channel_exclude` applies to IM
+# Per-turn capability policy. The surface owner applies these filters (they are
+# not owned by the decision engine). `always_include` prefers direct publication;
+# `always_exclude` removes names from the surface. `channel_exclude` applies to IM
 # channel sessions only (Signal / Telegram / Discord / WhatsApp / …) and defaults
 # to the operations/development surface: wasm_plugins_manage, wasm_plugin_reload,
 # wasm_plugins_status, hooks_manage, hooks_status, proxy_config, config_reload,
@@ -637,9 +653,10 @@ allow_executable_proposals = false
 # skill_id = "release-notes"
 # suite_digest = "<64 lowercase hex digits>"
 
-# Optional exact-model tool allowlists constrain decision-eligible tools.
-# Models without an entry keep the ordinary tool set. An empty list deliberately
-# exposes no tools. Quote model names containing `/` or `:` in TOML.
+# Optional exact-model tool allowlists constrain the published surface for
+# that model. Models without an entry keep the ordinary tool set. An empty
+# list deliberately exposes no tools. Quote model names containing `/` or `:`
+# in TOML.
 [tool_tiering.model_allowlists]
 "gemma4-e2b" = ["shell", "file_read", "file_write"]
 
@@ -660,7 +677,8 @@ allowed_tools = ["web_search", "file_read"]
 # Targeted turns (`agent` on POST /api/sessions/{id}/message, needs
 # [gateway] targeted_agents = true): `enabled = false` answers 409
 # `agent_disabled`; `autonomy` is capped at the main agent's level.
-# Names must match ^[a-z][a-z0-9_-]{0,63}$ and cannot be `main`.
+# History is a named partition, not Main's. Names must match
+# ^[a-z][a-z0-9_-]{0,63}$ and cannot be `main`.
 # enabled = true
 # autonomy = "supervised"
 
@@ -668,7 +686,8 @@ allowed_tools = ["web_search", "file_read"]
 [reliability.model_fallbacks]
 claude-opus-4-6 = ["claude-sonnet-4-6"]
 
-# Provider fallbacks
+# Provider fallbacks (this key lives on [reliability], not inside model_fallbacks)
+[reliability]
 fallback_providers = ["xai"]
 ```
 
@@ -1148,6 +1167,7 @@ effect) and its response carries the same `warning`.
 | Removed key | Why |
 |---|---|
 | `agent.max_tool_iterations` | progressing agent work has no arbitrary tool-round ceiling |
+| `agent.max_history_messages` | conversation retention follows the context-token budget, not a message count |
 | `agent.parallel_tools` | no concurrency ceiling to switch |
 | `agent.tool_dispatcher` | never read: the tool-call wire form follows the provider's capabilities |
 | `agent.read_only_tool_timeout_secs` | no timeouts on agent work |
@@ -1167,13 +1187,15 @@ effect) and its response carries the same `warning`.
 | `xin.max_tasks` | the persisted Xin task store no longer has an arbitrary task-count ceiling |
 | `autonomy.max_actions_per_hour` | no hourly action budget |
 | `gateway.request_timeout_secs` | no request deadline on gateway handlers |
-| `channels_config.message_timeout_secs` | no wall clock on a channel or chat turn; a stalled turn is ended by `runtime.idle_hang_secs`, a running one by `prx tasks kill` |
+| `channels_config.message_timeout_secs` | the global per-turn channel wall clock is gone; ramflux still uses `channels_config.ramflux.turn_wall_clock_secs`. A stalled turn is ended by `runtime.idle_hang_secs`, a running one by `prx tasks kill` |
+| `channels_config.matrix` | the Matrix channel was removed; the section is ignored and can be deleted |
 | `runtime.idle_hang_max_total_secs` | no absolute wall-clock ceiling on a progressing turn |
 | `agents.<name>.max_iterations` | delegated agents have no arbitrary tool-round ceiling |
 | `security.audit.sign_events` | audit signing was never implemented; the setting had no effect |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
 | `causal_tree.observability.decision_log`, `causal_tree.observability.metrics` (and the earlier `write_decision_log`, `write_metrics`) | never read; decision events follow the `[observability]` backend |
+| `[router.automix]` (whole table) | automix reply escalation was removed; the section is ignored and can be deleted |
 
 The `sessions_spawn` tool also no longer accepts `max_iterations` or
 `timeout_seconds`; task-mode and process-mode sub-agents share the same
@@ -1546,11 +1568,15 @@ Two settings are database-level rather than user-facing:
 - **WAL journalling** is enabled at startup and is a prerequisite, not a tuning
   knob — without it readers and the writer would lock each other out and a
   reader pool would be pointless.
-- **No `busy_timeout`.** If the database file is locked by another process,
-  SQLite retries until the lock clears rather than returning `SQLITE_BUSY`, and
-  logs a warning roughly every two seconds while it waits. A `busy_timeout` is
-  a timeout by another name: after it expires the caller gets an error for a
-  lock that is merely held by someone else.
+- **No `busy_timeout`.** Writer connections install an unbounded busy handler:
+  if the database file is locked by another process, SQLite retries until the
+  lock clears rather than returning `SQLITE_BUSY`, and logs a warning roughly
+  every two seconds while it waits. A `busy_timeout` is a timeout by another
+  name: after it expires the caller gets an error for a lock that is merely
+  held by someone else. Deadline-scoped reads (ingress and recovery) install a
+  deadline busy/progress handler on that connection and restore the pool
+  handler when the guard drops, including if a handler install returns an
+  error. That restore is not a configuration key.
 
 Reader connections are opened with `PRAGMA query_only`, so a statement that
 tries to mutate the database on a reader fails immediately instead of silently
@@ -1668,7 +1694,7 @@ boundaries, see [Runtime security](security.md).
 
 ### Secrets in configuration
 
-One registry (`src/config/secret_paths.rs`) decides which configuration paths
+One registry decides which configuration paths
 hold secrets, and which name an endpoint. Every configuration read surface
 uses it: `GET /api/config`, `GET /api/config/files`, `prx config show`, the
 `Debug` form of the configuration, change plans and `428`/`4xx` bodies,
@@ -1799,7 +1825,7 @@ below).
   - an MCP server environment variable (`process_environment_changed`;
     besides a token it can be `NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`,
     `PYTHONPATH` or `PATH`, which change what the server runs);
-  - a secret whose value admits a client (`access_grant_changed`, D-048):
+  - a secret whose value admits a client (`access_grant_changed`):
     `gateway.paired_tokens`, `webhook.token`, `webhook.signing_secret`,
     `channels_config.webhook.secret`, `channels_config.whatsapp.verify_token`,
     `channels_config.whatsapp.app_secret`,
@@ -2141,7 +2167,7 @@ raw file API, confirming the `baseline_unavailable` change with
 ### Configuration transactions, history and rollback
 
 Every configuration write that the running process activates goes through one
-transaction layer (`src/config/manage/`): `POST /api/config`,
+transaction layer: `POST /api/config`,
 `PUT /api/config/files/{name}`, `PUT /api/config/secrets`, the agent
 `gateway` tool's `config.patch`, and the `prx providers`, `prx models`,
 `prx routes` and `prx config` management commands (see
@@ -2200,22 +2226,20 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    route, agent, embedding, classifier), a new stdio MCP server or a changed
    `command`, `args` or `transport` of one (the program runs as PRX's user,
    so it can read the stored credentials, and it receives its `env` values;
-   this holds whether or not it has any `env`, D-045), and any change of an
+   this holds whether or not it has any `env`), and any change of an
    MCP server `url`, a remote
    node `endpoint`, the Mattermost `url`, Signal `http_url`, WhatsApp `ws_url`, Nextcloud Talk
    `base_url`, IRC `server`, email `imap_host`/`smtp_host`,
    `observability.otel_endpoint`, `chat.daemon.url` or a proxy URL
    (`proxy.http_proxy`, `proxy.https_proxy`, `proxy.all_proxy`: every
-   credentialed request goes through it). One registry,
-   `secret_paths::ENDPOINT_PATHS`, lists these endpoints and the URL fields
-   whose userinfo is redacted. A change of an MCP server `env` value
-   (`process_environment_changed`) or of a secret that admits a client
-   (`access_grant_changed`: the paired tokens, the webhook token and signing
-   secret, a channel's verify token or webhook secret, the node server's
-   bearer token and HMAC secret; the registry records the kind of every
-   secret path, `secret_paths::SecretUse`) is high risk on every surface.
+   credentialed request goes through it). One registry lists these endpoints
+   and the URL fields whose userinfo is redacted. A change of an MCP server
+   `env` value (`process_environment_changed`) or of a secret that admits a
+   client (`access_grant_changed`: the paired tokens, the webhook token and
+   signing secret, a channel's verify token or webhook secret, the node
+   server's bearer token and HMAC secret) is high risk on every surface.
    So is a change of a setting that decides who is admitted inbound
-   (`access_grant_changed`, D-049; `secret_paths::ACCESS_CONTROL_PATHS`):
+   (`access_grant_changed`):
    `gateway.require_pairing`, `gateway.trust_forwarded_headers`,
    `gateway.allow_public_bind`, `gateway.host`, `mcp_server.require_auth`,
    the MCP JWT material and policy (`jwt_public_key_pem`, `jwt_jwks`,
@@ -2243,7 +2267,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
      `deny`, an added `assign_owners` entry, a dropped deny entry, a
      removed, reordered or re-matched rule, an appended rule that carries
      an allow list or is appended under `default = "deny"`, and each allow
-     list by what it means at runtime (D-050): `tools_allow` emptied (every
+     list by what it means at runtime: `tools_allow` emptied (every
      tool) or given a new tool; `send_allow` given any entry, from empty
      too (the first non-empty `send_allow` is the whitelist, and without one
      only the reply channel is reachable), or emptied (the decision falls
@@ -2256,7 +2280,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
      entry removed; a `nodes.server.allowed_commands` entry added or a
      `nodes.server.blocked_commands` entry removed; `tunnel.custom.start_command`
      set or changed (a command the daemon runs, like an MCP launch);
-     containment (D-051): `runtime.kind` leaving `docker`,
+     containment: `runtime.kind` leaving `docker`,
      `runtime.docker.network` reaching further (`none` to any network, a
      named network to another, anything to `host`), a tool newly offered
      to channel sessions (judged on the effective channel surface, where
@@ -2316,7 +2340,7 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    `?confirm_high_risk=true` on `POST /api/config` and
    `PUT /api/config/files/{name}`, or `"confirm_high_risk": true` for
    `config.patch`. The `428` body carries the `revision` the refused change
-   was computed against. The confirmation is bound to it (D-049): the
+   was computed against. The confirmation is bound to it: the
    confirmed retry must send it as `If-Match` (the `revision` argument for
    `config.patch`); without it, or with `If-Match: *`, the answer is `428`
    again with `required: "if_match"`, and a change in between answers `409`
@@ -2342,15 +2366,15 @@ transaction layer (`src/config/manage/`): `POST /api/config`,
    human sees it, so run supervised when an agent may change credentials or
    endpoints. The approval level each surface requires is unchanged.
    The agent `proxy_config` tool's `set` is a configuration transaction
-   (D-050: history record, revision check, restore on refusal) and is
-   classified by the same plan (D-049): the plan's risk is its
-   approval tier (High for a new or changed proxy URL, since every
-   credentialed request goes through it; Medium otherwise), and its output
-   reports `risk` and `risk_reasons`. At `supervised` a High `set` needs a
-   runtime approval grant. At `full` autonomy the gate approves every
-   resource operation, High included, without asking anyone (D-037): the
-   classification is then recorded, not enforced. The same holds for
-   `config.patch`, whose confirmation the model itself supplies at `full`.
+   (history record, revision check, restore on refusal) and is classified by
+   the same plan: the plan's risk is its approval tier (High for a new or
+   changed proxy URL, since every credentialed request goes through it;
+   Medium otherwise), and its output reports `risk` and `risk_reasons`. At
+   `supervised` a High `set` needs a runtime approval grant. At `full`
+   autonomy the gate approves every resource operation, High included,
+   without asking anyone: the classification is then recorded, not
+   enforced. The same holds for `config.patch`, whose confirmation the
+   model itself supplies at `full`.
 3. **No lost update.** Every change is based on a revision (the fingerprint of
    `config.toml` and every `config.d` fragment). `POST /api/config`, the
    credential endpoint and `config.patch` use the revision of the
@@ -2837,10 +2861,10 @@ transport, pinned prices and remaining original token/money budgets are required
 See the [current candidate addendum](router.md#source-addendum-2026-10-05) for scope,
 unsupported cases and verification status.
 
-Minimum router config (single reachable provider):
+Minimum router config (single reachable provider). Provider and model defaults
+are top-level keys, not a `[general]` table:
 
 ```toml
-[general]
 default_provider = "openrouter"
 default_model = "openai/gpt-4o-mini"
 
@@ -2855,175 +2879,12 @@ categories = ["conversation"]
 
 For full examples, field-by-field reference, flow, and security boundaries, see [docs/router.md](router.md).
 
-The CLI no longer constructs the legacy speculative CTE engine or runs its separate AskApproval hook. Source-bound turn decisions and their approval records belong to the shared turn decision service. The removed legacy hook does not provide an alternate approval authority; retained v1 report compatibility is separate from runtime execution.
-
-For ordinary CLI single-shot and interactive turns, disabling the causal decision plane still runs the built-in conservative decision and constrained tool selection. Disabled decisions do not create decision/outcome settlement writes or enable remote decision backends; normal conversation history and terminal records follow their existing settings. Scheduled and other ingress migration is tracked separately and is not established by this CLI wiring.
-
-Chat also enters the built-in decision path when the causal plane is disabled. Provider selection remains bound to its runtime generation. If conversation recording supplies a durable inbound event, Chat verifies it; otherwise disabled mode keeps an in-memory source without inventing an event ID. Enabled mode still requires the durable event. Disabled terminal handling omits causal settlement/rejoin writes while retaining normal conversation behavior.
-
-Gateway webhook and platform-message turns also enter the built-in decision path while disabled. Their source remains bound to the admitted transport actor, workspace and runtime generation; optional unrecorded input carries no invented event ID. The shared terminal guard retains cancellation cleanup without causal settlement writes. Transport authorization and outbound delivery checks remain required.
-
-Scoped single-shot agent invocations retain the originating run and session identifiers for terminal records and child lineage. A missing run ID, empty session or mismatched workspace is rejected before runtime bootstrap. A scoped invocation cannot enter the interactive REPL. These identity checks do not replace scheduler lease validation or establish completion of scheduled decision admission.
-
-The Agent runtime publishes its decision service once for its actual CLI, Cron or Xin surface. For a non-operator scheduled run, runtime construction uses the same effective security policy as its scheduled tool adapter, after checking that the source and execution scope identify the same task attempt. Per-turn scheduled source admission remains a separate migration requirement.
-
-When a tool execution carries a runtime authority guard, the shared execution service revalidates it after preparation and reservation, before invoking the backend. Expired or unavailable authority prevents invocation; cancellation also stops dispatch. Failure to abandon a durable reservation is reported as indeterminate. This check does not make a later lease change atomic with an external side effect.
-
-Immediate Cron agent runs retain a Cron envelope even though they have no scheduler lease. Each invocation receives a distinct immediate-run identifier; scheduler-claimed runs retain their claim identifier and authority guard. Both paths preserve stored owner, topic, source-event and owner-isolation metadata and apply the job creator's execution policy. An absent scheduler claim does not grant local-operator authority.
-
-Daemon-managed Cron and Xin agent runs pass the scheduler's pinned configuration generation and shared configuration manager into Agent bootstrap. Cron explicitly carries this context across its spawned job boundary. Model selection and decision publication therefore use that pinned effective configuration, without creating a second manager or reconstructing a revision from a later disk state. Standalone calls keep their startup configuration path. The legacy generation-only Cron API adopts its supplied snapshot without re-reading configuration, checks that its Config argument matches, and continues generation numbering. Snapshots with deferred configuration require the existing-manager API because the effective snapshot cannot reconstruct desired settings. Unavailable source revisions and exhausted generation counters are refused.
-
-Decision source proofs retain an explicit task ID when the ingress supplies one. The decision state, execution binding, approval source and terminal/history correlation must agree on it. Durable task identity comes from a typed Task event subject; topic/goal labels and run IDs are not converted into task IDs. Missing historical task identity is not retroactively assigned.
-
-Cron/Xin agent invocations carry creator admission from the stored job/task row. Before bootstrap, Agent checks task/source lineage and the exact creator-derived execution context; an absent extra tool scope is accepted only for a recorded LocalOperator origin. Claimed Cron and Xin invocations require their matching attempt/lease and a live authority guard. Immediate Cron invocations retain their separate unique identity without inventing a claim. Cancellation or lost claim/lease prevents initialization.
-
-Cron/Xin use the Agent tool-tiering surface together with the stored creator's security policy and owner isolation. A creator channel label alone does not select the IM channel profile. IM turns apply `for_channel_surface()` in their owning adapter; inherited child capability boundaries remain part of child admission. Global exclusions and exact-model allowlists continue to apply to scheduled decisions.
-
-Scheduled Cron/Xin Agent turns retain terminal-cleanup ownership across task cancellation. During daemon shutdown, scheduled cleanup is acknowledged separately from supervisor aborts; an unconfirmed terminal or decision-queue drain returns an error. A replacement Cron/Xin configuration generation waits for the previous generation's cleanup, and new child work is refused after an unconfirmed cleanup failure. Expired task authority is still rejected during terminal persistence. Manual invocations wait for their local cleanup before returning; a forced drop without an enclosing owner cannot acknowledge completion to the caller.
-
-`reliability.scheduler_retries` retries Cron shell attempts and Agent startup failures before shared decision admission. Once an Agent invocation starts decision admission, the scheduler does not automatically replan the entire turn after failure: that turn may already own a durable decision or tool effects. An unconfirmed cleanup also prevents a whole-turn retry. Provider request retries remain governed by the existing provider reliability settings. A claimed invocation keeps its claim/run identity; this rule does not generate a new identity to bypass terminal or tool idempotency records.
-
-Gateway and Console turns also own cleanup for manually invoked scheduled Agent work. Their ordinary result waits for child cleanup; asynchronous jobs retain a separate child-cleanup acknowledgement outside the abortable work task. A lost, failed or timed-out acknowledgement remains an error. This does not grant a manual task scheduler lease or permission to repeat its effects.
-
-Ordinary Agent CLI/REPL execution owns cleanup for manual scheduled child calls before returning, while retaining its existing turn shutdown and decision-queue drain path. Interactive Chat carries its cleanup owner explicitly into spawned provider tasks. Child cleanup completes before the provider task emits its ordered-commit or completed action; unconfirmed cleanup is reported as a non-retryable failure. Chat exit drains retained child cleanup before completing its service shutdown.
-
-Channel message workers explicitly inherit their generation's cleanup owner. A model round waits for manually invoked child cleanup before producing its final channel reply; unconfirmed cleanup bypasses ordinary cancellation and context-overflow retry classification. Closing the inbound stream remains graceful. Explicit component shutdown cancels worker cleanup scopes, and failed cleanup is returned after listeners stop. Daemon channel generation replacement retains the same retirement barrier used for scheduled generations. Message fan-out remains ungated.
-
-Task-mode background workers use independent child-cleanup ownership, so a spawning turn returning does not cancel legitimate background work. Their external monitor retains cleanup after task abortion. Each steering iteration drains its manual child calls before returning history; unconfirmed cleanup prevents starting a replacement iteration. Dropping the outer steering future also aborts its active inner loop instead of detaching it.
-
-Task-mode `sessions_spawn` and `subagents` kill operations wait for the external task monitor to acknowledge exit and child cleanup. A request made before the abort handle is attached is retained and applied when attachment completes. Natural completion wins the race with a late termination request; missing ownership, timeout, panic or unconfirmed cleanup does not report a successful kill. Chat session shutdown requests task termination concurrently and retains pending or unconfirmed task entries instead of counting and clearing them as terminated.
-
-Process session workers also own cleanup for nested scheduled work. Each steering segment waits for child cleanup before accepting a replacement instruction; unconfirmed cleanup ends the run instead of starting another segment. Worker result publication follows a successful terminal commit, and the worker drains its retained cleanup before returning the result. An operating-system process kill cannot run this in-process cleanup path; process termination and durable recovery evidence remain separate.
-
-The staged decision-enabled worker recovery path attaches a recovery
-task to each Chat, Channel or Gateway tool generation. It reads at most 128
-launch records per page, waits one second between full pages, and retries a
-completed sweep or unavailable storage after 30 seconds. Disabling the decision
-plane starts no recovery task. Dropping the tool generation cancels its task.
-Recovery requires authenticated launch, source, parent decision, terminal and
-usage records, plus process absence in the same OS boot context (and Linux PID
-namespace). Other hosts, later boots, legacy records without this binding, and
-unknown process state remain unconfirmed. Recovery inserts read-only registry
-projections when no current row exists. With confirmed process absence but no
-completion journal, it retains authenticated segment usage and marks cleanup
-and total billing unconfirmed, without inventing a finish time. Such entries
-report `no_result` when joined. A later sweep may update only recovery-owned
-unconfirmed entries, and may not discard or alter previously confirmed usage.
-Recovery does not signal old PIDs, resume execution, send announcements or
-reprice usage. Existing monitor-owned rows remain with their original monitor.
-This path remains under development; compilation is not recovery or
-performance acceptance.
-
-Decision-granted `spawn_batch` reserves member IDs and durably records a signed
-membership plan before dispatch. A separate signed dispatch record distinguishes
-started, rejected and unknown members. `join` reads this owner-scoped plan and
-checks its parent decision; an incomplete dispatch record retains every planned
-member, while a completed record excludes only explicit rejections. Missing run
-results remain `no_result`. Dispatch errors are returned as
-`dispatch_unconfirmed`, and a failure to persist dispatch confirmation retains
-the batch ID in the response so callers can reconcile before retrying. These
-records describe membership and dispatch evidence; they never authorize replay
-of a child execution.
-
-Process launch records also bind their batch ID. Before dispatch and during
-recovery, PRX checks that the same owner and parent decision admit that run in
-the signed batch plan. Recovered process entries retain the verified batch ID
-for grouping; legacy launch records without a batch binding remain ungrouped.
-
-When an authenticated completion has missing parent outcome projections,
-recovery may use the service's already owned decision-store writer to persist
-the exact authenticated outcome and parent link. Both writes require queue
-acknowledgement, a completed drain and matching owner-scoped readback. Conflicts
-remain unconfirmed. Recovery never opens or upgrades a writable store, creates
-a key or repairs a database to obtain this capability; without an existing
-writer, missing projections remain pending.
-
-Issued child grants retain their configured logical source fabric. Nested
-delegate and task-mode child provenance, segment admission and decision
-settlement use that fabric, while execution-memory retrieval remains attached
-to the tool's private memory. A restored worker grant accepts only a fabric
-whose workspace matches its authenticated parent source. Worker session list,
-history, status and lifecycle tools use this logical fabric; spawn keeps a
-separate private execution-memory handle. Batch and historical-run lookup use
-the logical workspace rather than the private worker directory. Decision-enabled
-delegate and spawn require an issued child grant, and decision-enabled workers
-require authenticated child authority. The candidate child path is implemented
-but remains pending centralized behavior, security and performance validation.
-
-Logical event recording remains attached when a nested turn has no private
-execution-memory handle. For nested process workers, shared storage paths and
-the parent backend identity come from the issued logical source; private worker
-directories and private memory remain separate. Dispatch rejects a source
-fabric backed by a different memory handle even if its workspace name matches.
-
-Task and process children construct initial model history after child decision
-admission and close handling. Granted process children enrich their recorded
-raw input through the selected decision retrieval; they do not also run the
-legacy shared-context loader. Ordinary workers retain that loader when building
-their initial history. A close decision can return without preparing a model
-prompt or performing this legacy context read.
-
-Child request recording for delegate, task spawn and process workers retains a durable input receipt. A failed write, mismatched input/lineage or failed owner-scoped readback stops the child request instead of continuing with unverified provenance. Disabled user-message recording yields no durable receipt; its synthetic event is not source authority for enabled child decisions. Parent causation remains separate from the child request event.
-
-Channel smart-group pre-gating runs after source decision admission. Clearly relevant messages enter the main loop directly; uncertain messages and heuristic noise require a resolver-built classifier call bound to the pinned configuration generation and the turn's physical accounting scope before they can produce a silent terminal. Classifier construction, accounting, timeout and parsing failures retain fail-open behavior. Bot-sender and cooldown protections remain pre-admission transport guards.
-
-Channel decision source admission checks the recorded inbound event against its transport, owner, session, run, configuration generation and visibility, then reads back the complete owner-scoped event. Enabled decision mode requires this durable receipt. Raw routing input remains separate from the reserved-marker-neutralized history text. Channel runtime envelopes preserve the recorded private/group visibility. This source binding is part of the ongoing channel decision migration; it does not by itself establish full channel decision execution.
-
-The channel candidate admits a source-bound decision before constructing any classifier or selected main provider. Direct close replies pass channel outbound authorization and identity-notice acknowledgement before terminal persistence and delivery. Running turns use decision-selected retrieval, constrained tool routing and reserved compaction. Completed, silent, failed and cancelled outcomes share a decision terminal guard; failed/cancelled turns retain known provider traces and usage uncertainty. Main-provider startup warmup, descendant cleanup acknowledgement and channel parity remain pending migration verification.
-
-Channel model execution shares an outer descendant-cleanup scope. The parent terminal guard remains outside that scope and waits for its explicit acknowledgement, including on forced future drop. Context-overflow classification, compaction and provider replay are owned by the shared turn engine; channel and terminal-chat entrypoints do not compact or replay a completed engine call. A failed or missing cleanup acknowledgement leaves terminal settlement unconfirmed and suppresses failed result notices. Behavioral cancellation validation is still pending.
-
-Signal vision preflight retains its own provider trace and source-owned physical accounting scope. Each supported physical request reserves token and PMM-priced monetary liability before sending, then settles fully reported usage. Missing or interrupted usage remains uncertain. The redacted auxiliary observation links that scope; its aggregate trace does not issue another usage settlement or cost debit. Main-loop snapshots do not overwrite auxiliary observations. Assembled failure, cancellation, replay and fixed-budget validation remain pending.
-
-Auxiliary observations persist before descendant-cleanup acknowledgement when event recording is available; required durable receipts are checked by owner-scoped readback. Parent terminal persistence still waits for successful cleanup. Recording-disabled execution does not fabricate durable auxiliary replay evidence.
-
-Channel prompts now advertise only skill metadata from the decision-selected capability set after execution-gate validation. This path does not run an independent per-turn Skill RAG query or load skill instruction bodies. Catalog snapshots retain pinned skill metadata and authenticated process transport validates its identity/binding digest. Agent/Chat/worker prompt migration and fixed-budget validation remain pending.
-
-Decision-admitted Agent single-shot/interactive turns and Chat turns now use the same pinned skill metadata reader as channels. Remaining legacy/no-decision adapters and child/gateway prompt paths still require migration; this does not claim complete CDP-29 or prompt-parity acceptance.
-
-Decision-admitted Gateway/Console turns now consume the same pinned skill metadata reader. Granted process-worker segments rebuild their leading system prompt from each segment decision, so steering cannot retain an earlier segment's skill list. Private execution-workspace prompt identity remains separate from the inherited catalog metadata paths. Legacy/no-decision paths and child execution parity remain subject to final migration and verification.
-
-Issued synchronous delegates and task-mode child segments also append only their admitted skill metadata to the original delegated instructions. Steering replaces the system frame with a freshly selected view, preventing skill metadata from accumulating across segments.
-
-Channel startup no longer constructs an unused static skill prompt, embedding-backed skill list, or Skill RAG context. The decision catalog owns metadata discovery, and admitted turns build their selected prompt view. Provider startup and excluded delivery-filter behavior are unchanged by this cleanup.
-
-Console runtime execution now requires an admitted decision before prompt or context preparation; missing context fails explicitly. Its former independent skill/recall, unrestricted routing and unbound failure-finalization branches are removed. Gateway model-loop routing also refuses a missing decision rather than exposing the full registry. This remains part of the mandatory-context migration; the shared request type and other legacy adapters are not yet fully migrated.
-
-Chat Redux runtime execution now rejects missing admission before compaction or provider execution. The driver uses only decision-owned routing and requires trace capture against that binding; its session-wide routing fallback is removed. Legacy unbound test fixtures still need genuine admission setup during centralized validation.
-
-The ordinary Chat loop now requires source/provider binding and completes admission before context enrichment. Recall, skill metadata, compaction reservation and routing come from that decision, including disabled-plane built-in decisions. Removed independent per-turn recall/Skill RAG and whole-registry routing fallbacks; startup command/history skill metadata remains available without embedding initialization. Centralized parity and budget validation remain pending.
-
-Agent CLI and interactive turns now consume admitted decision recall, skills, compaction and routing without independent per-turn fallbacks. Runtime envelope overrides require the existing Cron/Xin stored-creator admission before bootstrap; unsupported overrides cannot inherit local CLI authority. Startup command skill metadata remains available without embedding initialization. Legacy routing characterization fixtures are test-local and do not establish production admission parity.
-
-Admitted Delegate directives now enter the shared execution path with exact selected capability references and their verified child manifest. The former placeholder hop to forced terminal selection is removed; closed contexts still reject execution. This connects existing issued-grant and child-ingress plumbing but does not establish child end-to-end acceptance. Ordinary ungranted/disabled children and explicit background-command admission remain separate migration work.
-
-A selected Delegate is returned for execution only after its parent decision chain drains to storage and every owner-scoped replay digest matches the issued chain. Cancellation, dropped writes, missing rows and conflicting persisted decisions fail before child launch. Other directive paths retain their existing persistence policy. Process-launch race and cancellation tests remain pending.
-
-Channel decisions participate in the shared terminal settlement and outcome-rejoin service. The admitted source, owner, generation, catalog and durable record checks remain required; this completes the service surface registration used by the channel terminal guard.
-
-Delegation persistence and readback must finish within the original selected decision deadline; storage verification does not extend the configured latency budget.
-
-Chat background launch, kill, steer, shell/PTY and decision-approval session commands require local terminal operator input. The same check applies during active turns and when plain text steers an attached session. Mailbox/model input cannot obtain operator authority through the shared command parser. Read-only session navigation remains available. This source check is separate from pending background-command decision admission and does not create a child grant.
-
-The `/workers cancel` and `/workers stop` aliases also require local terminal operator input in both idle and active-turn handlers, before worker lookup or cancellation-state changes. Read-only `/workers` status remains available.
-
-Ordinary configured delegates with the decision plane disabled now retain the exact PMM model/credential selection and actual provider instance through the child provider binding, including direct models and hints. This binding carries no parent grant and cannot issue a delegated source proof. Full ordinary child decision admission remains pending; legacy configuration-less isolated fixtures retain their existing construction path.
-
-The ordinary child snapshot is derived only from its effective in-memory configuration, with canonical hashing and explicit workspace/config paths. It does not run startup configuration management, reload disk state, change proxy globals or refresh metric labels.
-
-Ordinary delegate input events use the immutable child provider snapshot generation and revision rather than the caller's configuration labels. Before recording, the adapter verifies the actual provider instance, workspace, configured agent and delegate run/session/source identity. Existing durable input readback checks still apply; synthetic disabled-recording input does not become delegated authority.
-
-The tool execution service passes a task-local typed caller context to delegate/sessions_spawn dispatch after execution checks. Delegate derives its actor and lineage directly from this context when present, independently of model JSON. The context is scoped to the backend future and does not cross spawned tasks automatically; ordinary child admission must explicitly bind and retain the verified source. Legacy direct-tool callers still need separate admission migration.
-
-Within sessions_spawn execution, spawn/announcement lineage and run-owner confinement now prefer the execution service's typed caller context. Explicit owner isolation takes precedence over local-operator access, and a missing isolated owner admits no runs. Legacy direct-tool argument handling remains for callers outside this scope; it is not ordinary-child decision admission.
-
-Ordinary delegates dispatched through the execution service inherit the typed caller's resolved owner, parent run/session, causation, attempt/lease and authority guard on input events. A workspace mismatch is refused. Their route record references the child input receipt when durable, or no source event when recording is disabled; it does not substitute the parent input or a placeholder owner. This lineage alignment does not yet complete ordinary decision admission.
-
-Delegate tool projections retain the underlying read-only capability inventory and binding identities. An explicitly selected dynamic name is resolved from its exact live schema, including names outside a provider-facing listing window. A single-name projection exposes only that name; selecting a dispatcher root preserves its synthetic target bindings. This metadata alignment does not by itself complete ordinary child decision admission or establish delegated catalog parity.
-
-For an issued child grant, delegation retains original backend roots so dynamic aliases and synthetic targets can be checked against the parent catalog. The grant is first checked against the named agent's configured `allowed_tools`; synthetic Skill/Node targets may use their configured dispatcher root, and the existing transcript lookup dependency remains eligible only when present in the grant. Per-call execution bindings still enforce the exact granted and selected capability references. Ordinary delegation without a grant retains its filtered tool projection while its decision admission is being completed.
-
-Delegate input receipts bind the complete user input sent to the child, including the optional context block and task separators. Decision routing and the provider history use that same text; a granted child rejects a mismatched execution input before entering its tool loop.
+CLI, chat and gateway turns use the shared turn decision service. With
+`[causal_tree]` disabled they still run a built-in conservative decision and
+constrained tool selection; they do not write causal settlement and they do
+not enable a remote decision backend. Prompt recall and the tool surface stay
+with their own owners (see the top of this page). Child-session capability
+parity and PRX-to-PRX messaging are planned; they are not current behaviour.
 
 ### Workspace cost report
 
@@ -3292,8 +3153,20 @@ work failure as well as the unconfirmed-cleanup marker.
 
 ## Advisory decision engine
 
-The default-off `[decision_engine]` is separate from causal admission. See the
+`[decision_engine]` is default-off and is separate from causal admission
+(`[causal_tree]`). It does not own prompt recall or the tool surface. See the
 [decision engine reference](decision-engine.md) for modes, telemetry and cache cost.
+
+```toml
+[decision_engine]
+enabled = false
+mode = "pre"                 # pre | post | both
+prompt_budget_tokens = 300   # 50–2000
+candidates = 5               # 1–20
+timeout_ms = 1500            # 100–30000
+telemetry_cap = 1000         # 0–100000; 0 opens no store
+observe_queue = 64           # 1–1024; overflow drops and counts
+```
 
 | Key | Default | Contract |
 | --- | --- | --- |
