@@ -88,7 +88,7 @@ wasm = "plugin.wasm"
 type = "tool"          # tool | hook | middleware | cron | provider | storage | channel
 name = "echo"
 description = "Echo the input text"
-# events = ["prx.lifecycle.*"]   # hook
+# events = ["prx.lifecycle.*"]   # hook; "*" matches all; trailing * is prefix
 # priority = 100                 # middleware, lower runs first
 # schedule = "0 * * * *"         # cron, 5-field, required for cron
 
@@ -157,9 +157,13 @@ interface hook-exports {
 }
 ```
 
-Read-only. Manifest `events` patterns select lifecycle deliveries. Dynamic
-`events.subscribe` deliveries use the topic as `event`. Only this world can
-`subscribe`.
+Hooks do not transform the agent pipeline. They may still call host functions
+(KV, `events.publish`). Manifest `events` patterns select lifecycle
+deliveries: `"*"` matches every event; a trailing `*` is a prefix; a pattern
+also matches with or without a `prx.lifecycle.` prefix. Dynamic
+`events.subscribe` deliveries use the topic as `event` and use the subscribe
+wildcards (`"*"` / `.*` suffix), which are not the same rules. Only this world
+can `subscribe`.
 
 ### `middleware` — `prx:plugin/middleware-exports`
 
@@ -247,7 +251,9 @@ The host filters senders and sets channel name and timestamp. Declaring a
 channel does not grant transport; `http-outbound` still needs permission and
 allowlist.
 
-`send` receives the host's JSON `SendMessage`.
+`send` receives JSON with `content`, `recipient`, and optional `subject`,
+`thread_ts`, `quote_timestamp`, `quote_author`. An empty recipient is refused
+before the guest runs.
 
 A plugin declares exactly one channel capability.
 
@@ -270,11 +276,15 @@ set, not as an installable capability type.
 | `events` | `wit/host/event.wit` | `events` |
 | `websocket-outbound` | none (host-linked) | `websocket-outbound` |
 
-`kv` is an in-memory map. It survives a trap rebuild of the same adapter. It
-does not persist across a process restart or a new loaded generation.
+`kv` is an in-memory map **per capability adapter**. A tool and a hook from the
+same plugin do not share keys. It survives a trap rebuild of that adapter
+only. It does not persist across a process restart or a new loaded generation.
 
-`events.publish` payload max 64 KiB; topic 1..=256 bytes; nested publish depth
-8; 4096 subscriptions; per-subscriber queue 1024. `subscribe` is hook-only.
+`events.publish` payload max 64 KiB (a string; the host does not parse JSON);
+topic 1..=256 bytes; 4096 subscriptions; per-subscriber queue 1024. Guest
+`publish` always starts at depth 0; the depth-8 helper does not bound
+guest-driven republish cycles. `subscribe` is hook-only. Patterns: `"*"`
+(every topic), `.*` suffix (prefix), otherwise exact; pattern 1..=256 bytes.
 
 `http-outbound.request` methods: GET, POST, PUT, DELETE, PATCH, HEAD. Response
 body cap 16 MiB. At most 5 redirects. Private, loopback, link-local, CGNAT and
@@ -354,8 +364,8 @@ An invalid pattern is a manifest load error.
 | `max_memory_mb` | `64` | Guest linear memory |
 | `max_execution_time_ms` | `30000` | Epoch deadline / I/O timeout |
 | `max_http_requests_per_call` | `10` | HTTP `request` and WebSocket `connect` per invocation |
-| `max_http_requests_per_minute` | unset | Optional rolling 60-second cap, shared across rebuilds |
-| `max_kv_storage_mb` | `10` | In-memory KV, keys plus values |
+| `max_http_requests_per_minute` | unset | Optional rolling 60-second cap, shared by plugin name across adapters and rebuilds |
+| `max_kv_storage_mb` | `10` | In-memory KV per capability adapter, keys plus values |
 | `max_payload_bytes` | 1/8 of memory, floor 64 KiB | Largest host-to-guest payload |
 
 A trap poisons the Wasmtime `Store`. The next call rebuilds a new store,
@@ -398,14 +408,14 @@ except through a running gateway reload/enable.
 | `prx plugin inspect SOURCE` | Same for one bundle |
 | `prx plugin trust SOURCE --sha256 HASH --manifest-sha256 HASH --permission P` | Preview; `--yes` writes the record |
 | `prx plugin revoke NAME` | Preview; `--yes` removes the record |
-| `prx plugin reload NAME --gateway-url URL` | Dry-run unless `--token-from-stdin --yes` |
-| `prx plugin enable NAME --gateway-url URL` | Posts `POST /api/plugins/NAME/enable`; does not write trust or change `[plugins] enabled` |
+| `prx plugin reload NAME --gateway-url URL` | Preview; `--token-from-stdin --yes` posts `POST /api/plugins/NAME/reload` |
+| `prx plugin enable NAME --gateway-url URL` | Preview; `--token-from-stdin --yes` posts `POST /api/plugins/NAME/enable`; does not write trust or change `[plugins] enabled` |
 
 Reload and enable require HTTPS, or HTTP to a numeric loopback origin, with
 no path, query, fragment or userinfo. The token is piped on stdin (max 4096
-bytes). Read-only autonomy refuses trust writes. A name absent from the loaded
-generation is not first-discovered by enable or reload. Apply a local trust
-change with reload or by restarting the owning runtime.
+bytes). Read-only autonomy refuses `--yes` on trust, reload and enable. A name
+absent from the loaded generation is not first-discovered by enable or reload.
+Apply a local trust change with reload or by restarting the owning runtime.
 
 Gateway console install carries `source`, `sha256`, `manifest_sha256` and
 `permissions` and records trust after the component compiles.
@@ -419,7 +429,7 @@ disk does nothing until `wasm_plugin_reload`, `prx plugin reload`,
 `wasm_plugins_manage` `update`/`refresh`, or a process restart loads it.
 
 Reload publishes a complete new generation. In-flight guest calls keep their
-store. KV of the new generation starts empty.
+store. Each adapter's KV map in the new generation starts empty.
 
 ---
 
@@ -432,7 +442,8 @@ ended by the plugin epoch deadline, not by the caller's deadline.
 to `grant_permissions`. Add allowlist entries. Private addresses are refused
 even when listed.
 
-**KV empty after restart.** Expected: the store is in-memory.
+**KV empty after restart, reload, or in another capability of the same
+plugin.** Expected: the store is in-memory and per adapter.
 
 **`subscribe` fails on a tool plugin.** Only hook-capable instances have an
 event sink.

@@ -88,10 +88,10 @@ interface config {
 **WIT:** `wit/host/kv.wit`  
 **Permission:** `"kv"`
 
-Per-plugin in-memory map (`HashMap` in the adapter supervisor). Plugins cannot
-see each other's keys. The map is **not** written to disk. It survives a trap
-rebuild of the same adapter. It is empty after a process restart and after a
-new loaded generation (install, update, reload).
+In-memory map on one capability adapter (each adapter allocates its own map).
+A tool adapter and a hook adapter from the same plugin do not share keys. The map is **not** written to disk. It survives a trap rebuild of
+that adapter only. It is empty after a process restart and after a new loaded
+generation (install, update, reload).
 
 ```wit
 interface kv {
@@ -125,9 +125,9 @@ both return `none` (denied also logs a warning).
 - `"plugin KV quota exceeded: requested N bytes, limit M bytes"` — `N` is the
   sum of every key and value byte after the write, including this key.
 
-Quota is `resources.max_kv_storage_mb` (default 10), counted as key bytes plus
-value bytes for the whole namespace. Overwriting a key credits the previous
-size.
+Quota is `resources.max_kv_storage_mb` (default 10) on that adapter's map,
+counted as key bytes plus value bytes. Overwriting a key credits the previous
+size. Two adapters of the same plugin each have their own quota.
 
 ### `delete`
 
@@ -329,11 +329,15 @@ interface events {
 | Parameter | Type |
 |-----------|------|
 | `topic` | `string` — 1..=256 bytes |
-| `payload` | `string` — JSON text, max 65536 bytes |
+| `payload` | `string` — max 65536 bytes; the host does not parse it as JSON |
 
 **Returns:** `result<_, string>`. Errors: permission, topic length,
-`"event bus: payload size N exceeds maximum 65536 bytes"`,
-`"event bus: recursion depth limit (8) exceeded for topic '…'"`.
+`"event bus: payload size N exceeds maximum 65536 bytes"`.
+
+Guest `publish` always starts at depth 0. The depth-8 helper is not applied
+across guest deliveries: the hook pump forwards topic and payload only, so a
+hook that republishes to a topic it is subscribed to is not stopped by that
+helper.
 
 When no event bus is configured, `publish` returns `ok` and drops the event.
 
@@ -341,14 +345,15 @@ When no event bus is configured, `publish` returns `ok` and drops the event.
 
 | Parameter | Type |
 |-----------|------|
-| `topic-pattern` | `string` — exact topic, or a prefix wildcard ending in `.*` |
+| `topic-pattern` | `string` — 1..=256 bytes. `"*"` matches every topic. A pattern ending in `.*` is a prefix wildcard (`weather.*` matches `weather.update`). Any other string is an exact topic. `"*"` is not an exact literal topic. |
 
 **Returns:** `result<u64, string>` — subscription id.
 
 `subscribe` requires a hook-capable instance with an event sink. Other worlds
 get `"event subscriptions require a hook-capable plugin event handler"`.
 Without a bus: `"event bus is not configured"`. At most 4096 active
-subscriptions in the process.
+subscriptions in the process. A repeated subscribe from the same hook sink
+and pattern returns the existing id.
 
 Deliveries arrive on the hook `on-event` export; the event name is the topic.
 
@@ -359,7 +364,9 @@ Deliveries arrive on the hook `on-event` export; the event name is the topic.
 | `subscription-id` | `u64` |
 
 **Returns:** `result<_, string>`. Without a bus this is `ok`. Permission errors
-as for `publish`.
+as for `publish`. Only the plugin that subscribed may remove that id; any
+other id, including another plugin's, returns
+`"event bus: subscription ID N not found"`.
 
 ---
 
