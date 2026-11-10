@@ -1184,6 +1184,9 @@ pub struct MemoryLinkInput {
     /// Agent partition the writing turn runs under (MA-01b3). `None` for unpartitioned writers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_partition: Option<AgentPartition>,
+    /// Session of the writing turn, required to resolve a partitioned stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

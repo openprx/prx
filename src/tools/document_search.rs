@@ -72,7 +72,10 @@ pub(crate) fn parse_scope_principal(args: &serde_json::Value, workspace_id: Stri
         workspace_id,
         agent_id: None,
         persona_id: None,
-        session_key: read_scope("chat_id"),
+        // MA-01b3: the resolver stamps from `_zc_scope.session_key`. Console
+        // still authors `chat_id` as the turn session (V02-R6), so that remains
+        // the fallback when the session field is absent.
+        session_key: read_scope("session_key").or_else(|| read_scope("chat_id")),
         channel: read_scope("channel"),
         sender: read_scope("sender"),
         owner_id: read_scope("owner_id"),

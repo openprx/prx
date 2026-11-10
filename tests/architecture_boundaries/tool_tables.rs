@@ -226,6 +226,14 @@ pub(super) const NON_TOOL_RECEIVER_PRODUCERS: &[(&str, &str)] = &[
         "rusqlite `unchecked_transaction()` -> Transaction",
     ),
     (
+        "begin_immediate(..)",
+        "BEGIN IMMEDIATE rusqlite Transaction for stamped writers",
+    ),
+    (
+        "super::agent_migration::begin_immediate(..)",
+        "BEGIN IMMEDIATE rusqlite Transaction for stamped writers",
+    ),
+    (
         "open_approval_ledger(..)",
         "the approval ledger opener -> rusqlite Connection",
     ),

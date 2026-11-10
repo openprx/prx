@@ -4,7 +4,7 @@
 //! sessions whose channel is `console`. Nothing is guessed: a row whose
 //! workspace, owner or session cannot be proven stays NULL and is counted.
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::SqliteMemory;
 use crate::memory::{AgentPartition, AgentScopeRefused, PartitionKey};
@@ -209,6 +209,105 @@ pub(super) fn resolve_input_scope(
         return Err(AgentScopeRefused.into());
     }
     resolve_write_scope(tx, partition, session_key).map(Some)
+}
+
+/// `BEGIN IMMEDIATE` for every stamped writer (appendix B).
+pub(super) fn begin_immediate(conn: &Connection) -> anyhow::Result<Transaction<'_>> {
+    Ok(Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?)
+}
+
+/// Mint the write scope in a short committed transaction when lookup misses.
+pub(super) fn lookup_or_mint_write_scope(
+    conn: &Connection,
+    partition: &AgentPartition,
+    session_key: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(scope) = lookup_write_scope(conn, partition, session_key)? {
+        return Ok(scope);
+    }
+    let tx = begin_immediate(conn)?;
+    let scope = resolve_write_scope(&tx, partition, session_key)?;
+    tx.commit()?;
+    Ok(scope)
+}
+
+/// Guard G (H2): four-clause COALESCE predicate for stamped upserts.
+pub(super) fn scope_conflict_guard(table: &str, has_where: bool) -> String {
+    let predicate = format!(
+        "({table}.ma_scope_id IS excluded.ma_scope_id OR EXISTS(SELECT 1 FROM agent_scopes o JOIN agent_scopes n ON n.scope_id=excluded.ma_scope_id WHERE o.scope_id={table}.ma_scope_id AND o.workspace_id=n.workspace_id AND o.owner_id=n.owner_id AND o.agent_key=n.agent_key AND o.incarnation=n.incarnation) OR ({table}.ma_scope_id IS NULL AND excluded.ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE agent_key='m')) OR (excluded.ma_scope_id IS NULL AND EXISTS(SELECT 1 FROM agent_scopes o WHERE o.scope_id={table}.ma_scope_id AND o.agent_key='m')))"
+    );
+    if has_where {
+        format!(" AND {predicate}")
+    } else {
+        format!(" WHERE {predicate}")
+    }
+}
+
+/// SET fragment that keeps a Main stamp when an unstamped writer overwrites it.
+pub(super) fn scope_coalesce_set(table: &str) -> String {
+    format!("ma_scope_id = COALESCE(excluded.ma_scope_id, {table}.ma_scope_id)")
+}
+
+/// After `INSERT OR IGNORE`, the stored stamp must equal the bound scope.
+pub(super) fn refuse_if_stored_scope_differs(
+    tx: &Transaction<'_>,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    bound: &Option<String>,
+) -> anyhow::Result<()> {
+    let sql = match (table, id_column) {
+        ("memory_events", "event_id") => "SELECT ma_scope_id FROM memory_events WHERE event_id = ?1",
+        ("memory_drafts", "draft_id") => "SELECT ma_scope_id FROM memory_drafts WHERE draft_id = ?1",
+        ("memory_links", "link_id") => "SELECT ma_scope_id FROM memory_links WHERE link_id = ?1",
+        ("documents", "document_id") => "SELECT ma_scope_id FROM documents WHERE document_id = ?1",
+        _ => anyhow::bail!("unknown stamped identity ({table}.{id_column})"),
+    };
+    let stored: Option<String> = tx.query_row(sql, params![id], |row| row.get(0))?;
+    if stored != *bound {
+        return Err(AgentScopeRefused.into());
+    }
+    Ok(())
+}
+
+/// Same incarnation, Main-over-NULL, or unstamped-over-Main (D4 / M2).
+pub(super) fn scopes_compatible(conn: &Connection, stored: Option<&str>, writer: Option<&str>) -> anyhow::Result<bool> {
+    match (stored, writer) {
+        (None, None) => Ok(true),
+        (Some(stored), Some(writer)) if stored == writer => Ok(true),
+        (Some(stored), Some(writer)) => {
+            let same: bool = conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_scopes o
+                     JOIN agent_scopes n ON n.scope_id = ?2
+                     WHERE o.scope_id = ?1
+                       AND o.workspace_id = n.workspace_id
+                       AND o.owner_id = n.owner_id
+                       AND o.agent_key = n.agent_key
+                       AND o.incarnation = n.incarnation
+                 )",
+                params![stored, writer],
+                |row| row.get(0),
+            )?;
+            Ok(same)
+        }
+        (None, Some(writer)) => {
+            let is_main: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_scopes WHERE scope_id = ?1 AND agent_key = 'm')",
+                params![writer],
+                |row| row.get(0),
+            )?;
+            Ok(is_main)
+        }
+        (Some(stored), None) => {
+            let is_main: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_scopes WHERE scope_id = ?1 AND agent_key = 'm')",
+                params![stored],
+                |row| row.get(0),
+            )?;
+            Ok(is_main)
+        }
+    }
 }
 
 /// Stamp legacy console history with its owner's Main scope. Returns how many

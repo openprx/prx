@@ -1694,14 +1694,22 @@ impl SqliteMemory {
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<MemoryEvent> {
             let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             let now = Utc::now().to_rfc3339();
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-            conn.execute(
+            let bound_scope = super::agent_migration::resolve_input_scope(
+                &tx,
+                input.agent_partition.as_ref(),
+                input.session_key.as_deref(),
+                &input.workspace_id,
+                input.owner_id.as_deref(),
+            )?;
+            tx.execute(
                 "INSERT OR IGNORE INTO memory_events (
                     event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
-                    session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
+                    session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at, ma_scope_id
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     event_id,
                     input.workspace_id,
@@ -1716,11 +1724,19 @@ impl SqliteMemory {
                     input.persona_id,
                     input.visibility.as_str(),
                     input.payload_json,
-                    now
+                    now,
+                    bound_scope
                 ],
             )?;
+            super::agent_migration::refuse_if_stored_scope_differs(
+                &tx,
+                "memory_events",
+                "event_id",
+                &event_id,
+                &bound_scope,
+            )?;
 
-            let event = conn.query_row(
+            let event = tx.query_row(
                 "SELECT id, event_id, workspace_id, owner_id, event_type, subject_table, subject_id,
                         session_key, run_id, parent_run_id, agent_id, persona_id, visibility, payload_json, created_at
                  FROM memory_events
@@ -1729,6 +1745,7 @@ impl SqliteMemory {
                 params![event_id],
                 Self::memory_event_from_row,
             )?;
+            tx.commit()?;
             Ok(event)
         })
         .await?

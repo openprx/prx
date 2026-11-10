@@ -446,6 +446,7 @@ async fn save_and_message_event_boundaries_redact_aws_keys() {
             Some(&user_event.event_id),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
