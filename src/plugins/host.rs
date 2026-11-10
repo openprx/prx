@@ -185,6 +185,11 @@ pub struct HostState {
     /// instances install this sink; other capabilities cannot claim subscriptions.
     #[cfg(feature = "wasm-plugins")]
     pub event_sink: Option<tokio::sync::mpsc::Sender<EventMessage>>,
+    /// Depth of the event the guest is handling, if this invocation is an
+    /// event delivery. `None` means the guest is not inside a delivery, so a
+    /// `publish` is top-level (depth 0).
+    #[cfg(feature = "wasm-plugins")]
+    pub current_event_depth: Option<u32>,
     /// WASI resource table (required by WasiView).
     #[cfg(feature = "wasm-plugins")]
     pub wasi_table: ResourceTable,
@@ -234,6 +239,8 @@ impl HostState {
             event_bus: None,
             #[cfg(feature = "wasm-plugins")]
             event_sink: None,
+            #[cfg(feature = "wasm-plugins")]
+            current_event_depth: None,
             #[cfg(feature = "wasm-plugins")]
             wasi_table: ResourceTable::new(),
             #[cfg(feature = "wasm-plugins")]
@@ -312,8 +319,14 @@ impl HostState {
     }
 
     /// Start a new invocation: the per-call outbound request counter resets.
+    /// Event-delivery depth is cleared here and set by the hook adapter for
+    /// `on-event` calls, so a leftover depth cannot leak into another export.
     pub const fn begin_invocation(&mut self) {
         self.http_requests_this_call = 0;
+        #[cfg(feature = "wasm-plugins")]
+        {
+            self.current_event_depth = None;
+        }
     }
 
     /// Whether `url` passes the allowlist and the address checks for an

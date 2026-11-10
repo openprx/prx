@@ -281,10 +281,13 @@ same plugin do not share keys. It survives a trap rebuild of that adapter
 only. It does not persist across a process restart or a new loaded generation.
 
 `events.publish` payload max 64 KiB (a string; the host does not parse JSON);
-topic 1..=256 bytes; 4096 subscriptions; per-subscriber queue 1024. Guest
-`publish` always starts at depth 0; the depth-8 helper does not bound
-guest-driven republish cycles. `subscribe` is hook-only. Patterns: `"*"`
-(every topic), `.*` suffix (prefix), otherwise exact; pattern 1..=256 bytes.
+topic 1..=256 bytes; 4096 subscriptions; per-subscriber queue 1024. A guest
+`publish` while handling a delivered event of depth `d` is issued at depth
+`d`, so the next delivery is at `d+1`. A publish outside any event delivery
+is depth 0. Nested guest republish is rejected when depth exceeds 8 with
+`"event bus: recursion depth limit (8) exceeded for topic '…'"`. `subscribe`
+is hook-only. Patterns: `"*"` (every topic), `.*` suffix (prefix), otherwise
+exact; pattern 1..=256 bytes.
 
 `http-outbound.request` methods: GET, POST, PUT, DELETE, PATCH, HEAD. Response
 body cap 16 MiB. At most 5 redirects. Private, loopback, link-local, CGNAT and

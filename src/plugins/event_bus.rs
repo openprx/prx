@@ -133,6 +133,12 @@ impl EventBus {
             return Err(format!("event bus: topic must contain 1..={MAX_TOPIC_BYTES} bytes"));
         }
         if depth > MAX_RECURSION_DEPTH {
+            tracing::warn!(
+                topic = %topic,
+                depth,
+                limit = MAX_RECURSION_DEPTH,
+                "event bus: recursion depth limit exceeded"
+            );
             return Err(format!(
                 "event bus: recursion depth limit ({MAX_RECURSION_DEPTH}) exceeded for topic '{topic}'"
             ));
@@ -524,6 +530,45 @@ mod tests {
         );
     }
 
+    /// Nested publish that carries the delivered `EventMessage.depth` stops
+    /// when that depth exceeds `MAX_RECURSION_DEPTH`. The first publish is
+    /// depth 0 (delivered as 1); each hop uses the delivered depth, so the
+    /// guest is entered once per allowed depth plus the delivery whose
+    /// republish is rejected (`MAX_RECURSION_DEPTH + 1`).
+    #[tokio::test]
+    async fn nested_publish_with_delivered_depth_stops_at_the_limit() {
+        let bus = Arc::new(EventBus::new());
+        let (_id, mut rx) = bus.subscribe("plugin-loop", "loop.cascade").await.unwrap();
+        bus.publish("loop.cascade", "x").await.unwrap();
+
+        let mut deliveries = 0u32;
+        loop {
+            let msg = recv_one(&mut rx)
+                .await
+                .unwrap_or_else(|| panic!("cascade ended without a depth rejection after {deliveries} deliveries"));
+            deliveries += 1;
+            match bus.publish_with_depth("loop.cascade", "x", msg.depth).await {
+                Ok(()) => {}
+                Err(err) => {
+                    assert!(
+                        err.contains("recursion depth limit"),
+                        "expected the existing depth rejection, got: {err}"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                deliveries <= MAX_RECURSION_DEPTH + 1,
+                "cascade exceeded the depth limit ({deliveries} deliveries)"
+            );
+        }
+        assert_eq!(
+            deliveries,
+            MAX_RECURSION_DEPTH + 1,
+            "one delivery per successful publish (0..=MAX) plus the rejected hop"
+        );
+    }
+
     // 9. Stress test — N tasks publish concurrently, no panics, all deliveries complete.
     #[tokio::test]
     async fn stress_concurrent_publish() {
@@ -642,6 +687,14 @@ mod tests {
             .unwrap();
         assert_eq!(message.topic, "runtime.ready");
         assert_eq!(message.payload, "payload");
+        assert_eq!(message.depth, 1, "top-level publish is stored as depth 1");
+
+        bus.publish_with_depth("runtime.ready", "nested", 3).await.unwrap();
+        let nested = timeout(Duration::from_millis(100), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(nested.depth, 4, "the pump must forward EventMessage.depth");
 
         drop(inbox);
         bus.publish("runtime.ready", "cleanup").await.unwrap();
