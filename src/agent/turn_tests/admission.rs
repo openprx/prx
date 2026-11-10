@@ -1104,11 +1104,9 @@ async fn configured_mechanics_on_wall_clock_expires_when_decision_http_stalls_pa
     } = fixture;
     driver
         .run_factory(true, || async move {
-            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
-                None,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .expect("mechanics cleanup owner");
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
             cleanup
                 .run(boxed_mechanics_work(async move {
                     let caught = std::panic::AssertUnwindSafe(AdmittedTurn::configured_mechanics_on_current_clock(
@@ -1152,11 +1150,9 @@ async fn configured_mechanics_reaches_execute_when_decision_http_stalls_past_bud
     } = fixture;
     driver
         .run_factory(true, || async move {
-            let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(
-                None,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .expect("mechanics cleanup owner");
+            let cleanup =
+                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+                    .expect("mechanics cleanup owner");
             cleanup
                 .run(boxed_mechanics_work(async move {
                     let _admission = AdmittedTurn::configured_mechanics(
