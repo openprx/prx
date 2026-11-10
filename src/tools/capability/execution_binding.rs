@@ -47,6 +47,10 @@ impl PartialEq for ExecutionBinding {
 impl Eq for ExecutionBinding {}
 
 impl ExecutionBinding {
+    pub(crate) const fn requires_approval(&self) -> bool {
+        self.requires_approval
+    }
+
     pub(crate) const fn with_required_approval(mut self, required: bool) -> Self {
         self.requires_approval = required;
         self
