@@ -1,10 +1,11 @@
 # Upgrade actions for the unreleased candidate
 
 This note lists what an existing installation must or may do when moving from
-the last release (0.8.162) to the unreleased decision-plane candidate. Items
-that need no action are listed so they are not mistaken for omissions. Details
-live in the linked pages and in the `[Unreleased]` section of the
-[changelog](../CHANGELOG.md).
+the last release (0.8.171) to this unreleased tree (Cargo.toml is still
+0.8.171). The decision plane (`[causal_tree]`) and the advisory decision
+engine (`[decision_engine]`) are separate. Items that need no action are
+listed so they are not mistaken for omissions. Details live in the linked
+pages and in the `[Unreleased]` section of the [changelog](../CHANGELOG.md).
 
 ## Actions
 
@@ -14,6 +15,12 @@ live in the linked pages and in the `[Unreleased]` section of the
 | Flat built-in tool schemas | Built-in schemas no longer publish root `allOf`/`anyOf`/`oneOf`. Refresh cached schemas and handle conditional/alternative `InvalidArguments` errors before approval. The full original contract is checked with the selected dialect's existing lowering rules; Gemini stripping and executor clamps remain supported. Direct calls without a dialect enforce all original argument rules. Aliases and permission checks remain enforced. Native Anthropic and OpenRouter `anthropic/*` now reject unlowerable external/MCP schemas locally; republish those schemas with equally strict execution validation or exclude the tools with `[tool_tiering]`. Claude via other gateways needs an explicit provider/model `[[providers.tool_dialects]]` declaration with `tool_schema = "no_root_combinators"`. No stored-data migration is required; reverting the binary restores the former schema shape and its upstream compatibility limitation. | For external schema consumers and Anthropic users with external tools |
 | Compatible-provider cache accounting | Compatible responses now retain cache-read/cache-write counts and use the effective `cache_read`/`cache_write` rates. Previously those detail fields were dropped and all prompt tokens used the input rate. Review existing `[cost.prices]` cache rates and budget expectations: their configured values are unchanged, but newly retained counts can change recorded costs. This affects PRX accounting, not provider invoices. | Before upgrading when using compatible providers with prompt caching |
 | Matrix channel removed | The Matrix channel, the `channel-matrix` feature and the vendored Matrix SDK are gone. A `[channels_config.matrix]` section is ignored with one warning at load; delete it. Its values are not kept after the next config save. A `channel.matrix` proxy selector is ignored with a warning. Use ramflux for external messaging. | Only with a Matrix channel configured |
+| Advisory decision engine | `[decision_engine]` defaults to `enabled = false`. Off means no analysis, brief, telemetry store, or outcome writes. The engine never selects tools, grants approval, or replaces `[causal_tree]` admission. Set `enabled = true` and restart only to opt into bounded pre-turn briefs and/or outcome telemetry. See [the decision engine](decision-engine.md). | To use the advisory engine |
+| Recovery keys and database backup | SQLite recovery keys live in `.recovery_keys` beside the database. A usable backup is that database file plus every key generation the snapshot names; copy them together. A database without those keys cannot recover. Keys without that database do not start a new authority. Incomplete backup directories are refused. | Before any backup or host move |
+| Targeted gateway agents | `[gateway] targeted_agents` defaults to `false`. A named `agent` on `POST /api/sessions/{id}/message` then answers 409 and never runs as Main. The switch is pre-release. | Only if you send a named agent field |
+| Quiet CLI logs | Foreground commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`, `prx status`, and other non-service commands) default to `warn` on stderr when `RUST_LOG` is unset, so stdout stays the product. `prx daemon`, `prx gateway`, and `prx channel start` keep `info`. `RUST_LOG` always wins when set. Interactive `prx chat` writes the same default filter to `chat.log`. | If a script parsed tracing from stdout |
+| Retired `[router]` continuation table | The retired continuation table under `[router]` is ignored with one warning at load; delete it. Turns keep the serving model's reply. Authenticated historical v1 replies remain readable. | Only if that table is still in the file |
+| Source-tree layout | The repository root no longer ships a `task/` notes tree. Proptest shrinking seeds belong under `tests/proptest-regressions/`; a root `proptest-regressions/` directory is gitignored and is not replayed. | Only when working from a source clone |
 | Known Codex model default effort | Declared Codex rows now use `medium` rather than `xhigh`. Set an explicit supported effort if the former behavior is required. Unknown rows keep the legacy `medium` verbosity / `xhigh` effort base. See [model levels and parameters](model-catalog.md). | Only to retain the former effort |
 | WASM plugins off by default | Set `[plugins] enabled = true` and restart only after reviewing each plugin; install or update with `wasm_plugins_manage` and explicit `grant_permissions` to write `plugin-trust.json` beside `config.toml`. The configuration directory and `plugin-cache/` must be outside the workspace. A `.prx-managed` marker grants no trust. | To use WASM plugins |
 | Plugin outbound requests | An empty `http_allowlist` now denies every URL. Use URL patterns such as `https://api.example.com/*`, not string prefixes such as `https://api.example.com*`. The SSRF guard still refuses private, loopback and other unsafe destinations. See [plugin trust and networking](plugin-developer-guide.md). | For plugins needing outbound HTTP |
@@ -124,6 +131,10 @@ enabled = false
   [agent turn engine migration](agent-turn-engine-migration.md).
 - Decision-plane rollback and downgrade limits:
   [candidate notes](release-notes-decision-plane-candidate-2026-10-04.md).
+- SQLite writer connections still use an unbounded busy handler. Deadline-scoped
+  ingress and recovery reads install a busy/progress handler on that connection
+  and restore the pool handler when the guard drops, including if handler
+  install fails. This is not a configuration key.
 - Evolution targets shaped as `skills/<name>/SKILL.md` now require an enabled
   owner-scoped lifecycle and an existing managed binding. They stage lifecycle
   proposals instead of directly rewriting the compatibility projection. Existing
