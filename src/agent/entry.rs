@@ -2061,13 +2061,6 @@ pub(crate) async fn run_with_runtime_envelope(
                     terminal_guard
                         .set(guard)
                         .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
-                    anyhow::ensure!(
-                        !matches!(
-                            decision.disposition()?,
-                            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-                        ),
-                        "Supervised approval collection requires prx chat or Console; this CLI ingress has no review adapter"
-                    );
                     if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
                         let ports = CliDecisionClose {
                             terminal_guard: terminal_guard.get(),
@@ -2541,13 +2534,6 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                     )?
                     .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
-                    anyhow::ensure!(
-                        !matches!(
-                            decision.disposition()?,
-                            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-                        ),
-                        "Supervised approval collection requires prx chat or Console; this CLI ingress has no review adapter"
-                    );
                     if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = decision.disposition()? {
                         if history.is_empty() {
                             history.push(ChatMessage::system(""));

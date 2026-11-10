@@ -3150,8 +3150,7 @@ Retry with a compatible model: /provider {shown} <model>",
         }
         let fixed_reply = admitted_binding.fixed_reply()?;
 
-        let collection_turn = admitted_binding.is_approval_collection()?;
-        let direct_decision_turn = resume_decision || fixed_reply.is_some() || collection_turn;
+        let direct_decision_turn = resume_decision || fixed_reply.is_some();
         let file_mention_enrichment = if direct_decision_turn {
             FileMentionEnrichment { prompt: user_input.clone(), visible_note: None }
         } else {

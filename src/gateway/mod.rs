@@ -2703,13 +2703,6 @@ async fn run_gateway_chat_with_multimodal(
     )?;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
-            anyhow::ensure!(
-                !matches!(
-                    context.disposition()?,
-                    crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-                ),
-                "ingress has no approval collection adapter"
-            );
             if let crate::runtime::turn_decision::TurnDisposition::Close { reply } = context.disposition()? {
                 let ports = decision_runtime::GatewayDecisionClose {
                     resource: "gateway:webhook:message_event:assistant",

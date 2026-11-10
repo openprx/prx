@@ -171,9 +171,6 @@ impl ChildSegmentTurn {
         match self.decision.disposition()? {
             TurnDisposition::Close { .. } => Ok(true),
             TurnDisposition::Run => Ok(false),
-            TurnDisposition::CollectApprovalArguments => {
-                anyhow::bail!("child turn has no approval collection adapter")
-            }
         }
     }
 

@@ -190,16 +190,6 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
     finish_owned_start_turn_fixture(cleanup).await;
 }
 
-#[tokio::test]
-async fn t31_driver_approval_review_then_resume_executes_exact_call() {
-    crate::runtime::turn_decision::run_chat_approval_contract_fixture(false).await;
-}
-
-#[tokio::test]
-async fn t31_driver_approval_denial_then_resume_skips_tool_execution() {
-    crate::runtime::turn_decision::run_chat_approval_contract_fixture(true).await;
-}
-
 /// **S3 T3-1 Step 5**: io error retry — the driver succeeds on attempt 3 after io errors on attempts 1 and 2.
 ///
 /// A short backoff keeps the unit test fast (1s+2s, 3.5s in total, comfortably inside the unit

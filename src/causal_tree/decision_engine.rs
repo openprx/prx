@@ -257,14 +257,6 @@ pub(crate) struct PreparedHop<'a, 'catalog, P: PredictionPort> {
     resume_target: Option<&'a CapabilityRef>,
 }
 
-// The borrowed preparation frame returns before either owned branch proceeds.
-// This record retains only the evidence needed for the immediate decision.
-struct CollectionReadyRecord {
-    proof: super::approval_collection::DeferredArgumentProof,
-    post_rehearsal: GateReport,
-    pre_commit: GateReport,
-}
-
 impl<P: PredictionPort> PreparedHop<'_, '_, P> {
     pub(crate) const fn candidate_count(&self) -> usize {
         self.all.len()
@@ -283,17 +275,6 @@ impl<P: PredictionPort> PreparedHop<'_, '_, P> {
 
     pub(crate) fn candidate_bodies_changed_from_prepared(&self, prior: &PreparedHop<'_, '_, P>) -> bool {
         self.candidate_bodies_changed_from(&prior.state)
-    }
-
-    /// A newly discovered, gated proposal is progress even though it adds
-    /// no executable capability. This probe never issues a collection proof.
-    pub(crate) fn gained_collection_from_prepared(
-        &self,
-        prior: &PreparedHop<'_, '_, P>,
-        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> bool {
-        CausalDecisionEngine::collection_candidate(self, adapter).is_some()
-            && CausalDecisionEngine::collection_candidate(prior, adapter).is_none()
     }
 
     /// Selected discovery can authenticate an unchanged exact candidate.
@@ -847,174 +828,6 @@ impl CausalDecisionEngine {
             outgoing_child: None,
             outgoing_parent_allowed: None,
         })
-    }
-
-    pub(crate) async fn decide_prepared_with_collection<P: PredictionPort>(
-        mut prepared: PreparedHop<'_, '_, P>,
-        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> Result<EngineDecision, EngineError> {
-        match Self::prepare_collection_routing(&mut prepared, adapter)? {
-            Some(ready) => Ok(Self::finish_collection_decision(prepared, ready)),
-            None => Self::decide_prepared(prepared).await,
-        }
-    }
-
-    /// At the read-hop limit, an already discovered operation may terminate
-    /// in argument collection. It cannot start another read or executable hop.
-    pub(crate) fn decide_terminal_with_collection<P: PredictionPort>(
-        mut prepared: PreparedHop<'_, '_, P>,
-        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> Result<EngineDecision, EngineError> {
-        prepared.inputs.terminal_only = false;
-        if let Some(ready) = Self::prepare_collection_routing(&mut prepared, adapter)? {
-            return Ok(Self::finish_collection_decision(prepared, ready));
-        }
-        prepared.inputs.terminal_only = true;
-        Self::decide_terminal_prepared(prepared)
-    }
-
-    /// Source eligibility is supplied by the verified service's sealed ingress proof.
-    /// No backend sees this result and no executable capability is selected.
-    #[inline(never)]
-    fn collection_candidate<'a, 'catalog, P: PredictionPort>(
-        prepared: &PreparedHop<'a, 'catalog, P>,
-        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> Option<(super::approval_collection::ApprovalReviewAdapter, CausalCandidate)> {
-        let inputs = &prepared.inputs;
-        let trusted = prepared.state.trusted.parts();
-        adapter
-            .filter(|_| {
-                !inputs.terminal_only
-                    && super::logical_clock::now() < inputs.deadline
-                    && trusted.delivery.interactive
-                    && trusted.delivery.approval_channel
-            })
-            .and_then(|adapter| {
-                let policy = CandidatePolicy {
-                    key: inputs.key,
-                    max_candidates: usize::from(inputs.config.policy.max_candidates),
-                    can_deliver_text: inputs.can_deliver_text,
-                    may_delegate: false,
-                    delegation_target: None,
-                    cost_model: inputs.cost_model,
-                    discovered_refs: inputs.discovered_refs,
-                };
-                CausalCandidateGenerator::exact_deferred_mutation(
-                    &prepared.state,
-                    inputs.catalog,
-                    &policy,
-                    inputs.gates,
-                )
-                .filter(|candidate| {
-                    // Discovery also populates an optional outgoing child
-                    // manifest. That is not a request to delegate this call.
-                    inputs.delegation.is_none_or(|(_, requested)| {
-                        requested
-                            .iter()
-                            .all(|reference| candidate.required_capabilities().contains(reference))
-                    }) && !inputs.catalog.iter_entries().any(|entry| {
-                        matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
-                            && super::candidate_generator::names_entry(
-                                &prepared.state.routing_input.as_str().to_lowercase(),
-                                entry,
-                            )
-                    })
-                })
-                .map(|candidate| (adapter, candidate))
-            })
-    }
-
-    fn prepare_collection_routing<'a, 'catalog, P: PredictionPort>(
-        prepared: &mut PreparedHop<'a, 'catalog, P>,
-        adapter: Option<super::approval_collection::ApprovalReviewAdapter>,
-    ) -> Result<Option<CollectionReadyRecord>, EngineError> {
-        let inputs = &prepared.inputs;
-        let candidate = Self::collection_candidate(prepared, adapter);
-        let Some((adapter, candidate)) = candidate else {
-            return Ok(None);
-        };
-        let remaining = remaining_budget(inputs, &prepared.state);
-        let post_rehearsal = HardGates::apply_with_remaining_budget(
-            &prepared.state,
-            inputs.catalog,
-            std::slice::from_ref(&candidate),
-            inputs.gates,
-            remaining,
-        )?;
-        let pre_commit = HardGates::apply_with_remaining_budget(
-            &prepared.state,
-            inputs.catalog,
-            std::slice::from_ref(&candidate),
-            inputs.gates,
-            remaining,
-        )?;
-        if ![&post_rehearsal, &pre_commit].iter().all(|report| {
-            matches!(
-                report.outcomes.get(candidate.candidate_id()),
-                Some(GateOutcome::ApprovalDeferred | GateOutcome::ApprovalOnly { .. })
-            )
-        }) {
-            return Ok(None);
-        }
-        match &mut prepared.candidates {
-            CandidateSet::Legal { report, .. } | CandidateSet::NoLegalPath { report, .. } => {
-                report
-                    .outcomes
-                    .insert(candidate.candidate_id().clone(), GateOutcome::ApprovalDeferred);
-            }
-        }
-        let [reference] = candidate.required_capabilities() else {
-            return Err(EngineError::CandidateDrift);
-        };
-        let proof = super::approval_collection::DeferredArgumentProof::issue(
-            reference.clone(),
-            adapter,
-            prepared
-                .state
-                .material_fingerprint(inputs.key)
-                .map_err(EngineError::Fingerprint)?,
-        );
-        Ok(Some(CollectionReadyRecord {
-            proof,
-            post_rehearsal,
-            pre_commit,
-        }))
-    }
-
-    // Consume the owned hop only after borrowed preparation has returned.
-    #[inline(never)]
-    fn finish_collection_decision<P: PredictionPort>(
-        prepared: PreparedHop<'_, '_, P>,
-        ready: CollectionReadyRecord,
-    ) -> EngineDecision {
-        let inputs = &prepared.inputs;
-        let CollectionReadyRecord {
-            proof,
-            post_rehearsal,
-            pre_commit,
-        } = ready;
-        EngineDecision {
-            decision_id: inputs.decision_id,
-            deadline: inputs.deadline,
-            elapsed_ms: u64::try_from(prepared.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-            state: prepared.state,
-            candidates: prepared.candidates,
-            selection: Selection::CollectApprovalArguments(proof),
-            exploration_propensities: BTreeMap::new(),
-            prediction: None,
-            request_compiled: false,
-            audit_trace: None,
-            fallback_cause: None,
-            scores: BTreeMap::new(),
-            scored_count: 0,
-            #[cfg(test)]
-            rehearsal: BTreeMap::new(),
-            post_rehearsal,
-            pre_commit,
-            call_fingerprints: BTreeMap::new(),
-            outgoing_child: None,
-            outgoing_parent_allowed: None,
-        }
     }
 
     pub(crate) async fn decide_prepared<P: PredictionPort>(

@@ -335,13 +335,6 @@ async fn run_work(
         // errors that may contain the private content being saved.
         tracing::warn!("embedded Agent user memory promotion failed");
     }
-    anyhow::ensure!(
-        !matches!(
-            decision.disposition()?,
-            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-        ),
-        "ingress has no approval collection adapter"
-    );
     if let TurnDisposition::Close { reply } = decision.disposition()? {
         let reply = reply.into_owned();
         // A fixed close adds the raw user input and the final reply after

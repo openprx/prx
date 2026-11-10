@@ -260,9 +260,6 @@ impl ChannelDecisionTurn {
         Ok(match self.context.disposition()? {
             TurnDisposition::Close { reply } => Some(reply.into_owned()),
             TurnDisposition::Run => None,
-            TurnDisposition::CollectApprovalArguments => {
-                anyhow::bail!("channel has no approval collection adapter")
-            }
         })
     }
 

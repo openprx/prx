@@ -915,23 +915,13 @@ impl ChatTurnBinding {
         .await
     }
 
-    pub(super) fn is_approval_collection(&self) -> anyhow::Result<bool> {
-        self.decision.get().map_or(Ok(false), |decided| {
-            Ok(matches!(
-                decided.context.disposition()?,
-                crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
-            ))
-        })
-    }
-
     pub(super) fn fixed_reply(&self) -> anyhow::Result<Option<String>> {
         let Some(decided) = self.decision.get() else {
             return Ok(None);
         };
         match decided.context.disposition()? {
             crate::runtime::turn_decision::TurnDisposition::Close { reply } => Ok(Some(reply.into_owned())),
-            crate::runtime::turn_decision::TurnDisposition::Run
-            | crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments => Ok(None),
+            crate::runtime::turn_decision::TurnDisposition::Run => Ok(None),
         }
     }
 

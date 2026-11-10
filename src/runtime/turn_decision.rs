@@ -47,8 +47,6 @@ pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, O
 mod owner_filesystem;
 mod pending_approval;
 pub(crate) use pending_approval::DecisionApprovalView;
-pub(crate) use pending_approval::collection::ApprovalCollectionLease;
-pub(crate) use pending_approval::collection::DECLINED_REPLY as DECLINED_COLLECTION_REPLY;
 #[path = "turn_decision/routing/replay_facts.rs"]
 mod router_replay_facts;
 pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router_provider_binding};
@@ -723,7 +721,6 @@ fn unprompted_admission_ids(
 }
 
 pub(crate) enum TurnDisposition {
-    CollectApprovalArguments,
     Close { reply: std::borrow::Cow<'static, str> },
     Run,
 }
@@ -1344,16 +1341,15 @@ impl TurnDecisionContext {
 
     pub(crate) fn disposition(&self) -> Result<TurnDisposition, DirectiveError> {
         match &self.directive {
-            TurnExecutionDirective::CollectApprovalArguments(_) if !self.execution_closed.load(Ordering::Acquire) => {
-                Ok(TurnDisposition::CollectApprovalArguments)
-            }
-            TurnExecutionDirective::CollectApprovalArguments(_) => Err(DirectiveError::NotAdmitted),
             TurnExecutionDirective::Clarify { .. }
             | TurnExecutionDirective::RequestApproval { .. }
             | TurnExecutionDirective::Refuse { .. } => Ok(TurnDisposition::Close {
                 reply: render_terminal_directive(&self.directive)?,
             }),
-            TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
+            TurnExecutionDirective::CollectApprovalArguments(_)
+            | TurnExecutionDirective::AnswerDirectly
+                if !self.execution_closed.load(Ordering::Acquire) =>
+            {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
@@ -1361,7 +1357,8 @@ impl TurnDecisionContext {
             {
                 Ok(TurnDisposition::Run)
             }
-            TurnExecutionDirective::AnswerDirectly
+            TurnExecutionDirective::CollectApprovalArguments(_)
+            | TurnExecutionDirective::AnswerDirectly
             | TurnExecutionDirective::Execute { .. }
             | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
             _ => Err(DirectiveError::ActionMismatch),
@@ -2785,9 +2782,7 @@ impl TurnDecisionService {
                 Some(prepared.candidate_count()),
             );
             let decision = if terminal_only {
-                if hop == max_hops && !stop_hops && crate::causal_tree::logical_clock::now() < deadline {
-                    CausalDecisionEngine::decide_terminal_with_collection(prepared, proof.approval_review_adapter())?
-                } else if routing_failed {
+                if routing_failed {
                     CausalDecisionEngine::decide_terminal_for_reason(prepared, "routing_failed")?
                 } else {
                     CausalDecisionEngine::decide_terminal_prepared(prepared)?
@@ -2799,7 +2794,7 @@ impl TurnDecisionService {
                         if has_router_transition { return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry)); }
                         return Err(AgentDecisionError::Cancelled);
                     },
-                    decided = CausalDecisionEngine::decide_prepared_with_collection(prepared, proof.approval_review_adapter()) => decided?,
+                    decided = CausalDecisionEngine::decide_prepared(prepared) => decided?,
                 }
             };
             if cancellation.is_cancelled() {
@@ -3188,29 +3183,26 @@ impl TurnDecisionService {
                 if cancellation.is_cancelled() {
                     return Err(AgentDecisionError::Cancelled);
                 }
-                let gained_collection =
-                    next_prepared.gained_collection_from_prepared(&previous_prepared, proof.approval_review_adapter());
-                stop_hops = !gained_collection
-                    && crate::causal_tree::decision_engine::discovery_has_no_progress(
-                        || {
-                            progress_operand!(
-                                "same_evidence",
-                                next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
-                            )
-                        },
-                        || {
-                            progress_operand!(
-                                "same_candidate_bodies",
-                                !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
-                            )
-                        },
-                        || {
-                            !progress_operand!(
-                                "same_direct_readiness",
-                                !next_prepared.gained_direct_candidate_from_prepared(&previous_prepared)
-                            )
-                        },
-                    );
+                stop_hops = crate::causal_tree::decision_engine::discovery_has_no_progress(
+                    || {
+                        progress_operand!(
+                            "same_evidence",
+                            next_prepared.evidence_fingerprint() == previous_prepared.evidence_fingerprint()
+                        )
+                    },
+                    || {
+                        progress_operand!(
+                            "same_candidate_bodies",
+                            !next_prepared.candidate_bodies_changed_from_prepared(&previous_prepared)
+                        )
+                    },
+                    || {
+                        !progress_operand!(
+                            "same_direct_readiness",
+                            !next_prepared.gained_direct_candidate_from_prepared(&previous_prepared)
+                        )
+                    },
+                );
             }
             #[cfg(test)]
             progress_diagnostic::record("stop_hops", u64::from(stop_hops));
@@ -3616,8 +3608,6 @@ pub(crate) async fn build_turn_decision_service(
 }
 
 #[cfg(test)]
-pub(crate) use tests::exact_call_approval::collection::exact_file_collection_for_review as run_chat_approval_contract_fixture;
-#[cfg(test)]
 pub(crate) use tests::with_worker_probe_manifest;
 
 #[cfg(test)]
@@ -3644,5 +3634,3 @@ pub(crate) fn selected_custom_memory_read_scope(
 #[cfg(test)]
 mod selected_custom_memory_scope_tests;
 
-#[cfg(test)]
-pub(crate) use tests::exact_call_approval::collection::{exact_file_collection_for_review, historical_approval_events};

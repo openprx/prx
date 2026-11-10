@@ -258,27 +258,7 @@ impl DecisionRecordBuilder {
         let rejected = json!(GateRejections::for_hop(hop));
         gate_values.insert("rejected_by_gate".to_owned(), rejected.clone());
         gate_values.insert("turn_rejected_by_gate".to_owned(), rejected);
-        let mut gates = Value::Object(gate_values);
-        if let Selection::CollectApprovalArguments(proof) = &hop.selection {
-            if proof.state_fingerprint() != state_fingerprint
-                || hop.request_compiled
-                || hop.prediction.is_some()
-                || !hop.scores.is_empty()
-                || hop.outgoing_child.is_some()
-            {
-                return Err(RecordBuildError::Binding);
-            }
-            gates.as_object_mut().ok_or(RecordBuildError::Binding)?.insert(
-                "approval_collection".to_owned(),
-                json!({ "version": 1, "state_fingerprint": proof.state_fingerprint(),
-                    "capability": { "id": proof.capability().id.as_str(),
-                        "schema": hex::encode(proof.capability().fingerprint.0),
-                        "generation": proof.capability().generation.to_hex() }, "adapter": match proof.adapter() {
-                        super::approval_collection::ApprovalReviewAdapter::ChatOwnerReview => "chat_owner_review",
-                        super::approval_collection::ApprovalReviewAdapter::ConsoleOwnerReview => "console_owner_review",
-                    } }),
-            );
-        }
+        let gates = Value::Object(gate_values);
         let attempts = hop.prediction.as_ref().map_or_else(Vec::new, |prediction| {
             prediction
                 .attempts

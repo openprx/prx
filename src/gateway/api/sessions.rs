@@ -764,12 +764,6 @@ async fn run_console_runtime_turn(
         &outcome,
         crate::agent::turn_contracts::ToolLoopOutcome::AwaitingApproval { .. }
     );
-    if decision.context.approval_collection_proof().is_some() {
-        anyhow::ensure!(
-            awaiting_approval || decision.context.collected_declined_event().is_some(),
-            "Console collection returned without a durable pending approval"
-        );
-    }
     let reply = outcome.into_text();
     anyhow::ensure!(
         trace.execution_trace.as_ref() == Some(&decision.context.terminal_execution_trace()),
@@ -2299,17 +2293,7 @@ async fn run_console_message_job_work(
                 return Err(error);
             }
         };
-        let provider_trace = if context.approval_collection_proof().is_some() {
-            Some((
-                std::sync::Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default()),
-                std::sync::Arc::new(
-                    console_route_decision(&turn_runtime, &runtime_envelope, &message)
-                        .map_err(|error| error.to_string())?,
-                ),
-            ))
-        } else {
-            None
-        };
+        let provider_trace = None;
         ConsoleDecisionTurn {
             service: std::sync::Arc::clone(service),
             provider_trace,
@@ -2378,16 +2362,6 @@ async fn run_console_message_job_work(
                 ));
             }
             crate::runtime::turn_decision::TurnDisposition::Run => {}
-            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments => {
-                if target.is_some() {
-                    // Approval collection is a durable pending decision; a
-                    // targeted turn has none until MA-04.
-                    return Err("Targeted agents cannot collect approvals".to_owned());
-                }
-                if mode != ConsoleTurnMode::Message || decision.provider_trace.is_none() {
-                    return Err("Console collection requires the owning main-turn trace".to_owned());
-                }
-            }
         }
         if mode == ConsoleTurnMode::Resume {
             crate::gateway::authorize_gateway_config_resource_mutation(
@@ -2715,7 +2689,6 @@ pub(crate) async fn drive_disabled_engine_console_entry(workspace: &std::path::P
 
 #[cfg(test)]
 mod tests {
-    mod collection;
     mod targeting;
     use super::*;
     use crate::config::Config;

@@ -1,6 +1,5 @@
 //! Authenticated pending approval metadata. No caller-supplied operation or
 //! digest can create a record; issuance requires the service's gated context.
-pub(super) mod collection;
 mod h2;
 mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
@@ -214,47 +213,6 @@ impl TurnDecisionService {
 
     async fn persist_pending_record(&self, record: PendingRecord, source: &MessageEvent) -> anyhow::Result<()> {
         self.persist_pending_record_receipt(record, source).await.map(|_| ())
-    }
-
-    async fn persist_collection_pending_record(
-        &self,
-        context: Arc<TurnDecisionContext>,
-        record: PendingRecord,
-        source: &MessageEvent,
-    ) -> anyhow::Result<()> {
-        let proof = context
-            .approval_collection_proof()
-            .context("collection proof missing")?;
-        anyhow::ensure!(
-            context.service_id == self.service_id
-                && context
-                    .approval_collection_started
-                    .load(std::sync::atomic::Ordering::Acquire)
-                && record.binding.decision_id == context.decision_id().to_string()
-                && record.capabilities.as_slice()
-                    == [(
-                        proof.capability().id.as_str().to_owned(),
-                        proof.capability().fingerprint.0,
-                        proof.capability().generation.0
-                    )]
-                && record.subject.workspace_id == source.workspace_id
-                && source.owner_id.as_deref() == Some(record.subject.owner_id.as_str())
-                && record.subject.session_key == source.session_key
-                && source.run_id.as_deref() == Some(record.run_id.as_str())
-                && record.source_event_id == source.event_id
-                && record.sealed_call.is_some()
-                && !record.op_ids.is_empty(),
-            "collection pending commitment mismatch"
-        );
-        let expires_at = record.expires_at;
-        let event = self.persist_pending_record_receipt(record, source).await?;
-        if let Some(owner) = context.recursive_allowance.get() {
-            owner.retain_pending(expires_at);
-        }
-        context
-            .collected_approval_result
-            .set(Box::new(CollectedApprovalResult { event }))
-            .map_err(|_| anyhow::anyhow!("collection pending receipt already installed"))
     }
 
     async fn persist_pending_record_receipt(

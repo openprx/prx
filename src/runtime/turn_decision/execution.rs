@@ -789,10 +789,6 @@ impl TurnDecisionService {
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Vec<crate::skills::Skill>> {
-        if context.approval_collection_proof().is_some() {
-            self.validate_approval_collection(proof, context)?;
-            return Ok(Vec::new());
-        }
         let _ = self.agent_execution_specs(proof, context)?;
         let refs: Vec<_> = context.execution_refs().iter().cloned().collect();
         let entries = self.catalog.resolve(&refs)?;
@@ -837,73 +833,6 @@ impl TurnDecisionService {
             skill_names: &names,
         });
         Ok(skills)
-    }
-
-    pub(crate) fn validate_approval_collection<'a>(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &'a TurnDecisionContext,
-    ) -> anyhow::Result<&'a crate::causal_tree::approval_collection::DeferredArgumentProof> {
-        anyhow::ensure!(
-            context.service_id == self.service_id,
-            "decision belongs to another service"
-        );
-        anyhow::ensure!(
-            context.source_actor_matches(Some(proof.policy_channel()), Some(proof.policy_sender())),
-            "execution decision belongs to another ingress actor"
-        );
-        let model = self.resolve_agent_model(proof)?;
-        self.check_live_parity()?;
-        let catalog = self
-            .catalog
-            .view(&CatalogScope::default())
-            .with_surface(&self.publication_policy);
-        let model_ref = format!("{}:{}", model.provider_label(), model.model());
-        let exclusions = effective_agent_exclusions(
-            &self.generation.effective,
-            &self.registry,
-            &catalog,
-            model.model(),
-            &self.policy_version,
-            &self.state_key,
-        );
-        validate_agent_retrieval_provenance(
-            proof,
-            context.engine.state.trusted.parts(),
-            &model_ref,
-            &self.policy_version,
-            &exclusions.names,
-            exclusions.model_admission.as_deref(),
-        )?;
-        anyhow::ensure!(
-            context.engine.state.routing_input.as_str()
-                == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref(),
-            "decision input changed"
-        );
-        anyhow::ensure!(
-            context.catalog_generation() == catalog.generation(),
-            "decision catalog changed"
-        );
-        // The decision deadline bounded prediction/rehearsal/hops, not this
-        // subsequent main-provider turn. Its owner retains cancellation, idle
-        // supervision and cleanup; source/parity/closed checks still apply.
-        let collection = context
-            .approval_collection_proof()
-            .ok_or_else(|| anyhow::anyhow!("collection proof missing"))?;
-        anyhow::ensure!(
-            matches!(&context.directive, TurnExecutionDirective::CollectApprovalArguments(issued) if issued == collection),
-            "collection directive differs from its selected proof"
-        );
-        let state_fingerprint = context.engine.state.material_fingerprint(&self.state_key)?;
-        anyhow::ensure!(
-            proof.approval_review_adapter() == Some(collection.adapter())
-                && collection.state_fingerprint() == state_fingerprint
-                && collection.capability().generation == catalog.generation()
-                && !context.execution_closed.load(std::sync::atomic::Ordering::Acquire)
-                && context.execution_refs.is_empty(),
-            "collection source or lifetime changed"
-        );
-        Ok(collection)
     }
 
     pub(crate) fn agent_execution_specs(

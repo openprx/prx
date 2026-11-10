@@ -1497,7 +1497,7 @@ mod collection_decline_tests {
 
     #[test]
     fn decline_receipt_binds_source_decision_and_exact_clarification() {
-        let reply = crate::runtime::turn_decision::DECLINED_COLLECTION_REPLY;
+        let reply = "No operation has been executed or submitted for approval. Are you asking for an explanation of this capability, or requesting an action?";
         let payload = serde_json::json!({
             "version": 1, "decision_id": "prx-decision", "source_event_id": "prx-source",
             "reply_sha256": hex::encode(sha2::Sha256::digest(reply.as_bytes())),

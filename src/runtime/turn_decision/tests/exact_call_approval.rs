@@ -330,7 +330,6 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         // This genuine Chat input did not mention either file mutation. Its
         // selected read is not authority to collect or discover a write.
         assert!(context.approval_collection_proof().is_none());
-        assert!(service.begin_approval_collection(proof.as_ref(), &context).is_err());
         assert!(selected.specs.iter().all(|spec| spec.name != tool_name));
         let entry = service.catalog.entry_for_public_name(tool_name).unwrap();
         assert!(
@@ -405,9 +404,6 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
 
 #[path = "exact_call_approval/native_usage.rs"]
 mod native_usage;
-
-#[path = "exact_call_approval/collection.rs"]
-pub(crate) mod collection;
 
 #[path = "exact_call_approval/ordinary_plane.rs"]
 mod ordinary_plane;

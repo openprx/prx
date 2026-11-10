@@ -430,8 +430,8 @@ async fn run_turn_ignores_recorded_collect_directive() {
         );
     assert!(
         matches!(
-            context.disposition().expect("collect directive is readable"),
-            crate::runtime::turn_decision::TurnDisposition::CollectApprovalArguments
+            context.directive(),
+            crate::causal_tree::directive::TurnExecutionDirective::CollectApprovalArguments(_)
         ),
         "the fixture must carry a Collect directive"
     );
