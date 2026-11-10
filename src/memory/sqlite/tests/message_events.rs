@@ -951,3 +951,114 @@ async fn load_recent_shared_context_filters_roles_and_orders_chronologically() {
         vec!["first user", "second user"]
     );
 }
+
+/// Child start (`record_child_input` → `append_message_event`) fans out N
+/// writers onto one workspace file: each `SqliteMemory` is its own pool, the
+/// same shape as a spawn_batch member plus a second opener on that file
+/// (gateway `test_app_state`).
+///
+/// Writer 0 parks after a snapshot read. Writers 1..N-1 then commit. WAL
+/// `BEGIN DEFERRED` makes writer 0's INSERT return SQLITE_BUSY_SNAPSHOT /
+/// "database is locked" without the busy handler. `BEGIN IMMEDIATE` already
+/// holds the write lock, so the others wait and every writer succeeds.
+///
+/// MUTATION GUARD: restore `unchecked_transaction()` (BEGIN DEFERRED) on the
+/// append path and writer 0 fails with SQLITE_BUSY instead of waiting.
+#[tokio::test]
+async fn concurrent_child_start_writers_do_not_surface_sqlite_busy() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    const WRITERS: usize = 8;
+    // Open every pool before parking writer 0: creating them after the hold
+    // can outlast the snapshot wait on a loaded builder, drop the release
+    // receiver, and panic on send.
+    let mut memories: Vec<SqliteMemory> = (0..WRITERS)
+        .map(|_| SqliteMemory::new(tmp.path()).expect("test: child writer pool"))
+        .collect();
+    let runtime = tokio::runtime::Handle::current();
+    let (hold, _guard) = super::super::events::arm_append_snapshot_hold();
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let first = memories.remove(0);
+    let first_thread = {
+        let runtime = runtime.clone();
+        std::thread::spawn(move || {
+            let mut input = message_input(
+                "prx_workspace",
+                "child-0 start",
+                MemoryVisibility::Workspace,
+                None,
+                Some("prx_session"),
+                Some("prx_user"),
+            );
+            input.owner_id = Some("prx_user".to_string());
+            input.run_id = Some("child-0".to_string());
+            runtime.block_on(first.append_message_event(input))
+        })
+    };
+    hold.entered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("test: first writer must pin a WAL snapshot");
+
+    let mut threads = Vec::with_capacity(WRITERS - 1);
+    for (index, memory) in memories.into_iter().enumerate() {
+        let runtime = runtime.clone();
+        let completed = std::sync::Arc::clone(&completed);
+        let child = index + 1;
+        threads.push(std::thread::spawn(move || {
+            let mut input = message_input(
+                "prx_workspace",
+                &format!("child-{child} start"),
+                MemoryVisibility::Workspace,
+                None,
+                Some("prx_session"),
+                Some("prx_user"),
+            );
+            input.owner_id = Some("prx_user".to_string());
+            input.run_id = Some(format!("child-{child}"));
+            let result = runtime.block_on(memory.append_message_event(input));
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
+        }));
+    }
+    let wait_until = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    while completed.load(std::sync::atomic::Ordering::SeqCst) < WRITERS - 1 && std::time::Instant::now() < wait_until {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    hold.release.send(()).expect("test: release first writer");
+
+    let mut locked = Vec::new();
+    match first_thread.join().expect("test: child writer thread") {
+        Ok(_) => {}
+        Err(error) => {
+            let text = error.to_string();
+            if sqlite_busy(&text) {
+                locked.push(format!("child-0: {text}"));
+            } else {
+                panic!("test: child-0 failed: {text}");
+            }
+        }
+    }
+    for (index, thread) in threads.into_iter().enumerate() {
+        match thread.join().expect("test: child writer thread") {
+            Ok(_) => {}
+            Err(error) => {
+                let text = error.to_string();
+                let child = index + 1;
+                if sqlite_busy(&text) {
+                    locked.push(format!("child-{child}: {text}"));
+                } else {
+                    panic!("test: child-{child} failed: {text}");
+                }
+            }
+        }
+    }
+    assert!(
+        locked.is_empty(),
+        "no child start writer may fail with SQLITE_BUSY: {locked:?}"
+    );
+}
+
+fn sqlite_busy(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("database is locked") || text.contains("sqlite_busy")
+}
