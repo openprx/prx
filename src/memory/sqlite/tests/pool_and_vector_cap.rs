@@ -94,6 +94,7 @@ async fn saturated_read_pool_queues_instead_of_failing() {
     let (_tmp, mem) = temp_sqlite_with_read_pool(1);
     let held = mem.pool.read().expect("test: hold the only reader");
 
+    let wait_before = mem.pool_stats().total_reader_wait;
     let pool = Arc::clone(&mem.pool);
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let waiter = thread::spawn(move || {
@@ -102,12 +103,24 @@ async fn saturated_read_pool_queues_instead_of_failing() {
         done_tx.send(()).expect("test: report completion");
     });
 
+    // The pool starts its measurement before publishing this waiter count.
+    // Begin the held interval only after the waiter is actually queued.
+    let queue_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while mem.pool_stats().reader_waiters != 1 {
+        assert!(
+            std::time::Instant::now() < queue_deadline,
+            "the reader must enter the wait queue"
+        );
+        thread::yield_now();
+    }
+    let held_since = std::time::Instant::now();
     assert!(
         done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
         "a saturated pool must make the caller wait"
     );
     assert_eq!(mem.pool_stats().reader_waiters, 1, "the waiting caller is observable");
 
+    let held_interval = held_since.elapsed();
     drop(held);
     done_rx
         .recv_timeout(Duration::from_secs(30))
@@ -117,10 +130,10 @@ async fn saturated_read_pool_queues_instead_of_failing() {
     let stats = mem.pool_stats();
     assert_eq!(stats.max_readers, 1);
     assert!(stats.saturated_reader_acquisitions >= 1, "saturation is counted");
+    let measured_wait = stats.total_reader_wait.saturating_sub(wait_before);
     assert!(
-        stats.total_reader_wait >= Duration::from_millis(300),
-        "the wait is measured, not bounded: {:?}",
-        stats.total_reader_wait
+        measured_wait >= held_interval,
+        "the queued wait must cover the held interval: measured {measured_wait:?}, held {held_interval:?}"
     );
 }
 
