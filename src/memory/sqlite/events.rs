@@ -314,7 +314,7 @@ impl SqliteMemory {
         .await?
     }
 
-    pub(super) fn append_event_row(
+    pub(in crate::memory::sqlite) fn append_event_row(
         tx: &rusqlite::Transaction<'_>,
         input: MessageEventInput,
         bounded_receipt: bool,

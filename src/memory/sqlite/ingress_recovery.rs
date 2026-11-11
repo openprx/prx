@@ -363,7 +363,7 @@ fn stored_capsule(connection: &Connection, event_id: &str) -> anyhow::Result<Ing
     IngressCapsule::decode(&encoded)
 }
 
-pub(super) fn before_append(
+pub(in crate::memory::sqlite) fn before_append(
     transaction: &Transaction<'_>,
     operation: &AtomicIngressMutation,
     input: &MessageEventInput,
@@ -489,7 +489,7 @@ fn state_label(state: IngressRecoveryState) -> anyhow::Result<&'static str> {
     }
 }
 
-pub(super) fn after_append(
+pub(in crate::memory::sqlite) fn after_append(
     transaction: &Transaction<'_>,
     operation: &AtomicIngressMutation,
     event: &MessageEvent,

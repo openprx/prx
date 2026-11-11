@@ -898,6 +898,49 @@ impl Memory for EncryptedScope {
         Ok(self.reveal(event))
     }
 
+    async fn commit_recovery_terminal(
+        &self,
+        mut commit: crate::memory::recovery_authority::RecoveryTerminalCommit,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::recovery_authority::RecoveryTerminalOutcome> {
+        for event in &mut commit.events {
+            self.seal_event_content(event)?;
+        }
+        if let Some(ingress) = commit.ingress.as_mut() {
+            self.seal_event_content(&mut ingress.evidence)?;
+        }
+        let reveal = EncryptedScope {
+            inner: Arc::clone(&self.inner),
+            crypto: Arc::clone(&self.crypto),
+            account_id: self.account_id.clone(),
+            scope: self.scope.clone(),
+        };
+        crate::memory::sqlite::map_after_prefix(move |hook| {
+            Box::new(move |prefix, final_input| {
+                let revealed: Vec<_> = prefix.iter().cloned().map(|event| reveal.reveal(event)).collect();
+                hook(&revealed, final_input)
+            })
+        });
+        let outcome = self.inner.commit_recovery_terminal(commit, deadline).await?;
+        Ok(match outcome {
+            crate::memory::recovery_authority::RecoveryTerminalOutcome::Committed { receipt, events } => {
+                crate::memory::recovery_authority::RecoveryTerminalOutcome::Committed {
+                    receipt,
+                    events: events.into_iter().map(|event| self.reveal(event)).collect(),
+                }
+            }
+            crate::memory::recovery_authority::RecoveryTerminalOutcome::Replayed { receipt, events } => {
+                crate::memory::recovery_authority::RecoveryTerminalOutcome::Replayed {
+                    receipt,
+                    events: events.into_iter().map(|event| self.reveal(event)).collect(),
+                }
+            }
+            crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict => {
+                crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict
+            }
+        })
+    }
+
     async fn load_recent_shared_context(
         &self,
         query: crate::memory::SharedContextQuery,

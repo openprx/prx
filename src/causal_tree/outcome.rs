@@ -637,6 +637,27 @@ pub(crate) enum OutcomeCorrelationError {
 }
 
 impl TerminalFacts {
+    /// Live terminal facts for recovered skill signals before the marker exists.
+    pub(crate) const fn from_live(
+        terminal_id: String,
+        status: TurnTerminalStatus,
+        provider_outcome: Option<ProviderExecutionOutcome>,
+        execution_trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+    ) -> Self {
+        Self {
+            collected_pending: false,
+            collected_declined: false,
+            resume_claimed: false,
+            terminal_id,
+            status,
+            provider_outcome,
+            usage: None,
+            cost: None,
+            latency_ms: 0,
+            execution_trace,
+        }
+    }
+
     pub(crate) const fn with_verified_resume(
         mut self,
         replay: &crate::agent::terminal::VerifiedTerminalReplay,
@@ -1100,6 +1121,7 @@ impl OutcomeCorrelator {
             match cost {
                 CostSettlement::Recorded { .. } => "recorded",
                 CostSettlement::Replayed => "replayed",
+                CostSettlement::ProjectionPending => "projection_pending",
                 CostSettlement::Disabled => "disabled",
                 CostSettlement::UnknownPricing => "unknown_pricing",
                 CostSettlement::Subscription { .. } => "subscription",
@@ -1285,7 +1307,9 @@ mod tests {
 
     #[test]
     fn a_genuinely_different_settlement_is_still_rejected() {
-        use crate::cost::types::CostSettlement::{Disabled, Failed, Replayed, Subscription, UnknownPricing};
+        use crate::cost::types::CostSettlement::{
+            Disabled, Failed, ProjectionPending, Replayed, Subscription, UnknownPricing,
+        };
         let stored = priced_usage("terminal-1", 0.25);
         let mut other_amount = stored.clone();
         other_amount.cost_usd = Some(0.5);
@@ -1302,6 +1326,7 @@ mod tests {
         // Replayed only stands in for Recorded, never for any other outcome.
         for kind in [
             UnknownPricing,
+            ProjectionPending,
             Subscription {
                 provider: "kimi-code".to_owned(),
                 model: "kimi-for-coding".to_owned(),

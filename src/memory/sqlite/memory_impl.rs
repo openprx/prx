@@ -748,6 +748,14 @@ impl Memory for SqliteMemory {
         .map(|(event, _)| event)
     }
 
+    async fn commit_recovery_terminal(
+        &self,
+        commit: crate::memory::recovery_authority::RecoveryTerminalCommit,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<crate::memory::recovery_authority::RecoveryTerminalOutcome> {
+        self.commit_recovery_terminal_impl(commit, deadline).await
+    }
+
     async fn append_message_event_until(
         &self,
         input: MessageEventInput,

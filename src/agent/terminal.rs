@@ -6,6 +6,7 @@
 //! computes one usage settlement, and appends one `turn.finalized` commit marker.
 
 pub(crate) mod logical;
+pub(crate) mod recovery_commit;
 mod replay;
 #[cfg(test)]
 pub(crate) use replay::reseal_payload_for_test;
@@ -825,6 +826,7 @@ async fn finalize_turn_impl(
             // message store. Its insert/readback transaction elects one decision
             // before any usage, cost or assistant write, including across
             // processes. A retry of the same decision may reuse the claim.
+            if !fabric.records_recovery_terminal() {
             let claim_key = format!("turn:{}:decision-claim", commit.terminal_id);
             // A keyed, versioned digest binds the facts that can change terminal
             // side effects. Redaction precedes the digest, and the durable key
@@ -924,6 +926,7 @@ async fn finalize_turn_impl(
                 "terminal decision claim conflicts with the pinned decision or scope"
             );
             prepared.bind_claim(&recorded.key, &claim)?;
+            }
             prepared_replay = Some(prepared);
         }
         // Everything below persists the reply and the outcome (the assistant
@@ -945,6 +948,20 @@ async fn finalize_turn_impl(
             .provider_outcome
             .as_ref()
             .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
+
+        if fabric.records_recovery_terminal() {
+            return recovery_commit::finalize_recovery_terminal(
+                fabric,
+                commit,
+                cost_config,
+                workspace_dir,
+                stop_after_marker,
+                execution_trace,
+                prepared_replay,
+                usage_settlement,
+            )
+            .await;
+        }
 
         // The canonical usage event is written before the JSONL projection. A
         // crash can therefore leave usage awaiting projection, but can no longer
@@ -1214,7 +1231,7 @@ mod tests {
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use std::sync::Arc;
 
-    fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
+    pub(crate) fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
         let started_at = chrono::Utc::now();
         TurnTerminalDraft {
             decision: None,
@@ -1318,7 +1335,7 @@ mod tests {
 
     // Issue actual source authority, seed only that authenticated memory scope,
     // and let the production decision/turn loop produce its observations.
-    async fn bind_terminal_fixture(
+    pub(crate) async fn bind_terminal_fixture(
         workspace: &Path,
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
@@ -1327,7 +1344,7 @@ mod tests {
         bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true).await
     }
 
-    async fn bind_terminal_fixture_mode(
+    pub(crate) async fn bind_terminal_fixture_mode(
         workspace: &Path,
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
@@ -1587,6 +1604,7 @@ mod tests {
             .with_channel("cli")
             .with_session_key(proof.session_key())
             .with_run_id(proof.run_id());
+        draft.scope.causation_event_id = proof.source_event_id().map(str::to_owned);
         draft.decision = Some(decision);
         // The decision writer can enqueue causal events after its own commit.
         // Establish fixture baselines only after both queues acknowledge.
@@ -1767,8 +1785,7 @@ mod tests {
 
         assert!(matches!(
             receipt.cost_settlement,
-            Some(CostSettlement::Failed { ref error })
-                if error.contains("failed to create cost state directory")
+            Some(CostSettlement::ProjectionPending)
         ));
         let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
@@ -1797,7 +1814,7 @@ mod tests {
             terminal_payload
                 .pointer("/cost_settlement/status")
                 .and_then(serde_json::Value::as_str),
-            Some("failed")
+            Some("projection_pending")
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
@@ -1901,7 +1918,7 @@ mod tests {
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
-    fn priced_cost_config() -> CostConfig {
+    pub(crate) fn priced_cost_config() -> CostConfig {
         let mut cost_config = CostConfig::default();
         cost_config.prices.insert(
             "ollama/prx-local-model".to_string(),
@@ -1940,14 +1957,17 @@ mod tests {
         let first = finalize_turn(&fabric, commit.clone(), &cost_config, temp.path())
             .await
             .unwrap();
-        assert!(matches!(first.cost_settlement, Some(CostSettlement::Recorded { .. })));
+        assert!(matches!(first.cost_settlement, Some(CostSettlement::ProjectionPending)));
         let charged = ledger_lines_for(temp.path(), terminal_id);
         assert_eq!(charged, 1, "the first finalization charges exactly once");
 
         let second = finalize_turn(&fabric, commit, &cost_config, temp.path())
             .await
             .expect("a priced replay over the committed marker must finalize");
-        assert!(matches!(second.cost_settlement, Some(CostSettlement::Replayed)));
+        assert!(matches!(
+            second.cost_settlement,
+            Some(CostSettlement::ProjectionPending)
+        ));
         assert_eq!(first.terminal_event.event_id, second.terminal_event.event_id);
         assert_eq!(first.usage_settlement, second.usage_settlement);
         assert_eq!(ledger_lines_for(temp.path(), terminal_id), charged, "no second charge");
@@ -1984,10 +2004,10 @@ mod tests {
         ));
         let error = finalize_turn(&fabric, different, &cost_config, temp.path()).await;
         let error = error.expect_err("a different settlement must not replay over the marker");
+        let text = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("terminal decision claim conflicts with the pinned decision or scope"),
+            text.contains("terminal decision claim conflicts with the pinned decision or scope")
+                || text.contains("recovery terminal commit conflict"),
             "unexpected rejection: {error:#}"
         );
         assert_eq!(
@@ -2029,8 +2049,7 @@ mod tests {
 
         assert!(matches!(
             receipt.cost_settlement,
-            Some(CostSettlement::Failed { ref error })
-                if error.contains("Failed to open cost storage")
+            Some(CostSettlement::ProjectionPending)
         ));
         let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
         assert_eq!(
@@ -2115,7 +2134,10 @@ mod tests {
 
         drop(lock_file);
         let receipt = task.await.unwrap().unwrap();
-        assert!(matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })));
+        assert!(matches!(
+            receipt.cost_settlement,
+            Some(CostSettlement::ProjectionPending)
+        ));
         assert_eq!(
             std::fs::read_to_string(&cost_path)
                 .unwrap()
@@ -2486,7 +2508,7 @@ mod tests {
             "the configured price no longer matches: {usage:?}"
         );
         assert!(
-            matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })),
+            matches!(receipt.cost_settlement, Some(CostSettlement::ProjectionPending)),
             "the spend was not recorded against the budget: {:?}",
             receipt.cost_settlement
         );
@@ -3078,4 +3100,7 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) use tests::seed_replayable_completed_terminal;
+pub(crate) use tests::{
+    bind_terminal_fixture, bind_terminal_fixture_mode, completed_commit, priced_cost_config,
+    seed_replayable_completed_terminal,
+};

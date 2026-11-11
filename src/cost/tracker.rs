@@ -14,10 +14,27 @@ use std::sync::{Arc, OnceLock};
 mod report;
 mod settlement;
 pub use report::{CostTotals, WorkspaceCostReport, workspace_cost_report};
+#[cfg(test)]
+pub(crate) use settlement::{crash_after_append, crash_before_append, force_io_error};
 
 const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 const MAX_READ_ONLY_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static SETTLE_METERED_CALLS: std::sync::atomic::AtomicUsize = const { std::sync::atomic::AtomicUsize::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn settle_metered_call_count() -> usize {
+    SETTLE_METERED_CALLS.with(|cell| cell.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_settle_metered_call_count() {
+    SETTLE_METERED_CALLS.with(|cell| cell.store(0, std::sync::atomic::Ordering::SeqCst));
+}
 
 #[cfg(unix)]
 pub(super) fn read_state_ledger_bounded(workspace: &Path, filename: &str) -> Result<Option<String>> {
@@ -823,6 +840,8 @@ impl CostTracker {
         &self,
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     ) -> Result<CostSettlement> {
+        #[cfg(test)]
+        SETTLE_METERED_CALLS.with(|cell| cell.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
         self.settle_metered_inner(record, None)
     }
 

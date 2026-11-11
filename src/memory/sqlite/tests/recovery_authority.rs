@@ -1891,3 +1891,235 @@ mod attestation {
         drop(dir);
     }
 }
+
+fn outbox_facts(pricing: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "v": 1,
+        "terminal_id": "prx_settlement",
+        "status": "completed",
+        "pricing": pricing,
+        "usage": serde_json::Value::Null,
+        "usage_event_id": serde_json::Value::Null,
+        "final_event_id": "prx_final",
+    }))
+    .expect("test: outbox facts")
+}
+
+fn assert_outbox_error(error: &anyhow::Error, expected: &str, cell: &str) {
+    assert!(
+        error.chain().any(|cause| cause.to_string() == expected) || error.to_string().contains(expected),
+        "{cell}: expected {expected}, got {error:#}"
+    );
+}
+
+#[test]
+#[serial_test::serial(recovery_authority)]
+fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
+    crate::memory::sqlite::skip_outbox_mac_verify(false);
+    let (dir, memory) = store()?;
+    let key_id = memory.activate_recovery_authority()?;
+    let workspace = "prx_workspace";
+    let owner = "prx_owner";
+    let settlement = "prx_settlement";
+    let facts = outbox_facts("metered");
+    let digest = crate::memory::sqlite::usage_digest_for_test(&memory, &key_id, &facts)?;
+    let (mac, state_mac) = crate::memory::sqlite::sign_outbox_for_test(
+        &memory,
+        workspace,
+        owner,
+        settlement,
+        &key_id,
+        &digest,
+        crate::memory::recovery_authority::RecoveryPricing::Metered,
+        &facts,
+    )?;
+    let insert = |memory: &SqliteMemory,
+                  workspace: &str,
+                  owner: &str,
+                  settlement: &str,
+                  version: i64,
+                  key_id: &str,
+                  digest: &[u8],
+                  pricing: &str,
+                  state: &str,
+                  facts: &[u8],
+                  mac: &[u8],
+                  state_mac: &[u8]| {
+        crate::memory::sqlite::insert_raw_for_test(
+            memory, workspace, owner, settlement, version, key_id, digest, pricing, state, facts, mac, state_mac,
+        )
+    };
+    insert(
+        &memory, workspace, owner, settlement, 1, &key_id, &digest, "metered", "pending", &facts, &mac, &state_mac,
+    )?;
+    let path = memory.db_path.clone();
+    drop(memory);
+    let reopened = SqliteMemory::new_with_path(path.clone())?;
+    let page = reopened.pending_recovery_costs(workspace, None, 8)?;
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.first().expect("test: pending row").settlement_id, settlement);
+    drop(reopened);
+
+    let refuse_pending = |cell: &str, expected: &str, mutate: &dyn Fn(&SqliteMemory)| {
+        let memory = SqliteMemory::new_with_path(path.clone()).expect("test: reopen");
+        memory
+            .pool
+            .write()
+            .execute("DELETE FROM recovery_cost_outbox", [])
+            .expect("test: clear");
+        mutate(&memory);
+        let error = memory.pending_recovery_costs(workspace, None, 8).expect_err(cell);
+        assert_outbox_error(&error, expected, cell);
+    };
+
+    let workspace_err = {
+        let memory = SqliteMemory::new_with_path(path.clone())?;
+        memory.pending_recovery_costs("", None, 8).expect_err("workspace")
+    };
+    assert_outbox_error(
+        &workspace_err,
+        "recovery cost outbox workspace_id is invalid",
+        "workspace",
+    );
+    refuse_pending("owner", "recovery cost outbox owner_id is invalid", &|memory| {
+        insert(
+            memory, workspace, "", settlement, 1, &key_id, &digest, "metered", "pending", &facts, &mac, &state_mac,
+        )
+        .expect("test: empty owner insert");
+    });
+    refuse_pending(
+        "settlement_id",
+        "recovery cost outbox settlement_id is invalid",
+        &|memory| {
+            insert(
+                memory, workspace, owner, "", 1, &key_id, &digest, "metered", "pending", &facts, &mac, &state_mac,
+            )
+            .expect("test: empty settlement insert");
+        },
+    );
+
+    let version_err = {
+        let memory = SqliteMemory::new_with_path(path.clone())?;
+        memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
+        insert(
+            &memory, workspace, owner, settlement, 2, &key_id, &digest, "metered", "pending", &facts, &mac, &state_mac,
+        )
+        .expect_err("version")
+    };
+    assert!(
+        version_err.to_string().contains("version") || version_err.to_string().contains("CHECK"),
+        "version: {version_err}"
+    );
+
+    refuse_pending("key_id", "recovery cost outbox key_id is invalid", &|memory| {
+        insert(
+            memory, workspace, owner, settlement, 1, "", &digest, "metered", "pending", &facts, &mac, &state_mac,
+        )
+        .expect("test: empty key insert");
+    });
+
+    let digest_err = {
+        let memory = SqliteMemory::new_with_path(path.clone())?;
+        memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
+        insert(
+            &memory,
+            workspace,
+            owner,
+            settlement,
+            1,
+            &key_id,
+            &[1, 2, 3],
+            "metered",
+            "pending",
+            &facts,
+            &mac,
+            &state_mac,
+        )
+        .expect_err("usage_digest")
+    };
+    assert!(
+        digest_err.to_string().contains("usage_digest") || digest_err.to_string().contains("CHECK"),
+        "usage_digest: {digest_err}"
+    );
+
+    let pricing_err = {
+        let memory = SqliteMemory::new_with_path(path.clone())?;
+        memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
+        insert(
+            &memory, workspace, owner, settlement, 1, &key_id, &digest, "free", "pending", &facts, &mac, &state_mac,
+        )
+        .expect_err("pricing")
+    };
+    assert!(
+        pricing_err.to_string().contains("pricing") || pricing_err.to_string().contains("CHECK"),
+        "pricing: {pricing_err}"
+    );
+
+    let mut unknown = serde_json::from_slice::<serde_json::Value>(&facts)?;
+    unknown
+        .as_object_mut()
+        .expect("test: facts object")
+        .insert("extra".into(), serde_json::json!(1));
+    let unknown_facts = serde_json::to_vec(&unknown)?;
+    refuse_pending(
+        "facts unknown key",
+        "recovery cost outbox facts contain an unknown key",
+        &|memory| {
+            insert(
+                memory,
+                workspace,
+                owner,
+                settlement,
+                1,
+                &key_id,
+                &digest,
+                "metered",
+                "pending",
+                &unknown_facts,
+                &mac,
+                &state_mac,
+            )
+            .expect("test: unknown key insert");
+        },
+    );
+
+    refuse_pending("mac", "recovery cost outbox mac is invalid", &|memory| {
+        insert(
+            memory, workspace, owner, settlement, 1, &key_id, &digest, "metered", "pending", &facts, &[9u8; 32],
+            &state_mac,
+        )
+        .expect("test: bad mac insert");
+    });
+
+    let memory = SqliteMemory::new_with_path(path.clone())?;
+    memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
+    insert(
+        &memory, workspace, owner, settlement, 1, &key_id, &digest, "metered", "pending", &facts, &mac, &state_mac,
+    )?;
+    let transition = memory.pool.write().execute(
+        "UPDATE recovery_cost_outbox SET owner_id='other' WHERE settlement_id=?1",
+        rusqlite::params![settlement],
+    );
+    let transition_err = transition.expect_err("illegal transition");
+    assert!(
+        transition_err
+            .to_string()
+            .contains("illegal recovery cost outbox transition"),
+        "illegal transition: {transition_err}"
+    );
+
+    memory.pool.write().execute(
+        "UPDATE recovery_cost_outbox SET state='error' WHERE settlement_id=?1",
+        rusqlite::params![settlement],
+    )?;
+    let relabel = memory
+        .pending_recovery_costs(workspace, None, 8)
+        .expect_err("state relabel without state_mac");
+    assert_outbox_error(
+        &relabel,
+        "recovery cost outbox state_mac is invalid",
+        "state relabel without state_mac",
+    );
+    drop(dir);
+    Ok(())
+}

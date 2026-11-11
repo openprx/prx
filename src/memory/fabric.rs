@@ -167,7 +167,7 @@ pub struct MessageEventScope {
 /// subject, a webhook `reply_target`) that private reads match on, so it is
 /// stored exactly as given. Rows written before this existed are not
 /// rewritten.
-fn redact_provider_label(value: String) -> String {
+pub(crate) fn redact_provider_label(value: String) -> String {
     if crate::providers::byo_dialect_of(&value).is_none() {
         return value;
     }
@@ -277,6 +277,13 @@ impl MemoryFabric {
     pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
         self.event_recording = event_recording;
         self
+    }
+
+    /// Recording is on and a recovery repository is available.
+    pub(crate) fn records_recovery_terminal(&self) -> bool {
+        self.event_recording.enabled
+            && self.event_recording.record_user_messages
+            && self.memory.recovery_repository().is_some()
     }
 
     pub(crate) async fn with_ingress_recovery(

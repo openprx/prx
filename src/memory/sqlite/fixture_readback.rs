@@ -120,3 +120,71 @@ pub(crate) fn row_count(workspace: &std::path::Path, table: &str) -> i64 {
         .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
         .expect("test: row count")
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct OutboxRow {
+    pub(crate) settlement_id: String,
+    pub(crate) owner_id: String,
+    pub(crate) pricing: String,
+    pub(crate) state: String,
+    pub(crate) facts: Vec<u8>,
+}
+
+pub(crate) fn outbox_rows(workspace: &std::path::Path) -> Vec<OutboxRow> {
+    if !table_exists(workspace, "recovery_cost_outbox") {
+        return Vec::new();
+    }
+    read_only(workspace)
+        .prepare(
+            "SELECT settlement_id, owner_id, pricing, state, facts FROM recovery_cost_outbox ORDER BY settlement_id",
+        )
+        .expect("test: outbox statement")
+        .query_map([], |row| {
+            Ok(OutboxRow {
+                settlement_id: row.get(0)?,
+                owner_id: row.get(1)?,
+                pricing: row.get(2)?,
+                state: row.get(3)?,
+                facts: row.get(4)?,
+            })
+        })
+        .expect("test: outbox query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("test: outbox rows")
+}
+
+pub(crate) fn claim_payloads(workspace: &std::path::Path) -> Vec<String> {
+    read_only(workspace)
+        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type='turn.decision.claimed' ORDER BY id")
+        .expect("test: claim statement")
+        .query_map([], |row| row.get::<_, Option<String>>(0))
+        .expect("test: claim query")
+        .map(|row| row.expect("test: claim row").unwrap_or_default())
+        .collect()
+}
+
+pub(crate) fn stored_contents(workspace: &std::path::Path, role: &str) -> Vec<String> {
+    read_only(workspace)
+        .prepare("SELECT content FROM message_events WHERE role=?1 ORDER BY id")
+        .expect("test: content statement")
+        .query_map([role], |row| row.get::<_, String>(0))
+        .expect("test: content query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("test: content rows")
+}
+
+pub(crate) fn indexed_tables(workspace: &std::path::Path) -> Vec<String> {
+    if !table_exists(workspace, "ramflux_erase_index") {
+        return Vec::new();
+    }
+    let mut tables = read_only(workspace)
+        .prepare("SELECT DISTINCT table_name FROM ramflux_erase_index ORDER BY table_name")
+        .expect("test: erase index")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("test: erase index query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("test: erase index rows");
+    tables.sort();
+    tables.dedup();
+    tables
+}

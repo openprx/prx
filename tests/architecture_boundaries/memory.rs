@@ -167,6 +167,8 @@ const SQLITE_SEPARATE_MODULES: &[&str] = &[
     "recovery_authority.rs",
     "recovery_backup.rs",
     "recovery_keys.rs",
+    "recovery_outbox.rs",
+    "recovery_terminal.rs",
     "router_history.rs",
     "router_learning.rs",
 ];
@@ -180,6 +182,8 @@ const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
     "src/memory/sqlite/recovery_authority.rs::recovery_transport_index",
     // AUTH-02-1b: keyed digest of an erased stable input key; no content, no foreign key.
     "src/memory/sqlite/recovery_authority.rs::recovery_tombstones",
+    // AUTH-02-3a: authenticated cost outbox; survives erasure with closed facts keys.
+    "src/memory/sqlite/recovery_outbox.rs::recovery_cost_outbox",
     // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
     // is owned by IncidentStore, and is intentionally separate from message/memory events.
     "src/compliance/incident.rs::serious_incident_audit_events",
@@ -291,7 +295,11 @@ fn persisted_event_tables_are_explicitly_allowlisted() {
                 || table.contains("ledger")
                 || matches!(
                     table,
-                    "recovery_authority" | "recovery_attestations" | "recovery_transport_index" | "recovery_tombstones"
+                    "recovery_authority"
+                        | "recovery_attestations"
+                        | "recovery_transport_index"
+                        | "recovery_tombstones"
+                        | "recovery_cost_outbox"
                 )
             {
                 actual.push(format!("{relative}::{table}"));

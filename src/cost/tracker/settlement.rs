@@ -8,7 +8,87 @@ use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 
+#[cfg(test)]
+thread_local! {
+    static CRASH_BEFORE_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CRASH_AFTER_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_IO_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn crash_before_append(crash: bool) {
+    CRASH_BEFORE_APPEND.with(|cell| cell.set(crash));
+}
+
+#[cfg(test)]
+pub(crate) fn crash_after_append(crash: bool) {
+    CRASH_AFTER_APPEND.with(|cell| cell.set(crash));
+}
+
+#[cfg(test)]
+pub(crate) fn force_io_error(force: bool) {
+    FORCE_IO_ERROR.with(|cell| cell.set(force));
+}
+
 impl CostTracker {
+    /// Project authenticated recovery usage into the cost ledger. No budget check.
+    pub(crate) fn project_recovery_usage(&self, record: &MeteredTokenUsageRecord) -> Result<()> {
+        let settlement_id = record
+            .settlement_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
+        anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
+        let cost_usd = record
+            .cost_usd
+            .ok_or_else(|| anyhow!("recovery cost projection requires a priced usage record"))?;
+        anyhow::ensure!(
+            cost_usd.is_finite() && cost_usd >= 0.0,
+            "Metered usage cost must be a finite, non-negative value"
+        );
+        #[cfg(test)]
+        if CRASH_BEFORE_APPEND.with(std::cell::Cell::get) {
+            CRASH_BEFORE_APPEND.with(|cell| cell.set(false));
+            anyhow::bail!("test: crash before cost ledger append");
+        }
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
+        if storage.has_settlement(settlement_id) {
+            storage.verify_replayed_settlement(record, cost_usd)?;
+            if let Some((file, _)) = super::open_cost_file(&storage.path, super::CostFileAccess::Read)? {
+                file.sync_all()
+                    .with_context(|| format!("Failed to sync cost storage at {}", storage.path.display()))?;
+            }
+            return Ok(());
+        }
+        let usage = TokenUsage {
+            model: format!("{}/{}", record.provider, record.model),
+            input_tokens: record.prompt_tokens,
+            output_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+            cost_usd,
+            timestamp: Utc::now(),
+        };
+        let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        cost_record.settlement_sha256 = Some(settlement_fingerprint(record, cost_usd)?);
+        cost_record.settlement_provider = Some(record.provider.clone());
+        cost_record.settlement_source = Some(record.source);
+        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
+        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
+        #[cfg(test)]
+        if FORCE_IO_ERROR.with(std::cell::Cell::get) {
+            FORCE_IO_ERROR.with(|cell| cell.set(false));
+            anyhow::bail!("test: recovery cost projection I/O error");
+        }
+        storage.add_record(cost_record)?;
+        #[cfg(test)]
+        if CRASH_AFTER_APPEND.with(std::cell::Cell::get) {
+            CRASH_AFTER_APPEND.with(|cell| cell.set(false));
+            anyhow::bail!("test: crash after cost ledger append");
+        }
+        Ok(())
+    }
+
     /// The canonical cost append remains durable before the journal changes.
     /// Reuse the same locked snapshot and the row just written instead of
     /// reopening, rescanning and reacquiring the ledger between both steps.

@@ -910,3 +910,47 @@ async fn recovery_store_without_writer_rejoin_fails_closed() {
 async fn recovery_legacy_reader_creates_no_files() {
     auth_02_2b_tests::recovery_legacy_reader_creates_no_files().await;
 }
+
+#[path = "auth_02_3_tests.rs"]
+mod auth_02_3_tests;
+
+#[tokio::test]
+async fn recovery_terminal_loser_touches_no_outbox_or_ledger() {
+    auth_02_3_tests::recovery_terminal_loser_touches_no_outbox_or_ledger().await;
+}
+
+#[tokio::test]
+async fn recovery_nonmonetary_pricing_commits_disposition() {
+    auth_02_3_tests::recovery_nonmonetary_pricing_commits_disposition().await;
+}
+
+#[tokio::test]
+async fn recovery_terminal_claim_each_bound_field_is_refused() {
+    auth_02_3_tests::recovery_terminal_claim_each_bound_field_is_refused().await;
+}
+
+#[tokio::test]
+async fn recovery_terminal_commit_wrapped_backends_contract() {
+    auth_02_3_tests::recovery_terminal_commit_wrapped_backends_contract().await;
+}
+
+#[tokio::test]
+async fn recovery_terminal_commit_survives_restart() {
+    auth_02_3_tests::recovery_terminal_commit_survives_restart().await;
+}
+
+#[tokio::test]
+async fn recovery_erasure_indexes_settlement_terminal() {
+    auth_02_3_tests::recovery_erasure_indexes_settlement_terminal().await;
+}
+
+#[tokio::test]
+async fn recovery_restart_from_killed_process() {
+    auth_02_3_tests::recovery_restart_from_killed_process().await;
+}
+
+#[ignore = "child mode is invoked only by the owned recovery restart test"]
+#[tokio::test]
+async fn fresh_process_recovery_child() {
+    auth_02_3_tests::fresh_process_recovery_child().await;
+}

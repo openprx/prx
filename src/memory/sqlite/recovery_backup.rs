@@ -53,7 +53,7 @@ pub(super) fn with_fault<R>(hook: impl Fn(Step, &Path) -> anyhow::Result<()> + '
 
 /// Every persisted column that names a recovery key generation. A later
 /// table that stores a key id joins this list.
-const REFERENCES: [(&str, &str); 5] = [
+const REFERENCES: [(&str, &str); 6] = [
     ("recovery_authority", "SELECT active_key_id FROM recovery_authority"),
     ("recovery_attestations", "SELECT key_id FROM recovery_attestations"),
     (
@@ -61,6 +61,7 @@ const REFERENCES: [(&str, &str); 5] = [
         "SELECT key_id FROM recovery_transport_index",
     ),
     ("recovery_tombstones", "SELECT key_id FROM recovery_tombstones"),
+    ("recovery_cost_outbox", "SELECT key_id FROM recovery_cost_outbox"),
     (
         "ingress_recovery",
         "SELECT json_extract(capsule_json, '$.key_id') FROM ingress_recovery WHERE json_valid(capsule_json)",

@@ -2078,6 +2078,19 @@ pub trait Memory: Send + Sync {
         Err(crate::memory::fabric::fail_fast(self.name(), "commit_ingress_recovery"))
     }
 
+    /// Atomic terminal commit: claim, optional assistant/usage, final, attestation, outbox.
+    async fn commit_recovery_terminal(
+        &self,
+        commit: super::recovery_authority::RecoveryTerminalCommit,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<super::recovery_authority::RecoveryTerminalOutcome> {
+        let _ = (commit, deadline);
+        Err(crate::memory::fabric::fail_fast(
+            self.name(),
+            "commit_recovery_terminal",
+        ))
+    }
+
     /// Bounded evidence repair; this does not grant provider or tool authority.
     async fn append_message_event_until(
         &self,

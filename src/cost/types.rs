@@ -165,6 +165,8 @@ pub enum CostSettlement {
     Recorded {
         budget: BudgetCheck,
     },
+    /// Metered usage is committed to the recovery outbox; the ledger projection is pending.
+    ProjectionPending,
     Failed {
         error: String,
     },

@@ -184,7 +184,7 @@ pub(super) fn install_table_triggers(conn: &rusqlite::Connection, table: &str) -
         .collect::<Vec<_>>()
         .join("\n");
     for operation in ["INSERT", "UPDATE"] {
-        let changed: Vec<_> = [
+        let mut changed: Vec<_> = [
             "content",
             "raw_payload_json",
             "payload_json",
@@ -202,6 +202,9 @@ pub(super) fn install_table_triggers(conn: &rusqlite::Connection, table: &str) -
         .filter(|column| columns.iter().any(|name| name == column))
         .map(str::to_owned)
         .collect();
+        if operation == "UPDATE" && table == "recovery_attestations" {
+            changed.push("terminal_event_id".to_owned());
+        }
         if operation == "UPDATE" && changed.is_empty() {
             continue;
         }

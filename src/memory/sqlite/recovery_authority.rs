@@ -49,7 +49,7 @@ impl Drop for RecoveryKeyLoadGuard {
     }
 }
 
-const MAX_SERIALIZED_FACTS: usize = 262_144;
+pub(in crate::memory::sqlite) const MAX_SERIALIZED_FACTS: usize = 262_144;
 // Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
 // 40 KiB covers those strings, two 32-byte JSON digests, and structural keys.
 // Each byte field expands by at most 4x; reserve equal pending/completion budgets.
@@ -62,7 +62,7 @@ fn key_unavailable(error: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(RecoveryKeyUnavailable(format!("{error:#}")))
 }
 
-pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
+pub(in crate::memory::sqlite) fn schema(conn: &Connection) -> anyhow::Result<()> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_authority' AND type='table')",
         [],
@@ -98,7 +98,8 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
     }
     super::agent_registry::add_scope_column(conn, "recovery_attestations")?;
     super::erasure_pool::install_table_triggers(conn, "recovery_attestations")?;
-    transport_schema(conn)
+    transport_schema(conn)?;
+    super::recovery_outbox::schema(conn)
 }
 
 /// AUTH-02-1b tables, added lazily in the writer transaction so a database
@@ -153,7 +154,11 @@ fn validate_chain(chain: &RecoveryChain) -> anyhow::Result<()> {
 
 /// Encode every persisted column (including raw source/capsule bytes), with
 /// explicit type/length framing. No lossy MessageEvent normalization is used.
-fn event(conn: &Connection, chain: &RecoveryChain, id: &str) -> anyhow::Result<RecoveryEvidence> {
+pub(in crate::memory::sqlite) fn event(
+    conn: &Connection,
+    chain: &RecoveryChain,
+    id: &str,
+) -> anyhow::Result<RecoveryEvidence> {
     validate_chain(chain)?;
     anyhow::ensure!(!id.is_empty() && id.len() <= 1024, "invalid recovery event id");
     let record = conn.query_row("SELECT * FROM message_events WHERE event_id=?1 AND workspace_id=?2 AND owner_id=?3 AND source=?4 AND run_id=?5", params![id,chain.workspace_id,chain.owner_id,chain.source,chain.run_id], |row| {
@@ -186,7 +191,7 @@ fn event(conn: &Connection, chain: &RecoveryChain, id: &str) -> anyhow::Result<R
     })
 }
 
-fn framed(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
+pub(in crate::memory::sqlite) fn framed(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(16 + domain.len() + bytes.len());
     framed.extend_from_slice(&(domain.len() as u64).to_be_bytes());
     framed.extend_from_slice(domain);
@@ -232,7 +237,7 @@ fn sign(receipt: &mut RecoveryReceipt, key: &ring::hmac::Key) -> anyhow::Result<
     receipt.mac = domain_mac(key, receipt_domain(&receipt.state)?, &receipt_bytes(receipt)?);
     Ok(())
 }
-fn active(conn: &Connection) -> anyhow::Result<(String, String)> {
+pub(in crate::memory::sqlite) fn active(conn: &Connection) -> anyhow::Result<(String, String)> {
     let (version, namespace, id): (i64, String, String) = conn.query_row(
         "SELECT version,backend_namespace,active_key_id FROM recovery_authority WHERE singleton=1",
         [],
@@ -428,9 +433,9 @@ pub(super) fn rebind_main_binding(conn: &Connection, chains: &[RecoveryChain]) -
 
 // Recovery commits require SQLite FULL synchronization, independent of the
 // ordinary memory writer's NORMAL policy. Restore the connection on all paths.
-pub(super) struct FullSync<'a>(&'a Connection, i64);
+pub(in crate::memory::sqlite) struct FullSync<'a>(&'a Connection, i64);
 impl<'a> FullSync<'a> {
-    pub(super) fn new(conn: &'a Connection) -> anyhow::Result<Self> {
+    pub(in crate::memory::sqlite) fn new(conn: &'a Connection) -> anyhow::Result<Self> {
         let previous = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self(conn, previous))
@@ -676,8 +681,11 @@ impl SqliteMemory {
             }
             directory.load(&id).map_err(key_unavailable)?;
             // Every retained generation stays available, even during rotation.
-            let mut stmt =
-                tx.prepare("SELECT key_id FROM recovery_attestations UNION SELECT key_id FROM recovery_tombstones")?;
+            let mut stmt = tx.prepare(
+                "SELECT key_id FROM recovery_attestations
+                 UNION SELECT key_id FROM recovery_tombstones
+                 UNION SELECT key_id FROM recovery_cost_outbox",
+            )?;
             for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
                 directory.load(&id?).map_err(key_unavailable)?;
             }
@@ -736,7 +744,7 @@ fn check_publication(publication: &RecoveryPublication, settle: bool) -> anyhow:
 
 /// Publish inside the caller's transaction. The caller owns `FullSync` and the
 /// commit, so a combined transaction (ingress append + attestation) stays atomic.
-fn publish_in(
+pub(in crate::memory::sqlite) fn publish_in(
     tx: &rusqlite::Transaction<'_>,
     directory: &KeyDirectory,
     publication: &RecoveryPublication,
@@ -888,6 +896,23 @@ impl RecoveryRepository for SqliteMemory {
         }
         tx.commit()?;
         Ok(receipt)
+    }
+    fn pending_recovery_costs(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::memory::recovery_authority::RecoveryCostRow>> {
+        super::recovery_outbox::pending_recovery_costs(self, workspace_id, after, limit)
+    }
+    fn finish_recovery_cost(
+        &self,
+        workspace_id: &str,
+        settlement_id: &str,
+        usage_digest: &[u8; 32],
+        state: crate::memory::recovery_authority::RecoveryCostState,
+    ) -> anyhow::Result<()> {
+        super::recovery_outbox::finish_recovery_cost(self, workspace_id, settlement_id, usage_digest, state)
     }
 }
 

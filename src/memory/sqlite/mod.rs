@@ -14,7 +14,17 @@ mod recall;
 mod recovery_authority;
 mod recovery_backup;
 mod recovery_keys;
+mod recovery_outbox;
+mod recovery_terminal;
 pub(crate) mod remote_tree;
+
+#[cfg(test)]
+pub(crate) use recovery_outbox::{
+    insert_raw_for_test, sign_outbox_for_test, skip_outbox_mac_verify, usage_digest_for_test,
+};
+#[cfg(test)]
+pub(crate) use recovery_terminal::crash_before_commit;
+pub(crate) use recovery_terminal::{map_after_prefix, with_after_prefix_async};
 mod router_history;
 mod router_learning;
 mod rows;

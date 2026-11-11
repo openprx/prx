@@ -96,6 +96,10 @@ pub enum RecoveryMacDomain {
     QuarantineV3,
     TransportV3,
     InputKeyV3,
+    ClaimV3,
+    UsageDigestV1,
+    OutboxV1,
+    OutboxStateV1,
 }
 
 impl RecoveryMacDomain {
@@ -108,9 +112,120 @@ impl RecoveryMacDomain {
             Self::QuarantineV3 => b"prx-recovery-quarantine-v3",
             Self::TransportV3 => b"prx-recovery-transport-v3",
             Self::InputKeyV3 => b"prx-recovery-input-key-v3",
+            Self::ClaimV3 => b"prx-recovery-claim-v3",
+            Self::UsageDigestV1 => b"prx-recovery-usage-digest-v1",
+            Self::OutboxV1 => b"prx-recovery-outbox-v1",
+            Self::OutboxStateV1 => b"prx-recovery-outbox-state-v1",
         }
     }
 }
+
+/// Pricing stored on a recovery cost outbox row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPricing {
+    Metered,
+    Subscription,
+    Unknown,
+}
+
+impl RecoveryPricing {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metered => "metered",
+            Self::Subscription => "subscription",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "metered" => Ok(Self::Metered),
+            "subscription" => Ok(Self::Subscription),
+            "unknown" => Ok(Self::Unknown),
+            _ => anyhow::bail!("recovery cost outbox pricing is invalid"),
+        }
+    }
+}
+
+/// Durable projection state of one recovery cost outbox row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCostState {
+    Pending,
+    Acknowledged,
+    Error,
+    Blocked,
+}
+
+impl RecoveryCostState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Acknowledged => "acknowledged",
+            Self::Error => "error",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "acknowledged" => Ok(Self::Acknowledged),
+            "error" => Ok(Self::Error),
+            "blocked" => Ok(Self::Blocked),
+            _ => anyhow::bail!("recovery cost outbox state is invalid"),
+        }
+    }
+}
+
+/// Closed cost intent sealed into the terminal commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryCostIntent {
+    pub pricing: RecoveryPricing,
+    pub facts: Vec<u8>,
+}
+
+/// Authenticated pending or error cost row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryCostRow {
+    pub workspace_id: String,
+    pub owner_id: String,
+    pub settlement_id: String,
+    pub version: i64,
+    pub key_id: String,
+    pub usage_digest: [u8; 32],
+    pub pricing: RecoveryPricing,
+    pub state: RecoveryCostState,
+    pub facts: Vec<u8>,
+}
+
+/// Atomic terminal commit: claim, optional assistant/usage, final, attestation, outbox.
+pub struct RecoveryTerminalCommit {
+    pub events: Vec<super::traits::MessageEventInput>,
+    pub ingress: Option<super::ingress_recovery::IngressRecoveryCommit>,
+    pub publication: RecoveryPublication,
+    pub outbox: RecoveryCostIntent,
+}
+
+/// Result of one atomic terminal commit. `Conflict` rolls the transaction back.
+#[derive(Debug)]
+pub enum RecoveryTerminalOutcome {
+    Committed {
+        receipt: RecoveryReceipt,
+        events: Vec<super::traits::MessageEvent>,
+    },
+    Replayed {
+        receipt: RecoveryReceipt,
+        events: Vec<super::traits::MessageEvent>,
+    },
+    Conflict,
+}
+
+/// A terminal commit mixed inserted and existing events, or bound bytes differed.
+#[derive(Debug, thiserror::Error)]
+#[error("recovery terminal commit conflict")]
+pub struct RecoveryTerminalConflict;
 
 /// Supported only by durable repositories; ordinary memory operations never
 /// initialize this capability. Rotation is an operator operation after drain.
@@ -128,4 +243,19 @@ pub trait RecoveryRepository: Send + Sync {
     fn record_recovery_pending(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt>;
     fn settle_recovery(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt>;
     fn read_recovery_receipt(&self, chain: &RecoveryChain) -> anyhow::Result<Option<RecoveryReceipt>>;
+    /// Retryable outbox rows (`pending` or `error`), authenticated, ascending by settlement id.
+    fn pending_recovery_costs(
+        &self,
+        workspace_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RecoveryCostRow>>;
+    /// Write `state` and `state_mac` in one transaction. The outbox trigger enforces the transition.
+    fn finish_recovery_cost(
+        &self,
+        workspace_id: &str,
+        settlement_id: &str,
+        usage_digest: &[u8; 32],
+        state: RecoveryCostState,
+    ) -> anyhow::Result<()>;
 }
