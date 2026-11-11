@@ -1,9 +1,12 @@
+#![cfg(test)]
+
 use super::*;
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 const MAX_CHILD_OUTPUT: u64 = 16_384;
 const MAX_RESPONSE: usize = IDEMPOTENCY_MAX_REPLAY_BYTES + 16_384;
 const TEST_DEADLINE: Duration = Duration::from_secs(90);
-use std::process::{Child, Stdio};
 
 struct DurableCountingProvider(std::path::PathBuf);
 
