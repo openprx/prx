@@ -42,7 +42,7 @@ PRX 源码未使用因升级而变更的 API，下游消费者重新构建即可
   `.cargo/audit.toml` 加 explicit ignore + 注释引向 SECURITY.md。
 - **`sec-audit.yml` 阻断门**：`deny / advisories` 矩阵分支移除
   `continue-on-error`，CVE 真正阻断 `main` 合并 (Codex S5 P0-4)。
-- 详见 [`SECURITY.md`](../SECURITY.md) "Known Vulnerability Status (v0.4.0)" 章节。
+- 详见 [`SECURITY.md`](../../SECURITY.md) "Known Vulnerability Status (v0.4.0)" 章节。
 
 ## Testing
 
@@ -70,7 +70,7 @@ PRX 源码未使用因升级而变更的 API，下游消费者重新构建即可
 
 ### Pure 模式 100-turn 性能基线 (S5 P0-2)
 
-详见 [`perf-baseline.md`](perf-baseline.md)。
+详见 [`perf-baseline.md`](../perf-baseline.md)。
 
 ## Roadmap (v0.4.1)
 

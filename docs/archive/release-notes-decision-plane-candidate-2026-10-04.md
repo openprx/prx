@@ -17,8 +17,8 @@ Channel provider execution follows the smart-group admission gate. Closing
 instructions retain outbound identity/authorization checks. The prepared source
 and init-template cutover enables the local decision plane by default, without
 enabling remote decision I/O. This cutover is not yet an accepted release and
-does not modify deployed configuration. See [decision plane](decision-plane.md),
-[tools](tools.md) and [channels](channels.md).
+does not modify deployed configuration. See [decision plane](../decision-plane.md),
+[tools](../tools.md) and [channels](../channels.md).
 
 Durable ingress and terminal recovery use authenticated original records,
 bounded reads and tracked owner lifetimes. Recovery can reconcile retained real
@@ -40,8 +40,8 @@ and outcomes without a serving attempt are refused for serving training; the
 current consumer does not collect every failure path. Old policy records are
 not silently imported into the new domain. Repeated turns on one embedded Agent
 share its session; constructing another Agent or restarting does not restore the
-old session statistics. See [Router](router.md) and
-[routing and cost lifecycle](provider-routing-cost-lifecycle.md).
+old session statistics. See [Router](../router.md) and
+[routing and cost lifecycle](../provider-routing-cost-lifecycle.md).
 
 The separate billing-bound transport contract (H1) remains open. Static prices,
 timeouts and post-hoc accounting do not authorize another physical send. Paid
@@ -59,7 +59,7 @@ false as unset and therefore follow the candidate's adopted central default.
 Unversioned false alongside modern non-legacy settings remains explicit. Loading
 maps configuration in memory; a later save writes the versioned form. Unsupported
 legacy values and conflicting replacement keys are refused with file/key errors.
-See [configuration](configuration.md) for the complete migration contract.
+See [configuration](../configuration.md) for the complete migration contract.
 
 For an unambiguous disable when preparing rollback, retain the version marker
 with the explicit false value. A bare unversioned false can be interpreted as an
@@ -76,7 +76,7 @@ new Router projection reject it. This compatibility is one-way: an older binary
 is not guaranteed to read new candidate records. Verify readers and retained
 schemas before a binary downgrade. Turning the plane off or reverting code does
 not erase liabilities, durable evidence or already-dispatched external effects.
-See [provider management](provider-management.md) and [security](security.md).
+See [provider management](../provider-management.md) and [security](../security.md).
 
 ## Acceptance and delivery boundary
 
