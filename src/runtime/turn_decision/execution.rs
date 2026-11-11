@@ -703,6 +703,12 @@ impl TurnDecisionService {
             .execution
             .current_descriptor(name)
             .context("runtime dependency cannot execute")?;
+        anyhow::ensure!(
+            name != "skill_read"
+                || !proof.owner_isolated()
+                || crate::tools::execution::admits_owner_isolated_origin(&descriptor),
+            "skill_read is unavailable to this owner-isolated source"
+        );
         let spec = ToolSpec {
             name: descriptor.public_name,
             description: descriptor.description,

@@ -73,6 +73,17 @@ impl TurnDecisionService {
                 "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate"
             ) && (entry.supports_metadata_discovery()
                 || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
+                && (!trusted.owner_isolated()
+                    || crate::causal_tree::capability_policy::admits_owner_isolated_identity(
+                        &entry.public_name,
+                        &entry.root,
+                    )
+                    || (trusted
+                        .constraints
+                        .iter()
+                        .any(|code| code.as_str() == "owner_private_filesystem_v1")
+                        && entry.public_name == entry.root
+                        && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                 && !trusted.excludes_entry(view.model_admission_entry(entry))
                 && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly

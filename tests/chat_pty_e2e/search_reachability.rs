@@ -18,7 +18,7 @@ async fn drive(input: &str, advice: bool, skill: bool, native: bool) -> Result<(
             ),
         )?;
     }
-    let probe = WireProbe::start(guard.workspace_dir.clone(), skill, None).await?;
+    let probe = WireProbe::start(guard.workspace_dir.clone(), skill.then_some(true), None).await?;
     if !native {
         probe.require_no_tools();
     }

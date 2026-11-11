@@ -144,7 +144,12 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
             ),
         )?;
     }
-    let probe = WireProbe::start(workspace.path().to_owned(), skill, None).await?;
+    let probe = WireProbe::start(
+        workspace.path().to_owned(),
+        skill.then_some(!matches!(root, Root::Console)),
+        None,
+    )
+    .await?;
     if !native {
         probe.require_no_tools();
     }

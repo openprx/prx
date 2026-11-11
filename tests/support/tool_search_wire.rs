@@ -26,7 +26,7 @@ pub const INSTRUCTIONS: &str = "PRX_INSTRUCTION_SENTINEL";
 
 struct ProbeState {
     workspace: PathBuf,
-    skill: bool,
+    skill: Option<bool>,
     no_tools: AtomicBool,
     requests: parking_lot::Mutex<Vec<Value>>,
     errors: parking_lot::Mutex<Vec<String>>,
@@ -44,7 +44,7 @@ pub struct WireProbe {
 }
 
 impl WireProbe {
-    pub async fn start(workspace: PathBuf, skill: bool, parent_mode: Option<&'static str>) -> Result<Self> {
+    pub async fn start(workspace: PathBuf, skill: Option<bool>, parent_mode: Option<&'static str>) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let endpoint = format!("http://{}/v1", listener.local_addr()?);
         let state = Arc::new(ProbeState {
@@ -112,7 +112,7 @@ impl WireProbe {
             self.state.requests.lock().len()
                 == if self.state.no_tools.load(Ordering::Acquire) {
                     1
-                } else if self.state.skill {
+                } else if self.state.skill == Some(true) {
                     4
                 } else {
                     3
@@ -143,18 +143,18 @@ fn seed_row(workspace: &std::path::Path) -> Result<()> {
     db.busy_timeout(Duration::from_secs(5))?;
     // Data fixture only: ownership comes from the actual admitted input,
     // never from model arguments or a manufactured execution grant.
-    let (owner, agent, session, event, source, channel): (String, Option<String>, String, String, String, Option<String>) = db.query_row(
-        "SELECT owner_id,agent_id,session_key,event_id,source,channel FROM message_events WHERE role='user' ORDER BY id DESC LIMIT 1",
-        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+    let (owner, agent, session, event, source, channel, sender): (String, Option<String>, String, String, String, Option<String>, Option<String>) = db.query_row(
+        "SELECT owner_id,agent_id,session_key,event_id,source,channel,sender FROM message_events WHERE role='user' ORDER BY id DESC LIMIT 1",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
     )?;
     ensure!(
         !owner.is_empty() && !session.is_empty() && !event.is_empty(),
         "reader fixture requires real durable ingress"
     );
     db.execute(
-        "INSERT OR REPLACE INTO memories(id,key,content,category,created_at,updated_at,workspace_id,owner_id,agent_id,session_id,source_event_id,source,channel)
-         VALUES ('prx_wire_row','memory/prx_probe.md',?1,'core','2026-11-11T00:00:00Z','2026-11-11T00:00:00Z',?2,?3,?4,?5,?6,?7,?8)",
-        rusqlite::params![STORED,workspace.to_string_lossy(),owner,agent,session,event,source,channel],
+        "INSERT OR REPLACE INTO memories(id,key,content,category,created_at,updated_at,workspace_id,owner_id,agent_id,session_id,source_event_id,source,channel,chat_id,raw_sender,sender_id)
+         VALUES ('prx_wire_row','memory/prx_probe.md',?1,'core','2026-11-11T00:00:00Z','2026-11-11T00:00:00Z',?2,?3,?4,?5,?6,?7,?8,?5,?9,?3)",
+        rusqlite::params![STORED,workspace.to_string_lossy(),owner,agent,session,event,source,channel,sender],
     )?;
     Ok(())
 }
@@ -226,6 +226,12 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
     }
     let round = state.requests.lock().len();
     let offered = names(request);
+    let tool_results = || {
+        messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect::<Vec<_>>()
+    };
     if state.no_tools.load(Ordering::Acquire) {
         ensure!(offered.is_empty(), "non-tool model received tools");
         ensure!(
@@ -249,7 +255,21 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
             "deferred memory reader was eagerly declared"
         );
         seed_row(&state.workspace)?;
-        if state.skill {
+        if state.skill == Some(false) {
+            ensure!(
+                !system.contains("<available_skills>"),
+                "isolated source received unreadable skills"
+            );
+            ensure!(
+                !offered.contains(&"skill_read"),
+                "isolated source received an unusable reader"
+            );
+            ensure!(
+                !request.to_string().contains(INSTRUCTIONS),
+                "isolated source received a skill body"
+            );
+        }
+        if state.skill == Some(true) {
             ensure!(
                 system.contains("<name>prx_probe</name>"),
                 "first request lacks installed skill metadata"
@@ -261,17 +281,18 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
             );
         }
     }
-    let reader_round = usize::from(state.skill);
-    let message = if state.skill && round == 0 {
+    let reader_round = usize::from(state.skill == Some(true));
+    let message = if state.skill == Some(true) && round == 0 {
         tool_call("skill_read", &json!({"name":"prx_probe"}), round)
     } else if round == reader_round {
-        if state.skill {
+        if state.skill == Some(true) {
             ensure!(
                 messages
                     .iter()
                     .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")
                         && message.to_string().contains(INSTRUCTIONS)),
-                "live skill_read did not return the installed body"
+                "live skill_read did not return the installed body; tool_results={:?}",
+                tool_results()
             );
         }
         tool_call("capability_search", &json!({"query":"memory_get","limit":1}), round)
@@ -288,7 +309,8 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
                 .iter()
                 .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")
                     && message.to_string().contains(STORED)),
-            "real memory_get did not return the durable row"
+            "real memory_get did not return the durable row; tool_results={:?}",
+            tool_results()
         );
         state.completed.store(true, Ordering::Release);
         state.completion.notify_one();

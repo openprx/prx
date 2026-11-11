@@ -184,7 +184,7 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
         Root::ProcessWorker => Some("process"),
         _ => None,
     };
-    let probe = WireProbe::start(workspace.clone(), skill, mode).await?;
+    let probe = WireProbe::start(workspace.clone(), skill.then_some(true), mode).await?;
     if !native {
         probe.require_no_tools();
     }
