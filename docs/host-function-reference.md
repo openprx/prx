@@ -335,12 +335,17 @@ interface events {
 `"event bus: payload size N exceeds maximum 65536 bytes"`,
 `"event bus: recursion depth limit (8) exceeded for topic '…'"`.
 
-A guest `publish` while handling a delivered event of depth `d` is issued at
-depth `d` (the hook pump forwards `EventMessage.depth` into that invocation),
-so the next delivery is at `d+1`. A publish outside any event delivery is
-depth 0. Nested guest republish to a subscribed topic is rejected at depth 8
-with the recursion-limit error above; the host logs that rejection at warn
-without the payload.
+A guest `publish` while handling a delivered event uses that event's stored
+depth as the publish argument (the hook pump forwards `EventMessage.depth`
+into that invocation). The bus stores the next delivery as argument+1. A
+publish outside any event delivery (lifecycle `on-event`, an independent
+capability call) uses argument 0. Host recovery announcements
+(`prx.plugin.*_quarantined`, `prx.plugin.storage_restarted`) and a rebuild
+instantiation that happen because of a delivery inherit that delivery's
+depth. Publish arguments 0..=8 are accepted; 9 or above is rejected with
+the recursion-limit error above. A one-to-one republish chain therefore has
+nine deliveries (stored depths 1..=9); the ninth delivery's republish is the
+rejected hop. The host logs that rejection at warn without the payload.
 
 When no event bus is configured, `publish` returns `ok` and drops the event.
 

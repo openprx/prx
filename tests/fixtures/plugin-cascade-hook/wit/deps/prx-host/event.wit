@@ -1,0 +1,5 @@
+interface events {
+    publish: func(topic: string, payload: string) -> result<_, string>;
+    subscribe: func(topic-pattern: string) -> result<u64, string>;
+    unsubscribe: func(subscription-id: u64) -> result<_, string>;
+}

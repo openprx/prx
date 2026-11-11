@@ -187,7 +187,8 @@ pub struct HostState {
     pub event_sink: Option<tokio::sync::mpsc::Sender<EventMessage>>,
     /// Depth of the event the guest is handling, if this invocation is an
     /// event delivery. `None` means the guest is not inside a delivery, so a
-    /// `publish` is top-level (depth 0).
+    /// `publish` is top-level (argument 0). A rebuild instantiation inherits
+    /// the delivery depth of the call that triggered it.
     #[cfg(feature = "wasm-plugins")]
     pub current_event_depth: Option<u32>,
     /// WASI resource table (required by WasiView).

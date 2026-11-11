@@ -1,0 +1,21 @@
+[plugin]
+name = "cascade-hook"
+version = "0.1.0"
+description = "Test fixture: republishes loop.cascade until the host depth limit rejects it"
+wasm = "plugin.wasm"
+
+[[capabilities]]
+type = "hook"
+name = "cascade"
+
+[[capabilities.events]]
+pattern = "loop.cascade"
+
+[permissions]
+required = ["log", "kv", "events"]
+optional = []
+
+[resources]
+max_fuel = 50_000_000
+max_memory_mb = 8
+max_execution_time_ms = 500

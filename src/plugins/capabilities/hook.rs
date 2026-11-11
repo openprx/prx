@@ -43,11 +43,25 @@ pub struct WasmHook {
 #[derive(Default)]
 struct HookInvocationState {
     count: AtomicU64,
+    /// Incremented when an invocation that was counted returns from the guest
+    /// (or from a lookup failure after the count), including a rejected publish.
+    completed: AtomicU64,
     last_event: RwLock<Option<String>>,
     /// Depth of the last delivery that entered the guest. Test-only: production
     /// diagnostics do not publish it.
     #[cfg(test)]
     last_depth: RwLock<Option<u32>>,
+}
+
+/// Marks `HookInvocationState::completed` when the counted invocation returns.
+struct InvocationComplete<'a> {
+    state: &'a HookInvocationState,
+}
+
+impl Drop for InvocationComplete<'_> {
+    fn drop(&mut self) {
+        self.state.completed.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,7 +83,7 @@ struct OnEventCall {
     event: String,
     payload_json: String,
     /// Depth of this delivery: `Some` for bus-pumped events (`EventMessage.depth`),
-    /// `None` for a top-level lifecycle `on_event` (guest `publish` is depth 0).
+    /// `None` for a top-level lifecycle `on_event` (guest `publish` is argument 0).
     depth: Option<u32>,
     /// Counted when the supervisor enters the guest, never for a delivery
     /// it refuses (quarantined, or dead awaiting a rebuild).
@@ -81,6 +95,10 @@ impl GuestOp for OnEventCall {
 
     fn operation(&self) -> &'static str {
         "on-event"
+    }
+
+    fn delivery_depth(&self) -> Option<u32> {
+        self.depth
     }
 
     fn invoke<'a>(
@@ -109,6 +127,9 @@ impl OnEventCall {
             invocation_state,
         } = self;
         invocation_state.count.fetch_add(1, Ordering::Relaxed);
+        let _completed = InvocationComplete {
+            state: &invocation_state,
+        };
         *invocation_state.last_event.write() = Some(event.clone());
         #[cfg(test)]
         {
@@ -256,6 +277,11 @@ impl WasmHook {
     #[cfg(test)]
     fn last_delivery_depth(&self) -> Option<u32> {
         *self.invocation_state.last_depth.read()
+    }
+
+    #[cfg(test)]
+    fn completed_invocations(&self) -> u64 {
+        self.invocation_state.completed.load(Ordering::Relaxed)
     }
 
     pub fn plugin_name(&self) -> &str {
@@ -576,23 +602,29 @@ max_execution_time_ms = {timeout_ms}
     mod event_depth {
         use super::super::*;
         use crate::plugins::event_bus::{EventBus, MAX_RECURSION_DEPTH};
+        use sha2::{Digest, Sha256};
+        use std::path::Path;
         use std::sync::Arc;
         use tokio::time::{Duration, timeout};
 
-        fn audit_manifest() -> PluginManifest {
-            toml::from_str(
+        const CASCADE_WASM: &str = "tests/fixtures/plugin-cascade-hook/plugin.wasm";
+        const CASCADE_WASM_SHA256: &str = "tests/fixtures/plugin-cascade-hook/plugin.wasm.sha256";
+        const AUDIT_WASM: &str = "pdk/rust/examples/audit-hook/plugin.wasm";
+
+        fn hook_manifest(name: &str, timeout_ms: u64) -> PluginManifest {
+            toml::from_str(&format!(
                 r#"
 [plugin]
-name = "audit-hook"
+name = "{name}"
 version = "0.1.0"
 wasm = "plugin.wasm"
 
 [[capabilities]]
 type = "hook"
-name = "audit"
+name = "hook"
 
 [[capabilities.events]]
-pattern = "prx.lifecycle.*"
+pattern = "*"
 
 [permissions]
 required = ["log", "kv", "events"]
@@ -601,25 +633,24 @@ optional = []
 [resources]
 max_fuel = 1000000000
 max_memory_mb = 8
-max_execution_time_ms = 5000
-"#,
-            )
-            .expect("test: audit hook manifest parses")
+max_execution_time_ms = {timeout_ms}
+"#
+            ))
+            .expect("test: hook manifest parses")
         }
 
-        async fn audit_hook_with_bus(event_bus: Arc<EventBus>) -> WasmHook {
+        async fn load_hook(wasm_rel: &str, name: &str, event_bus: Arc<EventBus>, timeout_ms: u64) -> WasmHook {
             let engine = crate::plugins::shared_wasm_engine().expect("test: shared wasmtime engine");
-            let wasm =
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("pdk/rust/examples/audit-hook/plugin.wasm");
-            let bytes = std::fs::read(wasm).expect("test: the committed hook fixture is readable");
+            let wasm = Path::new(env!("CARGO_MANIFEST_DIR")).join(wasm_rel);
+            let bytes = std::fs::read(&wasm).unwrap_or_else(|error| panic!("test: read {}: {error}", wasm.display()));
             let component =
                 wasmtime::component::Component::from_binary(&engine, &bytes).expect("test: the fixture is a component");
             let granted = ["log", "kv", "events"].into_iter().map(str::to_string).collect();
-            let events = std::iter::once("prx.lifecycle.*".to_string()).collect();
+            let events = std::iter::once("*".to_string()).collect();
             WasmHook::new(
                 &engine,
                 &component,
-                &audit_manifest(),
+                &hook_manifest(name, timeout_ms),
                 granted,
                 events,
                 None,
@@ -629,10 +660,31 @@ max_execution_time_ms = 5000
             .expect("test: the fixture instantiates")
         }
 
-        async fn subscribe_hook(bus: &Arc<EventBus>, hook: &WasmHook, pattern: &str) {
-            bus.subscribe_pump("audit-hook", pattern, hook.event_sink())
+        async fn subscribe_hook(bus: &Arc<EventBus>, hook: &WasmHook, plugin: &str, pattern: &str) {
+            bus.subscribe_pump(plugin, pattern, hook.event_sink())
                 .await
                 .expect("test: pump subscription");
+        }
+
+        fn wasm_sha256(bytes: &[u8]) -> String {
+            hex::encode(Sha256::digest(bytes))
+        }
+
+        #[test]
+        fn committed_cascade_wasm_matches_documented_digest() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let wasm = std::fs::read(root.join(CASCADE_WASM)).expect("test: cascade wasm is committed");
+            let documented = std::fs::read_to_string(root.join(CASCADE_WASM_SHA256))
+                .expect("test: cascade wasm digest is committed")
+                .split_whitespace()
+                .next()
+                .expect("test: digest file names the hex")
+                .to_ascii_lowercase();
+            assert_eq!(
+                wasm_sha256(&wasm),
+                documented,
+                "rebuild tests/fixtures/plugin-cascade-hook per BUILD.md and refresh plugin.wasm.sha256"
+            );
         }
 
         /// The hook pump forwards `EventMessage.depth` into the guest
@@ -640,8 +692,8 @@ max_execution_time_ms = 5000
         #[tokio::test]
         async fn the_hook_pump_delivers_event_depth_into_the_guest_invocation() {
             let bus = Arc::new(EventBus::new());
-            let hook = audit_hook_with_bus(Arc::clone(&bus)).await;
-            subscribe_hook(&bus, &hook, "depth.probe").await;
+            let hook = load_hook(AUDIT_WASM, "audit-hook", Arc::clone(&bus), 5000).await;
+            subscribe_hook(&bus, &hook, "audit-hook", "depth.probe").await;
 
             bus.publish_with_depth("depth.probe", "{}", 3)
                 .await
@@ -661,44 +713,89 @@ max_execution_time_ms = 5000
         }
 
         /// A real WASM hook that republishes to its own topic stops when the
-        /// existing depth limit rejects the next publish. Invocations equal
-        /// the number of successful publishes (0..=MAX) plus the delivery
-        /// whose republish is rejected.
+        /// existing depth limit rejects the next publish. The test waits for
+        /// the guest to record that rejection and for the final pump
+        /// invocation to complete (not merely to start).
         #[tokio::test]
         async fn a_hook_that_republishes_to_its_own_topic_stops_at_the_depth_limit() {
             let bus = Arc::new(EventBus::new());
-            let hook = audit_hook_with_bus(Arc::clone(&bus)).await;
-            subscribe_hook(&bus, &hook, "loop.cascade").await;
+            let hook = load_hook(CASCADE_WASM, "cascade-hook", Arc::clone(&bus), 5000).await;
+            subscribe_hook(&bus, &hook, "cascade-hook", "loop.cascade").await;
+            let kv = hook.supervisor.kv_namespace();
 
             bus.publish("loop.cascade", "{}").await.expect("test: seed the cascade");
 
             let expected = u64::from(MAX_RECURSION_DEPTH).saturating_add(1);
-            let counted = timeout(Duration::from_secs(5), async {
-                let mut last = 0u64;
-                let mut stable_rounds = 0u8;
+            let rejection = timeout(Duration::from_secs(5), async {
                 loop {
-                    let n = hook.diagnostics().invocation_count;
+                    let completed = hook.completed_invocations();
                     assert!(
-                        n <= expected.saturating_add(8),
-                        "cascade exceeded the depth limit: {n} invocations"
+                        completed <= expected.saturating_add(8),
+                        "cascade exceeded the depth limit: {completed} completed invocations"
                     );
-                    if n == last && n >= expected {
-                        stable_rounds = stable_rounds.saturating_add(1);
-                        if stable_rounds >= 32 {
-                            return n;
+                    let rejected = kv.read().await.get("cascade.rejected").cloned();
+                    if completed == expected {
+                        if let Some(bytes) = rejected {
+                            return String::from_utf8(bytes).expect("test: rejection is utf-8");
                         }
-                    } else {
-                        last = n;
-                        stable_rounds = 0;
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("test: cascade must stop before the timeout (does not hang)");
+            assert!(
+                rejection.contains("recursion depth limit"),
+                "guest must observe the existing depth rejection, got: {rejection}"
+            );
             assert_eq!(
-                counted, expected,
+                hook.completed_invocations(),
+                expected,
+                "the final pump invocation must complete after the rejected publish"
+            );
+            assert_eq!(
+                hook.diagnostics().invocation_count,
+                expected,
                 "invocations must equal MAX_RECURSION_DEPTH+1 (allowed publish depths 0..=MAX, then one rejected hop)"
+            );
+        }
+
+        /// A quarantine published because a bus delivery trapped keeps that
+        /// delivery's depth; it does not start a depth-0 chain.
+        #[tokio::test]
+        async fn a_quarantine_announcement_during_a_delivery_keeps_that_delivery_depth() {
+            let bus = Arc::new(EventBus::new());
+            let hook = load_hook(AUDIT_WASM, "audit-hook", Arc::clone(&bus), 200).await;
+            subscribe_hook(&bus, &hook, "audit-hook", "depth.probe").await;
+            let (_id, mut rx) = bus
+                .subscribe("observer", "prx.plugin.hook_quarantined")
+                .await
+                .expect("test: observe quarantine announcements");
+            let kv = hook.supervisor.kv_namespace();
+            let hold = kv.write().await;
+            for _ in 0..4 {
+                bus.publish_with_depth("depth.probe", "{}", 3)
+                    .await
+                    .expect("test: delivery that will time out");
+            }
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if hook.is_quarantined() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("test: four timed-out deliveries quarantine the hook");
+            drop(hold);
+            let announced = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("test: quarantine announcement is published")
+                .expect("test: quarantine announcement is delivered");
+            assert_eq!(
+                announced.depth, 5,
+                "delivery stored depth 4; announcement publish arg 4 is stored as 5"
             );
         }
     }

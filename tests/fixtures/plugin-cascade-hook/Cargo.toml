@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "cascade-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Test fixture: a hook that republishes loop.cascade until the host rejects it"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+prx-pdk = { path = "../../../pdk/rust/prx-pdk" }
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros"] }
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen"]
+
+[package.metadata.component]
+package = "prx:plugin"
+
+[package.metadata.component.target.dependencies]
+"prx:host" = { path = "wit/deps/prx-host" }
