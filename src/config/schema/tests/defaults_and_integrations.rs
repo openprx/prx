@@ -259,6 +259,116 @@ async fn load_from_path_is_silent_when_the_cost_price_key_matches() {
     assert!(!logs.contains("cost.prices key matches no configured model"), "{logs}");
 }
 
+const QUERY_VALUE_SECRET: &str = "opaque7pricekeysecret";
+
+fn custom_query_secret_endpoint() -> String {
+    format!("custom:https://llm.example/v1?api_key={QUERY_VALUE_SECRET}")
+}
+
+fn custom_query_secret_price_toml() -> String {
+    let provider = custom_query_secret_endpoint();
+    let price_key = format!("{provider}/moonshotai/kimi-k2.5");
+    format!(
+        "default_temperature = 0.7\n\
+         default_provider = {provider:?}\n\
+         default_model = \"moonshotai/kimi-k2.5\"\n\
+         \n\
+         [cost.prices.{price_key:?}]\n\
+         input = 1.0\n\
+         output = 2.0\n\
+         cache_write = 1.0\n\
+         cache_read = 0.5\n"
+    )
+}
+
+#[test]
+async fn load_from_path_redacts_a_query_value_secret_from_cost_price_key_warnings() {
+    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+    let dir = tempfile::TempDir::new().expect("test: private config directory");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, custom_query_secret_price_toml()).expect("test: write query-secret cost.prices config");
+    let config =
+        Config::load_from_path(&path, dir.path().join("workspace")).expect("an unmatched price key still loads");
+    let warnings = unmatched_cost_price_key_warnings(&config);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        !warnings[0].contains(QUERY_VALUE_SECRET),
+        "warning leaked the query-value secret: {}",
+        warnings[0]
+    );
+    let (outcome, logs) = capture_logs(|| config.validate());
+    outcome.expect("an unmatched price key is a warning, not an error");
+    assert!(logs.contains("cost.prices key matches no configured model"), "{logs}");
+    assert!(
+        !logs.contains(QUERY_VALUE_SECRET),
+        "load log leaked the query-value secret: {logs}"
+    );
+}
+
+#[cfg(feature = "llm-router")]
+fn catalog_router_pair_on_one_provider() -> (String, String, String) {
+    let mut by_provider: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for candidate in crate::router::models::builtin_model_capabilities(&CostConfig::default()) {
+        by_provider
+            .entry(candidate.provider)
+            .or_default()
+            .push(candidate.model_id);
+    }
+    by_provider
+        .into_iter()
+        .find_map(|(provider, mut models)| {
+            models.sort();
+            models.dedup();
+            let extra = models.get(1)?.clone();
+            Some((provider, models[0].clone(), extra))
+        })
+        .expect("test: a catalog provider with two router candidates")
+}
+
+#[cfg(feature = "llm-router")]
+#[test]
+async fn catalog_router_candidate_price_key_does_not_warn() {
+    let (provider, default_model, extra_model) = catalog_router_pair_on_one_provider();
+    let mut config = Config {
+        default_provider: Some(provider),
+        default_model: Some(default_model),
+        ..Config::default()
+    };
+    assert!(
+        config.router.models.is_empty(),
+        "an empty [[router.models]] list derives catalog candidates"
+    );
+    let key = usage_pricing_key(crate::providers::selection::default_provider(&config), &extra_model);
+    config.cost.prices.insert(key, test_price());
+    assert_eq!(unmatched_cost_price_key_warnings(&config), Vec::<String>::new());
+}
+
+#[cfg(feature = "llm-router")]
+#[test]
+async fn explicit_router_list_does_not_inherit_catalog_price_keys() {
+    let (provider, default_model, extra_model) = catalog_router_pair_on_one_provider();
+    let mut config = Config {
+        default_provider: Some(provider.clone()),
+        default_model: Some(default_model.clone()),
+        ..Config::default()
+    };
+    config.router.models.push(
+        serde_json::from_value(serde_json::json!({
+            "model_id": default_model,
+            "provider": provider,
+        }))
+        .expect("test: explicit default router candidate"),
+    );
+    let key = usage_pricing_key(crate::providers::selection::default_provider(&config), &extra_model);
+    config.cost.prices.insert(key.clone(), test_price());
+    let warnings = unmatched_cost_price_key_warnings(&config);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "catalog key {key} for extra model {extra_model} must warn when [[router.models]] is explicit; {warnings:?}"
+    );
+}
+
 // ── Defaults ─────────────────────────────────────────────
 
 #[test]
