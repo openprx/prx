@@ -593,10 +593,25 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         let (dir, workspace, memory, fabric, commit, cost, service) = priced_setup("prx-skip-inline").await;
         let _skip = SkipInline;
         crate::agent::terminal::recovery_commit::skip_inline_projection(true);
-        finalize_turn(&fabric, commit, &cost, &workspace)
+        let receipt = finalize_turn(&fabric, commit, &cost, &workspace)
             .await
             .expect("test: skip inline");
         assert_eq!(first_outbox(&workspace).state, "pending");
+        let repository = memory.recovery_repository().expect("test: repository");
+        let rows = repository
+            .pending_recovery_costs(&workspace.to_string_lossy(), None, 1)
+            .expect("test: pending usage authentication");
+        let row = rows.first().expect("test: pending usage");
+        repository
+            .verify_recovery_mac(
+                &crate::memory::recovery_authority::RecoveryTag {
+                    key_id: row.key_id.clone(),
+                    tag: row.usage_digest,
+                },
+                RecoveryMacDomain::UsageDigestV1,
+                &serde_json::to_vec(&receipt.usage_settlement).expect("test: typed usage serialization"),
+            )
+            .expect("test: outbox binds the typed usage bytes");
         let (disabled, disabled_tracker) =
             prepare_scope(&workspace, Arc::clone(&memory), false, false, cost.clone()).await;
         drop(disabled);
@@ -932,11 +947,13 @@ fn spawn_recovery_child(workspace: &Path, phase: &str) -> (std::process::Child, 
     let (sent, ack) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         use std::io::BufRead;
+        let mut sent = Some(sent);
         for line in std::io::BufReader::new(stdout).lines() {
             let line = line.expect("test: child line");
-            if let Some((_, json)) = line.split_once("PRX_RECOVERY_ACK:") {
+            if let Some((_, json)) = line.split_once("PRX_RECOVERY_ACK:")
+                && let Some(sent) = sent.take()
+            {
                 sent.send(json.to_owned()).ok();
-                break;
             }
         }
     });

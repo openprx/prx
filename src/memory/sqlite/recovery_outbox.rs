@@ -225,8 +225,7 @@ pub(super) fn finish_recovery_cost(
     let owner_id = row.owner_id;
     let facts = row.facts;
     let key = directory.load(&row.key_id)?;
-    let value: serde_json::Value = serde_json::from_slice(&facts)?;
-    let usage = serde_json::to_vec(value.get("usage").unwrap_or(&serde_json::Value::Null))?;
+    let usage = usage_bytes(&facts)?;
     ring::hmac::verify(
         &key,
         &recovery_authority::framed(RecoveryMacDomain::UsageDigestV1.bytes(), &usage),
@@ -389,9 +388,7 @@ fn verify_state_mac(
 }
 
 fn usage_digest_mac(key: &ring::hmac::Key, facts: &[u8]) -> anyhow::Result<[u8; 32]> {
-    let value: serde_json::Value = serde_json::from_slice(facts).context("recovery cost outbox facts are invalid")?;
-    let usage = value.get("usage").cloned().unwrap_or(serde_json::Value::Null);
-    let bytes = serde_json::to_vec(&usage)?;
+    let bytes = usage_bytes(facts)?;
     let tag = ring::hmac::sign(
         key,
         &recovery_authority::framed(RecoveryMacDomain::UsageDigestV1.bytes(), &bytes),
@@ -579,4 +576,15 @@ fn read_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOutbox> {
         mac: row.get(9)?,
         state_mac: row.get(10)?,
     })
+}
+
+fn usage_bytes(facts: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let value: serde_json::Value = serde_json::from_slice(facts).context("recovery cost outbox facts are invalid")?;
+    let usage: Option<crate::llm::route_decision::MeteredTokenUsageRecord> = serde_json::from_value(
+        value
+            .get("usage")
+            .cloned()
+            .context("recovery cost outbox usage is missing")?,
+    )?;
+    Ok(serde_json::to_vec(&usage)?)
 }
