@@ -556,6 +556,7 @@ impl Memory for CountingMemory {
         _timestamp: Option<&str>,
         _message_id: Option<&str>,
         _owner_id: Option<&str>,
+        _agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         self.append_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())

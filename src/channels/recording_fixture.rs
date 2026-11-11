@@ -164,6 +164,7 @@ impl Memory for RecordedChannelFixtureMemory {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         owner_id: Option<&str>,
+        agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         self.original
             .append_conversation_turn(
@@ -175,6 +176,7 @@ impl Memory for RecordedChannelFixtureMemory {
                 timestamp,
                 message_id,
                 owner_id,
+                agent_partition,
             )
             .await
     }

@@ -1257,6 +1257,7 @@ impl Memory for PostgresMemory {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         owner_id: Option<&str>,
+        _agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> Result<()> {
         let client = self.client.clone();
         let sessions_table = self.qualified_sessions_table();

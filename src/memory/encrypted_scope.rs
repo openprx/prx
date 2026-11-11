@@ -558,6 +558,7 @@ impl Memory for EncryptedScope {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         _owner_id: Option<&str>,
+        _agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         let record = message_id.filter(|value| !value.is_empty()).unwrap_or(session_key);
         let key = format!("convturn:{session_key}:{role}:{record}");
@@ -1193,6 +1194,7 @@ mod tests {
                 None,
                 Some("m1"),
                 None,
+                None,
             )
             .await
             .expect("test: append");
@@ -1252,6 +1254,7 @@ mod tests {
                 id,
                 Some(time),
                 Some(id),
+                None,
                 None,
             )
             .await

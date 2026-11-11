@@ -370,6 +370,7 @@ async fn load_persisted_histories_rehydrates_legacy_and_canonical_for_merge() {
             Some("2026-05-20T00:00:00Z"),
             Some("m1"),
             Some("system:legacy"),
+            None,
         )
         .await
         .unwrap();
@@ -383,6 +384,7 @@ async fn load_persisted_histories_rehydrates_legacy_and_canonical_for_merge() {
             Some("2026-05-20T00:00:01Z"),
             Some("m2"),
             Some("system:legacy"),
+            None,
         )
         .await
         .unwrap();
@@ -397,6 +399,7 @@ async fn load_persisted_histories_rehydrates_legacy_and_canonical_for_merge() {
             Some("2026-05-21T00:00:00Z"),
             Some("m3"),
             Some("system:canonical"),
+            None,
         )
         .await
         .unwrap();
@@ -410,6 +413,7 @@ async fn load_persisted_histories_rehydrates_legacy_and_canonical_for_merge() {
             Some("2026-05-21T00:00:01Z"),
             Some("m4"),
             Some("system:canonical"),
+            None,
         )
         .await
         .unwrap();
@@ -454,6 +458,7 @@ async fn load_persisted_histories_defuses_a_stored_user_turn_with_a_reserved_mar
             Some("2026-05-21T00:00:00Z"),
             Some("m1"),
             Some("system:canonical"),
+            None,
         )
         .await
         .unwrap();
@@ -467,6 +472,7 @@ async fn load_persisted_histories_defuses_a_stored_user_turn_with_a_reserved_mar
             Some("2026-05-21T00:00:01Z"),
             Some("m2"),
             Some("system:canonical"),
+            None,
         )
         .await
         .unwrap();

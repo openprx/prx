@@ -352,6 +352,7 @@ async fn build_agent_context_returns_structured_bundle() {
         None,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -361,6 +362,7 @@ async fn build_agent_context_returns_structured_bundle() {
         "local-user",
         "assistant",
         "previous current-session answer",
+        None,
         None,
         None,
         None,
@@ -452,6 +454,7 @@ async fn d4_agent_recall_keeps_run_boundary_and_read_merges_only_with_legacy_key
         Some("2026-03-05T00:00:00Z"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -462,6 +465,7 @@ async fn d4_agent_recall_keeps_run_boundary_and_read_merges_only_with_legacy_key
         "user",
         "history from run B",
         Some("2026-03-05T00:00:01Z"),
+        None,
         None,
         None,
     )
@@ -1042,6 +1046,7 @@ async fn recall_respects_disabled_user_message_recording() {
         None,
         None,
         Some("owner-a"),
+        None,
     )
     .await
     .unwrap();
@@ -1110,6 +1115,7 @@ async fn scoped_recall_excludes_stale_and_future_history() {
             Some(timestamp),
             None,
             Some("owner-a"),
+            None,
         )
         .await
         .unwrap();
@@ -1123,6 +1129,7 @@ async fn scoped_recall_excludes_stale_and_future_history() {
         None,
         None,
         Some("owner-a"),
+        None,
     )
     .await
     .unwrap();
@@ -1433,6 +1440,7 @@ async fn exclusion_uses_full_live_input_not_projected_query() {
             None,
             None,
             Some("prx_owner"),
+            None,
         )
         .await
         .unwrap();

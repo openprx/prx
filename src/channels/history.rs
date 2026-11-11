@@ -196,6 +196,7 @@ pub(super) async fn append_sender_turn(
             timestamp,
             message_id,
             Some(owner_id.as_str()),
+            envelope.agent_partition.as_ref(),
         )
         .await
     {

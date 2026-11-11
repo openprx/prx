@@ -4,7 +4,7 @@ use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
 use crate::agent::turn_contracts::{CompactionPatch, CompactionPatchGuard, POST_COMPACTION_REFRESH_MARKER};
 use crate::memory::{
     CompactionRunInput, CompactionSourceEventRange, Memory, MemoryCategory, MemoryPrincipal, MemoryStoreMetadata,
-    MessageEvent, SessionContextQuery,
+    MemoryWriteContext, MessageEvent, SessionContextQuery,
 };
 use crate::providers::{ChatMessage, Provider};
 use crate::util::truncate_with_ellipsis;
@@ -782,13 +782,23 @@ async fn persist_compaction_audit(
     };
     // NOTE: `channel` is sourced from DocumentIngestRuntime so compaction
     // summaries are recall-scoped to the originating channel (FIX-P1-08).
+    // Review M7: carry the turn partition so Named summary memories are stamped.
+    let write_ctx = MemoryWriteContext {
+        workspace_id: Some(audit.workspace_id.clone()),
+        owner_id: audit.owner_id.clone(),
+        session_key: audit.session_key.clone(),
+        agent_partition: audit.agent_partition.clone(),
+        channel: audit.channel.clone(),
+        ..MemoryWriteContext::default()
+    };
     if let Err(error) = audit
         .memory
-        .store_with_metadata(
+        .store_with_context_and_metadata(
             &summary_memory_key,
             summary,
             MemoryCategory::Conversation,
             audit.session_key.as_deref(),
+            Some(&write_ctx),
             metadata,
         )
         .await

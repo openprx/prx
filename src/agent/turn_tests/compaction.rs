@@ -20,9 +20,10 @@ use crate::agent::turn_tests::{
     ScriptedProvider, SystemSummaryProvider, first_orphan_tool_index, tool_roundtrip_history_fixture,
     tool_roundtrip_history_fixture_with_tools,
 };
+use crate::config::agent_name::AgentName;
 use crate::memory::{
-    CompactionSourceEventRange, DocumentIngestInput, DocumentRecord, Memory, MemoryCategory, MemoryEntry, MemoryFabric,
-    MemoryPrincipal, MessageEvent, MessageEventInput, SqliteMemory,
+    AgentPartition, CompactionSourceEventRange, DocumentIngestInput, DocumentRecord, Memory, MemoryCategory,
+    MemoryEntry, MemoryFabric, MemoryPrincipal, MessageEvent, MessageEventInput, PartitionKey, SqliteMemory,
 };
 use crate::providers::{ChatMessage, ToolCall};
 use crate::runtime::envelope::RuntimeEnvelope;
@@ -1308,6 +1309,123 @@ async fn configurable_compaction_records_run_and_summary_memory() {
         )
         .unwrap();
     assert_eq!(stored_summary_count, 1);
+}
+
+#[tokio::test]
+async fn named_compaction_stamps_the_summary_memory() {
+    const WORKSPACE: &str = "workspace-a";
+    const OWNER: &str = "prx_owner";
+    const RUN_ID: &str = "run-compact-named";
+    const REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const UX: &str = "00000000-0000-4000-8000-0000000000a1";
+    const SX: &str = "00000000-0000-4000-8000-0000000000c1";
+    let tmp = TempDir::new().unwrap();
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let named = AgentPartition {
+        workspace_id: WORKSPACE.to_owned(),
+        owner_id: OWNER.to_owned(),
+        key: PartitionKey::Named {
+            name: AgentName::parse("x").unwrap(),
+            incarnation: UX.parse().unwrap(),
+        },
+    };
+    let envelope = RuntimeEnvelope::agent(WORKSPACE, RUN_ID)
+        .with_owner_id(OWNER)
+        .with_agent_partition(named);
+    {
+        let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'active', ?4)",
+            rusqlite::params![WORKSPACE, OWNER, UX, REV],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'n:x', ?5, 1)",
+            rusqlite::params![SX, WORKSPACE, OWNER, envelope.session_key, UX],
+        )
+        .unwrap();
+    }
+    let audit = DocumentIngestRuntime::from_envelope(mem.clone(), &envelope);
+    let fabric = MemoryFabric::new(mem.clone(), WORKSPACE);
+    let provider = SystemSummaryProvider {
+        response: "## Decisions\n- keep source anchors\n## Open TODOs\n- verify compaction\n## Critical Context\n- path /tmp/a and task run-compact-named".to_string(),
+    };
+    let large_evidence = {
+        let segment = "large output source evidence ";
+        segment.repeat(MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100)
+    };
+    let large_ref = compact_tool_result_for_history_with_status(
+        "shell",
+        &large_evidence,
+        MAX_TOOL_RESULT_INLINE_CHARS,
+        "persisted_document_backend",
+    );
+    let mut history = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("Remember file /tmp/a and task run-compact-named. ".repeat(120)),
+        ChatMessage::assistant(format!(
+            "Acknowledged source anchor requirement.\n{large_ref}\n{}",
+            "padding ".repeat(120)
+        )),
+        ChatMessage::user("Please compact soon. ".repeat(120)),
+        ChatMessage::assistant("Will preserve identifiers. ".repeat(120)),
+    ];
+    for (index, message) in history.iter().skip(1).enumerate() {
+        if message.role == "user" {
+            fabric
+                .record_inbound_user_message(
+                    envelope.message_scope(),
+                    message.content.clone(),
+                    Some(format!("compaction-named-{index}")),
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            fabric
+                .record_assistant_message(envelope.message_scope(), message.content.clone())
+                .await
+                .unwrap();
+        }
+    }
+    let config = crate::config::AgentCompactionConfig {
+        mode: crate::config::AgentCompactionMode::Safeguard,
+        reserve_tokens: 1,
+        keep_recent_messages: 1,
+        memory_flush: false,
+        max_context_tokens: 50,
+        max_context_tokens_explicit: true,
+        os_paging: crate::config::OsPagingConfig::default(),
+    };
+
+    let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, Some(&audit), "pre_turn")
+        .await
+        .unwrap();
+    assert!(compacted);
+
+    let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+    let summary_memory_key: String = conn
+        .query_row(
+            "SELECT summary_memory_key FROM compaction_runs
+             WHERE workspace_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+            [WORKSPACE],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT ma_scope_id FROM memories WHERE key = ?1 AND source = 'compaction_summary'",
+            [summary_memory_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stamp.as_deref(),
+        Some(SX),
+        "Named compaction must stamp the summary memory"
+    );
 }
 
 #[tokio::test]

@@ -46,6 +46,7 @@ async fn populated(encryption: bool) -> (TempDir, Arc<SqliteMemory>, Arc<dyn Mem
         Some("2026-11-01T01:00:00Z"),
         Some("assistant-1"),
         None,
+        None,
     )
     .await
     .unwrap();
