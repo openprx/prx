@@ -12,6 +12,12 @@ const DECISION_MODEL: &str = "prx-native-decision";
 /// Leave the production turn budget unchanged while giving this local HTTP
 /// fixture enough of that budget to run under full-suite CPU contention.
 pub(crate) const REHEARSAL_TIMEOUT_MS: u32 = 450;
+/// A controlled preemption or deadline advance after the real child request.
+#[derive(Clone)]
+pub(crate) enum ChildResponseControl {
+    WallStall(std::time::Duration),
+    AdvanceClock(Arc<crate::causal_tree::logical_clock::ManualClock>, std::time::Duration),
+}
 struct State {
     action: &'static str,
     target: &'static str,
@@ -19,6 +25,7 @@ struct State {
     requests: parking_lot::Mutex<Vec<Value>>,
     replies: parking_lot::Mutex<Vec<Result<Value, String>>>,
     response_wall_stall: parking_lot::Mutex<Option<std::time::Duration>>,
+    child_response_control: parking_lot::Mutex<Option<ChildResponseControl>>,
 }
 async fn reply(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
@@ -43,6 +50,14 @@ async fn reply(
             {
                 ("delegate", "session")
             } else {
+                // The request has passed real physical accounting and reached
+                // the child endpoint. Delay or advance only this child reply.
+                let control = state.child_response_control.lock().take();
+                match control {
+                    Some(ChildResponseControl::WallStall(delay)) => std::thread::sleep(delay),
+                    Some(ChildResponseControl::AdvanceClock(clock, by)) => clock.advance(by),
+                    None => {}
+                }
                 ("use_tool", child_target)
             }
         } else {
@@ -96,6 +111,7 @@ impl Driver {
             requests: parking_lot::Mutex::new(Vec::new()),
             replies: parking_lot::Mutex::new(Vec::new()),
             response_wall_stall: parking_lot::Mutex::new(None),
+            child_response_control: parking_lot::Mutex::new(None),
         });
         let stop = CancellationToken::new();
         let shutdown = stop.clone();
@@ -122,6 +138,9 @@ impl Driver {
     }
     pub(crate) fn stall_next_response(&self, delay: std::time::Duration) {
         *self.state.response_wall_stall.lock() = Some(delay);
+    }
+    pub(crate) fn control_child_response(&self, control: ChildResponseControl) {
+        *self.state.child_response_control.lock() = Some(control);
     }
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint

@@ -336,6 +336,17 @@ async fn a_terminal_status_is_never_overwritten_by_the_termination_commit() {
 /// and released by the test.
 #[tokio::test]
 async fn a_spawned_run_row_tracks_its_own_real_progress() {
+    assert_spawned_run_progress(false).await;
+}
+
+/// Simulate the observer being descheduled after progress but before reading
+/// the row. Keep the elapsed-time assertion independent of observer scheduling.
+#[tokio::test]
+async fn spawned_run_progress_survives_observer_wall_preemption() {
+    assert_spawned_run_progress(true).await;
+}
+
+async fn assert_spawned_run_progress(observer_preemption: bool) {
     let (ch, _) = RecordingChannel::new();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -357,7 +368,10 @@ async fn a_spawned_run_row_tracks_its_own_real_progress() {
         .expect("the real provider must be parked before measuring silence");
     // While parked in the provider the run really has made no progress, and
     // the row must say so instead of inventing activity.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Admission and provider entry used real I/O. From this causal barrier,
+    // measure the beat on a controlled Tokio clock, shared by the real run.
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_millis(200)).await;
     let (events_before, idle_before, stamp_before) = {
         let runs = tool.active_runs_snapshot().await;
         let run = runs.first().expect("the spawned run is registered");
@@ -376,11 +390,18 @@ async fn a_spawned_run_row_tracks_its_own_real_progress() {
     // Release it: the provider round-trip is a real ProgressKind event.
     gate.add_permits(4);
     let mut observed = None;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(2) {
+        // Keep this task runnable while the child performs real I/O. A sleep
+        // would let the paused clock auto-advance while waiting for SQLite.
+        tokio::task::yield_now().await;
         let runs = tool.active_runs_snapshot().await;
         let Some(run) = runs.first() else { continue };
         if run.progress.events() > events_before {
+            // Deliberate wall preemption, independent of the controlled clock.
+            if observer_preemption {
+                std::thread::sleep(idle_before);
+            }
             observed = Some((run.progress.events(), run.idle_for(), run.last_progress_at()));
             break;
         }
