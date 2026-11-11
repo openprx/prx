@@ -116,6 +116,7 @@ cargo build --release --locked --bin prx
 | [Providers](docs/providers.md) | Provider catalog, fallback chains, token refresh |
 | [Channels](docs/channels.md) | Messaging platforms, DM/group policies |
 | [Tools](docs/tools.md) | Built-in tools, hooks system, webhooks |
+| [Scheduled work](docs/scheduled-work.md) | Cron, Xin, and HEARTBEAT.md: what runs, leases, ordering |
 | [Remote Nodes](docs/remote-nodes.md) | `prx-node` agent, device pairing, JSON-RPC |
 | [Web Console](docs/web-console.md) | Browser-based management interface |
 | [Skill Lifecycle](docs/skill-lifecycle.md) | New instruction skills, reviewed executable bundles, evidence gates, publication and recovery (opt-in); [controlled V01 studies](docs/v01-controlled-study.md) |
