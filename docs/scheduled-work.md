@@ -46,7 +46,9 @@ space, and the bullet. The recurring interval is
 A new materialized task is due immediately. Prompt, interval, description, and
 enablement changes update the existing row. Removed bullets are disabled, not
 deleted. Re-adding the same bullet re-enables that task. A no-change
-reconciliation writes no lifecycle events.
+reconciliation writes no lifecycle events. `prx xin pause` and `prx xin cancel`
+do not persist for these tasks: while the bullet remains, the next
+reconciliation sets the task enabled again. Remove the bullet to disable it.
 
 Materialized tasks run only inside the configured active-hour window. When
 `start` is greater than `end`, the window wraps midnight. Due tasks outside
@@ -118,10 +120,13 @@ drains at most 100 pending outbox rows.
 ## Operator view
 
 Calendar, timezone, and delayed schedules stay on `prx cron`. Xin owns
-autonomous interval work and durable ordered workflows.
+autonomous interval work and durable ordered workflows. `prx cron add`,
+`add-at`, `add-every`, and `once` create shell jobs. Agent jobs are created
+through the cron tool with `job_type` `agent`, or `payload.kind` `agentTurn`
+or `systemEvent`.
 
 ```bash
-prx cron add '0 9 * * *' 'agent -m "Good morning!"'
+prx cron add '0 9 * * *' 'echo good-morning'
 prx cron add-at 2026-11-11T09:00:00Z 'echo once'
 prx cron add-every 60000 'echo interval'
 prx cron once 30m 'echo later'
@@ -147,8 +152,10 @@ prx xin goals get <goal-id>
 prx xin goals cancel <goal-id>
 ```
 
-Pause prevents future claims and leaves an active execution to finish. Cancel
-revokes the active task or step lease so the runner stops that execution.
+Pause prevents future claims on cron jobs and ordinary Xin tasks and leaves an
+active execution to finish. Cancel revokes the active task or step lease so
+the runner stops that execution. For HEARTBEAT.md tasks, pause and cancel are
+not durable: remove the bullet to keep the task disabled.
 `prx cron mark-operator` and `prx xin mark-operator` record that a pre-existing
 shell command is the operator's own; agent-created shell jobs stay refused for
 git.
