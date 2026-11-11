@@ -210,6 +210,7 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "providers::redact_endpoint_userinfo",
     "runtime::sqlite_pool::install_bounded_busy_handler",
     "security::redaction::redact_json_value",
+    "security::redaction::redact_provider_text",
     "security::redaction::redact_secrets",
 ];
 
