@@ -73,6 +73,8 @@ impl TurnDecisionService {
         );
         #[cfg(test)]
         crate::causal_tree::logical_clock::visit_site("auxiliary_deadline");
+        // Minted from `logical_clock::now()`. `Instant::now()` ignores a logical
+        // advance at this site (see the accounted skip test).
         anyhow::ensure!(
             crate::causal_tree::logical_clock::now() < context.engine.deadline,
             "auxiliary decision deadline expired"
