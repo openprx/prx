@@ -277,6 +277,7 @@ struct CliPendingInput {
     fabric: MemoryFabric,
     generation: Arc<crate::config::ConfigGeneration>,
     envelope: RuntimeEnvelope,
+    expected_session_key: String,
     scope: crate::memory::MessageEventScope,
     choice: AgentModelChoice,
     input: String,
@@ -299,11 +300,11 @@ impl CliPendingInput {
             .run_id
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("CLI input run is missing"))?;
-        let proof = issue_cli_agent_turn_proof(
+        let proof = issue_cli_agent_turn_proof_for_session(
             None,
             &self.envelope,
             &self.generation,
-            run,
+            (run, &self.expected_session_key),
             &self.input,
             event,
             &self.choice,
@@ -542,9 +543,10 @@ impl AgentTurnProof {
                 && crate::runtime::turn_source::recorded_input_matches(self.surface(), &input, &self.routing_input),
             "CLI admission input differs from its source proof"
         );
-        let mut scope = RuntimeEnvelope::agent(self.workspace_id.to_string(), self.run_id.to_string())
-            .with_source_message_event_id(event_id)
-            .message_scope();
+        let mut envelope = RuntimeEnvelope::agent(self.workspace_id.to_string(), self.run_id.to_string())
+            .with_source_message_event_id(event_id);
+        envelope.session_key = self.session_key.to_string();
+        let mut scope = envelope.message_scope();
         scope.config_generation_id = Some(self.config_generation_id);
         scope.config_source_revision = Some(self.config_source_revision.to_string());
         let summary = crate::security::redaction::redact_secrets(summary);
@@ -720,6 +722,28 @@ fn issue_cli_agent_turn_proof(
     recorded_event: Option<&crate::memory::MessageEvent>,
     choice: &AgentModelChoice,
 ) -> Result<AgentTurnProof, AgentTurnOriginError> {
+    issue_cli_agent_turn_proof_for_session(
+        runtime_envelope_override,
+        envelope,
+        generation,
+        (expected_run_id, &format!("agent:{expected_run_id}")),
+        routing_input,
+        recorded_event,
+        choice,
+    )
+}
+
+// The expected session is minted at the CLI entry, independently of the envelope
+// being validated. REPL turns share it until /clear; run IDs remain per-turn.
+fn issue_cli_agent_turn_proof_for_session(
+    runtime_envelope_override: Option<&RuntimeEnvelope>,
+    envelope: &RuntimeEnvelope,
+    generation: &crate::config::ConfigGeneration,
+    (expected_run_id, expected_session_key): (&str, &str),
+    routing_input: &str,
+    recorded_event: Option<&crate::memory::MessageEvent>,
+    choice: &AgentModelChoice,
+) -> Result<AgentTurnProof, AgentTurnOriginError> {
     let run_id = envelope.run_id.as_deref().ok_or(AgentTurnOriginError::Mismatch)?;
     let workspace_id = generation.effective.workspace_dir.to_string_lossy();
     let owner_id = crate::memory::principal::OwnerPrincipal::new(
@@ -753,7 +777,7 @@ fn issue_cli_agent_turn_proof(
             .is_some_and(|recipient| recipient != "cli:local-user")
         || envelope.visibility != crate::memory::MemoryVisibility::Session
         || run_id != expected_run_id
-        || envelope.session_key != format!("agent:{run_id}")
+        || envelope.session_key != expected_session_key
         || envelope.config_generation_id != Some(generation.id.0)
         || envelope.config_source_revision.as_deref() != Some(&generation.source_revision.fingerprint_sha256)
         || !choice.factory_credential_source_matches(&generation.effective)
@@ -1015,6 +1039,47 @@ mod agent_turn_origin_tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn repl_proof_and_admission_failure_bind_session_independently_of_run() {
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let mut config = Config::default();
+        config.workspace_dir = workspace.path().to_path_buf();
+        let generation = crate::config::new_shared(config).pin();
+        let envelope = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_session")
+            .with_run_id("prx_turn")
+            .with_config_generation(&generation);
+        let fabric = MemoryFabric::new(
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("actual source memory")),
+            workspace.path().to_string_lossy(),
+        );
+        let event = fabric
+            .record_inbound_user_message(envelope.message_scope(), "raw", None, None)
+            .await
+            .expect("persist inbound receipt");
+        let choice = resolve_agent_model_choice(&generation.effective, Some("ollama"), Some("prx-local-model"))
+            .expect("test selected model");
+        let issue = |identity| {
+            issue_cli_agent_turn_proof_for_session(None, &envelope, &generation, identity, "raw", Some(&event), &choice)
+        };
+        assert!(issue(("prx_turn", "agent:other_session")).is_err());
+        assert!(issue(("other_turn", "agent:prx_session")).is_err());
+        let proof = issue(("prx_turn", "agent:prx_session")).expect("REPL proof");
+        assert_eq!(proof.session_key(), "agent:prx_session");
+        proof
+            .record_cli_admission_failure(&fabric, &generation.effective, false, "test refusal")
+            .await
+            .expect("persist admission failure");
+        let failure = fabric
+            .memory()
+            .find_message_event_by_idempotency_key(fabric.workspace_id(), "turn:prx_turn:admission-failed")
+            .await
+            .expect("failure lookup")
+            .expect("durable failure event");
+        assert_eq!(failure.session_key.as_deref(), Some("agent:prx_session"));
+        assert_eq!(failure.owner_id, Some(envelope.resolved_owner_id()));
+        assert_eq!(failure.run_id.as_deref(), Some("prx_turn"));
     }
 
     #[tokio::test]
@@ -1797,6 +1862,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         fabric: memory_fabric.clone(),
                         generation: Arc::clone(&ctx.config_generation),
                         envelope: runtime_envelope.clone(),
+                        expected_session_key: format!("agent:{turn_run_id}"),
                         scope: fabric_scope.clone(),
                         choice: choice.clone(),
                         input: msg.clone(),
@@ -2266,6 +2332,8 @@ pub(crate) async fn run_with_runtime_envelope(
             println!("Type /help for commands.\n");
             let cli = crate::channels::CliChannel::new();
 
+            let mut repl_session_id = Uuid::new_v4().to_string();
+
             // Persistent conversation history across turns
             let mut history = if config.skill_rag.available() {
                 Vec::new()
@@ -2301,25 +2369,12 @@ pub(crate) async fn run_with_runtime_envelope(
                     "/help" => {
                         println!("Available commands:");
                         println!("  /help        Show this help message");
-                        println!("  /clear /new  Clear conversation history");
+                        println!("  /clear /new  Start a new session (stored memories are preserved)");
                         println!("  /quit /exit  Exit interactive mode\n");
                         continue;
                     }
                     "/clear" | "/new" => {
-                        println!("This will clear the current conversation and delete all session memory.");
-                        println!("Core memories (long-term facts/preferences) will be preserved.");
-                        print!("Continue? [y/N] ");
-                        let _ = std::io::stdout().flush();
-
-                        let mut confirm = String::new();
-                        if std::io::stdin().read_line(&mut confirm).is_err() {
-                            continue;
-                        }
-                        if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
-                            println!("Cancelled.\n");
-                            continue;
-                        }
-
+                        repl_session_id = Uuid::new_v4().to_string();
                         history.clear();
                         if !config.skill_rag.available() {
                             history.push(ChatMessage::system(build_runtime_system_prompt(
@@ -2329,21 +2384,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 native_tools,
                             )));
                         }
-                        // Clear conversation and daily memory
-                        let mut cleared = 0;
-                        for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
-                            let entries = mem.list(Some(&category), None).await.unwrap_or_default();
-                            for entry in entries {
-                                if mem.forget(&entry.key).await.unwrap_or(false) {
-                                    cleared += 1;
-                                }
-                            }
-                        }
-                        if cleared > 0 {
-                            println!("Conversation cleared ({cleared} memory entries removed).\n");
-                        } else {
-                            println!("Conversation cleared.\n");
-                        }
+                        println!("New session started. Stored memories are preserved.\n");
                         continue;
                     }
                     _ => {}
@@ -2354,7 +2395,8 @@ pub(crate) async fn run_with_runtime_envelope(
                 // and used for both the message-event envelope and the user op-id.
                 let turn_run_id = Uuid::new_v4().to_string();
                 let runtime_envelope =
-                    RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
+                    RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), repl_session_id.clone())
+                        .with_run_id(turn_run_id.clone())
                         .with_recipient("cli:local-user")
                         .with_config_generation(&ctx.config_generation);
                 let fabric_scope = runtime_envelope
@@ -2366,6 +2408,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     fabric: memory_fabric.clone(),
                     generation: Arc::clone(&ctx.config_generation),
                     envelope: runtime_envelope.clone(),
+                    expected_session_key: format!("agent:{repl_session_id}"),
                     scope: fabric_scope.clone(),
                     choice: choice.clone(),
                     input: user_input.clone(),
@@ -2380,11 +2423,11 @@ pub(crate) async fn run_with_runtime_envelope(
                         .turn_decisions
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("interactive agent decision service is missing"))?;
-                    let proof = issue_cli_agent_turn_proof(
+                    let proof = issue_cli_agent_turn_proof_for_session(
                         None,
                         &runtime_envelope,
                         &ctx.config_generation,
-                        &turn_run_id,
+                        (&turn_run_id, &format!("agent:{repl_session_id}")),
                         &user_input,
                         agent_user_event.as_ref(),
                         choice,
@@ -2525,7 +2568,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 // interactive agent turn inherits parent_run_id = the per-turn run_id.
                 let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
                     turn_run_id.clone(),
-                    format!("agent:{turn_run_id}"),
+                    runtime_envelope.session_key.clone(),
                 );
                 let provider_started_at = chrono::Utc::now();
                 let mut runtime_adapter =
