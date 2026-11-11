@@ -8,6 +8,7 @@
 use crate::memory::RAMFLUX_MEMORY_KEY_PREFIX;
 use crate::memory::traits::{ConversationTurn, Memory, MemoryCategory, MemoryEntry};
 use crate::security::ramflux_aead::{AccountCrypto, CryptoError, id_hash};
+use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;
 use std::collections::HashMap;
@@ -903,13 +904,42 @@ impl Memory for EncryptedScope {
         mut commit: crate::memory::recovery_authority::RecoveryTerminalCommit,
         deadline: std::time::Instant,
     ) -> anyhow::Result<crate::memory::recovery_authority::RecoveryTerminalOutcome> {
-        for event in &mut commit.events {
-            self.seal_event_content(event)?;
+        let final_index = commit.events.len().saturating_sub(1);
+        let mut stored_final = None;
+        for (index, event) in commit.events.iter_mut().enumerate() {
+            let stored = if let Some(key) = event.idempotency_key.as_deref() {
+                self.inner
+                    .find_message_event_by_idempotency_key(&event.workspace_id, key)
+                    .await?
+            } else {
+                None
+            };
+            if let Some(stored) = stored.as_ref() {
+                let plain = self.reveal(stored.clone());
+                if plain.content != event.content {
+                    return Ok(crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict);
+                }
+                event.content.clone_from(&stored.content);
+            } else {
+                self.seal_event_content(event)?;
+            }
+            if index == final_index {
+                stored_final = stored;
+            } else if let Some(payload) = event.raw_payload_json.take() {
+                let key = event.idempotency_key.as_deref().unwrap_or("event");
+                event.raw_payload_json = Some(match stored.as_ref() {
+                    Some(stored) if self.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) => stored
+                        .raw_payload_json
+                        .clone()
+                        .context("stored recovery payload missing")?,
+                    _ => self.seal(&format!("{key}:payload"), &payload)?,
+                });
+            }
         }
         if let Some(ingress) = commit.ingress.as_mut() {
             self.seal_event_content(&mut ingress.evidence)?;
         }
-        let reveal = EncryptedScope {
+        let reveal = Self {
             inner: Arc::clone(&self.inner),
             crypto: Arc::clone(&self.crypto),
             account_id: self.account_id.clone(),
@@ -918,7 +948,22 @@ impl Memory for EncryptedScope {
         crate::memory::sqlite::map_after_prefix(move |hook| {
             Box::new(move |prefix, final_input| {
                 let revealed: Vec<_> = prefix.iter().cloned().map(|event| reveal.reveal(event)).collect();
-                hook(&revealed, final_input)
+                if let Some(hook) = hook {
+                    hook(&revealed, final_input)?;
+                }
+                if let Some(payload) = final_input.raw_payload_json.take() {
+                    let key = final_input.idempotency_key.as_deref().unwrap_or("event");
+                    final_input.raw_payload_json = Some(match stored_final.as_ref() {
+                        Some(stored) if reveal.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) => {
+                            stored
+                                .raw_payload_json
+                                .clone()
+                                .context("stored recovery payload missing")?
+                        }
+                        _ => reveal.seal(&format!("{key}:payload"), &payload)?,
+                    });
+                }
+                Ok(())
             })
         });
         let outcome = self.inner.commit_recovery_terminal(commit, deadline).await?;

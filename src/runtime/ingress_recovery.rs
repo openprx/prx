@@ -270,14 +270,17 @@ impl RecoveryScope {
             let workspace = scope.workspace.clone();
             let workspace_id = workspace.to_string_lossy().into_owned();
             let cost = config.cost.clone();
-            let _ = owned_store_operation(owner, move || {
-                crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
-                    memory.as_ref(),
-                    &workspace_id,
-                    &workspace,
-                    &cost,
-                )
-            })
+            let _ = tokio::time::timeout(
+                Duration::from_secs(15),
+                owned_store_operation(owner, move || {
+                    crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
+                        memory.as_ref(),
+                        &workspace_id,
+                        &workspace,
+                        &cost,
+                    )
+                }),
+            )
             .await;
         }
         Ok(scope)

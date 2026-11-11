@@ -1386,6 +1386,20 @@ rollback must preserve these records; do not remove authentication fields or
 rewrite old markers to make them replayable. Recovery repairs telemetry and
 does not authorize another provider or tool execution.
 
+With event recording enabled, SQLite, Lucid's local store, and encrypted
+SQLite scopes commit the terminal events, recovery attestation, and an
+authenticated cost outbox together. A metered terminal records
+`projection_pending`; cost projection follows the commit and retries at startup,
+including when the causal decision plane is disabled. Projection reuses an
+identical settlement, leaves I/O failures retryable, and blocks conflicting or
+incomplete ledger rows without truncating them. Restart repair does not repeat
+provider or tool execution. Subscription and unknown pricing dispositions do
+not append monetary ledger rows. PostgreSQL retains its existing terminal path.
+Keep the workspace's `.recovery_keys` directory with its database backups.
+Conversation erasure removes the recovery attestation while retaining the
+outbox's redacted usage facts. Rollback must preserve both keys and stored
+records.
+
 Prompt memory recall is produced independently of decision selection. Each turn
 uses its authenticated owner, workspace and session scope, including owner
 isolation for external origins. The composed recalled context is capped at

@@ -5,7 +5,7 @@ use crate::memory::ingress_recovery::{AtomicIngressMutation, remaining};
 use crate::memory::recovery_authority::{RecoveryTerminalCommit, RecoveryTerminalConflict, RecoveryTerminalOutcome};
 use crate::memory::traits::{MessageEvent, MessageEventInput};
 use anyhow::Context;
-use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::cell::RefCell;
 use std::time::Instant;
 
@@ -37,12 +37,11 @@ where
 
 /// Rewrite the installed after-prefix hook. EncryptedScope uses this so the
 /// replay seal sees events as the decorator presents them (plaintext).
-pub(crate) fn map_after_prefix(map: impl FnOnce(AfterPrefix) -> AfterPrefix) {
+pub(crate) fn map_after_prefix(map: impl FnOnce(Option<AfterPrefix>) -> AfterPrefix) {
     AFTER_PREFIX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if let Some(hook) = slot.take() {
-            *slot = Some(map(hook));
-        }
+        let hook = slot.take();
+        *slot = Some(map(hook));
     });
 }
 
@@ -152,6 +151,27 @@ fn commit_blocking(
             .event_id
             .clone();
         let mut publication = commit.publication;
+        // Preserve the reception already authenticated for this run. publish_in
+        // verifies the previous receipt and the input bytes before settling it.
+        if publication.input.is_none() {
+            let input_id: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT input_event_id FROM recovery_attestations
+                 WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND run_id=?4",
+                    params![
+                        publication.chain.workspace_id,
+                        publication.chain.owner_id,
+                        publication.chain.source,
+                        publication.chain.run_id
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            publication.input = input_id
+                .flatten()
+                .map(|id| recovery_authority::event(&tx, &publication.chain, &id))
+                .transpose()?;
+        }
         publication.terminal = Some(recovery_authority::event(&tx, &publication.chain, &terminal_id)?);
         let receipt = match recovery_authority::publish_in(&tx, &directory, &publication, true) {
             Ok(receipt) => receipt,
@@ -227,6 +247,21 @@ fn events_match(input: &MessageEventInput, stored: &MessageEvent) -> bool {
         && input.session_key == stored.session_key
         && input.run_id == stored.run_id
         && input.channel == stored.channel
+        && input.parent_session_key == stored.parent_session_key
+        && input.parent_run_id == stored.parent_run_id
+        && input.agent_id == stored.agent_id
+        && input.persona_id == stored.persona_id
+        && input.sender == stored.sender
+        && input.recipient == stored.recipient
+        && input.subject == stored.subject
+        && input.goal_id == stored.goal_id
+        && input.causation_event_id == stored.causation_event_id
+        && input.correlation_id == stored.correlation_id
+        && input.attempt_id == stored.attempt_id
+        && input.lease_epoch == stored.lease_epoch
+        && input.config_generation_id == stored.config_generation_id
+        && input.config_source_revision == stored.config_source_revision
+        && input.visibility == stored.visibility
 }
 
 fn settlement_id_from_facts(facts: &[u8]) -> anyhow::Result<String> {

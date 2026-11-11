@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(clippy::indexing_slicing)]
 
 use super::recovery_config;
 use crate::agent::terminal::{
@@ -47,7 +46,8 @@ fn ledger_lines(workspace: &Path, terminal_id: &str) -> usize {
 fn assert_closed_outbox_facts(facts: &[u8]) {
     let value: serde_json::Value = serde_json::from_slice(facts).expect("test: outbox facts");
     let object = value.as_object().expect("test: outbox object");
-    assert_eq!(object.keys().map(String::as_str).collect::<Vec<_>>(), OUTBOX_FACT_KEYS);
+    assert_eq!(object.len(), OUTBOX_FACT_KEYS.len());
+    assert!(OUTBOX_FACT_KEYS.iter().all(|key| object.contains_key(*key)));
 }
 
 fn first_outbox(workspace: &Path) -> fixture_readback::OutboxRow {
@@ -244,58 +244,120 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         );
     };
     refuse_field("terminal_id", &|value| {
-        value["terminal_id"] = serde_json::json!("other");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("terminal_id".into(), serde_json::json!("other"));
     });
     refuse_field("decision_id", &|value| {
-        value["decision_id"] = serde_json::json!(uuid::Uuid::nil().to_string());
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("decision_id".into(), serde_json::json!(uuid::Uuid::nil().to_string()));
     });
     refuse_field("workspace", &|value| {
-        value["workspace_id"] = serde_json::json!("other-workspace");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("workspace_id".into(), serde_json::json!("other-workspace"));
     });
     refuse_field("source_event", &|value| {
-        value["source_event_id"] = serde_json::json!(uuid::Uuid::nil().to_string());
+        value.as_object_mut().expect("test: semantic object").insert(
+            "source_event_id".into(),
+            serde_json::json!(uuid::Uuid::nil().to_string()),
+        );
     });
     refuse_field("status", &|value| {
-        value["status"] = serde_json::json!("failed");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("status".into(), serde_json::json!("failed"));
     });
     refuse_field("scope", &|value| {
-        value["scope"]["session_key"] = serde_json::json!("other");
+        value
+            .get_mut("scope")
+            .expect("test: nested semantic")
+            .as_object_mut()
+            .expect("test: nested object")
+            .insert("session_key".into(), serde_json::json!("other"));
     });
     refuse_field("history", &|value| {
-        value["history"]["assistant_content"] = serde_json::json!("mutated");
+        value
+            .get_mut("history")
+            .expect("test: nested semantic")
+            .as_object_mut()
+            .expect("test: nested object")
+            .insert("assistant_content".into(), serde_json::json!("mutated"));
     });
     refuse_field("provider_outcome", &|value| {
-        value["provider_outcome"]["final_model"] = serde_json::json!("other-model");
+        value
+            .get_mut("provider_outcome")
+            .expect("test: nested semantic")
+            .as_object_mut()
+            .expect("test: nested object")
+            .insert("final_model".into(), serde_json::json!("other-model"));
     });
     refuse_field("delivery_intent", &|value| {
-        value["delivery_intent"] = serde_json::json!("none");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("delivery_intent".into(), serde_json::json!("none"));
     });
     refuse_field("execution_trace", &|value| {
-        value["execution_trace"] = serde_json::json!({"mutated": true});
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("execution_trace".into(), serde_json::json!({"mutated": true}));
     });
     refuse_field("decision_chain", &|value| {
-        value["decision_chain"] = serde_json::json!(["other"]);
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("decision_chain".into(), serde_json::json!(["other"]));
     });
     refuse_field("catalog_generation", &|value| {
-        value["catalog_generation"] = serde_json::json!("00");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("catalog_generation".into(), serde_json::json!("00"));
     });
     refuse_field("model_catalog_revision", &|value| {
-        value["model_catalog_revision"] = serde_json::json!("other");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("model_catalog_revision".into(), serde_json::json!("other"));
     });
     refuse_field("model_catalog_content_sha256", &|value| {
-        value["model_catalog_content_sha256"] = serde_json::json!("00");
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("model_catalog_content_sha256".into(), serde_json::json!("00"));
     });
     refuse_field("policy_version", &|value| {
-        value["policy_version"] = serde_json::json!(0);
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("policy_version".into(), serde_json::json!(0));
     });
     refuse_field("history_scope", &|value| {
-        value["history_scope"] = serde_json::json!({"session_key": "other"});
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("history_scope".into(), serde_json::json!({"session_key": "other"}));
     });
     refuse_field("telemetry", &|value| {
-        value["telemetry"]["summary"] = serde_json::json!("mutated");
+        value
+            .get_mut("telemetry")
+            .expect("test: nested semantic")
+            .as_object_mut()
+            .expect("test: nested object")
+            .insert("summary".into(), serde_json::json!("mutated"));
     });
     refuse_field("prepared_parameters", &|value| {
-        value["prepared_parameters"] = serde_json::json!([{"mutated": true}]);
+        value
+            .as_object_mut()
+            .expect("test: semantic object")
+            .insert("prepared_parameters".into(), serde_json::json!([{"mutated": true}]));
     });
     let mut key_preimage = serde_json::to_vec(&semantic).expect("test: key preimage");
     key_preimage.extend_from_slice(b"other-key");
@@ -377,6 +439,13 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             assert!(
                 stored.iter().all(|content| content != "done"),
                 "encrypted backend stored plaintext assistant content"
+            );
+            let terminals = fixture_readback::terminal_rows(&workspace).expect("test: encrypted terminal rows");
+            assert!(
+                terminals
+                    .iter()
+                    .all(|row| serde_json::from_str::<serde_json::Value>(&row.raw_payload).is_err()),
+                "encrypted backend stored plaintext terminal payload"
             );
             assert_eq!(
                 first.assistant_event.as_ref().map(|event| event.content.as_str()),
@@ -707,6 +776,62 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
 
 pub(super) async fn recovery_restart_from_killed_process() {
     let (dir, workspace) = home_workspace();
+    let (mut child, ack) = spawn_recovery_child(&workspace, "commit");
+    let payload = ack.recv_timeout(Duration::from_secs(120));
+    let _ = child.kill();
+    let _ = child.wait();
+    let payload = payload.expect("test: child ack");
+    let value: serde_json::Value = serde_json::from_str(&payload).expect("test: ack json");
+    assert_eq!(
+        value.get("outbox_state").and_then(serde_json::Value::as_str),
+        Some("pending")
+    );
+    let terminal_before = fixture_readback::terminal_rows(&workspace)
+        .expect("test: terminal before restart")
+        .into_iter()
+        .map(|row| row.raw_payload)
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_before.len(), 1);
+    assert!(
+        fixture_readback::indexed_tables(&workspace)
+            .iter()
+            .any(|table| table == "recovery_attestations")
+    );
+
+    let (mut restarted, ack) = spawn_recovery_child(&workspace, "repair");
+    let repaired = ack.recv_timeout(Duration::from_secs(120));
+    if repaired.is_err() {
+        let _ = restarted.kill();
+    }
+    let status = restarted.wait().expect("test: wait for restarted process");
+    assert!(status.success(), "restarted recovery process failed");
+    let repaired: serde_json::Value =
+        serde_json::from_str(&repaired.expect("test: repair ack")).expect("test: repair json");
+    assert_eq!(
+        repaired.get("outbox_state").and_then(serde_json::Value::as_str),
+        Some("acknowledged")
+    );
+    assert_eq!(fixture_readback::outbox_rows(&workspace).len(), 1);
+    assert_eq!(first_outbox(&workspace).state, "acknowledged");
+    assert_eq!(ledger_lines(&workspace, "prx-killed"), 1);
+    let terminal_after = fixture_readback::terminal_rows(&workspace)
+        .expect("test: terminal after restart")
+        .into_iter()
+        .map(|row| row.raw_payload)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_before, terminal_after,
+        "restart changed committed terminal bytes"
+    );
+    assert!(
+        fixture_readback::indexed_tables(&workspace)
+            .iter()
+            .any(|table| table == "recovery_attestations")
+    );
+    drop(dir);
+}
+
+fn spawn_recovery_child(workspace: &Path, phase: &str) -> (std::process::Child, std::sync::mpsc::Receiver<String>) {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "runtime::ingress_recovery::tests::fresh_process_recovery_child",
@@ -715,10 +840,11 @@ pub(super) async fn recovery_restart_from_killed_process() {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env("PRX_RECOVERY_TEST_WORKSPACE", &workspace)
+        .env("PRX_RECOVERY_TEST_WORKSPACE", workspace)
+        .env("PRX_RECOVERY_TEST_PHASE", phase)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("test: spawn recovery child");
     let stdout = child.stdout.take().expect("test: child stdout");
@@ -733,30 +859,31 @@ pub(super) async fn recovery_restart_from_killed_process() {
             }
         }
     });
-    let payload = ack.recv_timeout(Duration::from_secs(120)).expect("test: child ack");
-    let value: serde_json::Value = serde_json::from_str(&payload).expect("test: ack json");
-    assert_eq!(value["outbox_state"], "pending");
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
-    let cost = priced_cost_config();
-    let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, true, cost).await;
-    drop(recovery);
-    tracker
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .ok();
-    assert_eq!(fixture_readback::outbox_rows(&workspace).len(), 1);
-    assert_eq!(first_outbox(&workspace).state, "acknowledged");
-    assert_eq!(ledger_lines(&workspace, "prx-killed"), 1);
-    drop(dir);
+    (child, ack)
 }
 
 pub(super) async fn fresh_process_recovery_child() {
     let workspace =
         std::path::PathBuf::from(std::env::var("PRX_RECOVERY_TEST_WORKSPACE").expect("test: workspace env"));
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
+    let memory = SqliteMemory::new(&workspace)
+        .expect("test: process database")
+        .with_erasure_origin(tombstone_fixture::erasure_origin())
+        .expect("test: process erase scope");
+    if std::env::var("PRX_RECOVERY_TEST_PHASE").as_deref() == Ok("repair") {
+        let (recovery, tracker) =
+            prepare_scope(&workspace, Arc::clone(&memory), false, true, priced_cost_config()).await;
+        drop(recovery);
+        tracker
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("test: restarted process drain");
+        println!(
+            "PRX_RECOVERY_ACK:{}",
+            serde_json::json!({"outbox_state": first_outbox(&workspace).state})
+        );
+        return;
+    }
+
     let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
     let cost = priced_cost_config();
     let mut commit = completed_commit("prx-killed");

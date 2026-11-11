@@ -59,7 +59,6 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn insert_in(
     tx: &rusqlite::Transaction<'_>,
     directory: &KeyDirectory,
@@ -111,9 +110,25 @@ pub(super) fn insert_in(
         .optional()?;
     if let Some((stored_owner, stored_facts, stored_mac)) = existing {
         // Projection may have moved state off pending; identity is owner+facts+mac.
-        if stored_owner != owner_id || stored_facts != facts || stored_mac != mac {
+        if stored_owner != owner_id || stored_facts != facts {
             return Err(crate::memory::recovery_authority::RecoveryTerminalConflict.into());
         }
+        let stored_tag = stored_mac
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("recovery cost outbox mac is invalid"))?;
+        verify_outbox_mac(
+            &key,
+            workspace_id,
+            owner_id,
+            settlement_id,
+            1,
+            key_id,
+            &usage_digest,
+            pricing,
+            facts,
+            &stored_tag,
+        )?;
         return Ok(InsertOutbox::Replayed);
     }
     tx.execute(
@@ -168,21 +183,7 @@ pub(super) fn pending_recovery_costs(
          ORDER BY settlement_id ASC
          LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![workspace_id, after, limit as i64], |row| {
-        Ok(RawOutbox {
-            workspace_id: row.get(0)?,
-            owner_id: row.get(1)?,
-            settlement_id: row.get(2)?,
-            version: row.get(3)?,
-            key_id: row.get(4)?,
-            usage_digest: row.get(5)?,
-            pricing: row.get(6)?,
-            state: row.get(7)?,
-            facts: row.get(8)?,
-            mac: row.get(9)?,
-            state_mac: row.get(10)?,
-        })
-    })?;
+    let rows = statement.query_map(params![workspace_id, after, limit as i64], read_raw)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(authenticate(&directory, row?)?);
@@ -208,22 +209,30 @@ pub(super) fn finish_recovery_cost(
     );
     let writer = memory.pool.write();
     let tx = rusqlite::Transaction::new_unchecked(&writer, TransactionBehavior::Immediate)?;
-    let (owner_id, key_id, stored_digest, stored_state): (String, String, Vec<u8>, String) = tx.query_row(
-        "SELECT owner_id, key_id, usage_digest, state FROM recovery_cost_outbox
+    let raw = tx.query_row(
+        "SELECT workspace_id, owner_id, settlement_id, version, key_id, usage_digest,
+                pricing, state, facts, mac, state_mac FROM recovery_cost_outbox
          WHERE workspace_id=?1 AND settlement_id=?2",
         params![workspace_id, settlement_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        read_raw,
     )?;
+    let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
+    let row = authenticate(&directory, raw)?;
     anyhow::ensure!(
-        stored_digest.as_slice() == usage_digest.as_slice(),
-        "recovery cost outbox usage_digest is invalid"
-    );
-    anyhow::ensure!(
-        stored_state == RecoveryCostState::Pending.as_str() || stored_state == RecoveryCostState::Error.as_str(),
+        matches!(row.state, RecoveryCostState::Pending | RecoveryCostState::Error),
         "illegal recovery cost outbox transition"
     );
-    let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
-    let key = directory.load(&key_id)?;
+    let owner_id = row.owner_id;
+    let facts = row.facts;
+    let key = directory.load(&row.key_id)?;
+    let value: serde_json::Value = serde_json::from_slice(&facts)?;
+    let usage = serde_json::to_vec(value.get("usage").unwrap_or(&serde_json::Value::Null))?;
+    ring::hmac::verify(
+        &key,
+        &recovery_authority::framed(RecoveryMacDomain::UsageDigestV1.bytes(), &usage),
+        usage_digest,
+    )
+    .map_err(|_| anyhow::anyhow!("recovery cost outbox usage_digest is invalid"))?;
     let state_mac = sign_state(&key, workspace_id, &owner_id, settlement_id, usage_digest, state)?;
     tx.execute(
         "UPDATE recovery_cost_outbox SET state=?1, state_mac=?2 WHERE workspace_id=?3 AND settlement_id=?4",
@@ -392,7 +401,6 @@ fn usage_digest_mac(key: &ring::hmac::Key, facts: &[u8]) -> anyhow::Result<[u8; 
         .context("recovery cost outbox usage_digest is invalid")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sign_outbox(
     key: &ring::hmac::Key,
     workspace_id: &str,
@@ -480,7 +488,6 @@ fn validate_facts(facts: &[u8], pricing: RecoveryPricing) -> anyhow::Result<()> 
 
 /// Test helper: insert a fully formed row, bypassing MAC construction.
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_raw_for_test(
     memory: &SqliteMemory,
     workspace_id: &str,
@@ -525,7 +532,6 @@ pub(crate) fn usage_digest_for_test(memory: &SqliteMemory, key_id: &str, facts: 
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_outbox_for_test(
     memory: &SqliteMemory,
     workspace_id: &str,
@@ -557,4 +563,20 @@ pub(crate) fn sign_outbox_for_test(
         )?,
         sign_state(&key, workspace_id, owner_id, settlement_id, usage_digest, state)?,
     ))
+}
+
+fn read_raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawOutbox> {
+    Ok(RawOutbox {
+        workspace_id: row.get(0)?,
+        owner_id: row.get(1)?,
+        settlement_id: row.get(2)?,
+        version: row.get(3)?,
+        key_id: row.get(4)?,
+        usage_digest: row.get(5)?,
+        pricing: row.get(6)?,
+        state: row.get(7)?,
+        facts: row.get(8)?,
+        mac: row.get(9)?,
+        state_mac: row.get(10)?,
+    })
 }

@@ -59,6 +59,9 @@ impl CostTracker {
                 file.sync_all()
                     .with_context(|| format!("Failed to sync cost storage at {}", storage.path.display()))?;
             }
+            if let Some(parent) = storage.path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
             return Ok(());
         }
         let usage = TokenUsage {

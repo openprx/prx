@@ -40,7 +40,6 @@ pub(crate) fn crash_before_ack(crash: bool) {
     CRASH_BEFORE_ACK.with(|cell| cell.set(crash));
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn finalize_recovery_terminal(
     fabric: &MemoryFabric,
     commit: TurnTerminalCommit,
@@ -61,7 +60,33 @@ pub(super) async fn finalize_recovery_terminal(
     let repository = memory
         .recovery_repository()
         .context("recovery repository unavailable")?;
-    let key_id = repository.activate_recovery_authority()?;
+    repository.activate_recovery_authority()?;
+    let existing_claim = memory
+        .find_message_event_by_idempotency_key(
+            fabric.workspace_id(),
+            &format!("turn:{}:decision-claim", commit.terminal_id),
+        )
+        .await?;
+    let existing_payload = existing_claim
+        .as_ref()
+        .map(|event| {
+            serde_json::from_str::<serde_json::Value>(
+                event
+                    .raw_payload_json
+                    .as_deref()
+                    .context("recovery terminal claim has no payload")?,
+            )
+            .context("recovery terminal claim payload is invalid")
+        })
+        .transpose()?;
+    let key_id = match existing_payload.as_ref() {
+        Some(payload) => payload
+            .get("recovery_key_id")
+            .and_then(serde_json::Value::as_str)
+            .context("recovery terminal claim key is missing")?
+            .to_owned(),
+        None => repository.activate_recovery_authority()?,
+    };
     let recorded = commit.decision.is_recorded();
 
     if !recorded {
@@ -86,6 +111,24 @@ pub(super) async fn finalize_recovery_terminal(
     let semantic_bytes = serde_json::to_vec(&semantic)?;
     let mut claim_preimage = semantic_bytes.clone();
     claim_preimage.extend_from_slice(key_id.as_bytes());
+    if let Some(payload) = existing_payload.as_ref() {
+        let tag = hex::decode(
+            payload
+                .get("semantic_mac_v3")
+                .and_then(serde_json::Value::as_str)
+                .context("recovery terminal claim mac is missing")?,
+        )?;
+        let tag = crate::memory::recovery_authority::RecoveryTag {
+            key_id: key_id.clone(),
+            tag: tag
+                .as_slice()
+                .try_into()
+                .context("recovery terminal claim mac length")?,
+        };
+        repository
+            .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
+            .context("recovery terminal commit conflict")?;
+    }
     let semantic_mac_v3 = hex::encode(
         repository
             .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
@@ -105,14 +148,24 @@ pub(super) async fn finalize_recovery_terminal(
         None
     };
 
-    let claim_id = Uuid::new_v4().to_string();
+    let claim_id = terminal_event_id(
+        memory.as_ref(),
+        fabric.workspace_id(),
+        &commit.terminal_id,
+        "decision-claim",
+    )
+    .await?;
     let assistant_id = if commit.history.is_some() && commit.status == TurnTerminalStatus::Completed {
-        Some(Uuid::new_v4().to_string())
+        Some(terminal_event_id(memory.as_ref(), fabric.workspace_id(), &commit.terminal_id, "assistant").await?)
     } else {
         None
     };
-    let usage_id = usage_settlement.as_ref().map(|_| Uuid::new_v4().to_string());
-    let final_id = Uuid::new_v4().to_string();
+    let usage_id = if usage_settlement.is_some() {
+        Some(terminal_event_id(memory.as_ref(), fabric.workspace_id(), &commit.terminal_id, "usage").await?)
+    } else {
+        None
+    };
+    let final_id = terminal_event_id(memory.as_ref(), fabric.workspace_id(), &commit.terminal_id, "final").await?;
 
     let claim_payload = {
         let mut payload = serde_json::json!({
@@ -859,4 +912,16 @@ fn usage_from_facts(facts: &[u8]) -> anyhow::Result<Option<MeteredTokenUsageReco
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(usage) => Ok(Some(serde_json::from_value(usage.clone())?)),
     }
+}
+
+async fn terminal_event_id(
+    memory: &dyn Memory,
+    workspace: &str,
+    terminal: &str,
+    suffix: &str,
+) -> anyhow::Result<String> {
+    Ok(memory
+        .find_message_event_by_idempotency_key(workspace, &format!("turn:{terminal}:{suffix}"))
+        .await?
+        .map_or_else(|| Uuid::new_v4().to_string(), |event| event.event_id))
 }
