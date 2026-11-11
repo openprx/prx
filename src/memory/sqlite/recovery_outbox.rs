@@ -593,3 +593,14 @@ pub(crate) fn forge_acknowledged_cost_for_test(workspace: &std::path::Path, sett
     anyhow::ensure!(changed == 1, "test: expected one pending outbox row");
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) fn remove_cost_for_test(workspace: &std::path::Path, settlement: &str) -> anyhow::Result<()> {
+    let memory = SqliteMemory::new(workspace)?;
+    let changed = memory
+        .pool
+        .write()
+        .execute("DELETE FROM recovery_cost_outbox WHERE settlement_id=?1", [settlement])?;
+    anyhow::ensure!(changed == 1, "test: expected one outbox row to remove");
+    Ok(())
+}

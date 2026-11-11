@@ -821,10 +821,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .id,
         rejoin_marker.terminal_event.id
     );
-    let completed_context = reopened
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
-        .await
-        .expect("completed decision after service reopen");
+    let (_, completed_context, completed_scope) =
+        fresh_terminal_run(&reopened, &generation, Arc::clone(&memory), "prx_completed_rejoin_run").await;
     let (expected_classification, completed_outcome) = match completed_context.terminal_outcome_action() {
         Some(crate::causal_tree::branch::CausalActionKind::Clarify) => ("clarification", None),
         Some(crate::causal_tree::branch::CausalActionKind::Refuse) => ("refusal", None),
@@ -855,11 +853,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                     .expect("completed link"),
             ),
             terminal_id: "completed-rejoin-terminal-1".to_owned(),
-            scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-                .with_owner_id(proof.owner_id())
-                .with_channel("cli")
-                .with_session_key(proof.session_key())
-                .with_run_id(proof.run_id()),
+            scope: completed_scope,
             status: crate::agent::terminal::TurnTerminalStatus::Completed,
             history: None,
             history_scope: None,

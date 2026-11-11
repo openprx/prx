@@ -165,7 +165,7 @@ fn commit_blocking(
         };
 
         let settlement_id = settlement_id_from_facts(&commit.outbox.facts)?;
-        recovery_outbox::insert_in(
+        let outbox = recovery_outbox::insert_in(
             &tx,
             &directory,
             &publication.chain.workspace_id,
@@ -175,6 +175,10 @@ fn commit_blocking(
             commit.outbox.pricing,
             &commit.outbox.facts,
         )?;
+        match (existing_any, outbox) {
+            (false, recovery_outbox::InsertOutbox::Inserted) | (true, recovery_outbox::InsertOutbox::Replayed) => {}
+            _ => return Err(RecoveryTerminalConflict.into()),
+        }
 
         remaining(deadline)?;
         #[cfg(test)]

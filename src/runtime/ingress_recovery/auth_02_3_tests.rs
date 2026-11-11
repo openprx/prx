@@ -717,6 +717,31 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
     }
 
     {
+        let (dir, workspace, _memory, fabric, commit, cost, service) = priced_setup("prx-missing-outbox").await;
+        let _skip = SkipInline;
+        crate::agent::terminal::recovery_commit::skip_inline_projection(true);
+        finalize_turn(&fabric, commit.clone(), &cost, &workspace)
+            .await
+            .expect("test: terminal and pending outbox");
+        crate::memory::sqlite::remove_cost_for_test(&workspace, "prx-missing-outbox")
+            .expect("test: remove the paired outbox row");
+        let error = finalize_turn(&fabric, commit, &cost, &workspace)
+            .await
+            .expect_err("test: a replay cannot regenerate a missing atomic outbox");
+        assert!(
+            error.to_string().contains("recovery terminal commit conflict"),
+            "missing outbox: {error:#}"
+        );
+        assert!(
+            fixture_readback::outbox_rows(&workspace).is_empty(),
+            "refused replay recreated the outbox"
+        );
+        assert_eq!(ledger_lines(&workspace, "prx-missing-outbox"), 0);
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        drop(dir);
+    }
+
+    {
         let (dir, workspace, memory, fabric, commit, cost, service) = priced_setup("prx-torn-tail").await;
         let _skip = SkipInline;
         crate::agent::terminal::recovery_commit::skip_inline_projection(true);

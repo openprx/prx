@@ -20,8 +20,8 @@ pub(crate) mod remote_tree;
 
 #[cfg(test)]
 pub(crate) use recovery_outbox::{
-    forge_acknowledged_cost_for_test, insert_raw_for_test, sign_outbox_for_test, skip_outbox_mac_verify,
-    usage_digest_for_test,
+    forge_acknowledged_cost_for_test, insert_raw_for_test, remove_cost_for_test, sign_outbox_for_test,
+    skip_outbox_mac_verify, usage_digest_for_test,
 };
 #[cfg(test)]
 pub(crate) use recovery_terminal::crash_before_commit;
