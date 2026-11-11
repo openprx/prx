@@ -452,6 +452,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
 
 #[tokio::test]
 async fn process_channel_message_cancels_scoped_typing_task() {
+    const MAX_EVENT_PAGES: usize = 32;
     let tmp = tempfile::TempDir::new().unwrap();
     let channel_impl = Arc::new(RecordingChannel::default());
     let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -549,15 +550,19 @@ async fn process_channel_message_cancels_scoped_typing_task() {
     let mut after_id = 0;
     // Claims and provider audit events share the cursor stream. Read every
     // page before checking the turn's durable conversation projections.
-    loop {
+    for page_index in 0..MAX_EVENT_PAGES {
         let page = memory
             .list_message_events_since(&principal, after_id, 10)
             .await
-            .unwrap();
+            .expect("test: read conversation event page");
         let Some(last) = page.last() else { break };
         assert!(last.id > after_id, "message-event cursor must advance");
         after_id = last.id;
         events.extend(page);
+        assert!(
+            page_index + 1 < MAX_EVENT_PAGES,
+            "test: event stream exceeded fixture budget"
+        );
     }
     let user_event = events.iter().find(|event| event.role == "user").expect("user event");
     let assistant_event = events

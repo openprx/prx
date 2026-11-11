@@ -162,6 +162,7 @@ async fn spawn_denied_without_grant_under_supervised() {
 
 #[tokio::test]
 async fn spawn_records_request_and_result_message_events() {
+    const MAX_EVENT_PAGES: usize = 32;
     let tmp = tempfile::TempDir::new().unwrap();
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
     let (ch, _) = RecordingChannel::new();
@@ -210,15 +211,19 @@ async fn spawn_records_request_and_result_message_events() {
     let mut after_id = 0;
     // Claims and provider audit events share the cursor stream. Read every
     // page before checking the turn's durable conversation projections.
-    loop {
+    for page_index in 0..MAX_EVENT_PAGES {
         let page = memory
             .list_message_events_since(&principal, after_id, 10)
             .await
-            .unwrap();
+            .expect("test: read conversation event page");
         let Some(last) = page.last() else { break };
         assert!(last.id > after_id, "message-event cursor must advance");
         after_id = last.id;
         events.extend(page);
+        assert!(
+            page_index + 1 < MAX_EVENT_PAGES,
+            "test: event stream exceeded fixture budget"
+        );
     }
 
     let parent_event = events

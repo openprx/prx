@@ -126,6 +126,7 @@ async fn read_json(mut response: reqwest::Response) -> serde_json::Value {
 async fn restart_scenario() {
     let workspace = tempfile::tempdir().expect("test: fixture operation");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("test: fixture operation");
