@@ -175,10 +175,11 @@ pub(super) fn install_table_triggers(conn: &rusqlite::Connection, table: &str) -
         .iter()
         .map(|(parent, id, reference, extra)| {
             format!(
-                "INSERT OR IGNORE INTO ramflux_erase_index(account,conversation,message,table_name,record_rowid)
+                "INSERT INTO ramflux_erase_index(account,conversation,message,table_name,record_rowid)
          SELECT i.account,i.conversation,i.message,'{table}',NEW.rowid
          FROM ramflux_erase_index i JOIN {parent} e ON e.rowid=i.record_rowid
-         WHERE i.table_name='{parent}' AND e.{id}={reference} AND i.account=ramflux_origin(0) AND i.conversation=ramflux_origin(1) {extra};"
+         WHERE i.table_name='{parent}' AND e.{id}={reference} AND i.account=ramflux_origin(0) AND i.conversation=ramflux_origin(1) {extra}
+         ON CONFLICT(account,conversation,message,table_name,record_rowid) DO NOTHING;"
             )
         })
         .collect::<Vec<_>>()
