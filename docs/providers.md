@@ -784,23 +784,27 @@ provider. A different provider resolves its route credential or active auth
 profile unless the named delegate supplies an explicit `api_key`.
 
 Static prices are recorded in the embedded release catalog only when the
-provider publishes token prices for a stable model ID. Kimi Code is
-subscription/quota billed, so PRX deliberately does not invent a per-token cost
-for its coding aliases. OpenRouter rows may reuse the stable upstream tariff for
-recognized Anthropic, Google/Gemini, Moonshot, OpenAI and xAI model IDs; other
-OpenRouter and proxy pricing remains dynamic except for exact release rows with
-a published price. The release values are checked against the providers'
-published pricing: [Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
-[Gemini](https://ai.google.dev/gemini-api/docs/pricing), and
+provider publishes token prices for a stable model ID. Kimi Code catalog rows
+are subscription-billed: G6 admits them and records no per-token charge
+(`subscription-billed, no per-token cost recorded`). An operator `[cost.prices]`
+entry still wins and is then billed as a token price. OpenRouter rows may reuse
+the stable upstream tariff for recognized Anthropic, Google/Gemini, Moonshot,
+OpenAI and xAI model IDs; other OpenRouter and proxy pricing remains dynamic
+except for exact release rows with a published price. The release values are
+checked against the providers' published pricing:
+[Anthropic](https://platform.claude.com/docs/en/about-claude/pricing),
+[Gemini](https://ai.google.dev/gemini-api/docs/pricing),
 [xAI pricing](https://docs.x.ai/developers/pricing), and
-[Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat).
-An unpriced Kimi Code or OpenRouter selection is refused by G6 before a model
-call, even when credentials, subscription and model capabilities are valid.
-Selecting it explicitly does not bypass that gate. Supply an operator price
-override as described below or select a priced model. The generic user-facing
-policy reply does not expose configuration; operator logs, `prx doctor`, and
-`prx providers test` name the missing tariff and its configuration key. Selecting
-an unpriced default also prints a warning in the configuration change plan.
+[Moonshot/Kimi token tariffs](https://platform.kimi.ai/docs/pricing/chat)
+(platform Kimi chat models, not Kimi Code). An unpriced non-subscription
+selection, including an unpriced OpenRouter row, is refused by G6 before a
+model call, even when credentials and model capabilities are valid. Selecting
+it explicitly does not bypass that gate. Supply an operator price override as
+described below or select a priced or subscription model. The generic
+user-facing policy reply does not expose configuration; operator logs,
+`prx doctor`, and `prx providers test` name the missing tariff and its
+configuration key. Selecting an unpriced default also prints a warning in the
+configuration change plan.
 
 An uncertain model-specific price is omitted instead of inferred from another
 generation. Router ranking cost is a separate catalog hint and is never used as
@@ -952,8 +956,9 @@ OpenRouter chat traces retain reported prompt, completion, cached-input and
 cache-write token counts, using the provider's
 [usage fields](https://github.com/OpenRouterTeam/docs/blob/main/cookbook/administration/usage-accounting.mdx).
 A priced turn is settled into `<workspace>/state/costs.jsonl`; missing usage
-is not invented as a reported zero. Use `/cost` inside `prx chat` for the current
-cost summary. There is no standalone `prx cost` command.
+is not invented as a reported zero. Use `/cost` inside `prx chat` for the
+current session summary, or `prx cost` (`prx cost --json`) to read the
+workspace ledger without initializing configuration.
 
 ### Configuring fallback model IDs
 

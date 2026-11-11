@@ -1,10 +1,14 @@
 # Tools
 
-Built-in and dynamically discovered tools are organized by category. The exact
-provider-visible count is selected by the source-bound turn decision, configuration,
-runtime health, MCP metadata, and the active WASM generation. The resulting immutable
+Built-in and dynamically discovered tools are organized by category. The
+provider-visible surface is built by the **surface owner**: registry ∩ ACL ∩
+`always_exclude` / channel exclusions ∩ model allowlist ∩ catalog eligibility.
+That assembly does not read the advisory decision engine, so a turn still has a
+surface when `[decision_engine] enabled = false`. Runtime health, MCP metadata,
+and the active WASM generation feed the registry. The resulting immutable
 `ToolSpec` snapshot controls provider representation and execution for that
-iteration; see [Unified turn context](unified-turn-context.md).
+iteration; see [Unified turn context](unified-turn-context.md) and
+[Runtime security — tool surface owner](security.md#tool-surface-owner).
 
 The complete static public inventory contains 55 tool names. Runtime discovery
 can add Skill, MCP, and WASM aliases. MCP aliases remain in the discovery
@@ -287,12 +291,15 @@ it.
 
 ## Per-turn capability routing
 
-The current local candidate uses the shared turn decision to select exact
-capability references from a pinned runtime catalog. The original recorded
+The surface owner publishes the admitted tool names for the turn. Execution then
+binds a selected capability, schema fingerprint, catalog generation and source
+scope; that binding is independent of the advisory engine. The original recorded
 input belongs to the source proof; recalled memory and later provider history
-do not replace it. Selected references carry a catalog generation and schema
-fingerprint, and execution rechecks their source, policy and current definition.
-The candidate remains under verification; see [Decision plane](decision-plane.md).
+do not replace it. Execution rechecks source, policy and the current definition.
+When `[causal_tree]` is enabled, admission still runs the decision plane; with
+the plane off, the same surface owner still publishes the tools. See
+[Decision plane](decision-plane.md) and
+[Runtime security — tool surface owner](security.md#tool-surface-owner).
 
 `always_exclude` removes names from the eligible surface. `always_include`
 prefers direct publication and can restore a default channel exclusion, but it
@@ -1898,6 +1905,16 @@ first-discoverable by enable or reload. HTTP is accepted only for numeric
 loopback addresses; redirects and ambient proxies are disabled.
 
 ### Bounded instruction experiments
+
+**Availability.** The current experiment product is the local CLI
+(`prx skills lifecycle experiment` and `experiment product`). Ordinary
+`prx chat`, `prx gateway`, and `prx daemon` do not activate controlled H2
+authority. Chat/Gateway H2 starts only from an explicit foreground OS launch
+with both ceilings JSON and authority lifetime (see flags below). The Console
+route `POST /api/skills/lifecycle/h2` does not mint an H2 invocation: without a
+controlled profile it is `403`; with a profile attached it is `503`. No Study
+action is exposed to Chat or Gateway models. Child-session capability parity is
+planned; it is not current behaviour.
 
 The current experiment product surface is the explicit local CLI/service. Bounded recursion and adopted-result service mechanics do not provide conversational experiment actions or Gateway experiment control. Native Chat file-tool regression evidence is separate from a complete Chat experiment workflow; shared infrastructure does not establish entrypoint parity or measured learning benefit.
 

@@ -41,6 +41,15 @@ See [decision-plane behavior](docs/decision-plane.md) and the
 [configuration reference](docs/configuration.md) for admission, defaults and
 legacy-key migration.
 
+### Advisory Decision Engine
+
+The advisory engine (`[decision_engine]`) is **off by default**
+(`enabled = false`). Off means no analysis brief, telemetry store, or outcome
+writes. Tool selection, approval, and admission stay with the decision plane
+(`[causal_tree]`), the tool surface owner, and the approval ledger. Enable it
+only with an explicit `[decision_engine] enabled = true`. See
+[advisory decision engine](docs/decision-engine.md).
+
 ## Quick Start
 
 Linux and macOS:
@@ -84,6 +93,17 @@ cd prx
 cargo build --release --locked --bin prx
 ./target/release/prx init --interactive
 ```
+
+## Commands
+
+| Command | What it does |
+|---------|----------------|
+| `prx agent [message]` | One-shot agent loop: print the reply on stdout, or omit the message for a line-mode prompt. No TUI. |
+| `prx chat` | Fullscreen interactive session: streaming, tool cards, and saved sessions. `--plain` or `PRX_TUI=0` uses the reedline fallback. |
+| `prx go` | Zero-config start in a temporary workspace. Writes no config files. `--message` uses the agent loop; otherwise it opens chat. |
+| `prx tasks` | List or kill live subagent runs on a running gateway (`list`, `kill`, `send`, `pools`). |
+| `prx cost` | Read the workspace cost ledger without initializing configuration. `--json` for machine-readable output. |
+| `prx config` | Inspect and change configuration through a transaction (`show`, `plan`, `apply`, `history`, `rollback`, `status`, `schema`). |
 
 ## Binaries
 

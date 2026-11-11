@@ -7,12 +7,12 @@
 | 0.8.x   | :white_check_mark: |
 | < 0.8   | :x:                |
 
-## Known Vulnerability Status (v0.8.106)
+## Known Vulnerability Status
 
-As of v0.8.106 (2026-09), all known reachable CVEs are closed via dependency upgrades. Remaining
-advisories are explicitly ignored in `deny.toml` with documented justification.
+Current package version is `0.8.171`. Advisories that remain ignored are listed
+in `deny.toml` with a documented reason. New unsuppressed advisories fail CI.
 
-### Closed
+### Closed (historical)
 
 | Advisory | Crate | Severity | Resolution |
 |----------|-------|----------|------------|
@@ -22,14 +22,16 @@ advisories are explicitly ignored in `deny.toml` with documented justification.
 | RUSTSEC-2026-0141 | lettre | critical | Upgraded 0.11.19 → 0.11.23 |
 | RUSTSEC-2026-0269 | wasmtime | high | Upgraded 45.0.3 → 46.0.3 |
 
-### Suppressed (Unreachable / Transitive Wasm-Only)
+### Suppressed
 
 | Advisory | Crate | Reason |
 |----------|-------|--------|
 | RUSTSEC-2025-0141 | bincode 2.0.1 | Transitive via probe-rs; upstream project considered complete |
+| RUSTSEC-2026-0441 | pin-utils 0.1.0 | Transitive via async-imap; macro-only crate considered complete |
 
-CI enforcement: `sec-audit.yml` job `deny / advisories` runs `cargo deny check advisories`
-without `continue-on-error` (S5 P0-4) — any new unsuppressed advisory blocks `main` merges.
+CI enforcement: `.github/workflows/sec-audit.yml` job `deny / advisories` runs
+`cargo deny check advisories` without `continue-on-error` — any new
+unsuppressed advisory blocks `main` merges.
 
 ## Reporting a Vulnerability
 
@@ -55,21 +57,33 @@ Instead, please report them responsibly:
 
 ## Security Architecture
 
-OpenPRX implements defense-in-depth security:
+OpenPRX implements defense-in-depth security.
+
+Runtime boundaries, approvals, and the tool surface owner are documented in
+[docs/security.md](docs/security.md). Child-session capability parity and
+PRX-to-PRX messaging are planned; they are not current behaviour.
 
 ### Autonomy Levels
 
-- **ReadOnly** — Agent can only read, no shell or write access
-- **Supervised** — Agent can act within allowlists (default)
-- **Full** — Agent has full access within workspace sandbox
+Configured as `[autonomy] level`. Default is **Full**.
+
+- **ReadOnly** — side-effecting tools are denied; listed read-only tools still run
+- **Supervised** — side-effecting tools wait for an exact, durable, single-use approval
+- **Full** — side-effecting tools run without an approval prompt
+
+Full still applies identity-scope ACLs, workspace path bounds, the
+forbidden-path list, and the daily cost cap. The former hourly action cap
+(`autonomy.max_actions_per_hour`) is retired and ignored. Per-tool command
+allowlists are retired; side-effecting tools follow the read-only / side-effect
+split above.
 
 ### Sandboxing Layers
 
-1. **Workspace isolation** — All file operations confined to workspace directory
+1. **Workspace isolation** — file operations confined to the workspace when `workspace_only = true` (default)
 2. **Path traversal blocking** — `..` sequences and absolute paths rejected
-3. **Command allowlisting** — Only explicitly approved commands can execute
-4. **Forbidden path list** — Critical system paths (`/etc`, `/root`, `~/.ssh`) always blocked
-5. **Rate limiting** — Max actions per hour and cost per day caps
+3. **Forbidden path list** — critical system paths (`/etc`, `/root`, `~/.ssh`, …) always blocked unless the operator replaces the list
+4. **Daily cost cap** — `autonomy.max_cost_per_day_cents` (default 500)
+5. **Identity-scope ACLs** — `[autonomy.scopes]` can deny a tool for a sender, channel, or chat type at every autonomy level
 
 ### What We Protect Against
 
@@ -97,13 +111,13 @@ Operational configuration, evidence commands, and per-control rollback are in
 
 ## Security Testing
 
-All security mechanisms are covered by automated tests (129 tests):
+Security policy, shell, and file tools are covered by automated tests:
 
 ```bash
-cargo test -- security
-cargo test -- tools::shell
-cargo test -- tools::file_read
-cargo test -- tools::file_write
+cargo test --lib security
+cargo test --lib tools::shell
+cargo test --lib tools::file_read
+cargo test --lib tools::file_write
 ```
 
 ## Container Security
@@ -113,26 +127,21 @@ OpenPRX Docker images follow CIS Docker Benchmark best practices:
 | Control | Implementation |
 |---------|----------------|
 | **4.1 Non-root user** | Container runs as UID 65534 (distroless nonroot) |
-| **4.2 Minimal base image** | `gcr.io/distroless/cc-debian12:nonroot` — no shell, no package manager |
+| **4.2 Minimal base image** | `gcr.io/distroless/cc-debian13:nonroot` — no shell, no package manager |
 | **4.6 HEALTHCHECK** | Not applicable (stateless CLI/gateway) |
-| **5.25 Read-only filesystem** | Supported via `docker run --read-only` with `/workspace` volume |
+| **5.25 Read-only filesystem** | Supported via `docker run --read-only` with a writable `/prx-data` volume |
 
 ### Verifying Container Security
 
+The `release` stage in `Dockerfile` copies the binary into
+`gcr.io/distroless/cc-debian13:nonroot` and sets `USER 65534:65534`. Inspect a
+built image locally:
+
 ```bash
-# Build and verify non-root user
-docker build -t openprx .
+docker build --target release -t openprx .
 docker inspect --format='{{.Config.User}}' openprx
 # Expected: 65534:65534
 
-# Run with read-only filesystem (production hardening)
-docker run --read-only -v /path/to/workspace:/workspace openprx gateway
+# Run with a read-only root filesystem (production hardening)
+docker run --read-only -v /path/to/data:/prx-data openprx gateway
 ```
-
-### CI Enforcement
-
-The `docker` job in `.github/workflows/ci.yml` automatically verifies:
-
-1. Container does not run as root (UID 0)
-2. Runtime stage uses `:nonroot` variant
-3. Explicit `USER` directive with numeric UID exists

@@ -120,8 +120,9 @@ Step details:
 ## Full Configuration Example
 
 ```toml
-# Required provider defaults for normal request path
-[general]
+# Provider and model defaults are top-level keys.
+# An omitted pair stays unset on save; the runtime then uses the release
+# catalog defaults (openrouter / openrouter/anthropic/claude-sonnet-5).
 default_provider = "openrouter"
 default_model = "openai/gpt-4o-mini"
 
@@ -136,7 +137,7 @@ model = "gpt-4.1"
 
 [reliability]
 provider_retries = 2
-provider_backoff_ms = 800
+provider_backoff_ms = 500
 fallback_providers = ["openrouter"]
 [reliability.model_fallbacks]
 "gpt-4.1" = ["gpt-4o-mini"]
@@ -185,7 +186,6 @@ reserved_output_tokens = 8192
 At least one healthy provider must be configured and reachable.
 
 ```toml
-[general]
 default_provider = "openrouter"
 default_model = "openai/gpt-4o-mini"
 
@@ -235,7 +235,7 @@ Operational note:
 Audit-driven boundaries introduced with Router rollout:
 
 - Provider reachability filtering:
-  Router keeps only models reachable from `general.default_provider` or declared `[[model_routes]]`.
+  Router keeps only models reachable from the top-level `default_provider` or declared `[[model_routes]]`.
   If no reachable models remain, router auto-disables instead of routing unsafely.
 - `record_outcome` lock-free async persistence:
   in-memory metric mutation is completed under write lock, and all async persistence (`memory.store`) happens after lock release (no `await` under lock).
