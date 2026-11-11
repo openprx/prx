@@ -116,7 +116,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         trusted.source_event_id = proof_a.source_event_id().map(Arc::from);
         trusted.catalog_generation = view.generation();
         trusted.policy_version = Arc::clone(&service.policy_version);
-        trusted.resolved_model = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
+        trusted.bind_resolved_model(model.provider_label(), model.model());
         let effective = effective_agent_exclusions(
             &config,
             &service.registry,
@@ -1037,7 +1037,7 @@ async fn selected_discovery_is_source_bound_and_never_dispatches_a_tool() {
         trusted.source_event_id = proof.source_event_id().map(Arc::from);
         trusted.catalog_generation = view.generation();
         trusted.policy_version = Arc::clone(&service.policy_version);
-        trusted.resolved_model = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
+        trusted.bind_resolved_model(model.provider_label(), model.model());
         let effective = effective_agent_exclusions(
             &config,
             &service.registry,
