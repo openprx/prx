@@ -29,6 +29,7 @@ mod agent_partition;
 mod agent_registry;
 mod erasure;
 mod event_batch;
+mod mailbox_schema;
 mod message_events;
 mod mirror_and_guards;
 mod owner_isolation;

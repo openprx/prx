@@ -1125,6 +1125,7 @@ impl SqliteMemory {
         super::agent_registry::add_schema_scope_columns(conn)?;
         super::remote_tree::init_schema(conn)?;
         super::child_sessions::init_schema(conn)?;
+        super::mailbox_schema::init_schema(conn)?;
         let unattributed = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
@@ -1493,6 +1494,21 @@ impl SqliteMemory {
                 22,
                 "child_sessions",
                 "child_sessions(key TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL CHECK(json_valid(record))) STRICT; isolated from operator saved chats",
+            ),
+            (
+                23,
+                "prx_mailbox",
+                "prx_mailbox r4: five STRICT rowid tables; 68 columns; metadata natural-key UNIQUEs; bodies use receipt-id PK; one receipt adoption UNIQUE; eight query indexes; five-column scope FKs; zero triggers; typed Rust transaction validation",
+            ),
+            (
+                24,
+                "agent_erase_manifest_messaging_stores",
+                "agent_erase_manifest r4 STRICT rebuild: preserve erase_id,store,record_key,fts_rowid; append five prx_mailbox stores and child_sessions to the original 33-store CHECK; same UUID and NUL CHECKs on fresh and upgrade",
+            ),
+            (
+                25,
+                "child_sessions_scope_linkage",
+                "child_sessions r4 STRICT rebuild: preserve key,record; nullable workspace_id,owner_id,instance_id,session_id,agent_key,ma_scope_id,incarnation,generation; five-column scope FK; partial address UNIQUE and scope index; validate JSON and quarantine in store",
             ),
         ]
     }

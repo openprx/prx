@@ -9,6 +9,7 @@ mod events;
 mod evolution;
 mod ingress_recovery;
 mod memory_impl;
+mod mailbox_schema;
 mod mirror;
 mod recall;
 mod recovery_authority;

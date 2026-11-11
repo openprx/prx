@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The closed inventory of erase-manifest stores (design inventory enum).
-const MANIFEST_STORES: [&str; 33] = [
+pub(super) const MANIFEST_STORES: [&str; 39] = [
     "conversation_turns",
     "message_events",
     "memories",
@@ -42,6 +42,12 @@ const MANIFEST_STORES: [&str; 33] = [
     "ingress_recovery",
     "recovery_attestations",
     "ramflux_blobs",
+    "prx_mailbox_messages",
+    "prx_mailbox_receipts",
+    "prx_mailbox_outbox",
+    "prx_mailbox_parents",
+    "prx_mailbox_seq",
+    "child_sessions",
 ];
 
 /// Byte length of a text column.
@@ -93,8 +99,25 @@ fn nullable(col: &str, check: &str) -> String {
     format!("{col} IS NULL OR ({check})")
 }
 
-fn schema_sql() -> String {
+/// Shared verbatim column definition for fresh and upgraded manifests.
+/// `table` is one of the two schema-owned literal names, never request data.
+pub(super) fn manifest_schema_sql(table: &str) -> String {
     let stores = MANIFEST_STORES.join("','");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+            erase_id TEXT NOT NULL CHECK({erase}),
+            store TEXT NOT NULL CHECK(store IN ('{stores}')),
+            record_key TEXT NOT NULL CHECK({record_bytes} <= 1024 AND {record_nul}),
+            fts_rowid INTEGER CHECK(fts_rowid IS NULL OR fts_rowid > 0),
+            PRIMARY KEY (erase_id, store, record_key)
+        ) STRICT;",
+        erase = uuid("erase_id"),
+        record_bytes = bytes("record_key"),
+        record_nul = no_nul("record_key"),
+    )
+}
+
+fn schema_sql() -> String {
     let w = |c: &str| format!("{} <= 4096 AND {}", bytes(c), no_nul(c));
     let o = |c: &str| format!("{} <= 512 AND {}", bytes(c), no_nul(c));
     format!(
@@ -207,13 +230,7 @@ fn schema_sql() -> String {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS agent_erase_keys_expiry ON agent_erase_keys (expires_at);
 
-        CREATE TABLE IF NOT EXISTS agent_erase_manifest (
-            erase_id TEXT NOT NULL CHECK({u_erase}),
-            store TEXT NOT NULL CHECK(store IN ('{stores}')),
-            record_key TEXT NOT NULL CHECK({b_record} <= 1024 AND {n_record}),
-            fts_rowid INTEGER CHECK(fts_rowid IS NULL OR fts_rowid > 0),
-            PRIMARY KEY (erase_id, store, record_key)
-        ) STRICT;
+        {manifest}
 
         CREATE TABLE IF NOT EXISTS agent_purge_progress (
             workspace_id TEXT NOT NULL CHECK({w_ws}),
@@ -228,6 +245,7 @@ fn schema_sql() -> String {
             FOREIGN KEY (workspace_id, owner_id, agent_key, incarnation)
                 REFERENCES agent_incarnations (workspace_id, owner_id, agent_key, incarnation)
         ) STRICT;",
+        manifest = manifest_schema_sql("agent_erase_manifest"),
         w_ws = w("workspace_id"),
         o_owner = o("owner_id"),
         o_session = o("session_key"),
@@ -241,9 +259,7 @@ fn schema_sql() -> String {
         h_rev = hex64("config_revision"),
         h_hash = hex64("request_hash"),
         b_idem = bytes("idempotency_key"),
-        b_record = bytes("record_key"),
         n_idem = no_nul("idempotency_key"),
-        n_record = no_nul("record_key"),
         n_method = no_nul("request_method"),
         n_path = no_nul("canonical_path"),
     )
