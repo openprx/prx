@@ -696,6 +696,27 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
     }
 
     {
+        let (dir, workspace, _memory, fabric, commit, cost, service) = priced_setup("prx-forged-ack").await;
+        let _skip = SkipInline;
+        crate::agent::terminal::recovery_commit::skip_inline_projection(true);
+        finalize_turn(&fabric, commit.clone(), &cost, &workspace)
+            .await
+            .expect("test: pending before forged ack");
+        crate::memory::sqlite::forge_acknowledged_cost_for_test(&workspace, "prx-forged-ack")
+            .expect("test: relabel without the state MAC");
+        let error = finalize_turn(&fabric, commit, &cost, &workspace)
+            .await
+            .expect_err("test: replay must authenticate an acknowledged state");
+        assert!(
+            error.to_string().contains("state_mac is invalid"),
+            "forged ack: {error:#}"
+        );
+        assert_eq!(ledger_lines(&workspace, "prx-forged-ack"), 0);
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        drop(dir);
+    }
+
+    {
         let (dir, workspace, memory, fabric, commit, cost, service) = priced_setup("prx-torn-tail").await;
         let _skip = SkipInline;
         crate::agent::terminal::recovery_commit::skip_inline_projection(true);

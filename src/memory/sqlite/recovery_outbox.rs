@@ -100,35 +100,23 @@ pub(super) fn insert_in(
         facts,
     )?;
     let state_mac = sign_state(&key, workspace_id, owner_id, settlement_id, &usage_digest, state)?;
-    let existing: Option<(String, Vec<u8>, Vec<u8>)> = tx
+    let existing = tx
         .query_row(
-            "SELECT owner_id, facts, mac FROM recovery_cost_outbox
-             WHERE workspace_id=?1 AND settlement_id=?2",
+            "SELECT workspace_id, owner_id, settlement_id, version, key_id, usage_digest,
+                pricing, state, facts, mac, state_mac FROM recovery_cost_outbox
+         WHERE workspace_id=?1 AND settlement_id=?2",
             params![workspace_id, settlement_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            read_raw,
         )
         .optional()?;
-    if let Some((stored_owner, stored_facts, stored_mac)) = existing {
-        // Projection may have moved state off pending; identity is owner+facts+mac.
-        if stored_owner != owner_id || stored_facts != facts {
+    if let Some(raw) = existing {
+        // Projection may advance the state. Authenticate that recorded state
+        // rather than comparing it with a newly generated pending state.
+        let stored = authenticate(directory, raw)?;
+        if stored.owner_id != owner_id || stored.facts != facts || stored.key_id != key_id || stored.pricing != pricing
+        {
             return Err(crate::memory::recovery_authority::RecoveryTerminalConflict.into());
         }
-        let stored_tag = stored_mac
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("recovery cost outbox mac is invalid"))?;
-        verify_outbox_mac(
-            &key,
-            workspace_id,
-            owner_id,
-            settlement_id,
-            1,
-            key_id,
-            &usage_digest,
-            pricing,
-            facts,
-            &stored_tag,
-        )?;
         return Ok(InsertOutbox::Replayed);
     }
     tx.execute(
@@ -320,6 +308,12 @@ fn authenticate(directory: &KeyDirectory, raw: RawOutbox) -> anyhow::Result<Reco
         state,
         &state_mac,
     )?;
+    ring::hmac::verify(
+        &key,
+        &recovery_authority::framed(RecoveryMacDomain::UsageDigestV1.bytes(), &usage_bytes(&raw.facts)?),
+        &usage_digest,
+    )
+    .map_err(|_| anyhow::anyhow!("recovery cost outbox usage_digest is invalid"))?;
     Ok(RecoveryCostRow {
         workspace_id: raw.workspace_id,
         owner_id: raw.owner_id,
@@ -587,4 +581,15 @@ fn usage_bytes(facts: &[u8]) -> anyhow::Result<Vec<u8>> {
             .context("recovery cost outbox usage is missing")?,
     )?;
     Ok(serde_json::to_vec(&usage)?)
+}
+
+#[cfg(test)]
+pub(crate) fn forge_acknowledged_cost_for_test(workspace: &std::path::Path, settlement: &str) -> anyhow::Result<()> {
+    let memory = SqliteMemory::new(workspace)?;
+    let changed = memory.pool.write().execute(
+        "UPDATE recovery_cost_outbox SET state='acknowledged' WHERE settlement_id=?1 AND state='pending'",
+        [settlement],
+    )?;
+    anyhow::ensure!(changed == 1, "test: expected one pending outbox row");
+    Ok(())
 }
