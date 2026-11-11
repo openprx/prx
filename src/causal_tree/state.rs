@@ -152,6 +152,7 @@ impl TrustedParts {
     }
 
     /// Bind the PMM provider/model pair and the joined `resolved_model` ref.
+    #[cfg(test)]
     pub(crate) fn bind_resolved_model(&mut self, provider: &str, model: &str) {
         self.resolved_provider = Arc::from(provider);
         self.resolved_model_id = Arc::from(model);

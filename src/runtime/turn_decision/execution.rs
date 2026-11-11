@@ -917,7 +917,12 @@ impl TurnDecisionService {
                 );
                 &abstention_answer
             }
-            _ => anyhow::bail!("decision has no executable selection"),
+            _ => {
+                if let Some(reply) = context.refusal_reply() {
+                    anyhow::bail!("{reply}");
+                }
+                anyhow::bail!("decision has no executable selection");
+            }
         };
         let candidates = match &context.engine.candidates {
             CandidateSet::Legal { candidates, .. } => candidates,

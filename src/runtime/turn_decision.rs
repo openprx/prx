@@ -1414,8 +1414,30 @@ impl TurnDecisionContext {
         }
     }
 
-    pub(crate) fn close_reply(&self) -> Result<Option<std::borrow::Cow<'static, str>>, DirectiveError> {
-        match self.disposition()? {
+    fn refusal_reply(&self) -> Option<std::borrow::Cow<'static, str>> {
+        let crate::causal_tree::decision_select::Selection::Abstain {
+            action: CausalActionKind::Refuse,
+            reason_code,
+        } = &self.engine.selection
+        else {
+            return None;
+        };
+        let hint = crate::causal_tree::refusal::RefusalReason::classify(reason_code, &self.engine).user_hint();
+        Some(crate::causal_tree::refusal::render_refusal_reply(
+            reason_code,
+            hint.as_deref(),
+        ))
+    }
+
+    pub(crate) fn close_reply(&self) -> anyhow::Result<Option<std::borrow::Cow<'static, str>>> {
+        let disposition = self.disposition().map_err(|error| {
+            let error = anyhow::Error::new(error);
+            match self.refusal_reply() {
+                Some(reply) => error.context(reply.into_owned()),
+                None => error,
+            }
+        })?;
+        match disposition {
             #[cfg(test)]
             TurnDisposition::Close { reply } => Ok(Some(reply)),
             TurnDisposition::Run => Ok(None),

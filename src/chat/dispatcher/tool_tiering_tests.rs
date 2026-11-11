@@ -957,11 +957,14 @@ async fn discovery_cannot_append_an_excluded_tool() {
 async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Result<()> {
     use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
     use anyhow::Context as _;
-    for input in ["hi", "sessions_spawn"] {
+    for (input, excluded) in [("hi", false), ("sessions_spawn", false), ("sessions_spawn", true)] {
         let workspace = tempfile::tempdir()?;
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.autonomy.level = crate::security::AutonomyLevel::Full;
+        if excluded {
+            config.tool_tiering.always_exclude.push(SESSIONS_SPAWN_TOOL.to_owned());
+        }
         let provider = Arc::new(CatalogRecordingProvider::new(None, None));
         let (actions, _receiver) = mpsc::channel::<Action>(128);
         let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
@@ -993,6 +996,29 @@ async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Res
         )
         .await?;
         assert!(found.success);
+        let output: serde_json::Value = serde_json::from_str(&found.output)?;
+        let hits = output
+            .get("hits")
+            .and_then(serde_json::Value::as_array)
+            .context("search hits")?;
+        if excluded {
+            assert!(hits.is_empty(), "an exact mention cannot discover an excluded spawn");
+            assert_eq!(
+                routing
+                    .service
+                    .admit_offered_discoveries(routing.proof, routing.context, |_, _| false),
+                0
+            );
+            assert!(
+                routing
+                    .service
+                    .agent_appended_execution_specs(routing.proof, routing.context)?
+                    .specs
+                    .is_empty()
+            );
+            continue;
+        }
+        assert_eq!(hits.len(), 1);
         assert!(found.output.contains(SESSIONS_SPAWN_TOOL));
         assert_eq!(
             routing

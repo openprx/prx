@@ -448,6 +448,17 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
         other => panic!("read-only shell request must refuse with no_legal_path: {other:?}"),
     }
 
+    let decision = admission.decision();
+    let refusal = match decision.service.agent_execution_specs(decision.proof, decision.context) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a refused source must not publish an executable selection"),
+    };
+    assert!(refusal.starts_with(crate::causal_tree::refusal::GENERIC_REFUSAL_REPLY));
+    assert!(
+        !refusal.contains("no_legal_path"),
+        "internal gate codes stay out of the reply"
+    );
+
     // End the independent admission probe before opening the real CLI owner
     // against the same durable workspace. Keep both policy assertions intact.
     admission.decision().context.terminal_execution_trace();
