@@ -411,9 +411,22 @@ mod tests {
 
     #[test]
     fn unpriced_hint_redacts_opaque_url_query_credentials() {
-        let reason = unpriced_reason("custom:https://llm.example/v1?api_key=opaque-secret-token:prx-unpriced-fixture");
-        let hint = reason.user_hint().expect("unpriced has a hint");
-        assert!(!hint.contains("opaque-secret-token"), "{hint}");
+        // `region` is not a credential name, so redact_secrets leaves the
+        // query value. redact_provider_text masks every query value and fragment.
+        const QUERY_SECRET: &str = "opaque-query-secret";
+        const FRAGMENT_SECRET: &str = "opaque-fragment";
+        let raw = format!("custom:https://llm.example/v1?region={QUERY_SECRET}#{FRAGMENT_SECRET}:prx-unpriced-fixture");
+        assert!(
+            crate::security::redaction::redact_secrets(&raw).contains(QUERY_SECRET),
+            "redact_secrets must leave a non-credential query value"
+        );
+        assert!(
+            crate::security::redaction::redact_secrets(&raw).contains(FRAGMENT_SECRET),
+            "redact_secrets must leave a URL fragment"
+        );
+        let hint = unpriced_reason(&raw).user_hint().expect("unpriced has a hint");
+        assert!(!hint.contains(QUERY_SECRET), "{hint}");
+        assert!(!hint.contains(FRAGMENT_SECRET), "{hint}");
         assert!(!hint.contains('\n'), "{hint}");
         assert!(hint.contains("Reason:"), "{hint}");
     }
