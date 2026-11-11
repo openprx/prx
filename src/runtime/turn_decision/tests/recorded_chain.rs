@@ -385,7 +385,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     assert_ne!(
         first.is_ok(),
         second.is_ok(),
-        "exactly one decision must claim the terminal ID: first={first:?}, second={second:?}"
+        "exactly one decision must claim the terminal ID"
     );
     let winner = first
         .as_ref()

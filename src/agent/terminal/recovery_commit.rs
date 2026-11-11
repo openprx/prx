@@ -868,6 +868,7 @@ pub(crate) fn scan_pending_recovery_costs(
     workspace_dir: &Path,
     cost_config: &CostConfig,
 ) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
     let Some(repository) = memory.recovery_repository() else {
         return Ok(());
     };
@@ -880,7 +881,7 @@ pub(crate) fn scan_pending_recovery_costs(
                 return Ok(());
             }
         };
-    if rows.is_empty() {
+    if rows.is_empty() || Instant::now() >= deadline {
         return Ok(());
     }
     let tracker = match crate::cost::tracker::CostTracker::for_workspace(cost_config.clone(), workspace_dir) {
@@ -893,6 +894,9 @@ pub(crate) fn scan_pending_recovery_costs(
                 RecoveryCostState::Error
             };
             for row in rows {
+                if Instant::now() >= deadline {
+                    break;
+                }
                 if row.pricing != RecoveryPricing::Metered {
                     continue;
                 }
@@ -906,6 +910,9 @@ pub(crate) fn scan_pending_recovery_costs(
         }
     };
     for row in rows {
+        if Instant::now() >= deadline {
+            break;
+        }
         if row.pricing != RecoveryPricing::Metered {
             continue;
         }

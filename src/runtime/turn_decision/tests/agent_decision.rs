@@ -761,17 +761,13 @@ async fn disabled_or_keyless_fixed_close_has_no_applied_write() {
             Arc::clone(&memory),
         )
         .await;
-        let proof = if enabled {
-            crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
-                &generation,
-                Arc::clone(&memory),
-                "  ",
-                "prx_keyless_close_run",
-            )
-            .await
-        } else {
-            crate::agent::entry::test_cli_agent_turn_proof_with_input(&generation, "ollama", "prx-local-model", "  ")
-        };
+        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+            &generation,
+            Arc::clone(&memory),
+            "  ",
+            "prx_close_run",
+        )
+        .await;
         let context = service
             .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
