@@ -1,7 +1,7 @@
 //! Bounded, authenticated references for replies that cannot fit a claim.
+use crate::memory::ingress_recovery::{IngressEventLookup, IngressRecoveryScope};
 use crate::memory::recovery_authority::{MAX_SERIALIZED_RECOVERY_FACTS, RecoveryChain, RecoveryMacDomain, RecoveryTag};
 use crate::memory::{Memory, MessageEvent, MessageEventScope};
-use crate::memory::ingress_recovery::{IngressEventLookup, IngressRecoveryScope};
 use crate::runtime::ingress_recovery::SettledTerminalFacts;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,6 @@ pub(super) struct ReplyReference {
     pub(super) reply_sha256: String,
     pub(super) reply_bytes: u64,
     pub(super) result_hash: String,
-    pub(super) model: String,
 }
 
 impl ReplyReference {
@@ -24,7 +23,6 @@ impl ReplyReference {
             reply_sha256: hex::encode(Sha256::digest(reply.as_bytes())),
             reply_bytes: u64::try_from(reply.len()).context("reply byte length cannot be represented")?,
             result_hash: result_hash(reply, model),
-            model: model.to_owned(),
         })
     }
 
@@ -161,10 +159,18 @@ async fn verify_terminal(
             && facts.status == "completed",
         "reply terminal differs from settled receipt"
     );
-    let scope = IngressRecoveryScope { workspace_id: chain.workspace_id.clone(), owner_id: owner.clone(), source: terminal.source.clone() };
-    let claim = read_event(memory.as_ref(), &scope, IngressEventLookup::OwnedEventId(facts.claim_event_id.clone()))
-        .await?
-        .context("reply claim missing")?;
+    let scope = IngressRecoveryScope {
+        workspace_id: chain.workspace_id.clone(),
+        owner_id: owner.clone(),
+        source: terminal.source.clone(),
+    };
+    let claim = read_event(
+        memory.as_ref(),
+        &scope,
+        IngressEventLookup::OwnedEventId(facts.claim_event_id.clone()),
+    )
+    .await?
+    .context("reply claim missing")?;
     let claim_payload = payload(&claim)?;
     let semantic = claim_payload
         .get("semantic")
@@ -209,9 +215,13 @@ async fn verify_terminal(
         terminal_payload.get("assistant_event_id").and_then(Value::as_str) == Some(assistant_id),
         "reply assistant identity differs"
     );
-    let assistant = read_event(memory.as_ref(), &scope, IngressEventLookup::OwnedEventId(assistant_id.to_owned()))
-        .await?
-        .context("reply assistant missing")?;
+    let assistant = read_event(
+        memory.as_ref(),
+        &scope,
+        IngressEventLookup::OwnedEventId(assistant_id.to_owned()),
+    )
+    .await?
+    .context("reply assistant missing")?;
     anyhow::ensure!(
         assistant.role == "assistant"
             && assistant.event_type == "message.created"
@@ -284,9 +294,17 @@ pub(crate) async fn for_input(
     input_text: &str,
 ) -> anyhow::Result<Option<ReplayUnavailable>> {
     let owner = scope.owner_id.as_deref().context("gateway replay owner missing")?;
-    let recovery_scope = IngressRecoveryScope { workspace_id: workspace.to_owned(), owner_id: owner.to_owned(), source: scope.source.clone() };
-    let Some(input) = read_event(memory.as_ref(), &recovery_scope, IngressEventLookup::OwnedIdempotencyKey(key.to_owned()))
-        .await?
+    let recovery_scope = IngressRecoveryScope {
+        workspace_id: workspace.to_owned(),
+        owner_id: owner.to_owned(),
+        source: scope.source.clone(),
+    };
+    let Some(input) = read_event(
+        memory.as_ref(),
+        &recovery_scope,
+        IngressEventLookup::OwnedIdempotencyKey(key.to_owned()),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -306,14 +324,28 @@ pub(crate) async fn for_input(
         "stable gateway input differs from replay request"
     );
     let run = input.run_id.as_deref().context("gateway replay input run missing")?;
-    let Some(terminal) = read_event(memory.as_ref(), &recovery_scope, IngressEventLookup::OwnedIdempotencyKey(format!("turn:{run}:final")))
-        .await?
+    let Some(terminal) = read_event(
+        memory.as_ref(),
+        &recovery_scope,
+        IngressEventLookup::OwnedIdempotencyKey(format!("turn:{run}:final")),
+    )
+    .await?
     else {
         return Ok(None);
     };
     verify_terminal(memory, terminal, input.event_id).await
 }
 
-async fn read_event(memory: &dyn Memory, scope: &IngressRecoveryScope, lookup: IngressEventLookup) -> anyhow::Result<Option<MessageEvent>> {
-    memory.read_ingress_event(scope, &lookup, std::time::Instant::now() + std::time::Duration::from_secs(15)).await
+async fn read_event(
+    memory: &dyn Memory,
+    scope: &IngressRecoveryScope,
+    lookup: IngressEventLookup,
+) -> anyhow::Result<Option<MessageEvent>> {
+    memory
+        .read_ingress_event(
+            scope,
+            &lookup,
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+        )
+        .await
 }

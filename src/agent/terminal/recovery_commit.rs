@@ -50,6 +50,11 @@ pub(crate) fn crash_before_ack(crash: bool) {
     CRASH_BEFORE_ACK.with(|cell| cell.set(crash));
 }
 
+pub(super) struct ReplyAndUsage {
+    pub(super) reply_reference: Option<ReplyReference>,
+    pub(super) usage_settlement: Option<MeteredTokenUsageRecord>,
+}
+
 pub(super) async fn finalize_recovery_terminal(
     fabric: &MemoryFabric,
     commit: TurnTerminalCommit,
@@ -58,8 +63,12 @@ pub(super) async fn finalize_recovery_terminal(
     stop_after_marker: bool,
     mut execution_trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     mut prepared_replay: Option<PreparedReplay>,
-    usage_settlement: Option<MeteredTokenUsageRecord>,
+    reply_and_usage: ReplyAndUsage,
 ) -> anyhow::Result<TurnTerminalReceipt> {
+    let ReplyAndUsage {
+        reply_reference: original_reference,
+        usage_settlement,
+    } = reply_and_usage;
     ensure_runtime_authority(&commit.scope, "projection").await?;
     if let Some(outcome) = commit.provider_outcome.as_ref() {
         crate::llm::route_decision::record_provider_outcome_events(fabric, commit.scope.clone(), outcome).await?;
@@ -118,6 +127,7 @@ pub(super) async fn finalize_recovery_terminal(
         execution_trace.as_ref(),
         &prepared_parameters,
         &key_id,
+        original_reference,
     )?;
     let semantic_bytes = serde_json::to_vec(&semantic)?;
     let mut claim_preimage = semantic_bytes.clone();
@@ -626,6 +636,7 @@ fn claim_semantic(
     execution_trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     prepared_parameters: &[crate::providers::catalog::parameters::ResolvedParameters],
     key_id: &str,
+    original_reference: Option<ReplyReference>,
 ) -> anyhow::Result<(serde_json::Value, Option<ReplyReference>)> {
     let mut claim_outcome = commit.provider_outcome.clone();
     if let Some(outcome) = claim_outcome.as_mut() {
@@ -711,7 +722,10 @@ fn claim_semantic(
                 .trusted
                 .parts()
                 .resolved_model_id;
-            let reply = ReplyReference::new(&history.assistant_content, model)?;
+            let reply = match original_reference {
+                Some(reference) => reference,
+                None => ReplyReference::new(&history.assistant_content, model)?,
+            };
             compact_reply(&mut semantic, &history.assistant_content);
             semantic
                 .as_object_mut()
@@ -743,6 +757,7 @@ pub(crate) fn claim_semantic_for_test(
         trace.as_ref(),
         &prepared_parameters,
         key_id,
+        None,
     )?
     .0)
 }

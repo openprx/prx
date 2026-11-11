@@ -3389,7 +3389,9 @@ async fn run_webhook_job_work(
             replay_unavailable,
         }) => {
             let response_id = match replay_unavailable.as_ref() {
-                Some(reference) => Uuid::parse_str(&reference.terminal_id).context("invalid durable response id")?,
+                Some(reference) => {
+                    Uuid::parse_str(&reference.terminal_id).map_err(|_| "invalid durable response id".to_owned())?
+                }
                 None => Uuid::new_v4(),
             };
             if let Some(claim) = idempotency_claim.take() {
@@ -3444,7 +3446,8 @@ async fn run_webhook_job_work(
         }
         Err(e) => {
             if let Some(unavailable) = e.downcast_ref::<crate::agent::terminal::oversized_reply::ReplayUnavailable>() {
-                let response_id = Uuid::parse_str(&unavailable.terminal_id).context("invalid durable response id")?;
+                let response_id =
+                    Uuid::parse_str(&unavailable.terminal_id).map_err(|_| "invalid durable response id".to_owned())?;
                 if let Some(claim) = idempotency_claim.take() {
                     if !claim.succeed_unavailable(response_id, unavailable.result_hash.clone()) {
                         return Ok(jobs::JobOutput::new(

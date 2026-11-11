@@ -423,20 +423,45 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
     )
     .expect("test: bounded reply semantics");
     assert!(!bounded.to_string().contains(&reply), "claim retained oversized text");
-    assert_eq!(bounded["replay_unavailable"]["reply_bytes"], reply.len());
+    assert_eq!(
+        bounded
+            .get("replay_unavailable")
+            .and_then(|value| value.get("reply_bytes"))
+            .and_then(serde_json::Value::as_u64),
+        Some(reply.len() as u64),
+        "test: claim binds UTF-8 bytes rather than characters"
+    );
+    assert_eq!(
+        bounded
+            .get("replay_unavailable")
+            .and_then(|value| value.get("reply_sha256"))
+            .and_then(serde_json::Value::as_str),
+        Some("35bf14943aaacbb1c3adadceb560e297980c563951479567bac94f4807b23ed4"),
+        "test: digest differs from the UTF-8 reply vector"
+    );
     let mut bytes = serde_json::to_vec(&bounded).expect("test: bounded bytes");
     bytes.extend_from_slice(key_id.as_bytes());
-    assert!(bytes.len() <= crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS);
+    assert!(
+        bytes.len() <= crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS,
+        "test: compact claim exceeded unchanged MAC budget"
+    );
     let bounded_tag = repository
         .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &bytes)
         .expect("test: bounded claim MAC");
     for field in ["reply_sha256", "reply_bytes"] {
         let mut changed = bounded.clone();
-        changed["replay_unavailable"][field] = if field == "reply_bytes" {
-            serde_json::json!(reply.len() + 1)
-        } else {
-            serde_json::json!("00".repeat(32))
-        };
+        let changed_reference = changed
+            .get_mut("replay_unavailable")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test: reference object");
+        changed_reference.insert(
+            field.to_owned(),
+            if field == "reply_bytes" {
+                serde_json::json!(reply.len() + 1)
+            } else {
+                serde_json::json!("00".repeat(32))
+            },
+        );
         let mut changed_bytes = serde_json::to_vec(&changed).expect("test: changed reference");
         changed_bytes.extend_from_slice(key_id.as_bytes());
         let error = repository

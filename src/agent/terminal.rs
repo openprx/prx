@@ -930,6 +930,15 @@ async fn finalize_turn_impl(
             }
             prepared_replay = Some(prepared);
         }
+        // Preserve the gateway's response hash and byte identity before the
+        // persistence redactor changes text. Only bounded digests are retained.
+        let reply_reference = if fabric.records_recovery_terminal() {
+            commit.history.as_ref().map(|history| {
+                let model = &commit.decision.context.audit_hops().last()
+                    .context("decision has no final hop")?.state.trusted.parts().resolved_model_id;
+                oversized_reply::ReplyReference::new(&history.assistant_content, model)
+            }).transpose()?
+        } else { None };
         // Everything below persists the reply and the outcome (the assistant
         // message event, usage settlement, cost ledger, attempt events, the
         // terminal marker). Every surface finalizes here, so both are redacted
@@ -961,7 +970,7 @@ async fn finalize_turn_impl(
                 stop_after_marker,
                 execution_trace,
                 prepared_replay,
-                usage_settlement,
+                recovery_commit::ReplyAndUsage { reply_reference, usage_settlement },
             ))
             .await;
         }
