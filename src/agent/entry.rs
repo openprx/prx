@@ -369,15 +369,27 @@ impl CliPendingInput {
         let experiment_stage = crate::runtime::experiment_stage::current();
         tokio::spawn(async move {
             let operation = crate::runtime::experiment_stage::retain(experiment_stage, async {
-                let event = self
-                    .fabric
-                    .record_inbound_user_message_best_effort(
-                        self.scope.clone(),
-                        self.input.clone(),
-                        Some(self.key.clone()),
-                        "CLI",
+                let event = if self.generation.effective.causal_tree.enabled {
+                    Some(
+                        self.fabric
+                            .record_inbound_user_message(
+                                self.scope.clone(),
+                                self.input.clone(),
+                                Some(self.key.clone()),
+                                None,
+                            )
+                            .await?,
                     )
-                    .await?;
+                } else {
+                    self.fabric
+                        .record_inbound_user_message_best_effort(
+                            self.scope.clone(),
+                            self.input.clone(),
+                            Some(self.key.clone()),
+                            "CLI",
+                        )
+                        .await?
+                };
                 let proof = self.issue(event.as_ref()).await?;
                 Ok::<_, anyhow::Error>((event, proof))
             });
