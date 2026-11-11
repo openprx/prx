@@ -27,13 +27,13 @@ use uuid::Uuid;
 /// `1` remains a generic command failure.
 pub const AGENT_REFUSAL_EXIT_CODE: u8 = crate::causal_tree::refusal::AGENT_REFUSAL_EXIT_CODE;
 
-/// A single-shot CLI turn closed as Refuse after the reply was written to stdout.
-/// The close reply is already on stdout; `Display` stays generic so the CLI
+/// A single-shot CLI turn refused after its reply was written to stdout.
+/// The refusal reply is already on stdout; `Display` stays generic so the CLI
 /// mapper can exit 2 without reprinting it.
 #[derive(Debug, thiserror::Error)]
 #[error("agent turn refused")]
 pub struct AgentTurnRefused {
-    /// Terminal close text already printed on the CLI path.
+    /// Refusal text already printed on the CLI path.
     pub reply: String,
 }
 
@@ -2244,12 +2244,19 @@ pub(crate) async fn run_with_runtime_envelope(
                 let (response, turn_trace) = match turn_result {
                     Ok(result) => result,
                     Err(error) => {
-                        let provider_outcome =
-                            crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
-                                &route_decision,
-                                provider_started_at,
-                                &error,
-                            );
+                        let provider_outcome = if error.is::<crate::agent::send_admission::ProviderSendRefused>() {
+                            // No provider attempt belongs to a refused send. The
+                            // terminal guard retains any earlier observed rounds.
+                            None
+                        } else {
+                            Some(
+                                crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                                    &route_decision,
+                                    provider_started_at,
+                                    &error,
+                                ),
+                            )
+                        };
                         if let Err(finalize_error) = crate::runtime::turn_terminal::commit_terminal(
                             terminal_guard.get(),
                             &memory_fabric,
@@ -2260,7 +2267,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 status: crate::agent::terminal::TurnTerminalStatus::Failed,
                                 history: None,
                                 history_scope: None,
-                                provider_outcome: Some(provider_outcome),
+                                provider_outcome,
                                 telemetry: crate::agent::terminal::TurnTerminalTelemetry {
                                     summary: error.to_string(),
                                     started_at: provider_started_at,
@@ -2273,6 +2280,14 @@ pub(crate) async fn run_with_runtime_envelope(
                         .await
                         {
                             tracing::warn!(error = %finalize_error, "Failed to commit failed single-shot agent terminal event");
+                        }
+                        if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false)
+                            && let Some(refusal) =
+                                error.downcast_ref::<crate::agent::send_admission::ProviderSendRefused>()
+                        {
+                            let reply = refusal.reply().into_owned();
+                            println!("{reply}");
+                            return Err(AgentTurnRefused { reply }.into());
                         }
                         return Err(error);
                     }

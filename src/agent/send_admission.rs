@@ -9,6 +9,20 @@ use crate::tools::{ToolSchemaDialect, ToolSpec};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+/// A policy refusal at send admission, distinct from a transport/runtime error.
+#[derive(Debug, thiserror::Error)]
+#[error("{diagnostic}")]
+pub(crate) struct ProviderSendRefused {
+    reason: crate::causal_tree::refusal::RefusalReason,
+    diagnostic: String,
+}
+
+impl ProviderSendRefused {
+    pub(crate) fn reply(&self) -> std::borrow::Cow<'static, str> {
+        crate::causal_tree::refusal::render_refusal_reply("budget", self.reason.user_hint().as_deref())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Narrows the live G6 tokens after the decision was admitted, the way a
@@ -111,10 +125,13 @@ pub(crate) fn admit_provider_send(
     let tools = tools.unwrap_or_default();
     let remaining = live_g6_tokens(context);
     let answer = crate::cost::estimate::candidate_tokens(0);
-    anyhow::ensure!(
-        answer <= remaining,
-        "provider send refused: answer estimates {answer} tokens but {remaining} remain"
-    );
+    if answer > remaining {
+        return Err(ProviderSendRefused {
+            reason: crate::causal_tree::refusal::RefusalReason::Budget,
+            diagnostic: format!("provider send refused: answer estimates {answer} tokens but {remaining} remain"),
+        }
+        .into());
+    }
     let limits = service
         .send_limits(proof)
         .context("provider send budget cannot be established")?;
@@ -145,12 +162,41 @@ pub(crate) fn admit_provider_send(
         u64::try_from(request).unwrap_or(u64::MAX),
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
     )
-    .context("provider send refused: the request cost cannot be estimated")?;
-    anyhow::ensure!(
-        estimate.micro_usd <= ceiling,
-        "provider send refused: the estimated cost of {} micro-USD exceeds the {} remaining",
-        estimate.micro_usd,
-        ceiling
-    );
+    .ok_or_else(|| {
+        use crate::causal_tree::refusal::RefusalReason;
+        let reason = if !cost.prices.values().all(|price| price.is_finite_nonnegative()) {
+            RefusalReason::InvalidPrice
+        } else if matches!(
+            crate::llm::route_decision::usage_cost_resolution(
+                limits.model.provider_label(),
+                limits.model.model(),
+                0,
+                0,
+                0,
+                0,
+                &cost,
+            ),
+            crate::llm::route_decision::UsagePrice::Missing
+        ) && !crate::cost::estimate::zero_price_exempt(&limits.model)
+        {
+            crate::causal_tree::refusal::unpriced_reason(limits.model.provider_label(), limits.model.model())
+        } else {
+            RefusalReason::Budget
+        };
+        ProviderSendRefused {
+            reason,
+            diagnostic: "provider send refused: the request cost cannot be estimated".to_owned(),
+        }
+    })?;
+    if estimate.micro_usd > ceiling {
+        return Err(ProviderSendRefused {
+            reason: crate::causal_tree::refusal::RefusalReason::Budget,
+            diagnostic: format!(
+                "provider send refused: the estimated cost of {} micro-USD exceeds the {} remaining",
+                estimate.micro_usd, ceiling,
+            ),
+        }
+        .into());
+    }
     Ok(())
 }

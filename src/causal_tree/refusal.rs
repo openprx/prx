@@ -13,7 +13,7 @@ use super::gates::GateOutcome;
 pub(crate) const GENERIC_REFUSAL_REPLY: &str = "I can't complete this request under the current policy.";
 
 /// Distinct process status for a refused single-shot `prx agent` turn.
-/// `1` remains a generic command failure; this value is only a closed refuse.
+/// `1` remains a generic command or runtime failure.
 pub const AGENT_REFUSAL_EXIT_CODE: u8 = 2;
 
 /// Why a turn closed as Refuse. Exhaustive: a new variant must pick a hint.
@@ -238,7 +238,7 @@ fn display_field(text: &str) -> String {
         .to_string()
 }
 
-fn unpriced_reason(provider: &str, model: &str) -> RefusalReason {
+pub(crate) fn unpriced_reason(provider: &str, model: &str) -> RefusalReason {
     let model = display_field(model);
     let provider = display_field(provider);
     let price_key = if model.contains('/') || provider.is_empty() {
