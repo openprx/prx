@@ -49,6 +49,8 @@ pub(crate) enum TurnFailureKind {
     Attachment,
     /// The conversation no longer fits in the model's context window.
     ContextTooLong,
+    /// Recovery cannot safely fit the preserved current request.
+    ContextCapacity,
     /// Upstream asked us to slow down; waiting helps.
     RateLimited,
     /// Upstream refused on billing/entitlement grounds; waiting does not help.
@@ -74,6 +76,7 @@ impl TurnFailureKind {
         match self {
             Self::Attachment => "attachment",
             Self::ContextTooLong => "context_too_long",
+            Self::ContextCapacity => "context_capacity",
             Self::RateLimited => "rate_limited",
             Self::QuotaExhausted => "quota_exhausted",
             Self::ServiceCredentials => "service_credentials",
@@ -96,6 +99,9 @@ impl TurnFailureKind {
             }
             Self::ContextTooLong => {
                 "⚠️ This conversation has grown too long for me to work through in one go. Please start a new conversation, or ask a shorter question."
+            }
+            Self::ContextCapacity => {
+                "⚠️ Context capacity exceeded. Your current request was preserved. Shorten the request or use a larger context window."
             }
             Self::RateLimited => {
                 "⚠️ There are too many requests going through right now, so I was asked to slow down. Please wait a minute and send your message again."
@@ -130,6 +136,12 @@ pub(crate) fn turn_failure_notice(kind: TurnFailureKind, error_id: &str) -> Stri
 /// upstream 429 routinely arrives wrapped in a generic context line, and
 /// matching only the head would classify all of those as unknown.
 pub(crate) fn classify_turn_failure(err: &anyhow::Error) -> TurnFailureKind {
+    if err
+        .downcast_ref::<crate::agent::turn_contracts::ContextCapacityError>()
+        .is_some()
+    {
+        return TurnFailureKind::ContextCapacity;
+    }
     // Typed first: a tool-schema refusal (or a failover chain that ended in
     // one) is a configuration problem, whatever words its tool names contain.
     // After a boundary that carried it as text, a cause that *is* a rendered

@@ -172,9 +172,9 @@ pub enum Effect {
         provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<ChatMessage>,
-        /// Optional persisted/original-history source used for compaction patch
-        /// guard identity. When absent, the driver uses `history` for both budget
-        /// and guard source, preserving non-chat/test callers.
+        /// Original history plus the pending request, used for compaction
+        /// identity before the request's ordered commit. When absent, direct
+        /// callers use `history` for both the budget and guard source.
         compaction_guard_history: Option<Vec<ChatMessage>>,
         /// P5 proactive budgeting config resolved from the selected model
         /// window. The streaming driver uses it for preflight/mid-turn trims.

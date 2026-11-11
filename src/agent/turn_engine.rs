@@ -624,7 +624,7 @@ async fn run_turn_unguarded(
     let mut completion_correction: Option<String> = None;
     let mut execution_requirement = None;
     let mut inject_execution_retry = false;
-    let mut overflow_recovery_passes = 0;
+    let mut overflow_recovery_passes: usize = 0;
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
 
@@ -1538,8 +1538,9 @@ async fn run_turn_unguarded(
                     if crate::recovery::overflow::is_context_overflow_error(e)
                         && !is_stream_failure_after_model_output(e) =>
                 {
-                    if overflow_recovery_passes >= 3 {
+                    if overflow_recovery_passes >= crate::agent::turn_contracts::MAX_OVERFLOW_RECOVERY_PASSES {
                         return Err(crate::agent::turn_contracts::ContextCapacityError::RecoveryPassLimit {
+                            limit: crate::agent::turn_contracts::MAX_OVERFLOW_RECOVERY_PASSES,
                             provider_context: crate::providers::sanitize_api_error(&format!("{e:#}")),
                         }
                         .into());
@@ -1604,6 +1605,7 @@ async fn run_turn_unguarded(
                                     .ok_or_else(|| anyhow::anyhow!("invalid overflow compaction patch range"))?;
                                     patch.replacement = compacted.into_iter().skip(patch.range_start).collect();
                                     patch.append_after.clear();
+                                    let source_history = history.clone();
                                     apply_compaction_patch_exact(history, &patch);
                                     let turns_after = history.len().saturating_sub(usize::from(
                                         history.first().is_some_and(|message| message.role == "system"),
@@ -1614,6 +1616,7 @@ async fn run_turn_unguarded(
                                     emit_tool_loop_event(
                                         &runtime_adapter,
                                         ToolLoopEvent::ContextCompactionPatch {
+                                            source_history,
                                             patch,
                                             config: config.clone(),
                                             turns_before,

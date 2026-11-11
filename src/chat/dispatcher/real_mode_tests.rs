@@ -354,6 +354,8 @@ mod compaction_overflow;
 mod compaction_trim;
 mod dual_write;
 mod effects;
+#[cfg(feature = "terminal-tui")]
+mod overflow_reducer;
 mod replay;
 mod start_turn;
 mod step5a4;

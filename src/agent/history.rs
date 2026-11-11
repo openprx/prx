@@ -82,7 +82,7 @@ pub(super) fn apply_aggressive_trim(history: &mut Vec<ChatMessage>, keep_recent:
 ///
 /// One predicate for "the user actually asked this", used both to build a
 /// recall query and to identify the request the context budget must not delete.
-pub(super) fn latest_user_query_index(history: &[ChatMessage]) -> Option<usize> {
+pub(crate) fn latest_user_query_index(history: &[ChatMessage]) -> Option<usize> {
     history
         .iter()
         .rposition(|m| m.role == "user" && !m.content.is_empty() && !is_loop_written_user_note(&m.content))

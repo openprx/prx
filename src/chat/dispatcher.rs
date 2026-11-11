@@ -2189,7 +2189,38 @@ impl ReasoningProgressBatcher {
     }
 }
 
+/// The reducer owns completed text turns. The pending request is committed by
+/// the ordered turn owner, and native call/result envelopes belong only to the
+/// live worker. Remove those by position/representation, never by matching Q's
+/// text: an older turn may contain identical input.
+fn reducer_history_from_compacted_worker(
+    history: &[crate::providers::ChatMessage],
+) -> Vec<crate::providers::ChatMessage> {
+    let pending = crate::agent::history::latest_user_query_index(history);
+    history
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            if Some(*index) == pending
+                || message.role == "tool"
+                || message.role == "user" && crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
+            {
+                return false;
+            }
+            message.role != "assistant"
+                || !serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|value| {
+                    value
+                        .get("tool_calls")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                })
+        })
+        .map(|(_, message)| message.clone())
+        .collect()
+}
+
 struct ReduxToolLoopEventSink {
+    reducer_history: ParkingMutex<Vec<crate::providers::ChatMessage>>,
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
@@ -2232,6 +2263,7 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
             },
             crate::agent::turn_contracts::ToolLoopEvent::ContextCompactionPatch {
                 patch,
+                source_history,
                 config,
                 turns_before,
                 tokens_before,
@@ -2239,6 +2271,27 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 tokens_after,
                 used_context_tokens,
             } => {
+                anyhow::ensure!(
+                    crate::agent::compaction::compaction_patch_guard_matches(&source_history, &patch.guard),
+                    "worker compaction patch does not match its source"
+                );
+                let mut compacted_history = source_history;
+                crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_history, &patch);
+                let patch = {
+                    let mut source = self.reducer_history.lock();
+                    let target = reducer_history_from_compacted_worker(&compacted_history);
+                    let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
+                        .ok_or_else(|| anyhow::anyhow!("invalid reducer compaction source"))?;
+                    let patch = crate::agent::turn_contracts::CompactionPatch {
+                        range_start: 0,
+                        range_end: source.len(),
+                        replacement: target.clone(),
+                        append_after: Vec::new(),
+                        guard,
+                    };
+                    *source = target;
+                    patch
+                };
                 self.action_tx
                     .send(Action::HistoryCompactionPatchApplied {
                         reason: crate::chat::action::CompactReason::ContextOverflow,
@@ -2429,6 +2482,9 @@ async fn drive_start_turn_stream(
             return;
         }
     }
+    // Preserve a separate reducer source only if preflight changes the worker
+    // snapshot; ordinary turns move the existing guard view into the sink.
+    let mut reducer_source_history = None;
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
@@ -2457,6 +2513,7 @@ async fn drive_start_turn_stream(
                     .await;
                 return;
             }
+            let original_reducer_source = compaction_guard_history.clone();
             let turns_before = chat_history_turn_count(&history);
             let tokens_before = super::estimate_chat_history_tokens(&history);
             let injection_diagnostic =
@@ -2484,6 +2541,14 @@ async fn drive_start_turn_stream(
                 }
             };
             let replacement_len = outcome.replacement_len;
+            // A summary published the guard view at this point. A trim-only
+            // fallback did not change the reducer, so its original view remains
+            // authoritative even if the worker is trimmed further below.
+            reducer_source_history = Some(if replacement_len.is_some() {
+                compaction_guard_history.clone()
+            } else {
+                original_reducer_source
+            });
             let after_compact = crate::agent::context_budget::plan_context_budget(
                 &history,
                 config,
@@ -2546,10 +2611,17 @@ async fn drive_start_turn_stream(
         }
     }
 
+    // The guard source includes the pending raw request; reducer state keeps
+    // that request outside its history until ordered commit.
+    let mut reducer_history = reducer_source_history.unwrap_or(compaction_guard_history);
+    if reducer_history.last().is_some_and(|message| message.role == "user") {
+        reducer_history.pop();
+    }
     let reasoning = Arc::new(ParkingMutex::new(String::new()));
     let reasoning_progress = Arc::new(ParkingMutex::new(ReasoningProgressBatcher::default()));
     let stream_version = Arc::new(AtomicU64::new(0));
     let events: Arc<dyn crate::agent::turn_contracts::ToolLoopEventSink> = Arc::new(ReduxToolLoopEventSink {
+        reducer_history: ParkingMutex::new(reducer_history),
         provider_turn_task_id,
         draft_id: draft_id.clone(),
         action_tx: action_tx.clone(),
@@ -2652,7 +2724,17 @@ async fn drive_start_turn_stream(
             return;
         }
         Err(error) => {
-            let retryable = crate::agent::provider_round::tool_loop_error_is_retryable(&error);
+            let (message, retryable) = error
+                .downcast_ref::<crate::agent::turn_contracts::ContextCapacityError>()
+                .map_or_else(
+                    || {
+                        (
+                            error.to_string(),
+                            crate::agent::provider_round::tool_loop_error_is_retryable(&error),
+                        )
+                    },
+                    |capacity| (capacity.to_string(), false),
+                );
             // A failed turn keeps whatever reasoning it produced before it
             // broke, and that tail is often the only account of why it broke.
             // `StreamFailed` retires the draft, so the flush has to come first
@@ -2661,7 +2743,7 @@ async fn drive_start_turn_stream(
             let _ = action_tx
                 .send(Action::StreamFailed {
                     draft_id,
-                    err: error.to_string(),
+                    err: message,
                     retryable,
                 })
                 .await;

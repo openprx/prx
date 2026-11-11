@@ -216,6 +216,9 @@ pub(crate) fn stored_turn_message(role: String, content: String) -> ChatMessage 
     ChatMessage { role, content }
 }
 
+/// Maximum provider-overflow recovery passes within one turn.
+pub(crate) const MAX_OVERFLOW_RECOVERY_PASSES: usize = 3;
+
 /// Context recovery cannot safely fit the admitted request.
 #[derive(Debug, thiserror::Error)]
 pub enum ContextCapacityError {
@@ -224,9 +227,9 @@ pub enum ContextCapacityError {
     )]
     NoProgress { provider_context: String },
     #[error(
-        "Context capacity exceeded: context overflow recovery reached its limit of 3 passes; the current request was preserved. {provider_context}"
+        "Context capacity exceeded: context overflow recovery reached its limit of {limit} passes; the current request was preserved. {provider_context}"
     )]
-    RecoveryPassLimit { provider_context: String },
+    RecoveryPassLimit { provider_context: String, limit: usize },
     #[error(
         "Context capacity exceeded: system instructions and the current request need {used_tokens} tokens, but only {available_tokens} input tokens are available. Shorten the request or use a larger context window; the request was preserved."
     )]
@@ -380,6 +383,8 @@ pub(crate) enum ToolLoopEvent {
     ContextCompacted,
     ContextCompactionPatch {
         patch: CompactionPatch,
+        /// Worker source guarded by the patch; adapters project their durable transcript.
+        source_history: Vec<ChatMessage>,
         config: crate::config::AgentCompactionConfig,
         turns_before: usize,
         tokens_before: usize,

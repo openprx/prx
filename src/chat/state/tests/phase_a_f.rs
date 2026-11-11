@@ -1235,3 +1235,40 @@ fn test_s2a_tool_call_chunk_interleave_consistency() {
     assert!(state_a.control.active_cancel.is_some());
     assert!(state_b.control.active_cancel.is_some());
 }
+
+#[test]
+fn start_turn_default_guard_includes_the_uncommitted_request() {
+    let mut state = s();
+    state.reduce(Action::RecordUserTurn("older input".into()));
+    let mut worker = state.session.history.clone();
+    worker.push(ChatMessage::user("pending input"));
+    let effects = state.reduce(Action::StartLLMTurn {
+        provider_turn_task_id: None,
+        provider_turn_sequence: None,
+        draft_id: "prx-pending-guard".into(),
+        history: worker.clone(),
+        compaction_guard_history: None,
+        compaction_config: None,
+        cancel: CancellationToken::new(),
+        turn_spawn_ctx: None,
+        turn_message_send_ctx: None,
+        routing_input: None,
+        turn_binding: None,
+    });
+    let guard = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartTurn {
+                compaction_guard_history: Some(guard),
+                ..
+            } => Some(guard),
+            _ => None,
+        })
+        .expect("original history plus pending input");
+    assert_eq!(guard.len(), worker.len());
+    assert_eq!(
+        guard.last().map(|message| message.content.as_str()),
+        Some("pending input")
+    );
+    assert_eq!(state.session.history.len(), 1, "the pending input is still uncommitted");
+}

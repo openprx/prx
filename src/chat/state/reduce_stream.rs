@@ -145,6 +145,13 @@ impl ChatState {
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
+        let compaction_guard_history = compaction_guard_history.or_else(|| {
+            let mut source = self.session.history.clone();
+            if let Some(pending) = history.last().filter(|message| message.role == "user") {
+                source.push(pending.clone());
+            }
+            Some(source)
+        });
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -154,7 +161,7 @@ impl ChatState {
                 provider_turn_task_id,
                 draft_id,
                 history,
-                compaction_guard_history: compaction_guard_history.or_else(|| Some(self.session.history.clone())),
+                compaction_guard_history,
                 compaction_config,
                 cancel,
                 chat_mode,
@@ -197,6 +204,13 @@ impl ChatState {
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
+        let compaction_guard_history = compaction_guard_history.or_else(|| {
+            let mut source = self.session.history.clone();
+            if let Some(pending) = history.last().filter(|message| message.role == "user") {
+                source.push(pending.clone());
+            }
+            Some(source)
+        });
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -206,7 +220,7 @@ impl ChatState {
                 provider_turn_task_id,
                 draft_id,
                 history,
-                compaction_guard_history: compaction_guard_history.or_else(|| Some(self.session.history.clone())),
+                compaction_guard_history,
                 compaction_config,
                 cancel,
                 chat_mode,

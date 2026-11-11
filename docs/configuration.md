@@ -3238,7 +3238,10 @@ turn. Recovery preserves the current request and retries only when the restored
 history is smaller. If recovery makes no progress, reaches the pass limit, or
 the TUI's system instructions plus current request cannot fit, the turn stops
 with a context-capacity message. Shorten the request or select a model with a
-larger context window; the live request is never silently truncated.
+larger context window; the live request is never silently truncated. Channel
+replies use a dedicated capacity notice and preserve provider diagnostics in
+the logs. In terminal chat, compaction saves the completed conversation; the
+pending request is added once when its turn commits.
 
 ## Release catalog lifecycle
 
