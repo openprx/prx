@@ -232,7 +232,11 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
         if round == 1 {
             ensure!(
                 names(request).contains(&"sessions_spawn"),
-                "parent search did not admit spawn"
+                "parent search did not admit spawn; tool replies={:?}",
+                messages
+                    .iter()
+                    .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+                    .collect::<Vec<_>>()
             );
             return Ok(tool_call(
                 "sessions_spawn",

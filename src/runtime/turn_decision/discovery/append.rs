@@ -232,8 +232,17 @@ impl TurnDecisionService {
         let costs =
             crate::runtime::turn_cost::RuntimeCostModel::new(&model, &self.generation.effective, &observed_latency);
         let estimate = costs.estimate_entry(entry);
+        let delegation = matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn");
+        anyhow::ensure!(
+            !delegation || context.engine.outgoing_child.is_some(),
+            "offered delegation has no source-issued child manifest"
+        );
         let candidate = CausalCandidate::new(
-            CausalActionKind::UseTool,
+            if delegation {
+                CausalActionKind::Delegate
+            } else {
+                CausalActionKind::UseTool
+            },
             entry.family,
             CandidateSpec {
                 namespace: None,
