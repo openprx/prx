@@ -184,13 +184,32 @@ pub fn touch_topic(conn: &Connection, topic_id: &str) -> Result<()> {
 }
 
 pub fn add_participant(conn: &Connection, topic_id: &str, user_id: &str, role: &str) -> Result<()> {
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT ma_scope_id FROM topics WHERE id = ?1",
+            params![topic_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let guard = " WHERE (topic_participants.ma_scope_id IS excluded.ma_scope_id OR EXISTS(SELECT 1 FROM agent_scopes o JOIN agent_scopes n ON n.scope_id=excluded.ma_scope_id WHERE o.scope_id=topic_participants.ma_scope_id AND o.workspace_id=n.workspace_id AND o.owner_id=n.owner_id AND o.agent_key=n.agent_key AND o.incarnation=n.incarnation) OR (topic_participants.ma_scope_id IS NULL AND excluded.ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE agent_key='m')) OR (excluded.ma_scope_id IS NULL AND EXISTS(SELECT 1 FROM agent_scopes o WHERE o.scope_id=topic_participants.ma_scope_id AND o.agent_key='m')))";
     conn.execute(
-        "INSERT INTO topic_participants (topic_id, user_id, role, joined_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(topic_id, user_id) DO UPDATE SET role = excluded.role",
-        params![topic_id, user_id, role, Utc::now().to_rfc3339()],
+        &format!(
+            "INSERT INTO topic_participants (topic_id, user_id, role, joined_at, ma_scope_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(topic_id, user_id) DO UPDATE SET
+                role = excluded.role,
+                ma_scope_id = COALESCE(excluded.ma_scope_id, topic_participants.ma_scope_id)
+             {guard}"
+        ),
+        params![topic_id, user_id, role, Utc::now().to_rfc3339(), stamp],
     )?;
     Ok(())
+}
+
+/// Unstamped writers (webhook) may reuse NULL or Main topics, never Named.
+pub fn unstamped_writer_may_use_topic(conn: &Connection, topic_id: &str) -> Result<bool> {
+    topic_scope_reusable(conn, topic_id, None)
 }
 
 pub fn resolve_alias(conn: &Connection, topic_id: &str) -> Result<String> {
@@ -861,5 +880,41 @@ mod tests {
         let (_tmp, conn) = setup_conn();
         let result = search_topics_fts(&conn, "qa b :topic", 5).unwrap();
         assert!(result.is_empty(), "expected an empty value");
+    }
+
+    #[test]
+    fn add_participant_inherits_the_topic_stamp() {
+        let (_tmp, conn) = setup_conn();
+        const REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const U: &str = "00000000-0000-4000-8000-0000000000a1";
+        const S: &str = "00000000-0000-4000-8000-0000000000c1";
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES ('ws', 'ow', 'n:x', ?1, 'active', ?2)",
+            params![U, REV],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1, 'ws', 'ow', 'sess', 'n:x', ?2, 1)",
+            params![S, U],
+        )
+        .unwrap();
+        let topic_id = create_topic(
+            &conn,
+            "Named topic",
+            Some("openpr"),
+            Some("issue#1"),
+            "fp-named",
+            Some(S),
+        )
+        .unwrap();
+        add_participant(&conn, &topic_id, "u-1", "participant").unwrap();
+        let stamp: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM topic_participants WHERE topic_id = ?1 AND user_id = 'u-1'",
+                params![topic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp.as_deref(), Some(S), "participant inherits the topic stamp");
     }
 }

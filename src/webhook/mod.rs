@@ -351,24 +351,7 @@ impl SqliteWebhookRepository {
         if !owns_claim {
             anyhow::bail!("webhook ingestion ownership was lost before commit");
         }
-        let topic_id = match crate::memory::topic::find_topic_by_project_and_external(
-            &tx,
-            event.project.as_deref(),
-            &event.external_id,
-        )? {
-            Some(topic) => topic.id,
-            None => {
-                let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
-                crate::memory::topic::create_topic(
-                    &tx,
-                    &event.title,
-                    event.project.as_deref(),
-                    Some(&event.external_id),
-                    &fingerprint,
-                    None,
-                )?
-            }
-        };
+        let topic_id = webhook_resolve_topic(&tx, event)?;
 
         if let Some(url) = event.external_url.as_deref() {
             tx.execute(
@@ -390,20 +373,26 @@ impl SqliteWebhookRepository {
         let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, claim.ingestion_key);
         if memory_saved {
             let memory_id = Uuid::new_v4().to_string();
-            tx.execute(
-                "INSERT INTO memories (
+            let coalesce = crate::memory::sqlite::scope_coalesce_set("memories");
+            let scope_guard = crate::memory::sqlite::scope_conflict_guard("memories", false);
+            let changed = tx.execute(
+                &format!(
+                    "INSERT INTO memories (
                     id, key, content, category, created_at, updated_at, workspace_id,
                     owner_id, source, channel, chat_type, chat_id, sender_id, raw_sender,
-                    topic_id, visibility, sensitivity, risk_signals, policy_version
+                    topic_id, visibility, sensitivity, risk_signals, policy_version, ma_scope_id
                  ) VALUES (
                     ?1, ?2, ?3, 'conversation', ?4, ?4, ?5,
                     ?6, 'webhook', 'webhook', 'dm', ?7, ?6, ?6,
-                    ?8, 'owner', 'normal', '[]', 1
+                    ?8, 'owner', 'normal', '[]', 1, NULL
                  )
                  ON CONFLICT(key) DO UPDATE SET
                     content = excluded.content,
                     updated_at = excluded.updated_at,
-                    topic_id = excluded.topic_id",
+                    topic_id = excluded.topic_id,
+                    {coalesce}
+                 {scope_guard}"
+                ),
                 params![
                     memory_id,
                     memory_key,
@@ -415,6 +404,11 @@ impl SqliteWebhookRepository {
                     topic_id,
                 ],
             )?;
+            if changed == 0 {
+                return Err(
+                    crate::memory::owner_predicate::OwnerScopedStoreRefusal::KeyNotAvailable { key: memory_key }.into(),
+                );
+            }
         }
 
         let payload_json = serde_json::json!({
@@ -1569,6 +1563,33 @@ fn webhook_event_date(timestamp: &str) -> &str {
     timestamp.split_once('T').map_or(timestamp, |(date, _)| date)
 }
 
+/// Unstamped webhook writers may reuse NULL/Main topics. A Named topic is left
+/// untouched and a sidecar without the colliding `(project, external_id)` key
+/// is created instead (review H2).
+fn webhook_resolve_topic(tx: &Transaction<'_>, event: &WebhookEvent) -> Result<String> {
+    match crate::memory::topic::find_topic_by_project_and_external(tx, event.project.as_deref(), &event.external_id)? {
+        Some(topic) if crate::memory::topic::unstamped_writer_may_use_topic(tx, &topic.id)? => Ok(topic.id),
+        Some(_) => {
+            let fingerprint = format!(
+                "webhook-sidecar:{}",
+                webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title)
+            );
+            crate::memory::topic::create_topic(tx, &event.title, event.project.as_deref(), None, &fingerprint, None)
+        }
+        None => {
+            let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
+            crate::memory::topic::create_topic(
+                tx,
+                &event.title,
+                event.project.as_deref(),
+                Some(&event.external_id),
+                &fingerprint,
+                None,
+            )
+        }
+    }
+}
+
 fn webhook_topic_fingerprint(project: Option<&str>, external_id: &str, title: &str) -> String {
     let payload = format!(
         "{}:{}:{}",
@@ -2671,5 +2692,165 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    fn seed_named_scope(conn: &Connection) -> String {
+        const REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const U: &str = "00000000-0000-4000-8000-0000000000a1";
+        const S: &str = "00000000-0000-4000-8000-0000000000c1";
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES ('ws', 'ow', 'n:x', ?1, 'active', ?2)",
+            params![U, REV],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1, 'ws', 'ow', 'sess', 'n:x', ?2, 1)",
+            params![S, U],
+        )
+        .unwrap();
+        S.to_string()
+    }
+
+    #[tokio::test]
+    async fn webhook_does_not_mutate_a_named_topic() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+        let conn = Connection::open(&db_path).unwrap();
+        let scope = seed_named_scope(&conn);
+        let named_id = crate::memory::topic::create_topic(
+            &conn,
+            "Issue 42",
+            Some("openpr"),
+            Some("issue#42"),
+            "fp-named-issue",
+            Some(&scope),
+        )
+        .unwrap();
+        let updated_before: String = conn
+            .query_row(
+                "SELECT updated_at FROM topics WHERE id = ?1",
+                params![named_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "project": "openpr",
+                    "external_id": "issue#42",
+                    "external_url": "https://example.com/issues/42",
+                    "title": "Issue 42",
+                    "content": "details",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let topic_id = parsed.get("topic_id").and_then(serde_json::Value::as_str).unwrap();
+        assert_ne!(topic_id, named_id, "webhook must not reuse a Named topic");
+
+        let updated_after: String = conn
+            .query_row(
+                "SELECT updated_at FROM topics WHERE id = ?1",
+                params![named_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_after, updated_before, "Named topic must stay untouched");
+        let named_stamp: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM topics WHERE id = ?1",
+                params![named_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(named_stamp.as_deref(), Some(scope.as_str()));
+        let sidecar_stamp: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM topics WHERE id = ?1",
+                params![topic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sidecar_stamp.is_none(), "webhook sidecar stays unstamped");
+        let named_participants: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM topic_participants WHERE topic_id = ?1",
+                params![named_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            named_participants, 0,
+            "webhook must not add participants to a Named topic"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_unstamped_overwrite_of_a_named_memory() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+        let conn = Connection::open(&db_path).unwrap();
+        let scope = seed_named_scope(&conn);
+        let raw_key = "idem-named-overwrite";
+        let ingestion_key = format!("header:{}", webhook_scoped_key_digest("secret", raw_key));
+        let memory_key = format!("webhook:custom:issue#99:{ingestion_key}");
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at, visibility, sensitivity, ma_scope_id)
+             VALUES ('m-named', ?1, 'named-original', 'core', 't', 't', 'owner', 'normal', ?2)",
+            params![memory_key, scope],
+        )
+        .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .header("X-Idempotency-Key", raw_key)
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "project": "openpr",
+                    "external_id": "issue#99",
+                    "title": "Issue 99",
+                    "content": "details that would overwrite",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = ?1",
+                params![memory_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "named-original");
+        let stamp: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM memories WHERE key = ?1",
+                params![memory_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp.as_deref(), Some(scope.as_str()));
     }
 }

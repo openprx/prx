@@ -80,8 +80,16 @@ fn inspect_unfenced_scope(
             Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if let Some((scope, _)) = scopes.iter().find(|(_, fenced)| !fenced) {
-        return Ok(UnfencedScope::Ready(scope.clone()));
+    let unfenced: Vec<String> = scopes
+        .iter()
+        .filter(|(_, fenced)| !*fenced)
+        .map(|(scope, _)| scope.clone())
+        .collect();
+    if unfenced.len() > 1 {
+        return Err(AgentScopeRefused.into());
+    }
+    if let Some(scope) = unfenced.into_iter().next() {
+        return Ok(UnfencedScope::Ready(scope));
     }
     if scopes.is_empty() {
         Ok(UnfencedScope::Absent)
@@ -232,7 +240,7 @@ pub(super) fn lookup_or_mint_write_scope(
 }
 
 /// Guard G (H2): four-clause COALESCE predicate for stamped upserts.
-pub(super) fn scope_conflict_guard(table: &str, has_where: bool) -> String {
+pub(crate) fn scope_conflict_guard(table: &str, has_where: bool) -> String {
     let predicate = format!(
         "({table}.ma_scope_id IS excluded.ma_scope_id OR EXISTS(SELECT 1 FROM agent_scopes o JOIN agent_scopes n ON n.scope_id=excluded.ma_scope_id WHERE o.scope_id={table}.ma_scope_id AND o.workspace_id=n.workspace_id AND o.owner_id=n.owner_id AND o.agent_key=n.agent_key AND o.incarnation=n.incarnation) OR ({table}.ma_scope_id IS NULL AND excluded.ma_scope_id IN (SELECT scope_id FROM agent_scopes WHERE agent_key='m')) OR (excluded.ma_scope_id IS NULL AND EXISTS(SELECT 1 FROM agent_scopes o WHERE o.scope_id={table}.ma_scope_id AND o.agent_key='m')))"
     );
@@ -244,7 +252,7 @@ pub(super) fn scope_conflict_guard(table: &str, has_where: bool) -> String {
 }
 
 /// SET fragment that keeps a Main stamp when an unstamped writer overwrites it.
-pub(super) fn scope_coalesce_set(table: &str) -> String {
+pub(crate) fn scope_coalesce_set(table: &str) -> String {
     format!("ma_scope_id = COALESCE(excluded.ma_scope_id, {table}.ma_scope_id)")
 }
 

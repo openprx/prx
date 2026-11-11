@@ -2655,6 +2655,30 @@ async fn documents_writes_carry_scope() {
                 )
                 .expect("test: link stamp");
             assert_eq!(link_scope.as_deref(), Some(TARGET_SCOPE), "memory_links row carries X's scope");
+            let promoted_scope: Option<String> = conn
+                .query_row(
+                    "SELECT ma_scope_id FROM memories WHERE key = 'semantic-x'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("test: promoted memories stamp");
+            assert_eq!(
+                promoted_scope.as_deref(),
+                Some(TARGET_SCOPE),
+                "promoted memories row carries X's scope"
+            );
+            let promoted_event: Option<String> = conn
+                .query_row(
+                    "SELECT ma_scope_id FROM memory_events WHERE subject_id = 'semantic-x' AND event_type = 'memory.stored'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("test: promoted memory_events stamp");
+            assert_eq!(
+                promoted_event.as_deref(),
+                Some(TARGET_SCOPE),
+                "promoted memory_events row carries X's scope"
+            );
 
             fixture
                 .memory

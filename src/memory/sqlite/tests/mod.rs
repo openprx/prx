@@ -36,6 +36,7 @@ mod pool_and_vector_cap;
 mod recall;
 mod schema_and_documents;
 mod schema_atomic;
+mod scope_review;
 mod visibility_events;
 
 fn temp_sqlite() -> (TempDir, SqliteMemory) {
