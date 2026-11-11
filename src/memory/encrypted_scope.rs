@@ -945,28 +945,33 @@ impl Memory for EncryptedScope {
             account_id: self.account_id.clone(),
             scope: self.scope.clone(),
         };
-        crate::memory::sqlite::map_after_prefix(move |hook| {
-            Box::new(move |prefix, final_input| {
-                let revealed: Vec<_> = prefix.iter().cloned().map(|event| reveal.reveal(event)).collect();
-                if let Some(hook) = hook {
-                    hook(&revealed, final_input)?;
-                }
-                if let Some(payload) = final_input.raw_payload_json.take() {
-                    let key = final_input.idempotency_key.as_deref().unwrap_or("event");
-                    final_input.raw_payload_json = Some(match stored_final.as_ref() {
-                        Some(stored) if reveal.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) => {
-                            stored
-                                .raw_payload_json
-                                .clone()
-                                .context("stored recovery payload missing")?
-                        }
-                        _ => reveal.seal(&format!("{key}:payload"), &payload)?,
-                    });
-                }
-                Ok(())
-            })
-        });
-        let outcome = self.inner.commit_recovery_terminal(commit, deadline).await?;
+        let outcome = crate::memory::sqlite::map_after_prefix(
+            move |hook| {
+                Box::new(move |prefix, final_input| {
+                    let revealed: Vec<_> = prefix.iter().cloned().map(|event| reveal.reveal(event)).collect();
+                    if let Some(hook) = hook {
+                        hook(&revealed, final_input)?;
+                    }
+                    if let Some(payload) = final_input.raw_payload_json.take() {
+                        let key = final_input.idempotency_key.as_deref().unwrap_or("event");
+                        final_input.raw_payload_json = Some(match stored_final.as_ref() {
+                            Some(stored)
+                                if reveal.reveal(stored.clone()).raw_payload_json.as_deref() == Some(&payload) =>
+                            {
+                                stored
+                                    .raw_payload_json
+                                    .clone()
+                                    .context("stored recovery payload missing")?
+                            }
+                            _ => reveal.seal(&format!("{key}:payload"), &payload)?,
+                        });
+                    }
+                    Ok(())
+                })
+            },
+            self.inner.commit_recovery_terminal(commit, deadline),
+        )
+        .await?;
         Ok(match outcome {
             crate::memory::recovery_authority::RecoveryTerminalOutcome::Committed { receipt, events } => {
                 crate::memory::recovery_authority::RecoveryTerminalOutcome::Committed {

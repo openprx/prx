@@ -2091,6 +2091,73 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
         .expect("test: bad mac insert");
     });
 
+    // Valid encodings still have to be bound by the original authentication.
+    let alternate_key = SqliteMemory::new_with_path(path.clone())?.rotate_recovery_authority()?;
+    for field in [
+        "workspace",
+        "owner",
+        "settlement",
+        "key_id",
+        "usage_digest",
+        "pricing",
+        "facts",
+    ] {
+        let memory = SqliteMemory::new_with_path(path.clone())?;
+        memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
+        let changed_workspace = if field == "workspace" {
+            "prx_other_workspace"
+        } else {
+            workspace
+        };
+        let changed_owner = if field == "owner" { "prx_other_owner" } else { owner };
+        let changed_settlement = if field == "settlement" {
+            "prx_other_settlement"
+        } else {
+            settlement
+        };
+        let changed_key = if field == "key_id" {
+            alternate_key.as_str()
+        } else {
+            key_id.as_str()
+        };
+        let changed_digest = if field == "usage_digest" { [9u8; 32] } else { digest };
+        let changed_pricing = if field == "pricing" { "subscription" } else { "metered" };
+        let mut changed_facts: serde_json::Value = serde_json::from_slice(&facts)?;
+        if field == "pricing" {
+            changed_facts
+                .as_object_mut()
+                .context("test: facts object")?
+                .insert("pricing".into(), serde_json::json!("subscription"));
+        }
+        if field == "facts" {
+            changed_facts
+                .as_object_mut()
+                .context("test: facts object")?
+                .insert("status".into(), serde_json::json!("failed"));
+        }
+        let changed_facts = serde_json::to_vec(&changed_facts)?;
+        insert(
+            &memory,
+            changed_workspace,
+            changed_owner,
+            changed_settlement,
+            1,
+            changed_key,
+            &changed_digest,
+            changed_pricing,
+            "pending",
+            &changed_facts,
+            &mac,
+            &state_mac,
+        )?;
+        drop(memory);
+        let reopened = SqliteMemory::new_with_path(path.clone())?;
+        let error = reopened
+            .pending_recovery_costs(changed_workspace, None, 8)
+            .expect_err(field);
+        assert_outbox_error(&error, "recovery cost outbox mac is invalid", field);
+    }
+
     let memory = SqliteMemory::new_with_path(path.clone())?;
     memory.pool.write().execute("DELETE FROM recovery_cost_outbox", [])?;
     insert(

@@ -11,8 +11,8 @@ use std::time::Instant;
 
 type AfterPrefix = Box<dyn FnOnce(&[MessageEvent], &mut MessageEventInput) -> anyhow::Result<()> + Send>;
 
-thread_local! {
-    static AFTER_PREFIX: RefCell<Option<AfterPrefix>> = const { RefCell::new(None) };
+tokio::task_local! {
+    static AFTER_PREFIX: RefCell<Option<AfterPrefix>>;
 }
 
 #[cfg(test)]
@@ -25,24 +25,16 @@ pub(crate) async fn with_after_prefix_async<F, R>(hook: AfterPrefix, work: F) ->
 where
     F: std::future::Future<Output = R>,
 {
-    AFTER_PREFIX.with(|slot| {
-        *slot.borrow_mut() = Some(hook);
-    });
-    let result = work.await;
-    AFTER_PREFIX.with(|slot| {
-        slot.borrow_mut().take();
-    });
-    result
+    AFTER_PREFIX.scope(RefCell::new(Some(hook)), work).await
 }
 
-/// Rewrite the installed after-prefix hook. EncryptedScope uses this so the
-/// replay seal sees events as the decorator presents them (plaintext).
-pub(crate) fn map_after_prefix(map: impl FnOnce(Option<AfterPrefix>) -> AfterPrefix) {
-    AFTER_PREFIX.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let hook = slot.take();
-        *slot = Some(map(hook));
-    });
+/// Scope the decorator's hook to this task, including across backend awaits.
+pub(crate) async fn map_after_prefix<F, R>(map: impl FnOnce(Option<AfterPrefix>) -> AfterPrefix, work: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let hook = AFTER_PREFIX.try_with(|slot| slot.borrow_mut().take()).ok().flatten();
+    with_after_prefix_async(map(hook), work).await
 }
 
 #[cfg(test)]
@@ -59,7 +51,7 @@ impl SqliteMemory {
         remaining(deadline)?;
         let pool = self.pool.clone();
         let db_path = self.db_path.clone();
-        let hook = AFTER_PREFIX.with(|slot| slot.borrow_mut().take());
+        let hook = AFTER_PREFIX.try_with(|slot| slot.borrow_mut().take()).ok().flatten();
         #[cfg(test)]
         let crash = CRASH_BEFORE_COMMIT.with(|cell| {
             let crash = cell.get();
@@ -67,20 +59,11 @@ impl SqliteMemory {
             crash
         });
         crate::runtime::blocking::spawn_blocking(move || {
-            if let Some(hook) = hook {
-                AFTER_PREFIX.with(|slot| {
-                    *slot.borrow_mut() = Some(hook);
-                });
-            }
             #[cfg(test)]
             if crash {
                 CRASH_BEFORE_COMMIT.with(|cell| cell.set(true));
             }
-            let result = commit_blocking(&pool, &db_path, commit, deadline);
-            AFTER_PREFIX.with(|slot| {
-                slot.borrow_mut().take();
-            });
-            result
+            commit_blocking(&pool, &db_path, commit, deadline, hook)
         })
         .await?
     }
@@ -91,6 +74,7 @@ fn commit_blocking(
     db_path: &std::path::Path,
     mut commit: RecoveryTerminalCommit,
     deadline: Instant,
+    hook: Option<AfterPrefix>,
 ) -> anyhow::Result<RecoveryTerminalOutcome> {
     remaining(deadline)?;
     anyhow::ensure!(!commit.events.is_empty(), "recovery terminal commit has no events");
@@ -131,7 +115,6 @@ fn commit_blocking(
             stored.push(event);
         }
 
-        let hook = AFTER_PREFIX.with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
             hook(&stored, &mut final_input)?;
         }
