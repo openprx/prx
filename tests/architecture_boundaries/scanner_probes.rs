@@ -811,12 +811,19 @@ fn assert_reviewed_source_mutation(scanner: fn(), path: &str, needle: &str, repl
 }
 
 fn mutation_proof_embedded_input_guard() {
-    assert_reviewed_source_mutation(
-        embedded_user_input_cannot_bypass_reserved_marker_neutralization,
-        "src/agent/embedded_turn.rs",
-        "crate::agent::turn_contracts::inbound_user_message(input)",
-        "ChatMessage::user(input)",
-    );
+    let path = "src/agent/embedded_turn.rs";
+    let scanner = embedded_user_input_cannot_bypass_reserved_marker_neutralization;
+    assert!(!scanner_fails_with(scanner, Vec::new()));
+    let source = fs::read_to_string(repository_root().join(path)).expect("read actual mutation source");
+    let needle = "crate::agent::turn_contracts::inbound_user_message(input)";
+    let replacement = "ChatMessage::user(input)";
+    assert!(source.contains(needle), "reviewed mutation site disappeared: {path}");
+    // Close-path neutralization is cfg(test); replacen(1) would only hit that
+    // site and strip_cfg_test_items would hide the mutation.
+    assert!(scanner_fails_with(
+        scanner,
+        vec![(path.into(), source.replace(needle, replacement))]
+    ));
 }
 fn mutation_proof_execution_binding_guard() {
     assert_reviewed_source_mutation(

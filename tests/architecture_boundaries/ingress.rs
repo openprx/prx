@@ -13,7 +13,9 @@ pub(super) fn embedded_user_input_cannot_bypass_reserved_marker_neutralization()
     let source = read_source(&repository_root().join(path));
     let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
     let body = compact_rust_tokens(&function_body(&production, "run_work"));
-    assert_eq!(body.matches("inbound_user_message(input)").count(), 2);
+    // Close-path neutralization is cfg(test) after the engine-off switch;
+    // production keeps the live delegation site.
+    assert_eq!(body.matches("inbound_user_message(input)").count(), 1);
     assert_eq!(body.matches("inbound_user_message_owned(enriched)").count(), 1);
     assert!(
         body.contains(".record_guarded(input,&owner,cancellation,defer_model_selection)"),
@@ -23,7 +25,7 @@ pub(super) fn embedded_user_input_cannot_bypass_reserved_marker_neutralization()
         (
             "crate::agent::turn_contracts::inbound_user_message(input)",
             "ChatMessage::user(input)",
-            2,
+            1,
         ),
         (
             "crate::agent::turn_contracts::inbound_user_message_owned(enriched)",
@@ -31,9 +33,9 @@ pub(super) fn embedded_user_input_cannot_bypass_reserved_marker_neutralization()
             1,
         ),
     ] {
-        assert_eq!(source.matches(needle).count(), expected);
-        for (at, _) in source.match_indices(needle) {
-            let mut changed = source.clone();
+        assert_eq!(production.matches(needle).count(), expected);
+        for (at, _) in production.match_indices(needle) {
+            let mut changed = production.clone();
             changed.replace_range(at..at + needle.len(), replacement);
             assert!(scanner_fails_with(
                 user_text_enters_histories_only_neutralized,

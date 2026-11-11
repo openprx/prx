@@ -441,49 +441,31 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
         let source_kind = classify_compaction_argument(&production, &expression, at);
         classified.push(format!("{relative}::{function}::{anchor} -> {source_kind:?}"));
     }
-    // Decision-owned windows have two concrete producers: initial admission
-    // and the purpose-granted Router readmission. Neither may substitute base
-    // configuration for the resolved model's window or omit its reservation.
-    for (relative, function, resolver) in [
-        (
-            "src/runtime/turn_decision.rs",
-            "agent_budget_snapshot",
-            compact_rust_tokens(
-                "let effective = self.effective_compaction(proof.provider_name(), proof.model_name());",
-            ),
-        ),
-        (
-            "src/runtime/turn_decision/routing.rs",
-            "router_history_hop_inner",
-            compact_rust_tokens(
-                "let effective = crate::providers::context_window::resolve_effective_compaction_config_with_catalog(\
-                    &config.agent.compaction, admitted.provider_name(), admitted.model_name(), crate::providers::context_window::ContextWindowSources::from_config(config), \
-                    &config.model_routes, &self.provider_catalog,);",
-            ),
-        ),
-    ] {
-        let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
-            &repository_root().join(relative),
-        )));
-        let body = compact_rust_tokens(&function_body(&production, function));
-        assert_eq!(
-            body.matches(&resolver).count(),
-            1,
-            "{relative}: resolved producer changed"
-        );
-        assert_eq!(
-            body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config,extra_token_ratio_limit)?;")
-                .count(),
-            1
-        );
-        assert_eq!(
-            body.matches(
-                "letmain_compaction=reservation.reserved_compaction(&effective.config,extra_token_ratio_limit)?;"
-            )
+    // Decision-owned windows: initial admission is production. Router
+    // readmission (`router_history_hop_inner`) is engine-on / cfg(test).
+    let relative = "src/runtime/turn_decision.rs";
+    let function = "agent_budget_snapshot";
+    let resolver =
+        compact_rust_tokens("let effective = self.effective_compaction(proof.provider_name(), proof.model_name());");
+    let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+        &repository_root().join(relative),
+    )));
+    let body = compact_rust_tokens(&function_body(&production, function));
+    assert_eq!(
+        body.matches(&resolver).count(),
+        1,
+        "{relative}: resolved producer changed"
+    );
+    assert_eq!(
+        body.matches("letreservation=DecisionTokenReservation::from_effective_compaction(&effective.config,extra_token_ratio_limit)?;")
             .count(),
-            1
-        );
-    }
+        1
+    );
+    assert_eq!(
+        body.matches("letmain_compaction=reservation.reserved_compaction(&effective.config,extra_token_ratio_limit)?;")
+            .count(),
+        1
+    );
     for (relative, function, expected) in [
         (
             "src/runtime/turn_decision.rs",

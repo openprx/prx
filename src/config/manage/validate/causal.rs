@@ -30,11 +30,12 @@
 //! configuration.
 //!
 //! It resolves locally: the configuration, its declarations and the
-//! credential store's owner of a reference. While the plane is disabled the
-//! credential is not resolved: only the rules the configuration alone
-//! decides run, so a disabled plane never opens the credential store (D-082
-//! N-9); enabling it is a `[causal_tree]` change, checked in full. Nothing
-//! is sent anywhere.
+//! credential store's owner of a reference. While the decision engine is
+//! disabled the credential is not resolved: only the rules the configuration
+//! alone decides run, so a disabled engine never opens the credential store
+//! (D-082 N-9), even when recovery (`[causal_tree].enabled`) is on. Enabling
+//! the engine is a `[decision_engine]` change, checked in full. Nothing is
+//! sent anywhere.
 
 use crate::causal_tree::config::BackendSelection;
 use crate::config::Config;
@@ -45,6 +46,7 @@ use crate::decision::BackendKind;
 fn changed(current: Option<&Config>, candidate: &Config) -> bool {
     current.is_none_or(|current| {
         current.causal_tree != candidate.causal_tree
+            || current.decision_engine.enabled != candidate.decision_engine.enabled
             || super::rendering_changed(&current.providers, &candidate.providers)
     })
 }
@@ -70,7 +72,9 @@ fn check_section(config: &Config) -> Result<(), String> {
         return Ok(());
     };
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
-    let checked = if section.enabled {
+    // Same split as `decision::factory`: recovery-only (`[causal_tree]` on,
+    // engine off) never opens the credential store.
+    let checked = if section.enabled && config.decision_engine.enabled {
         crate::providers::selection::check_decision_backend(
             config,
             &catalog,
@@ -256,6 +260,7 @@ mod tests {
     fn an_unreadable_credential_store_never_blocks_unrelated_changes() {
         let temp = tempfile::TempDir::new().unwrap();
         let mut current = loopback_plane();
+        current.decision_engine.enabled = true;
         current.config_path = temp.path().join("config.toml");
         current.causal_tree.backend.credential_ref =
             crate::causal_tree::config::CredentialRefSetting::Profile("cred-decider".to_string());
@@ -295,6 +300,7 @@ mod tests {
                 ..Config::default()
             };
             config.causal_tree.enabled = true;
+            config.decision_engine.enabled = true;
             config.causal_tree.backend.kind = BackendSelection::Fixed(kind);
             config.causal_tree.backend.model = model.to_string();
             config.causal_tree.backend.pinned_snapshot = snapshot.to_string();
@@ -345,5 +351,20 @@ mod tests {
         assert!(warning.contains("builtin-only"), "{warning}");
         config.causal_tree.enabled = false;
         assert_eq!(startup_check(&config), None);
+    }
+
+    /// Engine off: recovery may keep `[causal_tree]` on, but the credential
+    /// store is never opened (D-082 N-9).
+    #[test]
+    fn disabled_engine_never_opens_the_credential_store() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = loopback_plane();
+        config.config_path = temp.path().join("config.toml");
+        config.causal_tree.backend.credential_ref =
+            crate::causal_tree::config::CredentialRefSetting::Profile("cred-decider".to_string());
+        std::fs::write(temp.path().join("auth-profiles.json"), "not json").unwrap();
+        assert_eq!(check_decision_plane(None, &config), Ok(None));
+        config.decision_engine.enabled = true;
+        assert!(check_decision_plane(None, &config).is_err());
     }
 }

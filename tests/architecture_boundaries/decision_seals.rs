@@ -193,7 +193,6 @@ pub(super) fn only_reviewed_production_sites_seal_decision_requests() {
         found,
         BTreeMap::from([
             ("src/causal_tree/admin.rs".to_string(), (1, 0, 0)),
-            ("src/causal_tree/questions.rs".to_string(), (0, 0, 1)),
             ("src/decision/factory.rs".to_string(), (1, 0, 0)),
         ]),
         "AG-29 decision request constructors changed; review redacted or neutral state provenance"
@@ -211,11 +210,16 @@ fn probe_decision_seal_inventory_rejects_an_extra_caller() {
     assert_eq!(decision_seal_sites(&hidden), (0, 0, 0));
 }
 
-/// AG-19 and AG-20 apply to the compiler's production body. Runtime
-/// injection tests cover values; this source guard catches a new construction
-/// path that starts reading untrusted names or schema metadata directly.
+/// AG-19 and AG-20 apply to the compiler body. After the engine-off switch
+/// that body is `#[cfg(test)]`; scan `compile` plus production remainder so
+/// planted probes still fire and test helpers cannot trip the counts.
 fn decision_compiler_source_errors(source: &str) -> Vec<&'static str> {
-    let production = strip_cfg_test_items(source);
+    let production = format!(
+        "{}\n{}\n{}",
+        function_body(source, "compile"),
+        function_body(source, "forced_choices_match"),
+        strip_cfg_test_items(source)
+    );
     let mut errors = Vec::new();
     if production.matches("redacted_projection(state)?").count() != 1
         || production.matches("state: projection,").count() != 1
@@ -404,8 +408,9 @@ pub(super) fn validation_requires_the_sealed_request_manifest() {
             "checked validation/construction helpers stay protocol-private"
         );
     }
-    assert_eq!(protocol.matches("Self::validate_parts(").count(), 2);
-    assert_eq!(protocol.matches("Self::from_validated_parts(").count(), 2);
+    // `seal_recovering_parts` is cfg(test) after the engine-off switch.
+    assert_eq!(protocol.matches("Self::validate_parts(").count(), 1);
+    assert_eq!(protocol.matches("Self::from_validated_parts(").count(), 1);
     let validation = function_body(&protocol, "validate_parts");
     let construction = function_body(&protocol, "from_validated_parts");
     assert!(!validation.contains("Uuid::now_v7"));
