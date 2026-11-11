@@ -944,9 +944,9 @@ async fn recovery_erasure_indexes_settlement_terminal() {
     auth_02_3_tests::recovery_erasure_indexes_settlement_terminal().await;
 }
 
-#[tokio::test]
-async fn recovery_restart_from_killed_process() {
-    auth_02_3_tests::recovery_restart_from_killed_process().await;
+#[test]
+fn recovery_restart_from_killed_process() {
+    auth_02_3_tests::recovery_restart_from_killed_process();
 }
 
 #[ignore = "child mode is invoked only by the owned recovery restart test"]

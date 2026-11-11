@@ -1009,7 +1009,7 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
     drop(dir);
 }
 
-pub(super) async fn recovery_restart_from_killed_process() {
+pub(super) fn recovery_restart_from_killed_process() {
     let (dir, workspace) = home_workspace();
     let (mut child, ack) = spawn_recovery_child(&workspace, "commit");
     let payload = ack.recv_timeout(Duration::from_secs(120));
