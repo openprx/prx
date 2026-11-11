@@ -487,7 +487,7 @@ impl A2aConfig {
     /// Parse-time checks. TLS files are read at use, not here.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.bind.trim().is_empty(), "a2a.bind must not be empty");
-        if !a2a_bind_is_loopback(&self.bind) {
+        if self.messaging_enabled && !a2a_bind_is_loopback(&self.bind) {
             let cert = self
                 .tls_cert_path
                 .as_deref()
@@ -668,8 +668,13 @@ mod a2a_foundation_tests {
 
     #[test]
     fn a2a_non_loopback_bind_without_tls_is_refused() {
-        let error = parse_a2a("[a2a]\nbind = \"0.0.0.0:16832\"\n").expect_err("test: refuse");
+        let error = parse_a2a("[a2a]\nmessaging_enabled = true\nbind = \"0.0.0.0:16832\"\n").expect_err("test: refuse");
         assert!(error.to_string().contains("tls_cert_path"), "{error}");
+    }
+
+    #[test]
+    fn a2a_disabled_messaging_keeps_advertised_non_loopback_bind() {
+        parse_a2a("[a2a]\nbind = \"0.0.0.0:16832\"\n").expect("advertised address needs no listener TLS");
     }
 
     #[test]

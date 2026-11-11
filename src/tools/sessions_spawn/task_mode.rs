@@ -361,7 +361,8 @@ pub(super) async fn run_sub_agent_task(
         let loop_cleanup =
             crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
                 .with_acknowledgement(Some(cleanup_ack));
-        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(Some(run_beat), async move {
+        let task_context = SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone).ok();
+        let loop_future = crate::agent::idle::scope_beat(Some(run_beat), async move {
             // Carry the segment proof across the spawn boundary explicitly.
             let child_source = child_source_owned;
             let child_service = child_service_owned;
@@ -511,7 +512,15 @@ pub(super) async fn run_sub_agent_task(
             }
             .await;
             (task_history, result)
-        }));
+        });
+        // The segment owns another task; keep the same child input and run
+        // identity across steering restarts as on the outer task driver.
+        let mut loop_handle = spawn_scoped(async move {
+            match task_context {
+                Some(context) => SPAWN_EXECUTION_CONTEXT.scope(context, loop_future).await,
+                None => loop_future.await,
+            }
+        });
         let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
 
         // A queued steer may arrive immediately after the run is published.

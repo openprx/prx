@@ -1187,8 +1187,8 @@ struct WorkerRun {
 }
 
 /// Build a manifest that authenticates but cannot run: its config directory is
-/// real (so the CLI/manifest cross-check passes) but holds no `config.toml`, so
-/// the run stops at `config_source_generation`.
+/// real (so the CLI/manifest cross-check passes). Without an authenticated
+/// decision source, the run stops immediately after transport verification.
 fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
     WorkerManifest {
         parent_capability: None,
@@ -1239,6 +1239,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         session_scope_key: "sessions_spawn:global".to_string(),
         parent_run_id: None,
         inherited_provenance: None,
+        session_addr: None,
         compaction_config: None,
     }
 }
@@ -1536,51 +1537,102 @@ fn worker_refuses_to_run_without_the_parent_capability_env() {
 
 /// Real `prx session-worker` over pipes, then FOUNDATION relaunch: same
 /// [`openprx::messaging::SessionAddr`], new run.
-#[test]
-fn relaunch_real_worker_keeps_session_addr() {
-    use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry};
-    use openprx::messaging::SessionAddr;
+#[tokio::test]
+async fn relaunch_real_worker_keeps_session_addr() {
+    use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchRecipe};
+    use openprx::messaging::{CausalChain, InheritedProvenance, RemotePeerAttr, SessionAddr};
+    use std::sync::Arc;
 
     let (_root, config_dir, workspace_dir, home) = worker_dirs();
     let addr = SessionAddr::new("prx-default", "owner-a", "child-a", Some("main"));
-    let registry = ChildSessionRegistry::new();
-    registry.insert(&ChildSession::new(addr.clone(), None, None));
-
-    let mut first = manifest_for(&config_dir, &workspace_dir);
-    first.run_id = "run-first".to_string();
+    let provenance = InheritedProvenance {
+        remote: RemotePeerAttr {
+            issuer: "spiffe://prx".into(),
+            subject: "spiffe://prx/peer".into(),
+            message_id: uuid::Uuid::from_u128(42),
+        },
+        chain: CausalChain {
+            trigger: uuid::Uuid::from_u128(42),
+            root: uuid::Uuid::from_u128(42),
+            depth: 2,
+            ancestry: Vec::new(),
+        },
+    };
+    let registry = ChildSessionRegistry::new(Arc::new(
+        openprx::memory::SqliteMemory::new(&workspace_dir.join("registry")).expect("durable registry"),
+    ));
+    registry
+        .insert(&ChildSession::new(
+            addr.clone(),
+            None,
+            Some(RelaunchRecipe {
+                addr: addr.clone(),
+                last_run: None,
+                inherited_provenance: Some(provenance.clone()),
+            }),
+        ))
+        .await
+        .expect("persist relaunch recipe");
     let expiry = far_future_expiry();
-    let capability = worker_capability(&first, expiry);
-    first.parent_capability = Some(capability.clone());
-
-    let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
-    let mut stdin = take_stdin(&mut child);
-    write_line(
-        &mut stdin,
-        &serde_json::to_string(&first).expect("first manifest serializes"),
-    );
-    let run = finish(child, Some(stdin));
-    assert!(run.status.success(), "first real worker reports on stdout");
-    assert_single_json_line(&run.stdout);
-
-    let exec = registry.relaunch(&addr).expect("relaunch");
-    assert_ne!(exec.run.as_deref(), Some("run-first"));
-    let restored = registry.reconstruct(&addr).expect("reconstruct");
-    assert_eq!(restored.addr(), &addr);
-    assert_eq!(restored.recipe().and_then(|recipe| recipe.last_run.clone()), exec.run);
-
-    let mut second = first;
-    second.run_id = exec.run.expect("new run");
-    let capability = worker_capability(&second, expiry);
-    second.parent_capability = Some(capability.clone());
-    let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
-    let mut stdin = take_stdin(&mut child);
-    write_line(
-        &mut stdin,
-        &serde_json::to_string(&second).expect("second manifest serializes"),
-    );
-    let run = finish(child, Some(stdin));
-    assert!(run.status.success(), "relaunched real worker reports on stdout");
-    assert_single_json_line(&run.stdout);
+    let mut previous_run = None;
+    for _ in 0..2 {
+        let mut manifest = registry
+            .relaunch_worker(&addr, manifest_for(&config_dir, &workspace_dir))
+            .await
+            .expect("relaunch manifest");
+        assert_eq!(manifest.session_addr.as_ref(), Some(&addr));
+        assert_eq!(manifest.inherited_provenance.as_ref(), Some(&provenance));
+        assert_ne!(previous_run.as_deref(), Some(manifest.run_id.as_str()));
+        previous_run = Some(manifest.run_id.clone());
+        let restored = registry.reconstruct(&addr).await.expect("durable recipe");
+        assert_eq!(
+            restored.recipe().and_then(|r| r.last_run.as_deref()),
+            Some(manifest.run_id.as_str())
+        );
+        let capability = worker_capability(&manifest, expiry);
+        manifest.parent_capability = Some(capability.clone());
+        let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
+        let mut stdin = take_stdin(&mut child);
+        write_line(
+            &mut stdin,
+            &serde_json::to_string(&manifest).expect("manifest wire bytes"),
+        );
+        let run = finish(child, Some(stdin));
+        assert!(run.status.success());
+        let result = assert_single_json_line(&run.stdout);
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(!result.success);
+        assert!(
+            error.ends_with("worker requires an authenticated decision source"),
+            "worker must verify the complete manifest before the decision-source guard: {error}"
+        );
+        // Each field must actually reach the worker's verified manifest: the
+        // unchanged HMAC must reject a changed address or stripped provenance.
+        for tamper_address in [false, true] {
+            let mut tampered = manifest.clone();
+            if tamper_address {
+                tampered.session_addr = None;
+            } else {
+                tampered.inherited_provenance = None;
+            }
+            let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
+            let mut stdin = take_stdin(&mut child);
+            write_line(
+                &mut stdin,
+                &serde_json::to_string(&tampered).expect("tampered wire bytes"),
+            );
+            let run = finish(child, Some(stdin));
+            let result = assert_single_json_line(&run.stdout);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("capability signature mismatch"),
+                "{result:?}"
+            );
+        }
+    }
 }
 
 /// A manifest that is not JSON at all, with a control frame queued behind it:

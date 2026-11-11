@@ -260,6 +260,9 @@ where
         SPAWN_EXECUTION_CONTEXT
             .scope(
                 SpawnExecutionContext {
+                    task_input: crate::messaging::TaskInput {
+                        inherited_provenance: manifest.inherited_provenance.clone(),
+                    },
                     operator_authority: None,
                     ordinary_authority: None,
                     incoming_grant,

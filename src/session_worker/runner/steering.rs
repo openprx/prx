@@ -72,7 +72,9 @@ pub(super) fn spawn_stdin_control_reader(steer_tx: tokio::sync::mpsc::Sender<Str
                 WorkerControlFrame::Message { .. }
                 | WorkerControlFrame::BrokerResult { .. }
                 | WorkerControlFrame::BrokerCancelAck { .. } => {
-                    // FOUNDATION: types only. MSG-CORE wires the reader.
+                    tracing::warn!(
+                        "session-worker discarded a non-Steer stdin control frame; messaging reader is not wired"
+                    );
                 }
             }
         }

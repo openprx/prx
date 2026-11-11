@@ -56,6 +56,7 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
         session_scope_key: "signal:group:test".to_string(),
         parent_run_id: Some("run-parent".to_string()),
         inherited_provenance: None,
+        session_addr: None,
         compaction_config: None,
     };
 
@@ -138,6 +139,7 @@ fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
         session_scope_key: "telegram:chat-1:alice".to_string(),
         parent_run_id: Some("run-parent".to_string()),
         inherited_provenance: None,
+        session_addr: None,
         compaction_config: None,
     };
 

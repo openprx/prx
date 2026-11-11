@@ -1,7 +1,7 @@
 //! SQL for `prx_remote_trees` / `prx_remote_tree_resources` (C2).
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::runtime::sqlite_pool::install_busy_handler;
 
@@ -60,6 +60,8 @@ pub enum RemoteTreeError {
     Exhausted { resource: RemoteTreeResource },
     /// Tree was closed; resume and further charge are refused.
     Closed,
+    /// Backend failure; distinct from a permanently closed tree.
+    Storage,
 }
 
 impl std::fmt::Display for RemoteTreeError {
@@ -67,11 +69,18 @@ impl std::fmt::Display for RemoteTreeError {
         match self {
             Self::Exhausted { resource } => write!(f, "remote_tree_resource_exhausted: {resource}"),
             Self::Closed => f.write_str("remote_tree_closed"),
+            Self::Storage => f.write_str("remote_tree_storage_error"),
         }
     }
 }
 
 impl std::error::Error for RemoteTreeError {}
+
+/// Preserve backend failures as transient/internal failures and retain diagnostics.
+pub(crate) fn storage_error(error: impl std::fmt::Display) -> RemoteTreeError {
+    tracing::warn!(%error, "remote-tree SQLite operation failed");
+    RemoteTreeError::Storage
+}
 
 /// Counters read after rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +152,19 @@ pub fn charge(
     ma_scope_id: Option<&str>,
     caps: RemoteTreeCaps,
 ) -> Result<(), RemoteTreeError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(storage_error)?;
+    charge_in_transaction(&tx, id, resource, resource_id, ma_scope_id, caps)?;
+    tx.commit().map_err(storage_error)
+}
+
+fn charge_in_transaction(
+    conn: &Connection,
+    id: &RemoteTreeId,
+    resource: RemoteTreeResource,
+    resource_id: &str,
+    ma_scope_id: Option<&str>,
+    caps: RemoteTreeCaps,
+) -> Result<(), RemoteTreeError> {
     ensure_open_tree(conn, id, ma_scope_id)?;
     match resource {
         RemoteTreeResource::Spawned => {
@@ -183,6 +205,17 @@ pub fn refund(
     resource: RemoteTreeResource,
     resource_id: &str,
 ) -> Result<(), RemoteTreeError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(storage_error)?;
+    refund_in_transaction(&tx, id, resource, resource_id)?;
+    tx.commit().map_err(storage_error)
+}
+
+fn refund_in_transaction(
+    conn: &Connection,
+    id: &RemoteTreeId,
+    resource: RemoteTreeResource,
+    resource_id: &str,
+) -> Result<(), RemoteTreeError> {
     ensure_tree_not_closed(conn, id)?;
     if let Some(kind) = resource.occupancy_kind() {
         conn.execute(
@@ -192,18 +225,28 @@ pub fn refund(
                AND kind = ?4 AND resource_id = ?5 AND state = 'live'",
             params![id.workspace_id, id.owner_id, id.trigger_message_id, kind, resource_id],
         )
-        .map_err(|_| RemoteTreeError::Closed)?;
+        .map_err(storage_error)?;
     }
     Ok(())
 }
 
 /// Load counters from durable rows.
 pub fn rebuild(conn: &Connection, id: &RemoteTreeId) -> Result<RemoteTreeSnapshot> {
-    snapshot(conn, id)
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let snapshot = snapshot(&tx, id)?;
+    tx.commit()?;
+    Ok(snapshot)
 }
 
 /// Close when no live occupancy remains and no resumable turn references the trigger.
 pub fn close(conn: &Connection, id: &RemoteTreeId, has_resumable_turn: bool) -> Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    close_in_transaction(&tx, id, has_resumable_turn)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn close_in_transaction(conn: &Connection, id: &RemoteTreeId, has_resumable_turn: bool) -> Result<()> {
     let snap = snapshot(conn, id)?;
     if snap.state == "closed" {
         return Ok(());
@@ -215,7 +258,7 @@ pub fn close(conn: &Connection, id: &RemoteTreeId, has_resumable_turn: bool) -> 
     conn.execute(
         "UPDATE prx_remote_trees
          SET state = 'closed', closed_at = ?4
-         WHERE workspace_id = ?1 AND owner_id = ?2 AND trigger_message_id = ?3",
+         WHERE workspace_id = ?1 AND owner_id = ?2 AND trigger_message_id = ?3 AND state = 'open'",
         params![id.workspace_id, id.owner_id, id.trigger_message_id, now],
     )?;
     Ok(())
@@ -223,7 +266,9 @@ pub fn close(conn: &Connection, id: &RemoteTreeId, has_resumable_turn: bool) -> 
 
 /// Resume. Closed trees return [`RemoteTreeError::Closed`].
 pub fn resume(conn: &Connection, id: &RemoteTreeId) -> Result<(), RemoteTreeError> {
-    ensure_tree_not_closed(conn, id)
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(storage_error)?;
+    ensure_tree_not_closed(&tx, id)?;
+    tx.commit().map_err(storage_error)
 }
 
 fn ensure_open_tree(conn: &Connection, id: &RemoteTreeId, ma_scope_id: Option<&str>) -> Result<(), RemoteTreeError> {
@@ -235,7 +280,7 @@ fn ensure_open_tree(conn: &Connection, id: &RemoteTreeId, ma_scope_id: Option<&s
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| RemoteTreeError::Closed)?;
+        .map_err(storage_error)?;
     match state.as_deref() {
         Some("closed") => Err(RemoteTreeError::Closed),
         Some(_) => Ok(()),
@@ -248,7 +293,7 @@ fn ensure_open_tree(conn: &Connection, id: &RemoteTreeId, ma_scope_id: Option<&s
                  ) VALUES (?1, ?2, ?3, ?4, 0, 0, 'open', ?5, NULL)",
                 params![id.workspace_id, id.owner_id, id.trigger_message_id, ma_scope_id, now],
             )
-            .map_err(|_| RemoteTreeError::Closed)?;
+            .map_err(storage_error)?;
             Ok(())
         }
     }
@@ -263,7 +308,7 @@ fn ensure_tree_not_closed(conn: &Connection, id: &RemoteTreeId) -> Result<(), Re
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| RemoteTreeError::Closed)?;
+        .map_err(storage_error)?;
     match state.as_deref() {
         Some("closed") => Err(RemoteTreeError::Closed),
         Some(_) => Ok(()),
@@ -283,18 +328,18 @@ fn bump_cumulative(
         "spawned" => {
             "UPDATE prx_remote_trees SET spawned = spawned + 1
              WHERE workspace_id = ?1 AND owner_id = ?2 AND trigger_message_id = ?3
-               AND spawned < ?4"
+               AND state = 'open' AND spawned < ?4"
         }
         "sends" => {
             "UPDATE prx_remote_trees SET sends = sends + 1
              WHERE workspace_id = ?1 AND owner_id = ?2 AND trigger_message_id = ?3
-               AND sends < ?4"
+               AND state = 'open' AND sends < ?4"
         }
         _ => return Err(RemoteTreeError::Closed),
     };
     let updated = conn
         .execute(sql, params![id.workspace_id, id.owner_id, id.trigger_message_id, cap])
-        .map_err(|_| RemoteTreeError::Closed)?;
+        .map_err(storage_error)?;
     if updated == 0 {
         return Err(RemoteTreeError::Exhausted { resource });
     }
@@ -325,7 +370,7 @@ fn insert_live(conn: &Connection, id: &RemoteTreeId, kind: &str, resource_id: &s
          DO UPDATE SET state = 'live'",
         params![id.workspace_id, id.owner_id, id.trigger_message_id, kind, resource_id],
     )
-    .map_err(|_| RemoteTreeError::Closed)?;
+    .map_err(storage_error)?;
     Ok(())
 }
 
@@ -337,7 +382,7 @@ fn live_count(conn: &Connection, id: &RemoteTreeId, kind: &str) -> Result<i64, R
         params![id.workspace_id, id.owner_id, id.trigger_message_id, kind],
         |row| row.get(0),
     )
-    .map_err(|_| RemoteTreeError::Closed)
+    .map_err(storage_error)
 }
 
 fn snapshot(conn: &Connection, id: &RemoteTreeId) -> Result<RemoteTreeSnapshot> {
@@ -357,9 +402,9 @@ fn snapshot(conn: &Connection, id: &RemoteTreeId) -> Result<RemoteTreeSnapshot> 
     Ok(RemoteTreeSnapshot {
         spawned,
         sends,
-        scheduled_live: live_count(conn, id, "scheduled").map_err(|error| anyhow::anyhow!("{error}"))?,
-        connection_live: live_count(conn, id, "connection").map_err(|error| anyhow::anyhow!("{error}"))?,
-        descendant_live: live_count(conn, id, "descendant").map_err(|error| anyhow::anyhow!("{error}"))?,
+        scheduled_live: live_count(conn, id, "scheduled").map_err(anyhow::Error::new)?,
+        connection_live: live_count(conn, id, "connection").map_err(anyhow::Error::new)?,
+        descendant_live: live_count(conn, id, "descendant").map_err(anyhow::Error::new)?,
         state,
     })
 }

@@ -446,6 +446,7 @@ async fn restore_operator_process(
             .ok_or_else(|| anyhow::anyhow!("missing child session"))?,
         parent_run_id: scope.parent_run_id.clone(),
         inherited_provenance: None,
+        session_addr: None,
         compaction_config: None,
     };
     // This exercises the real process-launch binding producer. The fixture

@@ -142,6 +142,9 @@ pub struct WorkerManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_source: Option<WorkerOperatorSource>,
     pub run_id: String,
+    /// Stable logical child address, sealed by the complete manifest HMAC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_addr: Option<crate::messaging::SessionAddr>,
     pub task: String,
     pub provider_name: String,
     pub model: String,
@@ -301,14 +304,15 @@ fn config_source_generation_once(config_dir: &Path) -> anyhow::Result<String> {
 /// frames inherit their trust from the pipe itself, which only the spawning
 /// parent holds a write end of. They therefore carry no capability material and
 /// can never widen what the sealed manifest already granted.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerControlFrame {
     /// Inject an operator message into the worker's running conversation.
     Steer { message: String },
     /// Parent-to-worker Data envelope (MSG-5). Types only in FOUNDATION.
-    Message { envelope: crate::messaging::PrxMessage },
+    Message {
+        envelope: Box<crate::messaging::PrxMessage>,
+    },
     /// Answer to a worker broker call (CAP-6a). Types only in FOUNDATION.
     BrokerResult { call_id: u64, outcome: BrokerOutcome },
     /// Acknowledgement of `BrokerCancel`.
@@ -317,12 +321,13 @@ pub enum WorkerControlFrame {
 
 /// Worker-to-parent stdout frame. Line-delimited; the terminal `WorkerResult`
 /// still follows. Reader wiring is MSG-CORE.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[allow(clippy::large_enum_variant, clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerOutputFrame {
     /// Worker-originated Data.
-    Message { envelope: crate::messaging::PrxMessage },
+    Message {
+        envelope: Box<crate::messaging::PrxMessage>,
+    },
     /// Delivery ack for a parent-injected message.
     Ack {
         message_id: uuid::Uuid,
@@ -353,8 +358,7 @@ pub enum CapabilityKind {
 }
 
 /// Result of a broker call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrokerOutcome {
     Ok { output: serde_json::Value },
@@ -521,6 +525,7 @@ mod tests {
             session_scope_key: "telegram:chat-1:openprx_user".into(),
             parent_run_id: Some("run-0".into()),
             inherited_provenance: None,
+            session_addr: None,
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
         };
 
@@ -607,7 +612,7 @@ mod tests {
     #[test]
     fn worker_c3_frames_round_trip() {
         let control = WorkerControlFrame::Message {
-            envelope: sample_envelope(),
+            envelope: Box::new(sample_envelope()),
         };
         let json = serde_json::to_string(&control).expect("test: control json");
         assert!(json.contains("\"kind\":\"message\""));
@@ -703,6 +708,7 @@ mod tests {
             session_scope_key: "s".into(),
             parent_run_id: None,
             inherited_provenance: None,
+            session_addr: None,
             compaction_config: None,
         };
         let trigger = uuid::Uuid::from_u128(42);

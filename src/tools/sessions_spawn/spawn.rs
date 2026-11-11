@@ -892,6 +892,10 @@ impl SessionsSpawnTool {
             let process_compaction_config = resolved_compaction.config.clone();
             let process_event_recording = child_model_config.memory.event_recording_config();
             let process_execution_ctx = SpawnExecutionContext {
+                task_input: parent_exec_ctx
+                    .as_ref()
+                    .map(|context| context.task_input.clone())
+                    .unwrap_or_default(),
                 operator_authority: None,
                 ordinary_authority: None,
                 incoming_grant: process_child_grant.clone(),
@@ -1469,6 +1473,10 @@ impl SessionsSpawnTool {
             ))
         });
         let mut task_execution_ctx = SpawnExecutionContext {
+            task_input: parent_exec_ctx
+                .as_ref()
+                .map(|context| context.task_input.clone())
+                .unwrap_or_default(),
             operator_authority: None,
             ordinary_authority: None,
             incoming_grant: child_grant,

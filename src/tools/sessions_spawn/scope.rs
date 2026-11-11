@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SpawnExecutionContext {
+    /// Runtime-owned task input, inherited independently of model arguments.
+    pub(crate) task_input: crate::messaging::TaskInput,
     pub(crate) operator_authority: Option<Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
     pub(crate) ordinary_authority: Option<Arc<crate::runtime::child_source::ordinary_task::OrdinaryTaskAuthority>>,
     /// Incoming authority for this child, never an outgoing grant for its tools.
@@ -46,6 +48,9 @@ impl SpawnExecutionContext {
     /// computation in `execute`).
     pub(crate) const fn seed_turn_context(run_id: String, session_scope_key: String) -> Self {
         Self {
+            task_input: crate::messaging::TaskInput {
+                inherited_provenance: None,
+            },
             operator_authority: None,
             ordinary_authority: None,
             incoming_grant: None,

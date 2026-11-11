@@ -252,10 +252,6 @@ pub enum ProviderUsageRecordKind {
 /// `Send + Sync` (passed across tasks over channels), and every case is expressible without
 /// `Box<dyn>`. Step 1: the type skeleton; Steps 2-5 wire it into the call paths one by one.
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Preserve inline public variants without a per-turn heap allocation"
-)]
 pub enum Action {
     // ── Input path ──────────────────────────────────────────────
     /// Raw keyboard event

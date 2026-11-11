@@ -155,10 +155,6 @@ fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn
 ///
 /// Returned by [`ChatState::reduce`] and dispatched by the main loop.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Preserve inline public variants without a per-turn heap allocation"
-)]
 pub enum Effect {
     /// Start a new round of LLM inference: takes draft_id, a history snapshot and a cancel token.
     ///
@@ -316,6 +312,8 @@ pub struct SessionState {
     pub turns: Vec<ChatTurn>,
     /// LLM context message list (system+user+assistant, used for the next request)
     pub history: Vec<ChatMessage>,
+    /// Durable logical child metadata when this view belongs to a child.
+    pub child_session: Option<crate::chat::sessions::child::ChildSessionMetadata>,
     /// Session creation time (lazily set on the first RecordUserTurn; never overwritten later)
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Summaries (v4) of background sessions (agent/shell/pty) run inside this chat session. Only
@@ -866,6 +864,7 @@ impl ChatState {
                 mode: ChatMode::default(),
                 turns: Vec::new(),
                 history: Vec::new(),
+                child_session: None,
                 created_at: None,
                 background_sessions: Vec::new(),
                 token_usage_records: Vec::new(),

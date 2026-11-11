@@ -55,8 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registry reconstruction, relaunch recipe, provenance sealing, remote-tree
   counters (migration `prx_remote_tree`), worker frame types, and `[a2a]`
   TLS / peer / credential / `remote_tree` config. `messaging_enabled` stays
-  false and no production path reads the new keys yet. A non-loopback
-  `a2a.bind` is refused at load without `tls_cert_path` and `tls_key_path`.
+  false and no production path reads the new keys yet. Enabling messaging with
+  a non-loopback `a2a.bind` requires `tls_cert_path` and `tls_key_path` at load.
 
 - Default-off advisory decision engine with bounded pre-turn briefs, FIFO outcome
   telemetry, and endpoint-free status and doctor diagnostics. See

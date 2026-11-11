@@ -183,6 +183,9 @@ pub struct ChatSession {
     pub updated_at: DateTime<Utc>,
     /// Ordered conversation turns
     pub turns: Vec<ChatTurn>,
+    /// Optional logical child identity in this registry record (no live handles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session: Option<crate::chat::sessions::child::ChildSessionMetadata>,
     /// Summaries of child sessions (agent / shell / pty) that ran during
     /// this chat session (v4). Persisted so a reloaded chat session can show
     /// what its background tasks produced. Reload restores **summaries only** —
@@ -301,6 +304,7 @@ impl ChatSession {
             created_at: now,
             updated_at: now,
             turns: Vec::new(),
+            child_session: None,
             background_sessions: Vec::new(),
             token_usage_records: Vec::new(),
             mode: ChatMode::default(),

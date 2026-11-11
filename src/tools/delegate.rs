@@ -1089,6 +1089,7 @@ impl DelegateTool {
                     parent.session_scope_key.clone(),
                 )
                 .with_channel_excluded_tools(parent.channel_excluded_tools.clone());
+                metadata.task_input = parent.task_input.clone();
                 metadata.spawn_depth = parent.spawn_depth;
                 metadata.is_turn_root = parent.is_turn_root;
                 metadata.owner_id = parent.owner_id.clone();
@@ -2666,6 +2667,77 @@ pub(crate) mod tests {
                 "{run} recalled the sibling prior segment: {preamble}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delegate_task_input_preserves_inherited_remote_provenance() {
+        use crate::tools::sessions_spawn::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext};
+        struct InputProbe(tokio::sync::mpsc::UnboundedSender<Option<crate::messaging::InheritedProvenance>>);
+        #[async_trait]
+        impl Tool for InputProbe {
+            fn name(&self) -> &str {
+                "dynamic_alias"
+            }
+            fn description(&self) -> &str {
+                "Report inherited task input"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object","properties":{}})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                let input =
+                    SPAWN_EXECUTION_CONTEXT.try_with(|context| context.task_input.inherited_provenance.clone())?;
+                self.0
+                    .send(input)
+                    .map_err(|_| anyhow::anyhow!("task input probe receiver closed"))?;
+                Ok(ToolResult {
+                    success: true,
+                    output: "dynamic_alias".into(),
+                    error: None,
+                })
+            }
+        }
+        let provenance = crate::messaging::InheritedProvenance {
+            remote: crate::messaging::RemotePeerAttr {
+                issuer: "spiffe://prx".into(),
+                subject: "spiffe://prx/peer".into(),
+                message_id: uuid::Uuid::from_u128(42),
+            },
+            chain: crate::messaging::CausalChain {
+                trigger: uuid::Uuid::from_u128(42),
+                root: uuid::Uuid::from_u128(42),
+                depth: 2,
+                ancestry: Vec::new(),
+            },
+        };
+        let mut parent = SpawnExecutionContext::seed_turn_context("prx-parent".into(), "prx-session".into());
+        provenance.seal_into_task_input(&mut parent.task_input);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result, requests) = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                parent,
+                run_configured_delegate_fixture(
+                    vec!["dynamic_alias".into()],
+                    vec![Arc::new(InputProbe(sender))],
+                    "dynamic_alias",
+                    json!({}),
+                    None,
+                    false,
+                    None,
+                ),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            requests.len(),
+            2,
+            "real delegated child must execute its tool and finish"
+        );
+        let actual = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("delegated tool observes task input")
+            .expect("probe result");
+        assert_eq!(actual.as_ref(), Some(&provenance));
     }
 
     #[test]

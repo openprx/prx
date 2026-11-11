@@ -69,8 +69,11 @@ impl InheritedProvenance {
 /// Stamp outbound Data with `in_reply_to = chain.trigger`. A conflicting model
 /// value is ignored.
 pub fn stamp_outbound(chain: &CausalChain, message: &mut PrxMessage) {
+    if message.kind != super::types::MessageKind::Data {
+        return;
+    }
     if message.in_reply_to != Some(chain.trigger) {
-        tracing::debug!(
+        tracing::warn!(
             trigger = %chain.trigger,
             model_in_reply_to = ?message.in_reply_to,
             "stamp_outbound overrode model in_reply_to"
@@ -124,10 +127,16 @@ mod tests {
         stamp_outbound(&chain, &mut message);
         assert_eq!(message.in_reply_to, Some(chain.trigger));
         assert_ne!(message.in_reply_to, Some(model_parent));
+        for kind in [MessageKind::Ack, MessageKind::Nack] {
+            message.kind = kind;
+            message.in_reply_to = Some(model_parent);
+            stamp_outbound(&chain, &mut message);
+            assert_eq!(message.in_reply_to, Some(model_parent));
+        }
     }
 
-    #[test]
-    fn inherited_provenance_seals_into_task_input() {
+    #[tokio::test]
+    async fn inherited_provenance_seals_into_task_input() {
         let provenance = InheritedProvenance {
             remote: RemotePeerAttr {
                 issuer: "spiffe://prx".into(),
@@ -136,8 +145,17 @@ mod tests {
             },
             chain: chain(),
         };
-        let mut task = TaskInput::default();
-        provenance.seal_into_task_input(&mut task);
-        assert_eq!(task.inherited_provenance.as_ref(), Some(&provenance));
+        let mut context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            "prx-run".into(),
+            "prx-session".into(),
+        );
+        provenance.seal_into_task_input(&mut context.task_input);
+        crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+            .scope(context, async {
+                let actual =
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.with(|context| context.task_input.clone());
+                assert_eq!(actual.inherited_provenance.as_ref(), Some(&provenance));
+            })
+            .await;
     }
 }

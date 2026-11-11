@@ -39,7 +39,7 @@ impl RemoteTreeStore {
         resource_id: &str,
         ma_scope_id: Option<&str>,
     ) -> Result<(), RemoteTreeError> {
-        let conn = sql::open_connection(&self.path).map_err(|_| RemoteTreeError::Closed)?;
+        let conn = sql::open_connection(&self.path).map_err(sql::storage_error)?;
         sql::charge(&conn, id, resource, resource_id, ma_scope_id, self.caps())
     }
 
@@ -50,7 +50,7 @@ impl RemoteTreeStore {
         resource: RemoteTreeResource,
         resource_id: &str,
     ) -> Result<(), RemoteTreeError> {
-        let conn = sql::open_connection(&self.path).map_err(|_| RemoteTreeError::Closed)?;
+        let conn = sql::open_connection(&self.path).map_err(sql::storage_error)?;
         sql::refund(&conn, id, resource, resource_id)
     }
 
@@ -69,7 +69,7 @@ impl RemoteTreeStore {
 
     /// Resume a tree. Closed trees return [`RemoteTreeError::Closed`].
     pub fn resume(&self, id: &RemoteTreeId) -> Result<(), RemoteTreeError> {
-        let conn = sql::open_connection(&self.path).map_err(|_| RemoteTreeError::Closed)?;
+        let conn = sql::open_connection(&self.path).map_err(sql::storage_error)?;
         sql::resume(&conn, id)
     }
 }
@@ -80,10 +80,17 @@ mod tests {
     use crate::memory::SqliteMemory;
 
     fn store(dir: &tempfile::TempDir) -> (RemoteTreeStore, RemoteTreeId, RemoteTreeId) {
+        store_with_limits(dir, RemoteTreeLimits::default())
+    }
+
+    fn store_with_limits(
+        dir: &tempfile::TempDir,
+        limits: RemoteTreeLimits,
+    ) -> (RemoteTreeStore, RemoteTreeId, RemoteTreeId) {
         let memory = SqliteMemory::new(dir.path()).expect("test: sqlite");
         drop(memory);
         let path = dir.path().join("memory").join("brain.db");
-        let store = RemoteTreeStore::open(&path, RemoteTreeLimits::default()).expect("test: open");
+        let store = RemoteTreeStore::open(&path, limits).expect("test: open");
         let a = RemoteTreeId {
             workspace_id: "ws".into(),
             owner_id: "owner-a".into(),
@@ -180,5 +187,324 @@ mod tests {
         let snap_b = store.rebuild(&b).expect("test: b");
         assert_eq!(snap_a.spawned, 16);
         assert_eq!(snap_b.spawned, 1);
+    }
+    #[test]
+    fn remote_tree_close_refuses_live_or_resumable() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store(&dir);
+        store
+            .charge(&id, RemoteTreeResource::Scheduled, "job", None)
+            .expect("live job");
+        assert!(store.close(&id, false).is_err());
+        store
+            .refund(&id, RemoteTreeResource::Scheduled, "job")
+            .expect("refund job");
+        assert!(store.close(&id, true).is_err());
+        store.resume(&id).expect("open tree can resume");
+        store.close(&id, false).expect("quiescent tree closes");
+        assert_eq!(store.rebuild(&id).expect("closed tombstone").state, "closed");
+    }
+
+    #[test]
+    fn resume_of_dropped_remote_tree_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store(&dir);
+        store
+            .charge(&id, RemoteTreeResource::Send, "send", None)
+            .expect("create tree");
+        store.close(&id, false).expect("close tree");
+        drop(store);
+        let store =
+            RemoteTreeStore::open(dir.path().join("memory/brain.db"), RemoteTreeLimits::default()).expect("reopen");
+        assert_eq!(store.resume(&id), Err(RemoteTreeError::Closed));
+        for resource in [
+            RemoteTreeResource::Spawned,
+            RemoteTreeResource::Send,
+            RemoteTreeResource::Scheduled,
+            RemoteTreeResource::Connection,
+        ] {
+            assert_eq!(
+                store.charge(&id, resource, "after-close", None),
+                Err(RemoteTreeError::Closed)
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_connections_cannot_exceed_remote_tree_occupancy_cap() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store(&dir);
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(8);
+            for index in 0..8 {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let id = id.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    store.charge(&id, RemoteTreeResource::Scheduled, &format!("job-{index}"), None)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("charge thread"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 4);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| *error
+                    == RemoteTreeError::Exhausted {
+                        resource: RemoteTreeResource::Scheduled
+                    })
+        );
+        assert_eq!(store.rebuild(&id).expect("atomic occupancy").scheduled_live, 4);
+    }
+
+    fn limits(maximum: u32) -> RemoteTreeLimits {
+        RemoteTreeLimits {
+            max_spawned: maximum,
+            max_scheduled: maximum,
+            max_connections: maximum,
+            max_sends: maximum,
+        }
+    }
+
+    fn charge_each(store: &RemoteTreeStore, id: &RemoteTreeId, index: usize) {
+        for resource in [
+            RemoteTreeResource::Spawned,
+            RemoteTreeResource::Send,
+            RemoteTreeResource::Scheduled,
+            RemoteTreeResource::Connection,
+        ] {
+            store
+                .charge(id, resource, &format!("{resource}-{index}"), None)
+                .expect("charge resource");
+        }
+    }
+
+    #[test]
+    fn remote_tree_spawn_breadth_cap_is_enforced() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(
+            &dir,
+            RemoteTreeLimits {
+                max_spawned: 2,
+                ..Default::default()
+            },
+        );
+        for index in 0..2 {
+            store
+                .charge(&id, RemoteTreeResource::Spawned, &format!("child-{index}"), None)
+                .expect("spawn");
+        }
+        assert_eq!(
+            store.charge(&id, RemoteTreeResource::Spawned, "extra", None),
+            Err(RemoteTreeError::Exhausted {
+                resource: RemoteTreeResource::Spawned
+            })
+        );
+        let snapshot = store.rebuild(&id).expect("snapshot");
+        assert_eq!(snapshot.spawned, 2);
+        assert_eq!(snapshot.descendant_live, 2);
+    }
+
+    #[test]
+    fn remote_tree_scheduled_entry_cap_is_enforced() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(
+            &dir,
+            RemoteTreeLimits {
+                max_scheduled: 2,
+                ..Default::default()
+            },
+        );
+        for index in 0..2 {
+            store
+                .charge(&id, RemoteTreeResource::Scheduled, &format!("job-{index}"), None)
+                .expect("schedule");
+        }
+        assert_eq!(
+            store.charge(&id, RemoteTreeResource::Scheduled, "extra", None),
+            Err(RemoteTreeError::Exhausted {
+                resource: RemoteTreeResource::Scheduled
+            })
+        );
+        store
+            .refund(&id, RemoteTreeResource::Scheduled, "job-0")
+            .expect("remove job");
+        store
+            .charge(&id, RemoteTreeResource::Scheduled, "extra", None)
+            .expect("released slot");
+        assert_eq!(store.rebuild(&id).expect("snapshot").scheduled_live, 2);
+    }
+
+    #[test]
+    fn remote_tree_live_connection_cap_is_enforced() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(
+            &dir,
+            RemoteTreeLimits {
+                max_connections: 2,
+                ..Default::default()
+            },
+        );
+        for index in 0..2 {
+            store
+                .charge(
+                    &id,
+                    RemoteTreeResource::Connection,
+                    &format!("connection-{index}"),
+                    None,
+                )
+                .expect("connect");
+        }
+        assert_eq!(
+            store.charge(&id, RemoteTreeResource::Connection, "extra", None),
+            Err(RemoteTreeError::Exhausted {
+                resource: RemoteTreeResource::Connection
+            })
+        );
+        store
+            .refund(&id, RemoteTreeResource::Connection, "connection-0")
+            .expect("close connection");
+        store
+            .charge(&id, RemoteTreeResource::Connection, "extra", None)
+            .expect("released slot");
+        assert_eq!(store.rebuild(&id).expect("snapshot").connection_live, 2);
+    }
+
+    #[test]
+    fn remote_tree_counters_survive_clock_advance_with_live_resources() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(&dir, limits(1));
+        charge_each(&store, &id, 0);
+        // Age the durable creation stamp relative to the actual wall clock.
+        // A forward clock jump must not make live resources or totals expire.
+        let connection = sql::open_connection(&store.path).expect("tree connection");
+        let updated = connection
+            .execute(
+                "UPDATE prx_remote_trees SET created_at = 0
+             WHERE workspace_id = ?1 AND owner_id = ?2 AND trigger_message_id = ?3",
+                rusqlite::params![id.workspace_id, id.owner_id, id.trigger_message_id],
+            )
+            .expect("age tree");
+        assert_eq!(updated, 1, "the live trigger must actually be aged");
+        assert_eq!(
+            store.rebuild(&id).expect("aged snapshot"),
+            RemoteTreeSnapshot {
+                spawned: 1,
+                sends: 1,
+                scheduled_live: 1,
+                connection_live: 1,
+                descendant_live: 1,
+                state: "open".into(),
+            }
+        );
+        for resource in [
+            RemoteTreeResource::Spawned,
+            RemoteTreeResource::Send,
+            RemoteTreeResource::Scheduled,
+            RemoteTreeResource::Connection,
+        ] {
+            assert_eq!(
+                store.charge(&id, resource, "extra", None),
+                Err(RemoteTreeError::Exhausted { resource })
+            );
+        }
+    }
+
+    #[test]
+    fn remote_tree_counters_rebuilt_after_restart() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(&dir, limits(2));
+        charge_each(&store, &id, 0);
+        charge_each(&store, &id, 1);
+        let path = store.path.clone();
+        drop(store);
+        let reopened = RemoteTreeStore::open(path, limits(2)).expect("reopen store");
+        assert_eq!(
+            reopened.rebuild(&id).expect("durable snapshot"),
+            RemoteTreeSnapshot {
+                spawned: 2,
+                sends: 2,
+                scheduled_live: 2,
+                connection_live: 2,
+                descendant_live: 2,
+                state: "open".into(),
+            }
+        );
+        for resource in [
+            RemoteTreeResource::Spawned,
+            RemoteTreeResource::Send,
+            RemoteTreeResource::Scheduled,
+            RemoteTreeResource::Connection,
+        ] {
+            assert_eq!(
+                reopened.charge(&id, resource, "extra", None),
+                Err(RemoteTreeError::Exhausted { resource })
+            );
+        }
+    }
+
+    #[test]
+    fn closed_connection_refunds_occupancy_but_spawn_and_send_totals_never_refund() {
+        let dir = tempfile::TempDir::new().expect("tree database");
+        let (store, id, _) = store_with_limits(&dir, limits(1));
+        charge_each(&store, &id, 0);
+        store
+            .refund(&id, RemoteTreeResource::Connection, "connection-0")
+            .expect("close connection");
+        store
+            .refund(&id, RemoteTreeResource::Spawned, "spawned-0")
+            .expect("descendant exit");
+        store
+            .refund(&id, RemoteTreeResource::Send, "send-0")
+            .expect("send has no occupancy");
+        store
+            .charge(&id, RemoteTreeResource::Connection, "replacement", None)
+            .expect("connection slot reused");
+        for resource in [
+            RemoteTreeResource::Spawned,
+            RemoteTreeResource::Send,
+            RemoteTreeResource::Scheduled,
+        ] {
+            assert_eq!(
+                store.charge(&id, resource, "extra", None),
+                Err(RemoteTreeError::Exhausted { resource })
+            );
+        }
+        assert_eq!(
+            store.rebuild(&id).expect("snapshot"),
+            RemoteTreeSnapshot {
+                spawned: 1,
+                sends: 1,
+                scheduled_live: 1,
+                connection_live: 1,
+                descendant_live: 0,
+                state: "open".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_tree_storage_failure_is_not_closed() {
+        let dir = tempfile::TempDir::new().expect("missing database root");
+        let store = RemoteTreeStore::open(dir.path().join("missing/brain.db"), RemoteTreeLimits::default())
+            .expect("store handle");
+        let id = RemoteTreeId {
+            workspace_id: "ws".into(),
+            owner_id: "owner-a".into(),
+            trigger_message_id: "trigger".into(),
+        };
+        assert_eq!(
+            store.charge(&id, RemoteTreeResource::Send, "send", None),
+            Err(RemoteTreeError::Storage)
+        );
+        assert_eq!(store.resume(&id), Err(RemoteTreeError::Storage));
     }
 }

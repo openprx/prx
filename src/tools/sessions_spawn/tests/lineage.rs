@@ -165,6 +165,7 @@ async fn spawn_nesting_is_uncapped_and_still_reports_depth() {
         let result = SPAWN_EXECUTION_CONTEXT
             .scope(
                 SpawnExecutionContext {
+                    task_input: crate::messaging::TaskInput::default(),
                     operator_authority: None,
                     ordinary_authority: None,
                     incoming_grant: None,
@@ -254,6 +255,7 @@ async fn spawn_run_parent_reports_child_at_depth_one() {
     let result = SPAWN_EXECUTION_CONTEXT
         .scope(
             SpawnExecutionContext {
+                task_input: crate::messaging::TaskInput::default(),
                 operator_authority: None,
                 ordinary_authority: None,
                 incoming_grant: None,
@@ -611,4 +613,77 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
                 .await
         }))
         .await
+}
+
+#[tokio::test]
+async fn task_spawn_inherits_sealed_remote_provenance() {
+    struct InputProbe(tokio::sync::mpsc::UnboundedSender<(String, Option<crate::messaging::InheritedProvenance>)>);
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for InputProbe {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            // Turn preparation runs on the actual child task. Provider I/O
+            // has its own owner; its task-locals are intentionally narrower.
+            if let Ok(input) = SPAWN_EXECUTION_CONTEXT
+                .try_with(|context| (context.run_id.clone(), context.task_input.inherited_provenance.clone()))
+            {
+                let _ = self.0.send(input);
+            }
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+    }
+    let provenance = crate::messaging::InheritedProvenance {
+        remote: crate::messaging::RemotePeerAttr {
+            issuer: "spiffe://prx".into(),
+            subject: "spiffe://prx/peer".into(),
+            message_id: uuid::Uuid::from_u128(42),
+        },
+        chain: crate::messaging::CausalChain {
+            trigger: uuid::Uuid::from_u128(42),
+            root: uuid::Uuid::from_u128(42),
+            depth: 2,
+            ancestry: Vec::new(),
+        },
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (channel, _) = RecordingChannel::new();
+    let tool = make_tool(Arc::new(channel), Arc::new(InputProbe(tx)));
+    let mut parent = SpawnExecutionContext::seed_turn_context("prx-parent".into(), "prx-session".into());
+    provenance.seal_into_task_input(&mut parent.task_input);
+    let result = SPAWN_EXECUTION_CONTEXT
+        .scope(parent, async {
+            execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "report done"}))).await
+        })
+        .await
+        .expect("real task admission");
+    assert!(result.success, "{:?}", result.error);
+    let child_run = tool
+        .active_runs_snapshot()
+        .await
+        .first()
+        .expect("registered child run")
+        .id
+        .clone();
+    let actual = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (run, input) = rx.recv().await.expect("probe result");
+            if run == child_run {
+                return input;
+            }
+        }
+    })
+    .await
+    {
+        Ok(input) => input,
+        Err(error) => {
+            let status = tool.active_runs_snapshot().await.first().map(|run| run.status.clone());
+            panic!("child provider did not observe task input: {error}; run status: {status:?}");
+        }
+    };
+    assert_eq!(actual.as_ref(), Some(&provenance));
 }
