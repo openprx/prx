@@ -366,7 +366,8 @@ impl Provider for RouterProvider {
 ///
 /// Intentionally bypasses prompt-guided tool injection by reporting
 /// `supports_native_tools() = true` — the chat tool loop then treats `Provider::chat`
-/// as native, and our impl just returns the canned text with no tool calls.
+/// as native. Native scripts propose an offered, requested tool once, then
+/// return the canned text.
 /// A test-only model stimulus; installed before provider construction in an
 /// isolated fixture process. It changes no provider binding or source grant.
 #[cfg(feature = "test-mock")]
@@ -396,6 +397,8 @@ pub(crate) struct MockEnvProvider {
     tool_call_spec: Option<MockToolCallSpec>,
     /// Streaming call counter; decides whether this call emits a tool_call or the final text.
     call_counter: Arc<AtomicUsize>,
+    /// Native script: 0 ready, 1 proposal returned, 2 final reply returned.
+    native_tool_state: AtomicUsize,
     /// S5 P0-1: full streaming script (a JSON-serialized list of chunks). When set, the stream
     /// emits the scripted chunks one by one, bypassing the response / tool_call_spec paths.
     script: Option<MockScript>,
@@ -686,6 +689,7 @@ impl MockEnvProvider {
                 .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result","constraints":[]}"#.to_string()),
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
+            native_tool_state: AtomicUsize::new(0),
             script,
             flavor,
             delay_ms_per_chunk,
@@ -750,10 +754,9 @@ impl Provider for MockEnvProvider {
         true
     }
 
-    /// A non-streaming request that offers exactly the one tool `OPENPRX_MOCK_TOOL_CALL`
-    /// names is an approval-argument collection (a single proposal schema, no
-    /// executable surface): answer it with that call, like a model would. Any
-    /// other request keeps the plain text outcome.
+    /// Propose the configured call once when it is offered and the current
+    /// request names it. A sole proposal schema also supports argument collection.
+    /// Unoffered tools and later unrelated input retain the plain text outcome.
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
         // The assessment is a distinct request, so it must not consume the
         // reply sentinel or advance the tool/stream script's counter.
@@ -790,7 +793,10 @@ impl Provider for MockEnvProvider {
                                     .script
                                     .as_ref()
                                     .is_some_and(|script| script.chunks.iter().any(|chunk| chunk.tool.is_some()));
-                            if scripted_tool && self.call_counter.load(Ordering::SeqCst) == 1 {
+                            if scripted_tool
+                                && (self.call_counter.load(Ordering::SeqCst) == 1
+                                    || self.native_tool_state.load(Ordering::SeqCst) == 1)
+                            {
                                 r#"{"requirement":"execution_required"}"#.to_string()
                             } else {
                                 r#"{"requirement":"informational"}"#.to_string()
@@ -802,8 +808,19 @@ impl Provider for MockEnvProvider {
                 reasoning_content: None,
             });
         }
-        if let (Some(spec), Some([offered])) = (self.tool_call_spec.as_ref(), request.tools)
-            && offered.name == spec.name
+        if let (Some(spec), Some(offered)) = (self.tool_call_spec.as_ref(), request.tools)
+            && offered.iter().any(|tool| tool.name == spec.name)
+            && (offered.len() == 1
+                || request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .is_some_and(|message| message.content.contains(spec.name.as_str())))
+            && self
+                .native_tool_state
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
         {
             return Ok(ChatResponse {
                 text: None,
@@ -819,6 +836,9 @@ impl Provider for MockEnvProvider {
         // Assessment requests returned above never wait on model stimulus.
         let hold = mock_hold_path_for_messages(&self.hold_while_file, request.messages);
         mock_wait_while_path_exists(hold.as_ref(), MOCK_HOLD_MAX_WAIT).await;
+        let _ = self
+            .native_tool_state
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst);
         Ok(ChatResponse {
             text: Some(self.non_streaming_outcome()?),
             tool_calls: Vec::new(),
@@ -1588,5 +1608,101 @@ mod tests {
         .await
         .expect("cap must complete the wait");
         assert!(path.exists(), "cap proceeds without deleting the hold file");
+    }
+
+    #[tokio::test]
+    async fn native_mock_script_requires_an_offer_and_does_not_repeat() -> anyhow::Result<()> {
+        let mut provider = MockEnvProvider::from_env();
+        provider.response = "PRX_NATIVE_REPLY".to_owned();
+        provider.error = None;
+        provider.execution_assessment = None;
+        provider.tool_call_spec = Some(MockToolCallSpec {
+            name: "prx_fixture_tool".to_owned(),
+            args: "{}".to_owned(),
+        });
+        let offered = ["prx_other_tool", "prx_fixture_tool"].map(|name| crate::tools::ToolSpec {
+            name: name.to_owned(),
+            description: "PRX fixture".to_owned(),
+            parameters: serde_json::json!({"type":"object"}),
+        });
+        let request = [ChatMessage::user("Call prx_fixture_tool")];
+        let unrelated = [ChatMessage::user("hi")];
+        let only_other = std::slice::from_ref(offered.first().expect("other tool"));
+        let absent = provider
+            .chat(
+                ChatRequest {
+                    messages: &request,
+                    tools: Some(only_other),
+                },
+                "mock",
+                0.0,
+            )
+            .await?;
+        assert!(absent.tool_calls.is_empty(), "unoffered calls are never scripted");
+        let plain = provider
+            .chat(
+                ChatRequest {
+                    messages: &unrelated,
+                    tools: Some(&offered),
+                },
+                "mock",
+                0.0,
+            )
+            .await?;
+        assert!(
+            plain.tool_calls.is_empty(),
+            "an unrelated turn cannot consume the tool script"
+        );
+        let proposed = provider
+            .chat(
+                ChatRequest {
+                    messages: &request,
+                    tools: Some(&offered),
+                },
+                "mock",
+                0.0,
+            )
+            .await?;
+        assert_eq!(proposed.tool_calls.len(), 1);
+        assert_eq!(
+            proposed.tool_calls.first().expect("one proposal").name,
+            "prx_fixture_tool"
+        );
+        let assessment = [
+            ChatMessage::system("Classify the execution requirement of current_request"),
+            request.first().expect("request").clone(),
+        ];
+        let assessed = provider
+            .chat(
+                ChatRequest {
+                    messages: &assessment,
+                    tools: None,
+                },
+                "mock",
+                0.0,
+            )
+            .await?;
+        assert_eq!(
+            assessed.text.as_deref(),
+            Some(r#"{"requirement":"execution_required"}"#)
+        );
+        let completed = provider
+            .chat(
+                ChatRequest {
+                    messages: &request,
+                    tools: Some(&offered),
+                },
+                "mock",
+                0.0,
+            )
+            .await?;
+        assert!(completed.tool_calls.is_empty());
+        assert_eq!(completed.text.as_deref(), Some("PRX_NATIVE_REPLY"));
+        assert_eq!(
+            provider.call_counter.load(Ordering::SeqCst),
+            0,
+            "native calls never consume the streaming script"
+        );
+        Ok(())
     }
 }

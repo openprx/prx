@@ -2322,7 +2322,9 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     let session = sg.session();
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
     drain_with_dsr(session, Duration::from_millis(200));
-    session.send("fan this out\r").expect("send prompt");
+    session
+        .send("Call sessions_spawn to fan this out\r")
+        .expect("send prompt");
     read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
 
     session.send("/sessions\r").expect("send /sessions");
