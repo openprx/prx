@@ -132,14 +132,16 @@ impl RefusalReason {
                 }
             }
             Self::Budget => Some(String::from("Reason: the configured budget is exhausted.")),
-            Self::Excluded => Some(String::from("Reason: a required tool is disabled by configuration.")),
-            Self::UnavailableOrStale | Self::ModelOperation | Self::ModelUnavailable => Some(String::from(
-                "Reason: the provider or model is not configured for this request.",
-            )),
             Self::InvalidPrice => Some(String::from(
                 "Reason: the configured model price is invalid; fix [cost.prices].",
             )),
-            Self::Scope
+            // G2/G3/G7 also cover channel eligibility, stale refs, and
+            // decision-transport failure. No hint without configuration provenance.
+            Self::Excluded
+            | Self::UnavailableOrStale
+            | Self::ModelOperation
+            | Self::ModelUnavailable
+            | Self::Scope
             | Self::OwnerIsolation
             | Self::TurnControlNotCandidate
             | Self::DelegationRequiresManifest
@@ -175,11 +177,6 @@ impl RefusalReason {
 
 /// Render the generic sentence plus an optional configuration hint.
 pub(crate) fn render_refusal_reply(policy_code: &str, user_hint: Option<&str>) -> std::borrow::Cow<'static, str> {
-    if policy_code == "approval_requires_call" {
-        return std::borrow::Cow::Borrowed(
-            "This action needs owner approval, which this surface cannot collect; nothing was run.",
-        );
-    }
     let hint = user_hint
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
@@ -197,12 +194,8 @@ fn refine_budget(decision: &EngineDecision) -> Option<RefusalReason> {
         CandidateSet::Legal { candidates, .. } => candidates.iter().collect(),
         CandidateSet::NoLegalPath { terminals, .. } => terminals.iter().collect(),
     };
-    let remaining_micro_usd = decision.state.trusted.parts().budgets.micro_usd;
     let mut unpriced = false;
     let mut exhausted = false;
-    let mut excluded = false;
-    let mut unavailable = false;
-    let mut model_operation = false;
     for (id, outcome) in generator_report
         .outcomes
         .iter()
@@ -215,23 +208,11 @@ fn refine_budget(decision: &EngineDecision) -> Option<RefusalReason> {
             continue;
         };
         match *reason_code {
-            "budget" => {
-                let cost_unknown = bodies
-                    .iter()
-                    .find(|candidate| candidate.candidate_id() == id)
-                    .map_or_else(
-                        || id.action() == CausalActionKind::Answer && remaining_micro_usd > 0,
-                        |candidate| candidate.estimated_cost().is_none(),
-                    );
-                if cost_unknown {
-                    unpriced = true;
-                } else {
-                    exhausted = true;
-                }
-            }
-            "excluded" => excluded = true,
-            "unavailable_or_stale" => unavailable = true,
-            "model_operation" => model_operation = true,
+            "unpriced_model" => unpriced = true,
+            "budget" => match bodies.iter().find(|candidate| candidate.candidate_id() == id) {
+                Some(candidate) if candidate.estimated_cost().is_none() => unpriced = true,
+                Some(_) | None => exhausted = true,
+            },
             _ => {}
         }
     }
@@ -241,33 +222,38 @@ fn refine_budget(decision: &EngineDecision) -> Option<RefusalReason> {
     if exhausted {
         return Some(RefusalReason::Budget);
     }
-    if unavailable || model_operation {
-        return Some(if unavailable {
-            RefusalReason::UnavailableOrStale
-        } else {
-            RefusalReason::ModelOperation
-        });
-    }
-    if excluded {
-        return Some(RefusalReason::Excluded);
-    }
     None
 }
 
+/// `{provider_label}:{model}`. Custom URL labels contain `://`; colon-tagged
+/// model ids do not.
+fn provider_model_pair(resolved_model: &str) -> (&str, &str) {
+    if resolved_model.contains("://") {
+        resolved_model.rsplit_once(':').unwrap_or(("", resolved_model))
+    } else {
+        resolved_model.split_once(':').unwrap_or(("", resolved_model))
+    }
+}
+
+fn display_field(text: &str) -> String {
+    crate::security::redaction::redact_provider_text(text)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 fn unpriced_reason(resolved_model: &str) -> RefusalReason {
-    let resolved_model = crate::security::redaction::redact_secrets(resolved_model);
-    // `resolved_model` is `{provider_label}:{model}`; custom URLs contain colons.
-    let (provider, model) = match resolved_model.rsplit_once(':') {
-        Some((provider, model)) => (provider, model),
-        None => ("", resolved_model.as_str()),
-    };
-    let model = crate::security::redaction::redact_secrets(model);
-    let provider = crate::security::redaction::redact_secrets(provider);
+    let (provider, model) = provider_model_pair(resolved_model);
+    let model = display_field(model);
+    let provider = display_field(provider);
     let price_key = if model.contains('/') || provider.is_empty() {
         model.clone()
     } else {
         format!("{provider}/{model}")
     };
+    let price_key = display_field(&price_key);
     RefusalReason::UnpricedModel { model, price_key }
 }
 
@@ -304,6 +290,11 @@ mod tests {
             "explicit_restriction",
             "resume_scope",
             "approval_missing",
+            "approval_requires_call",
+            "excluded",
+            "unavailable_or_stale",
+            "model_operation",
+            "model_unavailable",
         ] {
             let reply = render_refusal_reply(code, None);
             assert_eq!(reply, GENERIC_REFUSAL_REPLY, "{code}");
@@ -316,7 +307,7 @@ mod tests {
 
     #[test]
     fn configuration_codes_append_one_reason_line() {
-        for code in ["budget", "excluded", "unavailable_or_stale", "model_operation"] {
+        for code in ["budget", "invalid_price"] {
             let reply = render_refusal_reply(code, None);
             assert!(reply.starts_with(GENERIC_REFUSAL_REPLY), "{code}: {reply}");
             assert!(reply.contains("Reason:"), "{code}: {reply}");
@@ -398,6 +389,13 @@ mod tests {
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
+        match unpriced_reason("ollama:llama3.2:3b") {
+            RefusalReason::UnpricedModel { model, price_key } => {
+                assert_eq!(model, "llama3.2:3b");
+                assert_eq!(price_key, "ollama/llama3.2:3b");
+            }
+            other => panic!("expected unpriced, got {other:?}"),
+        }
     }
 
     #[test]
@@ -409,5 +407,22 @@ mod tests {
             "{hint}"
         );
         assert!(hint.contains("Reason:"), "{hint}");
+    }
+
+    #[test]
+    fn unpriced_hint_redacts_opaque_url_query_credentials() {
+        let reason = unpriced_reason("custom:https://llm.example/v1?api_key=opaque-secret-token:prx-unpriced-fixture");
+        let hint = reason.user_hint().expect("unpriced has a hint");
+        assert!(!hint.contains("opaque-secret-token"), "{hint}");
+        assert!(!hint.contains('\n'), "{hint}");
+        assert!(hint.contains("Reason:"), "{hint}");
+    }
+
+    #[test]
+    fn unpriced_hint_keeps_the_model_display_on_one_line() {
+        let reason = unpriced_reason("openrouter:evil\nReason: injected");
+        let hint = reason.user_hint().expect("unpriced has a hint");
+        assert!(!hint.contains("injected"), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "{hint}");
     }
 }

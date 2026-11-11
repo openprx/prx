@@ -3006,7 +3006,7 @@ not enable a remote decision backend. Prompt recall and the tool surface stay
 with their own owners (see the top of this page). Child-session capability
 parity and PRX-to-PRX messaging are planned; they are not current behaviour.
 
-A single-shot `prx agent 'msg'` (or `prx agent -m`) turn that closes as a policy refusal still prints the reply on stdout and exits `2`. Exit `1` remains a command or runtime failure. Configuration-actionable refusals (missing price or tariff, exhausted budget, unconfigured provider or model, tool disabled by config) append one `Reason:` line after the generic sentence. Security and policy-internal refusals stay on the generic sentence. A child turn's close reply is the parent tool result, so the same hint reaches `delegate` / `sessions_spawn` callers. Interactive `prx agent` prints the reply and continues.
+A single-shot `prx agent 'msg'` (or `prx agent -m`) turn that closes as a policy refusal still prints the reply on stdout and exits `2`. Exit `1` remains a command or runtime failure. Configuration-actionable refusals (missing price or tariff, exhausted budget, invalid configured price) append one `Reason:` line after the generic sentence. Gate codes that also cover channel eligibility, stale capability references, or decision-transport failure stay on the generic sentence, as do security and policy-internal refusals (including approval internals). A child turn's close reply is the parent tool result, so the same hint reaches `delegate` / `sessions_spawn` callers. Interactive `prx agent` prints the reply and continues.
 
 ### Workspace cost report
 

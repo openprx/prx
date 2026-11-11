@@ -2802,7 +2802,7 @@ mod tests {
                 HardGates::check_one(state, view, &candidate, gates),
                 GateOutcome::Blocked {
                     gate: 6,
-                    reason_code: "budget"
+                    reason_code: "unpriced_model"
                 }
             );
         });
@@ -2860,7 +2860,7 @@ mod tests {
         assert!(log.contains("candidate rejected by a hard gate"), "{log}");
         assert!(log.contains("use_tool-shell"), "{log}");
         assert!(log.contains("gate=6"), "{log}");
-        assert!(log.contains("budget"), "{log}");
+        assert!(log.contains("unpriced_model"), "{log}");
     }
 
     #[test]

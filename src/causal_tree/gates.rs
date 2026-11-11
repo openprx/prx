@@ -347,14 +347,21 @@ impl HardGates {
             return approval_outcome(approval_required || policy_asks, grant_verified, approval_ids);
         }
 
-        // G6: unknown cost or decision overhead is not free for an executable
-        // path. The overhead is the extra latency the decision itself spends;
-        // a tool's execution latency is a scoring input, not a G6 input.
+        // G6: a missing cost estimate is unpriced configuration. A priced path
+        // that exceeds remaining tokens, dollars, or decision overhead is
+        // budget. A tool's execution latency is a scoring input, not a G6 input.
         if candidate.action() != CausalActionKind::Refuse {
             let budget = remaining;
-            if candidate.estimated_cost().is_none_or(|estimate| {
-                u64::from(estimate.tokens) > budget.tokens || estimate.micro_usd > budget.micro_usd
-            }) || candidate
+            match candidate.estimated_cost() {
+                None => return blocked(6, "unpriced_model"),
+                Some(estimate)
+                    if u64::from(estimate.tokens) > budget.tokens || estimate.micro_usd > budget.micro_usd =>
+                {
+                    return blocked(6, "budget");
+                }
+                Some(_) => {}
+            }
+            if candidate
                 .decision_overhead_ms()
                 .is_none_or(|latency| u64::from(latency) > budget.latency_ms)
             {
@@ -750,7 +757,10 @@ mod tests {
             &inputs,
         )
         .unwrap();
-        assert_eq!(report.outcomes.get(answer.candidate_id()), Some(&blocked(6, "budget")));
+        assert_eq!(
+            report.outcomes.get(answer.candidate_id()),
+            Some(&blocked(6, "unpriced_model"))
+        );
         assert_eq!(report.outcomes.get(refusal.candidate_id()), Some(&GateOutcome::Passed));
         for candidate in &fixed_terminals {
             assert_eq!(
@@ -758,6 +768,41 @@ mod tests {
                 Some(&GateOutcome::Passed)
             );
         }
+    }
+
+    #[test]
+    fn g6_priced_token_overflow_is_budget_not_unpriced() {
+        let key = fixtures::key();
+        let mut state = fixtures::state(&key, "unmatched neutral request");
+        let catalog = CapabilityCatalog::build(&[], &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
+        let mut trusted = fixtures::trusted();
+        trusted.catalog_generation = *catalog.generation();
+        state.trusted = TrustedState::from_runtime(trusted);
+        let policy = SecurityPolicy::default();
+        let calls_seen = BTreeSet::<[u8; 32]>::new();
+        let calls = BTreeMap::new();
+        let inputs = probe_inputs(&policy, &calls_seen, &calls, &calls_seen);
+        let view = catalog.view(&CatalogScope::default());
+        let answer = CausalCandidate::new(
+            CausalActionKind::Answer,
+            CapabilityTarget::None,
+            CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: SideEffectClass::ReadOnly,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(CostEstimate {
+                    tokens: u32::MAX,
+                    micro_usd: 0,
+                }),
+                estimated_latency_ms: Some(0),
+            },
+        )
+        .with_decision_overhead_ms(Some(0));
+        assert_eq!(
+            HardGates::check_one(&state, &view, &answer, &inputs),
+            blocked(6, "budget")
+        );
     }
 
     #[test]
