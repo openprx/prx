@@ -1238,6 +1238,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         spawn_depth: 0,
         session_scope_key: "sessions_spawn:global".to_string(),
         parent_run_id: None,
+        inherited_provenance: None,
         compaction_config: None,
     }
 }
@@ -1531,6 +1532,55 @@ fn worker_refuses_to_run_without_the_parent_capability_env() {
         Some("session-worker parent capability env is missing"),
         "authentication must fail before anything else in the run"
     );
+}
+
+/// Real `prx session-worker` over pipes, then FOUNDATION relaunch: same
+/// [`openprx::messaging::SessionAddr`], new run.
+#[test]
+fn relaunch_real_worker_keeps_session_addr() {
+    use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry};
+    use openprx::messaging::SessionAddr;
+
+    let (_root, config_dir, workspace_dir, home) = worker_dirs();
+    let addr = SessionAddr::new("prx-default", "owner-a", "child-a", Some("main"));
+    let registry = ChildSessionRegistry::new();
+    registry.insert(&ChildSession::new(addr.clone(), None, None));
+
+    let mut first = manifest_for(&config_dir, &workspace_dir);
+    first.run_id = "run-first".to_string();
+    let expiry = far_future_expiry();
+    let capability = worker_capability(&first, expiry);
+    first.parent_capability = Some(capability.clone());
+
+    let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
+    let mut stdin = take_stdin(&mut child);
+    write_line(
+        &mut stdin,
+        &serde_json::to_string(&first).expect("first manifest serializes"),
+    );
+    let run = finish(child, Some(stdin));
+    assert!(run.status.success(), "first real worker reports on stdout");
+    assert_single_json_line(&run.stdout);
+
+    let exec = registry.relaunch(&addr).expect("relaunch");
+    assert_ne!(exec.run.as_deref(), Some("run-first"));
+    let restored = registry.reconstruct(&addr).expect("reconstruct");
+    assert_eq!(restored.addr(), &addr);
+    assert_eq!(restored.recipe().and_then(|recipe| recipe.last_run.clone()), exec.run);
+
+    let mut second = first;
+    second.run_id = exec.run.expect("new run");
+    let capability = worker_capability(&second, expiry);
+    second.parent_capability = Some(capability.clone());
+    let mut child = spawn_worker(&config_dir, &home, Some((&capability, expiry)));
+    let mut stdin = take_stdin(&mut child);
+    write_line(
+        &mut stdin,
+        &serde_json::to_string(&second).expect("second manifest serializes"),
+    );
+    let run = finish(child, Some(stdin));
+    assert!(run.status.success(), "relaunched real worker reports on stdout");
+    assert_single_json_line(&run.stdout);
 }
 
 /// A manifest that is not JSON at all, with a control frame queued behind it:

@@ -152,6 +152,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "mirror.rs",
     "mod.rs",
     "recall.rs",
+    "remote_tree.rs",
     "rows.rs",
     "schema.rs",
 ];
@@ -343,6 +344,7 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         ("memory_impl.rs", include_str!("../../src/memory/sqlite/memory_impl.rs")),
         ("mirror.rs", include_str!("../../src/memory/sqlite/mirror.rs")),
         ("recall.rs", include_str!("../../src/memory/sqlite/recall.rs")),
+        ("remote_tree.rs", include_str!("../../src/memory/sqlite/remote_tree.rs")),
         ("rows.rs", include_str!("../../src/memory/sqlite/rows.rs")),
         ("schema.rs", include_str!("../../src/memory/sqlite/schema.rs")),
     ];

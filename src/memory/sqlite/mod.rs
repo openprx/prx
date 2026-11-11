@@ -13,6 +13,7 @@ mod recall;
 mod recovery_authority;
 mod recovery_backup;
 mod recovery_keys;
+pub(crate) mod remote_tree;
 mod router_history;
 mod router_learning;
 mod rows;

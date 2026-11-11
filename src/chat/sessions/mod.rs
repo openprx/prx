@@ -35,6 +35,7 @@
 
 pub mod approval;
 pub mod assignment;
+pub mod child;
 pub mod command;
 pub mod daemon;
 pub mod event;

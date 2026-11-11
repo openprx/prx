@@ -160,6 +160,7 @@ pub(super) fn build_session_worker_manifest(
         spawn_depth,
         session_scope_key: session_scope_key.to_string(),
         parent_run_id: parent_run_id.map(str::to_string),
+        inherited_provenance: None,
         compaction_config: Some(compaction_config.clone()),
     };
 

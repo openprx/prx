@@ -15,6 +15,7 @@ pub(crate) mod h2_entry;
 pub(crate) mod lesson_delivery;
 pub mod native;
 pub mod registry;
+pub mod remote_tree;
 mod shell_cgroup;
 mod shell_container;
 pub mod shell_process;

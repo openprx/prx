@@ -303,6 +303,138 @@ pub struct A2aConfig {
     /// ignored and the caller must authenticate with a bearer JWT.
     #[serde(default)]
     pub spiffe_strict_validation: bool,
+    /// PEM server certificate for the dedicated A2A listener. Required for a
+    /// non-loopback bind. Relative to the config dir. Read at use.
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    /// PEM server key for the dedicated A2A listener. Required for a
+    /// non-loopback bind. File mode must be 0600 at use.
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
+    /// Optional PEM CA(s) for inbound client-certificate verification.
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
+    /// When true, A2A messaging routes are registered. FOUNDATION keeps this
+    /// false; ACT-1 flips it.
+    #[serde(default)]
+    pub messaging_enabled: bool,
+    /// Remote causal-tree occupancy caps.
+    #[serde(default)]
+    pub remote_tree: RemoteTreeLimits,
+    /// Named peer grants. Empty until operators add `[a2a.peers.*]`.
+    #[serde(default)]
+    pub peers: HashMap<String, A2aPeer>,
+    /// Outbound identities used by `[a2a.peers.*.credential]`.
+    #[serde(default)]
+    pub credentials: HashMap<String, A2aCredential>,
+}
+
+/// Caps for one remote causal tree (`[a2a.remote_tree]`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RemoteTreeLimits {
+    /// Cumulative spawned descendants.
+    #[serde(default = "default_remote_tree_max_spawned")]
+    pub max_spawned: u32,
+    /// Live scheduled occupancy.
+    #[serde(default = "default_remote_tree_max_scheduled")]
+    pub max_scheduled: u32,
+    /// Live connection occupancy.
+    #[serde(default = "default_remote_tree_max_connections")]
+    pub max_connections: u32,
+    /// Cumulative outbound sends.
+    #[serde(default = "default_remote_tree_max_sends")]
+    pub max_sends: u32,
+}
+
+pub(super) const fn default_remote_tree_max_spawned() -> u32 {
+    16
+}
+
+pub(super) const fn default_remote_tree_max_scheduled() -> u32 {
+    4
+}
+
+pub(super) const fn default_remote_tree_max_connections() -> u32 {
+    4
+}
+
+pub(super) const fn default_remote_tree_max_sends() -> u32 {
+    4
+}
+
+impl Default for RemoteTreeLimits {
+    fn default() -> Self {
+        Self {
+            max_spawned: default_remote_tree_max_spawned(),
+            max_scheduled: default_remote_tree_max_scheduled(),
+            max_connections: default_remote_tree_max_connections(),
+            max_sends: default_remote_tree_max_sends(),
+        }
+    }
+}
+
+/// Inbound key-possession method a peer must use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aPeerAuth {
+    Jwt,
+    Mtls,
+}
+
+/// One `[a2a.peers.<name>]` grant row.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct A2aPeer {
+    /// JWT `sub` or SPIFFE SAN.
+    pub subject: String,
+    /// JWT `iss` or SPIFFE trust-domain prefix.
+    pub issuer: String,
+    /// Stamped onto `from.instance`.
+    pub peer_instance: String,
+    /// Stamped onto `from.owner` at use. `None` means the subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_owner: Option<String>,
+    /// Outbound POST URL.
+    pub endpoint: String,
+    /// Outbound identity name in `[a2a.credentials.*]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    /// Outbound TLS server name. Optional when the SAN equals `subject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
+    /// Local owner this peer may message (`to.owner`).
+    pub local_owner: String,
+    /// Allowed session ids, or `["*"]`.
+    #[serde(default = "default_star_list")]
+    pub sessions: Vec<String>,
+    /// Allowed agent names, or `["*"]`.
+    #[serde(default = "default_star_list")]
+    pub agents: Vec<String>,
+    /// Inbound key-possession method.
+    pub auth: A2aPeerAuth,
+    /// Ed25519 public key PEM. Required when `auth = "jwt"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_public_key_path: Option<String>,
+    /// Outbound CA for this peer's server cert. Unset uses system roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_path: Option<String>,
+}
+
+fn default_star_list() -> Vec<String> {
+    vec!["*".into()]
+}
+
+/// One `[a2a.credentials.<name>]` outbound identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct A2aCredential {
+    /// Ed25519 signing key we use to self-issue peer JWTs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_key_path: Option<String>,
+    /// Optional client certificate for mTLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert_path: Option<String>,
+    /// Optional client key for mTLS. Mode 0600 at use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key_path: Option<String>,
 }
 
 pub(super) fn default_a2a_bind() -> String {
@@ -340,8 +472,92 @@ impl Default for A2aConfig {
             trusted_trust_domains: Vec::new(),
             spiffe_trust_bundle_pem: None,
             spiffe_strict_validation: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            client_ca_path: None,
+            messaging_enabled: false,
+            remote_tree: RemoteTreeLimits::default(),
+            peers: HashMap::new(),
+            credentials: HashMap::new(),
         }
     }
+}
+
+impl A2aConfig {
+    /// Parse-time checks. TLS files are read at use, not here.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.bind.trim().is_empty(), "a2a.bind must not be empty");
+        if !a2a_bind_is_loopback(&self.bind) {
+            let cert = self
+                .tls_cert_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            let key = self
+                .tls_key_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            anyhow::ensure!(
+                cert.is_some() && key.is_some(),
+                "a2a.bind '{}' is not loopback; a2a.tls_cert_path and a2a.tls_key_path are required",
+                self.bind
+            );
+        }
+        for (name, peer) in &self.peers {
+            anyhow::ensure!(
+                !peer.subject.trim().is_empty(),
+                "a2a.peers.{name}.subject must not be empty"
+            );
+            anyhow::ensure!(
+                !peer.issuer.trim().is_empty(),
+                "a2a.peers.{name}.issuer must not be empty"
+            );
+            anyhow::ensure!(
+                !peer.peer_instance.trim().is_empty(),
+                "a2a.peers.{name}.peer_instance must not be empty"
+            );
+            anyhow::ensure!(
+                !peer.endpoint.trim().is_empty(),
+                "a2a.peers.{name}.endpoint must not be empty"
+            );
+            anyhow::ensure!(
+                !peer.local_owner.trim().is_empty(),
+                "a2a.peers.{name}.local_owner must not be empty"
+            );
+            if peer.auth == A2aPeerAuth::Jwt {
+                anyhow::ensure!(
+                    peer.jwt_public_key_path
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|path| !path.is_empty()),
+                    "a2a.peers.{name}.jwt_public_key_path is required when auth = jwt"
+                );
+            }
+            if let Some(credential) = peer
+                .credential
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                anyhow::ensure!(
+                    self.credentials.contains_key(credential),
+                    "a2a.peers.{name}.credential '{credential}' is not in [a2a.credentials.*]"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn a2a_bind_is_loopback(bind: &str) -> bool {
+    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    let host = bind
+        .rsplit_once(':')
+        .map_or(bind, |(host, _)| host.trim_matches(['[', ']']));
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -424,5 +640,106 @@ impl Default for McpServerConfig {
             deny_tools: Vec::new(),
             working_dir: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod a2a_foundation_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn parse_a2a(toml: &str) -> anyhow::Result<A2aConfig> {
+        let config: Config = toml::from_str(toml)?;
+        config.a2a.validate()?;
+        Ok(config.a2a)
+    }
+
+    #[test]
+    fn a2a_defaults_keep_messaging_disabled() {
+        let config = Config::default();
+        config.a2a.validate().expect("test: default a2a");
+        assert!(!config.a2a.messaging_enabled);
+        assert_eq!(config.a2a.remote_tree.max_spawned, 16);
+        assert_eq!(config.a2a.remote_tree.max_scheduled, 4);
+        assert_eq!(config.a2a.remote_tree.max_connections, 4);
+        assert_eq!(config.a2a.remote_tree.max_sends, 4);
+        assert!(config.a2a.peers.is_empty());
+    }
+
+    #[test]
+    fn a2a_non_loopback_bind_without_tls_is_refused() {
+        let error = parse_a2a("[a2a]\nbind = \"0.0.0.0:16832\"\n").expect_err("test: refuse");
+        assert!(error.to_string().contains("tls_cert_path"), "{error}");
+    }
+
+    #[test]
+    fn a2a_jwt_peer_requires_public_key_path() {
+        let error = parse_a2a(
+            r#"
+[a2a.peers.rf]
+subject = "spiffe://prx/rf"
+issuer = "spiffe://prx"
+peer_instance = "rf"
+endpoint = "https://192.0.2.10:16832"
+local_owner = "owner-a"
+auth = "jwt"
+"#,
+        )
+        .expect_err("test: jwt key");
+        assert!(error.to_string().contains("jwt_public_key_path"), "{error}");
+    }
+
+    #[test]
+    fn a2a_peer_credential_must_exist() {
+        let error = parse_a2a(
+            r#"
+[a2a.peers.rf]
+subject = "spiffe://prx/rf"
+issuer = "spiffe://prx"
+peer_instance = "rf"
+endpoint = "https://192.0.2.10:16832"
+local_owner = "owner-a"
+auth = "mtls"
+credential = "missing"
+"#,
+        )
+        .expect_err("test: missing cred");
+        assert!(error.to_string().contains("credentials"), "{error}");
+    }
+
+    #[test]
+    fn a2a_peer_and_limits_round_trip() {
+        let a2a = parse_a2a(
+            r#"
+[a2a]
+messaging_enabled = false
+tls_cert_path = "a2a/server.crt"
+tls_key_path = "a2a/server.key"
+
+[a2a.remote_tree]
+max_spawned = 8
+
+[a2a.credentials.self]
+jwt_signing_key_path = "a2a/self.ed25519.pem"
+
+[a2a.peers.rf]
+subject = "spiffe://prx/rf"
+issuer = "spiffe://prx"
+peer_instance = "rf"
+endpoint = "https://192.0.2.10:16832"
+local_owner = "owner-a"
+auth = "jwt"
+jwt_public_key_path = "a2a/peers/rf.pub.pem"
+credential = "self"
+"#,
+        )
+        .expect("test: parse");
+        assert_eq!(a2a.remote_tree.max_spawned, 8);
+        assert_eq!(a2a.remote_tree.max_sends, 4);
+        let peer = a2a.peers.get("rf").expect("test: peer");
+        assert_eq!(peer.auth, A2aPeerAuth::Jwt);
+        assert_eq!(peer.credential.as_deref(), Some("self"));
+        assert_eq!(peer.sessions, vec!["*".to_string()]);
+        assert!(peer.remote_owner.is_none());
     }
 }

@@ -63,9 +63,17 @@ pub(super) fn spawn_stdin_control_reader(steer_tx: tokio::sync::mpsc::Sender<Str
                 tracing::warn!("session-worker discarded an unparseable stdin control frame");
                 continue;
             };
-            let WorkerControlFrame::Steer { message } = frame;
-            if steer_tx.blocking_send(message).is_err() {
-                break;
+            match frame {
+                WorkerControlFrame::Steer { message } => {
+                    if steer_tx.blocking_send(message).is_err() {
+                        break;
+                    }
+                }
+                WorkerControlFrame::Message { .. }
+                | WorkerControlFrame::BrokerResult { .. }
+                | WorkerControlFrame::BrokerCancelAck { .. } => {
+                    // FOUNDATION: types only. MSG-CORE wires the reader.
+                }
             }
         }
     });

@@ -1123,6 +1123,7 @@ impl SqliteMemory {
         super::erasure_pool::init_schema(conn)?;
         super::agent_registry::init_schema(conn)?;
         super::agent_registry::add_schema_scope_columns(conn)?;
+        super::remote_tree::init_schema(conn)?;
         let unattributed = super::agent_migration::migrate_legacy_console(conn)?;
         if unattributed > 0 {
             tracing::warn!(unattributed, "legacy console rows left without an agent scope");
@@ -1481,6 +1482,11 @@ impl SqliteMemory {
                 20,
                 "idx_agent_scopes_lookup",
                 "idx_agent_scopes_lookup ON agent_scopes(workspace_id, owner_id, agent_key, incarnation)",
+            ),
+            (
+                21,
+                "prx_remote_tree",
+                "prx_remote_trees(workspace_id,owner_id,trigger_message_id,ma_scope_id,spawned,sends,state,created_at,closed_at) STRICT PK(workspace_id,owner_id,trigger_message_id) + prx_remote_tree_resources(kind in scheduled/connection/descendant, live/gone occupancy) STRICT",
             ),
         ]
     }

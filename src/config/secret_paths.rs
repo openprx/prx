@@ -614,6 +614,10 @@ pub static ENDPOINT_PATHS: &[EndpointPath] = &[
     ),
     userinfo("mcp_server.jwt_jwks_uri", &[Key("mcp_server"), Key("jwt_jwks_uri")]),
     userinfo("a2a.card_jwks_uri", &[Key("a2a"), Key("card_jwks_uri")]),
+    recipient_url(
+        "a2a.peers.<*>.endpoint",
+        &[Key("a2a"), Key("peers"), AnyKey, Key("endpoint")],
+    ),
     // The decision endpoint (CDP-03, CDP-04): validation refuses userinfo
     // there, and this keeps every read surface safe for a hand-edited file.
     // The decision backend's credential is sent to it, so re-pointing it is
@@ -3201,10 +3205,16 @@ bot_token = "***"
     /// Schema slots whose name looks like a credential but that hold none.
     /// Each carries the reason; the guard below fails when one disappears
     /// from the schema, so the list cannot go stale.
-    const NOT_SECRET: &[(&str, &str)] = &[(
-        "nodes.server.tls_key",
-        "a filesystem path to the PEM file (like nodes.server.tls_cert), not the key material",
-    )];
+    const NOT_SECRET: &[(&str, &str)] = &[
+        (
+            "nodes.server.tls_key",
+            "a filesystem path to the PEM file (like nodes.server.tls_cert), not the key material",
+        ),
+        (
+            "a2a.peers.<*>.credential",
+            "outbound identity name referring to [a2a.credentials.*], not a secret",
+        ),
+    ];
 
     /// Registry completeness (R-PMMA F5, D-018 Q6): every string slot of the
     /// `Config` schema whose name looks like a credential is registered or

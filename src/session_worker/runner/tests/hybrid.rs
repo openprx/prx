@@ -97,6 +97,7 @@ async fn hybrid_worker_shared_context_reads_parent_fabric() {
         spawn_depth: 1,
         session_scope_key: "telegram:chat-1:alice".to_string(),
         parent_run_id: Some("run-parent".to_string()),
+        inherited_provenance: None,
         compaction_config: None,
     };
     let context = load_worker_shared_context(&manifest, &Config::default(), &shared_memory).await;
@@ -216,6 +217,7 @@ async fn process_mode_worker_prompt_carries_no_other_owners_spawn_text() {
         spawn_depth: 1,
         session_scope_key: "telegram:chat-1:alice".to_string(),
         parent_run_id: Some("run-parent".to_string()),
+        inherited_provenance: None,
         compaction_config: None,
     };
     let context = load_worker_shared_context(&manifest, &Config::default(), &shared_memory).await;
@@ -309,6 +311,7 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         spawn_depth: 1,
         session_scope_key: "telegram:chat-1:alice".to_string(),
         parent_run_id: Some("run-parent".to_string()),
+        inherited_provenance: None,
         compaction_config: None,
     };
 
@@ -458,6 +461,7 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         spawn_depth: 1,
         session_scope_key: "telegram:chat-1:alice".to_string(),
         parent_run_id: None,
+        inherited_provenance: None,
         compaction_config: None,
     };
     let readonly = SecurityPolicy {

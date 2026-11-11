@@ -14,11 +14,23 @@
         "card_jwks_uri": null,
         "card_signing_key_path": null,
         "card_ttl_seconds": 3600,
+        "client_ca_path": null,
+        "credentials": {},
         "discovery_advertised": false,
         "handoff_nonce_ttl_seconds": 3600,
+        "messaging_enabled": false,
+        "peers": {},
+        "remote_tree": {
+          "max_connections": 4,
+          "max_scheduled": 4,
+          "max_sends": 4,
+          "max_spawned": 16
+        },
         "spiffe_id": "spiffe://prx-local/agent/prx-default",
         "spiffe_strict_validation": false,
         "spiffe_trust_bundle_pem": null,
+        "tls_cert_path": null,
+        "tls_key_path": null,
         "trusted_trust_domains": []
       }
     },
@@ -833,6 +845,22 @@
           "default": 3600,
           "minimum": 0
         },
+        "client_ca_path": {
+          "description": "Optional PEM CA(s) for inbound client-certificate verification.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "credentials": {
+          "description": "Outbound identities used by `[a2a.peers.*.credential]`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/A2aCredential"
+          },
+          "default": {}
+        },
         "discovery_advertised": {
           "description": "Whether to advertise into an external A2A registry.",
           "type": "boolean",
@@ -844,6 +872,29 @@
           "format": "uint64",
           "default": 3600,
           "minimum": 0
+        },
+        "messaging_enabled": {
+          "description": "When true, A2A messaging routes are registered. FOUNDATION keeps this\nfalse; ACT-1 flips it.",
+          "type": "boolean",
+          "default": false
+        },
+        "peers": {
+          "description": "Named peer grants. Empty until operators add `[a2a.peers.*]`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/A2aPeer"
+          },
+          "default": {}
+        },
+        "remote_tree": {
+          "description": "Remote causal-tree occupancy caps.",
+          "$ref": "#/$defs/RemoteTreeLimits",
+          "default": {
+            "max_connections": 4,
+            "max_scheduled": 4,
+            "max_sends": 4,
+            "max_spawned": 16
+          }
         },
         "spiffe_id": {
           "description": "Local SPIFFE-style identifier placeholder.",
@@ -863,6 +914,22 @@
           ],
           "default": null
         },
+        "tls_cert_path": {
+          "description": "PEM server certificate for the dedicated A2A listener. Required for a\nnon-loopback bind. Relative to the config dir. Read at use.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "tls_key_path": {
+          "description": "PEM server key for the dedicated A2A listener. Required for a\nnon-loopback bind. File mode must be 0600 at use.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "trusted_trust_domains": {
           "description": "Trust domains accepted when verifying a peer SPIFFE SVID. Empty means the\n`allowed_peer_issuers` allow-list is the sole gate (backward compatible).",
           "type": "array",
@@ -872,6 +939,134 @@
           }
         }
       }
+    },
+    "A2aCredential": {
+      "description": "One `[a2a.credentials.<name>]` outbound identity.",
+      "type": "object",
+      "properties": {
+        "client_cert_path": {
+          "description": "Optional client certificate for mTLS.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_key_path": {
+          "description": "Optional client key for mTLS. Mode 0600 at use.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jwt_signing_key_path": {
+          "description": "Ed25519 signing key we use to self-issue peer JWTs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "A2aPeer": {
+      "description": "One `[a2a.peers.<name>]` grant row.",
+      "type": "object",
+      "properties": {
+        "agents": {
+          "description": "Allowed agent names, or `[\"*\"]`.",
+          "type": "array",
+          "default": [
+            "*"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "auth": {
+          "description": "Inbound key-possession method.",
+          "$ref": "#/$defs/A2aPeerAuth"
+        },
+        "credential": {
+          "description": "Outbound identity name in `[a2a.credentials.*]`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "description": "Outbound POST URL.",
+          "type": "string"
+        },
+        "issuer": {
+          "description": "JWT `iss` or SPIFFE trust-domain prefix.",
+          "type": "string"
+        },
+        "jwt_public_key_path": {
+          "description": "Ed25519 public key PEM. Required when `auth = \"jwt\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_owner": {
+          "description": "Local owner this peer may message (`to.owner`).",
+          "type": "string"
+        },
+        "peer_instance": {
+          "description": "Stamped onto `from.instance`.",
+          "type": "string"
+        },
+        "remote_owner": {
+          "description": "Stamped onto `from.owner` at use. `None` means the subject.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessions": {
+          "description": "Allowed session ids, or `[\"*\"]`.",
+          "type": "array",
+          "default": [
+            "*"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "subject": {
+          "description": "JWT `sub` or SPIFFE SAN.",
+          "type": "string"
+        },
+        "tls_ca_path": {
+          "description": "Outbound CA for this peer's server cert. Unset uses system roots.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tls_server_name": {
+          "description": "Outbound TLS server name. Optional when the SAN equals `subject`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "subject",
+        "issuer",
+        "peer_instance",
+        "endpoint",
+        "local_owner",
+        "auth"
+      ]
+    },
+    "A2aPeerAuth": {
+      "description": "Inbound key-possession method a peer must use.",
+      "type": "string",
+      "enum": [
+        "jwt",
+        "mtls"
+      ]
     },
     "AgentCompactionConfig": {
       "description": "Agent context compaction configuration (`[agent.compaction]`).",
@@ -4851,6 +5046,40 @@
         "endpoint",
         "bearer_token"
       ]
+    },
+    "RemoteTreeLimits": {
+      "description": "Caps for one remote causal tree (`[a2a.remote_tree]`).",
+      "type": "object",
+      "properties": {
+        "max_connections": {
+          "description": "Live connection occupancy.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 4,
+          "minimum": 0
+        },
+        "max_scheduled": {
+          "description": "Live scheduled occupancy.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 4,
+          "minimum": 0
+        },
+        "max_sends": {
+          "description": "Cumulative outbound sends.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 4,
+          "minimum": 0
+        },
+        "max_spawned": {
+          "description": "Cumulative spawned descendants.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 16,
+          "minimum": 0
+        }
+      }
     },
     "RetrievalInjectionRole": {
       "description": "Where recalled context pages are injected back into the request.",

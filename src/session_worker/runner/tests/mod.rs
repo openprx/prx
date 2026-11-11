@@ -64,6 +64,7 @@ pub(super) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifes
         spawn_depth: 0,
         session_scope_key: "sessions_spawn:global".to_string(),
         parent_run_id: None,
+        inherited_provenance: None,
         compaction_config: None,
     }
 }

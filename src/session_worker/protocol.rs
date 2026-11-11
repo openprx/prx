@@ -238,8 +238,19 @@ pub struct WorkerManifest {
     pub session_scope_key: String,
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// Sealed remote provenance for a chained turn. Absent on local operator work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_provenance: Option<crate::messaging::InheritedProvenance>,
     #[serde(default)]
     pub compaction_config: Option<crate::config::AgentCompactionConfig>,
+}
+
+impl WorkerManifest {
+    /// Seal remote provenance into this manifest. FOUNDATION API; spawn sites
+    /// still pass `None` until MSG-CORE / CHILD-CAP wire a chained turn.
+    pub fn seal_inherited_provenance(&mut self, provenance: crate::messaging::InheritedProvenance) {
+        self.inherited_provenance = Some(provenance);
+    }
 }
 
 /// Compute a stable generation for the complete on-disk configuration source.
@@ -290,11 +301,76 @@ fn config_source_generation_once(config_dir: &Path) -> anyhow::Result<String> {
 /// frames inherit their trust from the pipe itself, which only the spawning
 /// parent holds a write end of. They therefore carry no capability material and
 /// can never widen what the sealed manifest already granted.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerControlFrame {
     /// Inject an operator message into the worker's running conversation.
     Steer { message: String },
+    /// Parent-to-worker Data envelope (MSG-5). Types only in FOUNDATION.
+    Message { envelope: crate::messaging::PrxMessage },
+    /// Answer to a worker broker call (CAP-6a). Types only in FOUNDATION.
+    BrokerResult { call_id: u64, outcome: BrokerOutcome },
+    /// Acknowledgement of `BrokerCancel`.
+    BrokerCancelAck { call_id: u64 },
+}
+
+/// Worker-to-parent stdout frame. Line-delimited; the terminal `WorkerResult`
+/// still follows. Reader wiring is MSG-CORE.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::large_enum_variant, clippy::derive_partial_eq_without_eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerOutputFrame {
+    /// Worker-originated Data.
+    Message { envelope: crate::messaging::PrxMessage },
+    /// Delivery ack for a parent-injected message.
+    Ack {
+        message_id: uuid::Uuid,
+        state: crate::messaging::DeliveryState,
+    },
+    /// Capability broker call.
+    BrokerCall {
+        call_id: u64,
+        capability_kind: CapabilityKind,
+        name: String,
+        args: serde_json::Value,
+        deadline_ms: u64,
+        mac: String,
+    },
+    /// Cancel a pending broker call.
+    BrokerCancel { call_id: u64 },
+}
+
+/// Issued capability kind on a broker call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CapabilityKind {
+    McpAlias,
+    Wasm,
+    Skill,
+    Browser,
+    OtherLive { name: String },
+}
+
+/// Result of a broker call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrokerOutcome {
+    Ok { output: serde_json::Value },
+    Err { error: BrokerError },
+}
+
+/// Broker failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrokerError {
+    NotIssued,
+    Denied,
+    BackendGone,
+    Timeout,
+    Cancelled,
+    Failed { message: String },
 }
 
 /// Durable segment lookup references; consumers must verify the stored events.
@@ -444,6 +520,7 @@ mod tests {
             spawn_depth: 1,
             session_scope_key: "telegram:chat-1:openprx_user".into(),
             parent_run_id: Some("run-0".into()),
+            inherited_provenance: None,
             compaction_config: Some(crate::config::AgentCompactionConfig::default()),
         };
 
@@ -499,6 +576,153 @@ mod tests {
     fn worker_control_frame_rejects_unknown_kind() {
         let error = serde_json::from_str::<WorkerControlFrame>(r#"{"kind":"exec","command":"rm"}"#).unwrap_err();
         assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    fn sample_envelope() -> crate::messaging::PrxMessage {
+        crate::messaging::PrxMessage {
+            id: uuid::Uuid::nil(),
+            idempotency: crate::messaging::IdempotencyKey::parse("0123456789abcdef").expect("test: key"),
+            stream_id: Some(uuid::Uuid::nil()),
+            seq: 1,
+            ts: 0,
+            from: crate::messaging::SessionAddr::new("i", "o", "from", None),
+            to: crate::messaging::SessionAddr::new("i", "o", "to", None),
+            to_pin: crate::messaging::RecipientPin {
+                incarnation: uuid::Uuid::nil(),
+                generation: 1,
+                token: "t".into(),
+            },
+            in_reply_to: None,
+            hop_count: 0,
+            ancestry: Vec::new(),
+            kind: crate::messaging::MessageKind::Data,
+            body: crate::messaging::MessageBody::default(),
+            origin: None,
+            auth: None,
+            exec: None,
+            canonical_hash: None,
+        }
+    }
+
+    #[test]
+    fn worker_c3_frames_round_trip() {
+        let control = WorkerControlFrame::Message {
+            envelope: sample_envelope(),
+        };
+        let json = serde_json::to_string(&control).expect("test: control json");
+        assert!(json.contains("\"kind\":\"message\""));
+        let parsed: WorkerControlFrame = serde_json::from_str(&json).expect("test: control parse");
+        assert_eq!(parsed, control);
+
+        let result = WorkerControlFrame::BrokerResult {
+            call_id: 1,
+            outcome: BrokerOutcome::Ok {
+                output: serde_json::json!({"ok": true}),
+            },
+        };
+        let parsed: WorkerControlFrame =
+            serde_json::from_str(&serde_json::to_string(&result).expect("test: result")).expect("test: result parse");
+        assert_eq!(parsed, result);
+
+        let ack = WorkerControlFrame::BrokerCancelAck { call_id: 2 };
+        let parsed: WorkerControlFrame =
+            serde_json::from_str(&serde_json::to_string(&ack).expect("test: ack")).expect("test: ack parse");
+        assert_eq!(parsed, ack);
+
+        let output = WorkerOutputFrame::BrokerCall {
+            call_id: 3,
+            capability_kind: CapabilityKind::McpAlias,
+            name: "search".into(),
+            args: serde_json::json!({}),
+            deadline_ms: 1000,
+            mac: "ab".into(),
+        };
+        let json = serde_json::to_string(&output).expect("test: output json");
+        assert!(json.contains("\"kind\":\"broker_call\""));
+        assert!(json.contains("\"type\":\"mcp_alias\""));
+        let parsed: WorkerOutputFrame = serde_json::from_str(&json).expect("test: output parse");
+        assert_eq!(parsed, output);
+
+        let nack = WorkerOutputFrame::Ack {
+            message_id: uuid::Uuid::nil(),
+            state: crate::messaging::DeliveryState::Accepted,
+        };
+        let parsed: WorkerOutputFrame =
+            serde_json::from_str(&serde_json::to_string(&nack).expect("test: ack out")).expect("test: ack out parse");
+        assert_eq!(parsed, nack);
+    }
+
+    #[test]
+    fn inherited_provenance_is_sealed_into_worker_manifest() {
+        let mut manifest = WorkerManifest {
+            parent_capability: None,
+            capability_manifest: None,
+            child_source: None,
+            ordinary_source: None,
+            operator_source: None,
+            run_id: "run-1".into(),
+            task: "t".into(),
+            provider_name: "mock".into(),
+            model: "mock".into(),
+            api_key: None,
+            route_hint: None,
+            route_source_provider: None,
+            route_credential: None,
+            route_uses_root_connection: false,
+            direct_uses_root_connection: false,
+            temperature: 0.7,
+            temperature_override: None,
+            config_dir: PathBuf::from("/tmp"),
+            config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
+            workspace_dir: PathBuf::from("/tmp"),
+            memory_db_path: PathBuf::from("/tmp/brain.db"),
+            memory_workspace_id: None,
+            memory_strategy: None,
+            memory_backend: "sqlite".into(),
+            shared_memory_db_path: None,
+            worker_memory_db_path: None,
+            agent_id: None,
+            persona_id: None,
+            memory_event_recording: crate::memory::MemoryEventRecording::default(),
+            allowed_tools: Vec::new(),
+            channel_excluded_tools: Vec::new(),
+            system_prompt: None,
+            identity_dir: None,
+            scope_sender: None,
+            scope_channel: None,
+            scope_chat_type: None,
+            scope_chat_id: None,
+            owner_id: None,
+            owner_isolated: false,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            spawn_depth: 0,
+            session_scope_key: "s".into(),
+            parent_run_id: None,
+            inherited_provenance: None,
+            compaction_config: None,
+        };
+        let trigger = uuid::Uuid::from_u128(42);
+        let provenance = crate::messaging::InheritedProvenance {
+            remote: crate::messaging::RemotePeerAttr {
+                issuer: "spiffe://prx".into(),
+                subject: "spiffe://prx/peer".into(),
+                message_id: trigger,
+            },
+            chain: crate::messaging::CausalChain {
+                trigger,
+                root: trigger,
+                depth: 1,
+                ancestry: Vec::new(),
+            },
+        };
+        manifest.seal_inherited_provenance(provenance.clone());
+        assert_eq!(manifest.inherited_provenance.as_ref(), Some(&provenance));
+        let json = serde_json::to_value(&manifest).expect("test: json");
+        assert!(json.get("inherited_provenance").is_some());
     }
 
     #[test]

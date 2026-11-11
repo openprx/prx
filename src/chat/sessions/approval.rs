@@ -155,6 +155,12 @@ impl PendingApprovals {
             .get(run_id)
             .is_some_and(|waiter| waiter.sender.is_some())
     }
+
+    /// Test-only waiter insert so independent ChildSession maps can be asserted.
+    #[cfg(test)]
+    pub(crate) fn test_register(&self, run_id: &str) {
+        let _ = self.register(run_id);
+    }
 }
 
 /// Build a [`SpawnApprovalResolverFactory`] for the chat `/bg` path.

@@ -887,6 +887,7 @@ impl Config {
         // validated at all; wire it into the top-level validator.
         self.memory.validate()?;
         self.sessions_spawn.validate()?;
+        self.a2a.validate()?;
 
         // Smart group-reply pre-gate numeric ranges.
         self.smart_group.validate()?;

@@ -136,6 +136,7 @@ pub mod llm;
 pub(crate) mod markdown;
 pub mod media;
 pub mod memory;
+pub mod messaging;
 pub mod migration;
 pub(crate) mod multimodal;
 pub mod nodes;
