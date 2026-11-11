@@ -12,6 +12,8 @@
 //! exercising `dispatch` requires a memory backend and tool registry.
 #![allow(clippy::print_stdout)]
 
+pub mod msg;
+
 use super::session;
 use crate::memory::Memory;
 use crate::tools::Tool;

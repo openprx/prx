@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,7 +15,9 @@ use crate::tools::sessions_spawn::HistoryEntry;
 
 /// Inbound mailbox consume cursor. MSG-CORE fills reconstruction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MailboxCursor {}
+pub struct MailboxCursor {
+    pub streams: std::collections::BTreeMap<i64, u64>,
+}
 
 /// Provider binding without credentials (no key wiring).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,10 @@ pub struct ChildSession {
     approvals: PendingApprovals,
     turn: Mutex<()>,
     recipe: Option<RelaunchRecipe>,
+    mailbox_projection: std::collections::BTreeMap<usize, Uuid>,
+    tool_calls: std::collections::BTreeMap<usize, Vec<crate::chat::session::ToolCallSummary>>,
+    mailbox_scope: Option<crate::messaging::mailbox::MailboxScope>,
+    _history_lease: Option<Box<dyn Send + Sync>>,
 }
 
 impl ChildSession {
@@ -57,6 +63,10 @@ impl ChildSession {
             history: Vec::new(),
             provider,
             mailbox_cursor: MailboxCursor::default(),
+            mailbox_projection: Default::default(),
+            tool_calls: Default::default(),
+            mailbox_scope: None,
+            _history_lease: None,
             approvals: PendingApprovals::new(),
             turn: Mutex::new(()),
             recipe: recipe.or(Some(RelaunchRecipe {
@@ -71,6 +81,12 @@ impl ChildSession {
     #[must_use]
     pub const fn addr(&self) -> &SessionAddr {
         &self.addr
+    }
+
+    /// Registry-validated scope, available only after durable reconstruction.
+    #[must_use]
+    pub const fn mailbox_scope(&self) -> Option<&crate::messaging::mailbox::MailboxScope> {
+        self.mailbox_scope.as_ref()
     }
 
     /// This session's approval router.
@@ -113,6 +129,7 @@ impl ChildSession {
             addr: self.addr.clone(),
             provider: self.provider.clone(),
             recipe: self.recipe.clone(),
+            mailbox_projection: self.mailbox_projection.clone(),
         }
     }
 }
@@ -124,6 +141,9 @@ pub struct ChildSessionMetadata {
     pub addr: SessionAddr,
     pub provider: Option<ProviderBinding>,
     pub recipe: Option<RelaunchRecipe>,
+    /// Event identities of mailbox-projected turns; never a progress cursor.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mailbox_projection: std::collections::BTreeMap<usize, Uuid>,
 }
 
 /// Refuse a caller manifest whose identity differs from the logical child.
@@ -143,16 +163,80 @@ impl std::fmt::Display for RelaunchIdentityError {
 }
 impl std::error::Error for RelaunchIdentityError {}
 
+#[derive(Serialize)]
+struct ScopedChatRecord {
+    #[serde(flatten)]
+    record: crate::chat::session::ChatSession,
+    #[serde(skip)]
+    scope: crate::messaging::mailbox::MailboxScope,
+    #[serde(skip)]
+    cursors: std::collections::BTreeMap<i64, u64>,
+    #[serde(skip)]
+    mailbox_turns: Vec<crate::memory::child_sessions::ChildMailboxTurn>,
+    #[serde(skip)]
+    lease: Box<dyn Send + Sync>,
+}
+impl std::ops::Deref for ScopedChatRecord {
+    type Target = crate::chat::session::ChatSession;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+impl std::ops::DerefMut for ScopedChatRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.record
+    }
+}
+impl ScopedChatRecord {
+    fn parse(loaded: crate::memory::child_sessions::ScopedChildRecord) -> Result<Self> {
+        // Keep the opaque record's guard intact on parse failure. Its payload
+        // fields drop before its last (lease) field, including error unwinding.
+        let record = crate::chat::session::ChatSession::from_json(&loaded.record)?;
+        Ok(Self {
+            record,
+            scope: loaded.scope,
+            cursors: loaded.cursors,
+            mailbox_turns: loaded.mailbox_turns,
+            lease: loaded.lease,
+        })
+    }
+}
+
 /// Durable child registry, isolated from the operator saved-chat namespace.
 #[derive(Clone)]
 pub struct ChildSessionRegistry {
     memory: Arc<dyn crate::memory::Memory>,
+    workspace_id: Option<String>,
 }
 
 impl ChildSessionRegistry {
     /// Use the same durable backend as the parent session registry.
     pub fn new(memory: Arc<dyn crate::memory::Memory>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            workspace_id: None,
+        }
+    }
+
+    /// Scope is explicit runtime context, never guessed from instance or JSON.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace_id: String) -> Self {
+        self.workspace_id = Some(workspace_id);
+        self
+    }
+    fn context(&self, addr: &SessionAddr) -> Result<crate::memory::child_sessions::ChildSessionContext> {
+        Ok(crate::memory::child_sessions::ChildSessionContext {
+            workspace_id: self
+                .workspace_id
+                .clone()
+                .ok_or(crate::memory::child_sessions::ChildSessionError::UnboundScope)?,
+            addr: addr.clone(),
+        })
+    }
+
+    /// Existing canonical registry key; computing it grants no read authority.
+    pub fn canonical_session_key(addr: &SessionAddr) -> Result<String> {
+        Self::record_id(addr)
     }
 
     fn record_id(addr: &SessionAddr) -> Result<String> {
@@ -163,12 +247,13 @@ impl ChildSessionRegistry {
     }
 
     /// Mutate the complete stored record under the backend's transaction.
-    async fn update_record<F>(&self, addr: &SessionAddr, mut update: F) -> Result<crate::chat::session::ChatSession>
+    async fn update_record<F>(&self, addr: &SessionAddr, mut update: F) -> Result<ScopedChatRecord>
     where
         F: FnMut(Option<crate::chat::session::ChatSession>) -> Result<crate::chat::session::ChatSession>
             + Send
             + 'static,
     {
+        let context = self.context(addr)?;
         let key = Self::record_id(addr)?;
         let addr = addr.clone();
         let memory = Arc::clone(&self.memory);
@@ -176,7 +261,7 @@ impl ChildSessionRegistry {
             let store = memory
                 .child_session_store()
                 .context("transactional child session store unsupported")?;
-            let json = store.update(&key, &mut |old| {
+            let json = store.update(&key, &context, &mut |old| {
                 let old = old.map(crate::chat::session::ChatSession::from_json).transpose()?;
                 if let Some(record) = &old {
                     Self::validate_record(record, &addr, &key)?;
@@ -185,7 +270,7 @@ impl ChildSessionRegistry {
                 Self::validate_record(&record, &addr, &key)?;
                 Ok(record.to_json()?)
             })?;
-            Ok(crate::chat::session::ChatSession::from_json(&json)?)
+            ScopedChatRecord::parse(json)
         })
         .await?
     }
@@ -207,6 +292,7 @@ impl ChildSessionRegistry {
     pub async fn insert(&self, child: &ChildSession) -> Result<()> {
         let metadata = child.metadata();
         let history = child.history.clone();
+        let preserved_calls = child.tool_calls.clone();
         let key = Self::record_id(child.addr())?;
         self.update_record(child.addr(), move |old| {
             let mut metadata = metadata.clone();
@@ -235,13 +321,15 @@ impl ChildSessionRegistry {
                 .enumerate()
                 .map(|(index, entry)| {
                     let content = crate::chat::sanitize::sanitize_for_persistence(&entry.content);
-                    let tool_calls = record
-                        .turns
-                        .get(index)
-                        .filter(|turn| {
-                            turn.role == entry.role && turn.content == content && turn.timestamp == entry.timestamp
-                        })
-                        .map_or_else(Vec::new, |turn| turn.tool_calls.clone());
+                    let tool_calls = preserved_calls.get(&index).cloned().unwrap_or_else(|| {
+                        record
+                            .turns
+                            .get(index)
+                            .filter(|turn| {
+                                turn.role == entry.role && turn.content == content && turn.timestamp == entry.timestamp
+                            })
+                            .map_or_else(Vec::new, |turn| turn.tool_calls.clone())
+                    });
                     crate::chat::session::ChatTurn {
                         role: entry.role.clone(),
                         content,
@@ -257,51 +345,96 @@ impl ChildSessionRegistry {
         Ok(())
     }
 
-    async fn load_record(&self, addr: &SessionAddr) -> Result<crate::chat::session::ChatSession> {
+    async fn load_record(&self, addr: &SessionAddr) -> Result<ScopedChatRecord> {
+        let context = self.context(addr)?;
         let key = Self::record_id(addr)?;
         let memory = Arc::clone(&self.memory);
         let json = crate::runtime::blocking::spawn_blocking(move || {
             memory
                 .child_session_store()
                 .context("transactional child session store unsupported")?
-                .load(&key)?
+                .load(&key, &context)?
                 .context("child session not in registry")
         })
         .await??;
-        let record = crate::chat::session::ChatSession::from_json(&json)?;
+        let record = ScopedChatRecord::parse(json)?;
         Self::validate_record(&record, addr, &Self::record_id(addr)?)?;
         Ok(record)
     }
 
     /// Reopen the durable registry record only. Ask dies; no worker is revived.
     pub async fn reconstruct(&self, addr: &SessionAddr) -> Result<ChildSession> {
-        let record = self.load_record(addr).await?;
-        let metadata = record
-            .child_session
-            .ok_or_else(|| anyhow::anyhow!("session has no child identity"))?;
-        if metadata.addr != *addr {
-            bail!("child session registry address mismatch");
-        }
-        Ok(ChildSession {
-            addr: metadata.addr,
-            history: record
-                .turns
-                .into_iter()
-                .map(|turn| HistoryEntry {
+        let ScopedChatRecord {
+            record,
+            scope,
+            cursors,
+            mailbox_turns,
+            lease,
+        } = self.load_record(addr).await?;
+        let metadata = record.child_session.context("session has no child identity")?;
+        anyhow::ensure!(metadata.addr == *addr, "child session registry address mismatch");
+        let event_ids: Vec<_> = mailbox_turns.iter().map(|turn| turn.event_id).collect();
+        let mut fresh: std::collections::BTreeMap<_, _> =
+            mailbox_turns.into_iter().map(|turn| (turn.event_id, turn)).collect();
+        let unique: std::collections::BTreeSet<_> = metadata.mailbox_projection.values().copied().collect();
+        anyhow::ensure!(
+            unique.len() == metadata.mailbox_projection.len()
+                && metadata
+                    .mailbox_projection
+                    .keys()
+                    .all(|index| *index < record.turns.len()),
+            crate::memory::child_sessions::ChildSessionError::InvalidRecord
+        );
+        let mut history = Vec::new();
+        let mut projection = std::collections::BTreeMap::new();
+        let mut tool_calls = std::collections::BTreeMap::new();
+        for (index, turn) in record.turns.into_iter().enumerate() {
+            if let Some(event) = metadata.mailbox_projection.get(&index) {
+                if let Some(turn) = fresh.remove(event) {
+                    projection.insert(history.len(), turn.event_id);
+                    history.push(HistoryEntry {
+                        role: "user".into(),
+                        content: turn.content,
+                        timestamp: turn.timestamp,
+                    });
+                }
+            } else {
+                if !turn.tool_calls.is_empty() {
+                    tool_calls.insert(history.len(), turn.tool_calls);
+                }
+                history.push(HistoryEntry {
                     role: turn.role,
                     content: turn.content,
                     timestamp: turn.timestamp,
-                })
-                .collect(),
+                });
+            }
+        }
+        for id in event_ids {
+            if let Some(turn) = fresh.remove(&id) {
+                projection.insert(history.len(), turn.event_id);
+                history.push(HistoryEntry {
+                    role: "user".into(),
+                    content: turn.content,
+                    timestamp: turn.timestamp,
+                });
+            }
+        }
+        Ok(ChildSession {
+            addr: metadata.addr,
+            history,
             provider: metadata.provider,
             recipe: metadata.recipe,
-            mailbox_cursor: MailboxCursor::default(),
+            mailbox_cursor: MailboxCursor { streams: cursors },
             approvals: PendingApprovals::new(),
             turn: Mutex::new(()),
+            mailbox_projection: projection,
+            tool_calls,
+            mailbox_scope: Some(scope),
+            _history_lease: Some(lease),
         })
     }
 
-    async fn relaunch_record(&self, addr: &SessionAddr) -> Result<crate::chat::session::ChatSession> {
+    async fn relaunch_record(&self, addr: &SessionAddr) -> Result<ScopedChatRecord> {
         let expected = addr.clone();
         self.update_record(addr, move |old| {
             let mut record = old.context("child session not in registry")?;
@@ -324,8 +457,9 @@ impl ChildSessionRegistry {
         Ok(ExecRef {
             run: record
                 .child_session
-                .and_then(|metadata| metadata.recipe)
-                .and_then(|recipe| recipe.last_run),
+                .as_ref()
+                .and_then(|metadata| metadata.recipe.as_ref())
+                .and_then(|recipe| recipe.last_run.clone()),
         })
     }
 
@@ -345,7 +479,8 @@ impl ChildSessionRegistry {
         let record = self.relaunch_record(addr).await?;
         let recipe = record
             .child_session
-            .and_then(|metadata| metadata.recipe)
+            .as_ref()
+            .and_then(|metadata| metadata.recipe.clone())
             .context("relaunch recipe missing")?;
         manifest.run_id = recipe.last_run.context("relaunch returned no run")?;
         // The durable key frames instance, owner, session and agent together.
@@ -383,7 +518,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("registry directory");
         let registry = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("registry backend"),
-        ));
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let mut live = ChildSession::new(
             addr("child-a"),
             Some(ProviderBinding {
@@ -403,7 +539,8 @@ mod tests {
         drop(registry);
         let registry = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("reopened registry backend"),
-        ));
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let restored = registry.reconstruct(&addr("child-a")).await.expect("test: reconstruct");
         assert_eq!(restored.addr(), &addr("child-a"));
         assert_eq!(restored.history().len(), 1);
@@ -417,7 +554,8 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("registry directory");
         let registry = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("registry backend"),
-        ));
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let session = ChildSession::new(addr("child-a"), None, None);
         registry.insert(&session).await.expect("persist child");
         let first = registry.relaunch(&addr("child-a")).await.expect("test: first");
@@ -434,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("session database");
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("sqlite"));
-        let registry = ChildSessionRegistry::new(Arc::clone(&memory));
+        let registry = ChildSessionRegistry::new(Arc::clone(&memory)).with_workspace("prx_workspace".to_owned());
         let child = ChildSession::new(addr("child-a"), None, None);
         registry.insert(&child).await.expect("insert child");
         registry.relaunch(child.addr()).await.expect("relaunch child");
@@ -567,7 +705,8 @@ mod tests {
     async fn relaunch_and_insert_preserve_complete_child_record() {
         let dir = tempfile::tempdir().expect("session database");
         let registry =
-            ChildSessionRegistry::new(Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("sqlite")));
+            ChildSessionRegistry::new(Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("sqlite")))
+                .with_workspace("prx_workspace".to_owned());
         let stale = rich_child(&registry).await;
         let before = registry.load_record(stale.addr()).await.expect("before");
         let run = registry.relaunch(stale.addr()).await.expect("relaunch").run;
@@ -604,10 +743,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("session database");
         let first = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("first pool"),
-        ));
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let second = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("independent pool"),
-        ));
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let mut child = rich_child(&first).await;
         child.history.push(HistoryEntry {
             role: "user".into(),
@@ -632,8 +773,9 @@ mod tests {
         assert_eq!(
             record
                 .child_session
-                .and_then(|metadata| metadata.recipe)
-                .and_then(|recipe| recipe.last_run),
+                .as_ref()
+                .and_then(|metadata| metadata.recipe.as_ref())
+                .and_then(|recipe| recipe.last_run.clone()),
             run
         );
     }

@@ -5,6 +5,7 @@
 
 mod chain;
 mod digest;
+pub mod mailbox;
 mod types;
 
 pub use chain::{CausalChain, InheritedProvenance, InputProvenance, RemotePeerAttr, TaskInput, stamp_outbound};
@@ -13,3 +14,5 @@ pub use types::{
     DeliveryState, ExecRef, IdempotencyKey, MAX_BODY_BYTES, MessageAuth, MessageBody, MessageKind, MessageOrigin,
     PrxMessage, RecipientPin, SessionAddr,
 };
+
+pub mod send;

@@ -8,8 +8,9 @@ mod event_batch;
 mod events;
 mod evolution;
 mod ingress_recovery;
-mod memory_impl;
+pub mod mailbox;
 mod mailbox_schema;
+mod memory_impl;
 mod mirror;
 mod recall;
 mod recovery_authority;
@@ -209,6 +210,7 @@ pub struct SqliteMemory {
     /// capsule key id. The set never grows, whatever ids stored capsules name.
     recovery_key_gates: Arc<[parking_lot::Mutex<()>; recovery_authority::RECOVERY_KEY_GATES]>,
     ingress_owners: Arc<super::ingress_recovery::IngressOwnerCache>,
+    mailbox_runtime: Arc<mailbox::runtime::Runtime>,
     db_path: PathBuf,
     acl_enabled: bool,
     embedder: Arc<dyn EmbeddingProvider>,
@@ -421,6 +423,7 @@ impl SqliteMemory {
         Ok(Self {
             pool,
             ingress_owners: Default::default(),
+            mailbox_runtime: mailbox::runtime::for_database(&db_path)?,
             recovery_unavailable: Default::default(),
             recovery_warned: Default::default(),
             recovery_unusable: Default::default(),

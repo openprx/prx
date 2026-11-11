@@ -200,10 +200,11 @@ pub(super) async fn run_spawned_child_lifecycle(
         .take()
         .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
 
-    let stdout_task = tokio::spawn(drain_worker_stream(
+    let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames(
         stdout_stream,
-        "stdout",
+        None,
         progress.as_ref().map(Arc::clone),
+        MAX_SUBPROCESS_OUTPUT,
     ));
     let stderr_task = tokio::spawn(drain_worker_stream(
         stderr_stream,

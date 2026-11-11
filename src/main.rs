@@ -143,6 +143,8 @@ const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
         Commands::Approval { .. } => cli_tracing::CliCommand::Approval,
         Commands::Audit { .. } => cli_tracing::CliCommand::Audit,
         Commands::Config { .. } => cli_tracing::CliCommand::Config,
+        #[cfg(feature = "test-mock")]
+        Commands::MailboxHarness { .. } => cli_tracing::CliCommand::SessionWorker,
         Commands::SessionWorker { .. } => cli_tracing::CliCommand::SessionWorker,
         Commands::Completions { .. } => cli_tracing::CliCommand::Completions,
     }
@@ -895,6 +897,15 @@ Examples:
     Config {
         #[command(subcommand)]
         config_command: ConfigCommands,
+    },
+
+    #[cfg(feature = "test-mock")]
+    #[command(name = "__mailbox-harness", hide = true)]
+    MailboxHarness {
+        #[arg(value_parser=["accept-adopt"])]
+        action: String,
+        #[arg(long)]
+        workspace: std::path::PathBuf,
     },
 
     /// Internal worker entrypoint for process-isolated sessions
@@ -1708,6 +1719,11 @@ async fn async_main() -> Result<()> {
         // process-global state (witness key, session-worker secret) that has no
         // `Config` in hand and would otherwise anchor on `$HOME/.openprx`.
         config::set_process_config_dir(std::path::absolute(config_dir.trim()).context("resolve --config-dir")?);
+    }
+
+    #[cfg(feature = "test-mock")]
+    if let Commands::MailboxHarness { workspace, .. } = &cli.command {
+        return memory::sqlite::mailbox::harness::accept_adopt(workspace);
     }
 
     // session-worker must stay stdout-clean for IPC JSON.
@@ -3681,6 +3697,8 @@ mod tests {
             Commands::Approval { .. } => "Approval",
             Commands::Audit { .. } => "Audit",
             Commands::Config { .. } => "Config",
+            #[cfg(feature = "test-mock")]
+            Commands::MailboxHarness { .. } => "MailboxHarness",
             Commands::SessionWorker { .. } => "SessionWorker",
             Commands::Completions { .. } => "Completions",
         }
@@ -3723,6 +3741,17 @@ mod tests {
             (&["prx", "config", "show"], cli_tracing::CliCommand::Config),
             (&["prx", "session-worker"], cli_tracing::CliCommand::SessionWorker),
             (&["prx", "completions", "bash"], cli_tracing::CliCommand::Completions),
+            #[cfg(feature = "test-mock")]
+            (
+                &[
+                    "prx",
+                    "__mailbox-harness",
+                    "accept-adopt",
+                    "--workspace",
+                    "prx_workspace",
+                ],
+                cli_tracing::CliCommand::SessionWorker,
+            ),
         ];
         #[cfg(feature = "wasm-plugins")]
         let plugin_case: &[(&[&str], cli_tracing::CliCommand)] =
@@ -3771,6 +3800,8 @@ mod tests {
         ];
         #[cfg(feature = "wasm-plugins")]
         expected_tags.push("Plugin");
+        #[cfg(feature = "test-mock")]
+        expected_tags.push("MailboxHarness");
         expected_tags.sort_unstable();
         seen.sort_unstable();
         assert_eq!(seen, expected_tags);

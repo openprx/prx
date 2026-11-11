@@ -1028,7 +1028,8 @@ fn effect_for(descriptor: &ToolDescriptor) -> SideEffectClass {
         ToolEffect::Read => SideEffectClass::ReadOnly,
         ToolEffect::Act => match descriptor.public_name.as_str() {
             "shell" | "git_operations" => SideEffectClass::ProcessExec,
-            "message_send" | "http_request" => SideEffectClass::ExternalSend,
+            "message_send" | "http_request" | "prx_message" => SideEffectClass::ExternalSend,
+            "sessions_send" if descriptor.parameters.get("oneOf").is_some() => SideEffectClass::ExternalSend,
             "config_reload" | "proxy_config" => SideEffectClass::CredentialOrConfig,
             "nodes" | "mcp_call" | "skill_execute" => SideEffectClass::Destructive,
             "delegate" | "sessions_spawn" => SideEffectClass::ProcessExec,

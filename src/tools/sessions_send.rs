@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 
 /// Tool that sends a message to a running sub-agent session to redirect it.
 pub struct SessionsSendTool {
+    mailbox: Option<Arc<dyn crate::messaging::send::MailboxSender>>,
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     security: Arc<SecurityPolicy>,
     memory: Option<Arc<dyn Memory>>,
@@ -31,12 +32,19 @@ impl SessionsSendTool {
 
     pub fn with_security(active_runs: Arc<RwLock<Vec<SubAgentRun>>>, security: Arc<SecurityPolicy>) -> Self {
         Self {
+            mailbox: None,
             active_runs,
             security,
             memory: None,
             source_fabric: None,
             event_recording: MemoryEventRecording::default(),
         }
+    }
+
+    /// Opt-in only; activation owns registration of the address-based schema.
+    pub fn with_mailbox(mut self, sender: Arc<dyn crate::messaging::send::MailboxSender>) -> Self {
+        self.mailbox = Some(sender);
+        self
     }
 
     /// Logical lifecycle storage is independent of execution-memory isolation.
@@ -111,6 +119,12 @@ impl Tool for SessionsSendTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        if self.mailbox.is_some() {
+            return json!({"oneOf":[
+                {"type":"object","additionalProperties":false,"properties":{"run_id":{"type":"string","minLength":1},"message":{"type":"string","minLength":1}},"required":["run_id","message"]},
+                {"type":"object","additionalProperties":false,"properties":{"to":crate::messaging::send::target_schema(),"message":{"type":"string","minLength":1}},"required":["to","message"]}
+            ]});
+        }
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -130,6 +144,32 @@ impl Tool for SessionsSendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if args.get("to").is_some() {
+            use crate::messaging::{
+                mailbox::MailboxError,
+                send::{parse_target, send_result},
+            };
+            let sender = self.mailbox.as_ref().ok_or(MailboxError::Unauthorized)?;
+            let object = args.as_object().ok_or(MailboxError::InvalidMetadata)?;
+            if object.keys().any(|key| !matches!(key.as_str(), "to" | "message")) {
+                return Err(MailboxError::InvalidMetadata.into());
+            }
+            let target = parse_target(&args["to"], sender.source())?;
+            let message = args
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or(MailboxError::InvalidMetadata)?;
+            let result = sender.send(target, message.to_owned(), "text/plain".to_owned()).await;
+            let success = result.is_ok();
+            let error = result.as_ref().err().map(ToString::to_string);
+            return Ok(ToolResult {
+                success,
+                output: send_result(result).to_string(),
+                error,
+            });
+        }
+
         let run_id = args
             .get("run_id")
             .and_then(|v| v.as_str())

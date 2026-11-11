@@ -157,7 +157,7 @@ pub fn charge(
     tx.commit().map_err(storage_error)
 }
 
-fn charge_in_transaction(
+pub(super) fn charge_in_transaction(
     conn: &Connection,
     id: &RemoteTreeId,
     resource: RemoteTreeResource,

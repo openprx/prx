@@ -1560,7 +1560,8 @@ async fn relaunch_real_worker_keeps_session_addr() {
     };
     let registry = ChildSessionRegistry::new(Arc::new(
         openprx::memory::SqliteMemory::new(&workspace_dir.join("registry")).expect("durable registry"),
-    ));
+    ))
+    .with_workspace("prx_workspace".to_owned());
     registry
         .insert(&ChildSession::new(
             addr.clone(),
@@ -1640,7 +1641,8 @@ async fn relaunch_refuses_manifest_identity_mismatch_before_record_update() {
     let (_root, config, workspace, _home) = worker_dirs();
     let registry = ChildSessionRegistry::new(std::sync::Arc::new(
         openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"),
-    ));
+    ))
+    .with_workspace("prx_workspace".to_owned());
     let addr = openprx::messaging::SessionAddr::new("prx-default", "prx-owner", "prx-session", None);
     registry
         .insert(&ChildSession::new(addr.clone(), None, None))
@@ -1676,9 +1678,15 @@ async fn relaunch_refuses_manifest_identity_mismatch_before_record_update() {
 async fn relaunch_scope_key_separates_session_and_agent_and_is_stable() {
     use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry};
     let (_root, config, workspace, _home) = worker_dirs();
-    let registry = ChildSessionRegistry::new(std::sync::Arc::new(
-        openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"),
-    ));
+    let memory: std::sync::Arc<dyn openprx::memory::Memory> =
+        std::sync::Arc::new(openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"));
+    memory
+        .agent_registry()
+        .expect("registry")
+        .resolve_incarnation("prx_workspace", "prx-owner", "n:prx_agent", &"1".repeat(64), &|| Ok(()))
+        .expect("resolve")
+        .expect("configured named agent");
+    let registry = ChildSessionRegistry::new(memory).with_workspace("prx_workspace".to_owned());
     let mut keys = std::collections::HashSet::new();
     for (session, agent) in [
         ("prx-session", None),

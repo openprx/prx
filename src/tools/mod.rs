@@ -63,6 +63,7 @@ pub mod message_send;
 pub mod nodes;
 pub mod prompt;
 pub mod proxy_config;
+pub mod prx_message;
 pub mod pushover;
 pub mod schema;
 pub mod session_status;

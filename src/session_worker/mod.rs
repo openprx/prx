@@ -5,3 +5,5 @@ pub mod protocol;
 pub mod runner;
 pub(crate) mod startup_failure;
 pub(crate) mod transport_key;
+
+pub mod frames;
