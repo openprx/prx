@@ -1526,14 +1526,22 @@ mod tests {
                     .unwrap();
             }
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let context = service
-                .decide_agent_initial(
-                    &proof,
-                    crate::runtime::turn_decision::AgentTurnKind::Repl,
-                    &cancellation,
-                )
-                .await
-                .unwrap();
+            // Exclude preemption from the logical decision budget while
+            // retaining a real wall bound on fixture I/O.
+            let context = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::causal_tree::logical_clock::scope(
+                    crate::causal_tree::logical_clock::ManualClock::new(),
+                    service.decide_agent_initial(
+                        &proof,
+                        crate::runtime::turn_decision::AgentTurnKind::Repl,
+                        &cancellation,
+                    ),
+                ),
+            )
+            .await
+            .expect("terminal fixture admission must complete its real I/O")
+            .unwrap();
             if capture_parameters {
                 context.capture_main_parameters(true);
             }

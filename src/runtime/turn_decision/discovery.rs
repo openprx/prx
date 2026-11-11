@@ -82,6 +82,11 @@ impl TurnDecisionService {
                         && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
                 && !trusted.excludes_entry(view.model_admission_entry(entry))
+                && !(trusted
+                    .constraints
+                    .iter()
+                    .any(|code| code.as_str() == "intercepts_writes")
+                    && entry.plan_intercepted())
                 && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
                     && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly)
                 && (trusted.channel.is_none() || entry.channel_eligible)

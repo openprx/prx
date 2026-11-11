@@ -1000,12 +1000,20 @@ mod tests {
 
     /// A service over a configuration written to `dir`.
     async fn service(dir: &Path) -> (CausalConfigService, crate::config::SharedConfig) {
+        service_with_engine(dir, false).await
+    }
+
+    async fn service_with_engine(
+        dir: &Path,
+        engine_enabled: bool,
+    ) -> (CausalConfigService, crate::config::SharedConfig) {
         let mut config = Config {
             config_path: dir.join("config.toml"),
             workspace_dir: dir.join("workspace"),
             ..Config::default()
         };
         config.secrets.encrypt = false;
+        config.decision_engine.enabled = engine_enabled;
         crate::config::files::write_split_config(&config, false)
             .await
             .expect("test: write");
@@ -1042,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn a_cross_owner_credential_ref_is_rejected_before_the_plan() {
         let temp = tempfile::TempDir::new().unwrap();
-        let (service, shared) = service(temp.path()).await;
+        let (service, shared) = service_with_engine(temp.path(), true).await;
         let config = shared.desired().config.as_ref().clone();
         let references = CredentialReferences::for_config(&config).unwrap();
         references

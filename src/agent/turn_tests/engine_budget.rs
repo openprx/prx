@@ -509,15 +509,25 @@ async fn configured_small_native_schema_fixture() {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let max_request_tokens = Arc::new(AtomicUsize::new(0));
                 let provider = NativeToolProvider::recording("done", &calls, &max_request_tokens);
-                let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_native_schema(
-                    admission_config,
-                    &history.last().expect("current fixture input").content,
-                    Arc::clone(&tools_registry),
-                    Arc::clone(&memory),
-                    &endpoint,
-                    &provider,
+                // This control measures provider payloads, not host scheduling
+                // latency. Keep real endpoint I/O and a bounded wall wait while
+                // the unchanged decision budget uses the fixture's logical clock.
+                let admission = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crate::causal_tree::logical_clock::scope(
+                        crate::causal_tree::logical_clock::ManualClock::new(),
+                        crate::agent::turn_tests::admission::AdmittedTurn::configured_native_schema(
+                            admission_config,
+                            &history.last().expect("current fixture input").content,
+                            Arc::clone(&tools_registry),
+                            Arc::clone(&memory),
+                            &endpoint,
+                            &provider,
+                        ),
+                    ),
                 )
-                .await;
+                .await
+                .expect("native schema admission must complete real I/O");
                 let decision = admission.decision();
                 if excluded {
                     assert!(

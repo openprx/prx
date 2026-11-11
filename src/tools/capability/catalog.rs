@@ -965,6 +965,18 @@ fn summary(description: &str) -> String {
         .collect()
 }
 
+/// Canonical identity of a registered descriptor, shared by publication and
+/// execution observations. This identifies an observed call, not permission.
+pub(crate) fn descriptor_identity(descriptor: &ToolDescriptor) -> Result<CapabilityId, CatalogError> {
+    let namespace = if descriptor.adapter == ToolAdapterKind::McpAlias {
+        "mcp"
+    } else {
+        "native"
+    };
+    let family = canonical_identity_family(family_for(descriptor), namespace, &descriptor.public_name);
+    CapabilityId::new(family, namespace, &descriptor.public_name).map_err(|_| CatalogError::Identity)
+}
+
 fn family_for(descriptor: &ToolDescriptor) -> CapabilityTarget {
     match descriptor.adapter {
         ToolAdapterKind::McpAlias => CapabilityTarget::Mcp,

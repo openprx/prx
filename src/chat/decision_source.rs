@@ -874,7 +874,17 @@ impl ChatTurnBinding {
                         .open_issued_resume_turn_context(self, kind, cancellation)
                         .await?
                 } else {
-                    service.open_issued_turn_context(self, kind, cancellation).await?
+                    #[cfg(test)]
+                    {
+                        // Retain explicit local prediction fixtures without
+                        // reinstating prediction admission in production chat.
+                        service.open_issued_turn_context(self, kind, cancellation).await?
+                    }
+                    #[cfg(not(test))]
+                    {
+                        let opened = service.open_turn_context(self, kind, cancellation).await?;
+                        service.record_opened_context(self, opened, cancellation).await?
+                    }
                 };
                 let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {

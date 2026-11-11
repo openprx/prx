@@ -2503,9 +2503,17 @@ impl ToolExecutionService {
     ) -> ToolExecutionOutcome {
         let pending = context.execution_trace.as_ref().map(|trace| {
             let binding = context.admitted_binding.as_ref();
+            // Decision-free model turns still observe the identity of the
+            // concrete registered tool. An unknown name remains unbound;
+            // identifying a call never grants dispatch or marks it selected.
+            let observed = self
+                .current_descriptor(&command.name)
+                .and_then(|descriptor| super::capability::catalog::descriptor_identity(&descriptor).ok());
             trace.begin(
                 &command.operation_id,
-                binding.map(|binding| binding.capability_id()),
+                binding
+                    .map(|binding| binding.capability_id())
+                    .or_else(|| observed.as_ref().map(|id| id.as_str())),
                 binding.is_some_and(|binding| binding.is_selected()),
             )
         });

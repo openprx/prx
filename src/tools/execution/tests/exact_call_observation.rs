@@ -95,6 +95,17 @@ async fn failed_cached_call_is_not_another_physical_failure_and_fresh_ids_still_
     assert!(!first.replayed);
     let first = trace.seal();
     assert_eq!(
+        first.unbound_attempts, 0,
+        "a registered call has an execution-owned identity"
+    );
+    let observed = first.calls.first().expect("actual registered call");
+    assert_eq!(observed.capability_id, "native_tool:native:native_write");
+    assert_eq!(observed.status, "failed");
+    assert_eq!(
+        first.selected_successful_attempts, 0,
+        "observation does not mint a selection"
+    );
+    assert_eq!(
         first
             .exact_call_observations
             .as_ref()
