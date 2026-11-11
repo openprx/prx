@@ -68,7 +68,7 @@ enum RoutingPhase {
     Consumed {
         source: Arc<EmbeddedAgentSource>,
         transition: Arc<RouterTransition>,
-        embedding: Option<RouterEmbedding>,
+        embedding: Option<Box<RouterEmbedding>>,
         main_compaction: crate::config::AgentCompactionConfig,
     },
     Failed {
@@ -117,7 +117,9 @@ impl<'a> RouterContinuation<'a> {
     }
     pub(crate) fn finish(mut self) -> (Arc<EmbeddedAgentSource>, Option<RouterEmbedding>) {
         match &mut self.phase {
-            RoutingPhase::Consumed { source, embedding, .. } => (Arc::clone(source), embedding.take()),
+            RoutingPhase::Consumed { source, embedding, .. } => {
+                (Arc::clone(source), embedding.take().map(|value| *value))
+            }
             _ => (Arc::clone(&self.original), None),
         }
     }
@@ -781,7 +783,7 @@ impl TurnDecisionService {
             continuation.phase = RoutingPhase::Consumed {
                 source: admitted,
                 transition,
-                embedding: Some(embedding),
+                embedding: Some(Box::new(embedding)),
                 main_compaction,
             };
             Ok::<_, anyhow::Error>(next)
