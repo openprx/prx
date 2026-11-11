@@ -294,7 +294,6 @@ impl Ns8 {
     }
 
     /// Eight lowercase hex digits.
-    #[cfg(test)]
     pub(crate) fn to_hex(self) -> String {
         hex::encode(self.0)
     }
@@ -339,7 +338,6 @@ impl CandidateId {
     }
 
     /// The namespace discriminator, if the candidate is namespace-specific.
-    #[cfg(test)]
     pub(crate) const fn namespace(&self) -> Option<Ns8> {
         self.namespace
     }
@@ -419,7 +417,6 @@ impl CausalCandidate {
     /// only latency G6 compares with `extra_latency_budget_ms`. It defaults to
     /// the execution estimate; a tool or retrieval candidate adds none. `None`
     /// stays unknown and is rejected by G6.
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_decision_overhead_ms(mut self, overhead: Option<u32>) -> Self {
         self.decision_overhead_ms = overhead;

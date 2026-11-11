@@ -1,15 +1,11 @@
 pub(crate) mod model_admission;
-use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-#[cfg(test)]
 use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
@@ -220,8 +216,7 @@ impl TrustedState {
         Self(parts, None)
     }
 
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(test, feature = "llm-router"))]
     pub(crate) fn with_router_history(mut self, purpose: RouterHistoryReadBinding) -> Self {
         self.1 = Some(Arc::new(purpose));
         self
@@ -242,13 +237,10 @@ impl TrustedState {
 pub(crate) enum ObservedStepKind {
     Tool,
     Provider,
-    #[cfg(test)]
     Retrieve,
-    #[cfg(test)]
     Discover,
     /// Router training-history work is audited separately and is not query
     /// evidence for a user answer or an ordinary Memory Retrieve candidate.
-    #[cfg(test)]
     RouterHistory,
 }
 
@@ -257,11 +249,8 @@ impl ObservedStepKind {
         match self {
             Self::Tool => "tool",
             Self::Provider => "provider",
-            #[cfg(test)]
             Self::Retrieve => "retrieve",
-            #[cfg(test)]
             Self::Discover => "discover",
-            #[cfg(test)]
             Self::RouterHistory => "router_history",
         }
     }
@@ -342,7 +331,6 @@ impl ObservedStep {
 }
 
 /// The kind of an artifact.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ObservedArtifactKind {
     Memory,
@@ -350,7 +338,6 @@ pub(crate) enum ObservedArtifactKind {
     Session,
 }
 
-#[cfg(test)]
 impl ObservedArtifactKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -364,7 +351,6 @@ impl ObservedArtifactKind {
 /// A bounded artifact summary with its provenance.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ObservedArtifact {
-    #[cfg(test)]
     pub(crate) kind: ObservedArtifactKind,
     pub(crate) age_ms: u64,
     /// Runtime summaries are redacted and bounded to 256 characters before
@@ -380,12 +366,9 @@ pub(crate) struct ObservedArtifact {
 impl fmt::Debug for ObservedArtifact {
     /// The summary may contain private source text: only its length prints.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut dbg = f.debug_struct("ObservedArtifact");
-        #[cfg(test)]
-        {
-            dbg.field("kind", &self.kind);
-        }
-        dbg.field("age_ms", &self.age_ms)
+        f.debug_struct("ObservedArtifact")
+            .field("kind", &self.kind)
+            .field("age_ms", &self.age_ms)
             .field("summary_len", &self.summary.len())
             .field("summary_was_redacted", &self.summary_was_redacted)
             .field("summary_was_truncated", &self.summary_was_truncated)
@@ -471,7 +454,6 @@ impl ObservedState {
     /// candidates of the completed steps with status `Failed`, deduplicated
     /// and in id order. The projection marks exactly these candidates
     /// `failed_before` (D-061 M-3).
-    #[cfg(test)]
     pub(crate) fn failed_candidates(&self) -> BTreeSet<&CandidateId> {
         self.completed_steps
             .iter()
@@ -582,7 +564,6 @@ impl DerivedState {
     ///
     /// # Errors
     /// [`DuplicateCandidate`] when two candidates share an id.
-    #[cfg(test)]
     pub(crate) fn new(candidates: Vec<DerivedCandidate>) -> Result<Self, DuplicateCandidate> {
         let mut seen = BTreeSet::new();
         for derived in &candidates {
@@ -609,7 +590,6 @@ pub(crate) struct RawRoutingInput(String);
 impl RawRoutingInput {
     /// Routing text remains valid above this bound. Selected Retrieve and
     /// Discover require the exact UTF-8 source query to fit the local read port.
-    #[cfg(test)]
     pub(crate) const fn supports_selected_read_query(&self) -> bool {
         self.0.len() <= 1_024
     }
@@ -646,7 +626,6 @@ pub(crate) enum HopLineage {
     /// Hop 0.
     First,
     /// A later hop.
-    #[cfg(test)]
     After { hop: NonZeroU8, prior_decision_id: Uuid },
 }
 
@@ -655,7 +634,6 @@ impl HopLineage {
     pub(crate) const fn hop(self) -> u8 {
         match self {
             Self::First => 0,
-            #[cfg(test)]
             Self::After { hop, .. } => hop.get(),
         }
     }
@@ -664,7 +642,6 @@ impl HopLineage {
     pub(crate) const fn prior_decision_id(self) -> Option<Uuid> {
         match self {
             Self::First => None,
-            #[cfg(test)]
             Self::After { prior_decision_id, .. } => Some(prior_decision_id),
         }
     }
@@ -731,7 +708,6 @@ impl CausalState {
     /// progress. Sets, so the order and repeats of entries do not matter.
     /// Lowercase hex of
     /// `HMAC(DecisionKey, StateFingerprint, "evidence" ‖ canonical JSON)`.
-    #[cfg(test)]
     pub(crate) fn evidence_fingerprint(&self, key: &DecisionKey) -> String {
         let artifacts: BTreeSet<String> = self
             .observed

@@ -4,29 +4,14 @@
 //! surface. Retrieval and discovery are explicit recovery paths, not tool
 //! execution.
 
-#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch::CandidateId;
-#[cfg(test)]
-use super::branch::{CapabilityTarget, CausalCandidate, SideEffectClass};
-#[cfg(test)]
-use super::branch::{CausalActionKind, OpId};
-#[cfg(test)]
+use super::branch::{CandidateId, CapabilityTarget, CausalActionKind, CausalCandidate, OpId, SideEffectClass};
 use super::candidate_generator::{CandidateSet, PendingApproval};
-#[cfg(test)]
 use super::config::{CausalPolicy, EvaluationConfig};
-#[cfg(test)]
-use super::decision_score::CandidateScore;
-#[cfg(test)]
-use super::decision_score::PredictionEvidence;
-#[cfg(test)]
-use super::exploration::CandidateFacts;
-#[cfg(test)]
-use super::exploration::{self};
-#[cfg(test)]
+use super::decision_score::{CandidateScore, PredictionEvidence};
+use super::exploration::{self, CandidateFacts};
 use super::gates::{GateOutcome, GateReport};
-#[cfg(test)]
 use crate::decision::DecisionKey;
 
 /// A selected working candidate or an explicit terminal disposition.
@@ -41,26 +26,22 @@ pub(crate) enum Selection {
         propensity: f64,
         reason_code: Option<&'static str>,
     },
-    #[cfg(test)]
     Recover {
         candidate_id: CandidateId,
         reason_code: &'static str,
     },
-    #[cfg(test)]
     RequestApproval {
         terminal_id: CandidateId,
         pending_candidate_id: CandidateId,
         op_ids: Vec<OpId>,
         reason_code: &'static str,
     },
-    #[cfg(test)]
     Abstain {
         action: CausalActionKind,
         reason_code: &'static str,
     },
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SelectError {
     #[error("selection inputs disagree with the admitted candidate set")]
@@ -73,7 +54,6 @@ pub(crate) enum SelectError {
 
 /// Facts pinned with the same catalog and turn as the gate report. The
 /// selector cannot discover or refresh a capability by itself.
-#[cfg(test)]
 pub(crate) struct SelectorContext {
     pub interactive: bool,
     /// Exact direct entries in the pinned catalog generation.
@@ -95,13 +75,10 @@ pub(crate) struct SelectorContext {
     pub approved_resume: Option<CandidateId>,
 }
 
-#[cfg(test)]
 pub(crate) struct CausalSelector;
 
-#[cfg(test)]
 impl CausalSelector {
     /// Preserve the deterministic selector contract when exploration is off.
-    #[cfg(test)]
     pub(crate) fn select_with_exploration(
         admitted: &CandidateSet,
         scores: &BTreeMap<CandidateId, CandidateScore>,
@@ -235,7 +212,6 @@ impl CausalSelector {
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn select(
         admitted: &CandidateSet,
         scores: &BTreeMap<CandidateId, CandidateScore>,
@@ -557,28 +533,22 @@ impl CausalSelector {
 /// inclusive: a plain conversational turn is reported by the builtin model at
 /// exactly `weights::PLAIN_TURN_EVIDENCE`, which equals this value and must
 /// therefore count as sufficient (pinned by a test below).
-#[cfg(test)]
 const EVIDENCE_THRESHOLD: f64 = 0.5;
 /// A need-fresh-state probability above this marks observed artifacts stale.
-#[cfg(test)]
 const FRESHNESS_THRESHOLD: f64 = 0.5;
 /// Propensity of a deterministic selection. Only exploration replaces it.
-#[cfg(test)]
 const DETERMINISTIC_PROPENSITY: f64 = 1.0;
 
 /// Whether `evidence_sufficient` is below the answer threshold.
-#[cfg(test)]
 fn evidence_insufficient(evidence_sufficient: f64) -> bool {
     evidence_sufficient < EVIDENCE_THRESHOLD
 }
 
 /// Whether `needs_fresh_state` marks the evidence stale.
-#[cfg(test)]
 fn evidence_stale(needs_fresh_state: f64) -> bool {
     needs_fresh_state > FRESHNESS_THRESHOLD
 }
 
-#[cfg(test)]
 const fn is_terminal(action: CausalActionKind) -> bool {
     matches!(
         action,
@@ -586,7 +556,6 @@ const fn is_terminal(action: CausalActionKind) -> bool {
     )
 }
 
-#[cfg(test)]
 const fn estimated_cost(candidate: &CausalCandidate) -> u64 {
     match candidate.estimated_cost() {
         Some(cost) => cost.micro_usd,
@@ -594,7 +563,6 @@ const fn estimated_cost(candidate: &CausalCandidate) -> u64 {
     }
 }
 
-#[cfg(test)]
 const fn estimated_latency(candidate: &CausalCandidate) -> u32 {
     match candidate.estimated_latency_ms() {
         Some(latency) => latency,
@@ -602,7 +570,6 @@ const fn estimated_latency(candidate: &CausalCandidate) -> u32 {
     }
 }
 
-#[cfg(test)]
 const fn effective_threshold(base: f64, effect: SideEffectClass) -> f64 {
     let offset = match effect {
         SideEffectClass::ReadOnly => 0.0,
@@ -615,7 +582,6 @@ const fn effective_threshold(base: f64, effect: SideEffectClass) -> f64 {
     if base + offset > 1.0 { 1.0 } else { base + offset }
 }
 
-#[cfg(test)]
 fn available_approval(
     candidates: &[CausalCandidate],
     scopes: &BTreeMap<CandidateId, Vec<PendingApproval>>,
@@ -643,7 +609,6 @@ fn available_approval(
         .min_by(|left, right| approval_order(left).cmp(&approval_order(right)))
 }
 
-#[cfg(test)]
 fn approval_verified(pending: &PendingApproval, gates: &GateReport) -> bool {
     !pending.op_ids.is_empty()
         && matches!(
@@ -652,7 +617,6 @@ fn approval_verified(pending: &PendingApproval, gates: &GateReport) -> bool {
         )
 }
 
-#[cfg(test)]
 fn approval_selection(terminal_id: &CandidateId, pending: &PendingApproval) -> Selection {
     Selection::RequestApproval {
         terminal_id: terminal_id.clone(),
@@ -662,7 +626,6 @@ fn approval_selection(terminal_id: &CandidateId, pending: &PendingApproval) -> S
     }
 }
 
-#[cfg(test)]
 fn approval_order(selection: &Selection) -> Option<(&CandidateId, &CandidateId, &[OpId])> {
     let Selection::RequestApproval {
         terminal_id,
@@ -676,7 +639,6 @@ fn approval_order(selection: &Selection) -> Option<(&CandidateId, &CandidateId, 
     Some((terminal_id, pending_candidate_id, op_ids))
 }
 
-#[cfg(test)]
 pub(crate) fn terminal_abstain(
     candidates: &[CausalCandidate],
     gates: &GateReport,

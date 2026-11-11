@@ -831,7 +831,6 @@ impl TurnDecisionService {
 pub(super) struct ResumeGateEvidence {
     /// Authenticated original source content, still untrusted decision data.
     pub(super) original_request: Arc<str>,
-    #[cfg(test)]
     pub(super) candidate_reference: crate::causal_tree::branch::CapabilityRef,
     pub(super) calls: std::collections::BTreeMap<crate::causal_tree::branch::CandidateId, [u8; 32]>,
     pub(super) approvals:
@@ -924,7 +923,6 @@ impl AdmittedDecisionResume {
         };
         Ok(ResumeGateEvidence {
             original_request: Arc::from(self.prepared.approval.pending().source().content.as_str()),
-            #[cfg(test)]
             candidate_reference: reference.clone(),
             calls: BTreeMap::from([
                 (CandidateId::new(CausalActionKind::UseTool, entry.family, None), digest),

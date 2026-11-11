@@ -643,6 +643,11 @@ impl TurnDecisionService {
             None
         };
         execution_context.decision_resume = None;
+        if execution_context.call_budget.is_none() {
+            execution_context.call_budget = Some(
+                crate::agent::send_admission::call_token_budget(self, context, proof).context("called-tool budget")?,
+            );
+        }
         let trace = context.execution_trace.get_or_init(Default::default);
         trace.bind_exact_call_key(Arc::clone(&self.state_key))?;
         execution_context.execution_trace = Some(trace.clone());
@@ -853,7 +858,6 @@ impl TurnDecisionService {
         let abstention_answer;
         let selected_id = match &context.engine.selection {
             crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
-            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
             #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Abstain {
@@ -868,11 +872,18 @@ impl TurnDecisionService {
                 &abstention_answer
             }
             #[cfg(test)]
+            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(_) => {
+                abstention_answer = crate::causal_tree::branch::CandidateId::new(
+                    crate::causal_tree::branch::CausalActionKind::Answer,
+                    crate::causal_tree::branch::CapabilityTarget::None,
+                    None,
+                );
+                &abstention_answer
+            }
             _ => anyhow::bail!("decision has no executable selection"),
         };
         let candidates = match &context.engine.candidates {
             CandidateSet::Legal { candidates, .. } => candidates,
-            #[cfg(test)]
             CandidateSet::NoLegalPath { .. } => anyhow::bail!("decision has no admitted candidate set"),
         };
         let selected = candidates
@@ -925,6 +936,20 @@ impl TurnDecisionService {
                 );
                 direct
             }
+            #[cfg(test)]
+            TurnExecutionDirective::CollectApprovalArguments(_) => {
+                anyhow::ensure!(
+                    selected.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                        && selected_references.is_empty(),
+                    "leftover Collect must serve the Direct answer surface"
+                );
+                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates, &context.execution_refs);
+                anyhow::ensure!(
+                    direct == context.execution_refs,
+                    "answer direct surface changed after admission"
+                );
+                direct
+            }
             TurnExecutionDirective::Execute { allowed_capability_ids } => {
                 let ids: BTreeSet<_> = selected_references.iter().map(|reference| &reference.id).collect();
                 anyhow::ensure!(
@@ -943,9 +968,7 @@ impl TurnDecisionService {
                     &context.engine,
                     &DirectiveContext {
                         current_generation: catalog.generation(),
-                        #[cfg(test)]
                         approval_expires_at: chrono::Utc::now(),
-                        #[cfg(test)]
                         discovery_limit: 1,
                     },
                 )?;

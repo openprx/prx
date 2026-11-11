@@ -139,16 +139,7 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
                 .iter()
                 .map(|artifact| {
                     (
-                        {
-                            #[cfg(test)]
-                            {
-                                artifact.kind.as_str()
-                            }
-                            #[cfg(not(test))]
-                            {
-                                "artifact"
-                            }
-                        },
+                        artifact.kind.as_str(),
                         artifact_age_class(artifact.age_ms),
                         artifact.summary.as_str(),
                     )

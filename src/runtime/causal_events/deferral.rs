@@ -1,7 +1,6 @@
 //! Each admission may defer only its own ordinary events, until its deadline.
 use crate::decision::telemetry::CausalLineage;
 use parking_lot::Mutex;
-#[cfg(test)]
 use std::time::Instant;
 use std::{
     collections::BTreeMap,
@@ -57,7 +56,6 @@ pub(crate) struct PersistenceGuard {
 }
 
 impl PersistenceDeferral {
-    #[cfg(test)]
     pub(super) fn begin(self: &Arc<Self>, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
         let key = AdmissionKey::from(lineage);
         let state = Arc::new(AdmissionDeferral {

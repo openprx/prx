@@ -3,11 +3,9 @@ use super::{
     Arc, CapabilityRef, ChildExecutionPolicy, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService,
     TurnExecutionDirective, TurnSourceProof,
 };
-#[cfg(test)]
 use super::{
     BTreeSet, CapabilityAvailabilityLevel, CatalogView, CausalState, DecisionId, DiscoveredRefs, TurnSurfaceKind,
 };
-#[cfg(test)]
 use crate::tools::capability::child::AuthorityEnvelope;
 use crate::tools::capability::child::CapabilityConstraints;
 use std::time::Duration;
@@ -16,7 +14,6 @@ use std::time::Duration;
 /// not share the decision latency budget (`extra_latency_budget_ms`).
 const DELEGATION_DURABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
 pub(super) struct OutgoingDelegation {
     pub parent: CapabilityConstraints,
     pub requested: Vec<CapabilityRef>,
@@ -33,7 +30,6 @@ pub(super) fn publication_cost(
     use crate::causal_tree::branch::CausalActionKind;
     let candidates = match &decision.candidates {
         super::CandidateSet::Legal { candidates, .. } => candidates,
-        #[cfg(test)]
         super::CandidateSet::NoLegalPath { .. } => return None,
     };
     let action = if delegator {
@@ -49,7 +45,6 @@ pub(super) fn publication_cost(
 }
 
 impl TurnDecisionService {
-    #[cfg(test)]
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
         if proof.surface() != TurnSurfaceKind::AgentLoop
@@ -223,7 +218,6 @@ impl TurnDecisionService {
         )?))
     }
 
-    #[cfg(test)]
     pub(super) fn outgoing_delegation(
         &self,
         proof: &dyn TurnSourceProof,

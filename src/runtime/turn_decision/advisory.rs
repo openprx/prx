@@ -98,8 +98,7 @@ impl TurnDecisionService {
                 .iter()
                 .map(|candidate| candidate.candidate_id().key())
                 .collect::<Vec<_>>(),
-            #[cfg(test)]
-            _ => Vec::new(),
+            crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { .. } => Vec::new(),
         };
         let mut answers = BTreeMap::new();
         if let Some(prediction) = &context.engine.prediction {

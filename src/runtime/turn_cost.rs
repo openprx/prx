@@ -5,9 +5,7 @@ use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
 use crate::causal_tree::branch::CapabilityRef;
-#[cfg(test)]
-use crate::causal_tree::branch::CausalActionKind;
-use crate::causal_tree::branch::{CapabilityTarget, CostEstimate};
+use crate::causal_tree::branch::{CapabilityTarget, CausalActionKind, CostEstimate};
 #[cfg(test)]
 use crate::causal_tree::candidate_generator::CapabilityCostModel;
 use crate::causal_tree::candidate_generator::CostEstimateSource;
@@ -37,7 +35,6 @@ pub(super) struct RuntimeCostModel<'a> {
     zero_price_exempt: bool,
     warned_unpriced: AtomicBool,
     noted_subscription: AtomicBool,
-    #[cfg(test)]
     model_backed_retrieval: bool,
 }
 
@@ -49,7 +46,6 @@ impl<'a> RuntimeCostModel<'a> {
     ) -> Self {
         Self {
             model,
-            #[cfg(test)]
             model_backed_retrieval: {
                 let (provider, _) = crate::memory::configured_embedder(config);
                 !matches!(
@@ -68,7 +64,6 @@ impl<'a> RuntimeCostModel<'a> {
 }
 
 impl CostEstimateSource for RuntimeCostModel<'_> {
-    #[cfg(test)]
     fn decision_overhead_ms(&self, action: CausalActionKind, entry: &CapabilityEntry) -> u32 {
         // Versioned admission estimate for one model-backed retrieval hop.
         // Local catalog discovery has no model call. Paid transports still
@@ -101,7 +96,6 @@ impl CostEstimateSource for RuntimeCostModel<'_> {
         Some((cost, latency))
     }
 
-    #[cfg(test)]
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)> {
         let cost = estimate_cost_with_validity(
             self.model,

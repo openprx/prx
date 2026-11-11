@@ -58,8 +58,7 @@ pub(crate) use routing::RouterModelReadmission;
 #[cfg(feature = "llm-router")]
 pub(crate) use routing::commit_training_owned;
 
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
+#[cfg(all(test, feature = "llm-router"))]
 #[inline(never)]
 fn boxed_router_history_field<'a, F>(
     make: impl FnOnce() -> F,
@@ -72,7 +71,6 @@ where
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,18 +85,13 @@ use crate::causal_tree::branch::{
     CandidateSpec, CapabilityRef, CapabilityTarget, CatalogGeneration, CausalActionKind, CausalCandidate,
 };
 use crate::causal_tree::candidate_generator::CandidateSet;
-#[cfg(test)]
 use crate::causal_tree::candidate_generator::DiscoveredRefs;
-#[cfg(test)]
 use crate::causal_tree::decision_engine::{CausalDecisionEngine, EngineInputs};
 use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, EngineError, RetrievalIssueError};
-#[cfg(test)]
 use crate::causal_tree::decision_rehearsal::RehearsalPorts;
-#[cfg(test)]
 use crate::causal_tree::decision_rehearsal::{CatalogProbe, MemoryProbe, PinnedCount, ProbeUnavailable, SkillProbe};
 #[cfg(test)]
 use crate::causal_tree::directive::render_terminal_directive;
-#[cfg(test)]
 use crate::causal_tree::directive::{DirectiveContext, directive_from_selection};
 use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective, selected_discovery_family};
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
@@ -108,15 +101,11 @@ use crate::causal_tree::state::{
     CausalState, DeliveryConstraints, DerivedState, HopLineage, RawRoutingInput, TrustedParts, TrustedState,
     TurnBudgets, TurnSurfaceKind,
 };
-#[cfg(test)]
 use crate::causal_tree::state::{ObservedArtifact, ObservedArtifactKind};
-#[cfg(test)]
 use crate::causal_tree::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Enqueue, Retention, StoreError, StoreMode};
 use crate::config::ConfigGeneration;
-#[cfg(test)]
 use crate::decision::RequestLimits;
-#[cfg(test)]
 use crate::decision::builtin::weights::STALE_ARTIFACT_MS;
 use crate::decision::factory::{
     BackendPlaneStatus, DecisionBackendFactory, DecisionTransports, FactoryBuildError, FactoryDeps,
@@ -124,9 +113,7 @@ use crate::decision::factory::{
 use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage};
 use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::Memory;
-#[cfg(test)]
 use crate::memory::principal::MemoryWriteContext;
-#[cfg(test)]
 use crate::memory::traits::DecisionMemoryHit;
 use crate::providers::catalog::{CatalogView as ProviderCatalogView, Requirement, ResolvedModel, UnknownPolicy};
 use crate::security::SecurityPolicy;
@@ -296,14 +283,12 @@ pub(crate) struct DecisionPlaneStatus {
 
 /// Metadata-only rehearsal over the already pinned, filtered catalog view.
 /// It never refreshes MCP or starts a discovery process.
-#[cfg(test)]
 struct PinnedCatalogRehearsal<'view, 'catalog> {
     catalog: &'view CatalogView<'catalog>,
 }
 
 /// A query and visibility scope captured by the authenticated CLI ingress.
 /// The opaque probe arguments can only name this exact source-owned query.
-#[cfg(test)]
 struct ScopedMemoryRehearsal<'a> {
     memory: &'a dyn Memory,
     scope: &'a MemoryWriteContext,
@@ -312,7 +297,6 @@ struct ScopedMemoryRehearsal<'a> {
     key: &'a DecisionKey,
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl MemoryProbe for ScopedMemoryRehearsal<'_> {
     async fn count_hits(
@@ -336,9 +320,7 @@ impl MemoryProbe for ScopedMemoryRehearsal<'_> {
     }
 }
 
-#[cfg(test)]
 impl PinnedCatalogRehearsal<'_, '_> {
-    #[cfg(test)]
     fn count(
         &self,
         generation: CatalogGeneration,
@@ -368,7 +350,6 @@ impl PinnedCatalogRehearsal<'_, '_> {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl CatalogProbe for PinnedCatalogRehearsal<'_, '_> {
     async fn availability(
@@ -380,7 +361,6 @@ impl CatalogProbe for PinnedCatalogRehearsal<'_, '_> {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl SkillProbe for PinnedCatalogRehearsal<'_, '_> {
     async fn metadata(
@@ -424,7 +404,6 @@ impl TurnDecisionService {
             .with_surface(&self.publication_policy)
     }
 
-    #[cfg(test)]
     fn emit_agent_phase(
         &self,
         proof: &dyn TurnSourceProof,
@@ -970,7 +949,6 @@ impl TurnDecisionService {
 
 /// Derive parent execution metadata from exactly one final-gated selection.
 /// This private conversion issues no executor lease or dispatch authority.
-#[cfg(test)]
 fn selected_execute_refs(
     decision: &EngineDecision,
     directive: &TurnExecutionDirective,
@@ -1042,7 +1020,6 @@ fn exact_delegator_ref(decision: &EngineDecision, reference: &CapabilityRef) -> 
             exact_mentions,
             ..
         } => (candidates, exact_mentions),
-        #[cfg(test)]
         CandidateSet::NoLegalPath { .. } => return false,
     };
     candidates.iter().any(|candidate| {
@@ -1058,7 +1035,6 @@ fn direct_answer_refs(
     gates: &GateInputs<'_>,
     selected_discovery_refs: &BTreeSet<CapabilityRef>,
 ) -> BTreeSet<CapabilityRef> {
-    #[cfg(test)]
     let fallback_answer = matches!(
         decision.selection,
         crate::causal_tree::decision_select::Selection::Abstain {
@@ -1066,8 +1042,6 @@ fn direct_answer_refs(
             ..
         }
     );
-    #[cfg(not(test))]
-    let fallback_answer = false;
     if fallback_answer || !gates.model_can_call_tools {
         return BTreeSet::new();
     }
@@ -1083,6 +1057,10 @@ fn direct_answer_refs(
             };
             let directly_exposed = matches!(entry.exposure, Exposure::Direct);
             let exact_delegation = delegation && exact_delegator_ref(decision, &reference);
+            // Direct-surface mint already sealed a child manifest for a named
+            // or Direct delegator. Publish that entry so the serving model can
+            // call it without a hop-derived Delegate candidate.
+            let minted_delegator = delegation && decision.prediction.is_none() && decision.outgoing_child.is_some();
             // A selected local search is already a bounded, turn-scoped
             // relevance decision. Carry that exact schema into the serving
             // model's final snapshot when the following hop answers, while
@@ -1090,7 +1068,7 @@ fn direct_answer_refs(
             let selected_discovery = !delegation
                 && matches!(entry.exposure, Exposure::Searchable)
                 && selected_discovery_refs.contains(&reference);
-            if !directly_exposed && !exact_delegation && !selected_discovery {
+            if !directly_exposed && !exact_delegation && !selected_discovery && !minted_delegator {
                 return None;
             }
             if delegation && decision.outgoing_child.is_none() && !directly_exposed {
@@ -1116,9 +1094,19 @@ fn direct_answer_refs(
                     required_capabilities: vec![reference.clone()],
                     side_effect: entry.effect,
                     approval: entry.approval.clone(),
-                    estimated_cost: gates
-                        .child_scope
-                        .and_then(|_| delegation::publication_cost(decision, &reference, delegation)),
+                    estimated_cost: gates.child_scope.and_then(|_| {
+                        delegation::publication_cost(decision, &reference, delegation).or_else(|| {
+                            // Engine-off Direct never admits UseTool candidates, so
+                            // G1 would otherwise refuse every child Direct ref.
+                            decision
+                                .prediction
+                                .is_none()
+                                .then_some(crate::causal_tree::branch::CostEstimate {
+                                    tokens: 0,
+                                    micro_usd: 0,
+                                })
+                        })
+                    }),
                     estimated_latency_ms: None,
                 },
             );
@@ -1151,7 +1139,6 @@ fn discovery_source_guards_clear(state: &CausalState) -> bool {
     discovery_source_guards_clear_in(state, None)
 }
 
-#[cfg(test)]
 fn discovery_source_guards_clear_in(state: &CausalState, family: Option<CapabilityTarget>) -> bool {
     !state.trusted.parts().approval_pending
         && !state.derived.candidates().iter().any(|candidate| {
@@ -1159,7 +1146,6 @@ fn discovery_source_guards_clear_in(state: &CausalState, family: Option<Capabili
         })
 }
 
-#[cfg(test)]
 fn discovery_can_answer(decision: &EngineDecision) -> bool {
     selected_discovery_family(decision).is_ok_and(|family| discovery_source_guards_clear_in(&decision.state, family))
         && decision
@@ -1279,14 +1265,13 @@ impl TurnDecisionContext {
             crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => {
                 Some(candidate_id.target().as_str())
             }
-            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => {
                 Some(candidate_id.target().as_str())
             }
-            #[cfg(test)]
             crate::causal_tree::decision_select::Selection::Abstain { .. } => Some("none"),
+            crate::causal_tree::decision_select::Selection::RequestApproval { .. } => None,
             #[cfg(test)]
-            _ => None,
+            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(_) => None,
         }
     }
 
@@ -1300,9 +1285,7 @@ impl TurnDecisionContext {
                 .is_some_and(crate::tools::capability::execution_trace::ExecutionTrace::is_sealed)
                 .then_some(CausalActionKind::UseTool),
             TurnExecutionDirective::Delegate { .. } => Some(CausalActionKind::Delegate),
-            #[cfg(test)]
             TurnExecutionDirective::Clarify { .. } => Some(CausalActionKind::Clarify),
-            #[cfg(test)]
             TurnExecutionDirective::Refuse { .. } => Some(CausalActionKind::Refuse),
             _ => None,
         }
@@ -1330,7 +1313,7 @@ impl TurnDecisionContext {
         &mut self,
         proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
     ) {
-        self.directive = TurnExecutionDirective::CollectApprovalArguments;
+        self.directive = TurnExecutionDirective::CollectApprovalArguments(proof.clone());
         self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
@@ -1406,7 +1389,7 @@ impl TurnDecisionContext {
                 reply: render_terminal_directive(&self.directive)?,
             }),
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments if !self.execution_closed.load(Ordering::Acquire) => {
+            TurnExecutionDirective::CollectApprovalArguments(_) if !self.execution_closed.load(Ordering::Acquire) => {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
@@ -1418,7 +1401,7 @@ impl TurnDecisionContext {
                 Ok(TurnDisposition::Run)
             }
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments => Err(DirectiveError::NotAdmitted),
+            TurnExecutionDirective::CollectApprovalArguments(_) => Err(DirectiveError::NotAdmitted),
             TurnExecutionDirective::AnswerDirectly
             | TurnExecutionDirective::Execute { .. }
             | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
@@ -1452,14 +1435,14 @@ impl TurnDecisionContext {
     pub(crate) fn diagnostic_directive_kind(&self) -> (&'static str, String) {
         match &self.directive {
             TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.clone()),
-            TurnExecutionDirective::Refuse { policy_code } => ("Refuse", policy_code.clone()),
+            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.clone()),
             TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable".to_owned()),
             TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable".to_owned()),
             TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable".to_owned()),
             TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable".to_owned()),
             TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable".to_owned()),
             TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable".to_owned()),
-            TurnExecutionDirective::CollectApprovalArguments => {
+            TurnExecutionDirective::CollectApprovalArguments(_) => {
                 ("CollectApprovalArguments", "not_applicable".to_owned())
             }
         }
@@ -1467,19 +1450,17 @@ impl TurnDecisionContext {
 
     #[cfg(test)]
     pub(crate) const fn carries_collect_directive_for_test(&self) -> bool {
-        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments)
+        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments(_))
     }
 }
 
 /// Whether a finished memory read lets the turn answer: new evidence always
 /// does; a completed read that found nothing does only for a message that asks
 /// for something. A blank message has nothing to answer and stays closed.
-#[cfg(test)]
 fn read_finishes_retrieval(observed: &MemoryHopObservation, routing_input: &str) -> bool {
     observed.fresh_read || (observed.completed_ok && !routing_input.trim().is_empty())
 }
 
-#[cfg(test)]
 struct MemoryHopObservation {
     state: CausalState,
     fresh_read: bool,
@@ -1505,7 +1486,6 @@ pub(crate) enum AgentDecisionError {
     Directive(#[from] DirectiveError),
     #[error("decision deadline cannot be represented")]
     Deadline,
-    #[cfg(test)]
     #[error("decision action has no Agent execution port")]
     UnsupportedAction,
     #[error(transparent)]
@@ -1552,7 +1532,6 @@ pub(crate) enum AgentDiscoveryError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Selected(#[from] DiscoveryIssueError),
-    #[cfg(test)]
     #[error("selected discovery exceeds the configured decision hop limit")]
     HopLimit,
 }
@@ -1567,13 +1546,10 @@ pub(crate) enum AgentRetrievalError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Selected(#[from] RetrievalIssueError),
-    #[cfg(test)]
     #[error("selected evidence read exceeded the pinned decision deadline")]
     Deadline,
-    #[cfg(test)]
     #[error("selected evidence read exceeds the configured decision hop limit")]
     HopLimit,
-    #[cfg(test)]
     #[error("selected evidence read failed")]
     Backend(#[source] anyhow::Error),
 }
@@ -1581,7 +1557,6 @@ pub(crate) enum AgentRetrievalError {
 /// Convert selected read results into bounded runtime observations. A row's
 /// source_event_id is stored metadata, not an authenticated event receipt.
 /// The retrieval step itself receives a runtime-issued event id separately.
-#[cfg(test)]
 fn memory_artifacts_from_selected_read(
     hits: &[DecisionMemoryHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1613,7 +1588,6 @@ fn memory_artifacts_from_selected_read(
         .collect()
 }
 
-#[cfg(test)]
 fn document_artifacts_from_selected_read(
     hits: &[crate::memory::traits::DecisionDocumentHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1642,7 +1616,6 @@ fn document_artifacts_from_selected_read(
         .collect()
 }
 
-#[cfg(test)]
 fn session_artifacts_from_selected_read(
     hits: &[crate::memory::traits::DecisionSessionHit],
     now: chrono::DateTime<chrono::Utc>,
@@ -1887,7 +1860,6 @@ impl TurnDecisionService {
 
     /// A selected Discover can inspect only the pinned catalog view for this
     /// exact source turn. It does not publish refs to the tool executor.
-    #[cfg(test)]
     fn discover_selected_agent_refs(
         &self,
         proof: &dyn TurnSourceProof,
@@ -1927,7 +1899,6 @@ impl TurnDecisionService {
         Ok(refs)
     }
 
-    #[cfg(test)]
     async fn retrieve_selected_agent_evidence(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2040,7 +2011,6 @@ impl TurnDecisionService {
     /// A backend failure or deadline becomes a failed/cancelled read step for
     /// the fresh local terminal. Provenance and selection failures stay hard.
     /// Row metadata cannot mint an event receipt.
-    #[cfg(test)]
     async fn observe_selected_agent_memory(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2104,6 +2074,29 @@ impl TurnDecisionService {
             #[cfg(test)]
             selected_artifacts,
         })
+    }
+
+    /// Compile a prediction when recovery is on and a local backend can
+    /// answer (loopback HTTP, or an explicit Builtin), or the operator
+    /// enabled the decision engine with a remote backend. Default
+    /// Auto-without-endpoint and engine-off remote stay on the Direct surface.
+    pub(super) fn should_run_prediction_hop(&self) -> bool {
+        let config = &self.generation.effective;
+        if !config.causal_tree.enabled {
+            return false;
+        }
+        if matches!(
+            config.causal_tree.backend.kind,
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin)
+        ) {
+            return true;
+        }
+        matches!(
+            crate::decision::factory::configured_selection(&config.causal_tree),
+            Some(selection)
+                if selection.locality == crate::decision::BackendLocality::Loopback
+                    || config.decision_engine.enabled
+        )
     }
 
     /// Build the turn context, G6 slice and SendLimits without a prediction
@@ -2264,7 +2257,19 @@ impl TurnDecisionService {
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
-        let engine = EngineDecision::without_prediction(state, deadline, decision_id);
+        let mut engine = EngineDecision::without_prediction(state, deadline, decision_id);
+        if let Some(issued) =
+            self.outgoing_delegation(proof, &engine.state, decision_id, &DiscoveredRefs::empty(), &catalog)
+        {
+            engine.outgoing_child = Some(
+                crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(
+                    &issued.parent,
+                    &issued.requested,
+                )
+                .map_err(crate::causal_tree::decision_engine::EngineError::from)?,
+            );
+            engine.outgoing_parent_allowed = Some(issued.parent.allowed);
+        }
         let call_fingerprints = resume_evidence
             .as_ref()
             .map_or_else(BTreeMap::new, |evidence| evidence.calls.clone());
@@ -2342,7 +2347,7 @@ impl TurnDecisionService {
                 cancellation,
                 None,
                 None,
-                #[cfg(feature = "llm-router")]
+                #[cfg(all(test, feature = "llm-router"))]
                 None,
             )
             .await?;
@@ -2366,13 +2371,26 @@ impl TurnDecisionService {
             .sessions_spawn
             .allow_recursive_delegation
             .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
+        if self.should_run_prediction_hop() {
+            let admission = self
+                .decide_agent_initial_inner(
+                    proof,
+                    kind,
+                    cancellation,
+                    Some(&admitted),
+                    None,
+                    #[cfg(all(test, feature = "llm-router"))]
+                    None,
+                )
+                .await?;
+            return self.record_issued_decision(proof, admission, cancellation).await;
+        }
         let opened = self
             .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
             .await?;
         self.record_opened_context(proof, opened, cancellation).await
     }
 
-    #[cfg(test)]
     async fn decide_agent_initial_inner(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2380,7 +2398,7 @@ impl TurnDecisionService {
         cancellation: &CancellationToken,
         resume: Option<&pending_approval::AdmittedDecisionResume>,
         segment_observation: Option<&segment_observation::SegmentObservation>,
-        #[cfg(feature = "llm-router")] mut routing: Option<&mut routing::RouterContinuation<'_>>,
+        #[cfg(all(test, feature = "llm-router"))] mut routing: Option<&mut routing::RouterContinuation<'_>>,
     ) -> Result<accounting::AdmissionDecision, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
@@ -2514,11 +2532,11 @@ impl TurnDecisionService {
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let mut routing_hop = None;
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let mut routing_closed = false;
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         if let Some(continuation) = routing.as_deref_mut() {
             let (decision, next) = boxed_router_history_field(|| {
                 self.router_history_hop(&state, deadline, continuation, cancellation, &accounting)
@@ -2533,21 +2551,21 @@ impl TurnDecisionService {
             }
             routing_hop = Some(decision);
         }
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let proof: &dyn TurnSourceProof = routing
             .as_deref()
             .map_or(proof, |continuation| continuation.source().as_ref());
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let router_transition = routing.as_deref().and_then(routing::RouterContinuation::transition);
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let has_router_transition = router_transition.is_some();
-        #[cfg(not(feature = "llm-router"))]
+        #[cfg(not(all(test, feature = "llm-router")))]
         let has_router_transition = false;
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let routing_failed = routing.as_deref().is_some_and(routing::RouterContinuation::failed);
-        #[cfg(not(feature = "llm-router"))]
+        #[cfg(not(all(test, feature = "llm-router")))]
         let routing_failed = false;
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let budget = if let Some(compaction) = routing
             .as_deref()
             .and_then(routing::RouterContinuation::main_compaction)
@@ -2573,7 +2591,7 @@ impl TurnDecisionService {
         };
         // Only the history path re-admits a model. The ordinary path retains
         // its existing resolved value and allocation count.
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         let (model, model_ref) = if routing.is_some() {
             let model = self.resolve_agent_model(proof)?;
             let model_ref = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
@@ -2634,13 +2652,13 @@ impl TurnDecisionService {
             if cancellation.is_cancelled() && !has_router_transition {
                 return Err(AgentDecisionError::Cancelled);
             }
-            #[cfg(feature = "llm-router")]
+            #[cfg(all(test, feature = "llm-router"))]
             let prior_hops = if router_transition.is_some() {
                 prior_hops
             } else {
                 Vec::new()
             };
-            #[cfg(not(feature = "llm-router"))]
+            #[cfg(not(all(test, feature = "llm-router")))]
             let prior_hops = {
                 let _ = prior_hops;
                 Vec::<EngineDecision>::new()
@@ -2755,6 +2773,7 @@ impl TurnDecisionService {
                 main_parameters: Default::default(),
                 execution_trace: std::sync::OnceLock::new(),
                 execution_closed: Arc::new(AtomicBool::new(false)),
+                #[cfg(test)]
                 approval_collection_started: AtomicBool::new(false),
                 collected_approval_result: std::sync::OnceLock::new(),
                 discovery_offers: std::sync::OnceLock::new(),
@@ -2771,7 +2790,7 @@ impl TurnDecisionService {
                 execution_refs: BTreeSet::new(),
                 #[cfg(test)]
                 selected_retrieved: Vec::new(),
-                #[cfg(feature = "llm-router")]
+                #[cfg(all(test, feature = "llm-router"))]
                 router_transition: router_transition.clone(),
             }))
         };
@@ -2779,7 +2798,7 @@ impl TurnDecisionService {
         let mut allow_terminal_answer = false;
         let mut hop_ids = Vec::new();
         let mut prior_hops = Vec::new();
-        #[cfg(feature = "llm-router")]
+        #[cfg(all(test, feature = "llm-router"))]
         if let Some(decision) = routing_hop.take() {
             hop_ids.push(decision.decision_id);
             if routing_closed {
@@ -2810,6 +2829,7 @@ impl TurnDecisionService {
                         main_parameters: Default::default(),
                         execution_trace: std::sync::OnceLock::new(),
                         execution_closed: Arc::new(AtomicBool::new(false)),
+                        #[cfg(test)]
                         approval_collection_started: AtomicBool::new(false),
                         collected_approval_result: std::sync::OnceLock::new(),
                         discovery_offers: std::sync::OnceLock::new(),
@@ -2822,6 +2842,7 @@ impl TurnDecisionService {
                         execution_refs,
                         #[cfg(test)]
                         selected_retrieved: Vec::new(),
+                        #[cfg(all(test, feature = "llm-router"))]
                         router_transition: None,
                     }),
                     telemetry,
@@ -3088,6 +3109,7 @@ impl TurnDecisionService {
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             execution_closed: Arc::new(AtomicBool::new(false)),
+                            #[cfg(test)]
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
@@ -3100,16 +3122,57 @@ impl TurnDecisionService {
                             execution_refs,
                             #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(feature = "llm-router")]
+                            #[cfg(all(test, feature = "llm-router"))]
                             router_transition: router_transition.clone(),
                         }),
                         telemetry,
                     ));
                 }
-                TurnExecutionDirective::CollectApprovalArguments
-                | TurnExecutionDirective::Clarify { .. }
+                TurnExecutionDirective::Clarify { .. }
                 | TurnExecutionDirective::RequestApproval { .. }
                 | TurnExecutionDirective::Refuse { .. } => {
+                    if cancellation.is_cancelled() {
+                        if has_router_transition {
+                            return terminal_after_catalog_drift(&state, prior_hops)
+                                .map(|context| (context, telemetry));
+                        }
+                        return Err(AgentDecisionError::Cancelled);
+                    }
+                    return Ok((
+                        Arc::new(TurnDecisionContext {
+                            _event_memory: Arc::clone(&event_memory),
+                            model_catalog: self.provider_catalog.release_pin(),
+                            resume: None,
+                            accounting: accounting.retained_scope(),
+                            owner_filesystem: owner_filesystem.clone(),
+                            source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
+                            service_id: self.service_id,
+                            record_admitted: AtomicBool::new(false),
+                            recursive_allowance: self.recursive_allowances.retain(proof),
+                            main_parameters: Default::default(),
+                            execution_trace: std::sync::OnceLock::new(),
+                            execution_closed: Arc::new(AtomicBool::new(false)),
+                            #[cfg(test)]
+                            approval_collection_started: AtomicBool::new(false),
+                            collected_approval_result: std::sync::OnceLock::new(),
+                            discovery_offers: std::sync::OnceLock::new(),
+                            discovery_admissions: std::sync::OnceLock::new(),
+                            engine: decision,
+                            prior_hops,
+                            directive,
+                            main_compaction: budget.main_compaction,
+                            hop_ids,
+                            execution_refs: BTreeSet::new(),
+                            #[cfg(test)]
+                            selected_retrieved,
+                            #[cfg(all(test, feature = "llm-router"))]
+                            router_transition: router_transition.clone(),
+                        }),
+                        telemetry,
+                    ));
+                }
+                #[cfg(test)]
+                TurnExecutionDirective::CollectApprovalArguments(_) => {
                     if cancellation.is_cancelled() {
                         if has_router_transition {
                             return terminal_after_catalog_drift(&state, prior_hops)
@@ -3141,9 +3204,8 @@ impl TurnDecisionService {
                             main_compaction: budget.main_compaction,
                             hop_ids,
                             execution_refs: BTreeSet::new(),
-                            #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(feature = "llm-router")]
+                            #[cfg(all(test, feature = "llm-router"))]
                             router_transition: router_transition.clone(),
                         }),
                         telemetry,
@@ -3185,6 +3247,7 @@ impl TurnDecisionService {
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             execution_closed: Arc::new(AtomicBool::new(false)),
+                            #[cfg(test)]
                             approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
@@ -3197,7 +3260,7 @@ impl TurnDecisionService {
                             execution_refs,
                             #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(feature = "llm-router")]
+                            #[cfg(all(test, feature = "llm-router"))]
                             router_transition: router_transition.clone(),
                         }),
                         telemetry,
@@ -3334,7 +3397,6 @@ impl TurnDecisionService {
         Err(AgentDecisionError::UnsupportedAction)
     }
 
-    #[cfg(test)]
     async fn observed_capability_latency(
         &self,
         owner_id: &str,

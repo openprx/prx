@@ -49,6 +49,16 @@ impl DeferredArgumentProof {
     pub(crate) const fn capability(&self) -> &CapabilityRef {
         &self.capability
     }
+
+    #[cfg(test)]
+    pub(crate) fn state_fingerprint(&self) -> &str {
+        &self.state_fingerprint
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn adapter(&self) -> ApprovalReviewAdapter {
+        self.adapter
+    }
 }
 
 /// Validation of persisted evidence is not an authority constructor.

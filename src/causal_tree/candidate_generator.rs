@@ -3,32 +3,20 @@
 //! Kept separate from the `llm-router`-only legacy expander so the new
 //! decision domain also compiles in bare builds.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[cfg(test)]
-use super::branch::CausalActionKind;
-#[cfg(test)]
-use super::branch::OpId;
-#[cfg(test)]
-use super::branch::{ApprovalRequirement, CandidateSpec, CapabilityRef, Ns8, SideEffectClass};
-use super::branch::{CandidateId, CapabilityTarget, CausalCandidate, CostEstimate};
-use super::gates::GateReport;
-#[cfg(test)]
-use super::gates::{GateError, GateInputs, GateOutcome, HardGates};
-#[cfg(test)]
+use super::branch::{
+    ApprovalRequirement, CandidateId, CandidateSpec, CapabilityRef, CapabilityTarget, CausalActionKind,
+    CausalCandidate, CostEstimate, Ns8, OpId, SideEffectClass,
+};
+use super::gates::{GateError, GateInputs, GateOutcome, GateReport, HardGates};
 use super::state::{CausalState, ObservedStepKind, ObservedStepStatus, SideEffectMode};
-#[cfg(test)]
 use crate::decision::DecisionKey;
-use crate::tools::capability::catalog::CapabilityEntry;
-#[cfg(test)]
-use crate::tools::capability::catalog::{CatalogView, Exposure};
+use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
 
 /// The selected Memory hop uses the runtime's scoped lexical read port, not
 /// the tool's `execute` method. Keep its catalog anchor exact so a write tool
 /// in the broad Memory category cannot be mislabeled as Retrieve.
-#[cfg(test)]
 pub(crate) fn is_memory_retrieval_source(entry: &CapabilityEntry) -> bool {
     entry.family == CapabilityTarget::Memory
         && entry.public_name == "memory_search"
@@ -40,7 +28,6 @@ pub(crate) fn is_memory_retrieval_source(entry: &CapabilityEntry) -> bool {
         && matches!(entry.exposure, Exposure::Direct | Exposure::Searchable)
 }
 
-#[cfg(test)]
 pub(crate) fn is_document_retrieval_source(entry: &CapabilityEntry) -> bool {
     entry.family == CapabilityTarget::Document
         && entry.public_name == "document_search"
@@ -49,7 +36,6 @@ pub(crate) fn is_document_retrieval_source(entry: &CapabilityEntry) -> bool {
         && matches!(entry.exposure, Exposure::Direct | Exposure::Searchable)
 }
 
-#[cfg(test)]
 pub(crate) fn is_session_retrieval_source(entry: &CapabilityEntry) -> bool {
     entry.family == CapabilityTarget::Session
         && entry.public_name == "sessions_history"
@@ -58,47 +44,39 @@ pub(crate) fn is_session_retrieval_source(entry: &CapabilityEntry) -> bool {
         && matches!(entry.exposure, Exposure::Direct | Exposure::Searchable)
 }
 
-#[cfg(test)]
 pub(crate) fn is_retrieval_source(entry: &CapabilityEntry) -> bool {
     is_memory_retrieval_source(entry) || is_document_retrieval_source(entry) || is_session_retrieval_source(entry)
 }
 
 /// Exact turn-scoped refs. Production insertion is limited to a validated
 /// selected search in the sibling decision-engine module.
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DiscoveredRefs {
     refs: BTreeSet<CapabilityRef>,
 }
 
-#[cfg(test)]
 impl DiscoveredRefs {
-    #[cfg(test)]
     pub(crate) const fn empty() -> Self {
         Self { refs: BTreeSet::new() }
     }
 
     /// References from selected, final-gated discovery hops only.
-    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &CapabilityRef> {
         self.refs.iter()
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, reference: &CapabilityRef) -> bool {
         self.refs.contains(reference)
     }
 
     /// Preserve only refs issued by final-gated selected searches in this
     /// turn. No discovered ref is an execution grant by itself.
-    #[cfg(test)]
     pub(crate) fn extend_selected(&mut self, selected: Self) -> bool {
         let before = self.refs.len();
         self.refs.extend(selected.refs);
         self.refs.len() != before
     }
 
-    #[cfg(test)]
     pub(super) const fn from_selected_search(refs: BTreeSet<CapabilityRef>) -> Self {
         Self { refs }
     }
@@ -127,9 +105,7 @@ pub(crate) struct CapabilityCostModel {
 /// estimate remains unknown and is rejected by the budget gate.
 pub(crate) trait CostEstimateSource: Send + Sync {
     fn estimate_entry(&self, entry: &CapabilityEntry) -> Option<(CostEstimate, u32)>;
-    #[cfg(test)]
     fn estimate_terminal(&self) -> Option<(CostEstimate, u32)>;
-    #[cfg(test)]
     fn decision_overhead_ms(&self, _action: CausalActionKind, _entry: &CapabilityEntry) -> u32 {
         0
     }
@@ -152,7 +128,6 @@ impl CostEstimateSource for CapabilityCostModel {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct CandidatePolicy<'a> {
     pub key: &'a DecisionKey,
@@ -205,13 +180,10 @@ pub(crate) enum CandidateSet {
         discoverable_families: DiscoveryFamilies,
         candidates: Vec<CausalCandidate>,
         exact_mentions: BTreeSet<CandidateId>,
-        #[cfg(test)]
         truncated: Vec<CandidateId>,
-        #[cfg(test)]
         approval_scopes: BTreeMap<CandidateId, Vec<PendingApproval>>,
         report: GateReport,
     },
-    #[cfg(test)]
     NoLegalPath {
         reason: NoLegalReason,
         /// Admitted terminal bodies retained for fresh post/pre-commit gates.
@@ -221,21 +193,18 @@ pub(crate) enum CandidateSet {
     },
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoLegalReason {
     NoLegalCandidate,
     ApprovalScopeUnavailable,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct PendingApproval {
     pub candidate: CausalCandidate,
     pub op_ids: Vec<OpId>,
 }
 
-#[cfg(test)]
 pub(crate) struct CausalCandidateGenerator;
 
 /// Resolve all discovery identities against the current catalog. Ambiguous,
@@ -257,9 +226,7 @@ fn discovered_lifecycle_entry<'a>(catalog: &CatalogView<'a>, refs: &DiscoveredRe
     Some(entry)
 }
 
-#[cfg(test)]
 impl CausalCandidateGenerator {
-    #[cfg(test)]
     pub(crate) fn generate(
         state: &CausalState,
         catalog: &CatalogView<'_>,
@@ -271,7 +238,6 @@ impl CausalCandidateGenerator {
 
     /// Rebuild a fresh candidate set for a turn that has exhausted useful
     /// read hops. Terminal candidates still pass the ordinary three gates.
-    #[cfg(test)]
     pub(crate) fn generate_terminal_only(
         state: &CausalState,
         catalog: &CatalogView<'_>,
@@ -283,7 +249,6 @@ impl CausalCandidateGenerator {
 
     /// The runtime supplies only the exact target of an authenticated resume.
     /// This restores candidate intent, never an execution or discovery grant.
-    #[cfg(test)]
     pub(super) fn generate_with_resume_target(
         state: &CausalState,
         catalog: &CatalogView<'_>,
@@ -294,7 +259,6 @@ impl CausalCandidateGenerator {
         Self::generate_mode(state, catalog, policy, gates, false, resume_target)
     }
 
-    #[cfg(test)]
     fn generate_mode(
         state: &CausalState,
         catalog: &CatalogView<'_>,
@@ -721,7 +685,6 @@ impl CausalCandidateGenerator {
     }
 }
 
-#[cfg(test)]
 fn select_family_candidate<'a>(
     action: CausalActionKind,
     family: CapabilityTarget,
@@ -825,7 +788,6 @@ fn select_family_candidate<'a>(
 /// One filesystem plan can require reading and editing, or writing and then
 /// reading. Combine only individually gated native adapters (at most three),
 /// retaining exact refs, maximum effect, all approval ids and checked estimates.
-#[cfg(test)]
 fn is_native_file_entry(entry: &CapabilityEntry) -> bool {
     entry.family == CapabilityTarget::Filesystem
         && entry.namespace == "native"
@@ -833,7 +795,6 @@ fn is_native_file_entry(entry: &CapabilityEntry) -> bool {
         && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")
 }
 
-#[cfg(test)]
 fn native_file_group(members: &[CausalCandidate], namespace: Option<Ns8>) -> CausalCandidate {
     let estimated_cost = members.iter().try_fold(
         CostEstimate {
@@ -890,7 +851,6 @@ fn native_file_group(members: &[CausalCandidate], namespace: Option<Ns8>) -> Cau
     .with_decision_overhead_ms(overhead)
 }
 
-#[cfg(test)]
 fn from_entry(
     action: CausalActionKind,
     family: CapabilityTarget,
@@ -940,7 +900,6 @@ fn from_entry(
 /// Record why a generator probe left the candidate set. Probes that fail a
 /// gate are retained as diagnostic outcomes when the final candidate set
 /// does not contain their ID. They never supply executable candidate bodies.
-#[cfg(test)]
 fn trace_rejected(
     candidate: &CausalCandidate,
     outcome: &GateOutcome,
@@ -968,7 +927,6 @@ fn trace_rejected(
     }
 }
 
-#[cfg(test)]
 fn terminal(action: CausalActionKind, policy: &CandidatePolicy<'_>) -> CausalCandidate {
     let estimate = policy.cost_model.estimate_terminal();
     CausalCandidate::new(
@@ -1002,7 +960,6 @@ fn terminal(action: CausalActionKind, policy: &CandidatePolicy<'_>) -> CausalCan
     )
 }
 
-#[cfg(test)]
 fn approval_candidate(target: CapabilityTarget) -> CausalCandidate {
     CausalCandidate::new(
         CausalActionKind::RequestApproval,
@@ -1026,7 +983,6 @@ fn approval_candidate(target: CapabilityTarget) -> CausalCandidate {
 /// and an MCP tool with one fixed approval operation. Under Supervised
 /// autonomy every discovered MCP tool qualifies; multi-operation entries such
 /// as nodes do not.
-#[cfg(test)]
 pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
     match entry.family {
         CapabilityTarget::Filesystem => {
@@ -1042,13 +998,11 @@ pub(crate) fn collectable_approval_entry(entry: &CapabilityEntry) -> bool {
 
 /// The text names the capability itself (public name or id), not one of its
 /// bare aliases, which are ordinary words such as `write` or `search`.
-#[cfg(test)]
 pub(super) fn names_entry(folded_text: &str, entry: &CapabilityEntry) -> bool {
     contains_bounded(folded_text, &entry.id.as_str().to_lowercase())
         || contains_bounded(folded_text, &entry.public_name.to_lowercase())
 }
 
-#[cfg(test)]
 fn available_for_fallback(entry: &CapabilityEntry, policy: &CandidatePolicy<'_>) -> bool {
     !matches!(entry.exposure, Exposure::Searchable)
         || policy.discovered_refs.contains(&CapabilityRef {
@@ -1058,7 +1012,6 @@ fn available_for_fallback(entry: &CapabilityEntry, policy: &CandidatePolicy<'_>)
         })
 }
 
-#[cfg(test)]
 pub(super) fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool {
     entry
         .exact_mention_terms
@@ -1070,7 +1023,6 @@ pub(super) fn exact_mention(folded_text: &str, entry: &CapabilityEntry) -> bool 
 /// Keep the concrete Skill as the exact candidate so generic target-choice
 /// ties cannot disagree with the cheaper, more specific candidate's score.
 /// This changes intent ranking only; every Skill reference still passes gates.
-#[cfg(test)]
 pub(super) fn exact_operation_mention(folded_text: &str, entry: &CapabilityEntry, catalog: &CatalogView<'_>) -> bool {
     // A concrete read alias supersedes its mixed-effect management root.
     // Its schema admits only that read; naming a write still keeps the root.
@@ -1095,7 +1047,6 @@ pub(super) fn exact_operation_mention(folded_text: &str, entry: &CapabilityEntry
             .any(|skill| exact_mention(folded_text, skill) && entry.loads_read_only_skill(skill))
 }
 
-#[cfg(test)]
 fn contains_bounded(text: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;

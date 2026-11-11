@@ -88,7 +88,6 @@ impl TryFrom<WireObservations> for ExactCallObservations {
 }
 
 impl ExactCallObservations {
-    #[cfg(test)]
     pub(crate) fn physical_failure_count(&self) -> usize {
         self.calls
             .iter()
@@ -96,7 +95,6 @@ impl ExactCallObservations {
             .count()
     }
 
-    #[cfg(test)]
     pub(crate) fn cached_return_count(&self) -> usize {
         self.calls
             .iter()

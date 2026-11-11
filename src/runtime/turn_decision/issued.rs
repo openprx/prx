@@ -21,6 +21,20 @@ impl TurnDecisionService {
         kind: super::AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        if self.should_run_prediction_hop() {
+            let admission = self
+                .decide_agent_initial_inner(
+                    proof,
+                    kind,
+                    cancellation,
+                    None,
+                    None,
+                    #[cfg(all(test, feature = "llm-router"))]
+                    None,
+                )
+                .await?;
+            return self.record_issued_decision(proof, admission, cancellation).await;
+        }
         let opened = self.open_turn_context(proof, kind, cancellation).await?;
         self.record_opened_context(proof, opened, cancellation).await
     }
@@ -31,6 +45,20 @@ impl TurnDecisionService {
         observation: Option<&super::segment_observation::SegmentObservation>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+        if self.should_run_prediction_hop() {
+            let admission = self
+                .decide_agent_initial_inner(
+                    proof,
+                    super::AgentTurnKind::SingleShot,
+                    cancellation,
+                    None,
+                    observation,
+                    #[cfg(all(test, feature = "llm-router"))]
+                    None,
+                )
+                .await?;
+            return self.record_issued_decision(proof, admission, cancellation).await;
+        }
         let opened = self.open_segment_turn_context(proof, observation, cancellation).await?;
         self.record_opened_context(proof, opened, cancellation).await
     }

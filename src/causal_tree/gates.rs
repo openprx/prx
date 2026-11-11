@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 
 use super::branch::{
@@ -29,11 +28,9 @@ pub(crate) enum GateOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct GateReport {
     pub outcomes: BTreeMap<CandidateId, GateOutcome>,
-    #[cfg(test)]
     pub gate_set_hash: [u8; 32],
 }
 
-#[cfg(test)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GateError {
     #[error("duplicate candidate id in gate input")]
@@ -81,7 +78,6 @@ enum GateScope {
 pub(crate) struct HardGates;
 
 impl HardGates {
-    #[cfg(test)]
     pub(crate) fn apply(
         state: &CausalState,
         catalog: &CatalogView<'_>,
@@ -93,7 +89,6 @@ impl HardGates {
 
     /// Recheck with a monotonically narrowed runtime accounting snapshot. The
     /// compiled state remains immutable for request/record fingerprint parity.
-    #[cfg(test)]
     pub(crate) fn apply_with_remaining_budget(
         state: &CausalState,
         catalog: &CatalogView<'_>,

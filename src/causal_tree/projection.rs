@@ -27,52 +27,35 @@
 //! [`ProjectionManifest`], which CDP-19 copies into the request manifest.
 
 use std::borrow::Cow;
-#[cfg(test)]
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
+use serde_json::{Value, json};
 
-#[cfg(test)]
 use super::branch::{CausalActionKind, Ns8};
-#[cfg(test)]
 use super::state::{CausalState, DerivedCandidate};
-use crate::decision::DecisionError;
-#[cfg(test)]
-use crate::decision::StructuredValue;
+use crate::decision::{DecisionError, StructuredValue};
 
 /// Bounds of the state v1 contract (`tests/fixtures/decision/state_v1/SCHEMA.md`).
-#[cfg(test)]
 const LATEST_USER_TURN_BYTES: usize = 4096;
-#[cfg(test)]
 const GOAL_BYTES: usize = 1024;
 const ARTIFACT_SUMMARY_CHARS: usize = 256;
-#[cfg(test)]
 const CANDIDATE_SUMMARY_CHARS: usize = 160;
-#[cfg(test)]
 const MAX_STEPS: usize = 32;
-#[cfg(test)]
 const MAX_ARTIFACTS: usize = 16;
-#[cfg(test)]
 const MAX_FAILED_FINGERPRINTS: usize = 16;
-#[cfg(test)]
 const MAX_CONSTRAINTS: usize = 32;
-#[cfg(test)]
 const MAX_CANDIDATES: usize = 64;
 /// The longest run of base64-alphabet characters a projected string keeps
 /// (below the protocol's 1 KiB binary-run limit).
 const MAX_BASE64_RUN: usize = 512;
 /// The cost bucket of a candidate whose cost is unknown: the highest, never
 /// the free one (R-CDP16 L-6).
-#[cfg(test)]
 const UNKNOWN_COST_BUCKET: &str = "b4";
 /// The latency bucket of a candidate whose latency is unknown: the slowest,
 /// never the fastest (D-066 N-4).
-#[cfg(test)]
 const UNKNOWN_LATENCY_BUCKET: &str = "b4";
 
 const REDACTED: &str = "[REDACTED]";
@@ -80,7 +63,6 @@ const PRIVATE_URL: &str = "[private-url]";
 const BINARY: &str = "[binary]";
 
 /// What the projection changed.
-#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ProjectionManifest {
     /// Fields cut to their bound, in projection order.
@@ -94,12 +76,10 @@ pub(crate) struct ProjectionManifest {
 pub(crate) enum ProjectionError {
     /// No candidate is left (CDP-18's `NoLegalPath`): there is nothing to
     /// decide, and state v1 requires at least one candidate.
-    #[cfg(test)]
     #[error("the state has no candidate to decide between")]
     NoCandidates,
     /// More safety candidates (clarify, request approval, refuse) than
     /// state v1 allows; none of them may be dropped.
-    #[cfg(test)]
     #[error("{count} safety candidates exceed the state v1 bound")]
     TooManySafetyCandidates { count: usize },
     /// The object breaks `StructuredLimits::DEFAULT`. The projection's own
@@ -117,7 +97,6 @@ pub(crate) enum ProjectionError {
 /// [`ProjectionError`] when the state has no candidate, has more safety
 /// candidates than state v1 allows, or (unreachable today) breaks
 /// `StructuredLimits`.
-#[cfg(test)]
 pub(crate) fn redacted_projection(
     state: &CausalState,
 ) -> Result<(StructuredValue, ProjectionManifest), ProjectionError> {
@@ -273,7 +252,6 @@ pub(crate) fn redacted_projection(
 
 /// Clear the oldest remaining artifact summary in an already redacted state
 /// projection. The compiler retries the fixed request after each such cut.
-#[cfg(test)]
 pub(crate) fn shrink_oldest_artifact_summary(
     projection: &StructuredValue,
 ) -> Result<Option<StructuredValue>, DecisionError> {
@@ -310,7 +288,6 @@ pub(crate) fn shrink_oldest_artifact_summary(
 }
 
 /// Whether an action is a safety candidate, which a projection never drops.
-#[cfg(test)]
 const fn is_safety(action: CausalActionKind) -> bool {
     matches!(
         action,
@@ -324,7 +301,6 @@ const fn is_safety(action: CausalActionKind) -> bool {
 /// kept and the rest are ranked deterministically: a candidate the user
 /// named exactly first, then available ones, then by action (answer,
 /// retrieve, discover, use a tool, delegate), then by id.
-#[cfg(test)]
 fn select_candidates<'s>(
     all: &'s [DerivedCandidate],
     manifest: &mut ProjectionManifest,
@@ -354,7 +330,6 @@ fn select_candidates<'s>(
 }
 
 /// The last `max` entries of `items`, recording a cut.
-#[cfg(test)]
 fn recent<'a, T>(items: &'a [T], max: usize, field: &'static str, manifest: &mut ProjectionManifest) -> &'a [T] {
     if items.len() > max {
         manifest.truncated.push(field);
@@ -365,7 +340,6 @@ fn recent<'a, T>(items: &'a [T], max: usize, field: &'static str, manifest: &mut
 }
 
 /// The state v1 code grammar `^[a-z0-9][a-z0-9_-]{0,46}$`.
-#[cfg(test)]
 fn is_code(text: &str) -> bool {
     let mut bytes = text.bytes();
     bytes
@@ -376,22 +350,16 @@ fn is_code(text: &str) -> bool {
 }
 
 /// Upper bounds of buckets `b0`..`b3`; anything above is `b4`.
-#[cfg(test)]
 const TOKEN_BUCKETS: [u64; 4] = [1_000, 4_000, 16_000, 64_000];
-#[cfg(test)]
 const LATENCY_BUCKETS: [u64; 4] = [100, 500, 2_000, 10_000];
-#[cfg(test)]
 const COST_BUCKETS: [u64; 4] = [100, 1_000, 10_000, 100_000];
-#[cfg(test)]
 const BUCKET_CODES: [&str; 5] = ["b0", "b1", "b2", "b3", "b4"];
 
-#[cfg(test)]
 fn bucket(value: u64, bounds: &[u64; 4]) -> &'static str {
     let index = bounds.iter().take_while(|bound| value >= **bound).count();
     BUCKET_CODES.get(index).copied().unwrap_or("b4")
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy)]
 enum Bound {
     Bytes(usize),
@@ -399,7 +367,6 @@ enum Bound {
 }
 
 /// `text` redacted, sanitized and cut to `bound`, with the manifest updated.
-#[cfg(test)]
 fn project_text(text: &str, bound: Bound, field: &'static str, manifest: &mut ProjectionManifest) -> String {
     let (redacted, changed) = redact_text(text);
     if changed {
@@ -423,7 +390,6 @@ pub(crate) fn bounded_artifact_summary(text: &str) -> (String, bool, bool) {
     (summary, was_redacted, was_truncated)
 }
 
-#[cfg(test)]
 fn cut_bytes(text: String, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text, false);

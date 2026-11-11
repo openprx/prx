@@ -1,8 +1,8 @@
 //! Source-bound discovery offers. An offer does not grant dispatch authority.
 mod append;
 use super::{
-    Arc, BTreeMap, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, Context, Exposure, GateInputs,
-    Ordering, TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
+    Arc, BTreeMap, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, Exposure, GateInputs, Ordering,
+    TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
 };
 use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CausalActionKind};
 use crate::causal_tree::candidate_generator::CandidateSet;
@@ -109,7 +109,9 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly) {
+        if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly)
+            && !self.publication_policy.direct_names.contains("capability_search")
+        {
             let signals = crate::decision::builtin::features::text_signals(context.engine.state.routing_input.as_str());
             if !signals.structural()
                 && signals.request_weight <= crate::decision::builtin::weights::BRIEF_REQUEST_MAX_WEIGHT
@@ -140,10 +142,11 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        let descriptor = self
-            .execution
-            .current_descriptor("capability_search")
-            .context("capability search descriptor is absent")?;
+        let Some(descriptor) = self.execution.current_descriptor("capability_search") else {
+            // A child registry can inherit the parent's catalog entry without
+            // the control-port backend. Hide the port; do not fail the turn.
+            return Ok(None);
+        };
         let spec = ToolSpec {
             name: descriptor.public_name,
             description: descriptor.description,
@@ -192,7 +195,6 @@ impl TurnDecisionService {
                         }
                     }
                 }
-                #[cfg(test)]
                 CandidateSet::NoLegalPath { .. } => {}
             }
         }
@@ -203,6 +205,19 @@ impl TurnDecisionService {
                 && !families.contains(&entry.family)
             {
                 families.push(entry.family);
+            }
+        }
+        // Engine-off Direct (`without_prediction`) never runs the generator, so
+        // `discoverable_families` stays empty. Offer the same searchable families
+        // the generator would have marked so the control port can still publish.
+        if families.is_empty() {
+            for entry in view.iter_entries() {
+                if entry.supports_metadata_discovery()
+                    && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(entry.family)
+                    && !families.contains(&entry.family)
+                {
+                    families.push(entry.family);
+                }
             }
         }
         Ok(families)

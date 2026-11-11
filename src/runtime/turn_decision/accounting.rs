@@ -1,25 +1,17 @@
 //! Bounded admission resources and deferred physical-send accounting.
-use super::TurnDecisionContext;
-#[cfg(test)]
-use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
-#[cfg(test)]
+use super::{TurnBudgets, TurnDecisionContext, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
 use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
-#[cfg(test)]
 use crate::decision::{DecisionError, KeyDomain};
 use crate::runtime::causal_events::PersistenceGuard;
-#[cfg(test)]
 use crate::runtime::decision_accounting::AccountingScope;
-#[cfg(test)]
 use async_trait::async_trait;
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
-#[cfg(test)]
-use std::time::Instant;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 pub(super) type AdmissionDecision = (Arc<TurnDecisionContext>, Option<PersistenceGuard>);
 
-#[cfg(test)]
 pub(super) struct TurnAccounting<'a> {
     service: &'a TurnDecisionService,
     proof: &'a dyn TurnSourceProof,
@@ -30,7 +22,6 @@ pub(super) struct TurnAccounting<'a> {
 
 /// The telemetry guard belongs to admission, independently of the physical
 /// accounting scope that an issued context can retain after admission ends.
-#[cfg(test)]
 pub(super) fn admission_persistence(
     service: &TurnDecisionService,
     proof: &dyn TurnSourceProof,
@@ -52,7 +43,6 @@ pub(super) fn admission_persistence(
     })
 }
 
-#[cfg(test)]
 pub(super) fn admission_resources<'a>(
     service: &'a TurnDecisionService,
     proof: &'a dyn TurnSourceProof,
@@ -65,9 +55,7 @@ pub(super) fn admission_resources<'a>(
     )
 }
 
-#[cfg(test)]
 impl<'a> TurnAccounting<'a> {
-    #[cfg(test)]
     pub(super) fn ensure_scope(&self) -> Result<Arc<AccountingScope>, DecisionError> {
         if self.service.generation.effective.causal_tree.enabled
             && (!self.service.durable_key || !self.service.recordable)
@@ -106,12 +94,10 @@ impl<'a> TurnAccounting<'a> {
         scope.as_ref().map(Arc::clone).ok_or(DecisionError::BudgetExceeded)
     }
 
-    #[cfg(test)]
     pub(super) fn retained_scope(&self) -> Option<Arc<AccountingScope>> {
         self.scope.get().and_then(|scope| scope.as_ref().map(Arc::clone))
     }
 
-    #[cfg(test)]
     pub(super) fn remaining_budgets(&self) -> TurnBudgets {
         self.scope.get().and_then(Option::as_ref).map_or_else(
             || TurnBudgets {
@@ -125,7 +111,6 @@ impl<'a> TurnAccounting<'a> {
         )
     }
 
-    #[cfg(test)]
     pub(super) const fn new(
         service: &'a TurnDecisionService,
         proof: &'a dyn TurnSourceProof,
@@ -142,10 +127,8 @@ impl<'a> TurnAccounting<'a> {
     }
 }
 
-#[cfg(test)]
 impl budget::sealed::AccountingOwner for TurnAccounting<'_> {}
 
-#[cfg(test)]
 #[async_trait]
 impl DecisionAttemptAccounting for TurnAccounting<'_> {
     fn remaining_budget(&self) -> (u64, u64) {

@@ -119,7 +119,6 @@ impl DurableCausalEventSink {
 
     /// A source-bound admission may defer only its own ordinary events. Drain
     /// overrides that preference; deferral expires at the admission deadline.
-    #[cfg(test)]
     pub(super) fn defer_ordinary_persistence(&self, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
         self.deferral.begin(lineage, deadline)
     }

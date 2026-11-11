@@ -3,36 +3,23 @@
 //! The compiler reads only the redacted state projection. Question ids,
 //! options and instructions come from typed actions, targets and fixed text.
 
-#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Instant;
 
-#[cfg(test)]
 use serde_json::Value;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-#[cfg(test)]
 use super::branch::{ApprovalRequirement, CandidateId, CausalActionKind, CausalCandidate};
-#[cfg(test)]
 use super::candidate_generator::{CandidateSet, PendingApproval};
-use super::projection::ProjectionError;
-#[cfg(test)]
-use super::projection::{redacted_projection, shrink_oldest_artifact_summary};
-#[cfg(test)]
+use super::projection::{ProjectionError, redacted_projection, shrink_oldest_artifact_summary};
 use super::state::CausalState;
-use crate::decision::DecisionError;
-#[cfg(test)]
 use crate::decision::{
-    CandidateQuestion, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, OmissionReason, OptionId,
-    ProjectionAudit, QuestionId, RequestLimits, RequestParts, RequestRule, StructuredValue,
+    CandidateQuestion, DecisionError, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, OmissionReason,
+    OptionId, ProjectionAudit, QuestionId, RequestLimits, RequestParts, RequestRule, StructuredValue,
 };
 
 /// Inputs bound by the runtime to this decision hop.
-#[cfg(test)]
 pub(crate) struct CompilerPolicy<'a> {
     pub key: &'a DecisionKey,
     pub model: Option<&'a str>,
@@ -41,7 +28,6 @@ pub(crate) struct CompilerPolicy<'a> {
 }
 
 /// The sealed request and local projection facts the service records with it.
-#[cfg(test)]
 pub(crate) struct CompiledQuestionRequest {
     request: DecisionRequest,
     /// Values that a selector reads as probability 1 when a Choice question
@@ -49,21 +35,17 @@ pub(crate) struct CompiledQuestionRequest {
     forced_choices: BTreeMap<GlobalQuestion, OptionId>,
 }
 
-#[cfg(test)]
 impl CompiledQuestionRequest {
-    #[cfg(test)]
     pub(crate) const fn request(&self) -> &DecisionRequest {
         &self.request
     }
 
-    #[cfg(test)]
     pub(crate) fn forced_choice(&self, question: GlobalQuestion) -> Option<&OptionId> {
         self.forced_choices.get(&question)
     }
 
     /// Check the sidecar against the sealed omission manifest and the exact
     /// admitted set before extraction treats an omitted Choice as certain.
-    #[cfg(test)]
     pub(crate) fn forced_choices_match(&self, candidates: &[CausalCandidate]) -> bool {
         let working: Vec<_> = candidates
             .iter()
@@ -123,13 +105,10 @@ impl CompiledQuestionRequest {
 pub(crate) enum CompileError {
     #[error("state fingerprint serialization failed")]
     Fingerprint(#[source] serde_json::Error),
-    #[cfg(test)]
     #[error("a NoLegalPath has no decision request")]
     NoLegalPath,
-    #[cfg(test)]
     #[error("state candidates differ from the admitted candidate set")]
     CandidateMismatch,
-    #[cfg(test)]
     #[error("decision request exceeds its byte budget after artifact shrinking")]
     Budget,
     #[error(transparent)]
@@ -138,12 +117,9 @@ pub(crate) enum CompileError {
     Protocol(#[from] DecisionError),
 }
 
-#[cfg(test)]
 pub(crate) struct QuestionCompiler;
 
-#[cfg(test)]
 impl QuestionCompiler {
-    #[cfg(test)]
     pub(crate) fn compile(
         state: &CausalState,
         candidate_set: &CandidateSet,
@@ -399,7 +375,6 @@ impl QuestionCompiler {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn hash_candidate_set(
     candidates: &[CausalCandidate],
     exact_mentions: &BTreeSet<CandidateId>,
@@ -437,7 +412,6 @@ pub(crate) fn hash_candidate_set(
     hex::encode(hasher.finalize())
 }
 
-#[cfg(test)]
 fn hash_candidate(hasher: &mut Sha256, candidate: &CausalCandidate) {
     hash_text(hasher, candidate.candidate_id().as_str());
     hash_text(hasher, candidate.side_effect().as_str());
@@ -478,13 +452,11 @@ fn hash_candidate(hasher: &mut Sha256, candidate: &CausalCandidate) {
     }
 }
 
-#[cfg(test)]
 fn hash_text(hasher: &mut Sha256, text: &str) {
     hasher.update(text.len().to_be_bytes());
     hasher.update(text.as_bytes());
 }
 
-#[cfg(test)]
 const fn is_fixed_terminal(action: CausalActionKind) -> bool {
     matches!(
         action,
@@ -492,12 +464,10 @@ const fn is_fixed_terminal(action: CausalActionKind) -> bool {
     )
 }
 
-#[cfg(test)]
 fn fixed_text(text: &str) -> Result<StructuredValue, DecisionError> {
     StructuredValue::try_from(Value::String(text.to_string()))
 }
 
-#[cfg(test)]
 fn score_levels() -> Result<Vec<StructuredValue>, DecisionError> {
     ["very low", "low", "moderate", "high", "very high"]
         .into_iter()

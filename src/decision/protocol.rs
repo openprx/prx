@@ -784,7 +784,6 @@ impl DecisionRequest {
 
     /// Recover original compiler ownership on failure without cloning a
     /// successful request. Recovery carries no sealed request or authority.
-    #[cfg(test)]
     pub(crate) fn seal_recovering_parts(
         parts: RequestParts,
         projection_audit: ProjectionAudit,

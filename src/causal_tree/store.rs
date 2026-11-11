@@ -63,7 +63,6 @@ const DB_FILE: &str = "decisions.db";
 
 /// Limit the owner-scoped history before the outcome join. The query-plan
 /// regression below keeps this read on the existing scope/time index.
-#[cfg(test)]
 const CAPABILITY_LATENCY_SQL: &str = "WITH recent AS (
     SELECT decision_id, catalog_generation, created_at_ms FROM decisions
     WHERE workspace_id = ?1 AND owner_id = ?2
@@ -1904,7 +1903,6 @@ impl DecisionStoreReader {
     /// Fewer than five unambiguous complete outcomes leave the family default
     /// in force. Only the newest 1024 scoped decisions are joined, and at
     /// most 1024 outcome rows are decoded.
-    #[cfg(test)]
     pub(crate) fn capability_latency_p50(
         &self,
         workspace_id: &str,

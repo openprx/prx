@@ -7,13 +7,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::branch::CausalActionKind;
-#[cfg(test)]
-use super::branch::{CandidateId, CapabilityTarget};
+use super::branch::{CandidateId, CapabilityTarget, CausalActionKind};
 use super::candidate_generator::CandidateSet;
-#[cfg(test)]
-use super::decision_engine::PredictionAuditAnswer;
-use super::decision_engine::{EngineDecision, FallbackCause};
+use super::decision_engine::{EngineDecision, FallbackCause, PredictionAuditAnswer};
 use super::decision_score::SCORER_VERSION;
 use super::decision_select::Selection;
 use super::gates::{GateOutcome, GateReport};
@@ -84,11 +80,7 @@ impl GateRejections {
     }
 
     fn for_hop(hop: &EngineDecision) -> Self {
-        let report = match &hop.candidates {
-            CandidateSet::Legal { report, .. } => report,
-            #[cfg(test)]
-            CandidateSet::NoLegalPath { report, .. } => report,
-        };
+        let (CandidateSet::Legal { report, .. } | CandidateSet::NoLegalPath { report, .. }) = &hop.candidates;
         Self::from_reports([report, &hop.post_rehearsal, &hop.pre_commit])
     }
 }
@@ -117,7 +109,6 @@ impl DecisionRecordBuilder {
             }
             let prior = match (index, hop.state.lineage) {
                 (0, HopLineage::First) => None,
-                #[cfg(test)]
                 (position, HopLineage::After { hop, prior_decision_id })
                     if usize::from(hop.get()) == position
                         && records.last().is_some_and(|record: &DecisionRecord| {
@@ -146,8 +137,7 @@ impl DecisionRecordBuilder {
     /// Persist the actual selected first Router hop before its read begins.
     /// Rebuilding it in the eventual full chain uses the same immutable hop,
     /// IDs and timestamps, so the store requires an identical replay hash.
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(test, feature = "llm-router"))]
     pub(crate) fn build_router_history_read(
         hop: &EngineDecision,
         key: &DecisionKey,
@@ -195,7 +185,6 @@ impl DecisionRecordBuilder {
             .material_fingerprint(key)
             .map_err(RecordBuildError::Fingerprint)?;
         let catalog_generation = trusted.catalog_generation.to_hex();
-        #[cfg(test)]
         let projection = match (&hop.audit_trace, record_redacted_projection) {
             (Some(trace), enabled) => {
                 if trace.state_fingerprint != state_fingerprint
@@ -211,11 +200,6 @@ impl DecisionRecordBuilder {
             }
             (None, _) if hop.prediction.is_none() => None,
             _ => return Err(RecordBuildError::Binding),
-        };
-        #[cfg(not(test))]
-        let projection = {
-            let _ = record_redacted_projection;
-            None
         };
         let (backend_kind, backend_locality, configured_model, backend_endpoint, claimed_model, provider_request_id) =
             hop.prediction.as_ref().map_or_else(
@@ -244,7 +228,6 @@ impl DecisionRecordBuilder {
             );
         let candidates = match &hop.candidates {
             CandidateSet::Legal { candidates, .. } => candidates,
-            #[cfg(test)]
             CandidateSet::NoLegalPath { terminals, .. } => terminals,
         };
         let candidates = candidates
@@ -266,9 +249,7 @@ impl DecisionRecordBuilder {
         let (distributions, features) = audit_fields(hop)?;
         let builtin_shadow = shadow_fields(hop);
         let first_gates = match &hop.candidates {
-            CandidateSet::Legal { report, .. } => report,
-            #[cfg(test)]
-            CandidateSet::NoLegalPath { report, .. } => report,
+            CandidateSet::Legal { report, .. } | CandidateSet::NoLegalPath { report, .. } => report,
         };
         let mut gate_values = serde_json::Map::new();
         gate_values.insert("pre_prediction".to_owned(), gate_fields(first_gates, key));
@@ -277,7 +258,31 @@ impl DecisionRecordBuilder {
         let rejected = json!(GateRejections::for_hop(hop));
         gate_values.insert("rejected_by_gate".to_owned(), rejected.clone());
         gate_values.insert("turn_rejected_by_gate".to_owned(), rejected);
+        #[cfg(test)]
+        let mut gates = Value::Object(gate_values);
+        #[cfg(not(test))]
         let gates = Value::Object(gate_values);
+        #[cfg(test)]
+        if let Selection::CollectApprovalArguments(proof) = &hop.selection {
+            if proof.state_fingerprint() != state_fingerprint
+                || hop.request_compiled
+                || hop.prediction.is_some()
+                || !hop.scores.is_empty()
+                || hop.outgoing_child.is_some()
+            {
+                return Err(RecordBuildError::Binding);
+            }
+            gates.as_object_mut().ok_or(RecordBuildError::Binding)?.insert(
+                "approval_collection".to_owned(),
+                json!({ "version": 1, "state_fingerprint": proof.state_fingerprint(),
+                    "capability": { "id": proof.capability().id.as_str(),
+                        "schema": hex::encode(proof.capability().fingerprint.0),
+                        "generation": proof.capability().generation.to_hex() }, "adapter": match proof.adapter() {
+                        super::approval_collection::ApprovalReviewAdapter::ChatOwnerReview => "chat_owner_review",
+                        super::approval_collection::ApprovalReviewAdapter::ConsoleOwnerReview => "console_owner_review",
+                    } }),
+            );
+        }
         let attempts = hop.prediction.as_ref().map_or_else(Vec::new, |prediction| {
             prediction
                 .attempts
@@ -388,7 +393,6 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
             fallback,
             *propensity,
         ),
-        #[cfg(test)]
         Selection::Recover {
             candidate_id,
             reason_code,
@@ -398,13 +402,11 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
             Some(*reason_code),
             1.0,
         ),
-        #[cfg(test)]
         Selection::RequestApproval {
             terminal_id,
             reason_code,
             ..
         } => (Some(terminal_id.clone()), "request_approval", Some(*reason_code), 1.0),
-        #[cfg(test)]
         Selection::Abstain { action, reason_code } => {
             let terminal_id = CandidateId::new(*action, CapabilityTarget::None, None);
             let admitted = match &hop.candidates {
@@ -440,13 +442,9 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
 
 const fn fallback_code(cause: FallbackCause) -> &'static str {
     match cause {
-        #[cfg(test)]
         FallbackCause::NoLegalPath => "no_legal_path",
-        #[cfg(test)]
         FallbackCause::ExpiredBeforePrediction => "expired_before_prediction",
-        #[cfg(test)]
         FallbackCause::DecisionFailed => "decision_failed",
-        #[cfg(test)]
         FallbackCause::DeadlineExceeded => "deadline_exceeded",
         FallbackCause::HopStopped => "hop_stopped",
     }
@@ -488,23 +486,10 @@ fn gate_fields(report: &GateReport, key: &DecisionKey) -> Value {
 }
 
 fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), RecordBuildError> {
-    #[cfg(test)]
     let mut distributions = RecordedDistributions::default();
-    #[cfg(not(test))]
-    let distributions = RecordedDistributions::default();
-    #[cfg(test)]
     let mut answer_fields = serde_json::Map::new();
-    #[cfg(not(test))]
-    let answer_fields = serde_json::Map::new();
-    #[cfg(test)]
-    let mut omitted: BTreeMap<String, &'static str> = BTreeMap::new();
-    #[cfg(not(test))]
-    let omitted: BTreeMap<String, &'static str> = BTreeMap::new();
-    #[cfg(test)]
-    let mut forced: BTreeMap<String, String> = BTreeMap::new();
-    #[cfg(not(test))]
-    let forced: BTreeMap<String, String> = BTreeMap::new();
-    #[cfg(test)]
+    let mut omitted = BTreeMap::new();
+    let mut forced = BTreeMap::new();
     if let Some(trace) = &hop.audit_trace {
         for (id, answer) in &trace.answers {
             let value = match answer {
@@ -563,29 +548,15 @@ fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), 
             }),
         );
     }
-    #[cfg(test)]
-    let abstain_fallback = matches!(
-        hop.selection,
-        Selection::Abstain {
-            action: CausalActionKind::Answer,
-            ..
-        }
-    );
-    #[cfg(not(test))]
-    let abstain_fallback = false;
-    let hop_stopped_fallback = matches!(
-        &hop.selection,
-        Selection::Commit { candidate_id, .. }
-            if candidate_id.action() == CausalActionKind::Answer
-                && hop.fallback_cause == Some(FallbackCause::HopStopped)
-    );
     let mut features = json!({
         "answers":answer_fields,
         "omitted_questions":omitted,
         "forced_choices":forced,
         "scores":scores,
         "fallback_cause":hop.fallback_cause.map(fallback_code),
-        "fallback": (abstain_fallback || hop_stopped_fallback).then_some("answer_on_abstention"),
+        "fallback": (matches!(hop.selection, Selection::Abstain { action: CausalActionKind::Answer, .. })
+            || matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped)))
+            .then_some("answer_on_abstention"),
         "factory_reason":hop.prediction.as_ref().and_then(|prediction| prediction.reason.map(factory_reason)),
     });
     if let Selection::Commit {

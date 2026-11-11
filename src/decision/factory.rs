@@ -285,7 +285,6 @@ impl PredictionResult {
     /// True only when every configured backend reached response validation and
     /// every such response failed it. Transport, service, circuit and budget
     /// failures keep the deterministic builtin eligible.
-    #[cfg(test)]
     pub(crate) fn all_configured_attempts_failed_semantic_validation(&self) -> bool {
         self.reason == Some(FallbackReason::AllFailed)
             && !self.attempts.is_empty()
@@ -300,7 +299,6 @@ impl PredictionResult {
     /// The serving result can authorize terminal continuation. A builtin
     /// shadow remains usable after infrastructure fallback, but not after all
     /// configured responses failed semantic validation.
-    #[cfg(test)]
     pub(crate) fn served_attempt_succeeded(&self) -> bool {
         match self.served_by {
             ServedBy::Builtin => !self.all_configured_attempts_failed_semantic_validation(),
@@ -383,15 +381,12 @@ impl Slot {
 
 /// Engine-facing borrowed adapter. The original sealed accounting owner and
 /// physical attempt construction stay in the decision/runtime boundary.
-#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct AccountedPrediction<'a> {
     factory: &'a DecisionBackendFactory,
     accounting: Option<&'a dyn super::budget::DecisionAttemptAccounting>,
 }
-#[cfg(test)]
 impl crate::causal_tree::decision_engine::prediction_sealed::Producer for AccountedPrediction<'_> {}
-#[cfg(test)]
 impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction<'_> {
     fn remaining_budget(&self) -> Option<(u64, u64)> {
         self.accounting.map(|owner| owner.remaining_budget())
@@ -689,7 +684,6 @@ impl Emitter<'_> {
 }
 
 impl DecisionBackendFactory {
-    #[cfg(test)]
     pub(crate) fn prediction_port<'a>(
         &'a self,
         accounting: Option<&'a dyn super::budget::DecisionAttemptAccounting>,
@@ -786,9 +780,21 @@ impl DecisionBackendFactory {
         // would fail once enabled fails now. It reads local state only.
         let selected = match configured_selection(section) {
             None => None,
-            // A disabled plane, and a disabled decision engine, build no
-            // backend; they never open the credential store (D-082 N-9).
-            Some(selection) if !section.enabled || !config.decision_engine.enabled => {
+            // A disabled plane builds no backend. A disabled decision engine
+            // still builds a loopback HTTP slot so native/local fixtures compile
+            // predictions; a remote backend never opens the credential store
+            // while the engine is off (D-082 N-9).
+            Some(selection) if !section.enabled => {
+                crate::providers::selection::check_decision_model(
+                    deps.catalog,
+                    &selection.provider,
+                    backend.model.trim(),
+                    &selection.credential,
+                )
+                .map_err(FactoryBuildError::Selection)?;
+                None
+            }
+            Some(selection) if !config.decision_engine.enabled && selection.locality != BackendLocality::Loopback => {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
                     &selection.provider,
@@ -925,7 +931,6 @@ impl DecisionBackendFactory {
     /// The one configured model of retained eligible slots, before sealing.
     /// Builtin/default, disabled, keyless and excluded slots supply none.
     /// A divergent test-only slot order cannot define one compiler model.
-    #[cfg(test)]
     pub(crate) fn request_model(&self) -> Option<&str> {
         if !self.enabled {
             return None;
