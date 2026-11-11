@@ -2067,6 +2067,8 @@ impl TurnDecisionService {
             catalog_generation: catalog.generation(),
             policy_version: Arc::clone(&self.policy_version),
             resolved_model: Arc::clone(&model_ref),
+            resolved_provider: Arc::from(model.provider_label()),
+            resolved_model_id: Arc::from(model.model()),
         });
         let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
         let decision_id = DecisionId::new_runtime();
@@ -2308,6 +2310,8 @@ impl TurnDecisionService {
             catalog_generation: catalog.generation(),
             policy_version: Arc::clone(&self.policy_version),
             resolved_model: Arc::clone(&model_ref),
+            resolved_provider: Arc::from(model.provider_label()),
+            resolved_model_id: Arc::from(model.model()),
         });
         let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
         let goal = resume_evidence.as_ref().map_or_else(

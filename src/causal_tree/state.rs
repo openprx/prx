@@ -137,14 +137,27 @@ pub(crate) struct TrustedParts {
     pub(crate) delivery: DeliveryConstraints,
     pub(crate) catalog_generation: CatalogGeneration,
     pub(crate) policy_version: Arc<str>,
-    /// The PMM-resolved model reference of the turn.
+    /// The PMM-resolved model reference of the turn (`{provider}:{model}`).
     pub(crate) resolved_model: Arc<str>,
+    /// PMM provider label. Carried with [`Self::resolved_model_id`] so pricing
+    /// hints do not parse [`Self::resolved_model`].
+    pub(crate) resolved_provider: Arc<str>,
+    /// PMM model id of the turn.
+    pub(crate) resolved_model_id: Arc<str>,
 }
 
 impl TrustedParts {
     pub(crate) fn owner_isolated(&self) -> bool {
         self.constraints.iter().any(|code| code.as_str() == "owner_isolated")
     }
+
+    /// Bind the PMM provider/model pair and the joined `resolved_model` ref.
+    pub(crate) fn bind_resolved_model(&mut self, provider: &str, model: &str) {
+        self.resolved_provider = Arc::from(provider);
+        self.resolved_model_id = Arc::from(model);
+        self.resolved_model = Arc::from(format!("{provider}:{model}"));
+    }
+
     pub(crate) fn excludes_entry(
         &self,
         entry: crate::causal_tree::state::model_admission::ModelAdmissionEntry<'_>,
@@ -803,6 +816,8 @@ pub(crate) mod fixtures {
             catalog_generation: CatalogGeneration([7; 32]),
             policy_version: Arc::from("policy-1"),
             resolved_model: Arc::from("anthropic:claude"),
+            resolved_provider: Arc::from("anthropic"),
+            resolved_model_id: Arc::from("claude"),
         }
     }
 

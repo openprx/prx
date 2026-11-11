@@ -217,22 +217,16 @@ fn refine_budget(decision: &EngineDecision) -> Option<RefusalReason> {
         }
     }
     if unpriced {
-        return Some(unpriced_reason(decision.state.trusted.parts().resolved_model.as_ref()));
+        let parts = decision.state.trusted.parts();
+        return Some(unpriced_reason(
+            parts.resolved_provider.as_ref(),
+            parts.resolved_model_id.as_ref(),
+        ));
     }
     if exhausted {
         return Some(RefusalReason::Budget);
     }
     None
-}
-
-/// `{provider_label}:{model}`. Custom URL labels contain `://`; colon-tagged
-/// model ids do not.
-fn provider_model_pair(resolved_model: &str) -> (&str, &str) {
-    if resolved_model.contains("://") {
-        resolved_model.rsplit_once(':').unwrap_or(("", resolved_model))
-    } else {
-        resolved_model.split_once(':').unwrap_or(("", resolved_model))
-    }
 }
 
 fn display_field(text: &str) -> String {
@@ -244,8 +238,7 @@ fn display_field(text: &str) -> String {
         .to_string()
 }
 
-fn unpriced_reason(resolved_model: &str) -> RefusalReason {
-    let (provider, model) = provider_model_pair(resolved_model);
+fn unpriced_reason(provider: &str, model: &str) -> RefusalReason {
     let model = display_field(model);
     let provider = display_field(provider);
     let price_key = if model.contains('/') || provider.is_empty() {
@@ -367,32 +360,39 @@ mod tests {
     }
 
     #[test]
-    fn unpriced_reason_splits_provider_model_for_the_price_key() {
-        match unpriced_reason("openrouter:deepseek/deepseek-v3.2") {
+    fn unpriced_reason_uses_the_carried_provider_model_pair() {
+        match unpriced_reason("openrouter", "deepseek/deepseek-v3.2") {
             RefusalReason::UnpricedModel { model, price_key } => {
                 assert_eq!(model, "deepseek/deepseek-v3.2");
                 assert_eq!(price_key, "deepseek/deepseek-v3.2");
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
-        match unpriced_reason("kimi-code:kimi-for-coding") {
+        match unpriced_reason("kimi-code", "kimi-for-coding") {
             RefusalReason::UnpricedModel { model, price_key } => {
                 assert_eq!(model, "kimi-for-coding");
                 assert_eq!(price_key, "kimi-code/kimi-for-coding");
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
-        match unpriced_reason("custom:http://127.0.0.1:9/v1:prx-unpriced-fixture") {
+        match unpriced_reason("custom:http://127.0.0.1:9/v1", "prx-unpriced-fixture") {
             RefusalReason::UnpricedModel { model, price_key } => {
                 assert_eq!(model, "prx-unpriced-fixture");
                 assert_eq!(price_key, "custom:http://127.0.0.1:9/v1/prx-unpriced-fixture");
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
-        match unpriced_reason("ollama:llama3.2:3b") {
+        match unpriced_reason("ollama", "llama3.2:3b") {
             RefusalReason::UnpricedModel { model, price_key } => {
                 assert_eq!(model, "llama3.2:3b");
                 assert_eq!(price_key, "ollama/llama3.2:3b");
+            }
+            other => panic!("expected unpriced, got {other:?}"),
+        }
+        match unpriced_reason("custom:https://llm.example/v1", "llama3.2:3b") {
+            RefusalReason::UnpricedModel { model, price_key } => {
+                assert_eq!(model, "llama3.2:3b");
+                assert_eq!(price_key, "custom:https://llm.example/v1/llama3.2:3b");
             }
             other => panic!("expected unpriced, got {other:?}"),
         }
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn unpriced_hint_does_not_echo_a_redacted_secret() {
-        let reason = unpriced_reason("openrouter:sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop");
+        let reason = unpriced_reason("openrouter", "sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop");
         let hint = reason.user_hint().expect("unpriced has a hint");
         assert!(
             !hint.contains("sk-ant-api03-prx-redaction-sentinel-abcdefghijklmnop"),
@@ -415,16 +415,18 @@ mod tests {
         // query value. redact_provider_text masks every query value and fragment.
         const QUERY_SECRET: &str = "opaque-query-secret";
         const FRAGMENT_SECRET: &str = "opaque-fragment";
-        let raw = format!("custom:https://llm.example/v1?region={QUERY_SECRET}#{FRAGMENT_SECRET}:prx-unpriced-fixture");
+        let provider = format!("custom:https://llm.example/v1?region={QUERY_SECRET}#{FRAGMENT_SECRET}");
         assert!(
-            crate::security::redaction::redact_secrets(&raw).contains(QUERY_SECRET),
+            crate::security::redaction::redact_secrets(&provider).contains(QUERY_SECRET),
             "redact_secrets must leave a non-credential query value"
         );
         assert!(
-            crate::security::redaction::redact_secrets(&raw).contains(FRAGMENT_SECRET),
+            crate::security::redaction::redact_secrets(&provider).contains(FRAGMENT_SECRET),
             "redact_secrets must leave a URL fragment"
         );
-        let hint = unpriced_reason(&raw).user_hint().expect("unpriced has a hint");
+        let hint = unpriced_reason(&provider, "prx-unpriced-fixture")
+            .user_hint()
+            .expect("unpriced has a hint");
         assert!(!hint.contains(QUERY_SECRET), "{hint}");
         assert!(!hint.contains(FRAGMENT_SECRET), "{hint}");
         assert!(!hint.contains('\n'), "{hint}");
@@ -433,7 +435,7 @@ mod tests {
 
     #[test]
     fn unpriced_hint_keeps_the_model_display_on_one_line() {
-        let reason = unpriced_reason("openrouter:evil\nReason: injected");
+        let reason = unpriced_reason("openrouter", "evil\nReason: injected");
         let hint = reason.user_hint().expect("unpriced has a hint");
         assert!(!hint.contains("injected"), "{hint}");
         assert_eq!(hint.lines().count(), 1, "{hint}");

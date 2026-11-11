@@ -674,7 +674,7 @@ impl TurnDecisionService {
             let admitted = original.with_admitted_router_selection(token)?;
             let model = self.resolve_agent_model(admitted.as_ref())?;
             let mut parts = state.trusted.parts().clone();
-            parts.resolved_model = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
+            parts.bind_resolved_model(model.provider_label(), model.model());
             let effective = effective_agent_exclusions(
                 config,
                 &self.registry,
