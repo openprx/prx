@@ -392,6 +392,7 @@ pub(super) struct ChatFixtureAdmission {
     pub(super) service: Arc<ToolExecutionService>,
     pub(super) context: crate::tools::ToolExecutionContext,
     pub(super) fabric: crate::memory::MemoryFabric,
+    pub(super) approval_router: Arc<ApprovalRouter>,
 }
 
 pub(super) async fn admit_chat_fixture(
@@ -588,6 +589,7 @@ async fn admit_chat_fixture_with_mode(
         service,
         context,
         fabric,
+        approval_router,
     }
 }
 

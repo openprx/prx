@@ -516,6 +516,7 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
             .is_none(),
         "plain approval uses open_turn_context with no prediction port"
     );
+    let approval_router = Arc::clone(&admitted.approval_router);
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     let driver = tokio::spawn(drive_start_turn_stream(
         Some(admitted.binding),
@@ -539,6 +540,7 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
         Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
     ));
 
+    let mut saw_approval_requested = false;
     let mut saw_approval_required = false;
     let mut saw_finished = false;
     let mut saw_completed = false;
@@ -548,6 +550,18 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
             .expect("approval action within timeout")
             .expect("approval action channel remains open");
         match action {
+            Action::ToolApprovalRequested { name, tool_id, .. } if name == APPROVAL_TOOL => {
+                assert_eq!(
+                    executions.load(AtomicOrdering::SeqCst),
+                    0,
+                    "pending approval must not run the backend"
+                );
+                assert!(
+                    approval_router.resolve(&tool_id, false),
+                    "deny the actual pending request"
+                );
+                saw_approval_requested = true;
+            }
             Action::ToolStarted { name, .. } if name == APPROVAL_TOOL => {
                 panic!("unapproved tool reached execution preparation")
             }
@@ -557,7 +571,7 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
                 assert!(!success, "unapproved probe must be rejected");
                 let result = result.expect("approval-required result");
                 assert!(
-                    result.contains("Approval is required") && result.contains("has not run"),
+                    result.contains("User rejected tool approval"),
                     "unexpected approval result: {result}"
                 );
                 assert_eq!(
@@ -579,7 +593,7 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
     driver.await.expect("plain approval driver task");
     drop(action_tx);
     assert!(
-        saw_approval_required && saw_finished && saw_completed,
+        saw_approval_requested && saw_approval_required && saw_finished && saw_completed,
         "approval_required={saw_approval_required} finished={saw_finished} completed={saw_completed}"
     );
     assert_eq!(executions.load(AtomicOrdering::SeqCst), 0);

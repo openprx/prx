@@ -718,9 +718,9 @@ impl AgentTurnProof {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the CLI Agent turn does not match its authenticated runtime origin")]
 enum AgentTurnOriginError {
-    Mismatch,
+    #[error("the CLI Agent turn does not match its authenticated runtime origin ({0})")]
+    Mismatch(&'static str),
 }
 
 /// Only this entrypoint may issue a CLI Agent origin. Scheduled overrides are
@@ -756,7 +756,10 @@ fn issue_cli_agent_turn_proof_for_session(
     recorded_event: Option<&crate::memory::MessageEvent>,
     choice: &AgentModelChoice,
 ) -> Result<AgentTurnProof, AgentTurnOriginError> {
-    let run_id = envelope.run_id.as_deref().ok_or(AgentTurnOriginError::Mismatch)?;
+    let run_id = envelope
+        .run_id
+        .as_deref()
+        .ok_or(AgentTurnOriginError::Mismatch("missing_run_id"))?;
     let workspace_id = generation.effective.workspace_dir.to_string_lossy();
     let owner_id = crate::memory::principal::OwnerPrincipal::new(
         workspace_id.as_ref(),
@@ -792,9 +795,11 @@ fn issue_cli_agent_turn_proof_for_session(
         || envelope.session_key != expected_session_key
         || envelope.config_generation_id != Some(generation.id.0)
         || envelope.config_source_revision.as_deref() != Some(&generation.source_revision.fingerprint_sha256)
-        || !choice.factory_credential_source_matches(&generation.effective)
     {
-        return Err(AgentTurnOriginError::Mismatch);
+        return Err(AgentTurnOriginError::Mismatch("envelope"));
+    }
+    if !choice.factory_credential_source_matches(&generation.effective) {
+        return Err(AgentTurnOriginError::Mismatch("credential_source"));
     }
     let recorded_event_id = match recorded_event {
         Some(event) if event.id > 0 => {
@@ -819,11 +824,13 @@ fn issue_cli_agent_turn_proof_for_session(
                 || event.content != routing_input
                 || event.visibility != crate::memory::MemoryVisibility::Session
             {
-                return Err(AgentTurnOriginError::Mismatch);
+                return Err(AgentTurnOriginError::Mismatch("recorded_event"));
             }
             Some(event.event_id.as_str())
         }
-        Some(_) | None if generation.effective.causal_tree.enabled => return Err(AgentTurnOriginError::Mismatch),
+        Some(_) | None if generation.effective.causal_tree.enabled => {
+            return Err(AgentTurnOriginError::Mismatch("missing_recorded_event"));
+        }
         Some(_) | None => None,
     };
     Ok(AgentTurnProof {
