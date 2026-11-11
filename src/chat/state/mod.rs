@@ -1116,8 +1116,6 @@ impl ChatState {
                 }
                 vec![Effect::RequestRedraw]
             }
-            Action::HistoryCleared => self.reduce_history_cleared(),
-            Action::HistoryClearedWithNotice { notice } => self.reduce_history_cleared_with_notice(notice),
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
             Action::HistoryCompactionPatchApplied {
                 reason,
@@ -1404,11 +1402,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // (a persistence field, not a snapshot/UI field) → no UI dirty.
         Action::BackgroundSessionRecorded { .. } => false,
 
-        // UI mirror ledger / history clear / Pure-mode user echo: touch conversation_lines → dirty
-        Action::SystemMessageAdded { .. }
-        | Action::HistoryCleared
-        | Action::HistoryClearedWithNotice { .. }
-        | Action::UserMessageEchoed(_) => true,
+        // UI mirror ledger / Pure-mode user echo: touch conversation_lines → dirty
+        Action::SystemMessageAdded { .. } | Action::UserMessageEchoed(_) => true,
         // v1b/P1: writes sessions snapshot fields → dirty. The main loop only
         // dispatches these when content changes, and reducers also no-op
         // identical writes, so this never churns frames.

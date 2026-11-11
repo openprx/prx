@@ -345,43 +345,6 @@ impl ChatState {
         vec![Effect::SaveSession(self.build_session_snapshot())]
     }
 
-    /// `Action::HistoryCleared` — clear the LLM context history (keeping the system prompt) + clear UI.
-    ///
-    /// session.turns is not cleared (the persisted record is irreversible); only the LLM context (so the
-    /// next request carries no history) and the TUI conversation_lines display are reset.
-    pub(super) fn reduce_history_cleared(&mut self) -> Vec<Effect> {
-        // Defensively keep every system message (usually just one, but scan all in case it is not first)
-        let system_msgs: Vec<_> = self.session.history.drain(..).filter(|m| m.role == "system").collect();
-        // history was emptied by drain(..), so re-insert the system messages
-        self.session.history.extend(system_msgs);
-        // Note: the current input buffer is left alone; InputCancelled handles that separately
-        self.ui.conversation_lines.clear();
-        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
-        vec![
-            Effect::RequestRedraw,
-            Effect::LogTrace {
-                level: tracing::Level::INFO,
-                msg: "History cleared".to_string(),
-            },
-        ]
-    }
-
-    pub(super) fn reduce_history_cleared_with_notice(&mut self, notice: String) -> Vec<Effect> {
-        let mut effects = self.reduce_history_cleared();
-        #[cfg(feature = "terminal-tui")]
-        {
-            self.ui
-                .conversation_lines
-                .push(crate::chat::tui::ConversationLine::System { content: notice });
-        }
-        #[cfg(not(feature = "terminal-tui"))]
-        {
-            let _ = notice;
-        }
-        effects.push(Effect::RequestRedraw);
-        effects
-    }
-
     /// `Action::HistoryCompacted` — compact the LLM context history.
     ///
     /// The algorithm matches `chat::mod::compact_chat_history` exactly (during dual-write both paths must

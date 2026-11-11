@@ -201,10 +201,6 @@ async fn dispatcher_drives_all_action_variants() {
         Action::PasteReceived("paste".to_string()),
         Action::CancelRequested,
         Action::ShutdownRequested,
-        Action::HistoryCleared,
-        Action::HistoryClearedWithNotice {
-            notice: "Conversation cleared".to_string(),
-        },
         Action::ForceQuit,
         Action::ToolCardFoldToggled,
         Action::ReasoningFoldToggled,

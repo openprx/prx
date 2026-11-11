@@ -9,74 +9,6 @@ fn s() -> ChatState {
     ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
 }
 
-/// S2-C-1: redux_history_cleared_on_slash_clear_keeps_system_only
-///
-/// Simulates the /clear path: on HistoryCleared the reducer must keep every system message and
-/// clear user/assistant. It checks that the reducer ends up equivalent to legacy
-/// `history.clear() + conditional push of system` (legacy re-pushes only when skill_rag is off;
-/// the reducer simply keeps the existing system, which equals the skill_rag.enabled path).
-#[test]
-fn redux_history_cleared_on_slash_clear_keeps_system_only() {
-    let mut state = s();
-    // starting history: system + 2 user + 2 assistant
-    state.session.history.push(ChatMessage::system("sys-prompt-v1"));
-    state.session.history.push(ChatMessage::user("u1"));
-    state.session.history.push(ChatMessage::assistant("a1"));
-    state.session.history.push(ChatMessage::user("u2"));
-    state.session.history.push(ChatMessage::assistant("a2"));
-    assert_eq!(state.session.history.len(), 5);
-
-    let effects = state.reduce(Action::HistoryCleared);
-
-    // terminal state: only the system entry remains
-    assert_eq!(
-        state.session.history.len(),
-        1,
-        "after HistoryCleared only 1 system entry may remain in history"
-    );
-    let kept = state
-        .session
-        .history
-        .first()
-        .expect("test: history must hold 1 system entry");
-    assert_eq!(kept.role, "system");
-    assert_eq!(kept.content, "sys-prompt-v1");
-
-    // RequestRedraw + LogTrace must be emitted
-    assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
-    assert!(effects.iter().any(|e| matches!(e, Effect::LogTrace { .. })));
-
-    // boundary: repeated /clear must be idempotent (still only one system)
-    let _ = state.reduce(Action::HistoryCleared);
-    assert_eq!(
-        state.session.history.len(),
-        1,
-        "a second /clear still keeps 1 system entry"
-    );
-}
-
-#[cfg(feature = "terminal-tui")]
-#[test]
-fn redux_history_cleared_with_notice_keeps_visible_feedback() {
-    let mut state = s();
-    state.session.history.push(ChatMessage::system("sys-prompt-v1"));
-    state.ui.conversation_lines.push(ConversationLine::User {
-        content: "/clear".to_string(),
-    });
-
-    let effects = state.reduce(Action::HistoryClearedWithNotice {
-        notice: "Conversation cleared (kept system prompt).".to_string(),
-    });
-
-    assert_eq!(state.session.history.len(), 1);
-    assert_eq!(state.ui.conversation_lines.len(), 1);
-    assert!(
-        matches!(state.ui.conversation_lines.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
-        "clear notice must survive the same reducer step that clears conversation_lines"
-    );
-    assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
-}
-
 /// S2-C-2: redux_history_append_order_user_assistant_stable
 ///
 /// After dispatching SetLeadingSystemPrompt + RecordUserTurn + RecordAssistantTurn, session.history
@@ -202,57 +134,6 @@ fn redux_system_message_mirror_and_state_consistent() {
     });
     assert_eq!(state.ui.conversation_lines.len(), 3);
     assert_eq!(state.session.history.len(), 1, "session.history is still 1");
-}
-
-/// S2-C-bonus2 (Codex P0 regression): dispatching SetLeadingSystemPrompt after /clear must keep
-/// the terminal state at <= 1 system entry — using RecordSystemMessage by mistake would pile up
-/// 2+ system entries. This test simulates the full mod.rs:1254-1287 /clear !skill_rag.enabled path.
-#[test]
-fn redux_clear_then_set_leading_yields_single_system() {
-    let mut state = s();
-    // starting history: system + a few conversation entries
-    state.session.history.push(ChatMessage::system("old-system"));
-    state.session.history.push(ChatMessage::user("u1"));
-    state.session.history.push(ChatMessage::assistant("a1"));
-    state.session.history.push(ChatMessage::user("u2"));
-    assert_eq!(state.session.history.len(), 4);
-
-    // Step 1: HistoryCleared (dual-written with legacy `history.clear()`) —
-    // the reducer keeps the old system and drains user/assistant
-    let _ = state.reduce(Action::HistoryCleared);
-    assert_eq!(
-        state.session.history.len(),
-        1,
-        "HistoryCleared keeps only the 1 old system entry"
-    );
-    let after_clear = state.session.history.first().expect("test: post-clear history[0]");
-    assert_eq!(after_clear.content, "old-system");
-
-    // Step 2: SetLeadingSystemPrompt (dual-written with legacy `history.push(new system)`) —
-    // upsert: replace the existing leading system with the new prompt (never append)
-    let _ = state.reduce(Action::SetLeadingSystemPrompt {
-        content: "new-system".to_string(),
-    });
-    // Key point: the terminal state must still be 1 system with the new content (not 2 system entries)
-    assert_eq!(
-        state.session.history.len(),
-        1,
-        "/clear + SetLeadingSystemPrompt must end with 1 system entry, never accumulate"
-    );
-    let after_reset = state.session.history.first().expect("test: post-reset history[0]");
-    assert_eq!(after_reset.role, "system");
-    assert_eq!(after_reset.content, "new-system");
-
-    // Regression guard: using RecordSystemMessage by mistake would give 2 entries — this explicitly
-    // verifies SetLeadingSystemPrompt does not have append semantics
-    let _ = state.reduce(Action::SetLeadingSystemPrompt {
-        content: "newer-system".to_string(),
-    });
-    assert_eq!(
-        state.session.history.len(),
-        1,
-        "a repeated SetLeadingSystemPrompt still upserts, never appends"
-    );
 }
 
 /// S2-C-bonus (Codex suggestion): SetLeadingSystemPrompt on a non-empty history must replace the

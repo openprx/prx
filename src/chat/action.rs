@@ -295,12 +295,6 @@ pub enum Action {
     /// carried a compatible model argument, or the current model already changed), and the reducer
     /// syncs `session.model` along with it.
     ProviderChanged { provider: String, model: Option<String> },
-    /// Clear the context of the current session (/clear). /new uses SessionLoaded to switch to a new
-    /// session.
-    HistoryCleared,
-    /// Clear the history and append a user-visible receipt in the same UI snapshot.
-    HistoryClearedWithNotice { notice: String },
-
     // ── LLM streaming ───────────────────────────────────────────
     /// A new LLM inference turn starts, carrying the draft_id and cancellation token
     TurnStarted {
@@ -656,8 +650,6 @@ impl Action {
             Self::ModeChanged(_) => "ModeChanged",
             Self::ModelChanged { .. } => "ModelChanged",
             Self::ProviderChanged { .. } => "ProviderChanged",
-            Self::HistoryCleared => "HistoryCleared",
-            Self::HistoryClearedWithNotice { .. } => "HistoryClearedWithNotice",
             Self::TurnStarted { .. } => "TurnStarted",
             Self::StartLLMTurn { .. } => "StartLLMTurn",
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",
