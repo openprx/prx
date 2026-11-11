@@ -624,6 +624,7 @@ async fn run_turn_unguarded(
     let mut completion_correction: Option<String> = None;
     let mut execution_requirement = None;
     let mut inject_execution_retry = false;
+    let mut overflow_recovery_passes = 0;
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
 
@@ -1527,9 +1528,8 @@ async fn run_turn_unguarded(
             }
         };
 
-        // On context overflow, compact and retry for as long as each pass makes
-        // measurable progress. This has no arbitrary retry ceiling and cannot
-        // spin forever once history reaches its minimal representation.
+        // Recover from at most three provider overflows per turn, and only
+        // retry when the restored request view makes measurable progress.
         let (mut response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
                 // A stream that failed after model output is never compacted
@@ -1538,55 +1538,73 @@ async fn run_turn_unguarded(
                     if crate::recovery::overflow::is_context_overflow_error(e)
                         && !is_stream_failure_after_model_output(e) =>
                 {
+                    if overflow_recovery_passes >= 3 {
+                        return Err(crate::agent::turn_contracts::ContextCapacityError::RecoveryPassLimit {
+                            provider_context: crate::providers::sanitize_api_error(&format!("{e:#}")),
+                        }
+                        .into());
+                    }
+                    overflow_recovery_passes += 1;
                     let messages_before_compaction = history.len();
                     let tokens_before_compaction = estimate_history_tokens(history);
+                    let mut current_request = capture_current_turn_request(history);
+                    let mut restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
                     tracing::warn!("Context overflow detected; running compaction and retrying LLM call");
                     let mut emitted_exact_patch = false;
                     if let Some(config) = compaction_config {
-                        if runtime_adapter.stream_provider {
-                            let turns_before = history.len().saturating_sub(usize::from(
-                                history.first().is_some_and(|message| message.role == "system"),
-                            ));
-                            let tokens_before = estimate_history_tokens(history);
-                            match build_configurable_compaction_patch(
-                                history,
-                                provider,
-                                model,
-                                config,
-                                document_ingest.as_ref(),
-                                "overflow_retry",
-                            )
-                            .await
-                            {
-                                Ok(Some(patch)) => {
-                                    let replacement_len = patch.replacement.len();
-                                    apply_compaction_patch_exact(history, &patch);
+                        let mut before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                        let mut degraded_reason = None;
+                        match build_configurable_compaction_patch(
+                            history,
+                            provider,
+                            model,
+                            config,
+                            document_ingest.as_ref(),
+                            "overflow_retry",
+                        )
+                        .await
+                        {
+                            Ok(Some(mut patch)) => {
+                                crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
+                                restore_position = RestoredRequestPosition::Tail;
+                                if runtime_adapter.stream_provider {
+                                    let turns_before = history.len().saturating_sub(usize::from(
+                                        history.first().is_some_and(|message| message.role == "system"),
+                                    ));
+                                    // Compose the entire resulting view before applying or publishing
+                                    // the patch. Restoring Q only in the worker would leave the saved
+                                    // reducer view without the request (or duplicate it on replay).
+                                    let mut compacted = history.clone();
+                                    apply_compaction_patch_exact(&mut compacted, &patch);
                                     let switch_mode = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    if !switch_mode || before_trim.over_hard_limit {
+                                    let budget = plan_context_budget(&compacted, config, PRE_TURN_FLUSH_THRESHOLD);
+                                    before_trim = budget;
+                                    if !switch_mode || budget.over_hard_limit {
                                         trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                                            history,
+                                            &mut compacted,
                                             config,
-                                            replacement_len,
+                                            patch.replacement.len(),
                                         );
                                     }
-                                    if switch_mode && before_trim.over_hard_limit {
-                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        tracing::warn!(
-                                            before_used_tokens = before_trim.used_tokens,
-                                            after_used_tokens = after_trim.used_tokens,
-                                            "context switch retry stayed above the hard limit; degraded to a lossy trim"
-                                        );
-                                        persist_context_switch_degradation(
-                                            document_ingest.as_ref(),
-                                            "overflow_retry",
-                                            "over_hard_limit_after_handoff",
-                                            before_trim.used_tokens,
-                                            after_trim.used_tokens,
-                                            after_trim.available_input_tokens,
-                                        )
-                                        .await;
+                                    if switch_mode && budget.over_hard_limit {
+                                        degraded_reason = Some("over_hard_limit_after_handoff");
                                     }
+                                    restore_current_turn_request(
+                                        &mut compacted,
+                                        current_request.take(),
+                                        "overflow_retry",
+                                        restore_position,
+                                    );
+                                    patch.range_end = history.len();
+                                    patch.guard = crate::agent::compaction::compaction_patch_guard_for(
+                                        history,
+                                        patch.range_start,
+                                        patch.range_end,
+                                    )
+                                    .ok_or_else(|| anyhow::anyhow!("invalid overflow compaction patch range"))?;
+                                    patch.replacement = compacted.into_iter().skip(patch.range_start).collect();
+                                    patch.append_after.clear();
+                                    apply_compaction_patch_exact(history, &patch);
                                     let turns_after = history.len().saturating_sub(usize::from(
                                         history.first().is_some_and(|message| message.role == "system"),
                                     ));
@@ -1599,7 +1617,7 @@ async fn run_turn_unguarded(
                                             patch,
                                             config: config.clone(),
                                             turns_before,
-                                            tokens_before,
+                                            tokens_before: tokens_before_compaction,
                                             turns_after,
                                             tokens_after,
                                             used_context_tokens,
@@ -1607,98 +1625,51 @@ async fn run_turn_unguarded(
                                     )
                                     .await?;
                                     emitted_exact_patch = true;
-                                }
-                                Ok(None) => {
-                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    trim_history_to_context_budget(history, config);
-                                    if history.len() == messages_before_compaction
-                                        && estimate_history_tokens(history) >= tokens_before_compaction
-                                    {
-                                        apply_aggressive_trim(history, config.keep_recent_messages);
-                                    }
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        tracing::warn!(
-                                            "context switch retry could not create an exact handoff; degraded to a lossy trim"
-                                        );
-                                        persist_context_switch_degradation(
-                                            document_ingest.as_ref(),
-                                            "overflow_retry",
-                                            "handoff_unavailable",
-                                            before_trim.used_tokens,
-                                            after_trim.used_tokens,
-                                            after_trim.available_input_tokens,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!("Overflow retry compaction failed: {error}");
-                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        persist_context_switch_degradation(
-                                            document_ingest.as_ref(),
-                                            "overflow_retry",
-                                            "handoff_failed",
-                                            before_trim.used_tokens,
-                                            after_trim.used_tokens,
-                                            after_trim.available_input_tokens,
-                                        )
-                                        .await;
-                                    }
+                                } else {
+                                    apply_compaction_patch_exact(history, &patch);
                                 }
                             }
-                        } else {
-                            match apply_configurable_compaction(
-                                history,
-                                provider,
-                                model,
-                                config,
+                            Ok(None) => {
+                                if runtime_adapter.stream_provider {
+                                    trim_history_to_context_budget(history, config);
+                                }
+                                if !runtime_adapter.stream_provider
+                                    || history.len() == messages_before_compaction
+                                        && estimate_history_tokens(history) >= tokens_before_compaction
+                                {
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                }
+                                degraded_reason = Some("handoff_unavailable");
+                            }
+                            Err(error) => {
+                                tracing::warn!("Overflow retry compaction failed: {error}");
+                                apply_aggressive_trim(history, config.keep_recent_messages);
+                                degraded_reason = Some("handoff_failed");
+                            }
+                        }
+                        restore_current_turn_request(
+                            history,
+                            current_request.take(),
+                            "overflow_retry",
+                            restore_position,
+                        );
+                        if matches!(config.mode, crate::config::AgentCompactionMode::Switch)
+                            && let Some(reason) = degraded_reason
+                        {
+                            let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+                            persist_context_switch_degradation(
                                 document_ingest.as_ref(),
                                 "overflow_retry",
+                                reason,
+                                before_trim.used_tokens,
+                                after_trim.used_tokens,
+                                after_trim.available_input_tokens,
                             )
-                            .await
-                            {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        persist_context_switch_degradation(
-                                            document_ingest.as_ref(),
-                                            "overflow_retry",
-                                            "handoff_unavailable",
-                                            before_trim.used_tokens,
-                                            after_trim.used_tokens,
-                                            after_trim.available_input_tokens,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::warn!("Overflow retry compaction failed: {error}");
-                                    let before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                    if matches!(config.mode, crate::config::AgentCompactionMode::Switch) {
-                                        let after_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
-                                        persist_context_switch_degradation(
-                                            document_ingest.as_ref(),
-                                            "overflow_retry",
-                                            "handoff_failed",
-                                            before_trim.used_tokens,
-                                            after_trim.used_tokens,
-                                            after_trim.available_input_tokens,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
+                            .await;
                         }
                     } else {
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
+                        restore_current_turn_request(history, current_request, "overflow_retry", restore_position);
                     }
                     if !(emitted_exact_patch || runtime_adapter.stream_provider && compaction_config.is_some()) {
                         emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
@@ -1706,7 +1677,10 @@ async fn run_turn_unguarded(
                     let made_progress = history.len() < messages_before_compaction
                         || estimate_history_tokens(history) < tokens_before_compaction;
                     if !made_progress {
-                        anyhow::bail!("context overflow persisted and compaction made no progress: {e}");
+                        return Err(crate::agent::turn_contracts::ContextCapacityError::NoProgress {
+                            provider_context: crate::providers::sanitize_api_error(&format!("{e:#}")),
+                        }
+                        .into());
                     }
                     continue;
                 }

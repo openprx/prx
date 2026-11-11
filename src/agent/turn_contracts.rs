@@ -216,6 +216,26 @@ pub(crate) fn stored_turn_message(role: String, content: String) -> ChatMessage 
     ChatMessage { role, content }
 }
 
+/// Context recovery cannot safely fit the admitted request.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextCapacityError {
+    #[error(
+        "Context capacity exceeded: context overflow persisted and compaction made no progress; the current request was preserved. {provider_context}"
+    )]
+    NoProgress { provider_context: String },
+    #[error(
+        "Context capacity exceeded: context overflow recovery reached its limit of 3 passes; the current request was preserved. {provider_context}"
+    )]
+    RecoveryPassLimit { provider_context: String },
+    #[error(
+        "Context capacity exceeded: system instructions and the current request need {used_tokens} tokens, but only {available_tokens} input tokens are available. Shorten the request or use a larger context window; the request was preserved."
+    )]
+    RequestTooLarge {
+        used_tokens: usize,
+        available_tokens: usize,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolLoopCancelled;
 

@@ -1656,7 +1656,6 @@ fn compaction_patch_for_reducer_without_pending_user(
     if source_history
         .get(pending_index)
         .is_none_or(|message| message.role != "user")
-        || patch.range_end > pending_index
     {
         return patch.clone();
     }
@@ -1731,6 +1730,9 @@ async fn apply_redux_context_rollover(
         return Ok(ContextRolloverOutcome::default());
     }
 
+    let current_request =
+        crate::agent::context_preflight::capture_current_turn_request_with_source(history, compaction_guard_history);
+    let guard_request = crate::agent::context_preflight::capture_current_turn_request(compaction_guard_history);
     let patch = match crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
         history,
         compaction_guard_history,
@@ -1806,6 +1808,18 @@ async fn apply_redux_context_rollover(
     let reducer_source_history = compaction_guard_history.clone();
     crate::agent::compaction::apply_compaction_patch_exact(history, &patch);
     crate::agent::compaction::apply_compaction_patch_exact(compaction_guard_history, &patch);
+    crate::agent::context_preflight::restore_current_turn_request(
+        history,
+        current_request,
+        trigger,
+        crate::agent::context_preflight::RestoredRequestPosition::Tail,
+    );
+    crate::agent::context_preflight::restore_current_turn_request(
+        compaction_guard_history,
+        guard_request,
+        trigger,
+        crate::agent::context_preflight::RestoredRequestPosition::Tail,
+    );
     let budget = crate::agent::context_budget::plan_context_budget(
         history,
         config,
@@ -1822,12 +1836,12 @@ async fn apply_redux_context_rollover(
             );
         }
         let before_trim = history.len();
-        let trimmed =
-            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                history,
-                config,
-                replacement_len,
-            );
+        let trimmed = trim_redux_driver_context_budget_after_rollover(
+            history,
+            compaction_guard_history,
+            config,
+            Some(replacement_len),
+        );
         degraded_dropped = before_trim.saturating_sub(history.len());
         tracing::warn!(
             used_tokens = budget.used_tokens,
@@ -1852,8 +1866,27 @@ async fn apply_redux_context_rollover(
             .await;
         }
     }
-    let reducer_patch =
-        compaction_patch_for_reducer_without_pending_user(&patch, &reducer_source_history, compaction_guard_history);
+    let mut restored_patch = patch;
+    restored_patch.range_end = reducer_source_history.len();
+    let Some(guard) = crate::agent::compaction::compaction_patch_guard_for(
+        &reducer_source_history,
+        restored_patch.range_start,
+        restored_patch.range_end,
+    ) else {
+        return Err(());
+    };
+    restored_patch.guard = guard;
+    restored_patch.replacement = compaction_guard_history
+        .iter()
+        .skip(restored_patch.range_start)
+        .cloned()
+        .collect();
+    restored_patch.append_after.clear();
+    let reducer_patch = compaction_patch_for_reducer_without_pending_user(
+        &restored_patch,
+        &reducer_source_history,
+        compaction_guard_history,
+    );
     if let Err(error) = action_tx
         .send(Action::HistoryCompactionPatchApplied {
             reason,
@@ -1996,6 +2029,8 @@ fn trim_redux_driver_context_budget_after_rollover(
     config: &crate::config::AgentCompactionConfig,
     replacement_len: Option<usize>,
 ) -> bool {
+    let current_request =
+        crate::agent::context_preflight::capture_current_turn_request_with_source(history, compaction_guard_history);
     let histories_matched_before_trim = history.len() == compaction_guard_history.len()
         && history
             .iter()
@@ -2010,6 +2045,16 @@ fn trim_redux_driver_context_budget_after_rollover(
     } else {
         crate::agent::context_budget::trim_history_to_context_budget(history, config)
     };
+    crate::agent::context_preflight::restore_current_turn_request(
+        history,
+        current_request,
+        "redux_preflight",
+        if replacement_len.is_some() {
+            crate::agent::context_preflight::RestoredRequestPosition::Tail
+        } else {
+            crate::agent::context_preflight::RestoredRequestPosition::AboveEverythingLeftStanding
+        },
+    );
     if histories_matched_before_trim {
         *compaction_guard_history = history.clone();
     }
@@ -2400,6 +2445,18 @@ async fn drive_start_turn_stream(
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         if budget.over_hard_limit {
+            if let Err(error) =
+                crate::agent::context_preflight::ensure_current_request_capacity(&compaction_guard_history, config)
+            {
+                let _ = action_tx
+                    .send(Action::StreamFailed {
+                        draft_id,
+                        err: error.to_string(),
+                        retryable: false,
+                    })
+                    .await;
+                return;
+            }
             let turns_before = chat_history_turn_count(&history);
             let tokens_before = super::estimate_chat_history_tokens(&history);
             let injection_diagnostic =

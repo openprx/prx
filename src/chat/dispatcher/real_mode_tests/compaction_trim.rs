@@ -107,7 +107,13 @@ async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
         !driver_history
             .iter()
             .any(|message| message.content.contains("RECENT_ENRICHMENT_ONLY")),
-        "existing provider-side trim fallback must still remove enrichment-only overflow"
+        "trim may remove request-local enrichment"
+    );
+    assert!(
+        driver_history
+            .iter()
+            .any(|message| message.role == "user" && message.content == "current @huge.txt"),
+        "the admitted raw request must survive without its request-local enrichment"
     );
 }
 
@@ -309,6 +315,7 @@ async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reduce
             "recent-bulk ".repeat(80)
         )));
     }
+    original_history.push(PMsg::user("current request"));
     let mut driver_history = original_history.clone();
     let mut compaction_guard_history = original_history.clone();
     let config = crate::config::AgentCompactionConfig {
@@ -480,6 +487,7 @@ async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action(
             for i in 0..24 {
                 history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
             }
+            history.push(PMsg::user("current request"));
 
             let binding = admit_start_turn_fixture(
                 &fixture_deps,
@@ -1031,4 +1039,134 @@ async fn t31_driver_context_overflow_exhausted_emits_stream_failed() {
         })
         .await
         .expect("Q42 fixture cleanup");
+}
+
+#[tokio::test]
+async fn tui_preflight_irreducible_request_fails_before_provider() {
+    use crate::providers::traits::{ChatMessage, StreamChunk, StreamOptions, StreamResult};
+    use futures::stream::{self, BoxStream, StreamExt};
+
+    struct UnreachedProvider(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Provider for UnreachedProvider {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("irreducible TUI input must fail before compaction or dispatch")
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat_with_history(
+            &self,
+            _: &[ChatMessage],
+            _: &str,
+            _: f64,
+            _: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (mut deps, mut actions, _hooks, _tmp) = build_deps(Arc::new(NoneMemory::new()), CancellationToken::new());
+    deps.provider = Arc::new(UnreachedProvider(Arc::clone(&calls)));
+    let fixture_deps = deps.clone();
+    let request = "irreducible current request ".repeat(20).trim_end().to_owned();
+    let cleanup =
+        crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).expect("TUI preflight cleanup");
+    cleanup
+        .run(async {
+            let binding = admit_start_turn_fixture(&fixture_deps, "draft-capacity", &request, false)
+                .await
+                .expect("real TUI admission");
+            let history = vec![
+                ChatMessage::system("sys"),
+                ChatMessage::user("old request"),
+                ChatMessage::assistant("old context ".repeat(500)),
+                ChatMessage::user(&request),
+            ];
+            let config = crate::config::AgentCompactionConfig {
+                mode: crate::config::AgentCompactionMode::Safeguard,
+                max_context_tokens: 32,
+                max_context_tokens_explicit: true,
+                reserve_tokens: 10,
+                keep_recent_messages: 1,
+                memory_flush: false,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+            EffectExecutor::new_with_deps(deps)
+                .execute(Effect::StartTurn {
+                    provider_turn_task_id: None,
+                    draft_id: "draft-capacity".into(),
+                    history,
+                    compaction_guard_history: None,
+                    compaction_config: Some(config),
+                    cancel: CancellationToken::new(),
+                    chat_mode: crate::agent::turn_contracts::ChatMode::Edit,
+                    turn_spawn_ctx: None,
+                    turn_message_send_ctx: None,
+                    routing_input: None,
+                    turn_binding: Some(binding),
+                })
+                .await;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), actions.recv())
+                    .await
+                    .expect("TUI capacity action")
+                    .expect("action channel")
+                {
+                    Action::StreamFailed { err, retryable, .. } => {
+                        assert!(err.starts_with("Context capacity exceeded:"), "{err}");
+                        assert!(!retryable);
+                        break;
+                    }
+                    Action::HistoryCompactionPatchApplied { .. }
+                    | Action::HistoryCompacted { .. }
+                    | Action::StreamCompleted { .. } => panic!("irreducible input cannot be mutated or answered"),
+                    _ => {}
+                }
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .expect("TUI cleanup completes");
+}
+
+#[test]
+fn tui_preflight_trim_preserves_current_request() {
+    use crate::providers::ChatMessage;
+    for replacement_len in [None, Some(1)] {
+        let request = "live request ".repeat(500);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("old summary"),
+            ChatMessage::user(&request),
+        ];
+        let mut guard = history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            max_context_tokens: 128,
+            reserve_tokens: 10,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        trim_redux_driver_context_budget_after_rollover(&mut history, &mut guard, &config, replacement_len);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| m.role == "user" && m.content == request)
+                .count(),
+            1
+        );
+        assert_eq!(
+            history.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
+            guard.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>()
+        );
+        let error = crate::agent::context_preflight::ensure_current_request_capacity(&history, &config)
+            .expect_err("oversized request remains intact and typed");
+        assert!(matches!(
+            error.downcast_ref::<crate::agent::turn_contracts::ContextCapacityError>(),
+            Some(crate::agent::turn_contracts::ContextCapacityError::RequestTooLarge { .. })
+        ));
+    }
 }
