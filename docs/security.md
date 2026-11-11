@@ -12,9 +12,11 @@ behavior, see [Decision plane](decision-plane.md),
 [Web Console](web-console.md) and
 [Provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).
 
-Autonomy `full` still applies identity-scope ACLs, workspace path bounds, and
-tool/command policy. It is not an absence of limits. Child-session parity and
-PRX-to-PRX messaging are not current behavior.
+Autonomy `full` is the default. It still applies identity-scope ACLs, workspace
+path bounds, and tool/command policy. It is not an absence of limits. The
+former hourly action cap (`autonomy.max_actions_per_hour`) is retired and
+ignored. Child-session parity and PRX-to-PRX messaging are not current
+behavior.
 
 ## Source identity and owner scope
 
@@ -58,12 +60,14 @@ Approval binds workspace, owner, session, exact operation and call digest,
 capability/catalog identity and expiry. Model text such as “approved”, a
 decision backend's answer, or ordinary channel text is not an approval grant.
 
-Two durable namespaces exist and do not mix:
+Two durable namespaces exist and do not mix at the authority key:
 
 - **Decision-keyed** pending records, keyed by decision id.
 - **Run-keyed** exact-call records, keyed by run id and call digest, used when
-  there is no causal decision. A missing run id refuses the grant. Listings,
-  claims and revocations for the two namespaces stay separate.
+  there is no causal decision. A missing run id refuses the grant.
+
+Listings, claims and revocations keep those keys separate. The Console/gateway
+approval inbox merges both namespaces into one list.
 
 For a fresh supervised file operation, the runtime can collect a single
 `file_write` or `file_edit` argument proposal through the recorded Chat or
@@ -89,10 +93,12 @@ are never logged. Opening refuses incomplete backup directories, so a crash
 leftover cannot be restored as a live key repository or turned into a fresh
 authority.
 
-A coherent backup is the database snapshot plus every key generation that
-snapshot names, published by one atomic rename. Copy that bundle together. A
-database without its keys cannot recover. Keys without that database do not
-start a new authority. Restoring one without the other is not supported.
+A coherent backup is a consistent snapshot of the database plus every key
+generation that snapshot names, published by one atomic rename. The runtime
+writes the snapshot with `VACUUM INTO`; it does not copy a live write-ahead
+log. Copy the completed bundle. A database without its keys cannot recover.
+Keys without that database do not start a new authority. Restoring one without
+the other is not supported.
 
 ## Disconnection, interruption and unknown cost
 
