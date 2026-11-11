@@ -22,18 +22,18 @@ const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_mil
 const MAX_READ_ONLY_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 
 #[cfg(test)]
-thread_local! {
-    static SETTLE_METERED_CALLS: std::sync::atomic::AtomicUsize = const { std::sync::atomic::AtomicUsize::new(0) };
+fn settlement_call_counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
-pub(crate) fn settle_metered_call_count() -> usize {
-    SETTLE_METERED_CALLS.with(|cell| cell.load(std::sync::atomic::Ordering::SeqCst))
-}
-
-#[cfg(test)]
-pub(crate) fn reset_settle_metered_call_count() {
-    SETTLE_METERED_CALLS.with(|cell| cell.store(0, std::sync::atomic::Ordering::SeqCst));
+pub(crate) fn settle_metered_call_count(workspace: &Path) -> usize {
+    settlement_call_counts()
+        .lock()
+        .get(&workspace.join("state/costs.jsonl"))
+        .copied()
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -841,7 +841,10 @@ impl CostTracker {
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     ) -> Result<CostSettlement> {
         #[cfg(test)]
-        SETTLE_METERED_CALLS.with(|cell| cell.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+        {
+            let path = self.lock_storage().path.clone();
+            *settlement_call_counts().lock().entry(path).or_default() += 1;
+        }
         self.settle_metered_inner(record, None)
     }
 

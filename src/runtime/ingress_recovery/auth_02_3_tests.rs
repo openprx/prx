@@ -415,9 +415,7 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
 }
 
 pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
-    crate::cost::tracker::reset_settle_metered_call_count();
     for backend in ["sqlite", "lucid", "encrypted"] {
-        crate::cost::tracker::reset_settle_metered_call_count();
         let (dir, workspace) = home_workspace();
         let memory = backend_memory(backend, &workspace).expect("test: backend");
         let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
@@ -430,7 +428,7 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             .unwrap_or_else(|error| panic!("{backend} commit: {error:#}"));
         assert!(matches!(first.cost_settlement, Some(CostSettlement::ProjectionPending)));
         assert_eq!(
-            crate::cost::tracker::settle_metered_call_count(),
+            crate::cost::tracker::settle_metered_call_count(&workspace),
             0,
             "{backend} pre-commit cost spy"
         );
@@ -471,7 +469,6 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
         drop(dir);
     }
 
-    crate::cost::tracker::reset_settle_metered_call_count();
     let (dir, workspace) = home_workspace();
     let memory = backend_memory("postgres_class", &workspace).expect("test: postgres_class");
     let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
@@ -482,7 +479,7 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
         .await
         .expect("test: postgres_class");
     assert!(matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })));
-    assert_eq!(crate::cost::tracker::settle_metered_call_count(), 1);
+    assert_eq!(crate::cost::tracker::settle_metered_call_count(&workspace), 1);
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
 }
@@ -600,6 +597,19 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .await
             .expect("test: skip inline");
         assert_eq!(first_outbox(&workspace).state, "pending");
+        let (disabled, disabled_tracker) =
+            prepare_scope(&workspace, Arc::clone(&memory), false, false, cost.clone()).await;
+        drop(disabled);
+        disabled_tracker
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("test: recording-off drain");
+        assert_eq!(
+            first_outbox(&workspace).state,
+            "pending",
+            "recording-off scan acknowledged usage"
+        );
+        assert_eq!(ledger_lines(&workspace, "prx-skip-inline"), 0);
         let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, true, cost.clone()).await;
         drop(recovery);
         tracker
@@ -728,7 +738,78 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         drop(dir);
     }
 
-    crate::cost::tracker::reset_settle_metered_call_count();
+    {
+        let (dir, workspace, memory, fabric, commit, cost, service) = priced_setup("prx-conflicting-ledger").await;
+        let _skip = SkipInline;
+        crate::agent::terminal::recovery_commit::skip_inline_projection(true);
+        let first = finalize_turn(&fabric, commit, &cost, &workspace)
+            .await
+            .expect("test: conflict commit");
+        let mut conflicting = first.usage_settlement.expect("test: priced usage");
+        conflicting.prompt_tokens += 1;
+        conflicting.total_tokens += 1;
+        let tracker = crate::cost::tracker::CostTracker::for_workspace(cost.clone(), &workspace)
+            .expect("test: conflicting ledger tracker");
+        tracker
+            .settle_metered(&conflicting)
+            .expect("test: append real conflicting settlement");
+        let ledger = workspace.join("state/costs.jsonl");
+        let before = std::fs::read(&ledger).expect("test: conflict bytes before");
+        crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+        )
+        .expect("test: conflict scan");
+        assert_eq!(first_outbox(&workspace).state, "blocked");
+        assert_eq!(std::fs::read(&ledger).expect("test: conflict bytes after"), before);
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        drop(dir);
+    }
+
+    for backend in ["lucid", "encrypted"] {
+        let (dir, workspace) = home_workspace();
+        let memory = backend_memory(backend, &workspace).expect("test: restart backend");
+        let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
+        let cost = priced_cost_config();
+        let terminal_id = format!("prx-restart-{backend}");
+        let mut commit = completed_commit(&terminal_id);
+        let service = bind_terminal_fixture(&workspace, Arc::clone(&memory), &mut commit, &cost).await;
+        let owner = commit.scope.owner_id.clone().expect("test: restart owner");
+        let _skip = SkipInline;
+        crate::agent::terminal::recovery_commit::skip_inline_projection(true);
+        let first = finalize_turn(&fabric, commit, &cost, &workspace)
+            .await
+            .expect("test: backend commit");
+        assert_eq!(first_outbox(&workspace).state, "pending");
+        service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        drop(service);
+        drop(fabric);
+        drop(memory);
+        let reopened = backend_memory(backend, &workspace).expect("test: reopen backend");
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&reopened), false, true, cost).await;
+        recovery
+            .rejoin_terminal(&terminal_id, &owner)
+            .await
+            .expect("test: reopened settled rejoin");
+        let final_event = reopened
+            .find_message_event_by_idempotency_key(&workspace.to_string_lossy(), &format!("turn:{terminal_id}:final"))
+            .await
+            .expect("test: reopened terminal read")
+            .expect("test: reopened terminal");
+        assert_eq!(final_event.event_id, first.terminal_event.event_id);
+        assert_eq!(final_event.raw_payload_json, first.terminal_event.raw_payload_json);
+        assert_eq!(first_outbox(&workspace).state, "acknowledged");
+        assert_eq!(ledger_lines(&workspace, &terminal_id), 1);
+        drop(recovery);
+        tracker
+            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("test: reopened drain");
+        drop(dir);
+    }
+
     let (dir, workspace) = home_workspace();
     let memory = backend_memory("postgres_class", &workspace).expect("test: postgres_class restart");
     let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
@@ -739,7 +820,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         .await
         .expect("test: postgres_class restart");
     assert!(matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })));
-    assert_eq!(crate::cost::tracker::settle_metered_call_count(), 1);
+    assert_eq!(crate::cost::tracker::settle_metered_call_count(&workspace), 1);
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
 }
