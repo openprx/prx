@@ -85,7 +85,7 @@ async fn spawn_webhook_child(workspace: &std::path::Path) -> (WebhookChild, Stri
         while let Some(line) = lines.next_line().await.expect("test: child output") {
             consumed += line.len() as u64 + 1;
             assert!(consumed <= MAX_CHILD_OUTPUT, "test: child output exceeded its budget");
-            if let Some(address) = line.strip_prefix("PRX_OVERSIZED_READY ")
+            if let Some((_, address)) = line.split_once("PRX_OVERSIZED_READY ")
                 && let Some(send) = send.take()
             {
                 let _ = send.send(address.to_owned());
