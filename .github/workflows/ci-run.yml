@@ -38,6 +38,8 @@ jobs:
               run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
             - name: Verify source file size limit
               run: python3 scripts/ci/source_size_gate.py
+            - name: Verify tracked markdown has no CJK
+              run: python3 scripts/ci/docs_cjk_gate.py
 
     windows-installer:
         name: Windows Installer Contract
@@ -644,6 +646,9 @@ jobs:
                   BASE_SHA: ${{ needs.changes.outputs.base_sha }}
                   DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
               run: ./scripts/ci/docs_quality_gate.sh
+
+            - name: CJK in tracked markdown
+              run: ./scripts/ci/docs_cjk_gate.sh
 
             - name: Collect added links
               id: collect_links

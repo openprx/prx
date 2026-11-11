@@ -11,7 +11,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **Causal Tree Engine** — admitted decisions with rehearsal, scoring, and circuit breaker; enabled by default with the built-in backend
 - **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, and more
 - **Built-in tools and integrations** — shell, MCP, memory, scheduling, remote nodes, and an integration catalog
-- **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
+- **Xin, from the Chinese word for heart, task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
 - **Self-Evolution** — autonomous prompt improvement staged through the skills lifecycle

@@ -2197,7 +2197,7 @@ fn test_chat_s4_a_6_pure_snapshot_wide_characters_no_extra_spaces_via_real_path(
 // Real LLMs are unreachable without an API key, so this group emits a complete script
 // (delta + reasoning + tool + final) on the streaming path through MockEnvProvider's
 // OPENPRX_MOCK_SCRIPT, covering the driver's protocol-layer regressions across provider
-// flavors. See docs/archive/release-notes-0.4.0.md for details.
+// flavors.
 
 /// S5 P0-1: a full anthropic-flavor turn — several deltas + reasoning + final.
 #[test]

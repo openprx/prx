@@ -157,7 +157,7 @@ Canonical entry points:
 - installation contract: `docs/one-click-bootstrap.md`
 - runtime topics: `docs/configuration.md`, `docs/providers.md`,
   `docs/channels.md`, `docs/tools.md`
-- release history: `CHANGELOG.md`, `docs/archive/release-notes-*.md`
+- release history: `CHANGELOG.md`
 
 Runtime-contract references (must track behavior changes):
 
@@ -313,7 +313,7 @@ Do not run the full suite, mutation batches, stress loops or a local full CI (`.
 Additional expectations by change type:
 
 - **Docs/template-only**:
-  - run markdown lint and link-integrity checks
+  - run markdown lint, link-integrity, and CJK (`./scripts/ci/docs_cjk_gate.sh`) checks
   - if touching README or installation docs, verify every linked in-tree entry point
   - if touching installer/bootstrap docs or scripts, run
     `sh -n install.sh`, `bash -n scripts/bootstrap.sh`, and
@@ -328,6 +328,7 @@ If full checks are impractical, run the most relevant subset and document what w
 - Follow `.github/pull_request_template.md` fully (including side effects / blast radius).
 - Keep PR descriptions concrete: problem, change, non-goals, risk, rollback.
 - Use conventional commit titles.
+- All repository text (code, comments, commits, docs) is English.
 - Prefer small PRs (`size: XS/S/M`) when possible.
 - Agent-assisted PRs are welcome, **but contributors remain accountable for understanding what their code will do**.
 

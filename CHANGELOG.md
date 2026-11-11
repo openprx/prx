@@ -342,8 +342,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Unreleased changes merged during local closeout. Deployment, real messaging,
 paid-provider validation and external PostgreSQL/platform acceptance remain
-pending. See the [candidate notes](docs/archive/release-notes-decision-plane-candidate-2026-10-04.md)
-and the migration warnings below before upgrading.
+pending. See the migration warnings below before upgrading.
 
 ### Added
 
@@ -2233,7 +2232,7 @@ and the migration warnings below before upgrading.
 ### Fixed
 
 - Treat explicit negative capability instructions such as "do not use MCP" and
-  "不要调用浏览器/MCP" as exclusions during intent routing. Forbidden dynamic
+  "do not call the browser/MCP" as exclusions during intent routing. Forbidden dynamic
   capabilities no longer cold-start merely because their names appear in the
   user's constraint, while a later positive contrast still activates them.
 
@@ -2819,17 +2818,19 @@ and the migration warnings below before upgrading.
 
 ### Security
 
-- **BREAKING** — `OPENPRX_APPROVAL_OVERRIDE` env unset 不再静默 auto-approve
-  supervised 模式下的 tool approval。TUI 卡片 + Y/N 键盘 (T5-1 完整版) 留
-  Task #11；在 UI 接通前 fail-safe deny。显式设置 `OPENPRX_APPROVAL_OVERRIDE=allow`
-  可恢复旧行为；`deny` / `no` / `n` / `0` 与未设置一致拒绝。Codex S5 P0-3 反馈
-  "绝不静默 auto-approve"。`autonomy_level=Full` 不走此路径，行为不变。
+- **BREAKING** — leaving `OPENPRX_APPROVAL_OVERRIDE` unset no longer silently
+  auto-approves tool approval in supervised mode. The TUI card plus Y/N
+  keyboard path (full T5-1) remains Task #11; until that UI is connected, the
+  fail-safe is deny. Setting `OPENPRX_APPROVAL_OVERRIDE=allow` restores the old
+  behaviour; `deny` / `no` / `n` / `0` and unset all refuse. Codex S5 P0-3
+  feedback: never silently auto-approve. `autonomy_level=Full` does not take
+  this path; that behaviour is unchanged.
 
 ## [0.3.0] - 19 March 2026
 
 ### Added
 
-- **Xin (心) autonomous task engine** — Configuration-driven heartbeat
+- **Xin, from the Chinese word for heart, autonomous task engine** — Configuration-driven heartbeat
   scheduler for system-level autonomous work.
   - 5 built-in system tasks: health check, stale cleanup, memory
     evolution, fitness report, memory hygiene

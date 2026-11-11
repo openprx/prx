@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # S4-A / S4-B Renderer source switchover — grep guard.
 #
-# S4-B 完成后: chat_mirror.lock().push_* / tui_mirror.lock().push_* 应全部
-# 删除，整条 mirror 写路径不复存在（Pure 是唯一运行路径）.
+# After S4-B: every chat_mirror.lock().push_* / tui_mirror.lock().push_* call
+# must be gone, so the whole mirror write path no longer exists (Pure is the
+# only runtime path).
 #
-# S4-A 阶段: 上述 push 必须被 is_pure 守卫包裹（每处 mirror push 距离最近
-# is_pure 守卫 <= 10 行）.
+# During S4-A: each of those pushes must be wrapped by an is_pure guard (the
+# nearest is_pure guard is at most 10 lines above each mirror push).
 #
-# 用法: ./scripts/s4_a_gate.sh
-# 通过条件: mirror push 总数 == 0 (S4-B 完成) 或者守卫完整 (S4-A 阶段).
+# Usage: ./scripts/s4_a_gate.sh
+# Pass when the mirror-push count is 0 (S4-B complete) or every push is guarded
+# (S4-A).
 
 set -euo pipefail
 
@@ -24,26 +26,26 @@ for file in "${FILES[@]}"; do
     fi
 done
 
-echo "[S4-A/B gate] grep chat_mirror.lock() / tui_mirror.lock() push 调用 ..."
+echo "[S4-A/B gate] grep chat_mirror.lock() / tui_mirror.lock() push calls ..."
 MIRROR_PUSH_COUNT=$(cat "${FILES[@]}" | grep -c "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" || true)
-echo "  mirror push 调用数: $MIRROR_PUSH_COUNT"
+echo "  mirror push call count: $MIRROR_PUSH_COUNT"
 
 if [ "$MIRROR_PUSH_COUNT" -eq 0 ]; then
-    echo "[PASS] S4-B 完成态: mirror push 调用已全部删除 (Pure 是唯一运行路径)."
+    echo "[PASS] S4-B complete: every mirror push call is gone (Pure is the only runtime path)."
     exit 0
 fi
 
-# S4-A 阶段：检查守卫
-echo "[S4-A gate] grep 启发式 is_pure() / is_pure 守卫（前 5 行内）..."
+# S4-A: check guards
+echo "[S4-A gate] grep heuristic is_pure() / is_pure guards (within the previous 5 lines)..."
 GUARDED_COUNT=$(cat "${FILES[@]}" | grep -B 5 "chat_mirror\.lock()\.push_\|tui_mirror\.lock()\.push_" | grep -c "is_pure" || true)
-echo "  is_pure 守卫数 (启发式, 前 5 行内): $GUARDED_COUNT"
+echo "  is_pure guard count (heuristic, within previous 5 lines): $GUARDED_COUNT"
 
 if [ "$GUARDED_COUNT" -lt "$MIRROR_PUSH_COUNT" ]; then
-    echo "[FAIL] 启发式 Pure 守卫数 $GUARDED_COUNT < mirror push 数 ${MIRROR_PUSH_COUNT}，存在未守卫的旁路写。"
+    echo "[FAIL] heuristic Pure guard count $GUARDED_COUNT < mirror push count ${MIRROR_PUSH_COUNT}; an unguarded bypass write remains."
     exit 1
 fi
 
-echo "[S4-A gate] AWK 块级扫描：每处 push 距离最近 'if !...is_pure' 守卫 <= 10 行 ..."
+echo "[S4-A gate] AWK block scan: each push is at most 10 lines from the nearest 'if !...is_pure' guard ..."
 UNGUARDED_OUT=$(awk '
     BEGIN { guard_line = 0; unguarded = 0 }
     FNR == 1 { guard_line = 0 }
@@ -63,8 +65,8 @@ UNGUARDED_OUT=$(awk '
     END { exit (unguarded > 0 ? 1 : 0) }
 ' "${FILES[@]}") || {
     echo "$UNGUARDED_OUT"
-    echo "[FAIL] AWK 块级扫描发现失守 mirror push（见上方）."
+    echo "[FAIL] AWK block scan found an unguarded mirror push (see above)."
     exit 1
 }
 
-echo "[PASS] S4-A 阶段: mirror push 数 = ${MIRROR_PUSH_COUNT}，启发式守卫数 = ${GUARDED_COUNT}，AWK 块级扫描通过."
+echo "[PASS] S4-A: mirror push count = ${MIRROR_PUSH_COUNT}, heuristic guard count = ${GUARDED_COUNT}, AWK block scan passed."

@@ -68,6 +68,7 @@ module.exports = async ({ github, context, core }) => {
     "- `./scripts/ci/rust_quality_gate.sh`",
     "- `./scripts/ci/rust_strict_delta_gate.sh`",
     "- `./scripts/ci/docs_quality_gate.sh`",
+    "- `./scripts/ci/docs_cjk_gate.sh`",
     "",
     "After fixes, push a new commit and CI will re-run automatically.",
   ].join("\n");

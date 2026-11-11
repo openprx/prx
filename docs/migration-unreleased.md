@@ -133,8 +133,8 @@ enabled = false
 - Source-layout changes (`agent::loop_` removal, memory backend and chat module
   splits): no stored-data or configuration conversion. See
   [agent turn engine migration](agent-turn-engine-migration.md).
-- Decision-plane rollback and downgrade limits:
-  [candidate notes](archive/release-notes-decision-plane-candidate-2026-10-04.md).
+- Decision-plane rollback and downgrade limits: see the Unreleased notes in
+  `CHANGELOG.md`.
 - SQLite writer connections still use an unbounded busy handler. Deadline-scoped
   ingress and recovery reads install a busy/progress handler on that connection
   and restore the pool handler when the guard drops, including if handler

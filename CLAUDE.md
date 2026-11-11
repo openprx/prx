@@ -205,4 +205,4 @@ fix(scope): description
 refactor(scope): description
 ```
 
-English only in commits and code comments. Chinese allowed in user-facing docs.
+All repository text (code, comments, commits, docs) is English.

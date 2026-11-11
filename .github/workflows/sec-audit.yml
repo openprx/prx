@@ -61,7 +61,7 @@ jobs:
         checks:
           - advisories
           - bans licenses sources
-    # S5 P0-4: advisories 分支移除 continue-on-error，发布门真正阻断
+    # S5 P0-4: the advisories branch drops continue-on-error so the release gate actually blocks
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
