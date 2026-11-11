@@ -2712,12 +2712,13 @@ async fn run_gateway_chat_with_multimodal(
                     envelope: &runtime_envelope,
                     started_at: chrono::Utc::now(),
                 };
-                service
+                let receipt = service
                     .close_agent_directive_turn(&gateway_proof, Arc::clone(&context), &ports, &cancellation)
                     .await?;
+                let replay_unavailable = crate::agent::terminal::oversized_reply::from_receipt(&receipt)?;
                 return Ok(GatewayTurnResult {
                     response: reply.into_owned(),
-                    replay_unavailable: None,
+                    replay_unavailable,
                 });
             }
             let mem_context = crate::agent::context_recall::scoped_recall(
