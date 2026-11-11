@@ -471,7 +471,8 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
             .expect("actual proposed Answer gate outcome");
         assert_eq!(rejected.get("status").and_then(Value::as_str), Some("blocked"));
         assert_eq!(rejected.get("gate").and_then(Value::as_u64), Some(6));
-        assert_eq!(rejected.get("reason").and_then(Value::as_str), Some("budget"));
+        // Unpriced Answer is G6 unpriced_model. Priced overflow stays budget.
+        assert_eq!(rejected.get("reason").and_then(Value::as_str), Some("unpriced_model"));
     }
 }
 
