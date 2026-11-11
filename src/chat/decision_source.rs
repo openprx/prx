@@ -874,8 +874,7 @@ impl ChatTurnBinding {
                         .open_issued_resume_turn_context(self, kind, cancellation)
                         .await?
                 } else {
-                    let opened = service.open_turn_context(self, kind, cancellation).await?;
-                    service.record_opened_context(self, opened, cancellation).await?
+                    service.open_issued_turn_context(self, kind, cancellation).await?
                 };
                 let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {

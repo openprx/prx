@@ -2108,6 +2108,10 @@ impl TurnDecisionService {
     /// enabled the decision engine with a remote backend. Default
     /// Auto-without-endpoint and engine-off remote stay on the Direct surface.
     pub(super) fn should_run_prediction_hop(&self) -> bool {
+        #[cfg(test)]
+        if selected_loader_fixture::is_active() {
+            return true;
+        }
         let config = &self.generation.effective;
         if !config.causal_tree.enabled {
             return false;

@@ -569,15 +569,36 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                         .iter()
                         .any(|code| code.as_str() == "intercepts_writes")
                 );
-                // The existing Plan classifier excludes skills_list/skill_read
-                // and shell. Direct file_read is not a discoverable family.
+                // The control remains reachable for eligible read tools. Plan
+                // still excludes skill execution from its discovery offers.
                 assert!(
                     service
                         .agent_capability_search_spec(&proof, &context)
                         .unwrap()
-                        .is_none()
+                        .is_some()
                 );
-                assert!(service.capability_search_port(&proof, &context).is_err());
+                let port = service.capability_search_port(&proof, &context).unwrap();
+                let result = with_search_authority(
+                    Some(port),
+                    CapabilitySearchTool.execute(serde_json::json!({"query":"skills_list","limit":4})),
+                )
+                .await
+                .unwrap();
+                assert!(result.success);
+                let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+                assert!(
+                    !output
+                        .get("hits")
+                        .and_then(serde_json::Value::as_array)
+                        .unwrap()
+                        .iter()
+                        .any(|hit| {
+                            hit.get("schema")
+                                .and_then(|schema| schema.get("name"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("skills_list")
+                        })
+                );
                 assert!(
                     service
                         .admit_discovered_tool(&proof, &context, "skills_list")
@@ -1427,7 +1448,7 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
 }
 
 #[tokio::test]
-async fn eligible_deferred_tools_require_a_live_search_control() -> anyhow::Result<()> {
+async fn fixed_catalog_without_search_control_remains_valid() -> anyhow::Result<()> {
     for include_reader in [false, true] {
         let workspace = tempfile::tempdir()?;
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
@@ -1446,20 +1467,10 @@ async fn eligible_deferred_tools_require_a_live_search_control() -> anyhow::Resu
         let result = decision
             .service
             .agent_capability_search_spec(decision.proof, decision.context);
-        if include_reader {
-            let error = result
-                .err()
-                .context("missing control must be an explicit availability error")?;
-            anyhow::ensure!(
-                matches!(
-                    error.downcast_ref::<super::super::discovery::SearchControlUnavailable>(),
-                    Some(super::super::discovery::SearchControlUnavailable::MissingCatalogEntry)
-                ),
-                "unexpected availability error: {error:#}"
-            );
-        } else {
-            anyhow::ensure!(result?.is_none(), "empty catalog needs no discovery control");
-        }
+        anyhow::ensure!(result?.is_none(), "a fixed catalog must not invent a discovery control");
+        decision
+            .service
+            .agent_execution_specs(decision.proof, decision.context)?;
     }
     Ok(())
 }

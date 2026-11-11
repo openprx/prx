@@ -32,6 +32,8 @@ async fn build(workspace: &std::path::Path, endpoint: &str) -> (Agent, Arc<Obser
     config.config_path = workspace.join("config.toml");
     config.default_model = Some(MODEL.into());
     config.causal_tree.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
     config.router = policy.clone();
     // The real Router Retrieve hop is subject to G7, including PMM's

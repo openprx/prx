@@ -474,6 +474,7 @@ async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Resul
         cleanup
             .run(Box::pin(async {
                 let mut config = crate::config::Config::default();
+                config.tool_tiering.always_include.push("sessions_spawn".to_owned());
                 config.workspace_dir = workspace.path().to_path_buf();
                 config.config_path = workspace.path().join("config.toml");
                 config.default_provider = Some("ollama".to_owned());

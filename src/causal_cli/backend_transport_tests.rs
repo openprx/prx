@@ -282,6 +282,8 @@ fn build_plane_with(endpoint: &str, max_response_bytes: u32, remote: bool) -> Pl
         .expect("test: table")
         .insert("causal_tree".to_string(), section);
     let mut config: Config = tree.try_into().expect("test: config");
+    // This fixture exercises an explicitly enabled backend transport.
+    config.decision_engine.enabled = true;
     config.workspace_dir = home.path().to_path_buf();
     config.config_path = home.path().join("config.toml");
     let catalog = CatalogView::from_config(&config).with_curated([CuratedModel {
@@ -1044,6 +1046,8 @@ fn build_hosted(hosted: &Hosted) -> Plane {
         .expect("test: table")
         .insert("causal_tree".to_string(), section);
     let mut config: Config = tree.try_into().expect("test: config");
+    // This fixture exercises an explicitly enabled backend transport.
+    config.decision_engine.enabled = true;
     config.workspace_dir = home.path().join("workspace");
     config.config_path = home.path().join("config.toml");
     config.secrets.encrypt = true;

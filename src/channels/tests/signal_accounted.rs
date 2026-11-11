@@ -155,7 +155,11 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         config.causal_tree.rehearsal.timeout_ms = 5_000;
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = !text_only;
+        // These accounting fixtures require an actual selected private read;
+        // the text-only case omits vision, not the explicit local prediction.
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         // Narrow the allowed hops: one genuine memory read, then the existing
         // fresh-evidence terminal gate. Scoring thresholds remain unchanged.
         config.causal_tree.policy.max_decision_hops = 1;

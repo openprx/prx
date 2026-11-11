@@ -271,7 +271,7 @@ async fn run_work(
         source
     };
     let started_at = chrono::Utc::now();
-    #[cfg(feature = "llm-router")]
+    #[cfg(all(not(test), feature = "llm-router"))]
     let issued = service
         .open_issued_turn_context(
             source.as_ref(),
@@ -280,6 +280,21 @@ async fn run_work(
         )
         .await
         .map(|decision| (decision, source, None));
+    #[cfg(all(test, feature = "llm-router"))]
+    let issued = if let Some(router) = agent.router.as_ref().filter(|_| history_route) {
+        service
+            .open_issued_embedded_router_turn_context(source, router, cancellation)
+            .await
+    } else {
+        service
+            .open_issued_turn_context(
+                source.as_ref(),
+                crate::runtime::turn_decision::AgentTurnKind::Repl,
+                cancellation,
+            )
+            .await
+            .map(|decision| (decision, source, None))
+    };
     #[cfg(not(feature = "llm-router"))]
     let issued = service
         .open_issued_turn_context(

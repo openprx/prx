@@ -39,7 +39,7 @@
 
 use crate::causal_tree::config::BackendSelection;
 use crate::config::Config;
-use crate::decision::{BackendKind, BackendLocality};
+use crate::decision::BackendKind;
 
 /// Whether the decision plane of `candidate` differs from `current` in
 /// what the check reads.
@@ -72,27 +72,25 @@ fn check_section(config: &Config) -> Result<(), String> {
         return Ok(());
     };
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
-    // Same split as `decision::factory`: recovery-only remote (`[causal_tree]`
-    // on, engine off) never opens the credential store. A loopback HTTP slot
-    // still compiles predictions while the engine is off.
-    let checked =
-        if section.enabled && (config.decision_engine.enabled || selection.locality == BackendLocality::Loopback) {
-            crate::providers::selection::check_decision_backend(
-                config,
-                &catalog,
-                &selection.provider,
-                backend.model.trim(),
-                selection.credential,
-            )
-            .map(|_| ())
-        } else {
-            crate::providers::selection::check_decision_model(
-                &catalog,
-                &selection.provider,
-                backend.model.trim(),
-                &selection.credential,
-            )
-        };
+    // Recovery may remain enabled without permitting credential resolution.
+    // Public loopback slots need no stored credential to compile predictions.
+    let checked = if section.enabled && config.decision_engine.enabled {
+        crate::providers::selection::check_decision_backend(
+            config,
+            &catalog,
+            &selection.provider,
+            backend.model.trim(),
+            selection.credential,
+        )
+        .map(|_| ())
+    } else {
+        crate::providers::selection::check_decision_model(
+            &catalog,
+            &selection.provider,
+            backend.model.trim(),
+            &selection.credential,
+        )
+    };
     checked.map_err(|error| format!("the decision backend (causal_tree.backend) is refused: {error}"))
 }
 

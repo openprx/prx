@@ -2,10 +2,7 @@
 
 //! Restart regressions use the real SQLite memory and decision stores.
 use super::*;
-use crate::agent::terminal::{
-    TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus,
-    TurnTerminalTelemetry,
-};
+use crate::agent::terminal::TurnTerminalReceipt;
 use crate::chat::decision_source::{ChatAdmissionMode, ChatProviderBinding, ChatTurnBinding};
 use crate::memory::ingress_recovery::IngressCapsule;
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
@@ -48,6 +45,9 @@ fn config_at(workspace: &Path) -> crate::config::Config {
     config.default_provider = Some("ollama".into());
     config.default_model = Some("prx-local-model".into());
     config.causal_tree.enabled = true;
+    // Recovery fixtures deliberately exercise a local, selected Close terminal.
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.policy.max_decision_hops = 1;
     config
 }
@@ -187,46 +187,25 @@ async fn drain_legacy_fixture_decisions(service: &crate::runtime::turn_decision:
     );
 }
 
-/// After the switch, `open_turn_context` admits a Run turn. Persist a completed
-/// terminal through `finalize_turn` instead of `close()`, which requires Close.
+/// Produce a real selected Close receipt for the recovery fixtures. The local
+/// backend is explicit; no unexecuted Direct turn is recorded as completed.
 async fn persist_completed_chat(
     binding: &ChatTurnBinding,
     fabric: &MemoryFabric,
-    workspace: &Path,
+    _workspace: &Path,
     history_commit_len: usize,
 ) -> TurnTerminalReceipt {
     assert!(
-        binding.fixed_reply().unwrap().is_none(),
-        "open_turn_context admits a Run turn; Close is no longer the disabled-engine terminal"
+        binding.fixed_reply().unwrap().is_some(),
+        "fixture must select a Close terminal"
     );
     let run = binding.envelope().run_id.as_deref().expect("completed chat has a run");
-    let started_at = chrono::Utc::now();
-    let scope = binding.envelope().message_scope();
     let receipt = binding
-        .commit_terminal(
+        .close(
             fabric,
-            TurnTerminalDraft {
-                decision: binding.settlement_ref(run).unwrap(),
-                terminal_id: run.to_owned(),
-                history_scope: Some(scope.clone().with_sender("prx_runtime").with_recipient("local-user")),
-                scope,
-                status: TurnTerminalStatus::Completed,
-                history: Some(TurnHistoryProjection {
-                    assistant_content: "done".to_owned(),
-                    history_commit_len,
-                }),
-                provider_outcome: None,
-                telemetry: TurnTerminalTelemetry {
-                    summary: "chat decision closed".to_owned(),
-                    started_at,
-                    finished_at: chrono::Utc::now(),
-                },
-                delivery_intent: TurnDeliveryIntent::Reply {
-                    target: "terminal:local-user".to_owned(),
-                },
-            },
-            &config_at(workspace).cost,
-            workspace,
+            history_commit_len,
+            chrono::Utc::now(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();

@@ -530,6 +530,9 @@ pub(super) async fn run() {
         });
         let histories = Arc::new(Mutex::new(HashMap::new()));
         let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
+        // The persisted-backend assertions deliberately require local prediction.
+        initial.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
         initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
         assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());

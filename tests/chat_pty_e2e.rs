@@ -2301,7 +2301,18 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     let sentinel = "[MOCK-B2-FANOUT-DONE]";
     let tool_call =
         r#"sessions_spawn:{"action":"spawn_batch","tasks":["b2 fan-out one","b2 fan-out two","b2 fan-out three"]}"#;
-    let (mut sg, _guard) = spawn_chat(
+    let guard = new_harness_guard().expect("isolated batch fixture");
+    let mut config = openprx::config::Config::default();
+    // This fixture tests the batch lifecycle with an explicitly offered tool.
+    // Default-chat deferred discovery is exercised by search_reachability.
+    config.tool_tiering.always_include.push("sessions_spawn".to_owned());
+    std::fs::write(
+        guard.config_dir.join("config.toml"),
+        toml::to_string_pretty(&config).expect("serialize batch fixture"),
+    )
+    .expect("write batch fixture");
+    let mut sg = spawn_chat_in(
+        &guard,
         &["--plain"],
         &[
             ("OPENPRX_MOCK_TOOL_CALL", tool_call),

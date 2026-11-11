@@ -121,6 +121,9 @@ impl Fixture {
         config.config_path = workspace.path().join("config.toml");
         config.default_model = Some(MODEL.into());
         config.causal_tree.enabled = true;
+        // This fixture exercises the retained local prediction/router hop.
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         if let Some(max_hops) = max_hops {
             config.causal_tree.policy.max_decision_hops = max_hops;
         }

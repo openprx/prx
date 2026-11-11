@@ -34,7 +34,7 @@ use crate::causal_tree::directive::SelectedReadPurpose;
 use crate::causal_tree::state::RouterHistoryReadBinding;
 use crate::memory::RouterHistoryWriteEvidence;
 #[cfg(test)]
-use crate::memory::router_history::RouterReadScope;
+use crate::memory::router_history::{RouterEmbedding, RouterReadScope};
 #[cfg(test)]
 use crate::memory::{RouterHistoryRead, RouterHistoryReadEvidence};
 #[cfg(test)]
@@ -63,10 +63,12 @@ impl RouterModelReadmission {
 /// retry. It is moved to Reading before issuing the sole production grant.
 #[cfg(test)]
 enum RoutingPhase {
+    Pending,
     Reading,
     Consumed {
         source: Arc<EmbeddedAgentSource>,
         transition: Arc<RouterTransition>,
+        embedding: Option<RouterEmbedding>,
         main_compaction: crate::config::AgentCompactionConfig,
     },
     Failed {
@@ -83,14 +85,19 @@ pub(crate) struct RouterContinuation<'a> {
 }
 #[cfg(test)]
 impl<'a> RouterContinuation<'a> {
-    #[cfg(test)]
+    pub(crate) const fn new(router: &'a crate::router::RouterEngine, source: Arc<EmbeddedAgentSource>) -> Self {
+        Self {
+            router,
+            original: source,
+            phase: RoutingPhase::Pending,
+        }
+    }
     pub(super) const fn source(&self) -> &Arc<EmbeddedAgentSource> {
         match &self.phase {
             RoutingPhase::Consumed { source, .. } => source,
             _ => &self.original,
         }
     }
-    #[cfg(test)]
     pub(super) fn transition(&self) -> Option<Arc<RouterTransition>> {
         match &self.phase {
             RoutingPhase::Consumed { transition, .. } | RoutingPhase::Failed { transition } => {
@@ -99,15 +106,19 @@ impl<'a> RouterContinuation<'a> {
             _ => None,
         }
     }
-    #[cfg(test)]
     pub(super) const fn failed(&self) -> bool {
         matches!(self.phase, RoutingPhase::Failed { .. })
     }
-    #[cfg(test)]
     pub(super) const fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
         match &self.phase {
             RoutingPhase::Consumed { main_compaction, .. } => Some(main_compaction),
             _ => None,
+        }
+    }
+    pub(crate) fn finish(mut self) -> (Arc<EmbeddedAgentSource>, Option<RouterEmbedding>) {
+        match &mut self.phase {
+            RoutingPhase::Consumed { source, embedding, .. } => (Arc::clone(source), embedding.take()),
+            _ => (Arc::clone(&self.original), None),
         }
     }
 }
@@ -197,6 +208,43 @@ pub(crate) async fn commit_training_owned(
 
 #[cfg(test)]
 impl TurnDecisionService {
+    pub(crate) async fn open_issued_embedded_router_turn_context(
+        &self,
+        source: Arc<EmbeddedAgentSource>,
+        router: &crate::router::RouterEngine,
+        cancellation: &CancellationToken,
+    ) -> Result<
+        (
+            Arc<TurnDecisionContext>,
+            Arc<EmbeddedAgentSource>,
+            Option<RouterEmbedding>,
+        ),
+        AgentDecisionError,
+    > {
+        if !self.should_run_prediction_hop() {
+            let context = self
+                .open_issued_turn_context(source.as_ref(), super::AgentTurnKind::Repl, cancellation)
+                .await?;
+            return Ok((context, source, None));
+        }
+        let mut continuation = RouterContinuation::new(router, Arc::clone(&source));
+        let context = self
+            .decide_agent_initial_inner(
+                source.as_ref(),
+                super::AgentTurnKind::Repl,
+                cancellation,
+                None,
+                None,
+                Some(&mut continuation),
+            )
+            .await?;
+        let (admitted, embedding) = continuation.finish();
+        let context = self
+            .record_issued_decision(admitted.as_ref(), context, cancellation)
+            .await?;
+        Ok((context, admitted, embedding))
+    }
+
     /// An independent durable first row makes a forced drop after a read
     /// observable without inventing a terminal or resetting the decision.
     #[cfg(test)]
@@ -724,9 +772,16 @@ impl TurnDecisionService {
                 remaining_budget,
                 deadline,
             });
+            let embedding = RouterEmbedding {
+                source_event_id: proof.source_event_id().context("Router source missing")?.to_owned(),
+                query_sha256,
+                domain,
+                vector,
+            };
             continuation.phase = RoutingPhase::Consumed {
                 source: admitted,
                 transition,
+                embedding: Some(embedding),
                 main_compaction,
             };
             Ok::<_, anyhow::Error>(next)

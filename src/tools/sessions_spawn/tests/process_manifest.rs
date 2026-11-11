@@ -13,6 +13,7 @@ async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
             agents.insert("alpha".to_string(), make_agent_config(None));
             let provider: Arc<dyn Provider> = Arc::new(EchoProvider { response: "ok".into() });
             let mut config = crate::config::Config::default();
+            config.tool_tiering.always_include.push("sessions_spawn".to_owned());
             config.workspace_dir = workspace.path().to_path_buf();
             config.config_path = workspace.path().join("config.toml");
             config.default_provider = Some("ollama".to_owned());

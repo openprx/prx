@@ -6,7 +6,11 @@ mod wire;
 use wire::{MODEL, WireProbe};
 
 async fn drive(input: &str, advice: bool, skill: bool, native: bool) -> Result<()> {
-    let guard = new_harness_guard()?;
+    let mut guard = new_harness_guard()?;
+    // The explicit config directory owns the runtime workspace, as in the
+    // real import/resume fixture. Probe the store the child actually opens.
+    guard.workspace_dir = guard.config_dir.join("workspace");
+    std::fs::create_dir_all(&guard.workspace_dir)?;
     if skill {
         let path = guard.workspace_dir.join("skills/prx_probe");
         std::fs::create_dir_all(&path)?;

@@ -18,10 +18,6 @@ use crate::tools::capability::search_tool::{DiscoveryEntry, DiscoveryScope};
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SearchControlUnavailable {
     #[error(
-        "capability discovery unavailable: catalog has eligible deferred tools but no search control; rebuild the runtime catalog"
-    )]
-    MissingCatalogEntry,
-    #[error(
         "capability discovery unavailable: the published search control has no live backend; rebuild the runtime registry"
     )]
     MissingBackend,
@@ -167,10 +163,13 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        let entry = self
-            .catalog
-            .entry_for_public_name("capability_search")
-            .ok_or(SearchControlUnavailable::MissingCatalogEntry)?;
+        let Some(entry) = self.catalog.entry_for_public_name("capability_search") else {
+            // Custom runtimes may intentionally publish a fixed registry with
+            // no discovery control. Its absence must not invalidate an answer
+            // or a tool already admitted through that registry.
+            tracing::warn!("deferred discovery unavailable: this catalog does not publish capability_search");
+            return Ok(None);
+        };
         let trusted = context.engine.state.trusted.parts();
         if self.catalog_view().surface_excludes(entry)
             || trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))

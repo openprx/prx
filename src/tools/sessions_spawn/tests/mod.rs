@@ -552,6 +552,8 @@ fn make_agent_config(identity_dir: Option<String>) -> DelegateAgentConfig {
 /// Q71: derive only the approved parent metadata from the original fixture.
 fn preconstruction_parent_config(tool: &SessionsSpawnTool, workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
+    // These lifecycle/error fixtures exercise an explicitly offered spawn.
+    config.tool_tiering.always_include.push("sessions_spawn".to_owned());
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");
     config.default_provider = Some(tool.provider_name.clone());

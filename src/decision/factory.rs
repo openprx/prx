@@ -781,9 +781,8 @@ impl DecisionBackendFactory {
         let selected = match configured_selection(section) {
             None => None,
             // A disabled plane builds no backend. A disabled decision engine
-            // still builds a loopback HTTP slot so native/local fixtures compile
-            // predictions; a remote backend never opens the credential store
-            // while the engine is off (D-082 N-9).
+            // still builds a public loopback HTTP slot for local predictions.
+            // No engine-off slot may resolve a stored credential (D-082 N-9).
             Some(selection) if !section.enabled => {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
@@ -794,7 +793,11 @@ impl DecisionBackendFactory {
                 .map_err(FactoryBuildError::Selection)?;
                 None
             }
-            Some(selection) if !config.decision_engine.enabled && selection.locality != BackendLocality::Loopback => {
+            Some(selection)
+                if !config.decision_engine.enabled
+                    && (selection.locality != BackendLocality::Loopback
+                        || !matches!(&selection.credential, CredentialRef::None)) =>
+            {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
                     &selection.provider,
@@ -2301,6 +2304,7 @@ mod tests {
         );
         let lock = temp.path().join("auth-profiles.lock");
         std::fs::write(&lock, "pid=1\n").expect("test: held lock");
+        let held_key = key(&temp);
         let before = listing(temp.path());
         let transports = CountingTransports::refusing();
         let declared = catalog(&disabled, &format!("custom:{LOOPBACK}"));
@@ -2308,6 +2312,15 @@ mod tests {
         build(&disabled, &declared, None, &transports).expect("test: a disabled plane builds");
         assert_eq!(
             crate::config::manage::validate::check_decision_plane(None, &disabled),
+            Ok(None)
+        );
+        let mut recovery_only = disabled.clone();
+        recovery_only.causal_tree.enabled = true;
+        assert!(!recovery_only.decision_engine.enabled);
+        build(&recovery_only, &declared, Some(held_key), &transports)
+            .expect("test: engine-off recovery cannot resolve a stored loopback credential");
+        assert_eq!(
+            crate::config::manage::validate::check_decision_plane(None, &recovery_only),
             Ok(None)
         );
         assert!(
@@ -2331,6 +2344,7 @@ mod tests {
         std::fs::remove_file(&lock).expect("test: release");
         let mut enabled = disabled;
         enabled.causal_tree.enabled = true;
+        enabled.decision_engine.enabled = true;
         assert!(matches!(
             build(&enabled, &declared, Some(key(&temp)), &transports),
             Err(FactoryBuildError::Selection(ResolutionError::CredentialMissing { .. }))

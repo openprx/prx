@@ -327,8 +327,8 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
             selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
             ["file_read"]
         );
-        // This genuine Chat input did not mention either file mutation. Its
-        // selected read is not authority to collect or discover a write.
+        // Search stays reachable, but publishing its schema does not offer or
+        // admit a file mutation or authorize approval collection.
         assert!(context.approval_collection_proof().is_none());
         assert!(selected.specs.iter().all(|spec| spec.name != tool_name));
         let entry = service.catalog.entry_for_public_name(tool_name).unwrap();
@@ -342,9 +342,9 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
             service
                 .agent_capability_search_spec(proof.as_ref(), &context)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
-        assert!(service.capability_search_port(proof.as_ref(), &context).is_err());
+        assert!(service.capability_search_port(proof.as_ref(), &context).is_ok());
         assert!(
             service
                 .admit_discovered_tool(proof.as_ref(), &context, tool_name)

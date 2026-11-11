@@ -789,6 +789,7 @@ mod tests {
     async fn a_live_test_needs_the_confirmation() {
         let served = serve_config(|config| {
             loopback_plane(config);
+            config.decision_engine.enabled = true;
             config.causal_tree.backend.endpoint = "https://decisions.invalid/v1".into();
             config.causal_tree.backend.remote_enabled = true;
             config.providers.models.clear();
