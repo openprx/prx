@@ -1352,7 +1352,12 @@ mod tests {
         enabled: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
     ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
-        let input = "Use memory_search to explain the saved expression `2 + 2`.";
+        let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
+        let input = if scoped_retrieval {
+            "Use memory_search to explain the saved expression `2 + 2`."
+        } else {
+            "Give a brief greeting."
+        };
         let selection = draft
             .provider_outcome
             .as_ref()
@@ -1448,26 +1453,28 @@ mod tests {
         assert_eq!(source.content, input);
         assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
         assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
-        let mut write_scope = proof.memory_scope().clone();
-        write_scope.owner_id = Some(proof.owner_id().to_owned());
-        write_scope.require_owner_match = true;
-        memory
-            .store_with_context_and_metadata(
-                "prx_terminal_fixture_note",
-                "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
-                crate::memory::MemoryCategory::Core,
-                Some(proof.session_key()),
-                Some(&write_scope),
-                crate::memory::MemoryStoreMetadata {
-                    workspace_id: Some(source.workspace_id.clone()),
-                    owner_id: source.owner_id.clone(),
-                    channel: source.channel.clone(),
-                    source_event_id: Some(source.event_id.clone()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        if scoped_retrieval {
+            let mut write_scope = proof.memory_scope().clone();
+            write_scope.owner_id = Some(proof.owner_id().to_owned());
+            write_scope.require_owner_match = true;
+            memory
+                .store_with_context_and_metadata(
+                    "prx_terminal_fixture_note",
+                    "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
+                    crate::memory::MemoryCategory::Core,
+                    Some(proof.session_key()),
+                    Some(&write_scope),
+                    crate::memory::MemoryStoreMetadata {
+                        workspace_id: Some(source.workspace_id.clone()),
+                        owner_id: source.owner_id.clone(),
+                        channel: source.channel.clone(),
+                        source_event_id: Some(source.event_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let cancellation = tokio_util::sync::CancellationToken::new();
         let context = service
             .decide_agent_initial(
@@ -1483,7 +1490,7 @@ mod tests {
                     context.directive(),
                     crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
                 ),
-                "fixture requires real scoped retrieval to authorize Answer"
+                "fixture requires an admitted Answer"
             );
         }
         if draft.status == TurnTerminalStatus::Silent {
@@ -1638,7 +1645,14 @@ mod tests {
         let service = bind_terminal_fixture(workspace, Arc::clone(&memory), &mut draft, &cost).await;
         let terminal_id = draft.terminal_id.clone();
         let owner_id = draft.scope.owner_id.clone().expect("test: seeded terminal owner");
-        let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
+        // Generate authentic legacy bytes through the retained recording-off
+        // fallback, without adding a v3 receipt to this historical fixture.
+        let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy()).with_event_recording(
+            crate::memory::fabric::MemoryEventRecording {
+                record_user_messages: false,
+                ..Default::default()
+            },
+        );
         finalize_turn_stop_after_marker(&fabric, draft, &cost, workspace)
             .await
             .expect("test: seed signed terminal");

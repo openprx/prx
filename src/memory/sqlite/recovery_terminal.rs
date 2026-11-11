@@ -20,7 +20,7 @@ thread_local! {
     static CRASH_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Install a hook that runs after prefix events are durable and before the final row is inserted.
+/// Run a task-scoped hook after prefix rows are inserted and before the final row is inserted.
 pub(crate) async fn with_after_prefix_async<F, R>(hook: AfterPrefix, work: F) -> R
 where
     F: std::future::Future<Output = R>,

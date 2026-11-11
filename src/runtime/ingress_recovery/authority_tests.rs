@@ -417,6 +417,22 @@ impl Memory for LegacyLedger {
             .find_owned_message_event_by_idempotency_key(workspace_id, owner_id, idempotency_key)
             .await
     }
+    async fn find_owned_message_event(
+        &self,
+        workspace_id: &str,
+        owner_id: &str,
+        event_id: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.0.find_owned_message_event(workspace_id, owner_id, event_id).await
+    }
+    async fn list_message_events_since(
+        &self,
+        principal: &crate::memory::MemoryPrincipal,
+        after_id: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MessageEvent>> {
+        self.0.list_message_events_since(principal, after_id, limit).await
+    }
     async fn claim_ingress_recovery(
         &self,
         workspace_id: &str,

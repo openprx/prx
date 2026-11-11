@@ -1378,13 +1378,13 @@ writer drains; queue admission alone is not confirmation. A completed fixed
 reply can repair its missing directive-applied event using the original
 source's configuration generation and revision.
 
-Recovery requires the original workspace decision key and all referenced
-records. An unsigned marker, an older claim, a missing retained record, a
+Legacy decision-linked recovery requires the original workspace decision key
+and all referenced records. An unsigned marker, an older claim, a missing retained record, a
 changed row, or a replaced key causes recovery to fail explicitly. Keep the
 original key and database backup together when restoring a workspace. A
 rollback must preserve these records; do not remove authentication fields or
-rewrite old markers to make them replayable. Recovery repairs telemetry and
-does not authorize another provider or tool execution.
+rewrite old markers to make them replayable. Legacy recovery repairs telemetry and does not authorize another provider or
+tool execution.
 
 With event recording enabled, SQLite, Lucid's local store, and encrypted
 SQLite scopes commit the terminal events, recovery attestation, and an
