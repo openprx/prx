@@ -126,12 +126,22 @@ pub async fn run(
 pub(crate) async fn save_current_input(
     fabric: &crate::memory::MemoryFabric,
     run: &str,
+    session_key: &str,
     input: &str,
     event: Option<&str>,
 ) -> anyhow::Result<()> {
     let key = current_input_memory_key(run);
     fabric
-        .record_semantic_memory_from_event(&key, input, MemoryCategory::Conversation, None, event, None, None, None)
+        .record_semantic_memory_from_event(
+            &key,
+            input,
+            MemoryCategory::Conversation,
+            Some(session_key),
+            event,
+            None,
+            None,
+            None,
+        )
         .await
 }
 
@@ -2048,6 +2058,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     let _ = save_current_input(
                         &memory_fabric,
                         &turn_run_id,
+                        &runtime_envelope.session_key,
                         &msg,
                         agent_user_event.as_ref().map(|event| event.event_id.as_str()),
                     )
@@ -2528,7 +2539,7 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 // Auto-save conversation turns (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&user_input) {
-                    let _ = save_current_input(&memory_fabric, &turn_run_id, &user_input,
+                    let _ = save_current_input(&memory_fabric, &turn_run_id, &runtime_envelope.session_key, &user_input,
                         agent_user_event.as_ref().map(|event| event.event_id.as_str())).await;
                 }
 

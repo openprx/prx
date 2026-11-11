@@ -1733,11 +1733,10 @@ Retry with a compatible model: /provider {shown} <model>",
             continue;
         }
 
-        // `/new` is a real session boundary: save the current durable state,
-        // create a fresh session identity, and atomically replace every
-        // session-scoped UI/model ledger. It must not share `/clear` semantics,
-        // otherwise the old title, turns, and token usage survive indefinitely.
-        if user_input == "/new" {
+        // Both reset commands save the current state and switch every
+        // session-scoped UI/model ledger to a fresh identity. Stored memories
+        // remain intact, including those owned by other sessions or channels.
+        if matches!(user_input.as_str(), "/new" | "/clear") {
             match start_new_chat_session(
                 mem.as_ref(),
                 ChatSwitchCtx {
@@ -1772,59 +1771,6 @@ Retry with a compatible model: /provider {shown} <model>",
             {
                 Ok(message) => emit_chat_output(&message),
                 Err(e) => emit_chat_output(&e.to_string()),
-            }
-            continue;
-        }
-
-        // Handle /clear separately (needs mutable history). This intentionally
-        // keeps the current session identity and accounting ledger.
-        if user_input == "/clear" {
-            history.clear();
-            // S2-C Step 4: dual-write HistoryCleared to the reducer. The reducer's semantics are
-            // "drain every non-system message, keep system" — legacy first clears and may then push a
-            // system message (only when !skill_rag.enabled); both end states are "system only" (or
-            // empty when skill_rag.enabled). During the dual-write period the two paths reach the same
-            // end state but differ in between:
-            //   - legacy: clear() empties history → may push system
-            //   - reducer: HistoryCleared keeps the existing system (it does not rebuild it)
-            // On the real production path legacy later pushes a newly built system message (which
-            // overwrites the skill list of the old system), while the reducer's system is still the
-            // previous one. This S2-C stage does not correct that — legacy is still the real context
-            // source for the LLM and the reducer is the observation ledger.
-            if !config.skill_rag.available() {
-                let cleared_system = build_runtime_system_prompt(&config, model_name, &skills, native_tools);
-                history.push(ChatMessage::system(cleared_system.clone()));
-                // S2-C Step 4 (Codex P0 correction): use SetLeadingSystemPrompt rather than
-                // RecordSystemMessage. The reducer's HistoryCleared means "drain non-system, keep
-                // system" — the previous system message is still there; using RecordSystemMessage
-                // (append) here would produce a duplicate system message and accumulate more over
-                // time. SetLeadingSystemPrompt is an upsert: it replaces the existing leading system
-                // message or pushes into an empty history, which matches the end state of the legacy
-                // `clear + push` (at most 1 system message).
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::SetLeadingSystemPrompt {
-                        content: cleared_system,
-                    },
-                    "chat.system_prompt_after_clear",
-                );
-            }
-            let cleared = commands::handle_clear(mem.as_ref(), Some(&chat_session.id)).await;
-            let msg = commands::format_clear_feedback(cleared);
-            #[cfg(feature = "terminal-tui")]
-            {
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::HistoryClearedWithNotice { notice: msg.clone() },
-                    "chat.history_cleared_with_notice",
-                );
-                if let Some(tx) = redraw_tx_for_main.as_ref() {
-                    let _ = tx.try_send(());
-                } else {
-                    print_fallback_chat_output(&msg);
-                }
-            }
-            #[cfg(not(feature = "terminal-tui"))]
-            {
-                print_fallback_chat_output(&msg);
             }
             continue;
         }
@@ -3223,6 +3169,7 @@ Retry with a compatible model: /provider {shown} <model>",
             let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
             let _ = crate::agent::entry::save_current_input(&memory_fabric,
                 admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?,
+                &admitted_binding.envelope().session_key,
                 &safe_user_input, chat_user_event.as_ref().map(|event| event.event_id.as_str())).await;
         }
 
