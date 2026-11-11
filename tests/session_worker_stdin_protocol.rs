@@ -19,9 +19,9 @@
 //!    `tokio::io::stdin` read on the blocking pool, because runtime drop joins
 //!    that pool and the process would then wait for an EOF the parent
 //!    deliberately never sends.
-//! 2. Worker stdout stays **exactly one line of JSON** — the `WorkerResult` IPC
-//!    contract asserted by `src/main.rs`'s "session-worker must stay
-//!    stdout-clean for IPC JSON" comment.
+//! 2. With no mailbox binding, stdout stays exactly one `WorkerResult` JSON
+//!    line. The opt-in mailbox fixture below exercises live Data/Ack lines
+//!    followed by that same terminal result, with no non-protocol output.
 //! 3. Authentication still gates the run: no parent capability in the
 //!    environment means no run, regardless of what the manifest claims.
 //! 4. A malformed manifest followed by control frames fails cleanly, still on
@@ -1849,7 +1849,7 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
         .arg(turns.to_string())
         .env("HOME", &home)
         .env("OPENPRX_MOCK_RESPONSE", "PRX-MAILBOX-MODEL-DONE")
-        .env("OPENPRX_TEST_MAILBOX_OUTBOUND",workspace.join("worker-send-intent"))
+        .env("OPENPRX_TEST_MAILBOX_OUTBOUND", workspace.join("worker-send-intent"))
         .env(
             "OPENPRX_MOCK_HOLD_WHILE_FILE",
             format!("PRX-MAILBOX-INITIAL={}", workspace.join("provider-hold").display()),
@@ -1893,7 +1893,10 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
     )?;
     ensure!(copies == expected, "Data was copied into another turn's source journal");
     let worker_data:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='ordinary worker-originated Data'",[],|r|r.get(0))?;
-    ensure!(worker_data==expected,"worker-originated Data did not cross the real stdout pipe");
+    ensure!(
+        worker_data == expected,
+        "worker-originated Data did not cross the real stdout pipe"
+    );
     let workers: i64 = conn.query_row(
         "SELECT count(*) FROM child_sessions WHERE session_id='mailbox-worker' AND ma_scope_id IS NOT NULL",
         [],

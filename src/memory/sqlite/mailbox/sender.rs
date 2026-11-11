@@ -1,12 +1,18 @@
 //! Explicit dormant adapter used by tools and slash commands.
-use super::{SqliteMailbox, storage_error};
+use super::{SqliteMailbox, pin::check_scope, storage_error};
 use crate::messaging::mailbox::{MailboxError, MailboxPublished, MailboxResult, MailboxScope};
 use crate::messaging::send::{MailboxResolver, MailboxSender};
 use crate::messaging::{IdempotencyKey, InheritedProvenance, MessageBody, MessageKind, PrxMessage, SessionAddr};
 use async_trait::async_trait;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Transaction, TransactionBehavior};
 use std::sync::Arc;
 use uuid::Uuid;
+
+// Payload drops before its scope lease on every resolver/error/cancel path.
+struct PendingSend {
+    text: String,
+    _lease: super::runtime::Lease,
+}
 
 pub struct SqliteMailboxSender {
     store: SqliteMailbox,
@@ -47,6 +53,14 @@ impl MailboxSender for SqliteMailboxSender {
         if text.is_empty() {
             return Err(MailboxError::InvalidMetadata);
         }
+        let pending = {
+            let writer = self.store.memory.pool.write();
+            let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
+            check_scope(&tx, &self.scope, &self.source, None, true)?;
+            let lease = self.store.memory.mailbox_runtime.cache_lease(self.scope.scope_id);
+            tx.commit().map_err(storage_error)?;
+            PendingSend { text, _lease: lease }
+        };
         let resolved = self.resolver.resolve(&target).await?;
         if resolved.authority.source != self.source
             || resolved.authority.workspace_id != self.scope.workspace_id
@@ -54,21 +68,11 @@ impl MailboxSender for SqliteMailboxSender {
         {
             return Err(MailboxError::Unauthorized);
         }
-        let from = serde_json::to_string(&self.source).map_err(storage_error)?;
-        let to = serde_json::to_string(&target).map_err(storage_error)?;
-        // Streams survive reconstruction. Only a retired stream gets a new UUID.
-        let wire:Option<Vec<u8>>=self.store.memory.pool.write().query_row(
-            "SELECT wire_stream_id FROM prx_mailbox_seq WHERE workspace_id=?1 AND owner_id=?2 AND from_addr=?3 AND to_addr=?4 AND state=0 AND sender_ma_scope_id=?5 ORDER BY stream_id DESC LIMIT 1",
-            params![self.scope.workspace_id,self.scope.owner_id,from,to,self.scope.scope_id.to_string()],|r|r.get(0)).optional().map_err(storage_error)?;
-        let wire = wire
-            .map(|bytes| Uuid::from_slice(&bytes).map_err(|_| MailboxError::CorruptState))
-            .transpose()?
-            .unwrap_or_else(Uuid::new_v4);
         let id = Uuid::new_v4();
         let message = PrxMessage {
             id,
             idempotency: IdempotencyKey::parse(&id.to_string()).map_err(|_| MailboxError::InvalidMetadata)?,
-            stream_id: Some(wire),
+            stream_id: None,
             seq: 0,
             ts: self.store.clock.now(),
             from: self.source.clone(),
@@ -80,14 +84,14 @@ impl MailboxSender for SqliteMailboxSender {
             kind: MessageKind::Data,
             body: MessageBody {
                 mime,
-                bytes: text.into_bytes(),
+                bytes: pending.text.into_bytes(),
             },
             origin: None,
             auth: None,
             exec: None,
             canonical_hash: None,
         };
-        self.store.publish(
+        self.store.publish_current(
             &resolved.authority,
             message,
             &self.scope,

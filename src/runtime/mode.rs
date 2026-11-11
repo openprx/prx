@@ -329,6 +329,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
         Commands::Completions { .. } => anyhow::bail!("BUG: Completions command should have been handled earlier"),
         Commands::SessionWorker { .. } => anyhow::bail!("BUG: SessionWorker command should have been handled earlier"),
+        #[cfg(feature = "test-mock")]
+        Commands::MailboxHarness { .. } => anyhow::bail!("MailboxHarness must be handled before runtime dispatch"),
         Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),
 
         Commands::Agent {

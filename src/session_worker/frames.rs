@@ -54,23 +54,27 @@ where
         inner: reader,
         progress,
     };
-    let mut reader = BufReader::new(reader.take(limit.saturating_add(1)));
-    let mut total = 0u64;
+    let mut reader = BufReader::new(reader);
     let mut terminal = None;
     loop {
+        if terminal.is_some() {
+            // Keep pipe ownership until EOF without retaining later output.
+            tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+            break;
+        }
         let mut line = Vec::new();
-        let count = reader.read_until(b'\n', &mut line).await?;
+        let count = (&mut reader)
+            .take(limit.saturating_add(1))
+            .read_until(b'\n', &mut line)
+            .await?;
         if count == 0 {
             break;
         }
-        total = total.saturating_add(u64::try_from(count)?);
-        ensure!(total <= limit, "session-worker stdout exceeded byte limit");
+        ensure!(
+            u64::try_from(count)? <= limit,
+            "session-worker stdout line exceeded byte limit"
+        );
         if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        // The first terminal ends the protocol. Drain descendant-held pipes
-        // to EOF for ownership, but never route or decode later lines.
-        if terminal.is_some() {
             continue;
         }
         let value: serde_json::Value = serde_json::from_slice(&line).context("invalid worker stdout JSON line")?;
@@ -146,7 +150,9 @@ mod tests {
         bytes.extend_from_slice(b" \n");
         worker.write_all(&bytes).await?;
         worker.write_all(b"ignored after terminal\n").await?;
-        worker.write_all(&serde_json::to_vec(&WorkerOutputFrame::BrokerCancel { call_id: 9 })?).await?;
+        worker
+            .write_all(&serde_json::to_vec(&WorkerOutputFrame::BrokerCancel { call_id: 9 })?)
+            .await?;
         worker.write_all(b"\n").await?;
         drop(worker);
         assert_eq!(reader.await??, bytes);
@@ -181,6 +187,34 @@ mod tests {
     async fn empty_stdout_remains_available_to_exit_signal_classifier() -> Result<()> {
         let bytes = read_worker_frames(tokio::io::empty(), None, None, 4096).await?;
         assert_eq!(bytes, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_frames_have_a_per_line_limit_instead_of_a_cumulative_budget() -> Result<()> {
+        let (mut worker, parent) = tokio::io::duplex(4096);
+        let (sender, mut receiver) = mpsc::channel(32);
+        let reader = tokio::spawn(read_worker_frames(parent, Some(sender), None, 256));
+        let frame = WorkerOutputFrame::Ack {
+            message_id: Uuid::from_u128(1),
+            state: DeliveryState::Delivered,
+        };
+        let mut wire = serde_json::to_vec(&frame)?;
+        wire.push(b'\n');
+        assert!(wire.len() < 256);
+        for _ in 0..16 {
+            worker.write_all(&wire).await?;
+        }
+        let terminal = b"{\"success\":true,\"output\":\"done\",\"error\":null,\"tokens_used\":null}\n";
+        worker.write_all(terminal).await?;
+        drop(worker);
+        assert_eq!(reader.await??, terminal);
+        let mut received = 0;
+        while let Some(actual) = receiver.recv().await {
+            assert_eq!(actual, frame);
+            received += 1;
+        }
+        assert_eq!(received, 16);
         Ok(())
     }
 }

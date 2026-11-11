@@ -129,14 +129,20 @@ impl WorkerMailboxFactory for Factory {
         drop(outgoing);
         // The scripted model gets a typed send intent. Wire bytes are still
         // emitted by the actual worker stdout owner and read by its real parent.
-        let reverse = MailboxAuthority::local(self.workspace.clone(),worker.clone(),parent.clone())?;
-        let parent_key=crate::chat::sessions::child::ChildSessionRegistry::canonical_session_key(&parent)?;
-        let mut reply=message.clone();
-        reply.id=Uuid::new_v4();reply.idempotency=IdempotencyKey::parse(&reply.id.to_string())?;
-        reply.stream_id=Some(Uuid::new_v4());reply.from=worker.clone();reply.to=parent.clone();
-        reply.to_pin=self.store.recipient_pin(&reverse,&parent_scope,&parent_key)?;
-        reply.body.bytes=b"ordinary worker-originated Data".to_vec();
-        std::fs::write(self.hold.with_file_name("worker-send-intent"),serde_json::to_vec(&reply)?)?;
+        let reverse = MailboxAuthority::local(self.workspace.clone(), worker.clone(), parent.clone())?;
+        let parent_key = crate::chat::sessions::child::ChildSessionRegistry::canonical_session_key(&parent)?;
+        let mut reply = message;
+        reply.id = Uuid::new_v4();
+        reply.idempotency = IdempotencyKey::parse(&reply.id.to_string())?;
+        reply.stream_id = Some(Uuid::new_v4());
+        reply.from = worker.clone();
+        reply.to = parent.clone();
+        reply.to_pin = self.store.recipient_pin(&reverse, &parent_scope, &parent_key)?;
+        reply.body.bytes = b"ordinary worker-originated Data".to_vec();
+        std::fs::write(
+            self.hold.with_file_name("worker-send-intent"),
+            serde_json::to_vec(&reply)?,
+        )?;
         let frame = actor.lock().next_delivery()?.context("mailbox IPC delivery missing")?;
         let (controls, receiver) = mpsc::channel(64);
         controls.try_send(frame).context("queue initial mailbox Data")?;
@@ -144,8 +150,9 @@ impl WorkerMailboxFactory for Factory {
         std::fs::write(&self.hold, b"wait for real delivery Ack")?;
         let hold = self.hold.clone();
         let consumer_actor = Arc::clone(&actor);
-        let consumer_store=self.store.clone();
-        let parent_execution=consumer_store.execution_guard(&parent_scope,&parent,format!("parent-{}",manifest.run_id))?;
+        let consumer_store = self.store.clone();
+        let parent_execution =
+            consumer_store.execution_guard(&parent_scope, &parent, format!("parent-{}", manifest.run_id))?;
         let consumer = tokio::spawn(async move {
             while let Some(frame) = output_rx.recv().await {
                 if matches!(&frame, WorkerOutputFrame::Ack { .. }) {
@@ -155,12 +162,17 @@ impl WorkerMailboxFactory for Factory {
                         Err(error) => return Err(error.into()),
                     }
                 }
-                let received=consumer_actor.lock().receive(frame)?;
-                if let Some(receipt)=received {
-                    let delivered=consumer_store.deliver(&parent_scope,&parent)?.context("worker-originated delivery missing")?;
-                    ensure!(delivered.message().id==receipt.message_id,"worker Data delivered under another identity");
-                    let adopted=consumer_store.adopt(&delivered)?;
-                    consumer_store.acknowledge(&worker_scope,&parent,adopted.message_id,adopted.state)?;
+                let received = consumer_actor.lock().receive(frame)?;
+                if let Some(receipt) = received {
+                    let delivered = consumer_store
+                        .deliver(&parent_scope, &parent)?
+                        .context("worker-originated delivery missing")?;
+                    ensure!(
+                        delivered.message().id == receipt.message_id,
+                        "worker Data delivered under another identity"
+                    );
+                    let adopted = consumer_store.adopt(&delivered)?;
+                    consumer_store.acknowledge(&worker_scope, &parent, adopted.message_id, adopted.state)?;
                 }
             }
             drop(parent_execution);
@@ -293,59 +305,170 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
         failures: Mutex::new(Vec::new()),
     });
     let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?;
-    cleanup.run(async {
-        for turn in 0..turns {
-            let runs=Arc::new(RwLock::new(Vec::new()));
-            let security=Arc::new(crate::security::SecurityPolicy::from_config(&config.autonomy,&workspace));
-            let tool=crate::tools::sessions_spawn::SessionsSpawnTool::new_with_registry(Arc::new(crate::channels::CliChannel::new()),"mock","prx-mailbox-model",0.2,Arc::clone(&security),workspace.clone(),config.multimodal.clone(),HashMap::new(),None,crate::providers::ProviderRuntimeOptions{openprx_dir:Some(config_dir.clone()),..crate::providers::ProviderRuntimeOptions::default()},config.sessions_spawn.clone(),Arc::clone(&runs)).with_hint_config(&config).with_shared_memory(memory.clone()).with_worker_mailbox(factory.clone());
-            let tools_handle=tool.tools_handle();
-            let mut registry=crate::tools::default_tools(Arc::clone(&security));registry.push(Box::new(tool));
-            let registry=Arc::new(registry);ensure!(tools_handle.set(&registry),"parent registry already set");
-            let generation=crate::config::new_shared(config.clone()).pin();
-            let provider:Arc<dyn crate::providers::Provider>=Arc::new(ParentModel{inner:Arc::new(crate::providers::router::MockEnvProvider::from_env())});
-            let publication=crate::runtime::turn_publication::TurnDecisionPublication{generation,registry,mcp_tool:None,security,observer:Arc::new(crate::observability::NoopObserver),hooks:Arc::new(crate::hooks::HookManager::new(workspace.clone())),memory:memory.clone(),plugin_generation:0};
-            let result=crate::chat::decision_source::mailbox_fixture::spawn(publication,provider,serde_json::json!({"action":"spawn","mode":"process","task":format!("PRX-MAILBOX-INITIAL-{turn}"),"announce":false})).await?;
-            ensure!(result.success,"mailbox source spawn refused: {} {}",result.output,result.error.unwrap_or_default());
-            let control=runs.read().await.first().and_then(|run|run.process_control.clone()).context("real process run missing")?;
-            if tokio::time::timeout(std::time::Duration::from_secs(30),control.finalized()).await.is_err() {
-                let _=control.request_termination("mailbox fixture hang guard").await;
-                let _=tokio::time::timeout(std::time::Duration::from_secs(10),control.finalized()).await;
-                anyhow::bail!("mailbox worker did not finalize");
+    cleanup
+        .run(async {
+            for turn in 0..turns {
+                let runs = Arc::new(RwLock::new(Vec::new()));
+                let security = Arc::new(crate::security::SecurityPolicy::from_config(
+                    &config.autonomy,
+                    &workspace,
+                ));
+                let tool = crate::tools::sessions_spawn::SessionsSpawnTool::new_with_registry(
+                    Arc::new(crate::channels::CliChannel::new()),
+                    "mock",
+                    "prx-mailbox-model",
+                    0.2,
+                    Arc::clone(&security),
+                    workspace.clone(),
+                    config.multimodal.clone(),
+                    HashMap::new(),
+                    None,
+                    crate::providers::ProviderRuntimeOptions {
+                        openprx_dir: Some(config_dir.clone()),
+                        ..crate::providers::ProviderRuntimeOptions::default()
+                    },
+                    config.sessions_spawn.clone(),
+                    Arc::clone(&runs),
+                )
+                .with_hint_config(&config)
+                .with_shared_memory(memory.clone())
+                .with_worker_mailbox(factory.clone());
+                let tools_handle = tool.tools_handle();
+                let mut registry = crate::tools::default_tools(Arc::clone(&security));
+                registry.push(Box::new(tool));
+                let registry = Arc::new(registry);
+                ensure!(tools_handle.set(&registry), "parent registry already set");
+                let generation = crate::config::new_shared(config.clone()).pin();
+                let provider: Arc<dyn crate::providers::Provider> = Arc::new(ParentModel {
+                    inner: Arc::new(crate::providers::router::MockEnvProvider::from_env()),
+                });
+                let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+                    generation,
+                    registry,
+                    mcp_tool: None,
+                    security,
+                    observer: Arc::new(crate::observability::NoopObserver),
+                    hooks: Arc::new(crate::hooks::HookManager::new(workspace.clone())),
+                    memory: memory.clone(),
+                    plugin_generation: 0,
+                };
+                let result = crate::chat::decision_source::mailbox_fixture::spawn(
+                    publication,
+                    provider,
+                    serde_json::json!({
+                        "action":"spawn", "mode":"process",
+                        "task":format!("PRX-MAILBOX-INITIAL-{turn}"), "announce":false,
+                    }),
+                )
+                .await?;
+                ensure!(
+                    result.success,
+                    "mailbox source spawn refused: {} {}",
+                    result.output,
+                    result.error.unwrap_or_default()
+                );
+                let control = runs
+                    .read()
+                    .await
+                    .first()
+                    .and_then(|run| run.process_control.clone())
+                    .context("real process run missing")?;
+                if tokio::time::timeout(std::time::Duration::from_secs(30), control.finalized())
+                    .await
+                    .is_err()
+                {
+                    let _ = control.request_termination("mailbox fixture hang guard").await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), control.finalized()).await;
+                    anyhow::bail!("mailbox worker did not finalize");
+                }
+                let completed = runs.read().await;
+                ensure!(
+                    completed.first().is_some_and(|run| matches!(
+                        run.status,
+                        crate::tools::sessions_spawn::SubAgentStatus::Completed(_)
+                    )),
+                    "mailbox worker did not complete: {:?}",
+                    completed.first().map(|run| &run.status)
+                );
+                drop(completed);
+                let tasks = std::mem::take(&mut *factory.finished.lock());
+                for task in tasks {
+                    task.await??;
+                }
+                ensure!(
+                    factory.active.lock().is_empty() && factory.failures.lock().is_empty(),
+                    "mailbox worker ownership remains unresolved"
+                );
             }
-            let completed=runs.read().await;
-            ensure!(completed.first().is_some_and(|run|matches!(run.status,crate::tools::sessions_spawn::SubAgentStatus::Completed(_))),"mailbox worker did not complete: {:?}",completed.first().map(|run|&run.status));
-            drop(completed);
-            let tasks=std::mem::take(&mut *factory.finished.lock());
-            for task in tasks {task.await??;}
-            ensure!(factory.active.lock().is_empty() && factory.failures.lock().is_empty(),"mailbox worker ownership remains unresolved");
-        }
-        Ok(())
-    }).await
+            Ok(())
+        })
+        .await
 }
-
 
 /// Only the model is scripted in C7. This wrapper submits a typed outbound
 /// intent through the native stdout writer; it never fabricates pipe bytes,
 /// store receipts, source grants, worker processes or parent acceptance.
-pub(super) fn worker_model(manifest:&WorkerManifest,inner:Box<dyn crate::providers::Provider>)->Box<dyn crate::providers::Provider> {
-    if manifest.provider_name!="mock" || manifest.session_addr.is_none() { return inner; }
-    let Some(path)=std::env::var_os("OPENPRX_TEST_MAILBOX_OUTBOUND") else {return inner;};
-    Box::new(WorkerModel{inner,path:path.into(),sent:std::sync::atomic::AtomicBool::new(false)})
+pub(super) fn worker_model(
+    manifest: &WorkerManifest,
+    inner: Box<dyn crate::providers::Provider>,
+) -> Box<dyn crate::providers::Provider> {
+    if manifest.provider_name != "mock" || manifest.session_addr.is_none() {
+        return inner;
+    }
+    let Some(path) = std::env::var_os("OPENPRX_TEST_MAILBOX_OUTBOUND") else {
+        return inner;
+    };
+    Box::new(WorkerModel {
+        inner,
+        path: path.into(),
+        sent: std::sync::atomic::AtomicBool::new(false),
+    })
 }
 struct WorkerModel {
-    inner:Box<dyn crate::providers::Provider>,path:PathBuf,sent:std::sync::atomic::AtomicBool,
+    inner: Box<dyn crate::providers::Provider>,
+    path: PathBuf,
+    sent: std::sync::atomic::AtomicBool,
 }
 #[async_trait]
 impl crate::providers::Provider for WorkerModel {
-    async fn chat_with_system(&self,system:Option<&str>,message:&str,model:&str,temperature:f64)->Result<String>{self.inner.chat_with_system(system,message,model,temperature).await}
-    async fn chat_with_history(&self,messages:&[crate::providers::ChatMessage],model:&str,temperature:f64)->Result<String>{self.inner.chat_with_history(messages,model,temperature).await}
-    fn supports_native_tools(&self)->bool{self.inner.supports_native_tools()}
-    async fn chat(&self,request:crate::providers::ChatRequest<'_>,model:&str,temperature:f64)->Result<crate::providers::ChatResponse>{
-        let assessment=request.messages.first().is_some_and(|message|message.content.starts_with("Classify the execution requirement") || message.content.starts_with("Review the proposed final reply against the CURRENT request"));
-        let result=self.inner.chat(request,model,temperature).await?;
-        if !assessment && !self.sent.swap(true,std::sync::atomic::Ordering::SeqCst) {
-            let envelope:PrxMessage=serde_json::from_slice(&std::fs::read(&self.path)?)?;
-            super::stdout::frame(&WorkerOutputFrame::Message{envelope:Box::new(envelope)})?;
+    async fn chat_with_system(
+        &self,
+        system: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+    ) -> Result<String> {
+        self.inner.chat_with_system(system, message, model, temperature).await
+    }
+    async fn chat_with_history(
+        &self,
+        messages: &[crate::providers::ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> Result<String> {
+        self.inner.chat_with_history(messages, model, temperature).await
+    }
+    fn supports_native_tools(&self) -> bool {
+        self.inner.supports_native_tools()
+    }
+    async fn chat(
+        &self,
+        request: crate::providers::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> Result<crate::providers::ChatResponse> {
+        let assessment = request.messages.first().is_some_and(|message| {
+            message.content.starts_with("Classify the execution requirement")
+                || message
+                    .content
+                    .starts_with("Review the proposed final reply against the CURRENT request")
+        });
+        let result = self.inner.chat(request, model, temperature).await?;
+        if !assessment && !self.sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let envelope: PrxMessage = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+            super::stdout::frame(&WorkerOutputFrame::Message {
+                envelope: Box::new(envelope),
+            })?;
         }
         Ok(result)
     }

@@ -15,17 +15,62 @@ use crate::messaging::mailbox::{
 };
 use crate::messaging::{InheritedProvenance, MessageKind, MessageOrigin, PrxMessage, stamp_outbound};
 
+enum PublishInput {
+    Explicit(PrxMessage),
+    Current(PrxMessage),
+}
+
 impl SqliteMailbox {
     /// The runtime resolves a recipient pin before calling. The receiver alone
     /// can verify remote pins; this sender preserves the exact supplied pin.
     pub fn publish(
         &self,
         authority: &MailboxAuthority,
-        mut message: PrxMessage,
+        message: PrxMessage,
         sender: &MailboxScope,
         pin_expires_at: i64,
         inherited: Option<&InheritedProvenance>,
     ) -> MailboxResult<MailboxPublished> {
+        self.publish_input(
+            authority,
+            PublishInput::Explicit(message),
+            sender,
+            pin_expires_at,
+            inherited,
+        )
+    }
+
+    /// Tool/slash ports select their durable stream under the allocation
+    /// transaction, so concurrent first sends cannot mint separate streams.
+    pub(super) fn publish_current(
+        &self,
+        authority: &MailboxAuthority,
+        message: PrxMessage,
+        sender: &MailboxScope,
+        pin_expires_at: i64,
+        inherited: Option<&InheritedProvenance>,
+    ) -> MailboxResult<MailboxPublished> {
+        self.publish_input(
+            authority,
+            PublishInput::Current(message),
+            sender,
+            pin_expires_at,
+            inherited,
+        )
+    }
+
+    fn publish_input(
+        &self,
+        authority: &MailboxAuthority,
+        input: PublishInput,
+        sender: &MailboxScope,
+        pin_expires_at: i64,
+        inherited: Option<&InheritedProvenance>,
+    ) -> MailboxResult<MailboxPublished> {
+        let (current, mut message) = match input {
+            PublishInput::Explicit(message) => (false, message),
+            PublishInput::Current(message) => (true, message),
+        };
         let mut pin_expires_at = pin_expires_at;
         authority.authorize(&message)?;
         if authority.source.instance != self.local_instance
@@ -43,7 +88,7 @@ impl SqliteMailbox {
         if message.kind != MessageKind::Data {
             return Err(MailboxError::InvalidMetadata);
         }
-        if message.stream_id.is_none() {
+        if !current && message.stream_id.is_none() {
             return Err(MailboxError::StreamIdRequired);
         }
         if let Some(inherited) = inherited {
@@ -73,6 +118,9 @@ impl SqliteMailbox {
             // Allocation is sender-owned; a retry of its provisional request
             // must compare using the originally allocated seq, never charge it again.
             message.seq = sequence(&seq)?;
+            if current {
+                message.stream_id = Some(stream.wire_id);
+            }
             if meta.common.request_digest != crate::messaging::request_digest(&message) {
                 return Err(MailboxError::IdempotencyConflict);
             }
@@ -107,6 +155,17 @@ impl SqliteMailbox {
                 Some(&claims.canonical_session_key),
                 true,
             )?;
+        }
+        if current {
+            let wire:Option<Vec<u8>>=tx.query_row(
+                "SELECT wire_stream_id FROM prx_mailbox_seq WHERE workspace_id=?1 AND owner_id=?2 AND from_addr=?3 AND to_addr=?4 AND state=0 AND sender_ma_scope_id=?5 ORDER BY stream_id DESC LIMIT 1",
+                params![sender.workspace_id,sender.owner_id,encode(&message.from)?,encode(&message.to)?,sender.scope_id.to_string()],|row|row.get(0)
+            ).optional().map_err(storage_error)?;
+            message.stream_id = Some(
+                wire.map(|bytes| uuid(&bytes))
+                    .transpose()?
+                    .unwrap_or_else(uuid::Uuid::new_v4),
+            );
         }
         let mut stream = self.ensure_stream(&tx, &message, sender, Role::Sender)?;
         if stream.retired {

@@ -2,22 +2,24 @@
 //! through an independent connection before and after a real restart.
 #![cfg(all(feature = "test-mock", unix))]
 use anyhow::{Context, Result, ensure};
+use std::io::Read as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let barrier = dir.path().join("barrier");
     std::fs::write(&barrier, b"hold")?;
-    let mut child = Receiver(Command::new(env!("CARGO_BIN_EXE_prx"))
-        .args(["__mailbox-harness", "accept-adopt", "--workspace"])
-        .arg(dir.path())
-        .env("OPENPRX_TEST_MAILBOX_BARRIER", format!("{stage}={}", barrier.display()))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?);
+    let mut child = Receiver(
+        Command::new(env!("CARGO_BIN_EXE_prx"))
+            .args(["__mailbox-harness", "accept-adopt", "--workspace"])
+            .arg(dir.path())
+            .env("OPENPRX_TEST_MAILBOX_BARRIER", format!("{stage}={}", barrier.display()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
     let started = dir.path().join("barrier.started");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !started.exists() {
@@ -43,28 +45,43 @@ fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Res
 }
 struct Receiver(Child);
 impl std::ops::Deref for Receiver {
-    type Target=Child;
-    fn deref(&self)->&Child {&self.0}
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
 }
 impl std::ops::DerefMut for Receiver {
-    fn deref_mut(&mut self)->&mut Child {&mut self.0}
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
 }
 impl Drop for Receiver {
-    fn drop(&mut self) {let _=self.0.kill();let _=self.0.wait();}
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
-fn restart(workspace:&Path)->Result<()> {
-    let mut receiver=Receiver(Command::new(env!("CARGO_BIN_EXE_prx"))
-        .args(["__mailbox-harness","accept-adopt","--workspace"]).arg(workspace)
-        .env_remove("OPENPRX_TEST_MAILBOX_BARRIER").stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?);
-    let deadline=Instant::now()+Duration::from_secs(20);
+fn restart(workspace: &Path) -> Result<()> {
+    let mut receiver = Receiver(
+        Command::new(env!("CARGO_BIN_EXE_prx"))
+            .args(["__mailbox-harness", "accept-adopt", "--workspace"])
+            .arg(workspace)
+            .env_remove("OPENPRX_TEST_MAILBOX_BARRIER")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(status)=receiver.try_wait()? {
-            let mut stderr=String::new();
-            if let Some(mut pipe)=receiver.stderr.take() {pipe.read_to_string(&mut stderr)?;}
-            ensure!(status.success(),"restart failed: {stderr}");
+        if let Some(status) = receiver.try_wait()? {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = receiver.stderr.take() {
+                pipe.read_to_string(&mut stderr)?;
+            }
+            ensure!(status.success(), "restart failed: {stderr}");
             return Ok(());
         }
-        ensure!(Instant::now()<deadline,"mailbox restart exceeded hang guard");
+        ensure!(Instant::now() < deadline, "mailbox restart exceeded hang guard");
         std::thread::sleep(Duration::from_millis(10));
     }
 }

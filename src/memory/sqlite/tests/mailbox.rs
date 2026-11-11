@@ -836,6 +836,16 @@ fn mailbox_row_requires_scope() {
         MailboxError::StaleIncarnation
     );
     assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_messages"), 0);
+    let error = f.memory.pool.write().execute(
+        "INSERT INTO prx_mailbox_messages(id,stream_id,seq,workspace_id,owner_id,incarnation,generation,state,body_mime,body_bytes,delivery_meta) VALUES (1,1,x'0000000000000001',?1,?2,?3,1,0,'text/plain',x'00','{}')",
+        params![W,O,Uuid::from_u128(INC).to_string()],
+    ).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("NOT NULL constraint failed: prx_mailbox_messages.ma_scope_id")
+    );
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_messages"), 0);
 }
 
 #[test]
@@ -1971,4 +1981,139 @@ fn permanent_seq_gap_nacks_reachable_sender_outbox() {
         1,
         "Nack must not create an Ack receipt"
     );
+}
+
+#[test]
+fn worker_mime_projection_matches_durable_transcript() {
+    let f = Fixture::new();
+    for (index, (mime, bytes)) in [
+        ("text/plain", b"/approve remains ordinary input".to_vec()),
+        ("text/markdown", b"**ordinary input**".to_vec()),
+        ("text/plain", vec![0xff, 0]),
+        ("application/octet-stream", vec![0, 1, 0xff]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = u64::try_from(index + 1).unwrap();
+        let mut message = f.message(seq, seq);
+        message.body = MessageBody {
+            mime: mime.into(),
+            bytes,
+        };
+        f.store.accept(&f.authority, message).unwrap();
+        let delivered = f.deliver();
+        let worker_text = crate::session_worker::mailbox::user_text(delivered.message()).unwrap();
+        f.store.adopt(&delivered).unwrap();
+        let durable_text: String = f
+            .memory
+            .pool
+            .write()
+            .query_row(
+                "SELECT content FROM conversation_turns WHERE message_id=?1",
+                [delivered.message().id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worker_text, durable_text);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_sender_ports_share_one_durable_stream() {
+    let f = Fixture::new();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for text in ["first", "second"] {
+        let port = f.sender_port(None);
+        let target = f.target.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            port.send(target, text.into(), "text/plain".into()).await.unwrap()
+        }));
+    }
+    let mut published = Vec::new();
+    for task in tasks {
+        published.push(task.await.unwrap());
+    }
+    published.sort_by_key(|sent| sent.seq);
+    assert_eq!(published.iter().map(|sent| sent.seq).collect::<Vec<_>>(), vec![1, 2]);
+    let wire = published.first().unwrap().stream_id;
+    assert!(published.iter().all(|sent| sent.stream_id == wire));
+    let reopened = f
+        .sender_port(None)
+        .send(f.target.clone(), "reopened port".into(), "text/plain".into())
+        .await
+        .unwrap();
+    assert_eq!(reopened.stream_id, wire);
+    assert_eq!(reopened.seq, 3);
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_seq"), 1);
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_outbox"), 3);
+}
+
+#[tokio::test]
+async fn pending_send_resolver_keeps_payload_in_scope_until_cancel_join() {
+    struct PausedResolver {
+        inner: LocalResolver,
+        entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl crate::messaging::send::MailboxResolver for PausedResolver {
+        async fn resolve(
+            &self,
+            target: &SessionAddr,
+        ) -> crate::messaging::mailbox::MailboxResult<crate::messaging::send::MailboxDestination> {
+            let resolved = crate::messaging::send::MailboxResolver::resolve(&self.inner, target).await?;
+            let entered = self.entered.lock().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+            }
+            self.release.notified().await;
+            Ok(resolved)
+        }
+    }
+    use crate::messaging::send::MailboxSender as _;
+    let f = Fixture::new();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let resolver = Arc::new(PausedResolver {
+        inner: LocalResolver {
+            store: f.store.clone(),
+            authority: f.authority.clone(),
+            scope: f.recipient.clone(),
+        },
+        entered: parking_lot::Mutex::new(Some(entered)),
+        release: tokio::sync::Notify::new(),
+    });
+    let port = crate::memory::sqlite::mailbox::SqliteMailboxSender::new(
+        f.store.clone(),
+        f.source.clone(),
+        f.sender.clone(),
+        resolver,
+        None,
+    )
+    .unwrap();
+    let target = f.target.clone();
+    let sending = tokio::spawn(async move {
+        port.send(target, "pending scoped payload".into(), "text/plain".into())
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.memory.mailbox_runtime.has_scope_leases(f.sender.scope_id),
+        "queued send lost its body lease while resolver was pending"
+    );
+    sending.abort();
+    assert!(sending.await.unwrap_err().is_cancelled());
+    assert!(
+        !f.memory.mailbox_runtime.has_scope_leases(f.sender.scope_id),
+        "cancel join retained the send payload"
+    );
+    let erased = f.store.erase_scope(&f.sender, &|| Ok(())).unwrap();
+    assert_eq!(erased.remaining, 0);
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_outbox"), 0);
 }
