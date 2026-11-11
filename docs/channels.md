@@ -36,7 +36,9 @@ authorization_mode = "follow_rf"
 
 - **DM policy**: `allowlist` / `open` / `disabled` per channel
 - **Group policy**: `allowlist` / `open` with group-level filtering
-- **Allowed senders**: UUID-based allowlist per channel
+- **Allowed senders**: `allowed_from` is an exact-match list (`*` for all).
+  Signal entries are E.164 phone numbers. When the envelope has no phone
+  number, the UUID source is the sender and can be listed as that UUID.
 
 ## Configuration Example
 
@@ -44,7 +46,7 @@ authorization_mode = "follow_rf"
 [channels_config.signal]
 account = "+1234567890"
 dm_policy = "allowlist"
-allowed_from = ["uuid:your-uuid"]
+allowed_from = ["+1234567890"]
 
 [channels_config.wacli]
 webhook_listen = "127.0.0.1:16868"
@@ -118,16 +120,22 @@ The size caps are fixed constants. The only outbound-media configuration key is
 
 ## Turn Duration
 
-A channel turn has no wall-clock budget. It runs until it finishes, until it is
-cancelled (a newer message from the same sender where `interrupt_on_new_message`
-is on, or `prx tasks kill <id>`), or until the stall detector judges it hung —
-`[runtime] idle_hang_secs`, which measures *silence*, not duration, and is reset
-by every provider chunk, tool call and channel write. A turn that works for
-hours is never ended for working for hours.
+A non-ramflux channel turn has no wall-clock budget. It runs until it finishes,
+until it is cancelled (a newer message from the same sender where
+`interrupt_on_new_message` is on, or `prx tasks kill <id>`), or until the stall
+detector judges it hung — `[runtime] idle_hang_secs`, which measures *silence*,
+not duration, and is reset by every provider chunk, tool call and channel
+write. A turn that works for hours is never ended for working for hours.
 
-The `[channels_config] message_timeout_secs` key that used to impose a per-turn
-budget is retired. A config that still sets it keeps loading and logs a `WARN`
-naming the line to delete.
+The ramflux channel is the exception. PRX supplies
+`[channels_config.ramflux] turn_wall_clock_secs` (default 120, minimum 1) and
+cancels the turn when that duration elapses. The host may also send
+`turn.cancel`. Budget expiry currently reports as `cancelled`. See
+[ramflux-channel.md](ramflux-channel.md).
+
+The `[channels_config] message_timeout_secs` key that used to impose a global
+per-turn budget is retired. A config that still sets it keeps loading and logs
+a `WARN` naming the line to delete.
 
 Because a long turn no longer ends on a clock, it says what it is doing instead.
 On channels that support draft edits the draft carries a progress line — the

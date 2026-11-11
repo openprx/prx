@@ -164,8 +164,10 @@ prx emits `turn.status` `failed` with code `surface_rejected`.
 
 One turn runs per `conversation_id` (`max_in_flight_per_conversation`, default
 1). A new message while a turn is running is queued, or interrupts the running
-turn when `on_new_message = "interrupt"`. The host enforces
-`turn_wall_clock_secs` (default 120) with `turn.cancel`.
+turn when `on_new_message = "interrupt"`. PRX supplies
+`turn_wall_clock_secs` (default 120, minimum 1) and cancels the turn when that
+duration elapses. The host may also send `turn.cancel`. Budget expiry currently
+reports as `cancelled`.
 
 ## Config
 

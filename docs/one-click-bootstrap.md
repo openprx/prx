@@ -1,6 +1,8 @@
 # Install PRX
 
-Last verified: **July 26, 2026** for PRX 0.8.20 and Rust 1.97.1.
+This page tracks the installer contract in this tree: Cargo.toml `0.8.171`
+and `rust-version = 1.99.0`. The binary installer downloads the latest GitHub
+Release (v0.8.167); there is no v0.8.171 tag.
 
 ## Linux and macOS
 
@@ -72,7 +74,7 @@ Install or roll back to an exact release:
 
 ```bash
 curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh |
-  sh -s -- --version v0.8.20
+  sh -s -- --version v0.8.167
 ```
 
 Choose a destination:
@@ -89,7 +91,7 @@ modified.
 Windows equivalents:
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/openprx/prx/releases/latest/download/install.ps1))) -Version v0.8.20
+& ([scriptblock]::Create((irm https://github.com/openprx/prx/releases/latest/download/install.ps1))) -Version v0.8.167
 ```
 
 ## Source Build
