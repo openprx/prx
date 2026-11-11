@@ -46,9 +46,11 @@ space, and the bullet. The recurring interval is
 A new materialized task is due immediately. Prompt, interval, description, and
 enablement changes update the existing row. Removed bullets are disabled, not
 deleted. Re-adding the same bullet re-enables that task. A no-change
-reconciliation writes no lifecycle events. `prx xin pause` and `prx xin cancel`
-do not persist for these tasks: while the bullet remains, the next
-reconciliation sets the task enabled again. Remove the bullet to disable it.
+reconciliation writes no lifecycle events. `prx xin pause` is not durable for
+these tasks: while the bullet remains, the next reconciliation sets the task
+enabled again. Remove the bullet to keep it disabled. `prx xin cancel` still
+prevents scheduling: reconciliation may restore enabled, but status stays
+cancelled until `prx xin resume` resets it to pending.
 
 Materialized tasks run only inside the configured active-hour window. When
 `start` is greater than `end`, the window wraps midnight. Due tasks outside
@@ -154,8 +156,9 @@ prx xin goals cancel <goal-id>
 
 Pause prevents future claims on cron jobs and ordinary Xin tasks and leaves an
 active execution to finish. Cancel revokes the active task or step lease so
-the runner stops that execution. For HEARTBEAT.md tasks, pause and cancel are
-not durable: remove the bullet to keep the task disabled.
+the runner stops that execution. For HEARTBEAT.md tasks, pause is undone by
+the next reconciliation while the bullet remains; cancel keeps status
+cancelled, so scheduling still skips it, until `prx xin resume`.
 `prx cron mark-operator` and `prx xin mark-operator` record that a pre-existing
 shell command is the operator's own; agent-created shell jobs stay refused for
 git.
