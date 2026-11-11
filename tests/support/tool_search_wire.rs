@@ -19,6 +19,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 pub const MODEL: &str = "prx-search-probe";
+pub const PARENT_MODEL: &str = "prx-parent-probe";
 pub const INPUT: &str = "Read the saved project probe";
 pub const DONE: &str = "PRX_WIRE_FINISHED";
 pub const STORED: &str = "PRX_STORED_SENTINEL";
@@ -64,7 +65,13 @@ impl WireProbe {
             .route("/v1/chat/completions", post(inference))
             .route(
                 "/v1/models",
-                get(|| async { Json(json!({"object":"list","data":[{"id":MODEL,"object":"model"}]})) }),
+                get(|State(state): State<Arc<ProbeState>>| async move {
+                    let mut models = vec![json!({"id":MODEL,"object":"model"})];
+                    if state.parent_mode.is_some() {
+                        models.push(json!({"id":PARENT_MODEL,"object":"model"}));
+                    }
+                    Json(json!({"object":"list","data":models}))
+                }),
             )
             .with_state(Arc::clone(&state));
         let server = tokio::spawn(async move {
@@ -121,7 +128,7 @@ impl WireProbe {
         );
         if self.state.parent_mode.is_some() {
             ensure!(
-                self.state.parent_calls.load(Ordering::Acquire) >= 2,
+                self.state.parent_calls.load(Ordering::Acquire) >= 3,
                 "parent did not actually spawn and await the child"
             );
         }
@@ -186,7 +193,7 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
         .join("\n");
     if system.contains("Classify the execution requirement of current_request") {
         let informational = state.no_tools.load(Ordering::Acquire)
-            && request.get("model").and_then(Value::as_str) != Some("prx-parent-probe");
+            && request.get("model").and_then(Value::as_str) != Some(PARENT_MODEL);
         return Ok(json!({"role":"assistant","content":if informational {
             r#"{"requirement":"informational"}"#
         } else { r#"{"requirement":"execution_required"}"# }}));
@@ -197,7 +204,7 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
         );
     }
     if let Some(mode) = state.parent_mode
-        && request.get("model").and_then(Value::as_str) == Some("prx-parent-probe")
+        && request.get("model").and_then(Value::as_str) == Some(PARENT_MODEL)
         && messages.iter().any(|message| {
             message.get("role").and_then(Value::as_str) == Some("user")
                 && message
@@ -209,15 +216,39 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
         let round = state.parent_calls.fetch_add(1, Ordering::AcqRel);
         if round == 0 {
             ensure!(
+                names(request).contains(&"capability_search"),
+                "parent has no discovery control"
+            );
+            ensure!(
+                !names(request).contains(&"sessions_spawn"),
+                "chat spawn must initially be deferred"
+            );
+            return Ok(tool_call(
+                "capability_search",
+                &json!({"query":"sessions_spawn","limit":1}),
+                100,
+            ));
+        }
+        if round == 1 {
+            ensure!(
                 names(request).contains(&"sessions_spawn"),
-                "parent needs its source-issued spawn schema"
+                "parent search did not admit spawn"
             );
             return Ok(tool_call(
                 "sessions_spawn",
                 &json!({"action":"spawn","task":"hi","mode":mode,"model":MODEL}),
-                100,
+                101,
             ));
         }
+        let spawned = messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .context("actual parent spawn result")?;
+        ensure!(
+            spawned.to_string().contains("Sub-agent spawned"),
+            "parent spawn failed: {spawned}"
+        );
         let notified = state.completion.notified();
         if !state.completed.load(Ordering::Acquire) {
             tokio::time::timeout(Duration::from_secs(60), notified).await?;

@@ -8,7 +8,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
-use wire::{MODEL, WireProbe};
+use wire::{MODEL, PARENT_MODEL, WireProbe};
 
 #[derive(Clone, Copy, Debug)]
 enum Root {
@@ -25,7 +25,6 @@ const ROOTS: &[Root] = &[
     Root::TaskChild,
     Root::ProcessWorker,
 ];
-const PARENT_MODEL: &str = "prx-parent-probe";
 
 fn config(
     workspace: &Path,
@@ -113,7 +112,7 @@ fn command(config_dir: &Path, workspace: &Path, home: &Path) -> Command {
     command
 }
 
-async fn interactive(mut command: Command, input: &str) -> Result<()> {
+async fn interactive(mut command: Command, input: &str, marker: &str) -> Result<()> {
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -136,7 +135,7 @@ async fn interactive(mut command: Command, input: &str) -> Result<()> {
             while let Some(line) = lines.next_line().await? {
                 text.push_str(&line);
                 text.push('\n');
-                if text.contains(wire::DONE) {
+                if text.contains(marker) {
                     return Ok::<_, anyhow::Error>(());
                 }
                 ensure!(text.len() < 1024 * 1024, "unexpected interactive output size");
@@ -191,41 +190,52 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
     let config = config(&workspace, &config_dir, &probe, advice, native, mode.is_some())?;
     std::fs::write(config_dir.join("config.toml"), toml::to_string_pretty(&config)?)?;
     let mut command = command(&config_dir, &workspace, &home);
-    let result = if matches!(root, Root::Repl | Root::PlainChat) {
-        if matches!(root, Root::PlainChat) {
-            command.args(["chat", "--plain"]);
+    let result = async {
+        if matches!(
+            root,
+            Root::Repl | Root::PlainChat | Root::TaskChild | Root::ProcessWorker
+        ) {
+            if matches!(root, Root::Repl) {
+                command.arg("agent");
+            } else {
+                command.args(["chat", "--plain"]);
+            }
+            let source = if mode.is_some() {
+                "PRX_PARENT sessions_spawn: use memory_get capability_search skill_read prx_probe in a child"
+            } else {
+                input
+            };
+            let marker = if mode.is_some() {
+                "PRX_PARENT_FINISHED"
+            } else {
+                wire::DONE
+            };
+            interactive(command, source, marker).await
         } else {
-            command.arg("agent");
+            command.args(["agent", "-m", input]);
+            let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await??;
+            ensure!(
+                output.status.success(),
+                "{root:?} process failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ensure!(
+                String::from_utf8_lossy(&output.stdout).contains(wire::DONE),
+                "{root:?} did not complete; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
         }
-        interactive(command, input).await
-    } else {
-        let source = if mode.is_some() {
-            "PRX_PARENT sessions_spawn: use memory_get capability_search skill_read prx_probe in a child"
-        } else {
-            input
-        };
-        command.args(["agent", "-m", source]);
-        let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await??;
-        ensure!(
-            output.status.success(),
-            "{root:?} process failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let marker = if mode.is_some() {
-            "PRX_PARENT_FINISHED"
-        } else {
-            wire::DONE
-        };
-        ensure!(
-            String::from_utf8_lossy(&output.stdout).contains(marker),
-            "{root:?} did not complete; stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    };
+    }
+    .await;
     let wire = probe.finish().await;
-    result.with_context(|| format!("{root:?} advice={advice} native={native}"))?;
+    result.with_context(|| {
+        format!(
+            "{root:?} advice={advice} native={native}; wire failure: {:?}",
+            wire.as_ref().err()
+        )
+    })?;
     wire.with_context(|| format!("{root:?} actual provider wire"))
 }
 
