@@ -173,6 +173,9 @@ struct Announcements {
     restarted: Option<(String, u64)>,
     /// This call rebuilt the store before entering the guest.
     rebuilt: bool,
+    /// Delivery depth of the call that produced these announcements.
+    /// `None` is a top-level publish (argument 0).
+    delivery_depth: Option<u32>,
 }
 
 /// Registers the host functions a capability's guests import.
@@ -251,6 +254,12 @@ impl Respawn {
     /// the component into it. Constructors and rebuilds both come through
     /// here, so a rebuilt store is armed exactly like the first one.
     pub(crate) async fn instantiate(&self) -> PluginResult<LiveInstance> {
+        self.instantiate_for_delivery(None).await
+    }
+
+    /// [`Respawn::instantiate`], inheriting the current event-delivery depth
+    /// so a constructor `publish` during a rebuild continues that chain.
+    pub(crate) async fn instantiate_for_delivery(&self, delivery_depth: Option<u32>) -> PluginResult<LiveInstance> {
         let timeout_ms = self.manifest.resources.max_execution_time_ms;
         let optional = self.manifest.permissions.optional.iter().cloned().collect();
         let mut host_state = HostState::new(
@@ -276,6 +285,12 @@ impl Respawn {
         if let Some(sink) = &self.event_sink {
             host_state = host_state.with_event_sink(sink.clone());
         }
+        #[cfg(feature = "wasm-plugins")]
+        {
+            host_state.current_event_depth = delivery_depth;
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        let _ = delivery_depth;
 
         let mut store = wasmtime::Store::new(&self.engine, host_state);
         apply_store_resource_limits(&mut store, self.manifest.resources.max_memory_mb);
@@ -633,6 +648,16 @@ pub(crate) trait GuestOp: Send {
     /// Label for logs, e.g. the middleware stage or the storage operation.
     fn operation(&self) -> &'static str;
 
+    /// Depth of the event delivery this call is handling, if any.
+    ///
+    /// Hook bus deliveries return `Some(EventMessage.depth)`. Every other
+    /// capability, and a lifecycle `on_event`, return `None` (top-level).
+    /// Rebuild instantiation and recovery announcements inherit this value
+    /// so a trap during a delivery cannot open a new depth-0 chain.
+    fn delivery_depth(&self) -> Option<u32> {
+        None
+    }
+
     fn invoke<'a>(
         self,
         store: &'a mut wasmtime::Store<HostState>,
@@ -926,10 +951,11 @@ impl Supervisor {
         // from holding the store lock; only the caller that performed the
         // transition carries it, so each event is emitted exactly once.
         if let Some((reason, restart_count)) = announcements.restarted {
-            self.publish_restart(&reason, restart_count).await;
+            self.publish_restart(&reason, restart_count, announcements.delivery_depth)
+                .await;
         }
         if let Some(reason) = announcements.quarantined {
-            self.publish_quarantine(&reason).await;
+            self.publish_quarantine(&reason, announcements.delivery_depth).await;
         }
         (result, announcements.rebuilt)
     }
@@ -942,7 +968,9 @@ impl Supervisor {
         announcements: &mut Announcements,
     ) -> PluginResult<O::Output> {
         let operation = op.operation();
-        self.ensure_live(inner, operation, announcements).await;
+        let delivery_depth = op.delivery_depth();
+        announcements.delivery_depth = delivery_depth;
+        self.ensure_live(inner, operation, announcements, delivery_depth).await;
 
         #[cfg(test)]
         {
@@ -1008,6 +1036,7 @@ impl Supervisor {
         inner: &mut SupervisorInner,
         operation: &'static str,
         announcements: &mut Announcements,
+        delivery_depth: Option<u32>,
     ) {
         let AdapterState::Dead { reason, cause } = &inner.state else {
             return;
@@ -1035,7 +1064,7 @@ impl Supervisor {
 
         let rebuilt = {
             let refund = charged.then(|| RestartRefund::arm(&mut inner.restart_attempts));
-            let rebuilt = self.respawn.instantiate().await;
+            let rebuilt = self.respawn.instantiate_for_delivery(delivery_depth).await;
             if let Some(refund) = refund {
                 refund.commit();
             }
@@ -1218,7 +1247,7 @@ impl Supervisor {
         reason
     }
 
-    async fn publish_restart(&self, reason: &str, restart_count: u64) {
+    async fn publish_restart(&self, reason: &str, restart_count: u64, delivery_depth: Option<u32>) {
         let Some(bus) = &self.respawn.event_bus else {
             return;
         };
@@ -1229,7 +1258,8 @@ impl Supervisor {
             "restart_count": restart_count,
         })
         .to_string();
-        if let Err(error) = bus.publish(STORAGE_RESTARTED_TOPIC, &payload).await {
+        let depth = delivery_depth.unwrap_or(0);
+        if let Err(error) = bus.publish_with_depth(STORAGE_RESTARTED_TOPIC, &payload, depth).await {
             tracing::warn!(
                 plugin = %self.plugin_name,
                 capability = self.kind.as_str(),
@@ -1239,7 +1269,7 @@ impl Supervisor {
         }
     }
 
-    async fn publish_quarantine(&self, reason: &str) {
+    async fn publish_quarantine(&self, reason: &str, delivery_depth: Option<u32>) {
         let Some(bus) = &self.respawn.event_bus else {
             return;
         };
@@ -1249,7 +1279,11 @@ impl Supervisor {
             "reason": reason,
         })
         .to_string();
-        if let Err(error) = bus.publish(self.kind.quarantine_topic(), &payload).await {
+        let depth = delivery_depth.unwrap_or(0);
+        if let Err(error) = bus
+            .publish_with_depth(self.kind.quarantine_topic(), &payload, depth)
+            .await
+        {
             tracing::warn!(
                 plugin = %self.plugin_name,
                 capability = self.kind.as_str(),
@@ -1602,7 +1636,9 @@ max_execution_time_ms = 30000
             cancel_one_call(&supervisor).await;
             let mut guard = supervisor.lock().await;
             let mut announcements = Announcements::default();
-            supervisor.ensure_live(&mut guard, "test", &mut announcements).await;
+            supervisor
+                .ensure_live(&mut guard, "test", &mut announcements, None)
+                .await;
             assert!(
                 matches!(guard.state, AdapterState::Live(_)),
                 "a cancelled call is rebuilt, never quarantined"

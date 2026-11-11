@@ -282,11 +282,16 @@ only. It does not persist across a process restart or a new loaded generation.
 
 `events.publish` payload max 64 KiB (a string; the host does not parse JSON);
 topic 1..=256 bytes; 4096 subscriptions; per-subscriber queue 1024. A guest
-`publish` while handling a delivered event of depth `d` is issued at depth
-`d`, so the next delivery is at `d+1`. A publish outside any event delivery
-is depth 0. Nested guest republish is rejected when depth exceeds 8 with
-`"event bus: recursion depth limit (8) exceeded for topic '…'"`. `subscribe`
-is hook-only. Patterns: `"*"` (every topic), `.*` suffix (prefix), otherwise
+`publish` while handling a delivered event uses that event's stored depth as
+the publish argument, so the next delivery is stored as argument+1. A
+publish outside any event delivery (lifecycle `on-event`, an independent
+capability call) uses argument 0. Host recovery announcements and a rebuild
+instantiation that happen because of a delivery inherit that delivery's
+depth. Publish arguments 0..=8 are accepted; 9 or above is rejected with
+`"event bus: recursion depth limit (8) exceeded for topic '…'"`. A
+one-to-one republish chain therefore has nine deliveries (stored depths
+1..=9); the ninth delivery's republish is the rejected hop. `subscribe` is
+hook-only. Patterns: `"*"` (every topic), `.*` suffix (prefix), otherwise
 exact; pattern 1..=256 bytes.
 
 `http-outbound.request` methods: GET, POST, PUT, DELETE, PATCH, HEAD. Response

@@ -77,14 +77,6 @@ impl AuditHook {
             log::info(&format!("audit-hook: published milestone summary at total={total}"));
         }
 
-        // Dedicated cascade topic used by the host's depth-limit test. Lifecycle
-        // events never take this path, so ordinary auditing does not loop.
-        if event == "loop.cascade" {
-            if let Err(e) = events::publish(event, payload_json) {
-                log::warn(&format!("audit-hook: cascade publish rejected: {e}"));
-            }
-        }
-
         Ok(())
     }
 

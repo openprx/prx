@@ -1,0 +1,10 @@
+package prx:plugin@0.1.0;
+
+world hook {
+    import prx:host/log@0.1.0;
+    import prx:host/config@0.1.0;
+    import prx:host/kv@0.1.0;
+    import prx:host/events@0.1.0;
+
+    export hook-exports;
+}

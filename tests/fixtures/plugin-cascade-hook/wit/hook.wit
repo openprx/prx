@@ -1,0 +1,5 @@
+package prx:plugin@0.1.0;
+
+interface hook-exports {
+    on-event: func(event: string, payload-json: string) -> result<_, string>;
+}
