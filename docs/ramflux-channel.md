@@ -165,9 +165,13 @@ prx emits `turn.status` `failed` with code `surface_rejected`.
 One turn runs per `conversation_id` (`max_in_flight_per_conversation`, default
 1). A new message while a turn is running is queued, or interrupts the running
 turn when `on_new_message = "interrupt"`. PRX supplies
-`turn_wall_clock_secs` (default 120, minimum 1) and cancels the turn when that
-duration elapses. The host may also send `turn.cancel`. Budget expiry currently
-reports as `cancelled`.
+`turn_wall_clock_secs` (default 120, minimum 1). When that duration elapses,
+PRX marks the turn budget-expired and cancels it. If the turn then returns
+without a terminal status, `turn.status` is `failed` with code `turn_timeout`.
+Paths that write a terminal status after the model loop, including an
+interrupting newer message, report `cancelled`. The host may also send
+`turn.cancel`; that explicit cancel reports `cancelled` unless the
+budget-expired marker is already set.
 
 ## Config
 
@@ -287,7 +291,6 @@ backend produce a JSON-RPC error instead of `{erased:true}`.
 | --- | --- | --- |
 | Runtime `reply.task_propose` producer | Deferred | Wire encoding exists; the turn loop does not autonomously propose tasks. |
 | Runtime `reply.attachment` producer | Deferred | Wire encoding exists; generated attachments are not sent by the turn loop. |
-| Distinct `turn_timeout` error | Deferred | Budget cancellation currently uses `cancelled`. |
 | Replay across process restart | Deferred | Unacknowledged replay is currently process-local. |
 | Remaining low-priority review findings | Deferred | Cursor/action deduplication, metadata hardening, and bounded-resource refinements remain separate followups. |
 

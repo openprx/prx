@@ -128,9 +128,10 @@ not duration, and is reset by every provider chunk, tool call and channel
 write. A turn that works for hours is never ended for working for hours.
 
 The ramflux channel is the exception. PRX supplies
-`[channels_config.ramflux] turn_wall_clock_secs` (default 120, minimum 1) and
-cancels the turn when that duration elapses. The host may also send
-`turn.cancel`. Budget expiry currently reports as `cancelled`. See
+`[channels_config.ramflux] turn_wall_clock_secs` (default 120, minimum 1).
+When that duration elapses, PRX marks the turn budget-expired and cancels it.
+A return without a terminal status then reports `turn.status` `failed` with
+code `turn_timeout`. Explicit cancellation can report `cancelled`. See
 [ramflux-channel.md](ramflux-channel.md).
 
 The `[channels_config] message_timeout_secs` key that used to impose a global
