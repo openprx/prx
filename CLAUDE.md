@@ -2,10 +2,6 @@
 
 This file is loaded by Claude Code on every session. These rules are MANDATORY.
 
-## Rust Edition
-
-Use **Rust 2024 edition** (`edition = "2024"` in Cargo.toml) for all new code.
-
 ## Build & Test
 
 Module flow: the unit of work is one module, built by one lane on one branch and delivered in one PR with the whole module done. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one. Push only checkpoint commits while coding; open the PR (not a draft) when the module is complete.
@@ -55,12 +51,12 @@ let parsed: i32 = text.parse().unwrap_or(0);
 let guard = mutex.lock();  // parking_lot — no poison, no unwrap needed
 let json = serde_json::to_string(&obj)?;
 
-// ✅ ONLY exception — compile-time constants in LazyLock/OnceLock:
-static RE: LazyLock<Regex> = LazyLock::new(||
-    Regex::new(r"^[a-z]+$").expect("BUG: invalid hardcoded regex for identifier pattern")
-);
-// .expect() with descriptive message is allowed ONLY for compile-time-constant values
+// ✅ Hardcoded constants (regex etc.): keep the Result, propagate on use — no exception exists:
+static RE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(r"^[a-z]+$"));
+let re = RE.as_ref().map_err(|e| anyhow::anyhow!("identifier regex: {e}"))?;
 ```
+
+Production code has **no** panic exception: `.unwrap()`, `.expect()`, `panic!`, `unreachable!`, panicking indexing and `#[allow(clippy::unwrap_used | expect_used | panic)]` are all banned outside `#[cfg(test)]`. `panic::catch_unwind` is not an error path either: release profiles use `panic = "abort"`, so it catches nothing there (Google Rust Style Guide: banned in first-party code except as defense in depth that nothing relies on).
 
 ### 2. Error Handling Hierarchy
 
@@ -73,8 +69,9 @@ static RE: LazyLock<Regex> = LazyLock::new(||
 .unwrap_or_else(|| ...)    → computed fallback
 if let Some(v) = opt { }   → pattern match
 .ok()                      → discard error when truly ignorable (log first!)
-.expect("BUG: ...")        → ONLY for invariants that are programming errors
 ```
+
+Broken internal invariants also return a typed error (Google guide: codebases may route even invariant violations through `Result`; PRX does).
 
 **NEVER** silently swallow errors. If using `.ok()` or `.unwrap_or()`, add a `tracing::warn!()` or comment explaining why.
 
@@ -102,6 +99,7 @@ use std::sync::RwLock;         // Same issue
 - Minimize unsafe scope to the smallest possible block
 - Validate all inputs BEFORE the unsafe block
 - Prefer safe abstractions (`nix` crate over raw `libc`, etc.)
+- Google guide: write `unsafe` only when the same thing cannot be done safely; wrap it in a safe abstraction isolated from business logic; add a technical justification answering "why not safe?" and, if the reason is performance, cite the benchmark; document invariants of every `unsafe fn` / `unsafe trait`
 
 ### 5. SQL Injection Prevention
 
@@ -112,25 +110,13 @@ format!("DELETE FROM {qualified_table} WHERE key = '{}'", key)
 
 // ✅ REQUIRED:
 sqlx::query("SELECT * FROM users WHERE id = $1").bind(id)
-// For dynamic table/schema names: validate with strict regex FIRST
+// For dynamic table/schema names: validate strictly FIRST (no panic path)
 fn validate_identifier(name: &str) -> Result<&str> {
-    let re = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]{0,62}$").unwrap();
-    if re.is_match(name) { Ok(name) } else { bail!("invalid identifier") }
+    let mut chars = name.chars();
+    let valid_start = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let valid_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid_start && valid_rest && name.len() <= 63 { Ok(name) } else { bail!("invalid identifier") }
 }
-```
-
-### 6. String Handling
-
-```rust
-// ❌ Wasteful:
-fn process(data: String) { ... }        // forces caller to clone
-format!("{}", simple_string)             // use .to_string() or clone
-
-// ✅ Efficient:
-fn process(data: &str) { ... }          // borrow when possible
-fn process(data: impl AsRef<str>) { }   // flexible
-fn process(data: Cow<'_, str>) { }      // avoid clone when not needed
-Arc<str>                                 // shared immutable strings
 ```
 
 ### 7. Async Best Practices
@@ -171,24 +157,9 @@ tracing::debug!("auth: [REDACTED]");
 tracing::info!(host = %hostname, port = port, "server started");
 ```
 
-### 9. Clippy Lints (Enforce in CI)
-
-Add to `Cargo.toml` or `clippy.toml`:
-```toml
-# In lib.rs or main.rs:
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]  # or warn if using expect for constants
-#![deny(clippy::panic)]
-#![warn(clippy::pedantic)]
-#![warn(clippy::nursery)]
-```
-
 ### 10. Testing Rules
 
-- Tests MAY use `.unwrap()` — but prefer `.expect("test: description")` for better failure messages
-- Tests use `#[cfg(test)]` module isolation
-- No flaky timing tests — use reasonable thresholds (2x expected) or mock time
-- Test error paths, not just happy paths
+The canonical panic and test rules (Google Rust Style Guide plus PRX resource limits) live in `AGENTS.md` §3.9, which every coding lane reads. Read it before writing or reviewing tests.
 
 ## Architecture Rules
 

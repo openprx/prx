@@ -130,6 +130,39 @@ Required:
 - For risky changes, define rollback path before merge.
 - Avoid mixed mega-patches that block safe rollback.
 
+### 3.9 Panic-Free Production + Hardened Tests
+
+**Why here:** A panic in the agent runtime kills every session in the process (release builds use `panic = "abort"`), and test code that reads hostile input can exhaust memory or hang Linux and macOS hosts.
+
+Required in production code (everything outside `#[cfg(test)]`):
+
+- No `.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!` or panicking indexing, and no `#[allow(clippy::unwrap_used | expect_used | panic)]` to get around the lints. There is no exception, including hardcoded constants: store `LazyLock<Result<Regex, regex::Error>>` and propagate the error on use.
+- Broken internal invariants return a typed error too.
+- `panic::catch_unwind` is not an error path: under `panic = "abort"` it catches nothing (Google Rust Style Guide: banned in first-party code except as defense in depth that nothing relies on).
+
+Required in test code:
+
+Test code follows the Google Rust Style Guide (https://google.github.io/styleguide/rustguide.html) and the module flow in §6.1. From the guide:
+
+- Panics are allowed in tests for assertions: `.unwrap()`, `.expect()`, `assert!`, `panic!` are fine under `#[cfg(test)]` (clippy.toml `allow-*-in-tests`). Prefer `.expect("test: <what>")` over `.unwrap()` so the failure says why.
+- Every non-trivial `assert!` / `assert_eq!` carries a context message that says what broke (API misuse vs implementation bug); it must not just repeat the condition.
+- Prefer `if let` / `match` / `assert_matches!` over check-then-unwrap (`is_some()` followed by `unwrap()`).
+- Unit tests live in `#[cfg(test)] mod tests` of the leaf module; `use super::*;` is allowed there. Non-leaf `mod.rs` files hold only declarations and re-exports.
+- No `panic::catch_unwind` in tests; use `#[should_panic]` or assert on the returned `Err`.
+- `#[rustfmt::skip]` only for manual alignment or generated data, never for personal style.
+
+Test code is attack surface too: a test that reads a hostile fixture, socket, subprocess or env var can exhaust memory or hang the host (Linux and macOS CI alike). PRX rules (not in the Google guide):
+
+- **Bound every read.** Never `read_to_end` / `read_to_string` / `lines()` on input the test does not fully control; use `.take(MAX_BYTES)` and fail on overflow.
+- **Never size an allocation from input.** No `Vec::with_capacity(len)`, `vec![0; len]` or `String::with_capacity(len)` where `len` comes from bytes, headers, env or a peer; clamp to a named constant first.
+- **Bounded queues only.** `mpsc::channel(N)` with an explicit `N`; no `unbounded_channel` in tests.
+- **Every async test and child process has a deadline.** Wrap waits in `tokio::time::timeout`; spawn children with `kill_on_drop(true)`; never wait on a peer without a timeout.
+- **Bound generated data and recursion.** Sizes, iteration counts and nesting depth in tests and property tests are named constants, never derived from input.
+- **Isolate the filesystem.** Use `tempfile::TempDir`; never a fixed `/tmp` path (symlink / pre-creation attacks); never write outside the temp dir.
+- **Fuzz targets** run with explicit `-rss_limit_mb`, `-max_len` and `-timeout`.
+- No flaky timing tests: thresholds at 2x expected, or mock time.
+- Test error paths, not just happy paths.
+
 ## 4) Repository Map (High-Level)
 
 - `src/main.rs` — CLI entrypoint and command routing
@@ -269,7 +302,7 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 - Implement `Tool` in `src/tools/` with strict parameter schema.
 - Validate and sanitize all inputs.
-- Return structured `ToolResult`; avoid panics in runtime path.
+- Return structured `ToolResult`; no panics anywhere in production code (§3.9).
 
 ### 7.4 Adding a Peripheral
 
@@ -455,4 +488,4 @@ When working in fast iterative mode:
 - Validate assumptions with code search before implementing.
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
-- If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+- If uncertain, stop and ask (record the open question in the lane report); never leave a TODO, stub or hidden guess in code.
