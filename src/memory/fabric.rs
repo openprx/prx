@@ -1,6 +1,6 @@
 use crate::memory::{
     Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEvent, MemoryEventInput, MemoryLinkInput,
-    MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
+    MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MemoryWriteContext, MessageEvent, MessageEventInput,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -549,16 +549,28 @@ impl MemoryFabric {
         persona_id: Option<&str>,
         agent_partition: Option<crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
+        if agent_partition.is_some() && session_id.is_none() {
+            return Err(crate::memory::AgentScopeRefused.into());
+        }
         let category_label = category.to_string();
+        let owner_id = agent_partition.as_ref().map(|partition| partition.owner_id.clone());
+        let write_ctx = agent_partition.as_ref().map(|partition| MemoryWriteContext {
+            workspace_id: Some(self.workspace_id.clone()),
+            owner_id: owner_id.clone(),
+            agent_partition: Some(partition.clone()),
+            session_key: session_id.map(str::to_string),
+            ..MemoryWriteContext::default()
+        });
         self.memory
-            .store_with_metadata(
+            .store_with_context_and_metadata(
                 key,
                 content,
                 category,
                 session_id,
+                write_ctx.as_ref(),
                 MemoryStoreMetadata {
                     workspace_id: Some(self.workspace_id.clone()),
-                    owner_id: None,
+                    owner_id: owner_id.clone(),
                     agent_id: agent_id.map(str::to_string),
                     persona_id: persona_id.map(str::to_string),
                     source_event_id: source_event_id.map(str::to_string),
@@ -571,12 +583,10 @@ impl MemoryFabric {
         let _event = self
             .memory
             .append_memory_event(MemoryEventInput {
-                agent_partition: None,
+                agent_partition: agent_partition.clone(),
                 event_id: None,
                 workspace_id: self.workspace_id.clone(),
-                // Semantic promotion has no caller scope in hand; the event is
-                // workspace-visible, so it needs no owner attribution.
-                owner_id: None,
+                owner_id: owner_id.clone(),
                 event_type: "memory.stored".to_string(),
                 subject_table: "memories".to_string(),
                 subject_id: key.to_string(),
@@ -1254,5 +1264,134 @@ mod tests {
             .await
             .unwrap();
         assert!(visible.is_empty());
+    }
+
+    #[tokio::test]
+    async fn semantic_promotion_stamps_store_event_and_link_or_refuses_named() {
+        use crate::config::agent_name::AgentName;
+        use crate::memory::{AgentPartition, AgentScopeRefused, DocumentIngestInput, MemoryVisibility, PartitionKey};
+        use rusqlite::{Connection, params};
+
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(memory);
+        let workspace = "workspace-a";
+        let owner = "prx_owner";
+        let session = "sess-1";
+        const REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const UX: &str = "00000000-0000-4000-8000-0000000000a1";
+        const SX: &str = "00000000-0000-4000-8000-0000000000c1";
+        let conn = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'active', ?4)",
+            params![workspace, owner, UX, REV],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'n:x', ?5, 1)",
+            params![SX, workspace, owner, session, UX],
+        )
+        .unwrap();
+        let named = AgentPartition {
+            workspace_id: workspace.to_owned(),
+            owner_id: owner.to_owned(),
+            key: PartitionKey::Named {
+                name: AgentName::parse("x").unwrap(),
+                incarnation: UX.parse().unwrap(),
+            },
+        };
+        memory
+            .ingest_document(DocumentIngestInput {
+                agent_partition: Some(named.clone()),
+                document_id: Some("doc-promo".into()),
+                workspace_id: workspace.to_owned(),
+                owner_id: Some(owner.to_owned()),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: Some("promo".into()),
+                content: "source document".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: None,
+                session_key: Some(session.to_owned()),
+                agent_id: None,
+                persona_id: None,
+            })
+            .await
+            .unwrap();
+        let fabric = MemoryFabric::new(memory.clone(), workspace);
+        let marker = "[document_ingest_ref]\ndocument_id: doc-promo\n[/document_ingest_ref]";
+        fabric
+            .record_semantic_memory_from_event(
+                "semantic-x",
+                marker,
+                MemoryCategory::Core,
+                Some(session),
+                None,
+                None,
+                None,
+                Some(named.clone()),
+            )
+            .await
+            .unwrap();
+        let mem_scope: Option<String> = conn
+            .query_row("SELECT ma_scope_id FROM memories WHERE key = 'semantic-x'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            mem_scope.as_deref(),
+            Some(SX),
+            "promoted memories row carries X's scope"
+        );
+        let event_scope: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM memory_events WHERE subject_id = 'semantic-x' AND event_type = 'memory.stored'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_scope.as_deref(),
+            Some(SX),
+            "promoted memory_events row carries X's scope"
+        );
+        let link_scope: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM memory_links WHERE document_id = 'doc-promo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_scope.as_deref(), Some(SX), "memory_links row carries X's scope");
+
+        let refused = fabric
+            .record_semantic_memory_from_event(
+                "semantic-refused",
+                "no session",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                None,
+                Some(named),
+            )
+            .await
+            .expect_err("test: Named without session_key");
+        assert!(
+            refused.downcast_ref::<AgentScopeRefused>().is_some(),
+            "Named without session: {refused:#}"
+        );
+        let missing: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memories WHERE key = 'semantic-refused'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "refused Named promotion writes nothing");
     }
 }

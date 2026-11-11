@@ -104,7 +104,12 @@ impl SqliteMemory {
         }
         for attempt in 0..2_u8 {
             let salt_scope = self
-                .salt_scope_for_write(input.agent_partition.as_ref(), input.session_key.as_deref())
+                .salt_scope_for_write(
+                    input.agent_partition.as_ref(),
+                    input.session_key.as_deref(),
+                    Some(input.workspace_id.as_str()),
+                    input.owner_id.as_deref(),
+                )
                 .await?;
             let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
             for (chunk_index, heading, content) in &raw_chunks {
@@ -391,7 +396,16 @@ impl SqliteMemory {
         // V02-R8: empty for every non-isolated principal, so both statements
         // below stay byte-identical for them.
         let visibility_guard = Self::document_visibility_guard(&principal);
-        let query_embedding = self.get_or_compute_embedding(&query).await?;
+        // Named/Main search must not persist an unscoped cache row (review H1).
+        // Read selection stays the same: the chunk vectors are independent of the
+        // cache key. Partitioned callers skip the cache write.
+        let query_embedding = if principal.agent_partition.is_some() {
+            self.embed_without_cache(&query, None)
+                .await?
+                .map(|prepared| vector::bytes_to_vec(&prepared.bytes))
+        } else {
+            self.get_or_compute_embedding(&query).await?
+        };
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedder.dimensions();

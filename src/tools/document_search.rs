@@ -84,7 +84,7 @@ pub(crate) fn parse_scope_principal(args: &serde_json::Value, workspace_id: Stri
         // which for MCP is the caller-chosen subject alone.
         require_owner_match: crate::tools::execution::scope_requires_owner_match(args),
         legacy_session_key: None,
-        agent_partition: None,
+        agent_partition: crate::tools::execution::trusted_scope_agent_partition(args),
     }
 }
 
@@ -122,12 +122,22 @@ pub(crate) async fn append_document_tool_retrieval_trace(
 ) -> Option<String> {
     let selected_json = serde_json::to_string(selected).ok();
     let dropped_json = serde_json::to_string(dropped).ok();
+    let workspace_id = principal
+        .agent_partition
+        .as_ref()
+        .map(|partition| partition.workspace_id.clone())
+        .unwrap_or_else(|| principal.workspace_id.clone());
+    let owner_id = principal
+        .agent_partition
+        .as_ref()
+        .map(|partition| partition.owner_id.clone())
+        .or_else(|| owner_id_for_document_principal(principal));
     match memory
         .append_retrieval_trace(RetrievalTraceInput {
             agent_partition: principal.agent_partition.clone(),
             trace_id: None,
-            workspace_id: principal.workspace_id.clone(),
-            owner_id: owner_id_for_document_principal(principal),
+            workspace_id,
+            owner_id,
             session_key: principal.session_key.clone(),
             agent_id: principal.agent_id.clone(),
             persona_id: principal.persona_id.clone(),
@@ -326,5 +336,89 @@ mod tests {
         assert!(result.output.contains("\"document_id\": \"doc-search-1\""));
         assert!(result.output.contains("\"source_anchor\": \"doc-search-1#chunk-0\""));
         assert!(result.output.contains("\"trace_id\":"));
+    }
+
+    #[tokio::test]
+    async fn named_document_search_stamps_the_retrieval_trace() {
+        use crate::config::agent_name::AgentName;
+        use crate::memory::{AgentPartition, PartitionKey};
+        use rusqlite::{Connection, params};
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let owner = "prx_owner";
+        let session = "prx-session";
+        const REV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const UX: &str = "00000000-0000-4000-8000-0000000000a1";
+        const SX: &str = "00000000-0000-4000-8000-0000000000c1";
+        let memory = SqliteMemory::new(tmp.path()).unwrap();
+        let conn = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+        conn.execute(
+            "INSERT INTO agent_incarnations VALUES (?1, ?2, 'n:x', ?3, 'active', ?4)",
+            params![&workspace, owner, UX, REV],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_scopes VALUES (?1, ?2, ?3, ?4, 'n:x', ?5, 1)",
+            params![SX, &workspace, owner, session, UX],
+        )
+        .unwrap();
+        let partition = AgentPartition {
+            workspace_id: workspace.clone(),
+            owner_id: owner.to_owned(),
+            key: PartitionKey::Named {
+                name: AgentName::parse("x").unwrap(),
+                incarnation: UX.parse().unwrap(),
+            },
+        };
+        memory
+            .ingest_document(DocumentIngestInput {
+                agent_partition: Some(partition.clone()),
+                document_id: Some("doc-search-named".into()),
+                workspace_id: workspace.clone(),
+                owner_id: Some(owner.to_owned()),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "test".into(),
+                source_uri: None,
+                title: Some("Named Search".into()),
+                content: "alpha beta source evidence for document retrieval".into(),
+                mime_type: Some("text/plain".into()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: None,
+                session_key: Some(session.to_owned()),
+                agent_id: None,
+                persona_id: None,
+            })
+            .await
+            .unwrap();
+
+        let tool = DocumentSearchTool::new(tmp.path().to_path_buf(), Arc::new(memory));
+        let args = json!({
+            "query": "source evidence",
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "session_key": session,
+                "owner_id": owner,
+                "agent_partition": partition
+            }
+        });
+        let parsed = parse_scope_principal(&args, workspace.clone());
+        assert_eq!(parsed.agent_partition.as_ref(), Some(&partition));
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.success);
+        let stamp: Option<String> = conn
+            .query_row(
+                "SELECT ma_scope_id FROM retrieval_traces ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stamp.as_deref(),
+            Some(SX),
+            "W12 retrieval trace carries the Named scope"
+        );
     }
 }

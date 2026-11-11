@@ -190,7 +190,14 @@ impl SqliteMemory {
         let needs_embedding = matches!(&category, MemoryCategory::Core | MemoryCategory::Custom(_));
         for attempt in 0..2_u8 {
             let salt_scope = self
-                .salt_scope_for_write(partition.as_ref(), session_key.as_deref())
+                .salt_scope_for_write(
+                    partition.as_ref(),
+                    session_key.as_deref(),
+                    context.and_then(|ctx| ctx.workspace_id.as_deref()),
+                    context
+                        .and_then(|ctx| ctx.owner_id.as_deref())
+                        .or(isolated_owner.as_deref()),
+                )
                 .await?;
             let prepared = if needs_embedding {
                 self.embed_without_cache(content, salt_scope.as_deref()).await?
@@ -538,10 +545,15 @@ impl SqliteMemory {
         &self,
         partition: Option<&crate::memory::AgentPartition>,
         session_key: Option<&str>,
+        workspace_id: Option<&str>,
+        owner_id: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         let Some(partition) = partition.cloned() else {
             return Ok(None);
         };
+        if partition.workspace_id != workspace_id.unwrap_or("") || owner_id != Some(partition.owner_id.as_str()) {
+            return Err(crate::memory::AgentScopeRefused.into());
+        }
         let session_key = session_key.map(str::to_owned);
         let pool = self.pool.clone();
         crate::runtime::blocking::spawn_blocking(move || {
@@ -1869,10 +1881,12 @@ impl SqliteMemory {
         let reason = reason.to_string();
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<Option<String>> {
             let conn = pool.write();
+            let tx = super::agent_migration::begin_immediate(&conn)?;
             // FIX-P1-11: snapshot the row's value before soft-deleting it. We DO NOT
             // physically delete from `memories`; we record a trash row so it can be
-            // restored within the grace window.
-            let row: Option<(String, String, Option<String>)> = conn
+            // restored within the grace window. Parent stamp is read inside the
+            // writer transaction (review M3).
+            let row: Option<(String, String, Option<String>)> = tx
                 .query_row(
                     "SELECT content, category, ma_scope_id FROM memories WHERE key = ?1",
                     params![key],
@@ -1884,7 +1898,7 @@ impl SqliteMemory {
             };
             // Idempotency: if an unrestored trash entry already exists for this key,
             // return it rather than duplicating.
-            let existing: Option<String> = conn
+            let existing: Option<String> = tx
                 .query_row(
                     "SELECT trash_id FROM memory_trash WHERE memory_key = ?1 AND restored_at IS NULL LIMIT 1",
                     params![key],
@@ -1897,7 +1911,6 @@ impl SqliteMemory {
             let trash_id = format!("trash-{}", Uuid::now_v7());
             let now = Utc::now();
             let grace_until = now + chrono::Duration::days(i64::from(grace_days));
-            let tx = super::agent_migration::begin_immediate(&conn)?;
             tx.execute(
                 "INSERT INTO memory_trash (
                     trash_id, memory_key, content, category, reason, trashed_at, grace_until, ma_scope_id

@@ -32,6 +32,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) use agent_migration::{scope_coalesce_set, scope_conflict_guard};
+
 pub use approval_grants::{
     SqliteTaskEventMirror, append_task_event_mirror, append_task_event_mirror_idempotent, init_approval_grant_schema,
     is_approval_grant_revoked, revoke_approval_grant,
