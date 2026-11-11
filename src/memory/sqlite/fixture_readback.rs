@@ -188,3 +188,15 @@ pub(crate) fn indexed_tables(workspace: &std::path::Path) -> Vec<String> {
     tables.dedup();
     tables
 }
+
+/// Observe the terminal-origin inheritance independently of the reception origin.
+pub(crate) fn erasure_index_rows_for(
+    workspace: &std::path::Path,
+    table: &str,
+    origin: &crate::memory::erasure::ErasureOrigin,
+) -> i64 {
+    read_only(workspace).query_row(
+        "SELECT count(*) FROM ramflux_erase_index WHERE table_name=?1 AND account=?2 AND conversation=?3 AND message=?4",
+        rusqlite::params![table, origin.account, origin.conversation, origin.message], |row| row.get(0)
+    ).expect("test: origin index rows")
+}

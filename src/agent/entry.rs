@@ -933,6 +933,54 @@ pub(crate) async fn test_recorded_cli_agent_turn_proof_with_selection(
 }
 
 #[cfg(test)]
+pub(crate) async fn test_recovery_cli_agent_turn_proof_with_selection(
+    generation: &crate::config::ConfigGeneration,
+    memory: Arc<dyn crate::memory::Memory>,
+    input: &str,
+    run_id: &str,
+    selection: (&str, &str),
+) -> AgentTurnProof {
+    let envelope = RuntimeEnvelope::agent(generation.effective.workspace_dir.to_string_lossy(), run_id)
+        .with_config_generation(generation);
+    let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let ticket = owner
+        .register(tokio_util::sync::CancellationToken::new())
+        .expect("test: ingress owner");
+    let fabric = crate::memory::MemoryFabric::new(memory, generation.effective.workspace_dir.to_string_lossy())
+        .with_event_recording(generation.effective.memory.event_recording_config())
+        .with_ingress_recovery(&generation.effective, &ticket)
+        .await
+        .expect("test: recovery ingress fabric");
+    let event = fabric
+        .record_inbound_user_message(
+            envelope.message_scope(),
+            input,
+            Some(format!("prx:terminal-fixture:{run_id}:input")),
+            None,
+        )
+        .await
+        .expect("test: recovery input");
+    let proof = issue_cli_agent_turn_proof(
+        None,
+        &envelope,
+        generation,
+        run_id,
+        input,
+        Some(&event),
+        &resolve_agent_model_choice(&generation.effective, Some(selection.0), Some(selection.1))
+            .expect("test: selected recovery model"),
+    )
+    .expect("test: recovery CLI proof");
+    drop(fabric);
+    ticket.finish(true);
+    owner
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+        .await
+        .expect("test: ingress owner drained");
+    proof
+}
+
+#[cfg(test)]
 mod agent_turn_origin_tests {
     use super::*;
 

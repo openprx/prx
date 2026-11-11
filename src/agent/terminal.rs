@@ -1341,7 +1341,7 @@ mod tests {
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
     ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
-        bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true).await
+        bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true, None).await
     }
 
     pub(crate) async fn bind_terminal_fixture_mode(
@@ -1350,6 +1350,7 @@ mod tests {
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
         enabled: bool,
+        ingress_memory: Option<Arc<dyn Memory>>,
     ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
         let input = "Use memory_search to explain the saved expression `2 + 2`.";
         let selection = draft
@@ -1409,14 +1410,28 @@ mod tests {
         .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
         .await
         .unwrap();
-        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
-            &generation,
-            Arc::clone(&memory),
-            input,
-            &draft.terminal_id,
-            selection,
-        )
-        .await;
+        let proof = match ingress_memory {
+            Some(ingress_memory) => {
+                crate::agent::entry::test_recovery_cli_agent_turn_proof_with_selection(
+                    &generation,
+                    ingress_memory,
+                    input,
+                    &draft.terminal_id,
+                    selection,
+                )
+                .await
+            }
+            None => {
+                crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                    &generation,
+                    Arc::clone(&memory),
+                    input,
+                    &draft.terminal_id,
+                    selection,
+                )
+                .await
+            }
+        };
         assert!(
             service.model_can_call_tools(&proof),
             "fixture's actual traced provider supports verified native tools"
@@ -1668,6 +1683,7 @@ mod tests {
                     &mut draft,
                     &CostConfig::default(),
                     enabled,
+                    None,
                 )
                 .await;
                 let principal = terminal_fixture_principal(temp.path(), &draft.scope);

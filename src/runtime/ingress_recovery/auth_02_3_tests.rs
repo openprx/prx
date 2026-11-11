@@ -125,9 +125,47 @@ pub(super) async fn recovery_terminal_loser_touches_no_outbox_or_ledger() {
         .await
         .expect_err("loser");
     assert!(
-        error.to_string().contains("recovery terminal commit conflict") || error.to_string().contains("Conflict"),
+        error.to_string().contains("scope does not match the pinned turn"),
         "loser: {error:#}"
     );
+    // The runtime rejects a mismatched owner before storage. Exercise the
+    // atomic store's independent owner collision using the actual final bytes.
+    let mut event: crate::memory::MessageEventInput =
+        serde_json::from_value(serde_json::to_value(&winner.terminal_event).expect("test: final event JSON"))
+            .expect("test: final event input");
+    event.event_id = Some(uuid::Uuid::new_v4().to_string());
+    event.owner_id = Some("prx_other_owner".into());
+    event.session_key = Some("prx_other_session".into());
+    event.run_id = Some("prx_other_run".into());
+    let outcome = memory
+        .commit_recovery_terminal(
+            crate::memory::recovery_authority::RecoveryTerminalCommit {
+                events: vec![event],
+                ingress: None,
+                publication: crate::memory::recovery_authority::RecoveryPublication {
+                    chain: crate::memory::recovery_authority::RecoveryChain {
+                        workspace_id: fabric.workspace_id().into(),
+                        owner_id: "prx_other_owner".into(),
+                        source: winner.terminal_event.source.as_str().into(),
+                        run_id: "prx_other_run".into(),
+                    },
+                    input: None,
+                    terminal: None,
+                    facts: winner_row.facts.clone(),
+                },
+                outbox: crate::memory::recovery_authority::RecoveryCostIntent {
+                    pricing: crate::memory::recovery_authority::RecoveryPricing::Metered,
+                    facts: winner_row.facts.clone(),
+                },
+            },
+            Instant::now() + Duration::from_secs(15),
+        )
+        .await
+        .expect("test: owner collision transaction");
+    assert!(matches!(
+        outcome,
+        crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict
+    ));
     let loser_row = first_outbox(&workspace);
     assert_eq!(loser_row.owner_id, winner_owner);
     assert_eq!(loser_row.settlement_id, terminal_id);
@@ -382,7 +420,7 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
 
     let mut unrecorded = completed_commit("prx-claim-unrecorded");
     let unrecorded_service =
-        bind_terminal_fixture_mode(&workspace, Arc::clone(&memory), &mut unrecorded, &cost, false).await;
+        bind_terminal_fixture_mode(&workspace, Arc::clone(&memory), &mut unrecorded, &cost, false, None).await;
     finalize_turn(&fabric, unrecorded, &cost, &workspace)
         .await
         .expect("test: unrecorded");
@@ -845,10 +883,40 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
     let sqlite = SqliteMemory::new(&workspace).unwrap();
     let origin = tombstone_fixture::erasure_origin();
     let memory = sqlite.with_erasure_origin(origin.clone()).expect("test: erasure view");
+    let input_origin = crate::memory::erasure::ErasureOrigin::new("prx_account", "prx_conversation", "prx_input");
+    let ingress_memory = sqlite
+        .with_erasure_origin(input_origin)
+        .expect("test: ingress erasure view");
     let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
     let cost = priced_cost_config();
     let mut commit = completed_commit("prx-erase");
-    let service = bind_terminal_fixture(&workspace, Arc::clone(&memory), &mut commit, &cost).await;
+    let service = bind_terminal_fixture_mode(
+        &workspace,
+        Arc::clone(&memory),
+        &mut commit,
+        &cost,
+        true,
+        Some(ingress_memory),
+    )
+    .await;
+    let pending_chain = crate::memory::recovery_authority::RecoveryChain {
+        workspace_id: fabric.workspace_id().into(),
+        owner_id: commit.scope.owner_id.clone().expect("test: pending owner"),
+        source: commit.scope.source.as_str().into(),
+        run_id: commit.scope.run_id.clone().expect("test: pending run"),
+    };
+    let pending = memory
+        .recovery_repository()
+        .expect("test: pending repository")
+        .read_recovery_receipt(&pending_chain)
+        .expect("test: authenticated pending receipt")
+        .expect("test: pending ingress attestation");
+    assert_eq!(pending.state, "pending");
+    assert_eq!(
+        fixture_readback::erasure_index_rows_for(&workspace, "recovery_attestations", &origin),
+        0,
+        "terminal origin was already indexed before terminal commit"
+    );
     finalize_turn(&fabric, commit, &cost, &workspace)
         .await
         .expect("test: erase commit");
@@ -857,12 +925,37 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
         tables.iter().any(|table| table == "recovery_attestations"),
         "attestation was not indexed: {tables:?}"
     );
+    assert!(
+        fixture_readback::erasure_index_rows_for(&workspace, "recovery_attestations", &origin) > 0,
+        "terminal UPDATE did not inherit the terminal origin"
+    );
     let before_outbox = first_outbox(&workspace);
     assert_closed_outbox_facts(&before_outbox.facts);
-    tombstone_fixture::erase(&memory);
+    let store = memory.erasure_store().expect("test: conversation erasure store");
+    let origins = store
+        .origins(&origin.account, Some(&origin.conversation))
+        .expect("test: conversation origins");
+    for origin in &origins {
+        store.begin_delete(origin).expect("test: conversation deletion fence");
+    }
+    for origin in &origins {
+        store.erase_rows(origin).expect("test: conversation erasure");
+    }
     assert_eq!(fixture_readback::row_count(&workspace, "recovery_attestations"), 0);
+    for table in ["message_events", "ingress_recovery", "recovery_transport_index"] {
+        assert_eq!(
+            fixture_readback::row_count(&workspace, table),
+            0,
+            "{table} retained orphaned rows"
+        );
+    }
+
     assert!(fixture_readback::table_exists(&workspace, "ramflux_tombstones"));
     assert!(fixture_readback::row_count(&workspace, "ramflux_tombstones") >= 1);
+    assert!(
+        fixture_readback::row_count(&workspace, "recovery_tombstones") >= 1,
+        "conversation erasure did not retain the stable recovery input key"
+    );
     let after_outbox = first_outbox(&workspace);
     assert_closed_outbox_facts(&after_outbox.facts);
     assert_eq!(after_outbox.settlement_id, before_outbox.settlement_id);
