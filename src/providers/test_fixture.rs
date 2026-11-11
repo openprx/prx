@@ -20,8 +20,35 @@ pub(crate) fn register(label: &str, provider: Arc<dyn Provider>) {
     fixtures().lock().insert(label.to_owned(), Arc::downgrade(&provider));
 }
 
-pub(crate) fn unregister(label: &str) {
-    fixtures().lock().remove(label);
+/// Installs `provider` under `label` and restores the previous map entry on drop.
+#[must_use]
+pub(crate) struct FixtureGuard {
+    label: String,
+    previous: Option<Weak<dyn Provider>>,
+    _keep_alive: Arc<dyn Provider>,
+}
+
+impl Drop for FixtureGuard {
+    fn drop(&mut self) {
+        let mut map = fixtures().lock();
+        match self.previous.take() {
+            Some(previous) => {
+                map.insert(self.label.clone(), previous);
+            }
+            None => {
+                map.remove(&self.label);
+            }
+        }
+    }
+}
+
+pub(crate) fn register_scoped(label: &str, provider: Arc<dyn Provider>) -> FixtureGuard {
+    let previous = fixtures().lock().insert(label.to_owned(), Arc::downgrade(&provider));
+    FixtureGuard {
+        label: label.to_owned(),
+        previous,
+        _keep_alive: provider,
+    }
 }
 
 pub(crate) fn build(label: &str) -> Option<Box<dyn Provider>> {

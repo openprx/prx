@@ -203,21 +203,19 @@ async fn assert_classifier_and_main_receipts(
     );
 }
 
-async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
-    exercise_accounted_classifier_after_main(content, verdict, |_| {}, None).await;
+#[derive(Clone, Copy)]
+enum ClockPlan {
+    /// Epoch sits an hour ahead of wall time (acceptance-test default).
+    EpochLead,
+    /// Advance logical time past `extra_latency_budget_ms` at the auxiliary check.
+    LogicalExpiry,
 }
 
-/// `after_main` runs after the production factory has built the main provider
-/// and before the turn, so a process-global fixture can steal the later
-/// classifier `create_provider_for` without rewriting the already-built main
-/// transport. `auxiliary_advance` spends logical time at the auxiliary
-/// deadline check so a fail-open skip can be forced without wall sleep.
-async fn exercise_accounted_classifier_after_main(
-    content: &str,
-    verdict: Verdict,
-    after_main: impl FnOnce(&str) + Send,
-    auxiliary_advance: Option<Duration>,
-) {
+async fn exercise_accounted_classifier(content: &str, verdict: Verdict) {
+    exercise_accounted_classifier_with(content, verdict, ClockPlan::EpochLead).await;
+}
+
+async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, plan: ClockPlan) {
     let workspace = tempfile::tempdir().expect("smart-group workspace");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -243,8 +241,8 @@ async fn exercise_accounted_classifier_after_main(
     };
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let clock = crate::causal_tree::logical_clock::ManualClock::new();
-    if let Some(advance) = auxiliary_advance {
-        clock.arm_site("auxiliary_deadline", Duration::ZERO, advance);
+    if matches!(plan, ClockPlan::LogicalExpiry) {
+        clock.arm_site("auxiliary_deadline", Duration::ZERO, Duration::from_millis(600));
     }
     crate::causal_tree::logical_clock::scope(clock, async move {
         let outcome = std::panic::AssertUnwindSafe(async {
@@ -297,7 +295,6 @@ async fn exercise_accounted_classifier_after_main(
                 )
                 .expect("actual smart-group main provider factory"),
             );
-            after_main(&provider);
             let channel_impl = Arc::new(RecordingChannel::default());
             let mut ctx = gate_test_ctx(
                 &workspace,
@@ -348,7 +345,7 @@ async fn exercise_accounted_classifier_after_main(
                 .await
                 .expect("admitted smart-group turn must finish");
 
-            if auxiliary_advance.is_some() {
+            if matches!(plan, ClockPlan::LogicalExpiry) {
                 let models: Vec<String> = requests
                     .lock()
                     .iter()
@@ -568,9 +565,8 @@ async fn smart_group_classifier_failure_fails_open_and_persists_both_receipts() 
     .await;
 }
 
-/// In-process stand-in that answers without touching the loopback. A process-global
-/// fixture registered under the shared catalog name `openai` must not steal this
-/// test's uniquely named classifier or main provider.
+/// Answers without touching the loopback. Installed only in an isolated child
+/// process so a live `openai` map entry cannot race other lib tests.
 struct SwallowProvider;
 
 #[async_trait::async_trait]
@@ -586,30 +582,44 @@ impl Provider for SwallowProvider {
     }
 }
 
-#[tokio::test]
-async fn smart_group_classifier_keeps_loopback_when_a_shared_openai_fixture_is_registered() {
-    let swallow: Arc<dyn Provider> = Arc::new(SwallowProvider);
-    let hold = Arc::clone(&swallow);
-    exercise_accounted_classifier_after_main(
-        "the deployment completed an hour ago across the project",
-        Verdict::Yes,
-        |_| {
-            crate::providers::test_fixture::register(PROVIDER, swallow);
-        },
-        None,
-    )
-    .await;
-    crate::providers::test_fixture::unregister(PROVIDER);
-    drop(hold);
+fn run_openai_fixture_child() -> bool {
+    const FLAG: &str = "PRX_SMART_GROUP_OPENAI_FIXTURE_CHILD";
+    if std::env::var_os(FLAG).is_some() {
+        return false;
+    }
+    let test = "channels::tests::smart_group_accounted::smart_group_classifier_keeps_loopback_when_a_shared_openai_fixture_is_registered";
+    let output = std::process::Command::new(std::env::current_exe().expect("test: executable"))
+        .args([test, "--exact", "--nocapture"])
+        .env(FLAG, "1")
+        .output()
+        .expect("test: openai fixture child");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 #[tokio::test]
+async fn smart_group_classifier_keeps_loopback_when_a_shared_openai_fixture_is_registered() {
+    if run_openai_fixture_child() {
+        return;
+    }
+    let swallow: Arc<dyn Provider> = Arc::new(SwallowProvider);
+    let _guard = crate::providers::test_fixture::register_scoped(PROVIDER, swallow);
+    exercise_accounted_classifier("the deployment completed an hour ago across the project", Verdict::Yes).await;
+}
+
+/// Logical expiry at auxiliary admission fail-opens into main. This is the
+/// clock-fix barrier; it is not a reproduction of CI 42895839383.
+#[tokio::test]
 async fn smart_group_classifier_is_skipped_when_the_auxiliary_deadline_elapses() {
-    exercise_accounted_classifier_after_main(
+    exercise_accounted_classifier_with(
         "the deployment completed an hour ago across the project",
         Verdict::Yes,
-        |_| {},
-        Some(Duration::from_millis(600)),
+        ClockPlan::LogicalExpiry,
     )
     .await;
 }
