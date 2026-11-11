@@ -25,16 +25,10 @@ use crate::config::Config;
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
 use crate::tools::sessions_spawn::STEER_CHANNEL_CAPACITY;
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::sync::Arc;
 
 fn write_worker_result(result: &impl serde::Serialize) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    let json = serde_json::to_string(result).context("serialize worker result")?;
-    stdout.write_all(json.as_bytes()).context("write worker result")?;
-    stdout.write_all(b"\n").context("write worker newline")?;
-    stdout.flush().context("flush worker stdout")?;
-    Ok(())
+    super::stdout::terminal(result)
 }
 
 /// Validate the sealed manifest, scrub the capability material, and only then
@@ -59,12 +53,27 @@ async fn run_manifest(
     let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
     scrub_capability_env();
     let transport = validation?;
+    let (mailbox_tx, mailbox_rx) = if read_stdin_control_frames {
+        if let Some(address) = manifest.session_addr.as_ref() {
+            anyhow::ensure!(
+                manifest.owner_id.as_deref() == Some(address.owner.as_str())
+                    && manifest.agent_id.as_deref().unwrap_or("main") == address.agent,
+                "worker mailbox identity differs from sealed manifest"
+            );
+            let (tx, rx) = super::mailbox::worker_mailbox(address.clone(), manifest.run_id.clone())?;
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
     let steer_rx = read_stdin_control_frames.then(|| {
         let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<String>(STEER_CHANNEL_CAPACITY);
-        spawn_stdin_control_reader(steer_tx);
+        spawn_stdin_control_reader(steer_tx, mailbox_tx);
         steer_rx
     });
-    run_authenticated_manifest(manifest, steer_rx, explicit_config_dir, Some(transport)).await
+    run_authenticated_manifest(manifest, steer_rx, mailbox_rx, explicit_config_dir, Some(transport)).await
 }
 
 /// Remove the capability-bearing environment variables after validation.

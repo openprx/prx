@@ -693,6 +693,7 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
         test_worker_executable: tool.test_worker_executable.clone(),
         channels: Arc::clone(&tool.channels),
         test_parent_provider: tool.test_parent_provider.clone(),
+        worker_mailbox: tool.worker_mailbox.clone(),
         provider_name: tool.provider_name.clone(),
         model: tool.model.clone(),
         security: Arc::clone(&tool.security),

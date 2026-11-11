@@ -191,7 +191,7 @@ fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
         config_source_revision: Some("revision-17".to_string()),
     };
 
-    let (manifest, _, _) = build_session_worker_manifest(
+    let (manifest, _, _, _) = build_session_worker_manifest(
         "run-child",
         "task",
         "openrouter",
@@ -225,6 +225,7 @@ fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
         None,
         &resolved.config,
         &[],
+        None,
         None,
         None,
     )
@@ -309,16 +310,17 @@ fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal
             excluded,
             None,
             None,
+            None,
         )
         .expect("manifest")
     };
 
-    let (bounded, sealed, _) = build(&hidden);
+    let (bounded, sealed, _, _) = build(&hidden);
     assert_eq!(
         bounded.channel_excluded_tools, hidden,
         "the spawning surface's hidden set has to cross the process boundary"
     );
-    let (open, open_seal, _) = build(&[]);
+    let (open, open_seal, _, _) = build(&[]);
     assert!(open.channel_excluded_tools.is_empty(), "expected an empty value");
     assert_ne!(
         sealed, open_seal,

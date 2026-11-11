@@ -154,7 +154,7 @@ impl Tool for SessionsSendTool {
             if object.keys().any(|key| !matches!(key.as_str(), "to" | "message")) {
                 return Err(MailboxError::InvalidMetadata.into());
             }
-            let target = parse_target(&args["to"], sender.source())?;
+            let target = parse_target(args.get("to").ok_or(MailboxError::InvalidAddress)?, sender.source())?;
             let message = args
                 .get("message")
                 .and_then(serde_json::Value::as_str)

@@ -61,6 +61,7 @@ pub(super) async fn run_sub_agent_process(
     recovery: Option<&process_terminal::ProcessRecovery>,
     source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
     batch_id: Option<&str>,
+    mailbox: Option<&Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
     #[cfg(test)] test_worker_executable: Option<&TestWorkerExecutable>,
 ) -> anyhow::Result<ProcessWorkerOutcome> {
     if source_fabric.is_some_and(|fabric| fabric.memory().requires_scoped_execution()) {
@@ -205,7 +206,7 @@ pub(super) async fn run_sub_agent_process(
     // it with an HMAC bound to the run id, an absolute expiry, and a digest of
     // the manifest contents. A leaked capability token therefore cannot be
     // replayed for a different run, after expiry, or with a tampered manifest.
-    let (manifest, sealed_capability, capability_expiry) = build_session_worker_manifest(
+    let (manifest, sealed_capability, capability_expiry, mut mailbox_binding) = build_session_worker_manifest(
         run_id,
         task,
         provider_name,
@@ -241,6 +242,7 @@ pub(super) async fn run_sub_agent_process(
         channel_excluded_tools,
         child_source,
         source_launch.zip(source_transport_key.as_ref()),
+        mailbox,
     )?;
 
     if let Some(reason) = process_control.termination_reason() {
@@ -338,6 +340,10 @@ pub(super) async fn run_sub_agent_process(
             std::env::current_dir().map_or_else(|_| "<unavailable>".to_owned(), |dir| dir.display().to_string())
         )
     })?;
+    if let Some(binding) = mailbox_binding.as_mut() {
+        binding.spawned();
+    }
+
     #[cfg(unix)]
     prepared_manifest.mark_spawned();
     #[cfg(test)]
@@ -384,6 +390,9 @@ pub(super) async fn run_sub_agent_process(
                 control.observe_reap_status(status);
             }
             worker_registration.mark_reaped();
+            if let Some(binding) = mailbox_binding.as_mut() {
+                binding.joined();
+            }
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;
@@ -477,6 +486,7 @@ pub(super) async fn run_sub_agent_process(
             &payload,
             process_control,
             Some(WorkerSteerPipe {
+                frames: mailbox_binding.as_mut().and_then(|binding| binding.frames.take()),
                 steer_rx,
                 history,
                 run_id: run_id.to_string(),
@@ -517,6 +527,9 @@ pub(super) async fn run_sub_agent_process(
                 anyhow::anyhow!("session-worker lifecycle failed: {error:#}; cleanup failed: {cleanup_error:#}")
             })?;
             worker_registration.mark_reaped();
+            if let Some(binding) = mailbox_binding.as_mut() {
+                binding.joined();
+            }
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;
@@ -560,6 +573,9 @@ pub(super) async fn run_sub_agent_process(
             }
             cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error:#}"))?;
             worker_registration.mark_reaped();
+            if let Some(binding) = mailbox_binding.as_mut() {
+                binding.joined();
+            }
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;
@@ -586,6 +602,9 @@ pub(super) async fn run_sub_agent_process(
     let (status, stdout, stderr) = match owned_phase {
         OwnedProcessPhase::Exited { status, stdout, stderr } => {
             worker_registration.mark_reaped();
+            if let Some(binding) = mailbox_binding.as_mut() {
+                binding.joined();
+            }
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;
@@ -604,6 +623,9 @@ pub(super) async fn run_sub_agent_process(
         }
         OwnedProcessPhase::Terminated(reason) => {
             worker_registration.mark_reaped();
+            if let Some(binding) = mailbox_binding.as_mut() {
+                binding.joined();
+            }
             #[cfg(test)]
             if let Some(control) = protocol {
                 control.diagnostic.lock().registration_marked_reaped = true;

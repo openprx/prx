@@ -10,7 +10,7 @@ use super::context::{
 use super::paths::normalized_worker_memory_strategy;
 use super::prompt::{build_worker_system_prompt, build_worker_system_prompt_with_skills};
 use super::provider::{validate_worker_route, worker_credentials, worker_provider, worker_spawn_tool};
-use super::steering::run_segments_with_steering;
+use super::steering::run_segments_with_controls;
 use super::tools::{select_tools_for_manifest, verify_worker_orchestration_tool_names};
 use super::validate::validate_parent_memory_backend;
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -50,12 +50,13 @@ pub(super) async fn run_validated_manifest(
     let capability = compute_worker_capability_with_key(&key, &manifest.run_id, 300, &payload);
     manifest.parent_capability = Some(capability.clone());
     let transport = authenticate_worker_capability_with_key(&manifest, Some(&capability), 300, 0, key)?;
-    run_authenticated_manifest(manifest, steer_rx, explicit_config_dir, Some(transport)).await
+    run_authenticated_manifest(manifest, steer_rx, None, explicit_config_dir, Some(transport)).await
 }
 
 pub(super) async fn run_authenticated_manifest(
     manifest: WorkerManifest,
     steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    mailbox_rx: Option<crate::session_worker::mailbox::WorkerMailboxInbox>,
     explicit_config_dir: Option<&str>,
     transport: Option<AuthenticatedWorkerTransport>,
 ) -> Result<WorkerResult> {
@@ -65,7 +66,13 @@ pub(super) async fn run_authenticated_manifest(
     let config_dir = manifest.config_dir.clone();
     let memory_db = manifest.memory_db_path.clone();
     let prepared = cleanup
-        .run(owned_worker_future(manifest, steer_rx, explicit_config_dir, transport))
+        .run(owned_worker_future(
+            manifest,
+            steer_rx,
+            mailbox_rx,
+            explicit_config_dir,
+            transport,
+        ))
         .await
         .with_context(|| {
             format!(
@@ -376,15 +383,23 @@ pub(super) fn verify_worker_parent_authority(
 fn owned_worker_future(
     manifest: WorkerManifest,
     steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    mailbox_rx: Option<crate::session_worker::mailbox::WorkerMailboxInbox>,
     explicit_config_dir: Option<&str>,
     transport: Option<AuthenticatedWorkerTransport>,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<PreparedWorkerResult>> + Send + '_>> {
-    Box::pin(run_owned_manifest(manifest, steer_rx, explicit_config_dir, transport))
+    Box::pin(run_owned_manifest(
+        manifest,
+        steer_rx,
+        mailbox_rx,
+        explicit_config_dir,
+        transport,
+    ))
 }
 
 async fn run_owned_manifest(
     manifest: WorkerManifest,
     mut steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
+    mut mailbox_rx: Option<crate::session_worker::mailbox::WorkerMailboxInbox>,
     explicit_config_dir: Option<&str>,
     transport: Option<AuthenticatedWorkerTransport>,
 ) -> Result<PreparedWorkerResult> {
@@ -1147,9 +1162,10 @@ async fn run_owned_manifest(
         let raw_task = manifest.task.as_str();
         let manifest_ref = &manifest;
         let config_ref = &config;
-        let (history, loop_result) = run_segments_with_steering(
+        let (history, loop_result) = run_segments_with_controls(
             initial_history,
             &mut steer_rx,
+            &mut mailbox_rx,
             |mut segment_history, cancel, raw_steer| {
                 let tools_registry = Arc::clone(tools_registry_ref);
                 let memory = Arc::clone(memory_ref);

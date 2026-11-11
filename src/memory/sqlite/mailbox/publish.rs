@@ -26,6 +26,7 @@ impl SqliteMailbox {
         pin_expires_at: i64,
         inherited: Option<&InheritedProvenance>,
     ) -> MailboxResult<MailboxPublished> {
+        let mut pin_expires_at = pin_expires_at;
         authority.authorize(&message)?;
         if authority.source.instance != self.local_instance
             || authority.workspace_id != sender.workspace_id
@@ -39,8 +40,11 @@ impl SqliteMailbox {
         validate_address(&message.from)?;
         validate_address(&message.to)?;
         validate_body(&message.body.mime, &message.body.bytes)?;
-        if message.kind != MessageKind::Data || message.stream_id.is_none() {
+        if message.kind != MessageKind::Data {
             return Err(MailboxError::InvalidMetadata);
+        }
+        if message.stream_id.is_none() {
+            return Err(MailboxError::StreamIdRequired);
         }
         if let Some(inherited) = inherited {
             stamp_outbound(&inherited.chain, &mut message);
@@ -95,6 +99,7 @@ impl SqliteMailbox {
         }
         if message.to.instance == self.local_instance {
             let claims = self.verify_pin(authority, &message)?;
+            pin_expires_at = pin_expires_at.min(claims.expires_at);
             check_scope(
                 &tx,
                 &claims.scope,

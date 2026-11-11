@@ -2452,3 +2452,6 @@ pub(crate) mod admission_failure_tests {
         );
     }
 }
+
+#[cfg(feature = "test-mock")]
+pub(crate) mod mailbox_fixture;

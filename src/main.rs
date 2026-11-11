@@ -906,6 +906,10 @@ Examples:
         action: String,
         #[arg(long)]
         workspace: std::path::PathBuf,
+        #[arg(long)]
+        worker: bool,
+        #[arg(long, default_value_t = 1)]
+        turns: usize,
     },
 
     /// Internal worker entrypoint for process-isolated sessions
@@ -1722,7 +1726,16 @@ async fn async_main() -> Result<()> {
     }
 
     #[cfg(feature = "test-mock")]
-    if let Commands::MailboxHarness { workspace, .. } = &cli.command {
+    if let Commands::MailboxHarness {
+        workspace,
+        worker,
+        turns,
+        ..
+    } = &cli.command
+    {
+        if *worker {
+            return session_worker::mailbox_harness::run(workspace, *turns).await;
+        }
         return memory::sqlite::mailbox::harness::accept_adopt(workspace);
     }
 

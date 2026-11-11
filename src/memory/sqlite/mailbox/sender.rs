@@ -27,6 +27,7 @@ impl SqliteMailboxSender {
         if source.instance != store.local_instance || scope.owner_id != source.owner {
             return Err(MailboxError::Unauthorized);
         }
+        store.validate_scope(&scope, &source)?;
         Ok(Self {
             store,
             source,

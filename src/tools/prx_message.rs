@@ -26,7 +26,7 @@ impl Tool for PrxMessageTool {
         &[ToolCategory::Communication]
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","additionalProperties":false,"properties":{"to":target_schema(),"text":{"type":"string","minLength":1,"maxLength":262144},"mime":{"type":"string","enum":["text/plain","text/markdown"],"default":"text/plain"}},"required":["to","text"]})
+        json!({"type":"object","additionalProperties":false,"properties":{"to":target_schema(),"text":{"type":"string","minLength":1,"maxLength":crate::messaging::MAX_BODY_BYTES},"mime":{"type":"string","enum":["text/plain","text/markdown"],"default":"text/plain"}},"required":["to","text"]})
     }
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let object = args.as_object().ok_or(MailboxError::InvalidMetadata)?;

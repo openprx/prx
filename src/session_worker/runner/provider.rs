@@ -264,7 +264,7 @@ pub(super) fn worker_provider(
     } else {
         crate::providers::selection::credential_for(config, &manifest.provider_name)
     };
-    build_worker_provider_selection(
+    let provider = build_worker_provider_selection(
         config,
         &manifest.provider_name,
         &manifest.model,
@@ -273,7 +273,10 @@ pub(super) fn worker_provider(
         &credentials.provider,
         &credentials.reliability,
         options,
-    )
+    )?;
+    #[cfg(feature = "test-mock")]
+    let provider = crate::session_worker::mailbox_harness::worker_model(manifest, provider);
+    Ok(provider)
 }
 
 /// Resolve and construct the exact provider/model connection a worker was

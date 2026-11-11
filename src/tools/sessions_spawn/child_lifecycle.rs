@@ -19,6 +19,13 @@ use tokio::sync::RwLock;
 /// pipe, which is the worker's EOF signal that no further steering can arrive.
 pub(super) struct AbortOnDrop(pub(super) tokio::task::JoinHandle<()>);
 
+impl AbortOnDrop {
+    async fn shutdown(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -33,42 +40,50 @@ impl Drop for AbortOnDrop {
 /// bounded steer channel, which parks `sessions_send` — the same contract task
 /// mode already has. A stuck target is the idle detector's problem, not a
 /// timeout's.
+#[cfg(test)]
 pub(super) async fn pump_worker_steer_frames(
-    mut stdin: tokio::process::ChildStdin,
-    mut steer_rx: tokio::sync::mpsc::Receiver<String>,
+    stdin: tokio::process::ChildStdin,
+    steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
     run_id: String,
 ) {
-    use tokio::io::AsyncWriteExt;
+    pump_worker_control_frames(stdin, steer_rx, None, history, run_id).await;
+}
 
-    while let Some(message) = steer_rx.recv().await {
-        let frame = match serde_json::to_string(&WorkerControlFrame::Steer {
-            message: message.clone(),
-        }) {
-            Ok(frame) => frame,
-            Err(error) => {
-                tracing::warn!(run_id = %run_id, "failed to encode sub-agent steer frame: {error}");
-                continue;
+pub(super) async fn pump_worker_control_frames(
+    mut stdin: tokio::process::ChildStdin,
+    mut steer_rx: tokio::sync::mpsc::Receiver<String>,
+    mut controls: Option<crate::session_worker::frames::WorkerControlQueue>,
+    history: Arc<RwLock<Vec<HistoryEntry>>>,
+    run_id: String,
+) {
+    let mut steer_open = true;
+    let mut controls_open = controls.is_some();
+    while steer_open || controls_open {
+        let frame = tokio::select! {
+            steer=steer_rx.recv(),if steer_open=> {
+                steer.map_or_else(||{steer_open=false;None},|message|Some(WorkerControlFrame::Steer{message}))
+            }
+            control=async {match controls.as_mut() {Some(queue)=>queue.receiver.recv().await,None=>std::future::pending().await}},if controls_open=> {
+                if control.is_none() {controls_open=false;}
+                control
             }
         };
-        let write = async {
-            stdin.write_all(frame.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await
+        let Some(frame) = frame else {
+            continue;
         };
-        if let Err(error) = write.await {
-            // Broken pipe: the worker exited. Stop pumping; the run's terminal
-            // commit drops the sender so no caller can park on it afterwards.
-            tracing::debug!(run_id = %run_id, "sub-agent steer pipe closed: {error}");
+        if let Err(error) = crate::session_worker::frames::write_control_frame(&mut stdin, &frame).await {
+            tracing::debug!(%run_id,"sub-agent control pipe closed: {error}");
             return;
         }
-        // Recorded only after the frame is on the wire, so history reflects what
-        // was actually delivered rather than what was merely queued.
-        history.write().await.push(HistoryEntry {
-            role: "user".to_string(),
-            content: steering_instruction(&message),
-            timestamp: Utc::now(),
-        });
+        // Data and broker responses never acquire operator-Steer wording.
+        if let WorkerControlFrame::Steer { message } = frame {
+            history.write().await.push(HistoryEntry {
+                role: "user".to_owned(),
+                content: steering_instruction(&message),
+                timestamp: Utc::now(),
+            });
+        }
     }
 }
 
@@ -132,12 +147,15 @@ pub(super) async fn run_spawned_child_lifecycle(
 ) -> anyhow::Result<OwnedProcessPhase> {
     use tokio::io::AsyncWriteExt;
 
+    let frame_outputs = steer
+        .as_ref()
+        .and_then(|pipe| pipe.frames.as_ref().map(|frames| frames.outputs.clone()));
     // The manifest is line 1 of the worker's stdin. Unlike before, the pipe is
     // then kept open for the life of the run so steer frames can follow it.
     #[cfg(test)]
     let mut held_stdin = None;
     #[cfg(test)]
-    let _steer_pump = if let Some(control) = protocol {
+    let mut steer_pump = if let Some(control) = protocol {
         assert!(payload.len() < 3072, "fixture manifest line exceeds stdin precondition");
         let mut pipe = child.stdin.take().context("worker protocol stdin missing")?;
         pipe.write_all(payload.as_bytes()).await?;
@@ -164,9 +182,10 @@ pub(super) async fn run_spawned_child_lifecycle(
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
         steer.map(|steer| {
-            AbortOnDrop(tokio::spawn(pump_worker_steer_frames(
+            AbortOnDrop(tokio::spawn(pump_worker_control_frames(
                 stdin,
                 steer.steer_rx,
+                steer.frames.map(|frames| frames.controls),
                 steer.history,
                 steer.run_id,
             )))
@@ -175,14 +194,15 @@ pub(super) async fn run_spawned_child_lifecycle(
         None
     };
     #[cfg(not(test))]
-    let _steer_pump = if let Some(mut stdin) = child.stdin.take() {
+    let mut steer_pump = if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(payload.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
         steer.map(|steer| {
-            AbortOnDrop(tokio::spawn(pump_worker_steer_frames(
+            AbortOnDrop(tokio::spawn(pump_worker_control_frames(
                 stdin,
                 steer.steer_rx,
+                steer.frames.map(|frames| frames.controls),
                 steer.history,
                 steer.run_id,
             )))
@@ -202,7 +222,7 @@ pub(super) async fn run_spawned_child_lifecycle(
 
     let stdout_task = tokio::spawn(crate::session_worker::frames::read_worker_frames(
         stdout_stream,
-        None,
+        frame_outputs,
         progress.as_ref().map(Arc::clone),
         MAX_SUBPROCESS_OUTPUT,
     ));
@@ -217,11 +237,19 @@ pub(super) async fn run_spawned_child_lifecycle(
 
     #[cfg(not(test))]
     {
-        run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await
+        let phase = run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await;
+        if let Some(pump) = steer_pump.take() {
+            pump.shutdown().await;
+        }
+        phase
     }
     #[cfg(test)]
     {
-        let phase = run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await?;
+        let phase = run_owned_child_phase(child, process_group, stdout_task, stderr_task, process_control).await;
+        if let Some(pump) = steer_pump.take() {
+            pump.shutdown().await;
+        }
+        let phase = phase?;
         #[cfg(test)]
         if let (Some(control), OwnedProcessPhase::Exited { status, stdout, stderr }) = (protocol, &phase) {
             let mut terminal = control.terminal.lock();

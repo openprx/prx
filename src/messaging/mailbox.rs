@@ -21,6 +21,8 @@ pub const MAX_BYTES: i64 = 64 * 1024 * 1024;
 pub enum MailboxError {
     #[error("invalid_address")]
     InvalidAddress,
+    #[error("stream_id_required")]
+    StreamIdRequired,
     #[error("invalid_metadata")]
     InvalidMetadata,
     #[error("invalid_mime")]
@@ -51,7 +53,7 @@ pub enum MailboxError {
     StaleRun,
     #[error("unknown_parent")]
     UnknownParent,
-    #[error("chain_depth_exceeded")]
+    #[error("chain_too_deep")]
     ChainDepth,
     #[error("queue_full")]
     QueueFull,

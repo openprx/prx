@@ -196,7 +196,7 @@ impl ProcessRunControl {
     /// Resolve once the sole owner has published a finalization — or once it is
     /// gone without publishing one, which is the same thing for a waiter that
     /// only needs to know the run is over.
-    pub(super) async fn finalized(&self) {
+    pub(crate) async fn finalized(&self) {
         let mut receiver = self.finalized_tx.subscribe();
         while receiver.borrow_and_update().is_none() {
             if receiver.changed().await.is_err() {

@@ -5,6 +5,26 @@ use anyhow::{Context, Result, ensure};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+/// Explicitly supplied by the dormant mailbox runtime; no factory installs it.
+pub struct WorkerControlQueue {
+    pub receiver: mpsc::Receiver<WorkerControlFrame>,
+    /// Drops after the receiver and all queued payloads.
+    pub owner: std::sync::Arc<dyn Send + Sync>,
+}
+
+pub struct WorkerFrameChannels {
+    pub controls: WorkerControlQueue,
+    pub outputs: mpsc::Sender<WorkerOutputFrame>,
+}
+
+pub async fn write_control_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &WorkerControlFrame) -> Result<()> {
+    let bytes = serde_json::to_vec(frame).context("serialize worker control frame")?;
+    writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// One owner serializes all control kinds; concurrent producers never interleave
 /// JSON bytes. Queue capacity belongs to the caller's bounded runtime channel.
 pub async fn write_control_frames<W>(mut writer: W, mut frames: mpsc::Receiver<WorkerControlFrame>) -> Result<()>
@@ -12,10 +32,7 @@ where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = frames.recv().await {
-        let bytes = serde_json::to_vec(&frame).context("serialize worker control frame")?;
-        writer.write_all(&bytes).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        write_control_frame(&mut writer, &frame).await?;
     }
     Ok(())
 }
@@ -51,10 +68,11 @@ where
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        ensure!(
-            terminal.is_none(),
-            "session-worker emitted output after terminal result"
-        );
+        // The first terminal ends the protocol. Drain descendant-held pipes
+        // to EOF for ownership, but never route or decode later lines.
+        if terminal.is_some() {
+            continue;
+        }
         let value: serde_json::Value = serde_json::from_slice(&line).context("invalid worker stdout JSON line")?;
         if value.get("kind").is_some() {
             let frame: WorkerOutputFrame = serde_json::from_value(value).context("invalid worker output frame")?;
@@ -89,7 +107,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
         let this = self.get_mut();
         let before = buf.filled().len();
         let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &result
+        if matches!(&result, std::task::Poll::Ready(Ok(())))
             && buf.filled().len() > before
             && let Some(progress) = &this.progress
         {
@@ -127,6 +145,9 @@ mod tests {
         let mut bytes = serde_json::to_vec(&terminal)?;
         bytes.extend_from_slice(b" \n");
         worker.write_all(&bytes).await?;
+        worker.write_all(b"ignored after terminal\n").await?;
+        worker.write_all(&serde_json::to_vec(&WorkerOutputFrame::BrokerCancel { call_id: 9 })?).await?;
+        worker.write_all(b"\n").await?;
         drop(worker);
         assert_eq!(reader.await??, bytes);
         Ok(())
@@ -159,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn empty_stdout_remains_available_to_exit_signal_classifier() -> Result<()> {
         let bytes = read_worker_frames(tokio::io::empty(), None, None, 4096).await?;
-        assert!(bytes.is_empty());
+        assert_eq!(bytes, Vec::<u8>::new());
         Ok(())
     }
 }

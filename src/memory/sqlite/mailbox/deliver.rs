@@ -128,6 +128,7 @@ impl SqliteMailbox {
                 {
                     return Err(MailboxError::Quota("seq"));
                 }
+                super::outbox::nack_gaps(&tx, &stream, next, seq, now)?;
                 for missing in next..seq {
                     stream.progress.seq_skipped.push(Hole {
                         seq: missing,

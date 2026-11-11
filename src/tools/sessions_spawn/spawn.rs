@@ -987,6 +987,7 @@ impl SessionsSpawnTool {
             } else {
                 None
             };
+            let process_worker_mailbox = self.worker_mailbox.clone();
             let process_batch_id = batch_id.map(str::to_owned);
             #[cfg(test)]
             let test_worker_executable = self.test_worker_executable.clone();
@@ -1050,6 +1051,7 @@ impl SessionsSpawnTool {
                                 monitor_recovery.as_deref(),
                                 process_source_launch,
                                 process_batch_id.as_deref(),
+                                process_worker_mailbox.as_ref(),
                                 #[cfg(test)]
                                 test_worker_executable.as_ref(),
                             )

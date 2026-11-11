@@ -371,6 +371,7 @@ impl ParentToolRegistry {
 /// Returns immediately with a run ID; results are announced via the active channel
 /// when the sub-agent completes.
 pub struct SessionsSpawnTool {
+    worker_mailbox: Option<Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
     execution_schema: std::sync::OnceLock<Arc<serde_json::Value>>,
     /// Channel for announcing sub-agent results.
     ///

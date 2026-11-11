@@ -334,6 +334,7 @@ impl OwnedProcessGroup {
 
 /// Steering plumbing handed to the owner of a session-worker child process.
 pub(super) struct WorkerSteerPipe {
+    pub(super) frames: Option<crate::session_worker::frames::WorkerFrameChannels>,
     pub(super) steer_rx: tokio::sync::mpsc::Receiver<String>,
     pub(super) history: Arc<RwLock<Vec<HistoryEntry>>>,
     pub(super) run_id: String,

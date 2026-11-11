@@ -35,6 +35,18 @@ pub struct SqliteMailbox {
 }
 
 impl SqliteMailbox {
+    pub fn validate_scope(
+        &self,
+        scope: &crate::messaging::mailbox::MailboxScope,
+        address: &crate::messaging::SessionAddr,
+    ) -> MailboxResult<()> {
+        if address.instance != self.local_instance {
+            return Err(MailboxError::Unauthorized);
+        }
+        let writer = self.memory.pool.write();
+        pin::check_scope(&writer, scope, address, None, true)
+    }
+
     pub fn new(
         memory: SqliteMemory,
         local_instance: String,

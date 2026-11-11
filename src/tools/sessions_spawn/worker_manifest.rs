@@ -109,7 +109,13 @@ pub(super) fn build_session_worker_manifest(
         crate::runtime::operator_spawn::process::ProcessSourceLaunch,
         &ring::hmac::Key,
     )>,
-) -> anyhow::Result<(WorkerManifest, String, u64)> {
+    mailbox: Option<&std::sync::Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
+) -> anyhow::Result<(
+    WorkerManifest,
+    String,
+    u64,
+    Option<crate::session_worker::mailbox_binding::BoundWorkerMailbox>,
+)> {
     let mut manifest = WorkerManifest {
         parent_capability: None,
         capability_manifest: None,
@@ -170,9 +176,22 @@ pub(super) fn build_session_worker_manifest(
         grant.bind_worker_manifest(&mut manifest, receipt, selection)?;
     }
 
-    let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
-    let sealed_capability = if let Some((launch, key)) = source_launch {
+    let source_key = if let Some((launch, key)) = source_launch {
         launch.bind_worker_manifest(key, &mut manifest)?;
+        Some(key)
+    } else {
+        None
+    };
+    let mailbox = mailbox
+        .map(|factory| {
+            crate::session_worker::mailbox_binding::BoundWorkerMailbox::bind(
+                std::sync::Arc::clone(factory),
+                &mut manifest,
+            )
+        })
+        .transpose()?;
+    let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
+    let sealed_capability = if let Some(key) = source_key {
         compute_worker_capability_with_key(
             key,
             &manifest.run_id,
@@ -183,5 +202,5 @@ pub(super) fn build_session_worker_manifest(
         seal_worker_capability(&manifest, capability_expiry)?
     };
     manifest.parent_capability = Some(sealed_capability.clone());
-    Ok((manifest, sealed_capability, capability_expiry))
+    Ok((manifest, sealed_capability, capability_expiry, mailbox))
 }

@@ -785,6 +785,10 @@ impl Provider for MockEnvProvider {
                 reasoning_content: None,
             });
         }
+        // The same semantic model barrier applies to non-streaming workers.
+        // Assessment requests returned above never wait on model stimulus.
+        let hold = mock_hold_path_for_messages(&self.hold_while_file, request.messages);
+        mock_wait_while_path_exists(hold.as_ref(), MOCK_HOLD_MAX_WAIT).await;
         Ok(ChatResponse {
             text: Some(self.non_streaming_outcome()?),
             tool_calls: Vec::new(),

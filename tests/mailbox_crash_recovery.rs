@@ -3,20 +3,21 @@
 #![cfg(all(feature = "test-mock", unix))]
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let barrier = dir.path().join("barrier");
     std::fs::write(&barrier, b"hold")?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prx"))
+    let mut child = Receiver(Command::new(env!("CARGO_BIN_EXE_prx"))
         .args(["__mailbox-harness", "accept-adopt", "--workspace"])
         .arg(dir.path())
         .env("OPENPRX_TEST_MAILBOX_BARRIER", format!("{stage}={}", barrier.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()?);
     let started = dir.path().join("barrier.started");
     let deadline = Instant::now() + Duration::from_secs(20);
     while !started.exists() {
@@ -34,25 +35,38 @@ fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Res
     child.wait()?;
     let database = dir.path().join("memory/brain.db");
     inspect(&database, transcript_before, state_before)?;
-    let output = Command::new(env!("CARGO_BIN_EXE_prx"))
-        .args(["__mailbox-harness", "accept-adopt", "--workspace"])
-        .arg(dir.path())
-        .env_remove("OPENPRX_TEST_MAILBOX_BARRIER")
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "restart failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    restart(dir.path())?;
     inspect(&database, 1, 2)?;
     // A second restart must neither append nor consume twice.
-    let status = Command::new(env!("CARGO_BIN_EXE_prx"))
-        .args(["__mailbox-harness", "accept-adopt", "--workspace"])
-        .arg(dir.path())
-        .env_remove("OPENPRX_TEST_MAILBOX_BARRIER")
-        .status()?;
-    ensure!(status.success(), "second restart failed");
+    restart(dir.path())?;
     inspect(&database, 1, 2)
+}
+struct Receiver(Child);
+impl std::ops::Deref for Receiver {
+    type Target=Child;
+    fn deref(&self)->&Child {&self.0}
+}
+impl std::ops::DerefMut for Receiver {
+    fn deref_mut(&mut self)->&mut Child {&mut self.0}
+}
+impl Drop for Receiver {
+    fn drop(&mut self) {let _=self.0.kill();let _=self.0.wait();}
+}
+fn restart(workspace:&Path)->Result<()> {
+    let mut receiver=Receiver(Command::new(env!("CARGO_BIN_EXE_prx"))
+        .args(["__mailbox-harness","accept-adopt","--workspace"]).arg(workspace)
+        .env_remove("OPENPRX_TEST_MAILBOX_BARRIER").stdout(Stdio::null()).stderr(Stdio::piped()).spawn()?);
+    let deadline=Instant::now()+Duration::from_secs(20);
+    loop {
+        if let Some(status)=receiver.try_wait()? {
+            let mut stderr=String::new();
+            if let Some(mut pipe)=receiver.stderr.take() {pipe.read_to_string(&mut stderr)?;}
+            ensure!(status.success(),"restart failed: {stderr}");
+            return Ok(());
+        }
+        ensure!(Instant::now()<deadline,"mailbox restart exceeded hang guard");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 fn inspect(path: &Path, transcript: i64, state: i64) -> Result<()> {
     let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

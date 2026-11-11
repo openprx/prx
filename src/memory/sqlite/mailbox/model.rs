@@ -9,8 +9,12 @@ use crate::messaging::{CausalChain, MessageAuth, MessageOrigin, PrxMessage, Remo
 pub(super) fn encode<T: Serialize>(value: &T) -> MailboxResult<String> {
     serde_json::to_string(value).map_err(|_| MailboxError::InvalidMetadata)
 }
-pub(super) fn decode<T: DeserializeOwned>(json: &str) -> MailboxResult<T> {
-    serde_json::from_str(json).map_err(|_| MailboxError::InvalidMetadata)
+pub(super) fn decode<T: DeserializeOwned + Serialize>(json: &str) -> MailboxResult<T> {
+    let value: T = serde_json::from_str(json).map_err(|_| MailboxError::InvalidMetadata)?;
+    if encode(&value)? != json {
+        return Err(MailboxError::InvalidMetadata);
+    }
+    Ok(value)
 }
 pub(super) fn uuid(bytes: &[u8]) -> MailboxResult<Uuid> {
     Uuid::from_slice(bytes).map_err(|_| MailboxError::CorruptState)

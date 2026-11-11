@@ -183,3 +183,53 @@ impl SqliteMailbox {
         tx.commit().map_err(storage_error)
     }
 }
+
+/// A local sender role makes the missing allocation reachable without an Ack
+/// frame or a second transaction. Remote senders are handled by their transport.
+pub(super) fn nack_gaps(
+    conn: &rusqlite::Connection,
+    stream: &stream::Stream,
+    start: u64,
+    end: u64,
+    now: i64,
+) -> MailboxResult<()> {
+    let Some(sender) = stream.sender.as_ref() else {
+        return Ok(());
+    };
+    match check_scope(conn, sender, &stream.from, None, true) {
+        Ok(()) => {}
+        Err(MailboxError::StaleIncarnation | MailboxError::Fenced) => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let mut query = conn.prepare("SELECT id,message_id,envelope_meta FROM prx_mailbox_outbox WHERE stream_id=?1 AND state IN(0,1) AND seq>=?2 AND seq<?3").map_err(storage_error)?;
+    let rows = query
+        .query_map(
+            params![stream.id, start.to_be_bytes().as_slice(), end.to_be_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(storage_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage_error)?;
+    drop(query);
+    for (id, message_id, json) in rows {
+        let mut meta: OutboxMeta = decode(&json)?;
+        meta.common.validate(uuid(&message_id)?)?;
+        if meta.body_erased_at.is_some() {
+            return Err(MailboxError::CorruptState);
+        }
+        meta.last_error = Some(MailboxError::SeqAlreadyConsumed.to_string());
+        meta.updated_at = now;
+        let terminal = *meta.terminal_at.get_or_insert(now);
+        let expiry = terminal
+            .checked_add(REPLAY_SECONDS)
+            .ok_or(MailboxError::InvalidMetadata)?;
+        conn.execute("UPDATE prx_mailbox_outbox SET state=3,expires_at=?1,envelope_meta=?2 WHERE id=?3 AND ma_scope_id=?4 AND state IN(0,1)",params![expiry,encode(&meta)?,id,sender.scope_id.to_string()]).map_err(storage_error)?;
+    }
+    Ok(())
+}

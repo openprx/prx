@@ -43,7 +43,10 @@ use tokio_util::sync::CancellationToken;
 /// fills the parent's bounded queue and finally slows the steering caller down.
 /// There is deliberately no wall-clock deadline anywhere on that chain: a worker
 /// too busy to accept a frame is the idle detector's business, not a timeout's.
-pub(super) fn spawn_stdin_control_reader(steer_tx: tokio::sync::mpsc::Sender<String>) {
+pub(super) fn spawn_stdin_control_reader(
+    steer_tx: tokio::sync::mpsc::Sender<String>,
+    mut mailbox: Option<super::super::mailbox::WorkerMailboxSender>,
+) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
@@ -69,12 +72,22 @@ pub(super) fn spawn_stdin_control_reader(steer_tx: tokio::sync::mpsc::Sender<Str
                         break;
                     }
                 }
-                WorkerControlFrame::Message { .. }
-                | WorkerControlFrame::BrokerResult { .. }
-                | WorkerControlFrame::BrokerCancelAck { .. } => {
-                    tracing::warn!(
-                        "session-worker discarded a non-Steer stdin control frame; messaging reader is not wired"
-                    );
+                WorkerControlFrame::Message { envelope } => {
+                    let result = mailbox
+                        .as_mut()
+                        .ok_or(crate::messaging::mailbox::MailboxError::Unauthorized)
+                        .and_then(|inbox| inbox.enqueue(*envelope));
+                    match result {
+                        Ok(ack) => {
+                            if super::super::stdout::frame(&ack).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error,"session-worker refused mailbox control frame"),
+                    }
+                }
+                WorkerControlFrame::BrokerResult { .. } | WorkerControlFrame::BrokerCancelAck { .. } => {
+                    tracing::warn!("session-worker discarded an unregistered broker control frame");
                 }
             }
         }
@@ -98,9 +111,25 @@ pub(super) type SteeredSegment = (
 /// history it already advanced is preserved), appends the operator turn and
 /// re-enters the loop. A closed channel means no more steering, so the current
 /// segment is simply awaited to its natural end.
+#[cfg(test)]
 pub(super) async fn run_segments_with_steering<F, Fut>(
+    history: Vec<ChatMessage>,
+    steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
+    run_segment: F,
+) -> SteeredSegment
+where
+    F: FnMut(Vec<ChatMessage>, CancellationToken, Option<String>) -> Fut,
+    Fut: Future<Output = SteeredSegment>,
+{
+    run_segments_with_controls(history, steer_rx, &mut None, run_segment).await
+}
+
+/// Data adoption advances the session's ordinary history. Receiver dispatch is
+/// A2A-4: no Data is passed to the current turn's source/approval machinery.
+pub(super) async fn run_segments_with_controls<F, Fut>(
     mut history: Vec<ChatMessage>,
     steer_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
+    mailbox: &mut Option<super::super::mailbox::WorkerMailboxInbox>,
     mut run_segment: F,
 ) -> SteeredSegment
 where
@@ -112,30 +141,43 @@ where
         let cancel = CancellationToken::new();
         let segment = run_segment(history, cancel.clone(), raw_steer.take());
         tokio::pin!(segment);
-
-        let steered = tokio::select! {
-            finished = &mut segment => return finished,
-            steer = next_steer(steer_rx) => steer,
-        };
-
-        match steered {
-            Some(message) => {
-                cancel.cancel();
-                let (mut advanced, cancelled) = segment.await;
-                if cancelled
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>())
-                {
-                    return (advanced, cancelled);
+        let finished = tokio::select! {
+            finished=&mut segment=>finished,
+            steer=next_steer(steer_rx)=> {
+                if let Some(message)=steer {
+                    cancel.cancel();
+                    let (mut advanced,cancelled)=segment.await;
+                    if cancelled.as_ref().err().is_some_and(|error|error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>()) {return (advanced,cancelled);}
+                    advanced.push(ChatMessage::user(steering_instruction(&message)));
+                    raw_steer=Some(message);history=advanced;continue;
                 }
-                advanced.push(ChatMessage::user(steering_instruction(&message)));
-                raw_steer = Some(message);
-                history = advanced;
+                segment.await
             }
-            // Steer channel closed — wait for natural completion.
-            None => return segment.await,
+        };
+        let (mut advanced, result) = finished;
+        if result.is_err() {
+            return (advanced, result);
         }
+        while let Some(message) = mailbox.as_mut().and_then(|inbox| inbox.try_next()) {
+            let text = match super::super::mailbox::user_text(&message) {
+                Ok(text) => text,
+                Err(error) => return (advanced, Err(error.into())),
+            };
+            advanced.push(ChatMessage::user(text));
+            let ack = mailbox
+                .as_ref()
+                .ok_or(crate::messaging::mailbox::MailboxError::CorruptState)
+                .and_then(|inbox| inbox.consumed(&message));
+            match ack {
+                Ok(ack) => {
+                    if let Err(error) = super::super::stdout::frame(&ack) {
+                        return (advanced, Err(error));
+                    }
+                }
+                Err(error) => return (advanced, Err(error.into())),
+            }
+        }
+        return (advanced, result);
     }
 }
 

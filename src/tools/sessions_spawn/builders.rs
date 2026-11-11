@@ -15,6 +15,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 impl SessionsSpawnTool {
+    /// Explicit dormant runtime constructor; production factories never call it.
+    pub fn with_worker_mailbox(
+        mut self,
+        factory: Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>,
+    ) -> Self {
+        self.worker_mailbox = Some(factory);
+        self
+    }
+
     pub(super) fn resolved_process_config_source(
         options: &providers::ProviderRuntimeOptions,
         pinned_config: Option<&crate::config::Config>,
@@ -104,6 +113,7 @@ impl SessionsSpawnTool {
             .with_providers(std::iter::once(provider_name.as_str()))
             .with_providers(agents.values().map(|agent| agent.provider.as_str()));
         Self {
+            worker_mailbox: None,
             channel: Arc::new(RwLock::new(channel)),
             #[cfg(test)]
             test_worker_executable: None,

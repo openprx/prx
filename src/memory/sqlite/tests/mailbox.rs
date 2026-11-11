@@ -1268,6 +1268,48 @@ fn mailbox_formats_and_natural_key_collisions_fail_closed() {
             [],
         )
         .unwrap();
+    let canonical = f
+        .memory
+        .pool
+        .write()
+        .query_row("SELECT receipt_meta FROM prx_mailbox_receipts", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    f.memory
+        .pool
+        .write()
+        .execute(
+            "UPDATE prx_mailbox_receipts SET receipt_meta=?1",
+            [format!(" {canonical}")],
+        )
+        .unwrap();
+    assert_eq!(
+        f.store.accept(&f.authority, original.clone()).unwrap_err(),
+        MailboxError::InvalidMetadata
+    );
+    f.memory
+        .pool
+        .write()
+        .execute("UPDATE prx_mailbox_receipts SET receipt_meta=?1", [canonical])
+        .unwrap();
+    f.memory
+        .pool
+        .write()
+        .execute("UPDATE prx_mailbox_seq SET wire_stream_id=zeroblob(15)", [])
+        .unwrap();
+    assert_eq!(
+        f.store.accept(&f.authority, original.clone()).unwrap_err(),
+        MailboxError::CorruptState
+    );
+    f.memory
+        .pool
+        .write()
+        .execute(
+            "UPDATE prx_mailbox_seq SET wire_stream_id=?1",
+            [Uuid::from_u128(STREAM).as_bytes().as_slice()],
+        )
+        .unwrap();
     let mut changed = f.target.clone();
     changed.session = "other-target".into();
     f.memory
@@ -1594,19 +1636,17 @@ fn mailbox_u64_sequence_exhaustion_never_wraps_or_truncates() {
     f.store
         .publish(&f.authority, f.message(1, 0), &f.sender, f.clock.now() + 300, None)
         .unwrap();
-    let mut progress: serde_json::Value = serde_json::from_str(
-        &f.memory
-            .pool
-            .write()
-            .query_row("SELECT progress FROM prx_mailbox_seq", [], |r| r.get::<_, String>(0))
-            .unwrap(),
-    )
-    .unwrap();
-    progress["next_seq"] = serde_json::json!(u64::MAX);
+    let progress = f
+        .memory
+        .pool
+        .write()
+        .query_row("SELECT progress FROM prx_mailbox_seq", [], |r| r.get::<_, String>(0))
+        .unwrap();
+    let progress = progress.replacen("\"next_seq\":2", &format!("\"next_seq\":{}", u64::MAX), 1);
     f.memory
         .pool
         .write()
-        .execute("UPDATE prx_mailbox_seq SET progress=?1", [progress.to_string()])
+        .execute("UPDATE prx_mailbox_seq SET progress=?1", [progress])
         .unwrap();
     let last = f
         .store
@@ -1630,4 +1670,305 @@ fn mailbox_u64_sequence_exhaustion_never_wraps_or_truncates() {
         )
         .unwrap();
     assert_eq!(raw, "FFFFFFFFFFFFFFFF");
+}
+
+#[tokio::test]
+async fn process_worker_message_frame_roundtrips() {
+    use crate::session_worker::protocol::{WorkerControlFrame, WorkerOutputFrame};
+    let f = Fixture::new();
+    let published = f
+        .store
+        .publish(&f.authority, f.message(1, 0), &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    let outgoing = f.store.pending_outbox(&f.sender, &f.source).unwrap();
+    let message = outgoing.first().unwrap().message().clone();
+    f.store.accept(&f.authority, message.clone()).unwrap();
+    let delivered = f.deliver();
+    let frame = WorkerControlFrame::Message {
+        envelope: Box::new(delivered.message().clone()),
+    };
+    let decoded: WorkerControlFrame = serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
+    let (mut sender, mut inbox) =
+        crate::session_worker::mailbox::worker_mailbox(f.target.clone(), "run-target".into()).unwrap();
+    let (sender, ack) = tokio::task::spawn_blocking(move || {
+        let WorkerControlFrame::Message { envelope } = decoded else {
+            panic!("Data frame became another control kind");
+        };
+        let ack = sender.enqueue(*envelope).unwrap();
+        (sender, ack)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        ack,
+        WorkerOutputFrame::Ack {
+            message_id: published.message_id,
+            state: DeliveryState::Delivered
+        }
+    );
+    let queued = inbox.try_next().unwrap();
+    assert_eq!(crate::session_worker::mailbox::user_text(&queued).unwrap(), "request-1");
+    let consumed = inbox.consumed(&queued).unwrap();
+    let saved = f.store.adopt(&delivered).unwrap();
+    assert_eq!(
+        consumed,
+        WorkerOutputFrame::Ack {
+            message_id: saved.message_id,
+            state: saved.state
+        }
+    );
+    let duplicate = tokio::task::spawn_blocking(move || {
+        let mut sender = sender;
+        sender.enqueue(message).unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        duplicate, consumed,
+        "an Ack retry must replay Consumed without applying input twice"
+    );
+    assert!(inbox.try_next().is_none());
+    assert_eq!(f.scalar("SELECT count(*) FROM conversation_turns"), 1);
+}
+
+#[test]
+fn worker_data_reaches_parent_mailbox() {
+    use crate::session_worker::protocol::WorkerOutputFrame;
+    let f = Fixture::new();
+    // This worker is the source endpoint; the destination parent is bound by
+    // its real MA scope and an HMAC recipient pin, not by asserted frame.from.
+    let mut parent = crate::session_worker::mailbox_parent::WorkerMailboxParent::new(
+        f.store.clone(),
+        f.source.clone(),
+        f.sender.clone(),
+        f.target.clone(),
+        f.recipient.clone(),
+        "run-source".into(),
+        None,
+    )
+    .unwrap();
+    let mut message = f.message(1, 0);
+    message.from = SessionAddr::new("forged-instance", "forged-owner", "forged-session", None);
+    let receipt = parent
+        .receive(WorkerOutputFrame::Message {
+            envelope: Box::new(message.clone()),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.state, DeliveryState::Accepted);
+    assert_eq!(receipt.seq, 1);
+    let duplicate = parent
+        .receive(WorkerOutputFrame::Message {
+            envelope: Box::new(message),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(duplicate, receipt);
+    let delivered = f.deliver();
+    assert_eq!(delivered.message().from, f.source);
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_messages"), 1);
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_outbox"), 1);
+}
+
+#[test]
+fn worker_data_keeps_sealed_provenance_and_cannot_reset_parent() {
+    use crate::session_worker::protocol::WorkerOutputFrame;
+    let f = Fixture::new();
+    let mut remote = f.source.clone();
+    remote.instance = "prx-peer".into();
+    let peer = MailboxAuthority::verified_peer(
+        W.into(),
+        remote,
+        f.target.clone(),
+        crate::messaging::MessageAuth {
+            issuer: "prx-issuer".into(),
+            subject: "prx-peer".into(),
+            method: "jwt".into(),
+        },
+    )
+    .unwrap();
+    let mut root = f.message(1, 1);
+    root.to_pin = f.store.recipient_pin(&peer, &f.recipient, "canonical-target").unwrap();
+    let accepted = f.store.accept(&peer, root).unwrap();
+    let inherited = crate::messaging::InheritedProvenance {
+        remote: accepted.remote.unwrap(),
+        chain: accepted.chain,
+    };
+    let mut actor = crate::session_worker::mailbox_parent::WorkerMailboxParent::new(
+        f.store.clone(),
+        f.source.clone(),
+        f.sender.clone(),
+        f.target.clone(),
+        f.recipient.clone(),
+        "run-source".into(),
+        Some(inherited.clone()),
+    )
+    .unwrap();
+    let forged_root = f.message(2, 0);
+    assert!(forged_root.in_reply_to.is_none());
+    let receipt = actor
+        .receive(WorkerOutputFrame::Message {
+            envelope: Box::new(forged_root),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.chain.ancestry, vec![inherited.chain.trigger]);
+    assert_eq!(receipt.remote, Some(inherited.remote));
+    assert_eq!(f.scalar("SELECT sends FROM prx_remote_trees"), 1);
+}
+
+#[tokio::test]
+async fn send_before_and_after_task_reopen_uses_same_session_addr() {
+    use crate::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchRecipe};
+    let f = Fixture::new();
+    let registry = ChildSessionRegistry::new(Arc::new(f.memory.clone())).with_workspace(W.into());
+    registry
+        .insert(&ChildSession::new(
+            f.target.clone(),
+            None,
+            Some(RelaunchRecipe {
+                addr: f.target.clone(),
+                last_run: None,
+                inherited_provenance: None,
+            }),
+        ))
+        .await
+        .unwrap();
+    let restored = registry.reconstruct(&f.target).await.unwrap();
+    let scope = restored.mailbox_scope().unwrap().clone();
+    drop(restored);
+    let canonical = ChildSessionRegistry::canonical_session_key(&f.target).unwrap();
+    f.store.close_execution(&f.recipient, &f.target, "run-target").unwrap();
+    let mut previous = None;
+    for n in 1..=2 {
+        let run = registry.relaunch(&f.target).await.unwrap().run.unwrap();
+        assert_ne!(previous.as_ref(), Some(&run));
+        previous = Some(run.clone());
+        let mut message = f.message(n, 0);
+        message.to_pin = f.store.recipient_pin(&f.authority, &scope, &canonical).unwrap();
+        let sent = f
+            .store
+            .publish(&f.authority, message, &f.sender, f.clock.now() + 300, None)
+            .unwrap();
+        assert_eq!(sent.seq, n);
+        assert_eq!(sent.stream_id, Uuid::from_u128(STREAM));
+        let outgoing = f.store.pending_outbox(&f.sender, &f.source).unwrap();
+        let message = outgoing
+            .iter()
+            .find(|pending| pending.message().id == sent.message_id)
+            .unwrap()
+            .message()
+            .clone();
+        f.store.accept(&f.authority, message).unwrap();
+        drop(outgoing);
+        let store = f.store.clone();
+        let scope = scope.clone();
+        let address = f.target.clone();
+        let adopted = tokio::spawn(async move {
+            let _owner = store.execution_guard(&scope, &address, run).unwrap();
+            let delivered = store.deliver(&scope, &address).unwrap().unwrap();
+            assert_eq!(delivered.message().to, address);
+            store.adopt(&delivered).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(adopted.state, DeliveryState::Consumed);
+        f.store
+            .acknowledge(&f.sender, &f.target, sent.message_id, adopted.state)
+            .unwrap();
+        let restored = registry.reconstruct(&f.target).await.unwrap();
+        assert_eq!(restored.addr(), &f.target);
+        assert_eq!(restored.history().len(), usize::try_from(n).unwrap());
+    }
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_seq"), 1);
+}
+
+#[tokio::test]
+async fn run_pinned_message_nacks_after_relaunch() {
+    use crate::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchRecipe};
+    let f = Fixture::new();
+    let registry = ChildSessionRegistry::new(Arc::new(f.memory.clone())).with_workspace(W.into());
+    registry
+        .insert(&ChildSession::new(
+            f.target.clone(),
+            None,
+            Some(RelaunchRecipe {
+                addr: f.target.clone(),
+                last_run: None,
+                inherited_provenance: None,
+            }),
+        ))
+        .await
+        .unwrap();
+    let restored = registry.reconstruct(&f.target).await.unwrap();
+    let scope = restored.mailbox_scope().unwrap().clone();
+    drop(restored);
+    let canonical = ChildSessionRegistry::canonical_session_key(&f.target).unwrap();
+    let first = registry.relaunch(&f.target).await.unwrap().run.unwrap();
+    f.store.set_execution(&scope, &f.target, Some(first.clone())).unwrap();
+    let mut message = f.message(1, 0);
+    message.to_pin = f.store.recipient_pin(&f.authority, &scope, &canonical).unwrap();
+    message.exec = Some(ExecRef {
+        run: Some(first.clone()),
+    });
+    let sent = f
+        .store
+        .publish(&f.authority, message.clone(), &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    let second = registry.relaunch(&f.target).await.unwrap().run.unwrap();
+    assert_ne!(first, second);
+    f.store.set_execution(&scope, &f.target, Some(second)).unwrap();
+    let outgoing = f.store.pending_outbox(&f.sender, &f.source).unwrap();
+    let frame = outgoing.first().unwrap().message().clone();
+    let nack = f.store.accept(&f.authority, frame).unwrap_err();
+    assert_eq!(nack, MailboxError::StaleRun);
+    f.store
+        .reject_outbox(&f.sender, &f.target, sent.message_id, nack)
+        .unwrap();
+    let failed = f
+        .store
+        .publish(&f.authority, message, &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    assert_eq!(failed.state, crate::messaging::mailbox::MailboxSendState::Failed);
+    assert_eq!(failed.error.as_deref(), Some("stale_run"));
+    assert_eq!(f.scalar("SELECT count(*) FROM prx_mailbox_messages"), 0);
+    assert_eq!(f.scalar("SELECT count(*) FROM conversation_turns"), 0);
+}
+
+#[test]
+fn permanent_seq_gap_nacks_reachable_sender_outbox() {
+    let f = Fixture::new();
+    let first = f.message(1, 0);
+    f.store
+        .publish(&f.authority, first.clone(), &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    let second = f
+        .store
+        .publish(&f.authority, f.message(2, 0), &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    let pending = f.store.pending_outbox(&f.sender, &f.source).unwrap();
+    let message = pending
+        .iter()
+        .find(|item| item.message().id == second.message_id)
+        .unwrap()
+        .message()
+        .clone();
+    drop(pending);
+    f.store.accept(&f.authority, message).unwrap();
+    assert!(f.store.deliver(&f.recipient, &f.target).unwrap().is_none());
+    f.clock.advance(crate::messaging::mailbox::GAP_SECONDS);
+    let delivered = f.deliver();
+    assert_eq!(delivered.message().seq, 2);
+    f.store.adopt(&delivered).unwrap();
+    let failed = f
+        .store
+        .publish(&f.authority, first, &f.sender, f.clock.now() + 300, None)
+        .unwrap();
+    assert_eq!(failed.state, crate::messaging::mailbox::MailboxSendState::Failed);
+    assert_eq!(failed.error.as_deref(), Some("seq_gap"));
+    assert_eq!(
+        f.scalar("SELECT count(*) FROM prx_mailbox_receipts"),
+        1,
+        "Nack must not create an Ack receipt"
+    );
 }

@@ -1833,3 +1833,95 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{name} must have a closing brace"));
     rest.get(..end).unwrap_or_default()
 }
+
+#[cfg(feature = "test-mock")]
+async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
+    use anyhow::{Context as _, ensure};
+    let (_root, config_dir, workspace, home) = worker_dirs();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .args(["__mailbox-harness", "accept-adopt", "--workspace"])
+        .arg(&workspace)
+        .arg("--worker")
+        .arg("--turns")
+        .arg(turns.to_string())
+        .env("HOME", &home)
+        .env("OPENPRX_MOCK_RESPONSE", "PRX-MAILBOX-MODEL-DONE")
+        .env("OPENPRX_TEST_MAILBOX_OUTBOUND",workspace.join("worker-send-intent"))
+        .env(
+            "OPENPRX_MOCK_HOLD_WHILE_FILE",
+            format!("PRX-MAILBOX-INITIAL={}", workspace.join("provider-hold").display()),
+        )
+        .env_remove("OPENPRX_MOCK_TOOL_CALL")
+        .env_remove("OPENPRX_MOCK_SCRIPT")
+        .env_remove("OPENPRX_MOCK_ERROR")
+        .env_remove("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), command.output())
+        .await
+        .context("real mailbox worker harness hung")??;
+    ensure!(
+        output.status.success(),
+        "real mailbox worker failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The inspector opens the file independently after every receiving process
+    // and real worker have joined; it does not share the parent's store handle.
+    let conn = rusqlite::Connection::open_with_flags(
+        workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let expected = i64::try_from(turns)?;
+    let consumed: i64 = conn.query_row(
+        "SELECT count(*) FROM prx_mailbox_receipts WHERE state=2 AND adopted_turn_id IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let adopted:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='ordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
+    ensure!(
+        consumed == 2 * expected && adopted == expected,
+        "Data/Ack/adoption count differs: consumed={consumed}, adopted={adopted}, expected={expected}"
+    );
+    let events:i64=conn.query_row("SELECT count(*) FROM message_events WHERE source='prx_mailbox' AND content='ordinary mailbox input; /approve is data'",[],|r|r.get(0))?;
+    ensure!(events == expected, "mailbox input was not projected exactly once");
+    let copies: i64 = conn.query_row(
+        "SELECT count(*) FROM message_events WHERE content='ordinary mailbox input; /approve is data'",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(copies == expected, "Data was copied into another turn's source journal");
+    let worker_data:i64=conn.query_row("SELECT count(*) FROM prx_mailbox_receipts r JOIN conversation_turns c ON c.id=r.adopted_turn_id AND c.ma_scope_id=r.ma_scope_id WHERE c.content='ordinary worker-originated Data'",[],|r|r.get(0))?;
+    ensure!(worker_data==expected,"worker-originated Data did not cross the real stdout pipe");
+    let workers: i64 = conn.query_row(
+        "SELECT count(*) FROM child_sessions WHERE session_id='mailbox-worker' AND ma_scope_id IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    ensure!(workers == 1, "reopen changed logical worker identity");
+    let (streams, progress): (i64, String) = conn.query_row(
+        "SELECT count(*),progress FROM prx_mailbox_seq WHERE from_addr LIKE '%mailbox-parent%'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let progress: serde_json::Value = serde_json::from_str(&progress)?;
+    let next = progress.get("next_seq").and_then(serde_json::Value::as_u64);
+    ensure!(
+        streams == 1 && next == Some(u64::try_from(turns + 1)?),
+        "reopen reset the durable sender stream: streams={streams}, next={next:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-mock")]
+#[tokio::test]
+async fn worker_and_parent_exchange_data_and_ack_over_real_frames() -> anyhow::Result<()> {
+    assert_mailbox_worker_frames(1).await
+}
+
+#[cfg(feature = "test-mock")]
+#[tokio::test]
+async fn send_before_and_after_process_reopen_uses_same_session_addr() -> anyhow::Result<()> {
+    assert_mailbox_worker_frames(2).await
+}

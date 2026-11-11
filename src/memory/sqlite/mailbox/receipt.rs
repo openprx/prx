@@ -194,7 +194,18 @@ pub(super) fn parent_chain(
         .map_err(storage_error)?;
     if let Some(json) = parent {
         let meta: super::model::ParentMeta = decode(&json)?;
-        if meta.ancestry.len() != usize::from(meta.hop_count) || meta.hop_count > 8 || meta.ancestry.contains(&id) {
+        let unique: std::collections::HashSet<_> = meta.ancestry.iter().collect();
+        if meta.request_digest.len() != 64
+            || !meta
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || meta.created_at < 0
+            || unique.len() != meta.ancestry.len()
+            || meta.ancestry.len() != usize::from(meta.hop_count)
+            || meta.hop_count > 8
+            || meta.ancestry.contains(&id)
+        {
             return Err(MailboxError::CorruptState);
         }
         return Ok((meta.hop_count, meta.ancestry));
