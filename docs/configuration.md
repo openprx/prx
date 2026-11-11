@@ -154,6 +154,14 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[providers]` | `[providers.ollama] num_ctx` unset. `[[providers.tool_dialects]]`: `provider` required; `model` unset (all models); `tool_schema`/`tool_call` unset (`raw` / `native`). `[[providers.models]]`: `provider` required; `model` unset; `operations`, `native_tools`, `vision_input`, `streaming`, `structured_output`, `tool_schema_dialect`, `tool_call_dialect`, `context_window` all unset. See later sections |
 | `[model_settings.<id>]` | catalog levels and explicit parameters; omitted keys stay with the catalog |
 
+## Interactive agent sessions
+
+In interactive `prx agent`, `/clear` and `/new` discard the in-memory
+conversation history and start a new session immediately. Stored memories,
+including those from the previous session, other sessions, channels, and Console,
+are preserved. Turns within a session share its session ID and each have their
+own run ID.
+
 ## Tracing and `RUST_LOG`
 
 Foreground CLI commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
