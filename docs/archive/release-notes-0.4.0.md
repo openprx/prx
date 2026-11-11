@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # OpenPRX v0.4.0 Release Notes
 
 发布日期: 2026-05-17 (S5 Release Prep)

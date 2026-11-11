@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # PRX 0.8.10 Release Notes
 
 Release date: 2026-07-17
@@ -35,5 +37,5 @@ workspace snapshot before this candidate was prepared.
 5. Install the exact audited 0.8.11 binary atomically, restart PRX and wacli,
    and complete the Stage 5 and Stage 6 acceptance matrices.
 
-The complete feature notes remain in `docs/release-notes-0.8.8.md`; the 0.8.9
+The complete feature notes remain in `docs/archive/release-notes-0.8.8.md`; the 0.8.9
 through 0.8.11 notes document the release-candidate compatibility repairs.

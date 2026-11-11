@@ -157,7 +157,7 @@ Canonical entry points:
 - installation contract: `docs/one-click-bootstrap.md`
 - runtime topics: `docs/configuration.md`, `docs/providers.md`,
   `docs/channels.md`, `docs/tools.md`
-- release history: `CHANGELOG.md`, `docs/release-notes-*.md`
+- release history: `CHANGELOG.md`, `docs/archive/release-notes-*.md`
 
 Runtime-contract references (must track behavior changes):
 

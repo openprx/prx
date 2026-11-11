@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # Decision-plane candidate notes — 2026-10-04
 
 This is an unreleased local candidate, not an acceptance or deployment record.

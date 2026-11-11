@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # PRX 0.8.9 Release Notes
 
 Release date: 2026-07-17
@@ -29,5 +31,5 @@ remain on 0.8.7 state.
    and repeat status/verify plus doctor, runtime, health, and readiness checks.
 
 The complete feature and compatibility notes remain in
-`docs/release-notes-0.8.8.md`; 0.8.9 changes only the release version and
+`docs/archive/release-notes-0.8.8.md`; 0.8.9 changes only the release version and
 migration-history compatibility described above.

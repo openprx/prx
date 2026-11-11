@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # PRX 0.8.8 Release Notes
 
 Release date: 2026-07-16

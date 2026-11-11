@@ -342,7 +342,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Unreleased changes merged during local closeout. Deployment, real messaging,
 paid-provider validation and external PostgreSQL/platform acceptance remain
-pending. See the [candidate notes](docs/release-notes-decision-plane-candidate-2026-10-04.md)
+pending. See the [candidate notes](docs/archive/release-notes-decision-plane-candidate-2026-10-04.md)
 and the migration warnings below before upgrading.
 
 ### Added
@@ -2695,6 +2695,21 @@ and the migration warnings below before upgrading.
   substitutions, pipelines, and background-process bookkeeping.
 - Removed the obsolete `[autonomy.sandbox]` schema/templates and Landlock build
   feature so deleting the old switch cannot silently activate isolation.
+
+## [0.8.19] - 19 July 2026
+
+- Fixes group-chat `chat_profile_update` guidance and neutralizes internal
+  scope wording in model-visible descriptions and errors.
+- Adds safe compatible-provider fallback parsing for registered-tool
+  `<function=NAME>{json}</function>` responses.
+- Keeps runtime scope injection and target-field rejection unchanged.
+
+## [0.8.18] - 19 July 2026
+
+- Removes the `http_request` domain allowlist and all request permission
+  gates. The tool is an unrestricted native HTTP primitive.
+- Retains only transport behavior such as HTTP(S) URL syntax, timeout,
+  response-size truncation, and response handling.
 
 ## [0.8.12] - 17 July 2026
 

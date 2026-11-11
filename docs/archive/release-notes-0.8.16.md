@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # OpenPRX 0.8.16
 
 This patch closes the deployed full-audit and chat self-check gaps.

@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # OpenPRX 0.8.17
 
 This patch records the post-audit configuration remediation and refreshes the

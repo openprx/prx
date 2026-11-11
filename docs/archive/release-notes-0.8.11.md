@@ -1,3 +1,5 @@
+Historical, not current behaviour.
+
 # PRX 0.8.11 Release Notes
 
 Release date: 2026-07-17
@@ -32,5 +34,5 @@ inside the deployed Tokio runtime. The deployment was atomically rolled back to
 5. Install the exact audited release binary atomically, restart PRX and wacli,
    and complete the Stage 5 and Stage 6 acceptance matrices.
 
-The complete feature notes remain in `docs/release-notes-0.8.8.md`; the later
+The complete feature notes remain in `docs/archive/release-notes-0.8.8.md`; the later
 notes document each stopped release candidate and its repair.
