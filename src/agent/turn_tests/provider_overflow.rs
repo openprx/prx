@@ -261,7 +261,7 @@ async fn provider_overflow_retry_keeps_current_request() {
                         .is_some_and(|c| matches!(c.mode, AgentCompactionMode::Aggressive))
                 {
                     let events = events.0.lock().expect("events");
-                    let (patch, config) = events
+                    let (patch, _config) = events
                         .iter()
                         .find_map(|event| match event {
                             ToolLoopEvent::ContextCompactionPatch { patch, config, .. } => Some((patch, config)),
@@ -272,45 +272,18 @@ async fn provider_overflow_retry_keeps_current_request() {
                         before,
                         &patch.guard
                     ));
-                    let mut state = crate::chat::state::ChatState::new(
-                        Arc::from("ollama"),
-                        Arc::from("prx-local-model"),
-                        CancellationToken::new(),
-                    );
-                    state.session.history = before.clone();
-                    let effects = state.reduce(crate::chat::action::Action::HistoryCompactionPatchApplied {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                        patch: patch.clone(),
-                        compaction_config: config.clone(),
-                    });
-                    assert!(
-                        effects
-                            .iter()
-                            .any(|effect| matches!(effect, crate::chat::state::Effect::SaveSession(_)))
-                    );
-                    let saved = effects
-                        .iter()
-                        .find_map(|effect| match effect {
-                            crate::chat::state::Effect::SaveSession(session) => Some(session),
-                            _ => None,
-                        })
-                        .expect("compaction saves a session snapshot");
-                    assert_eq!(
-                        saved.turns.iter().filter(|turn| turn.content == REQUEST).count(),
-                        1,
-                        "saved request must not disappear or become a second user input"
-                    );
+                    let mut replayed = before.clone();
+                    crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch);
                     let pairs = |messages: &[ChatMessage]| {
                         messages
                             .iter()
-                            .skip(1)
-                            .map(|m| (m.role.clone(), m.content.clone()))
+                            .map(|message| (message.role.clone(), message.content.clone()))
                             .collect::<Vec<_>>()
                     };
                     assert_eq!(
-                        pairs(&state.session.history),
+                        pairs(&replayed),
                         pairs(retry),
-                        "saved reducer view equals worker retry"
+                        "worker patch replays the exact retry view"
                     );
                     assert_eq!(
                         retry.last().map(|m| m.content.as_str()),

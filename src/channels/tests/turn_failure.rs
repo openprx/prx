@@ -380,3 +380,17 @@ async fn failed_channel_turn_sends_classified_advice_carrying_the_turn_error_id(
         "the quoted code must match the id logged for run {run_id}: {response}"
     );
 }
+
+#[test]
+fn typed_capacity_failure_uses_capacity_advice_without_exposing_provider_text() {
+    let error = anyhow::Error::new(crate::agent::turn_contracts::ContextCapacityError::NoProgress {
+        provider_context: "rate limited at private-provider.example".into(),
+    })
+    .context("unrelated outer wording");
+    let kind = classify_turn_failure(&error);
+    assert_eq!(kind, TurnFailureKind::ContextCapacity);
+    let notice = turn_failure_notice(kind, "0badc0de");
+    assert!(notice.contains("Context capacity exceeded"));
+    assert!(notice.contains("current request was preserved"));
+    assert!(!notice.contains("private-provider.example"));
+}
