@@ -103,6 +103,52 @@ fn doctor_process_warns_when_a_cost_price_key_matches_no_configured_model() {
 }
 
 #[test]
+fn doctor_process_redacts_a_query_value_secret_from_cost_price_key_warnings() {
+    const QUERY_VALUE_SECRET: &str = "opaque7pricekeysecret";
+    let provider = format!("custom:https://llm.example/v1?api_key={QUERY_VALUE_SECRET}");
+    let price_key = format!("{provider}/moonshotai/kimi-k2.5");
+    let toml = format!(
+        "default_temperature = 0.7\n\
+         default_provider = {provider:?}\n\
+         default_model = \"moonshotai/kimi-k2.5\"\n\
+         \n\
+         [cost.prices.{price_key:?}]\n\
+         input = 1.0\n\
+         output = 2.0\n\
+         cache_write = 1.0\n\
+         cache_read = 0.5\n"
+    );
+    let temp = TempDir::new().unwrap();
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), toml).unwrap();
+
+    let output = run_doctor(&config_dir, &[]).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("[cost]"),
+        "doctor stdout missing [cost] section: {stdout}"
+    );
+    assert!(
+        stdout.contains("matches no configured provider/model"),
+        "doctor stdout missing unmatched-key warning: {stdout}"
+    );
+    assert!(
+        !stdout.contains(QUERY_VALUE_SECRET),
+        "doctor stdout leaked the query-value secret: {stdout}"
+    );
+    assert!(
+        stderr.contains("cost.prices key matches no configured model"),
+        "load-path warning missing from stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(QUERY_VALUE_SECRET),
+        "load log leaked the query-value secret: {stderr}"
+    );
+}
+
+#[test]
 fn doctor_process_is_silent_on_cost_when_the_price_key_matches() {
     let temp = TempDir::new().unwrap();
     let config_dir = temp.path().join("config");

@@ -3028,10 +3028,12 @@ That is why hosted rows differ:
   (the bare model id, not `custom:<url>/moonshotai/kimi-k2.5`)
 - `custom:<url>` / `kimi-k2.5` → `[cost.prices."custom:<url>/kimi-k2.5"]`
 
-A key that matches no configured provider/model under that rule is a warning
-at load and in `prx doctor`, not a load error. For a `custom:<url>` provider
-the warning names the expected key. Duplicate redacted keys and non-finite
-or negative amounts remain load errors (table above).
+A key that matches no configured provider/model under that rule, and no
+catalog-derived router candidate when `[[router.models]]` is empty, is a
+warning at load and in `prx doctor`, not a load error. For a `custom:<url>`
+provider the warning names the expected key. Displayed keys and custom
+endpoints are redacted, including URL query values. Duplicate redacted keys
+and non-finite or negative amounts remain load errors (table above).
 
 ### Workspace cost report
 

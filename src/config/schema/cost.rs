@@ -112,25 +112,16 @@ pub(crate) fn cost_price_key_matches(price_key: &str, lookup_key: &str) -> bool 
 }
 
 /// Warnings for `[cost.prices]` keys `G6` would never look up for a configured
-/// provider/model. Existing configs keep loading: this is a warning, not an error.
-/// For a custom provider the text names the expected key.
+/// provider/model, including catalog-derived router candidates when
+/// `[[router.models]]` is empty. Existing configs keep loading: this is a
+/// warning, not an error. For a custom provider the text names the expected
+/// key. Displayed values use [`crate::security::redaction::redact_provider_text`].
 #[must_use]
 pub(crate) fn unmatched_cost_price_key_warnings(config: &super::Config) -> Vec<String> {
     if config.cost.prices.is_empty() {
         return Vec::new();
     }
-    let mut seen = std::collections::BTreeSet::new();
-    let mut lookups = Vec::new();
-    for (provider, model) in crate::config::manage::validate::selected_models(config) {
-        if provider.trim().is_empty() || model.trim().is_empty() {
-            continue;
-        }
-        if !seen.insert((provider.clone(), model.clone())) {
-            continue;
-        }
-        let key = usage_pricing_key(&provider, &model);
-        lookups.push((provider, model, key));
-    }
+    let lookups = pricing_lookup_keys(config);
     let mut custom_expected = Vec::new();
     let mut seen_custom = std::collections::BTreeSet::new();
     for (provider, model, expected) in &lookups {
@@ -155,8 +146,7 @@ pub(crate) fn unmatched_cost_price_key_warnings(config: &super::Config) -> Vec<S
         {
             continue;
         }
-        let shown = crate::providers::redact_endpoint_userinfo(price_key);
-        let shown = shown.as_ref();
+        let shown = crate::security::redaction::redact_provider_text(price_key);
         let mut message = format!(
             "[cost.prices.{shown:?}] matches no configured provider/model; G6 looks up the bare model id when the model contains '/', otherwise {{provider}}/{{model}}"
         );
@@ -169,6 +159,46 @@ pub(crate) fn unmatched_cost_price_key_warnings(config: &super::Config) -> Vec<S
     warnings
 }
 
+/// Direct selections plus, when `[[router.models]]` is empty, reachable
+/// catalog-derived router candidates (`RouterEngine::new` derives the same
+/// list and G6 consumes their `[cost.prices]` overrides).
+fn pricing_lookup_keys(config: &super::Config) -> Vec<(String, String, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut lookups = Vec::new();
+    let mut push = |provider: String, model: String| {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            return;
+        }
+        if !seen.insert((provider.clone(), model.clone())) {
+            return;
+        }
+        let key = usage_pricing_key(&provider, &model);
+        lookups.push((provider, model, key));
+    };
+    for (provider, model) in crate::config::manage::validate::selected_models(config) {
+        push(provider, model);
+    }
+    #[cfg(feature = "llm-router")]
+    if config.router.models.is_empty() {
+        let default_provider = crate::providers::selection::default_provider(config);
+        let reachable = crate::router::capability::reachable_provider_names(default_provider, &config.model_routes);
+        for candidate in crate::router::capability::filter_models_by_providers(
+            crate::router::models::builtin_model_capabilities(&config.cost),
+            &reachable,
+        ) {
+            if crate::router::capability::is_model_reachable(
+                default_provider,
+                &config.model_routes,
+                &candidate.provider,
+                &candidate.model_id,
+            ) {
+                push(candidate.provider, candidate.model_id);
+            }
+        }
+    }
+    lookups
+}
+
 fn custom_expected_clause(custom_expected: &[(String, String, String)]) -> Option<String> {
     if custom_expected.is_empty() {
         return None;
@@ -178,9 +208,9 @@ fn custom_expected_clause(custom_expected: &[(String, String, String)]) -> Optio
         .map(|(provider, model, expected)| {
             format!(
                 "for custom provider '{}' model '{}' the expected key is {:?}",
-                crate::providers::redact_endpoint_userinfo(provider),
-                crate::providers::redact_endpoint_userinfo(model),
-                crate::providers::redact_endpoint_userinfo(expected).as_ref()
+                crate::security::redaction::redact_provider_text(provider),
+                crate::security::redaction::redact_provider_text(model),
+                crate::security::redaction::redact_provider_text(expected)
             )
         })
         .collect();
