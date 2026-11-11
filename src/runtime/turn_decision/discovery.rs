@@ -122,7 +122,7 @@ impl TurnDecisionService {
         Ok(entries)
     }
 
-    /// Only an explicit executable engine hop may narrow the index. Empty
+    /// Only an explicit engine-selected family may narrow the index. Empty
     /// families on ordinary Direct turns mean the full eligible index.
     fn discovery_families(
         &self,
@@ -130,11 +130,7 @@ impl TurnDecisionService {
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Vec<CapabilityTarget>> {
         self.agent_execution_specs(proof, context)?;
-        if matches!(context.directive(), TurnExecutionDirective::Execute { .. }) {
-            Ok(super::discovery_scope(context.audit_hops())?.into_iter().collect())
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(super::discovery_scope(context.audit_hops())?.into_iter().collect())
     }
 
     /// Stable control definition, separate from the selected business refs and
