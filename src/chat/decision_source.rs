@@ -1685,6 +1685,7 @@ pub(crate) mod admission_failure_tests {
         crate::agent::entry::save_current_input(
             &fabric,
             binding.envelope().run_id.as_deref().unwrap(),
+            &binding.envelope().session_key,
             "prx input",
             binding.envelope().source_message_event_id.as_deref(),
         )
@@ -1692,6 +1693,10 @@ pub(crate) mod admission_failure_tests {
         .unwrap();
         let memory = fabric.memory();
         let before = memory.get(&key).await.unwrap().unwrap();
+        assert_eq!(
+            before.session_id.as_deref(),
+            Some(binding.envelope().session_key.as_str())
+        );
         let recalled = binding.recalled_context(memory.as_ref()).await;
         assert!(!recalled.preamble.contains("[Memory context]"));
         assert!(!recalled.ids.contains(&before.id));

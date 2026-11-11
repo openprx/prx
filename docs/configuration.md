@@ -156,9 +156,10 @@ and the module-gate family are absorbed on load; they are not live switches.
 
 ## Interactive agent sessions
 
-In interactive `prx agent`, `/clear` and `/new` discard the in-memory
-conversation history and start a new session immediately. Stored memories,
-including those from the previous session, other sessions, channels, and Console,
+In interactive `prx agent` and `prx chat`, `/clear` and `/new` discard the
+in-memory conversation history and start a new session immediately. Chat saves
+the previous session and resets its session-specific UI and accounting state.
+Stored memories, including those from the previous session, other sessions, channels, and Console,
 are preserved. Turns within a session share its session ID and each have their
 own run ID.
 
