@@ -8,7 +8,7 @@ exclude-dev = false
 [output]
 feature-depth = 1
 
-# ===== 安全漏洞 =====
+# ===== Security advisories =====
 [advisories]
 yanked = "deny"
 unmaintained = "all"
@@ -22,7 +22,7 @@ ignore = [
     { id = "RUSTSEC-2026-0441", reason = "pin-utils: async-imap transitive dep, macro-only crate considered complete" },
 ]
 
-# ===== 许可证合规 =====
+# ===== License compliance =====
 [licenses]
 allow = [
     "MIT",
@@ -49,7 +49,7 @@ unused-allowed-license = "allow"
 [licenses.private]
 ignore = true
 
-# ===== 依赖禁用 =====
+# ===== Dependency bans =====
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
@@ -73,7 +73,7 @@ deny = ["native-tls", "native-tls-vendored"]
 duplicates = "warn"
 unused = "warn"
 
-# ===== 来源可信 =====
+# ===== Trusted sources =====
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
