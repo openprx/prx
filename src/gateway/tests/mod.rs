@@ -36,6 +36,7 @@ pub(crate) fn idle_agents() -> agent_lifecycle::AgentReconcile {
 
 mod idempotency;
 mod metrics;
+mod oversized_restart;
 mod owner_isolation;
 mod pairing;
 mod platform_jobs;
@@ -629,6 +630,10 @@ fn webhook_test_config() -> Config {
 
 fn webhook_test_state(provider: Arc<dyn Provider>) -> AppState {
     let workspace = tempfile::tempdir().expect("webhook fixture workspace").keep();
+    webhook_test_state_at(provider, workspace)
+}
+
+fn webhook_test_state_at(provider: Arc<dyn Provider>, workspace: std::path::PathBuf) -> AppState {
     let mut config = webhook_test_config();
     config.workspace_dir = workspace.clone();
     config.config_path = workspace.join("config.toml");

@@ -49,7 +49,8 @@ impl Drop for RecoveryKeyLoadGuard {
     }
 }
 
-pub(in crate::memory::sqlite) const MAX_SERIALIZED_FACTS: usize = 262_144;
+pub(in crate::memory::sqlite) const MAX_SERIALIZED_FACTS: usize =
+    crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS;
 // Six identity/event-id strings of at most 1024 bytes expand by at most 6x.
 // 40 KiB covers those strings, two 32-byte JSON digests, and structural keys.
 // Each byte field expands by at most 4x; reserve equal pending/completion budgets.

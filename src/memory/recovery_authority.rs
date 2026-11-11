@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Existing serialized recovery-facts and MAC-input budget.
+pub(crate) const MAX_SERIALIZED_RECOVERY_FACTS: usize = 262_144;
+
 /// The key a v3 artifact needs is missing, retired or unusable. Recovery for
 /// that artifact is unavailable; startup and chat continue, with no marker,
 /// no replay and no regeneration.
@@ -52,6 +55,21 @@ pub struct RecoveryReceipt {
 }
 
 impl RecoveryReceipt {
+    /// Input identity from an already authenticated repository receipt.
+    pub(crate) fn input_event_id(&self) -> anyhow::Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct EventId {
+            id: String,
+        }
+        #[derive(Deserialize)]
+        struct Bound {
+            input: Option<EventId>,
+        }
+        Ok(serde_json::from_slice::<Bound>(&self.facts)?
+            .input
+            .map(|event| event.id))
+    }
+
     /// The opaque pending facts the receipt was published with. Call only on a
     /// receipt returned by `read_recovery_receipt`, which has authenticated it.
     pub fn pending_facts(&self) -> anyhow::Result<Vec<u8>> {

@@ -4,6 +4,8 @@ use super::helpers::{
 };
 use std::fs;
 const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
+    // Oversized terminal restart fixture: real HTTP, acknowledged child, kill and reap.
+    "src/gateway/tests/oversized_restart.rs::spawn_webhook_child::.spawn()",
     // Linux-only opt-in regression: a real setsid descendant proves the cgroup
     // contains session escape. The test joins the shell and removes its group.
     "src/runtime/shell_cgroup.rs::setsid_descendant_is_killed_and_the_managed_group_is_removed::let mut child = command.spawn().unwrap();",

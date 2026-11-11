@@ -241,15 +241,19 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         .expect("test: claim winner");
     let commit: crate::agent::terminal::TurnTerminalCommit = draft.clone().try_into().expect("test: commit");
     let recorded = commit.decision.is_recorded();
-    let semantic =
-        crate::agent::terminal::recovery_commit::claim_semantic_for_test(&commit, fabric.workspace_id(), recorded)
-            .expect("test: semantic");
     let payload: serde_json::Value = serde_json::from_str(&first_claim_payload(&workspace)).expect("test: claim json");
     let key_id = payload
         .get("recovery_key_id")
         .and_then(serde_json::Value::as_str)
         .expect("test: recovery_key_id")
         .to_owned();
+    let semantic = crate::agent::terminal::recovery_commit::claim_semantic_for_test(
+        &commit,
+        fabric.workspace_id(),
+        recorded,
+        &key_id,
+    )
+    .expect("test: semantic");
     let mac = hex::decode(
         payload
             .get("semantic_mac_v3")
@@ -406,6 +410,43 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         key_err.to_string().contains("invalid recovery authentication"),
         "key id: {key_err:#}"
     );
+
+    // Digest-only claims retain byte-exact binding without expanding the MAC budget.
+    let mut oversized = commit.clone();
+    let reply = "π".repeat(crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS);
+    oversized.history.as_mut().expect("test: history").assistant_content = reply.clone();
+    let bounded = crate::agent::terminal::recovery_commit::claim_semantic_for_test(
+        &oversized,
+        fabric.workspace_id(),
+        recorded,
+        &key_id,
+    )
+    .expect("test: bounded reply semantics");
+    assert!(!bounded.to_string().contains(&reply), "claim retained oversized text");
+    assert_eq!(bounded["replay_unavailable"]["reply_bytes"], reply.len());
+    let mut bytes = serde_json::to_vec(&bounded).expect("test: bounded bytes");
+    bytes.extend_from_slice(key_id.as_bytes());
+    assert!(bytes.len() <= crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS);
+    let bounded_tag = repository
+        .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &bytes)
+        .expect("test: bounded claim MAC");
+    for field in ["reply_sha256", "reply_bytes"] {
+        let mut changed = bounded.clone();
+        changed["replay_unavailable"][field] = if field == "reply_bytes" {
+            serde_json::json!(reply.len() + 1)
+        } else {
+            serde_json::json!("00".repeat(32))
+        };
+        let mut changed_bytes = serde_json::to_vec(&changed).expect("test: changed reference");
+        changed_bytes.extend_from_slice(key_id.as_bytes());
+        let error = repository
+            .verify_recovery_mac(&bounded_tag, RecoveryMacDomain::ClaimV3, &changed_bytes)
+            .expect_err(field);
+        assert!(
+            error.to_string().contains("invalid recovery authentication"),
+            "{field}: {error:#}"
+        );
+    }
 
     let mut replay = draft.clone();
     replay.status = TurnTerminalStatus::Failed;

@@ -6,6 +6,7 @@
 //! computes one usage settlement, and appends one `turn.finalized` commit marker.
 
 pub(crate) mod logical;
+pub(crate) mod oversized_reply;
 pub(crate) mod recovery_commit;
 mod replay;
 #[cfg(test)]
@@ -950,7 +951,9 @@ async fn finalize_turn_impl(
             .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
 
         if fabric.records_recovery_terminal() {
-            return recovery_commit::finalize_recovery_terminal(
+            // Keep the recovery transaction future out of the enclosing
+            // terminal future, including in nested child/cleanup callers.
+            return boxed_terminal_work(move || recovery_commit::finalize_recovery_terminal(
                 fabric,
                 commit,
                 cost_config,
@@ -959,7 +962,7 @@ async fn finalize_turn_impl(
                 execution_trace,
                 prepared_replay,
                 usage_settlement,
-            )
+            ))
             .await;
         }
 

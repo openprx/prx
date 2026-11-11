@@ -1,5 +1,6 @@
 //! AUTH-02-3a/3b terminal commit: claim v3, authenticated outbox, cost projection.
 
+use super::oversized_reply::{ReplyReference, compact_reply};
 use super::replay::PreparedReplay;
 use super::{
     TurnTerminalCommit, TurnTerminalPayload, TurnTerminalReceipt, TurnTerminalStatus, ensure_runtime_authority,
@@ -110,12 +111,13 @@ pub(super) async fn finalize_recovery_terminal(
     }
 
     let prepared_parameters = commit.decision.context.prepared_main_parameters();
-    let semantic = claim_semantic(
+    let (semantic, reply_reference) = claim_semantic(
         &commit,
         fabric.workspace_id(),
         recorded,
         execution_trace.as_ref(),
         &prepared_parameters,
+        &key_id,
     )?;
     let semantic_bytes = serde_json::to_vec(&semantic)?;
     let mut claim_preimage = semantic_bytes.clone();
@@ -194,6 +196,12 @@ pub(super) async fn finalize_recovery_terminal(
                 .context("claim payload")?
                 .insert("semantic_mac_v2".into(), serde_json::Value::String(mac));
         }
+        if reply_reference.is_some() {
+            payload
+                .as_object_mut()
+                .context("claim payload")?
+                .insert("semantic".into(), semantic.clone());
+        }
         payload.to_string()
     };
 
@@ -238,7 +246,14 @@ pub(super) async fn finalize_recovery_terminal(
         attempt_id: commit.scope.attempt_id.as_deref(),
         lease_epoch: commit.scope.lease_epoch,
     };
-    let payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
+    let mut payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
+    if let (Some(reference), Some(history)) = (&reply_reference, &commit.history) {
+        compact_reply(&mut payload_value, &history.assistant_content);
+        payload_value
+            .as_object_mut()
+            .context("terminal payload")?
+            .insert("replay_unavailable".into(), serde_json::to_value(reference)?);
+    }
 
     let mut events = Vec::new();
     events.push(runtime_event(
@@ -253,13 +268,18 @@ pub(super) async fn finalize_recovery_terminal(
     if let (Some(history), Some(id)) = (commit.history.as_ref(), assistant_id.as_ref()) {
         if commit.status == TurnTerminalStatus::Completed {
             let scope = commit.history_scope.clone().unwrap_or_else(|| commit.scope.clone());
-            events.push(assistant_event(
+            let mut assistant = assistant_event(
                 fabric,
                 scope,
                 history.assistant_content.clone(),
                 format!("turn:{}:assistant", commit.terminal_id),
                 id.clone(),
-            ));
+            );
+            if let Some(reference) = &reply_reference {
+                assistant.content = "reply_unavailable".into();
+                assistant.raw_payload_json = Some(serde_json::json!({"replay_unavailable": reference}).to_string());
+            }
+            events.push(assistant);
         }
     }
     if let (Some(usage), Some(id)) = (usage_settlement.as_ref(), usage_id.as_ref()) {
@@ -605,7 +625,8 @@ fn claim_semantic(
     recorded: bool,
     execution_trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     prepared_parameters: &[crate::providers::catalog::parameters::ResolvedParameters],
-) -> anyhow::Result<serde_json::Value> {
+    key_id: &str,
+) -> anyhow::Result<(serde_json::Value, Option<ReplyReference>)> {
     let mut claim_outcome = commit.provider_outcome.clone();
     if let Some(outcome) = claim_outcome.as_mut() {
         outcome.redact_provider_labels();
@@ -672,7 +693,38 @@ fn claim_semantic(
                 redact_persisted_json(serde_json::to_value(prepared_parameters)?),
             );
     }
-    Ok(semantic)
+    let mut reference = None;
+    let bound = crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS;
+    if serde_json::to_vec(&semantic)?.len().saturating_add(key_id.len()) > bound {
+        if let Some(history) = commit
+            .history
+            .as_ref()
+            .filter(|history| !history.assistant_content.is_empty())
+        {
+            let model = &commit
+                .decision
+                .context
+                .audit_hops()
+                .last()
+                .context("decision has no final hop")?
+                .state
+                .trusted
+                .parts()
+                .resolved_model_id;
+            let reply = ReplyReference::new(&history.assistant_content, model)?;
+            compact_reply(&mut semantic, &history.assistant_content);
+            semantic
+                .as_object_mut()
+                .context("claim semantic object")?
+                .insert("replay_unavailable".into(), serde_json::to_value(&reply)?);
+            reference = Some(reply);
+        }
+        anyhow::ensure!(
+            serde_json::to_vec(&semantic)?.len().saturating_add(key_id.len()) <= bound,
+            "oversized recovery MAC input"
+        );
+    }
+    Ok((semantic, reference))
 }
 
 #[cfg(test)]
@@ -680,10 +732,19 @@ pub(crate) fn claim_semantic_for_test(
     commit: &super::TurnTerminalCommit,
     fabric_workspace: &str,
     recorded: bool,
+    key_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let prepared_parameters = commit.decision.context.prepared_main_parameters();
     let trace = recorded.then(|| commit.decision.context.terminal_execution_trace());
-    claim_semantic(commit, fabric_workspace, recorded, trace.as_ref(), &prepared_parameters)
+    Ok(claim_semantic(
+        commit,
+        fabric_workspace,
+        recorded,
+        trace.as_ref(),
+        &prepared_parameters,
+        key_id,
+    )?
+    .0)
 }
 
 fn runtime_event(

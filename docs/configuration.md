@@ -1395,6 +1395,13 @@ identical settlement, leaves I/O failures retryable, and blocks conflicting or
 incomplete ledger rows without truncating them. Restart repair does not repeat
 provider or tool execution. Subscription and unknown pricing dispositions do
 not append monetary ledger rows. PostgreSQL retains its existing terminal path.
+When reply text would exceed the serialized recovery-claim limit, the terminal
+binds its SHA-256 digest and byte length instead of retaining the text. The first
+webhook response still returns the reply. A duplicate, including after a restart,
+returns `409` with `status: "replay_unavailable"` and `result_hash`, without
+calling the provider again. Altered or unavailable authentication evidence
+refuses replay. All recovery size limits remain unchanged.
+
 Keep the workspace's `.recovery_keys` directory with its database backups.
 Conversation erasure removes the recovery attestation while retaining the
 outbox's redacted usage facts. Rollback must preserve both keys and stored

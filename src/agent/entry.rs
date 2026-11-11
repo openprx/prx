@@ -2002,11 +2002,14 @@ pub(crate) async fn run_with_runtime_envelope(
                     };
                     if let Some(source) = proof.scheduled.as_ref() {
                         runtime_envelope = source.envelope.clone();
-                        fabric_scope = runtime_envelope
-                            .message_scope()
-                            .with_recipient(format!("{provider_name}/{model_name}"));
-                        *cancel_scope.lock() = runtime_envelope.message_scope();
                     }
+                    // Admission owns the durable input identity. Carry it into
+                    // ordinary completion and cancellation, not just tool calls.
+                    runtime_envelope.source_message_event_id = proof.source_event_id.as_deref().map(str::to_owned);
+                    fabric_scope = runtime_envelope
+                        .message_scope()
+                        .with_recipient(format!("{provider_name}/{model_name}"));
+                    *cancel_scope.lock() = runtime_envelope.message_scope();
                     let proof = admission_proof.get_or_init(|| proof);
                     if scheduled_admission.is_some() {
                         // Mark before polling decision work: a failed or interrupted
@@ -2453,12 +2456,12 @@ pub(crate) async fn run_with_runtime_envelope(
                 // D8-3: one run_id per turn (was per-run). Generated at the turn entry
                 // and used for both the message-event envelope and the user op-id.
                 let turn_run_id = Uuid::new_v4().to_string();
-                let runtime_envelope =
+                let mut runtime_envelope =
                     RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), repl_session_id.clone())
                         .with_run_id(turn_run_id.clone())
                         .with_recipient("cli:local-user")
                         .with_config_generation(&ctx.config_generation);
-                let fabric_scope = runtime_envelope
+                let mut fabric_scope = runtime_envelope
                     .message_scope()
                     .with_recipient(format!("{provider_name}/{model_name}"));
                 let owner = crate::runtime::turn_cleanup::current_tracker()
@@ -2491,6 +2494,10 @@ pub(crate) async fn run_with_runtime_envelope(
                         agent_user_event.as_ref(),
                         choice,
                     )?;
+                    runtime_envelope.source_message_event_id = proof.source_event_id.as_deref().map(str::to_owned);
+                    fabric_scope = runtime_envelope
+                        .message_scope()
+                        .with_recipient(format!("{provider_name}/{model_name}"));
                     let decision =
                         match service
                             .decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::Repl, shutdown)

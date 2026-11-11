@@ -576,6 +576,16 @@ impl IdempotencyClaim {
         transitioned
     }
 
+    fn succeed_unavailable(mut self, response_id: Uuid, result_hash: String) -> bool {
+        let transitioned =
+            self.store
+                .complete_result_if_owner(&self.key_digest, self.generation, response_id, result_hash, None);
+        if transitioned {
+            self.armed = false;
+        }
+        transitioned
+    }
+
     fn fail(mut self) -> bool {
         let retry_eligible = self.retry_eligible();
         let transitioned = self
@@ -740,6 +750,19 @@ impl IdempotencyStore {
         replay: IdempotencyReplay,
         result_hash: String,
     ) -> bool {
+        let response_id = replay.response_id;
+        let replay = (replay.payload_bytes() <= IDEMPOTENCY_MAX_REPLAY_BYTES).then_some(replay);
+        self.complete_result_if_owner(key_digest, generation, response_id, result_hash, replay)
+    }
+
+    fn complete_result_if_owner(
+        &self,
+        key_digest: &str,
+        generation: u64,
+        response_id: Uuid,
+        result_hash: String,
+        replay: Option<IdempotencyReplay>,
+    ) -> bool {
         let mut state = self.state.lock();
         let Some(IdempotencyEntry::Processing {
             generation: current_generation,
@@ -756,15 +779,10 @@ impl IdempotencyStore {
 
         let request_fingerprint = *request_fingerprint;
         let reserved_bytes = *reserved_bytes;
-        let replay_bytes = replay.payload_bytes();
-        let response_id = replay.response_id;
         state.payload_bytes = state.payload_bytes.saturating_sub(reserved_bytes);
-        let replay = if replay_bytes <= IDEMPOTENCY_MAX_REPLAY_BYTES {
-            state.payload_bytes = state.payload_bytes.saturating_add(replay_bytes);
-            Some(replay)
-        } else {
-            None
-        };
+        state.payload_bytes = state
+            .payload_bytes
+            .saturating_add(replay.as_ref().map_or(0, IdempotencyReplay::payload_bytes));
         state.entries.insert(
             key_digest.to_string(),
             IdempotencyEntry::Succeeded {
@@ -849,12 +867,15 @@ fn webhook_idempotency_digest(scope: &str, raw_key: &str) -> String {
 }
 
 fn webhook_result_hash(response: &str, model: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(response.as_bytes());
-    hasher.update([0]);
-    hasher.update(model.as_bytes());
-    hex::encode(hasher.finalize())
+    crate::agent::terminal::oversized_reply::result_hash(response, model)
+}
+
+fn replay_unavailable_body(response_id: Uuid, result_hash: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "replay_unavailable", "idempotent": true,
+        "response_id": response_id.to_string(), "result_hash": result_hash,
+        "message": "The original request succeeded, but its response is too large to replay"
+    })
 }
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
@@ -2452,13 +2473,18 @@ where
         .await
 }
 
+struct GatewayTurnResult {
+    response: String,
+    replay_unavailable: Option<crate::agent::terminal::oversized_reply::ReplayUnavailable>,
+}
+
 async fn run_gateway_chat_with_multimodal(
     state: &AppState,
     provider_label: &str,
     message: &str,
     fabric_ctx: &GatewayFabricContext,
     autosave_key: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GatewayTurnResult> {
     let turn_runtime = state.pin_turn_runtime();
     turn_runtime
         .provider_binding
@@ -2522,7 +2548,21 @@ async fn run_gateway_chat_with_multimodal(
         Some(owner_id) => runtime_envelope.with_owner_id(owner_id),
         None => runtime_envelope,
     };
-    let base_scope = runtime_envelope.message_scope();
+    if fabric.records_recovery_terminal() {
+        if let Some(key) = fabric_ctx.idempotency_key.as_deref() {
+            if let Some(unavailable) = crate::agent::terminal::oversized_reply::for_input(
+                fabric.memory(),
+                fabric.workspace_id(),
+                &runtime_envelope.message_scope(),
+                key,
+                message,
+            )
+            .await?
+            {
+                return Err(unavailable.into());
+            }
+        }
+    }
     authorize_gateway_config_resource_mutation(
         &config_snapshot,
         "gateway:webhook:message_event:user",
@@ -2550,6 +2590,7 @@ async fn run_gateway_chat_with_multimodal(
         .record(message.to_owned(), fabric_ctx.idempotency_key.clone())
         .await?;
     let runtime_envelope = source_receipt.envelope().clone();
+    let base_scope = runtime_envelope.message_scope();
     let gateway_proof = source_receipt.bind(&turn_runtime, fabric_ctx)?;
     if let Some(key) = autosave_key {
         let write_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
@@ -2652,7 +2693,7 @@ async fn run_gateway_chat_with_multimodal(
         runtime_envelope.clone(),
         admission_acknowledgement,
     )?;
-    let turn_result: anyhow::Result<String> = child_cleanup
+    let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
             anyhow::ensure!(
                 !matches!(
@@ -2674,7 +2715,10 @@ async fn run_gateway_chat_with_multimodal(
                 service
                     .close_agent_directive_turn(&gateway_proof, Arc::clone(&context), &ports, &cancellation)
                     .await?;
-                return Ok(reply.into_owned());
+                return Ok(GatewayTurnResult {
+                    response: reply.into_owned(),
+                    replay_unavailable: None,
+                });
             }
             let mem_context = crate::agent::context_recall::scoped_recall(
                 state.mem.as_ref(),
@@ -2975,7 +3019,7 @@ async fn run_gateway_chat_with_multimodal(
                 .run_id
                 .clone()
                 .unwrap_or_else(|| provider_outcome.decision_id.clone());
-            if let Err(error) = decision_runtime::commit_terminal(
+            let receipt = decision_runtime::commit_terminal(
                 Some(&terminal_guard),
                 &fabric,
                 crate::agent::terminal::TurnTerminalDraft {
@@ -3003,11 +3047,12 @@ async fn run_gateway_chat_with_multimodal(
                 },
                 &config_snapshot,
             )
-            .await
-            {
-                return Err(error);
-            }
-            Ok(response)
+            .await?;
+            let replay_unavailable = crate::agent::terminal::oversized_reply::from_receipt(&receipt)?;
+            Ok(GatewayTurnResult {
+                response,
+                replay_unavailable,
+            })
         })
         .await;
     if let Err(error) = &turn_result {
@@ -3191,13 +3236,7 @@ async fn handle_webhook(
                 response_id,
                 result_hash,
             } => {
-                let body = serde_json::json!({
-                    "status": "replay_unavailable",
-                    "idempotent": true,
-                    "response_id": response_id.to_string(),
-                    "result_hash": result_hash,
-                    "message": "The original request succeeded, but its response is too large to replay"
-                });
+                let body = replay_unavailable_body(response_id, &result_hash);
                 return (StatusCode::CONFLICT, Json(body));
             }
             IdempotencyClaimOutcome::RequestConflict => {
@@ -3345,16 +3384,27 @@ async fn run_webhook_job_work(
     }
     match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx, autosave_key.as_deref()).await
     {
-        Ok(response) => {
-            let response_id = Uuid::new_v4();
-            let result_hash = webhook_result_hash(&response, &model_label);
+        Ok(GatewayTurnResult {
+            response,
+            replay_unavailable,
+        }) => {
+            let response_id = match replay_unavailable.as_ref() {
+                Some(reference) => Uuid::parse_str(&reference.terminal_id).context("invalid durable response id")?,
+                None => Uuid::new_v4(),
+            };
             if let Some(claim) = idempotency_claim.take() {
-                let replay = IdempotencyReplay {
-                    response_id,
-                    response: Arc::from(response.as_str()),
-                    model: Arc::from(model_label.as_str()),
+                let completed = if let Some(reference) = replay_unavailable {
+                    claim.succeed_unavailable(response_id, reference.result_hash)
+                } else {
+                    let result_hash = webhook_result_hash(&response, &model_label);
+                    let replay = IdempotencyReplay {
+                        response_id,
+                        response: Arc::from(response.as_str()),
+                        model: Arc::from(model_label.as_str()),
+                    };
+                    claim.succeed(replay, result_hash)
                 };
-                if !claim.succeed(replay, result_hash) {
+                if !completed {
                     tracing::error!("Webhook idempotency ownership was lost before success commit");
                     let err = serde_json::json!({
                         "error": "Request completed but its idempotency result could not be committed"
@@ -3393,6 +3443,21 @@ async fn run_webhook_job_work(
             Ok(jobs::JobOutput::new(StatusCode::OK, body))
         }
         Err(e) => {
+            if let Some(unavailable) = e.downcast_ref::<crate::agent::terminal::oversized_reply::ReplayUnavailable>() {
+                let response_id = Uuid::parse_str(&unavailable.terminal_id).context("invalid durable response id")?;
+                if let Some(claim) = idempotency_claim.take() {
+                    if !claim.succeed_unavailable(response_id, unavailable.result_hash.clone()) {
+                        return Ok(jobs::JobOutput::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            serde_json::json!({"error":"Idempotency ownership was lost"}),
+                        ));
+                    }
+                }
+                return Ok(jobs::JobOutput::new(
+                    StatusCode::CONFLICT,
+                    replay_unavailable_body(response_id, &unavailable.result_hash),
+                ));
+            }
             if let Some(claim) = idempotency_claim.take() {
                 let _ = claim.fail();
             }
@@ -3610,7 +3675,7 @@ async fn run_channel_webhook_job_work(
         )
         .await
         {
-            Ok(response) => {
+            Ok(GatewayTurnResult { response, .. }) => {
                 if let Err((status, body)) = authorize_gateway_resource_mutation(
                     &state,
                     &gateway_channel_webhook_operation(channel_key, "send"),

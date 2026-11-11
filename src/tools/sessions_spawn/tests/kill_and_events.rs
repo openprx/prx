@@ -194,25 +194,32 @@ async fn spawn_records_request_and_result_message_events() {
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let events = memory
-        .list_message_events_since(
-            &MemoryPrincipal {
-                require_owner_match: false,
-                workspace_id: "/tmp".to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some("telegram:chat-1:alice".to_string()),
-                channel: Some("telegram".to_string()),
-                sender: Some("alice".to_string()),
-                owner_id: None,
-                legacy_session_key: None,
-                agent_partition: None,
-            },
-            0,
-            10,
-        )
-        .await
-        .unwrap();
+    let principal = MemoryPrincipal {
+        require_owner_match: false,
+        workspace_id: "/tmp".to_string(),
+        agent_id: None,
+        persona_id: None,
+        session_key: Some("telegram:chat-1:alice".to_string()),
+        channel: Some("telegram".to_string()),
+        sender: Some("alice".to_string()),
+        owner_id: None,
+        legacy_session_key: None,
+        agent_partition: None,
+    };
+    let mut events = Vec::new();
+    let mut after_id = 0;
+    // Claims and provider audit events share the cursor stream. Read every
+    // page before checking the turn's durable conversation projections.
+    loop {
+        let page = memory
+            .list_message_events_since(&principal, after_id, 10)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        assert!(last.id > after_id, "message-event cursor must advance");
+        after_id = last.id;
+        events.extend(page);
+    }
 
     let parent_event = events
         .iter()

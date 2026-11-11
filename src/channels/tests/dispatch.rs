@@ -533,25 +533,32 @@ async fn process_channel_message_cancels_scoped_typing_task() {
     assert_eq!(starts, 1, "start_typing should be called once");
     assert_eq!(stops, 1, "stop_typing should be called once");
 
-    let events = memory
-        .list_message_events_since(
-            &MemoryPrincipal {
-                require_owner_match: false,
-                workspace_id: tmp.path().to_string_lossy().to_string(),
-                agent_id: None,
-                persona_id: None,
-                session_key: Some("test-channel_alice".to_string()),
-                channel: Some("test-channel".to_string()),
-                sender: Some("alice".to_string()),
-                owner_id: None,
-                legacy_session_key: None,
-                agent_partition: None,
-            },
-            0,
-            10,
-        )
-        .await
-        .unwrap();
+    let principal = MemoryPrincipal {
+        require_owner_match: false,
+        workspace_id: tmp.path().to_string_lossy().to_string(),
+        agent_id: None,
+        persona_id: None,
+        session_key: Some("test-channel_alice".to_string()),
+        channel: Some("test-channel".to_string()),
+        sender: Some("alice".to_string()),
+        owner_id: None,
+        legacy_session_key: None,
+        agent_partition: None,
+    };
+    let mut events = Vec::new();
+    let mut after_id = 0;
+    // Claims and provider audit events share the cursor stream. Read every
+    // page before checking the turn's durable conversation projections.
+    loop {
+        let page = memory
+            .list_message_events_since(&principal, after_id, 10)
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        assert!(last.id > after_id, "message-event cursor must advance");
+        after_id = last.id;
+        events.extend(page);
+    }
     let user_event = events.iter().find(|event| event.role == "user").expect("user event");
     let assistant_event = events
         .iter()
