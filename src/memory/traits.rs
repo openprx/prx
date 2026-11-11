@@ -1400,6 +1400,11 @@ const fn enforced_read_mode(context: Option<&MemoryWriteContext>, requested: Mem
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
+    /// Unavailable without a transactional namespace for child sessions.
+    fn child_session_store(&self) -> Option<&dyn crate::memory::child_sessions::ChildSessionStore> {
+        None
+    }
+
     /// Unavailable for backends without repository-owned durable authority.
     fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
         None

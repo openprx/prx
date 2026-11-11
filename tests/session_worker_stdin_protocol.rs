@@ -1576,10 +1576,9 @@ async fn relaunch_real_worker_keeps_session_addr() {
     let expiry = far_future_expiry();
     let mut previous_run = None;
     for _ in 0..2 {
-        let mut manifest = registry
-            .relaunch_worker(&addr, manifest_for(&config_dir, &workspace_dir))
-            .await
-            .expect("relaunch manifest");
+        let mut base = manifest_for(&config_dir, &workspace_dir);
+        base.owner_id = Some(addr.owner.clone());
+        let mut manifest = registry.relaunch_worker(&addr, base).await.expect("relaunch manifest");
         assert_eq!(manifest.session_addr.as_ref(), Some(&addr));
         assert_eq!(manifest.inherited_provenance.as_ref(), Some(&provenance));
         assert_ne!(previous_run.as_deref(), Some(manifest.run_id.as_str()));
@@ -1632,6 +1631,81 @@ async fn relaunch_real_worker_keeps_session_addr() {
                 "{result:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn relaunch_refuses_manifest_identity_mismatch_before_record_update() {
+    use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchIdentityError};
+    let (_root, config, workspace, _home) = worker_dirs();
+    let registry = ChildSessionRegistry::new(std::sync::Arc::new(
+        openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"),
+    ));
+    let addr = openprx::messaging::SessionAddr::new("prx-default", "prx-owner", "prx-session", None);
+    registry
+        .insert(&ChildSession::new(addr.clone(), None, None))
+        .await
+        .expect("insert");
+    for (owner, agent, expected) in [
+        (None, None, RelaunchIdentityError::Owner),
+        (Some("prx-other-owner"), None, RelaunchIdentityError::Owner),
+        (Some("prx-owner"), Some("prx_other_agent"), RelaunchIdentityError::Agent),
+    ] {
+        let mut base = manifest_for(&config, &workspace);
+        base.owner_id = owner.map(str::to_owned);
+        base.agent_id = agent.map(str::to_owned);
+        let error = registry
+            .relaunch_worker(&addr, base)
+            .await
+            .expect_err("identity refusal");
+        assert_eq!(error.downcast_ref::<RelaunchIdentityError>(), Some(&expected));
+        assert!(
+            registry
+                .reconstruct(&addr)
+                .await
+                .expect("unchanged child")
+                .recipe()
+                .expect("recipe")
+                .last_run
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn relaunch_scope_key_separates_session_and_agent_and_is_stable() {
+    use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry};
+    let (_root, config, workspace, _home) = worker_dirs();
+    let registry = ChildSessionRegistry::new(std::sync::Arc::new(
+        openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"),
+    ));
+    let mut keys = std::collections::HashSet::new();
+    for (session, agent) in [
+        ("prx-session", None),
+        ("prx-session", Some("prx_agent")),
+        ("prx-other-session", None),
+    ] {
+        let addr = openprx::messaging::SessionAddr::new("prx-default", "prx-owner", session, agent);
+        registry
+            .insert(&ChildSession::new(addr.clone(), None, None))
+            .await
+            .expect("insert");
+        let mut previous = None;
+        for _ in 0..2 {
+            let mut base = manifest_for(&config, &workspace);
+            base.owner_id = Some(addr.owner.clone());
+            base.agent_id = agent.map(str::to_owned);
+            let manifest = registry.relaunch_worker(&addr, base).await.expect("matching identity");
+            assert_eq!(manifest.session_addr.as_ref(), Some(&addr));
+            if let Some(previous) = previous {
+                assert_eq!(manifest.session_scope_key, previous);
+            }
+            previous = Some(manifest.session_scope_key);
+        }
+        assert!(
+            keys.insert(previous.expect("scope key")),
+            "session and agent must both distinguish scopes"
+        );
     }
 }
 

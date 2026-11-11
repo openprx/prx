@@ -153,6 +153,7 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
     "mod.rs",
     "recall.rs",
     "remote_tree.rs",
+    "child_sessions.rs",
     "rows.rs",
     "schema.rs",
 ];
@@ -332,6 +333,10 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         (
             "approval_grants.rs",
             include_str!("../../src/memory/sqlite/approval_grants.rs"),
+        ),
+        (
+            "child_sessions.rs",
+            include_str!("../../src/memory/sqlite/child_sessions.rs"),
         ),
         ("documents.rs", include_str!("../../src/memory/sqlite/documents.rs")),
         ("drafts.rs", include_str!("../../src/memory/sqlite/drafts.rs")),

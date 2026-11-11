@@ -72,7 +72,7 @@ pub fn stamp_outbound(chain: &CausalChain, message: &mut PrxMessage) {
     if message.kind != super::types::MessageKind::Data {
         return;
     }
-    if message.in_reply_to != Some(chain.trigger) {
+    if message.in_reply_to.is_some_and(|supplied| supplied != chain.trigger) {
         tracing::warn!(
             trigger = %chain.trigger,
             model_in_reply_to = ?message.in_reply_to,
@@ -97,8 +97,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stamp_outbound_overrides_model_in_reply_to() {
+    #[tokio::test]
+    async fn stamp_outbound_overrides_model_in_reply_to() {
+        let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let dispatch = crate::config::secret_paths::fixture::capture_dispatch(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
         let chain = chain();
         let model_parent = Uuid::from_u128(7);
         let mut message = PrxMessage {
@@ -124,9 +146,18 @@ mod tests {
             exec: None,
             canonical_hash: None,
         };
-        stamp_outbound(&chain, &mut message);
+        tracing::dispatcher::with_default(&dispatch, || stamp_outbound(&chain, &mut message));
+        assert!(String::from_utf8_lossy(&sink.0.lock()).contains("WARN"));
+        assert!(String::from_utf8_lossy(&sink.0.lock()).contains("overrode model in_reply_to"));
+        sink.0.lock().clear();
         assert_eq!(message.in_reply_to, Some(chain.trigger));
         assert_ne!(message.in_reply_to, Some(model_parent));
+        for supplied in [None, Some(chain.trigger)] {
+            message.in_reply_to = supplied;
+            tracing::dispatcher::with_default(&dispatch, || stamp_outbound(&chain, &mut message));
+            assert_eq!(message.in_reply_to, Some(chain.trigger));
+            assert!(sink.0.lock().is_empty(), "normal stamps must not audit an override");
+        }
         for kind in [MessageKind::Ack, MessageKind::Nack] {
             message.kind = kind;
             message.in_reply_to = Some(model_parent);

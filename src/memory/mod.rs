@@ -1,6 +1,7 @@
 pub(crate) mod active_view;
 pub mod agent_registry;
 pub mod backend;
+pub mod child_sessions;
 pub mod chunker;
 pub mod compaction;
 pub mod document;

@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Dormant A2A messaging foundation: envelope and session types, ChildSession
-  registry reconstruction, relaunch recipe, provenance sealing, remote-tree
+  registry reconstruction in a dedicated child store, relaunch recipe, provenance sealing, remote-tree
   counters (migration `prx_remote_tree`), worker frame types, and `[a2a]`
   TLS / peer / credential / `remote_tree` config. `messaging_enabled` stays
   false and no production path reads the new keys yet. Enabling messaging with

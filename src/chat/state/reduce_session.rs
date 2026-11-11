@@ -29,7 +29,6 @@ impl ChatState {
         self.session.mode = loaded.mode;
         self.ui.chat_mode = loaded.mode;
         self.session.turns = loaded.turns;
-        self.session.child_session = loaded.child_session;
         self.session.token_usage_records = loaded.token_usage_records;
         self.ui.token_usage_summary = MainSessionTokenUsageSummary::from_records(&self.session.token_usage_records);
         // v4: restore persisted background-session summaries (display only —
@@ -146,7 +145,7 @@ impl ChatState {
             created_at: self.session.created_at.unwrap_or(now),
             updated_at: now,
             turns: self.session.turns.clone(),
-            child_session: self.session.child_session.clone(),
+            child_session: None,
             background_sessions: self.session.background_sessions.clone(),
             token_usage_records: self.session.token_usage_records.clone(),
             mode: self.session.mode,

@@ -34,6 +34,10 @@ fn checkpoint_truncate(conn: &mut rusqlite::Connection) -> anyhow::Result<i64> {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    fn child_session_store(&self) -> Option<&dyn crate::memory::child_sessions::ChildSessionStore> {
+        Some(self)
+    }
+
     fn recovery_repository(&self) -> Option<&dyn crate::memory::recovery_authority::RecoveryRepository> {
         Some(self)
     }

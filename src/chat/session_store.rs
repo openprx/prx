@@ -55,6 +55,9 @@ pub(super) async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Result<Opt
             session.id
         ));
     }
+    if session.child_session.is_some() {
+        return Ok(None);
+    }
     Ok(Some(session))
 }
 
@@ -314,7 +317,7 @@ pub(super) fn valid_session_entry(entry: &crate::memory::MemoryEntry) -> Result<
     let session = session::ChatSession::from_json(&entry.content)
         .map_err(|e| anyhow::anyhow!("saved session '{id_from_key}' stored entry is corrupt: {e}"))?;
     if session.id == id_from_key {
-        Ok(Some(session))
+        Ok(session.child_session.is_none().then_some(session))
     } else {
         Err(anyhow::anyhow!(
             "saved session entry key '{}' disagrees with stored id '{}'",

@@ -616,17 +616,18 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
 }
 
 #[tokio::test]
-async fn task_spawn_inherits_sealed_remote_provenance() {
-    struct InputProbe(tokio::sync::mpsc::UnboundedSender<(String, Option<crate::messaging::InheritedProvenance>)>);
+async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
+    type Observation = (Option<SpawnExecutionContext>, Vec<String>, String);
+    struct ContextProbe(tokio::sync::mpsc::UnboundedSender<Observation>);
     #[async_trait::async_trait]
-    impl crate::providers::Provider for InputProbe {
+    impl crate::providers::Provider for ContextProbe {
         fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
-            // Turn preparation runs on the actual child task. Provider I/O
-            // has its own owner; its task-locals are intentionally narrower.
-            if let Ok(input) = SPAWN_EXECUTION_CONTEXT
-                .try_with(|context| (context.run_id.clone(), context.task_input.inherited_provenance.clone()))
-            {
-                let _ = self.0.send(input);
+            // This runs on the real turn-preparation task. Ignore admission
+            // on the parent; its context must not cross the inner task hop.
+            let context = current_spawn_execution_context();
+            if context.as_ref().is_none_or(|context| context.run_id != "prx-parent") {
+                let key = spawn_session_scope_key(context.as_ref(), None);
+                let _ = self.0.send((context, ambient_channel_excluded_tools(), key));
             }
             crate::providers::traits::ProviderCapabilities {
                 native_tool_calling: true,
@@ -637,53 +638,49 @@ async fn task_spawn_inherits_sealed_remote_provenance() {
             Ok("done".into())
         }
     }
-    let provenance = crate::messaging::InheritedProvenance {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (channel, _) = RecordingChannel::new();
+    let tool = make_tool(Arc::new(channel), Arc::new(ContextProbe(sender)));
+    // Discard setup observations. Everything admitted below has parent scope.
+    while receiver.try_recv().is_ok() {}
+    let mut parent = SpawnExecutionContext::seed_turn_context("prx-parent".into(), "prx-parent-session".into());
+    parent.is_turn_root = false;
+    parent.spawn_depth = 4;
+    parent.channel_excluded_tools = vec!["prx_hidden".into()];
+    parent.owner_id = Some("prx-owner".into());
+    parent.topic_id = Some("prx-topic".into());
+    parent.task_input.inherited_provenance = Some(crate::messaging::InheritedProvenance {
         remote: crate::messaging::RemotePeerAttr {
             issuer: "spiffe://prx".into(),
             subject: "spiffe://prx/peer".into(),
-            message_id: uuid::Uuid::from_u128(42),
+            message_id: uuid::Uuid::nil(),
         },
         chain: crate::messaging::CausalChain {
-            trigger: uuid::Uuid::from_u128(42),
-            root: uuid::Uuid::from_u128(42),
+            trigger: uuid::Uuid::nil(),
+            root: uuid::Uuid::nil(),
             depth: 2,
             ancestry: Vec::new(),
         },
-    };
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let (channel, _) = RecordingChannel::new();
-    let tool = make_tool(Arc::new(channel), Arc::new(InputProbe(tx)));
-    let mut parent = SpawnExecutionContext::seed_turn_context("prx-parent".into(), "prx-session".into());
-    provenance.seal_into_task_input(&mut parent.task_input);
+    });
     let result = SPAWN_EXECUTION_CONTEXT
         .scope(parent, async {
-            execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "report done"}))).await
+            execute_admitted_spawn(&tool, with_spawn_grant(json!({"task":"report done"}))).await
         })
         .await
         .expect("real task admission");
     assert!(result.success, "{:?}", result.error);
-    let child_run = tool
-        .active_runs_snapshot()
+    let (context, hidden, scope) = tokio::time::timeout(std::time::Duration::from_secs(20), receiver.recv())
         .await
-        .first()
-        .expect("registered child run")
-        .id
-        .clone();
-    let actual = match tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let (run, input) = rx.recv().await.expect("probe result");
-            if run == child_run {
-                return input;
-            }
-        }
-    })
-    .await
-    {
-        Ok(input) => input,
-        Err(error) => {
-            let status = tool.active_runs_snapshot().await.first().map(|run| run.status.clone());
-            panic!("child provider did not observe task input: {error}; run status: {status:?}");
-        }
-    };
-    assert_eq!(actual.as_ref(), Some(&provenance));
+        .expect("real child turn preparation")
+        .expect("probe observation");
+    // Main's in-process loop has no spawn context: nested calls retain its
+    // depth-zero/no-parent fallback, empty hidden tools, and global scope.
+    assert!(
+        context.is_none(),
+        "dormant foundation must not install child lineage: {context:?}"
+    );
+    assert_eq!(context.as_ref().map_or(0, |context| context.spawn_depth + 1), 0);
+    assert_eq!(context.as_ref().map(|context| &context.run_id), None);
+    assert_eq!(hidden, Vec::<String>::new());
+    assert_eq!(scope, "sessions_spawn:global");
 }
