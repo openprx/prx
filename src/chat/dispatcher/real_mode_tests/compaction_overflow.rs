@@ -206,6 +206,7 @@ async fn redux_driver_switch_degradation_tells_the_user_context_was_dropped() {
             for i in 0..24 {
                 history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
             }
+            history.push(PMsg::user("current request"));
 
             let binding = admit_start_turn_fixture(
                 &fixture_deps,
@@ -375,6 +376,8 @@ async fn redux_driver_preflight_uses_provider_summary_before_first_stream_reques
             for i in 0..24 {
                 history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
             }
+
+            history.push(PMsg::user("current request"));
 
             let binding = admit_start_turn_fixture(
                 &fixture_deps,

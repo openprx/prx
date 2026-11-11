@@ -162,9 +162,10 @@ pub(super) async fn preflight_context_budget_before_provider_call(
 
 /// The turn's own request, captured before a context-budget removal can take
 /// it, with the number of messages that followed it at capture time.
-pub(super) struct CapturedTurnRequest {
+pub(crate) struct CapturedTurnRequest {
     message: ChatMessage,
     messages_after: usize,
+    restore_message: Option<ChatMessage>,
 }
 
 /// Where a restored request goes back into history.
@@ -176,7 +177,7 @@ pub(super) struct CapturedTurnRequest {
 /// passes the variant its own removal earned rather than guessing from the
 /// shape of the history afterwards.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum RestoredRequestPosition {
+pub(crate) enum RestoredRequestPosition {
     /// **Summary compaction replaced a front range: the request returns at the
     /// tail.**
     ///
@@ -279,7 +280,7 @@ fn is_loop_written_user_note(message: &ChatMessage) -> bool {
 /// ([`is_loop_written_user_note`]). A real `user` turn below the candidate means
 /// the predicate skipped the current request, and this floor then protects
 /// nothing rather than protecting the wrong thing.
-pub(super) fn capture_current_turn_request(history: &[ChatMessage]) -> Option<CapturedTurnRequest> {
+pub(crate) fn capture_current_turn_request(history: &[ChatMessage]) -> Option<CapturedTurnRequest> {
     let index = latest_user_query_index(history)?;
     let a_real_user_turn_follows = history
         .iter()
@@ -293,8 +294,25 @@ pub(super) fn capture_current_turn_request(history: &[ChatMessage]) -> Option<Ca
     }
     history.get(index).map(|message| CapturedTurnRequest {
         message: message.clone(),
+        restore_message: None,
         messages_after: history.len().saturating_sub(index).saturating_sub(1),
     })
+}
+
+/// Keep prepared-message identity while restoring the admitted source text if
+/// a request-local enrichment is removed. The positional guard remains the
+/// same; enrichment that survives is never mistaken for a second request.
+pub(crate) fn capture_current_turn_request_with_source(
+    history: &[ChatMessage],
+    source: &[ChatMessage],
+) -> Option<CapturedTurnRequest> {
+    let mut captured = capture_current_turn_request(history)?;
+    if let Some(original) = capture_current_turn_request(source)
+        && original.messages_after == captured.messages_after
+    {
+        captured.restore_message = Some(original.message);
+    }
+    Some(captured)
 }
 
 /// Put the turn's own request back when the removal it was captured for took
@@ -321,7 +339,7 @@ pub(super) fn capture_current_turn_request(history: &[ChatMessage]) -> Option<Ca
 /// caller deleted for good is not in history to be captured again.
 ///
 /// The insertion rule is [`RestoredRequestPosition`].
-pub(super) fn restore_current_turn_request(
+pub(crate) fn restore_current_turn_request(
     history: &mut Vec<ChatMessage>,
     captured: Option<CapturedTurnRequest>,
     trigger: &str,
@@ -343,8 +361,9 @@ pub(super) fn restore_current_turn_request(
         restored_at = position.as_str(),
         "the context budget removed the current turn's request; restoring it over the budget"
     );
+    let message = captured.restore_message.unwrap_or(captured.message);
     match position {
-        RestoredRequestPosition::Tail => history.push(captured.message),
+        RestoredRequestPosition::Tail => history.push(message),
         RestoredRequestPosition::AboveEverythingLeftStanding => {
             // `history_non_system_start` inspects `history[0]` only, so "the
             // front of the non-system region" is exact for the leading system
@@ -357,10 +376,36 @@ pub(super) fn restore_current_turn_request(
             // pass this insert would hand a strict template a system message
             // that is not the first transcript item.
             let index = history_non_system_start(history).min(history.len());
-            history.insert(index, captured.message);
+            history.insert(index, message);
         }
     }
     true
+}
+
+/// Reject a request that cannot fit even after removing every older turn.
+/// This is used by the TUI before handing its prepared history to the engine.
+pub(crate) fn ensure_current_request_capacity(
+    history: &[ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+) -> Result<()> {
+    let Some(request) = capture_current_turn_request(history) else {
+        return Ok(());
+    };
+    let mut irreducible: Vec<_> = history
+        .iter()
+        .filter(|message| message.role == "system")
+        .cloned()
+        .collect();
+    irreducible.push(request.message);
+    let budget = plan_context_budget(&irreducible, config, PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_hard_limit {
+        return Err(crate::agent::turn_contracts::ContextCapacityError::RequestTooLarge {
+            used_tokens: budget.used_tokens,
+            available_tokens: budget.available_input_tokens,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[path = "turn_tests/context_preflight.rs"]

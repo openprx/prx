@@ -3233,6 +3233,13 @@ router window metadata, catalog limits and the existing fallback. Legacy
 `router.models[].max_context/reserved_output_tokens` remain readable with a
 migration warning once per process.
 
+Provider-reported context overflow triggers at most three recovery passes per
+turn. Recovery preserves the current request and retries only when the restored
+history is smaller. If recovery makes no progress, reaches the pass limit, or
+the TUI's system instructions plus current request cannot fit, the turn stops
+with a context-capacity message. Shorten the request or select a model with a
+larger context window; the live request is never silently truncated.
+
 ## Release catalog lifecycle
 
 `prx models catalog status` shows the embedded revision, digest and lifecycle
