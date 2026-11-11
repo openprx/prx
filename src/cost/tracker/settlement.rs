@@ -30,6 +30,41 @@ pub(crate) fn force_io_error(force: bool) {
     FORCE_IO_ERROR.with(|cell| cell.set(force));
 }
 
+#[cfg(test)]
+pub(crate) struct RecoveryProjectionFaults {
+    before: bool,
+    after: bool,
+    io: bool,
+}
+#[cfg(test)]
+pub(crate) struct RecoveryProjectionFaultGuard(RecoveryProjectionFaults);
+#[cfg(test)]
+pub(crate) fn take_recovery_projection_faults() -> RecoveryProjectionFaults {
+    RecoveryProjectionFaults {
+        before: CRASH_BEFORE_APPEND.with(|cell| cell.replace(false)),
+        after: CRASH_AFTER_APPEND.with(|cell| cell.replace(false)),
+        io: FORCE_IO_ERROR.with(|cell| cell.replace(false)),
+    }
+}
+#[cfg(test)]
+impl RecoveryProjectionFaults {
+    pub(crate) fn install(self) -> RecoveryProjectionFaultGuard {
+        RecoveryProjectionFaultGuard(Self {
+            before: CRASH_BEFORE_APPEND.with(|cell| cell.replace(self.before)),
+            after: CRASH_AFTER_APPEND.with(|cell| cell.replace(self.after)),
+            io: FORCE_IO_ERROR.with(|cell| cell.replace(self.io)),
+        })
+    }
+}
+#[cfg(test)]
+impl Drop for RecoveryProjectionFaultGuard {
+    fn drop(&mut self) {
+        CRASH_BEFORE_APPEND.with(|cell| cell.set(self.0.before));
+        CRASH_AFTER_APPEND.with(|cell| cell.set(self.0.after));
+        FORCE_IO_ERROR.with(|cell| cell.set(self.0.io));
+    }
+}
+
 impl CostTracker {
     /// Project authenticated recovery usage into the cost ledger. No budget check.
     pub(crate) fn project_recovery_usage(&self, record: &MeteredTokenUsageRecord) -> Result<()> {

@@ -798,11 +798,16 @@ async fn disabled_or_keyless_fixed_close_has_no_applied_write() {
             commit: crate::agent::terminal::TurnTerminalDraft {
                 decision,
                 terminal_id: "prx_unrecorded_close".to_owned(),
-                scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-                    .with_owner_id(proof.owner_id())
-                    .with_channel("cli")
-                    .with_session_key(proof.session_key())
-                    .with_run_id(proof.run_id()),
+                scope: {
+                    let mut scope =
+                        crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
+                            .with_owner_id(proof.owner_id())
+                            .with_channel("cli")
+                            .with_session_key(proof.session_key())
+                            .with_run_id(proof.run_id());
+                    scope.causation_event_id = proof.source_event_id().map(str::to_owned);
+                    scope
+                },
                 status: crate::agent::terminal::TurnTerminalStatus::Completed,
                 history: None,
                 history_scope: None,

@@ -15,7 +15,7 @@ mod report;
 mod settlement;
 pub use report::{CostTotals, WorkspaceCostReport, workspace_cost_report};
 #[cfg(test)]
-pub(crate) use settlement::{crash_after_append, crash_before_append, force_io_error};
+pub(crate) use settlement::{crash_after_append, crash_before_append, force_io_error, take_recovery_projection_faults};
 
 const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);

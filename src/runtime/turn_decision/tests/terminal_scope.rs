@@ -81,11 +81,12 @@ impl LinkedFixture {
             );
         }
         let now = chrono::Utc::now();
-        let scope = crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
+        let mut scope = crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
             .with_owner_id(proof.owner_id())
             .with_channel("cli")
             .with_session_key(proof.session_key())
             .with_run_id(proof.run_id());
+        scope.causation_event_id = proof.source_event_id().map(str::to_owned);
         let commit = crate::agent::terminal::TurnTerminalDraft {
             decision: Some(
                 service
@@ -347,7 +348,7 @@ async fn disabled_terminal_validates_source_without_decision_store_writes() {
     .await
     .expect("disabled terminal retains ordinary history behavior");
     assert!(receipt.assistant_event.is_some());
-    assert_eq!(fixture.marker_presence(&fabric).await, [false, true, false, true]);
+    assert_eq!(fixture.marker_presence(&fabric).await, [true, true, false, true]);
     assert!(fixture.service.store.writer().is_none());
     assert!(!fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
     assert!(!fixture.workspace.path().join("self/causal_tree/decisions.db").exists());

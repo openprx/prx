@@ -1,6 +1,36 @@
 #![cfg(test)]
 use super::*;
 
+async fn fresh_terminal_run(
+    service: &TurnDecisionService,
+    generation: &crate::config::ConfigGeneration,
+    memory: Arc<dyn Memory>,
+    run: &str,
+) -> (
+    crate::agent::entry::AgentTurnProof,
+    Arc<TurnDecisionContext>,
+    crate::memory::MessageEventScope,
+) {
+    let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+        generation,
+        memory,
+        "prx test routing input",
+        run,
+    )
+    .await;
+    let context = service
+        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .await
+        .expect("test: fresh terminal decision");
+    let mut scope = crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
+        .with_owner_id(proof.owner_id())
+        .with_channel("cli")
+        .with_session_key(proof.session_key())
+        .with_run_id(proof.run_id());
+    scope.causation_event_id = proof.source_event_id().map(str::to_owned);
+    (proof, context, scope)
+}
+
 #[tokio::test]
 async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let workspace = tempfile::tempdir().expect("test workspace");
@@ -304,12 +334,27 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .is_empty(),
         "a conflicting replay must not write an outcome"
     );
+    // A settled run cannot acquire a second terminal. Race fresh decisions
+    // from one new source run instead of reusing the already settled run.
+    let (race_proof, race_a_context, race_scope) =
+        fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_concurrent_run").await;
+    let race_b_context = service
+        .decide_agent_initial(&race_proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .await
+        .expect("test: competing terminal decision");
     let mut concurrent_a = linked_commit.clone();
+    concurrent_a.decision = Some(
+        service
+            .settlement_ref(Arc::clone(&race_a_context))
+            .expect("test: first race link"),
+    );
+    concurrent_a.scope = race_scope;
+
     concurrent_a.terminal_id = "concurrent-terminal-1".to_owned();
     let mut concurrent_b = concurrent_a.clone();
     concurrent_b.decision = Some(
         service
-            .settlement_ref(Arc::clone(&conflicting_context))
+            .settlement_ref(Arc::clone(&race_b_context))
             .expect("second concurrent decision link"),
     );
     let priced_outcome =
@@ -331,8 +376,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 ..Default::default()
             },
         };
-    concurrent_a.provider_outcome = Some(priced_outcome(context.decision_id(), 10));
-    concurrent_b.provider_outcome = Some(priced_outcome(conflicting_context.decision_id(), 20));
+    concurrent_a.provider_outcome = Some(priced_outcome(race_a_context.decision_id(), 10));
+    concurrent_b.provider_outcome = Some(priced_outcome(race_b_context.decision_id(), 20));
     let (first, second) = tokio::join!(
         crate::agent::terminal::finalize_turn(&fabric, concurrent_a, &config.cost, workspace.path()),
         crate::agent::terminal::finalize_turn(&fabric, concurrent_b, &config.cost, workspace.path())
@@ -340,7 +385,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     assert_ne!(
         first.is_ok(),
         second.is_ok(),
-        "exactly one decision must claim the terminal ID"
+        "exactly one decision must claim the terminal ID: first={first:?}, second={second:?}"
     );
     let winner = first
         .as_ref()
@@ -384,7 +429,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         "the cost ledger must belong to the claimed winner"
     );
     assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
-    let concurrent_count = [context.decision_id(), conflicting_context.decision_id()]
+    let concurrent_count = [race_a_context.decision_id(), race_b_context.decision_id()]
         .into_iter()
         .map(|id| {
             service
@@ -400,11 +445,19 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         })
         .sum::<usize>();
     assert_eq!(concurrent_count, 1, "the losing decision cannot settle an outcome");
+    let (_, divergent_context, divergent_scope) =
+        fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_divergent_run").await;
     let mut divergent_a = linked_commit.clone();
+    divergent_a.decision = Some(
+        service
+            .settlement_ref(Arc::clone(&divergent_context))
+            .expect("test: divergent link"),
+    );
+    divergent_a.scope = divergent_scope;
     divergent_a.terminal_id = "divergent-terminal-1".to_owned();
-    divergent_a.provider_outcome = Some(priced_outcome(context.decision_id(), 30));
+    divergent_a.provider_outcome = Some(priced_outcome(divergent_context.decision_id(), 30));
     let mut divergent_b = divergent_a.clone();
-    divergent_b.provider_outcome = Some(priced_outcome(context.decision_id(), 40));
+    divergent_b.provider_outcome = Some(priced_outcome(divergent_context.decision_id(), 40));
     let (first, second) = tokio::join!(
         crate::agent::terminal::finalize_turn(&fabric, divergent_a, &config.cost, workspace.path()),
         crate::agent::terminal::finalize_turn(&fabric, divergent_b, &config.cost, workspace.path())
@@ -447,9 +500,17 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         Some(winner_tokens),
         "only the semantic claim winner can write cost"
     );
+    let (_, scope_context, scope_event) =
+        fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_scope_replay_run").await;
     let mut scope_commit = linked_commit.clone();
+    scope_commit.decision = Some(
+        service
+            .settlement_ref(Arc::clone(&scope_context))
+            .expect("test: scope replay link"),
+    );
+    scope_commit.scope = scope_event;
     scope_commit.terminal_id = "scope-replay-terminal-1".to_owned();
-    scope_commit.provider_outcome = Some(priced_outcome(context.decision_id(), 50));
+    scope_commit.provider_outcome = Some(priced_outcome(scope_context.decision_id(), 50));
     let scope_marker =
         crate::agent::terminal::finalize_turn(&fabric, scope_commit.clone(), &config.cost, workspace.path())
             .await
@@ -484,10 +545,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         1,
         "changed scope cannot add a cost settlement"
     );
-    let rejoin_context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
-        .await
-        .expect("decision before terminal-only crash point");
+    let (_, rejoin_context, rejoin_event_scope) =
+        fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_rejoin_run").await;
     assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
     let rejoin_marker = crate::agent::terminal::finalize_turn_stop_after_marker(
         &fabric,
@@ -498,11 +557,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                     .expect("recordable link"),
             ),
             terminal_id: "rejoin-terminal-1".to_owned(),
-            scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-                .with_owner_id(proof.owner_id())
-                .with_channel("cli")
-                .with_session_key(proof.session_key())
-                .with_run_id(proof.run_id()),
+            scope: rejoin_event_scope,
             status: crate::agent::terminal::TurnTerminalStatus::Failed,
             history: None,
             history_scope: None,
@@ -534,10 +589,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .is_empty(),
         "expected an empty value"
     );
-    let late_context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
-        .await
-        .expect("decision for delayed terminal task");
+    let (_, late_context, late_event_scope) =
+        fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_late_run").await;
     let late_commit = crate::agent::terminal::TurnTerminalDraft {
         decision: Some(
             service
@@ -545,11 +598,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 .expect("delayed decision link"),
         ),
         terminal_id: "late-async-terminal-1".to_owned(),
-        scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-            .with_owner_id(proof.owner_id())
-            .with_channel("cli")
-            .with_session_key(proof.session_key())
-            .with_run_id(proof.run_id()),
+        scope: late_event_scope,
         status: crate::agent::terminal::TurnTerminalStatus::Failed,
         history: None,
         history_scope: None,
@@ -609,6 +658,10 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         i64::try_from(
             context.hop_ids().len()
                 + conflicting_context.hop_ids().len()
+                + race_a_context.hop_ids().len()
+                + race_b_context.hop_ids().len()
+                + divergent_context.hop_ids().len()
+                + scope_context.hop_ids().len()
                 + rejoin_context.hop_ids().len()
                 + late_context.hop_ids().len()
         )

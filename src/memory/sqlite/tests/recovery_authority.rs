@@ -448,11 +448,7 @@ fn recovery_settlement_race_has_one_receipt() {
     );
     assert_eq!(
         writer
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%outbox%' AND name LIKE '%recovery%'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
+            .query_row("SELECT count(*) FROM recovery_cost_outbox", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         0
     );

@@ -1805,7 +1805,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), temp.path().to_string_lossy());
-        let cost_config = CostConfig::default();
+        let cost_config = priced_cost_config();
 
         let mut commit = completed_commit("preflight-failure-run");
         let service = bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &cost_config).await;
@@ -1906,7 +1906,7 @@ mod tests {
             bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut commit, &CostConfig::default()).await;
         let principal = terminal_fixture_principal(temp.path(), &commit.scope);
         commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new(
-            "authority-lost-after-usage",
+            "authority-lost-before-terminal-commit",
             {
                 let validations = Arc::clone(&validations);
                 move || Ok(validations.fetch_add(1, Ordering::SeqCst) == 0)
@@ -1929,8 +1929,9 @@ mod tests {
                 .iter()
                 .filter(|event| event.event_type == "usage.settled")
                 .count(),
-            1
+            0
         );
+        assert!(crate::memory::sqlite::fixture_readback::outbox_rows(temp.path()).is_empty());
         assert_eq!(
             events
                 .iter()

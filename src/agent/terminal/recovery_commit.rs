@@ -31,6 +31,15 @@ thread_local! {
 }
 
 #[cfg(test)]
+struct ProjectionAckGuard(bool);
+#[cfg(test)]
+impl Drop for ProjectionAckGuard {
+    fn drop(&mut self) {
+        CRASH_BEFORE_ACK.with(|cell| cell.set(self.0));
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn skip_inline_projection(skip: bool) {
     SKIP_INLINE_PROJECTION.with(|cell| cell.set(skip));
 }
@@ -414,17 +423,33 @@ pub(super) async fn finalize_recovery_terminal(
             }
         };
         if !skip_inline {
-            match find_pending_cost(repository, fabric.workspace_id(), &commit.terminal_id)? {
-                Some(row) => project_committed_usage(
-                    fabric.memory().as_ref(),
-                    fabric.workspace_id(),
-                    workspace_dir,
-                    cost_config,
-                    &row,
-                )?,
-                None if replayed => {}
-                None => anyhow::bail!("metered recovery cost outbox row missing after commit"),
-            }
+            let memory = fabric.memory();
+            let workspace_id = fabric.workspace_id().to_owned();
+            let workspace_dir = workspace_dir.to_path_buf();
+            let cost_config = cost_config.clone();
+            let settlement_id = commit.terminal_id.clone();
+            #[cfg(test)]
+            let faults = crate::cost::tracker::take_recovery_projection_faults();
+            #[cfg(test)]
+            let crash_ack = CRASH_BEFORE_ACK.with(std::cell::Cell::get);
+            crate::runtime::blocking::spawn_blocking(move || {
+                #[cfg(test)]
+                let _faults = faults.install();
+                #[cfg(test)]
+                let _ack = ProjectionAckGuard(CRASH_BEFORE_ACK.with(|cell| cell.replace(crash_ack)));
+                let repository = memory
+                    .recovery_repository()
+                    .context("recovery repository unavailable")?;
+                match find_pending_cost(repository, &workspace_id, &settlement_id)? {
+                    Some(row) => {
+                        project_committed_usage(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &row)
+                    }
+                    None if replayed => Ok(()),
+                    None => anyhow::bail!("metered recovery cost outbox row missing after commit"),
+                }
+            })
+            .await
+            .context("recovery cost projection worker failed")??;
         }
     }
 
@@ -855,6 +880,9 @@ pub(crate) fn scan_pending_recovery_costs(
                 return Ok(());
             }
         };
+    if rows.is_empty() {
+        return Ok(());
+    }
     let tracker = match crate::cost::tracker::CostTracker::for_workspace(cost_config.clone(), workspace_dir) {
         Ok(tracker) => tracker,
         Err(error) => {
