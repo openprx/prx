@@ -21,7 +21,7 @@ const BASE_TOKEN: &str = "reply_to";
 /// not be flagged.
 ///
 /// A `reply_to` occurrence is a violation when it is NOT part of a longer
-/// identifier (the next char is not `[A-Za-z0-9_]`) AND it appears in one of the
+/// identifier (neither adjacent char is `[A-Za-z0-9_]`) AND it appears in one of the
 /// two banned syntactic forms:
 ///   * field access:      `.reply_to`           (preceded by `.`)
 ///   * field definition/  `reply_to:` / `reply_to :`  (followed by optional
@@ -33,12 +33,16 @@ fn line_violates(line: &str) -> bool {
         let token_start = start + rel;
         let after = token_start + BASE_TOKEN.len();
 
-        // Skip when `reply_to` is just the prefix of a longer identifier
-        // (e.g. `reply_to_sender_jid`): the next byte continues the identifier.
+        // Skip when `reply_to` is part of a longer identifier
+        // (e.g. `reply_to_sender_jid` or `in_reply_to`).
+        let prev_is_ident_char = token_start
+            .checked_sub(1)
+            .and_then(|idx| bytes.get(idx))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
         let next_is_ident_char = bytes
             .get(after)
             .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
-        if !next_is_ident_char {
+        if !prev_is_ident_char && !next_is_ident_char {
             // Form (a): `.reply_to` — immediately preceded by a `.`.
             let preceded_by_dot = token_start > 0 && bytes.get(token_start - 1) == Some(&b'.');
 
@@ -134,6 +138,21 @@ mod line_violates_tests {
         assert!(!line_violates("reply_to_sender_jid: jid,"));
         assert!(!line_violates("reply_to_id: Some(1),"));
         assert!(!line_violates("self.reply_to_display.clone()"));
+    }
+
+    #[test]
+    fn ignores_reply_to_suffix_in_longer_identifiers() {
+        assert!(!line_violates("in_reply_to: Some(id),"));
+        assert!(!line_violates("in_reply_to : Some(id),"));
+        assert!(!line_violates("let parent = message.in_reply_to;"));
+        assert!(!line_violates("customreply_to: Some(id),"));
+        assert!(!line_violates("field1reply_to: Some(id),"));
+    }
+
+    #[test]
+    fn flags_bare_field_access_after_longer_identifier() {
+        assert!(line_violates("let parent = message.reply_to;"));
+        assert!(line_violates("in_reply_to: message.reply_to,"));
     }
 
     #[test]
