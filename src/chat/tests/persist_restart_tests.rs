@@ -171,6 +171,18 @@ async fn completed_chat(workspace: &Path, fault: Fault) -> MessageEvent {
     source
 }
 
+/// Journal-backed close does not await the auxiliary decision-store queue.
+/// A fixture that deliberately selects legacy store replay needs its own
+/// durability acknowledgement before asserting that replay can verify it.
+async fn drain_legacy_fixture_decisions(service: &crate::runtime::turn_decision::TurnDecisionService) {
+    assert!(
+        service
+            .drain_writes(std::time::Instant::now() + Duration::from_secs(5))
+            .await,
+        "fixture decision writes must be durable before legacy replay"
+    );
+}
+
 async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &CleanupScope) -> MessageEvent {
     cleanup
         .scope_admission(async {
@@ -220,6 +232,9 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                 memory
                     .replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())
                     .unwrap();
+                if matches!(fault, Fault::LegacySelection) {
+                    drain_legacy_fixture_decisions(&service).await;
+                }
                 let rejoin = service
                     .recovery_scope()
                     .rejoin_terminal("prx-first-run", source.owner_id.as_deref().unwrap())
@@ -780,4 +795,99 @@ async fn unauthenticated_marker_warns_once_per_run_with_recovery_hint() {
         "a new run may emit one warning for the retained legacy marker: {log}"
     );
     assert_eq!(marker(dir.path(), &first).await.event_id, legacy.event_id);
+}
+
+/// Hold the real writer so journal close can finish before a decision row
+/// exists. Legacy replay must wait for an acknowledged queue drain.
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_fixture_waits_for_queued_decision_writes() {
+    let dir = tempfile::tempdir().expect("isolated decision store");
+    let cleanup = CleanupScope::new(None, CancellationToken::new()).expect("cleanup owner");
+    cleanup
+        .run(async {
+            let memory = Arc::new(SqliteMemory::new(dir.path())?);
+            let generation = crate::config::new_shared(config_at(dir.path())).pin();
+            let hold = Arc::new(parking_lot::Mutex::new(()));
+            let held_store = crate::causal_tree::store::CausalDecisionStore::open_shared_held(
+                dir.path(),
+                crate::causal_tree::store::Retention::days(1, 1),
+                Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                    crate::observability::noop::NoopObserver,
+                ))),
+                Arc::clone(&hold),
+            )?;
+            let (source, binding, guard) = guarded_input(memory.clone(), &generation, "prx-first-run").await?;
+            let service = publish(memory.clone(), generation).await?;
+            drop(held_store); // The actual service now owns the shared writer.
+
+            let (ready, ready_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _held = hold.lock();
+                ready.send(()).expect("writer hold acquired");
+                // The sender also drops on unwind, so assertion failures release
+                // the writer without a timing-based auto-release.
+                let _ = release_rx.recv();
+            });
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer hold ready");
+
+            let cancel = CancellationToken::new();
+            binding.decide(&service, &cancel).await?;
+            assert!(binding.fixed_reply()?.is_some());
+            let fabric = MemoryFabric::new(memory.clone(), dir.path().to_string_lossy());
+            let receipt = binding.close(&fabric, 2, chrono::Utc::now(), &cancel).await?;
+            let mut payload: serde_json::Value = serde_json::from_str(
+                receipt
+                    .terminal_event
+                    .raw_payload_json
+                    .as_deref()
+                    .expect("real terminal payload"),
+            )?;
+            assert!(
+                payload
+                    .pointer_mut("/terminal_replay_v1")
+                    .expect("replay binding")
+                    .as_object_mut()
+                    .expect("replay object")
+                    .remove("journal_version")
+                    .is_some()
+            );
+            let key = crate::decision::DecisionKey::load_or_create(dir.path())?;
+            crate::agent::terminal::reseal_payload_for_test(&key, &mut payload, receipt.assistant_event.as_ref())?;
+            memory.replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())?;
+
+            let error = service
+                .recovery_scope()
+                .rejoin_terminal("prx-first-run", source.owner_id.as_deref().expect("source owner"))
+                .await
+                .expect_err("queued decision is not durable while writer is held");
+            assert!(
+                format!("{error:#}").contains("terminal replay decision row is missing"),
+                "{error:#}"
+            );
+
+            let drain = drain_legacy_fixture_decisions(&service);
+            tokio::pin!(drain);
+            assert!(
+                futures::poll!(drain.as_mut()).is_pending(),
+                "fixture must wait for the held decision writer"
+            );
+            release.send(()).expect("release actual writer");
+            drain.await;
+            holder.join().expect("writer holder exits");
+            service
+                .recovery_scope()
+                .rejoin_terminal("prx-first-run", source.owner_id.as_deref().expect("source owner"))
+                .await
+                .expect("acknowledged decision row supports legacy replay");
+            guard.handoff();
+            service
+                .shutdown(std::time::Instant::now() + Duration::from_secs(5))
+                .await;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .expect("real legacy replay and cleanup");
 }
