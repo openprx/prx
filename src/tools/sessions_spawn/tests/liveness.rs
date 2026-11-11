@@ -2,6 +2,8 @@
 
 use super::*;
 
+const PROGRESS_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[test]
 fn isolated_memory_prefixes_key() {
     assert_eq!(memory_key_prefix("alpha", "plan"), "alpha:plan");
@@ -390,8 +392,9 @@ async fn assert_spawned_run_progress(observer_preemption: bool) {
     // Release it: the provider round-trip is a real ProgressKind event.
     gate.add_permits(4);
     let mut observed = None;
+    // Only detect a hung child; elapsed-time assertions use the paused clock.
     let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_secs(2) {
+    while started.elapsed() < PROGRESS_HANG_GUARD {
         // Keep this task runnable while the child performs real I/O. A sleep
         // would let the paused clock auto-advance while waiting for SQLite.
         tokio::task::yield_now().await;
