@@ -1074,7 +1074,7 @@ fn test_reduce_key_pressed_returns_empty_step1() {
 #[test]
 fn test_reduce_unfilled_actions_return_empty() {
     let mut state = make_state();
-    // Filled in by Step 4: HistoryCleared/SessionLoaded/SessionSaved/SessionSwitched/
+    // Filled in by Step 4: SessionLoaded/SessionSaved/SessionSwitched/
     //   RecordUserTurn/RecordAssistantTurn/CancelRequested/ShutdownRequested
     // The following are still left for Step 5 (they return an empty vec):
     let unfilled = [Action::SlashCommandIssued {
