@@ -135,10 +135,26 @@ impl TurnDecisionService {
                             && entry.generation == reference.generation
                             && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
                             && (matches!(entry.exposure, Exposure::Direct)
-                                || super::exact_delegator_ref(&context.engine, reference))
+                                || super::exact_delegator_ref(&context.engine, reference)
+                                || super::sealed_direct_delegator(&context.engine)
+                                    && context.engine.state.trusted.parts().surface != TurnSurfaceKind::Interactive)
                     })
                 });
-                anyhow::ensure!(admitted_delegator, "answer surface has no admitted delegator");
+                let discovered_delegator = context.discovery_admission("sessions_spawn").is_some_and(|admission| {
+                    !admission.requires_approval
+                        && self
+                            .catalog_view()
+                            .entry_any(&admission.reference.id)
+                            .is_some_and(|entry| {
+                                entry.public_name == "sessions_spawn"
+                                    && entry.fingerprint == admission.reference.fingerprint
+                                    && entry.generation == admission.reference.generation
+                            })
+                });
+                anyhow::ensure!(
+                    admitted_delegator || discovered_delegator,
+                    "answer surface has no admitted delegator"
+                );
                 context
                     .engine
                     .outgoing_child
@@ -254,6 +270,14 @@ impl TurnDecisionService {
                 .entry_for_public_name(name)
                 .is_some_and(|entry| matches!(entry.exposure, Exposure::Direct) && permitted(entry))
         });
+        // Chat keeps sessions_spawn deferred. Prepare its bounded child
+        // manifest now, so a later admitted search hit can use the same
+        // durable parent authority without exposing an eager model schema.
+        let deferred_chat_delegator = trusted.surface == TurnSurfaceKind::Interactive
+            && self
+                .catalog
+                .entry_for_public_name("sessions_spawn")
+                .is_some_and(|entry| entry.supports_metadata_discovery() && permitted(entry));
         let direct = if discovered.iter().next().is_none() {
             let input = state.routing_input.as_str();
             // This proposal comes from the pinned configuration of a sealed
@@ -263,7 +287,7 @@ impl TurnDecisionService {
                 || input
                     .split(|character: char| !character.is_alphanumeric() && character != '_')
                     .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
-            if !names_delegator && !direct_delegator {
+            if !names_delegator && !direct_delegator && !deferred_chat_delegator {
                 return None;
             }
             if names_delegator {

@@ -421,6 +421,10 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
     )
     .await;
     let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    // This cell tests the retained explicit local refusal path. Default Auto
+    // leaves tool choice to the serving model; dispatch still enforces policy.
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
 
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_enabled_builtin_model(

@@ -128,7 +128,8 @@ impl TurnDecisionService {
                         && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
                 })
             });
-        if admits_delegation {
+        if admits_delegation || context.engine.outgoing_child.is_some() && self.generation.effective.causal_tree.enabled
+        {
             if self.generation.effective.causal_tree.enabled {
                 tokio::select! {
                     biased;

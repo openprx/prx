@@ -947,7 +947,6 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
     );
     config.causal_tree.policy.extra_latency_budget_ms = 1_000;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
-    config.tool_tiering.always_include.push("capability_search".into());
     let dispatches = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
         name: "discovered_probe".to_owned(),

@@ -31,9 +31,9 @@ mod providers;
 mod runtime;
 mod sessions;
 #[cfg(test)]
-pub(crate) use sessions::drive_disabled_engine_console_entry;
-#[cfg(test)]
 pub(in crate::gateway) use sessions::post_session_message;
+#[cfg(test)]
+pub(crate) use sessions::{drive_disabled_engine_console_entry, drive_search_console_entry};
 mod skills;
 mod skills_h2;
 mod skills_lifecycle;

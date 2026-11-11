@@ -2968,3 +2968,40 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) async fn drive_search_cron_entry(config: Config, input: &str) -> anyhow::Result<()> {
+    use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+    use anyhow::Context as _;
+    let policy = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    let make_tool = || {
+        Box::new(crate::tools::CronTool::new(
+            crate::config::new_shared(config.clone()),
+            Arc::clone(&policy),
+        )) as Box<dyn crate::tools::Tool>
+    };
+    let created = execute_as(
+        make_tool(),
+        surface_context(&config, Surface::AgentCli),
+        serde_json::json!({
+            "action":"add","schedule":{"kind":"at","at":(Utc::now()+ChronoDuration::hours(1)).to_rfc3339()},
+            "job_type":"agent","prompt":input,
+        }),
+    )
+    .await;
+    anyhow::ensure!(created.success, "cron creation failed: {created:?}");
+    let job = crate::cron::list_jobs(&config)?
+        .into_iter()
+        .next()
+        .context("created cron job")?;
+    let run = execute_as(
+        make_tool(),
+        surface_context(&config, Surface::AgentCli),
+        serde_json::json!({
+            "action":"run","job_id":job.id,
+        }),
+    )
+    .await;
+    anyhow::ensure!(run.success, "actual manual cron claim/run failed: {run:?}");
+    Ok(())
+}

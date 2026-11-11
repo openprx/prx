@@ -23,9 +23,26 @@ refresh. Unchanged servers reuse that discovery state. A later configuration or
 forced-discovery change still invalidates the old catalog; parity, policy, and
 approval checks remain enforced.
 
+Native tool turns start with the file/shell core (`file_read`, `file_write`,
+`file_edit`, `shell`). When eligible deferred capabilities exist, the request
+also declares `capability_search`, including for brief inputs and with the
+advisory decision engine disabled. Search returns bounded, source-scoped offers;
+a hit becomes a declared tool on the next request after fresh admission. Channel
+exclusions, model policy and issued child scope still apply. Search does not
+expand that scope. A catalog with deferred tools but no live search backend
+reports a publication error rather than advertising an unusable discovery path.
+
+Eligible installed skills are advertised as metadata. A request that advertises skills
+includes an admitted `skill_read` definition; instruction bodies stay lazy.
+If the live reader cannot be admitted, the metadata is suppressed with a
+diagnostic. Chat's `sessions_spawn` definition is deferred behind search by
+default. An explicit `[tool_tiering] always_include = ["sessions_spawn"]`
+preference can publish it directly when policy permits. Chat's slash-command
+session controls remain available independently.
+
 | Category | Tools |
 |----------|-------|
-| **Capability discovery** | `capability_search` (source-authorized AnswerDirectly and Execute turns) |
+| **Capability discovery** | `capability_search` (tool-capable turns with eligible deferred features) |
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `file_edit`, `git_operations` |
 | **Web** | `web_search_tool`, `web_fetch`, `http_request` |
 | **Memory & Documents** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `transcript_history_lookup`, `memory_forget`, `memory_reindex`, `chat_profile_update`, `document_search`, `document_get_chunk`, `document_ingest`, `document_sync` |

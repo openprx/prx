@@ -52,3 +52,18 @@ pub(crate) fn build_runtime_system_prompt(
 
 #[path = "turn_tests/runtime_prompt.rs"]
 mod tests;
+
+/// Remove the generated lazy-skill section when its live reader cannot be
+/// admitted. Only system metadata is affected; user and tool data stay intact.
+pub(crate) fn suppress_unreadable_skill_metadata(messages: &mut [crate::providers::ChatMessage]) {
+    for message in messages.iter_mut().filter(|message| message.role == "system") {
+        while let Some(start) = message.content.find("## Available Skills\n") {
+            let Some(end) = message.content[start..].find("</available_skills>") else {
+                break;
+            };
+            message
+                .content
+                .replace_range(start..start + end + "</available_skills>".len(), "");
+        }
+    }
+}

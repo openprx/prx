@@ -1258,6 +1258,10 @@ mod tests {
         let mut builder = embedded_provider_builder(workspace.path())
             .provider(Box::new(CustomContextSpy(ModelSpy(Arc::clone(&models), "ollama"))))
             .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
+        // This fixture asserts selected-retrieval behavior, so opt in to the
+        // retained local prediction backend instead of relying on default Auto.
+        builder.runtime_config.as_mut().unwrap().0.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
             config.causal_tree.enabled = true;

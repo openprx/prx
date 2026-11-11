@@ -9,7 +9,8 @@ advisory decision engine as owning everything:
   is not selected by the decision engine.
 - **Tool surface** is built by the surface owner: registry ∩ ACL ∩
   `always_exclude` / channel exclusions ∩ model allowlist ∩ catalog eligibility.
-  The surface is built even when the advisory engine is off.
+  The surface is built even when the advisory engine is off. Authorized search
+  stays available when deferred tools exist, including for brief inputs.
 - **Targeted gateway turns** (`[gateway] targeted_agents`, default `false`) use
   a named memory partition (`name` + incarnation), not Main's history. The
   switch is pre-release.
@@ -693,6 +694,11 @@ always_include = []
 always_exclude = []
 # channel_exclude = []
 
+# A request that advertises skill metadata also admits its live skill_read
+# dependency. Missing or denied readers suppress that metadata with a diagnostic.
+# Chat sessions_spawn is deferred by default; always_include can opt it into the
+# direct surface when policy permits.
+#
 # Skill catalog published in the system prompt. A catalog at or below `top_k` is
 # published whole, in a canonical order, which keeps that section of the prompt a
 # pure function of the installed skills instead of a retrieval result that moves

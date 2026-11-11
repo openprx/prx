@@ -469,13 +469,20 @@ async fn admit_chat_fixture_with_mode(
         .cost
         .prices
         .insert(format!("{}/{}", selection.0, selection.1), pricing);
-    config.providers.models.push(
-        serde_json::from_value(serde_json::json!({
-            "provider": selection.0, "model": selection.1,
-            "operations": ["chat"], "native_tools": true,
-        }))
-        .expect("fixture model descriptor"),
-    );
+    if !config
+        .providers
+        .models
+        .iter()
+        .any(|model| model.provider == selection.0 && model.model.as_deref() == Some(selection.1))
+    {
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": selection.0, "model": selection.1,
+                "operations": ["chat"], "native_tools": true,
+            }))
+            .expect("fixture model descriptor"),
+        );
+    }
     let generation = crate::config::new_shared(config.clone()).pin();
     let policy = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace));
     let approval_router = Arc::new(ApprovalRouter::new());
@@ -1122,4 +1129,78 @@ pub(crate) async fn drive_disabled_engine_chat_entry(workspace: &std::path::Path
             .prediction
             .is_none()
     );
+}
+
+pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input: &str) -> anyhow::Result<()> {
+    use crate::agent::turn_tests::reachability::{boxed_root_probe, provider, registry};
+    use anyhow::Context as _;
+    let model = config.default_model.clone().context("wire model")?;
+    let name = config.default_provider.clone().context("wire provider")?;
+    let workspace = config.workspace_dir.clone();
+    let provider: Arc<dyn Provider> = Arc::from(provider(&config)?);
+    let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
+    let tools = registry(&config, memory);
+    let (actions, mut receiver) = mpsc::channel::<Action>(128);
+    let cancel = CancellationToken::new();
+    let admitted = admit_chat_fixture_with_config(
+        provider.clone(),
+        Some(tools),
+        config.clone(),
+        (&name, &model, None),
+        ("prx_search_chat", input),
+        actions.clone(),
+        cancel.clone(),
+    )
+    .await;
+    let skills = admitted.binding.prompt_skills()?;
+    let prompt = crate::agent::runtime_prompt::build_runtime_system_prompt(&config, &model, &skills, true);
+    let history = vec![ChatMessage::system(&prompt), ChatMessage::user(input)];
+    let mut driver = tokio::spawn(boxed_root_probe(|| {
+        drive_start_turn_stream(
+            Some(admitted.binding),
+            None,
+            provider,
+            history.clone(),
+            history,
+            model,
+            0.0,
+            None,
+            cancel,
+            "prx_search_chat".to_owned(),
+            actions,
+            Some(admitted.registry),
+            Some(admitted.service),
+            admitted.context,
+            admitted.fabric,
+            None,
+            crate::agent::turn_contracts::ChatMode::Edit,
+            Arc::new(crate::observability::NoopObserver),
+            Arc::new(crate::hooks::HookManager::new(workspace)),
+        )
+    }));
+    let result = async {
+        loop {
+            let action = tokio::time::timeout(std::time::Duration::from_secs(60), receiver.recv())
+                .await?
+                .context("chat action stream closed before completion")?;
+            match action {
+                Action::StreamFailed { err, .. } => anyhow::bail!("chat entry failed: {err}"),
+                Action::StreamCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        driver.abort();
+    }
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), &mut driver).await;
+    if joined.is_err() {
+        driver.abort();
+        let _ = driver.await;
+    }
+    result?;
+    joined??;
+    Ok(())
 }

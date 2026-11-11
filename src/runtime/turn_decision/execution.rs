@@ -664,7 +664,7 @@ impl TurnDecisionService {
     ) -> anyhow::Result<ToolSpec> {
         anyhow::ensure!(proof.tool_calls_allowed(), "source configuration forbids tool calls");
         anyhow::ensure!(
-            matches!(name, "transcript_history_lookup" | "stay_silent"),
+            matches!(name, "transcript_history_lookup" | "stay_silent" | "skill_read"),
             "unknown runtime dependency"
         );
         self.agent_execution_specs(proof, context)?;
@@ -756,15 +756,40 @@ impl TurnDecisionService {
 
     /// Recheck the issued decision before each provider iteration. A backend
     /// root with many aliases contributes only the exact selected definitions.
-    /// Read only metadata belonging to the final-gated capability set. This
-    /// performs no embedding lookup or skill-body load.
+    /// Read metadata eligible for this source. Advertising metadata is
+    /// separate from execution and selection receipts. This performs no
+    /// embedding lookup or skill-body load.
     pub(crate) fn agent_prompt_skills(
         &self,
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Vec<crate::skills::Skill>> {
         let _ = self.agent_execution_specs(proof, context)?;
-        let refs: Vec<_> = context.execution_refs().iter().cloned().collect();
+        // Direct turns have no prediction-selected skill, but their installed
+        // metadata must still be actionable on the first request. Reuse the
+        // source-bound discovery eligibility rather than loading skill bodies.
+        let refs: Vec<_> = if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly) {
+            if self
+                .agent_runtime_dependency_spec(proof, context, "skill_read")
+                .is_err()
+            {
+                if self
+                    .catalog_view()
+                    .iter_entries()
+                    .any(|entry| entry.skill_metadata.is_some())
+                {
+                    tracing::warn!("skill metadata suppressed because live skill_read is unavailable");
+                }
+                return Ok(Vec::new());
+            }
+            self.discovery_entries(proof, context)?
+                .into_values()
+                .filter(|entry| entry.searchable)
+                .map(|entry| entry.reference)
+                .collect()
+        } else {
+            context.execution_refs().iter().cloned().collect()
+        };
         let entries = self.catalog.resolve(&refs)?;
         let mut skills: Vec<crate::skills::Skill> = Vec::new();
         for entry in entries {
@@ -797,7 +822,19 @@ impl TurnDecisionService {
                 embedding: None,
             });
         }
-        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        // Advertising installed metadata is not a skill selection receipt.
+        let names: Vec<&str> = skills
+            .iter()
+            .filter(|skill| {
+                context.execution_refs().iter().any(|reference| {
+                    self.catalog_view()
+                        .entry_any(&reference.id)
+                        .and_then(|entry| entry.skill_metadata.as_ref())
+                        .is_some_and(|metadata| metadata.name == skill.name)
+                })
+            })
+            .map(|skill| skill.name.as_str())
+            .collect();
         crate::skills::lifecycle::schedule_selection_receipts(&crate::skills::lifecycle::SelectionRequest {
             workspace_dir: &self.generation.effective.workspace_dir,
             enabled: self.generation.effective.skills_lifecycle.enabled,
@@ -937,7 +974,7 @@ impl TurnDecisionService {
                 direct
             }
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments(_) => {
+            TurnExecutionDirective::CollectApprovalArguments => {
                 anyhow::ensure!(
                     selected.action() == crate::causal_tree::branch::CausalActionKind::Answer
                         && selected_references.is_empty(),

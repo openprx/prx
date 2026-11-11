@@ -5,7 +5,6 @@ use super::{
     TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
 };
 use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CausalActionKind};
-use crate::causal_tree::candidate_generator::CandidateSet;
 use crate::tools::ToolSpec;
 use crate::tools::capability::search::CatalogSearch;
 use crate::tools::capability::search_tool::CapabilitySearchPort;
@@ -15,6 +14,18 @@ pub(super) use append::MAX_DISCOVERED_TOOLS_PER_TURN;
 
 pub(super) use crate::tools::capability::search_tool::DiscoveryOffers;
 use crate::tools::capability::search_tool::{DiscoveryEntry, DiscoveryScope};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SearchControlUnavailable {
+    #[error(
+        "capability discovery unavailable: catalog has eligible deferred tools but no search control; rebuild the runtime catalog"
+    )]
+    MissingCatalogEntry,
+    #[error(
+        "capability discovery unavailable: the published search control has no live backend; rebuild the runtime registry"
+    )]
+    MissingBackend,
+}
 
 impl TurnDecisionService {
     pub(crate) fn capability_search_port(
@@ -26,6 +37,23 @@ impl TurnDecisionService {
             self.agent_capability_search_spec(proof, context)?.is_some(),
             "turn does not expose capability search"
         );
+        let entries = self.discovery_entries(proof, context)?;
+        let offers = context.discovery_offers.get_or_init(Default::default);
+        Ok(CapabilitySearchPort::new(Arc::new(DiscoveryScope::published(
+            Arc::clone(&self.catalog),
+            self.publication_policy.clone(),
+            entries,
+            Arc::downgrade(offers),
+            Arc::downgrade(&context.execution_closed),
+            Arc::downgrade(&self.execution),
+        ))))
+    }
+
+    pub(super) fn discovery_entries(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> anyhow::Result<BTreeMap<CapabilityId, DiscoveryEntry>> {
         let families = self.discovery_families(proof, context)?;
         let view = self
             .catalog
@@ -42,7 +70,7 @@ impl TurnDecisionService {
             });
             let eligible = !matches!(
                 entry.public_name.as_str(),
-                "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate" | "sessions_spawn"
+                "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate"
             ) && (entry.supports_metadata_discovery()
                 || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
                 && entry.availability.level >= CapabilityAvailabilityLevel::Configured
@@ -64,7 +92,7 @@ impl TurnDecisionService {
                     proof.policy_channel(),
                     proof.policy_chat_type(),
                 ) != crate::tools::execution::ToolExecutionDecision::Deny;
-            if !eligible || (!core && !families.contains(&entry.family)) {
+            if !eligible {
                 continue;
             }
             entries.insert(
@@ -76,25 +104,41 @@ impl TurnDecisionService {
                         generation: entry.generation,
                     },
                     core,
-                    searchable: families.contains(&entry.family)
-                        && (entry.supports_metadata_discovery() || offered_direct.contains(&entry.id)),
+                    searchable: entry.supports_metadata_discovery() || offered_direct.contains(&entry.id),
                 },
             );
         }
-        self.discovery_families(proof, context)?;
-        let offers = context.discovery_offers.get_or_init(Default::default);
-        Ok(CapabilitySearchPort::new(Arc::new(DiscoveryScope::published(
-            Arc::clone(&self.catalog),
-            self.publication_policy.clone(),
-            entries,
-            Arc::downgrade(offers),
-            Arc::downgrade(&context.execution_closed),
-            Arc::downgrade(&self.execution),
-        ))))
+        // An explicit engine-selected family may narrow discovery. A Direct
+        // turn has no family prerequisite; an empty narrowing must not strand
+        // otherwise eligible capabilities.
+        if let Some(family) = families.first().copied() {
+            if entries
+                .iter()
+                .any(|(id, entry)| entry.searchable && view.entry_any(id).is_some_and(|item| item.family == family))
+            {
+                entries.retain(|id, entry| entry.core || view.entry_any(id).is_some_and(|item| item.family == family));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Only an explicit executable engine hop may narrow the index. Empty
+    /// families on ordinary Direct turns mean the full eligible index.
+    fn discovery_families(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> anyhow::Result<Vec<CapabilityTarget>> {
+        self.agent_execution_specs(proof, context)?;
+        if matches!(context.directive(), TurnExecutionDirective::Execute { .. }) {
+            Ok(super::discovery_scope(context.audit_hops())?.into_iter().collect())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Stable control definition, separate from the selected business refs and
-    /// the two fixed runtime dependencies. Explicit exclusions still apply.
+    /// conditional runtime dependencies. Explicit exclusions still apply.
     pub(crate) fn agent_capability_search_spec(
         &self,
         proof: &dyn TurnSourceProof,
@@ -109,23 +153,17 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        if matches!(context.directive(), TurnExecutionDirective::AnswerDirectly)
-            && !self.publication_policy.direct_names.contains("capability_search")
+        if !self
+            .discovery_entries(proof, context)?
+            .values()
+            .any(|entry| entry.searchable)
         {
-            let signals = crate::decision::builtin::features::text_signals(context.engine.state.routing_input.as_str());
-            if !signals.structural()
-                && signals.request_weight <= crate::decision::builtin::weights::BRIEF_REQUEST_MAX_WEIGHT
-            {
-                return Ok(None);
-            }
-        }
-        if self.discovery_families(proof, context)?.is_empty() {
             return Ok(None);
         }
-        let Some(entry) = self.catalog.entry_for_public_name("capability_search") else {
-            tracing::warn!("decision catalog has discovery families but no capability_search backend");
-            return Ok(None);
-        };
+        let entry = self
+            .catalog
+            .entry_for_public_name("capability_search")
+            .ok_or(SearchControlUnavailable::MissingCatalogEntry)?;
         let trusted = context.engine.state.trusted.parts();
         if self.catalog_view().surface_excludes(entry)
             || trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))
@@ -142,11 +180,10 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        let Some(descriptor) = self.execution.current_descriptor("capability_search") else {
-            // A child registry can inherit the parent's catalog entry without
-            // the control-port backend. Hide the port; do not fail the turn.
-            return Ok(None);
-        };
+        let descriptor = self
+            .execution
+            .current_descriptor("capability_search")
+            .ok_or(SearchControlUnavailable::MissingBackend)?;
         let spec = ToolSpec {
             name: descriptor.public_name,
             description: descriptor.description,
@@ -162,65 +199,6 @@ impl TurnDecisionService {
             "capability search definition changed"
         );
         Ok(Some(spec))
-    }
-
-    fn discovery_families(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
-    ) -> anyhow::Result<Vec<CapabilityTarget>> {
-        anyhow::ensure!(
-            !context.execution_closed.load(Ordering::Acquire)
-                && matches!(
-                    context.directive(),
-                    TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
-                )
-                && proof.tool_calls_allowed()
-                && self.model_can_call_tools(proof),
-            "turn does not permit capability discovery"
-        );
-        self.agent_execution_specs(proof, context)?;
-        if let Some(family) = super::discovery_scope(context.audit_hops())? {
-            return Ok(vec![family]);
-        }
-        let mut families = Vec::new();
-        for decision in context.audit_hops() {
-            match &decision.candidates {
-                CandidateSet::Legal {
-                    discoverable_families, ..
-                } => {
-                    for family in discoverable_families.iter() {
-                        if !families.contains(&family) {
-                            families.push(family);
-                        }
-                    }
-                }
-                CandidateSet::NoLegalPath { .. } => {}
-            }
-        }
-        let view = self.catalog_view();
-        for id in self.direct_discovery_ids(context) {
-            if let Some(entry) = view.entry_any(&id)
-                && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(entry.family)
-                && !families.contains(&entry.family)
-            {
-                families.push(entry.family);
-            }
-        }
-        // Engine-off Direct (`without_prediction`) never runs the generator, so
-        // `discoverable_families` stays empty. Offer the same searchable families
-        // the generator would have marked so the control port can still publish.
-        if families.is_empty() {
-            for entry in view.iter_entries() {
-                if entry.supports_metadata_discovery()
-                    && crate::causal_tree::candidate_generator::DiscoveryFamilies::supports(entry.family)
-                    && !families.contains(&entry.family)
-                {
-                    families.push(entry.family);
-                }
-            }
-        }
-        Ok(families)
     }
 
     /// A selected Skill needs a way to discover its execution tools after its

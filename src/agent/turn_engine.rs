@@ -531,12 +531,43 @@ async fn run_turn_unguarded(
         let constrained = service.agent_execution_specs(proof, context)?;
         let search_spec = service.agent_capability_search_spec(proof, context)?;
         let appended = service.agent_appended_execution_specs(proof, context)?;
+        let advertises_skills = history
+            .iter()
+            .any(|message| message.role == "system" && message.content.contains("<available_skills>"));
+        let skill_spec = if advertises_skills && proof.tool_calls_allowed() && service.model_can_call_tools(proof) {
+            // Exact selected/discovered skill readers already passed source
+            // and fingerprint admission, including their bound skill name.
+            let admitted = constrained
+                .specs
+                .iter()
+                .chain(appended.specs.iter())
+                .find(|spec| spec.name == "skill_read")
+                .cloned();
+            match admitted.map_or_else(
+                || service.agent_runtime_dependency_spec(proof, context, "skill_read"),
+                Ok,
+            ) {
+                Ok(spec) => Some(spec),
+                Err(error) => {
+                    tracing::warn!(%error, "suppressing skill metadata: live skill_read is unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if advertises_skills && skill_spec.is_none() {
+            super::runtime_prompt::suppress_unreadable_skill_metadata(history);
+            tracing::warn!("skill metadata suppressed because this turn has no admitted skill_read");
+        }
+
         let mut selected_tools: Vec<&dyn Tool> = tools_registry
             .iter()
             .filter(|tool| {
                 constrained.roots.contains(tool.name())
                     || appended.roots.contains(tool.name())
                     || search_spec.as_ref().is_some_and(|spec| spec.name == tool.name())
+                    || skill_spec.as_ref().is_some_and(|spec| tool.supports_name(&spec.name))
             })
             .map(Box::as_ref)
             .collect();
@@ -570,6 +601,10 @@ async fn run_turn_unguarded(
         tool_specs.extend(appended.specs);
         if let Some(spec) = search_spec {
             tool_specs.push(spec);
+        }
+        if let Some(spec) = &skill_spec {
+            tool_specs.retain(|candidate| candidate.name != spec.name);
+            tool_specs.push(spec.clone());
         }
         if expose_stay_silent {
             {
@@ -816,6 +851,15 @@ async fn run_turn_unguarded(
             {
                 tool_specs_rewritten = true;
             }
+        }
+        if !tool_specs.iter().any(|spec| spec.name == "skill_read")
+            && prepared_messages
+                .messages
+                .iter()
+                .any(|message| message.role == "system" && message.content.contains("<available_skills>"))
+        {
+            super::runtime_prompt::suppress_unreadable_skill_metadata(&mut prepared_messages.messages);
+            tracing::warn!("skill metadata suppressed because the final tool surface has no skill_read");
         }
         {
             let fingerprints = &decision_fingerprints;

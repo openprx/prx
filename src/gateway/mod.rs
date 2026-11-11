@@ -26,7 +26,7 @@
 mod agent_lifecycle;
 mod api;
 #[cfg(test)]
-pub(crate) use api::drive_disabled_engine_console_entry;
+pub(crate) use api::{drive_disabled_engine_console_entry, drive_search_console_entry};
 mod compat;
 mod decision_cleanup;
 mod decision_runtime;
@@ -4007,4 +4007,4 @@ mod platform_test_transport;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::drive_disabled_engine_webhook_entry;
+pub(crate) use tests::{drive_disabled_engine_webhook_entry, drive_search_webhook_entry};

@@ -7,6 +7,7 @@
 //! It never leaves `127.0.0.1`, and every credential is a sentinel.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
 use axum::Router;
@@ -27,6 +28,8 @@ struct ModelState {
     tool: String,
     arguments: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    search_issued: Arc<AtomicBool>,
+    tool_issued: Arc<AtomicBool>,
 }
 
 /// A loopback chat-completions endpoint whose first answer in a turn is a
@@ -46,26 +49,35 @@ impl ScriptedStoreModel {
         .await
     }
 
-    /// A model whose first answer is one native call of `tool` with
-    /// `arguments`, and whose every later answer is text.
+    /// A model that discovers a deferred tool, attempts its native call with
+    /// `arguments`, then answers with text.
     pub(crate) async fn start_calling(tool: &str, arguments: &Value) -> Self {
         async fn complete(State(state): State<ModelState>, Json(body): Json<Value>) -> Json<Value> {
-            let already_called = {
-                let mut requests = state.requests.lock();
-                let already_called = !requests.is_empty();
-                requests.push(body.clone());
-                already_called
+            state.requests.lock().push(body.clone());
+            let declared = |name: &str| {
+                body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(name))
+                })
             };
-            let answered = already_called
-                || body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message.get("role").and_then(Value::as_str) == Some("tool")
-                            || message
-                                .get("content")
-                                .and_then(Value::as_str)
-                                .is_some_and(|content| content.contains(STORED_PREFIX))
-                    })
-                });
+            if !state.tool_issued.load(Ordering::SeqCst)
+                && !declared(&state.tool)
+                && declared("capability_search")
+                && !state.search_issued.swap(true, Ordering::SeqCst)
+            {
+                return Json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": null, "tool_calls": [{
+                            "id": "call_cron_origin_search", "type": "function",
+                            "function": {"name": "capability_search", "arguments": json!({"query": state.tool, "limit": 1}).to_string()}
+                        }]}, "finish_reason": "tool_calls"
+                    }]
+                }));
+            }
+            // Still attempt the requested call after a denied search so negative
+            // origin tests continue to exercise the dispatch boundary.
+            let answered = state.tool_issued.swap(true, Ordering::SeqCst);
             if answered {
                 return Json(json!({
                     "choices": [{
@@ -95,6 +107,8 @@ impl ScriptedStoreModel {
             tool: tool.to_string(),
             arguments: arguments.to_string(),
             requests: Arc::clone(&requests),
+            search_issued: Arc::new(AtomicBool::new(false)),
+            tool_issued: Arc::new(AtomicBool::new(false)),
         };
         let app = Router::new()
             .route("/v1/chat/completions", post(complete))

@@ -1029,6 +1029,10 @@ fn exact_delegator_ref(decision: &EngineDecision, reference: &CapabilityRef) -> 
     })
 }
 
+pub(super) const fn sealed_direct_delegator(decision: &EngineDecision) -> bool {
+    decision.prediction.is_none() && decision.outgoing_child.is_some()
+}
+
 fn direct_answer_refs(
     decision: &EngineDecision,
     catalog: &CatalogView<'_>,
@@ -1060,7 +1064,8 @@ fn direct_answer_refs(
             // Direct-surface mint already sealed a child manifest for a named
             // or Direct delegator. Publish that entry so the serving model can
             // call it without a hop-derived Delegate candidate.
-            let minted_delegator = delegation && decision.prediction.is_none() && decision.outgoing_child.is_some();
+            let minted_delegator =
+                delegation && sealed_direct_delegator(decision) && trusted.surface != TurnSurfaceKind::Interactive;
             // A selected local search is already a bounded, turn-scoped
             // relevance decision. Carry that exact schema into the serving
             // model's final snapshot when the following hop answers, while
@@ -1313,7 +1318,7 @@ impl TurnDecisionContext {
         &mut self,
         proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
     ) {
-        self.directive = TurnExecutionDirective::CollectApprovalArguments(proof.clone());
+        self.directive = TurnExecutionDirective::CollectApprovalArguments;
         self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
     }
 
@@ -1389,7 +1394,7 @@ impl TurnDecisionContext {
                 reply: render_terminal_directive(&self.directive)?,
             }),
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments(_) if !self.execution_closed.load(Ordering::Acquire) => {
+            TurnExecutionDirective::CollectApprovalArguments if !self.execution_closed.load(Ordering::Acquire) => {
                 Ok(TurnDisposition::Run)
             }
             TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
@@ -1401,7 +1406,7 @@ impl TurnDecisionContext {
                 Ok(TurnDisposition::Run)
             }
             #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments(_) => Err(DirectiveError::NotAdmitted),
+            TurnExecutionDirective::CollectApprovalArguments => Err(DirectiveError::NotAdmitted),
             TurnExecutionDirective::AnswerDirectly
             | TurnExecutionDirective::Execute { .. }
             | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
@@ -1442,7 +1447,7 @@ impl TurnDecisionContext {
             TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable".to_owned()),
             TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable".to_owned()),
             TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable".to_owned()),
-            TurnExecutionDirective::CollectApprovalArguments(_) => {
+            TurnExecutionDirective::CollectApprovalArguments => {
                 ("CollectApprovalArguments", "not_applicable".to_owned())
             }
         }
@@ -1450,7 +1455,7 @@ impl TurnDecisionContext {
 
     #[cfg(test)]
     pub(crate) const fn carries_collect_directive_for_test(&self) -> bool {
-        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments(_))
+        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments)
     }
 }
 
@@ -3172,7 +3177,7 @@ impl TurnDecisionService {
                     ));
                 }
                 #[cfg(test)]
-                TurnExecutionDirective::CollectApprovalArguments(_) => {
+                TurnExecutionDirective::CollectApprovalArguments => {
                     if cancellation.is_cancelled() {
                         if has_router_transition {
                             return terminal_after_catalog_drift(&state, prior_hops)

@@ -3248,7 +3248,7 @@ mod real_mode_tests;
 #[cfg(test)]
 mod turn_characterization_tests;
 #[cfg(test)]
-pub(crate) use turn_characterization_tests::drive_disabled_engine_chat_entry;
+pub(crate) use turn_characterization_tests::{drive_disabled_engine_chat_entry, drive_search_chat_entry};
 
 #[cfg(test)]
 mod tool_tiering_tests;

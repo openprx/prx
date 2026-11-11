@@ -952,3 +952,66 @@ async fn discovery_cannot_append_an_excluded_tool() {
     assert_eq!(denied.len(), 3);
     assert!(denied.iter().all(|offer| !contains(offer, WEB_TOOL)));
 }
+
+#[tokio::test]
+async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Result<()> {
+    use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
+    use anyhow::Context as _;
+    for input in ["hi", "sessions_spawn"] {
+        let workspace = tempfile::tempdir()?;
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.path().to_owned();
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let provider = Arc::new(CatalogRecordingProvider::new(None, None));
+        let (actions, _receiver) = mpsc::channel::<Action>(128);
+        let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
+            provider,
+            Some(spawn_probe_registry()),
+            config,
+            ("ollama", "tiering-model", None),
+            ("prx_deferred_spawn", input),
+            actions,
+            CancellationToken::new(),
+        )
+        .await;
+        let routing = admitted
+            .binding
+            .decision_routing()
+            .context("source-bound chat routing")?;
+        let initial = routing.service.agent_execution_specs(routing.proof, routing.context)?;
+        assert!(!initial.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL));
+        assert!(
+            routing
+                .service
+                .agent_capability_search_spec(routing.proof, routing.context)?
+                .is_some()
+        );
+        let port = routing.service.capability_search_port(routing.proof, routing.context)?;
+        let found = with_search_authority(
+            Some(port),
+            CapabilitySearchTool.execute(serde_json::json!({"query": SESSIONS_SPAWN_TOOL, "limit": 1})),
+        )
+        .await?;
+        assert!(found.success);
+        assert!(found.output.contains(SESSIONS_SPAWN_TOOL));
+        assert_eq!(
+            routing
+                .service
+                .admit_offered_discoveries(routing.proof, routing.context, |_, _| false),
+            1
+        );
+        let appended = routing
+            .service
+            .agent_appended_execution_specs(routing.proof, routing.context)?;
+        assert!(appended.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL));
+        let (_, execution) =
+            routing
+                .service
+                .bind_agent_execution(routing.proof, routing.context, &admitted.context, &appended.specs)?;
+        assert!(
+            execution.child_grant.is_some(),
+            "deferred publication retains the sealed child grant"
+        );
+    }
+    Ok(())
+}

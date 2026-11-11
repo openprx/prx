@@ -14,6 +14,7 @@ pub(crate) mod admission;
 mod engine_safety;
 pub(crate) mod engine_switch;
 mod parameters;
+pub(crate) mod reachability;
 
 use crate::agent::compaction::is_tool_roundtrip_companion;
 use crate::agent::context_budget::{budgeted_tokens, estimate_history_tokens_with_source};

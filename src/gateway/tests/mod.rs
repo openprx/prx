@@ -1116,3 +1116,58 @@ async fn all_workspace_message_events(
         .await
         .expect("test: list the workspace's message events")
 }
+
+pub(crate) async fn drive_search_webhook_entry(mut config: Config, input: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    config.gateway.require_pairing = false;
+    let workspace = config.workspace_dir.as_path();
+    let provider: Arc<dyn Provider> = Arc::from(crate::agent::turn_tests::reachability::provider(&config)?);
+    let model = config.default_model.clone().context("webhook model")?;
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace)?);
+    let registry = crate::agent::turn_tests::reachability::registry(&config, Arc::clone(&memory));
+    let mut state = AppState {
+        config: crate::config::new_shared(config.clone()),
+        provider,
+        model,
+        temperature: 0.0,
+        mem: Arc::clone(&memory),
+        auto_save: false,
+        tools_registry: registry,
+        mcp_tool: None,
+        turn_runtime: None,
+        hooks: Arc::new(HookManager::new(workspace.to_path_buf())),
+        webhook_token_hash: None,
+        webhook_signing_secret: None,
+        pairing: Arc::new(PairingGuard::new(false, &[])),
+        trust_forwarded_headers: false,
+        rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+        idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
+        whatsapp: None,
+        signal: None,
+        whatsapp_app_secret: None,
+        linq: None,
+        linq_signing_secret: None,
+        nextcloud_talk: None,
+        nextcloud_talk_webhook_secret: None,
+        observer: Arc::new(crate::observability::NoopObserver),
+        start_time: Instant::now(),
+        gateway_port: 0,
+        logs_broadcast_tx: broadcast::channel(16).0,
+        #[cfg(feature = "wasm-plugins")]
+        plugin_runtime: None,
+    };
+    install_webhook_turn_runtime(&mut state);
+    let response = handle_webhook(
+        State(state),
+        test_connect_info(),
+        test_uri(),
+        HeaderMap::new(),
+        Bytes::from(serde_json::to_vec(
+            &serde_json::json!({"message":input,"reply_target":"prx_probe_client"}),
+        )?),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(response.status().is_success(), "webhook failed: {}", response.status());
+    Ok(())
+}

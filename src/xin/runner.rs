@@ -2166,3 +2166,28 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) async fn drive_search_xin_entry(config: Config, input: &str) -> anyhow::Result<()> {
+    use crate::cron::origin_test_support::{Surface, execute_as, surface_context};
+    use anyhow::Context as _;
+    let policy = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    let created = execute_as(
+        Box::new(crate::tools::XinTool::new(
+            crate::config::new_shared(config.clone()),
+            Arc::clone(&policy),
+        )),
+        surface_context(&config, Surface::AgentCli),
+        serde_json::json!({
+            "action":"add","name":"prx_search_probe","payload":input,"execution_mode":"agent_session",
+        }),
+    )
+    .await;
+    anyhow::ensure!(created.success, "xin creation failed: {created:?}");
+    let task = store::list_tasks(&config)?
+        .into_iter()
+        .next()
+        .context("created xin task")?;
+    run_task_now(&config, &policy, &task.id).await?;
+    Ok(())
+}

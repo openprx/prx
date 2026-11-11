@@ -68,6 +68,8 @@ use tempfile::TempDir;
 
 #[path = "chat_pty_e2e/decision_resume.rs"]
 mod decision_resume;
+#[path = "chat_pty_e2e/search_reachability.rs"]
+mod search_reachability;
 
 // D-071: every wait below ends on an event (the expected output, the process
 // exiting, the peer recording a call). These limits only turn a hang into a

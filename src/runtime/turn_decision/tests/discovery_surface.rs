@@ -303,7 +303,7 @@ impl Tool for DiscoverySurfaceTool {
 }
 
 #[tokio::test]
-async fn default_greeting_keeps_production_discovery_closed() {
+async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
@@ -389,9 +389,9 @@ async fn default_greeting_keeps_production_discovery_closed() {
         service
             .agent_capability_search_spec(&proof, &context)
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    assert!(service.capability_search_port(&proof, &context).is_err());
+    assert!(service.capability_search_port(&proof, &context).is_ok());
     assert!(
         service
             .prepare_discovered_tool(&proof, &context, "skills_list")
@@ -1424,4 +1424,42 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn eligible_deferred_tools_require_a_live_search_control() -> anyhow::Result<()> {
+    for include_reader in [false, true] {
+        let workspace = tempfile::tempdir()?;
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+        let tools: Vec<Box<dyn Tool>> = if include_reader {
+            vec![Box::new(crate::tools::memory_get::MemoryGetTool::new(
+                workspace.path().to_owned(),
+                memory,
+                false,
+            ))]
+        } else {
+            Vec::new()
+        };
+        let admitted =
+            crate::agent::test_admission::AdmittedTurn::with_tools(workspace.path(), "hi", Arc::new(tools)).await;
+        let decision = admitted.decision();
+        let result = decision
+            .service
+            .agent_capability_search_spec(decision.proof, decision.context);
+        if include_reader {
+            let error = result
+                .err()
+                .context("missing control must be an explicit availability error")?;
+            anyhow::ensure!(
+                matches!(
+                    error.downcast_ref::<super::super::discovery::SearchControlUnavailable>(),
+                    Some(super::super::discovery::SearchControlUnavailable::MissingCatalogEntry)
+                ),
+                "unexpected availability error: {error:#}"
+            );
+        } else {
+            anyhow::ensure!(result?.is_none(), "empty catalog needs no discovery control");
+        }
+    }
+    Ok(())
 }

@@ -22,7 +22,7 @@ pub(crate) enum SelectedReadPurpose {
 #[derive(Debug, Clone)]
 pub(crate) enum TurnExecutionDirective {
     #[cfg(test)]
-    CollectApprovalArguments(super::approval_collection::DeferredArgumentProof),
+    CollectApprovalArguments,
     AnswerDirectly,
     Retrieve {
         sources: Vec<CapabilityRef>,
@@ -158,7 +158,7 @@ pub(crate) fn directive_from_selection(
             {
                 return Err(DirectiveError::NotAdmitted);
             }
-            Ok(TurnExecutionDirective::CollectApprovalArguments(proof.clone()))
+            Ok(TurnExecutionDirective::CollectApprovalArguments)
         }
         Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => {
             let CandidateSet::Legal {

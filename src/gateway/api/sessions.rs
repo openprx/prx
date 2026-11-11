@@ -2680,6 +2680,11 @@ pub(crate) async fn drive_disabled_engine_console_entry(workspace: &std::path::P
 }
 
 #[cfg(test)]
+pub(crate) async fn drive_search_console_entry(config: crate::config::Config, input: &str) -> anyhow::Result<()> {
+    tests::drive_search_console_entry(config, input).await
+}
+
+#[cfg(test)]
 mod tests {
     mod targeting;
     use super::*;
@@ -2693,6 +2698,42 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::broadcast;
+
+    pub(super) async fn drive_search_console_entry(config: Config, input: &str) -> anyhow::Result<()> {
+        use crate::agent::turn_tests::reachability::{boxed_root_probe, provider, registry};
+        let workspace = config.workspace_dir.clone();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
+        let provider: Arc<dyn Provider> = Arc::from(provider(&config)?);
+        let mut state = test_app_state_with_config(config.clone(), provider);
+        state.tools_registry = registry(&config, Arc::clone(&memory));
+        state.mem = memory;
+        state.hooks = Arc::new(HookManager::new(workspace.clone()));
+        let cleanup =
+            crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?;
+        cleanup
+            .run(boxed_root_probe(|| async move {
+                let envelope = console_runtime_envelope_for_workspace(
+                    workspace.to_string_lossy().to_string(),
+                    "prx_search_console",
+                    "console",
+                    "prx_user",
+                );
+                let (runtime, _, _, proof) = console_test_source(&mut state, envelope, input).await;
+                let _ = run_console_message_job(
+                    runtime,
+                    state,
+                    input.to_owned(),
+                    Vec::new(),
+                    ConsoleTurnSource::Message(proof),
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+                Ok(())
+            }))
+            .await?;
+        Ok(())
+    }
 
     pub(super) async fn drive_disabled_engine_console_entry(workspace: &std::path::Path) {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())

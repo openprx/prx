@@ -756,3 +756,103 @@ fn gate_test_message() -> traits::ChannelMessage {
         sender_is_bot: false,
     }
 }
+
+pub(crate) async fn drive_search_channel_entry(config: Config, input: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let workspace = config.workspace_dir.as_path();
+    let wire_provider: Arc<dyn Provider> = Arc::from(crate::agent::turn_tests::reachability::provider(&config)?);
+    let wire_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace)?);
+    let wire_tools = crate::agent::turn_tests::reachability::registry(&config, Arc::clone(&wire_memory));
+    let wire_policy = Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        workspace,
+    ));
+    let shared = crate::config::new_shared(config.clone());
+    let generation = shared.pin();
+    let channel_impl = Arc::new(RecordingChannel::default());
+    let channel: Arc<dyn Channel> = channel_impl;
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+    let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        config: shared,
+        config_generation: generation,
+        channels_by_name: Arc::new(channels_by_name),
+        provider: wire_provider,
+        default_provider: Arc::new(config.default_provider.clone().context("channel provider")?),
+        memory: Arc::clone(&wire_memory),
+        tools_registry: wire_tools,
+        observer: Arc::new(NoopObserver),
+        hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf())),
+        model: Arc::new(config.default_model.clone().context("channel model")?),
+        temperature: 0.0,
+        auto_save_memory: false,
+        memory_event_recording: config.memory.event_recording_config(),
+        read_only_tool_concurrency_window: 2,
+        priority_scheduling_enabled: false,
+        low_priority_tools: Vec::new(),
+        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        api_key: config.api_key.clone(),
+        api_url: config.api_url.clone(),
+        reliability: Arc::new(config.reliability.clone()),
+        interrupt_on_new_message: false,
+        multimodal: config.multimodal.clone(),
+        security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+            security: Arc::clone(&wire_policy),
+        })),
+        provider_runtime_options: providers::provider_runtime_options_from_config(&config),
+        workspace_dir: Arc::new(workspace.to_path_buf()),
+        tool_tiering: config.tool_tiering.clone(),
+        signal_inbound_policy: None,
+        whatsapp_inbound_policy: None,
+        bot_names: vec!["prx".to_string()],
+        bot_uuids: vec![],
+        mention_only_by_channel: HashMap::new(),
+        group_reply_mode_by_channel: HashMap::new(),
+        smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        test_inbound_authorizer: None,
+    });
+    run_search_channel_probe(
+        runtime_ctx,
+        traits::ChannelMessage {
+            id: "prx-search-channel".to_string(),
+            sender: "prx_user".to_string(),
+            reply_target: "prx_channel".to_string(),
+            content: input.to_owned(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        },
+        CancellationToken::new(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_search_channel_probe(
+    ctx: Arc<ChannelRuntimeContext>,
+    message: traits::ChannelMessage,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()> {
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;
+    let retained = Arc::clone(&ctx);
+    cleanup
+        .run(crate::agent::turn_tests::reachability::boxed_root_probe(
+            || async move {
+                process_channel_message(ctx, message, cancellation).await;
+                Ok(())
+            },
+        ))
+        .await?;
+    drop(retained);
+    Ok(())
+}
