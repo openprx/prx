@@ -386,6 +386,7 @@ impl Memory for SelectedMemoryView<'_> {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         owner_id: Option<&str>,
+        agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         let _ = (
             session_key,
@@ -396,6 +397,7 @@ impl Memory for SelectedMemoryView<'_> {
             timestamp,
             message_id,
             owner_id,
+            agent_partition,
         );
         anyhow::bail!("custom retrieval append_conversation_turn is outside bounded recall; migration required")
     }

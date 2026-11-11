@@ -515,6 +515,7 @@ impl Memory for SqliteMemory {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         owner_id: Option<&str>,
+        agent_partition: Option<&crate::memory::AgentPartition>,
     ) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         let session_key = session_key.to_string();
@@ -528,6 +529,10 @@ impl Memory for SqliteMemory {
             .map(str::to_string)
             .or_else(|| Some(format!("legacy:{session_key}")));
         let preview = Self::conversation_preview(&content);
+        let named = matches!(
+            agent_partition.map(|partition| &partition.key),
+            Some(crate::memory::PartitionKey::Named { .. })
+        );
 
         crate::runtime::blocking::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = pool.write();
@@ -565,10 +570,13 @@ impl Memory for SqliteMemory {
                     .query_map([parent], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 match parents.as_slice() {
-                    [scope] => scope.clone(),
-                    [] => None,
+                    [Some(scope)] => Some(scope.clone()),
+                    [None] | [] if named => return Err(crate::memory::AgentScopeRefused.into()),
+                    [None] | [] => None,
                     _ => return Err(crate::memory::AgentScopeRefused.into()),
                 }
+            } else if named {
+                return Err(crate::memory::AgentScopeRefused.into());
             } else {
                 None
             };

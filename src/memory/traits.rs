@@ -1875,6 +1875,7 @@ pub trait Memory: Send + Sync {
         timestamp: Option<&str>,
         message_id: Option<&str>,
         owner_id: Option<&str>,
+        agent_partition: Option<&AgentPartition>,
     ) -> anyhow::Result<()> {
         let _ = (
             session_key,
@@ -1885,6 +1886,7 @@ pub trait Memory: Send + Sync {
             timestamp,
             message_id,
             owner_id,
+            agent_partition,
         );
         Ok(())
     }

@@ -707,6 +707,7 @@ async fn append_conversation_turn_persists_session_and_turns() {
         Some("2026-03-05T00:00:00Z"),
         Some("msg-1"),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -717,6 +718,7 @@ async fn append_conversation_turn_persists_session_and_turns() {
         "assistant",
         "first assistant message",
         Some("2026-03-05T00:00:01Z"),
+        None,
         None,
         None,
     )
@@ -781,6 +783,7 @@ async fn append_conversation_turn_stores_owner_id() {
         Some("2026-03-05T00:00:00Z"),
         Some("msg-owned"),
         Some("owner:alice"),
+        None,
     )
     .await
     .unwrap();
@@ -818,6 +821,7 @@ async fn conversation_turns_owner_acl_filters_same_session_key() {
         Some("2026-03-05T00:00:00Z"),
         Some("msg-a"),
         Some("owner:alice"),
+        None,
     )
     .await
     .unwrap();
@@ -830,6 +834,7 @@ async fn conversation_turns_owner_acl_filters_same_session_key() {
         Some("2026-03-05T00:00:01Z"),
         Some("msg-b"),
         Some("owner:bob"),
+        None,
     )
     .await
     .unwrap();
@@ -871,6 +876,7 @@ async fn load_recent_conversation_histories_limits_per_session() {
             Some(&format!("2026-03-05T00:00:0{idx}Z")),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -900,6 +906,7 @@ async fn list_conversation_turns_returns_latest_window_chronologically() {
             Some(&format!("2026-03-05T00:00:0{idx}Z")),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -927,6 +934,7 @@ async fn load_recent_conversation_histories_limits_sessions_by_updated_at() {
         Some("2026-03-05T00:00:00Z"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -939,6 +947,7 @@ async fn load_recent_conversation_histories_limits_sessions_by_updated_at() {
         Some("2026-03-05T00:00:01Z"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -949,6 +958,7 @@ async fn load_recent_conversation_histories_limits_sessions_by_updated_at() {
         "user",
         "turn-c",
         Some("2026-03-05T00:00:02Z"),
+        None,
         None,
         None,
     )

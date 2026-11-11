@@ -1,4 +1,4 @@
-//! Review r1 findings: H1 cache decline, M2 unique unfenced, M3 parent, M5 W/O.
+//! Review findings: H1 cache decline, M2 unique unfenced, M3 parent, M5 W/O, r2 M3 refuse.
 use super::*;
 use crate::config::agent_name::AgentName;
 use crate::memory::{
@@ -144,6 +144,35 @@ fn lookup_write_scope_refuses_multiple_unfenced_scopes() {
     );
 }
 
+fn seed_session_with_count(conn: &Connection, message_count: i64) {
+    conn.execute(
+        "INSERT INTO sessions (
+            session_key, channel, sender, owner_id, created_at, updated_at, message_count, last_message_preview
+         ) VALUES (?1, 'console', 'sender', ?2, 't', 't', ?3, 'prev')",
+        params![SESSION, O, message_count],
+    )
+    .unwrap();
+}
+
+fn assert_named_parent_refused_and_rolled_back(conn: &Connection, error: anyhow::Error) {
+    assert!(
+        error.downcast_ref::<AgentScopeRefused>().is_some(),
+        "Named missing/unscoped parent: {error:#}"
+    );
+    let turns: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conversation_turns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(turns, 0, "Named parent refusal must not insert a turn");
+    let count: i64 = conn
+        .query_row(
+            "SELECT message_count FROM sessions WHERE session_key = ?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 5, "Named parent refusal must roll back the session increment");
+}
+
 #[tokio::test]
 async fn append_conversation_turn_inherits_parent_stamp_inside_the_writer_tx() {
     let tmp = TempDir::new().unwrap();
@@ -166,6 +195,7 @@ async fn append_conversation_turn_inherits_parent_stamp_inside_the_writer_tx() {
         None,
         Some("evt-x"),
         Some(O),
+        Some(&named()),
     )
     .await
     .unwrap();
@@ -181,6 +211,61 @@ async fn append_conversation_turn_inherits_parent_stamp_inside_the_writer_tx() {
         Some(SX),
         "W4 inherits the parent stamp inside BEGIN IMMEDIATE"
     );
+}
+
+#[tokio::test]
+async fn append_conversation_turn_refuses_a_missing_parent_under_named() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let conn = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+    seed_named(&conn);
+    seed_session_with_count(&conn, 5);
+    let error = mem
+        .append_conversation_turn(
+            SESSION,
+            "console",
+            "sender",
+            "user",
+            "hello",
+            None,
+            Some("missing-evt"),
+            Some(O),
+            Some(&named()),
+        )
+        .await
+        .unwrap_err();
+    assert_named_parent_refused_and_rolled_back(&conn, error);
+}
+
+#[tokio::test]
+async fn append_conversation_turn_refuses_a_cleared_parent_stamp_under_named() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let conn = Connection::open(tmp.path().join("memory/brain.db")).unwrap();
+    seed_named(&conn);
+    seed_session_with_count(&conn, 5);
+    conn.execute(
+        "INSERT INTO message_events (event_id, workspace_id, owner_id, source, session_key, role,
+                                     event_type, content, visibility, created_at, updated_at, ma_scope_id)
+         VALUES ('evt-null', ?1, ?2, 'console', ?3, 'user', 'message.created', 'hello', 'session', 't', 't', NULL)",
+        params![W, O, SESSION],
+    )
+    .unwrap();
+    let error = mem
+        .append_conversation_turn(
+            SESSION,
+            "console",
+            "sender",
+            "user",
+            "hello",
+            None,
+            Some("evt-null"),
+            Some(O),
+            Some(&named()),
+        )
+        .await
+        .unwrap_err();
+    assert_named_parent_refused_and_rolled_back(&conn, error);
 }
 
 #[tokio::test]

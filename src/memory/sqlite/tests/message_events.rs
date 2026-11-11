@@ -709,6 +709,7 @@ async fn d4_list_conversation_turns_read_merges_legacy_key() {
         Some("2026-03-05T00:00:00Z"),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -719,6 +720,7 @@ async fn d4_list_conversation_turns_read_merges_legacy_key() {
         "user",
         "canonical turn",
         Some("2026-03-05T00:00:01Z"),
+        None,
         None,
         None,
     )

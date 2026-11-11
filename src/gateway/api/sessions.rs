@@ -467,6 +467,7 @@ async fn append_console_turn(
             None,
             event.as_ref().map(|event| event.event_id.as_str()),
             Some(owner_id.as_str()),
+            envelope.agent_partition.as_ref(),
         )
         .await?;
 
@@ -1711,6 +1712,7 @@ impl ConsolePendingInput {
                                 None,
                                 Some(&event.event_id),
                                 Some(&self.envelope.resolved_owner_id()),
+                                self.envelope.agent_partition.as_ref(),
                             )
                             .await?;
                     }
