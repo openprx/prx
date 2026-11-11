@@ -170,6 +170,10 @@ async fn fresh_process_ingress_child() {
     config.config_path = workspace.join("config.toml");
     config.default_model = Some(MODEL.into());
     config.causal_tree.enabled = true;
+    // The child proves recovery after a real selected private read. Request
+    // local prediction explicitly; ordinary Auto turns remain Direct.
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.policy.max_decision_hops = 1;
     if mode.starts_with("float-") {
         config.cost.prices.insert(

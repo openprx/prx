@@ -249,7 +249,10 @@ async fn run(known_usage: bool) {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(terminals, 1);
+        assert_eq!(
+            terminals, 1,
+            "the acquired embedding must leave a durable terminal; reply={reply:?}"
+        );
         if known_usage {
             assert_eq!(reply.unwrap(), "The expression adds two integers.");
             assert_eq!(calls.load(Ordering::SeqCst), 1);

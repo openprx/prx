@@ -263,6 +263,12 @@ impl Drop for Loopback {
 /// A configuration that reaches only the loopback model.
 pub(super) fn template(root: &Path, loopback: &Loopback) -> Config {
     let mut config = Config::default();
+    // These acceptance scenarios assert selected skill receipts and logical
+    // prediction deadlines. Request the local backend explicitly; default
+    // Auto turns intentionally keep their decision-free Direct surface.
+    config.causal_tree.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = root.join("workspace");
     config.config_path = root.join("config.toml");
     config.default_provider = Some(loopback.provider());
@@ -434,14 +440,14 @@ impl World {
     pub async fn run_task(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
         let run = crate::causal_tree::logical_clock::scope(
             std::sync::Arc::clone(&self.clock),
-            crate::agent::run(
+            Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt.to_string()),
                 None,
                 None,
                 0.0,
                 tokio_util::sync::CancellationToken::new(),
-            ),
+            )),
         );
         tokio::time::timeout(std::time::Duration::from_secs(60), run)
             .await

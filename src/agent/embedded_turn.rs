@@ -644,7 +644,16 @@ async fn run_work(
     let (outcome, trace) = match result {
         Ok(result) => result,
         Err(error) => {
+            let refusal = error
+                .downcast_ref::<crate::agent::send_admission::ProviderSendRefused>()
+                .map(|refused| refused.reply().into_owned());
             guard.finish_failure(&error, cancellation.is_cancelled()).await?;
+            if let Some(reply) = refusal {
+                agent
+                    .history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(&reply)));
+                return Ok(reply);
+            }
             return Err(error);
         }
     };
