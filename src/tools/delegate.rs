@@ -1144,6 +1144,8 @@ impl DelegateTool {
                 None => work.await,
             }
         };
+        #[cfg(test)]
+        let work = crate::causal_tree::logical_clock::inherit(work);
         #[cfg(all(test, unix))]
         let work = delegate_diagnostic::inherit(work);
         let mut task = DelegateTask(crate::agent::channel_approval::spawn(boxed_delegate_field(|| {
@@ -2695,6 +2697,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn delegate_empty_context_omits_prefix() {
+        assert_empty_delegate_context().await;
+    }
+
+    async fn assert_empty_delegate_context() {
         let (result, requests) = run_configured_delegate_fixture(
             vec!["dynamic_alias".to_owned()],
             vec![Arc::new(DynamicAliasTool)],
@@ -2706,13 +2712,83 @@ pub(crate) mod tests {
         )
         .await;
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(requests.len(), 2, "child must execute the tool and finish");
+        assert_eq!(
+            requests.len(),
+            2,
+            "child must execute the tool and finish: {}",
+            result.output
+        );
         let messages = requests[0]["messages"].as_array().unwrap();
         let user_message = messages
             .iter()
             .find(|message| message["role"] == "user")
             .expect("the provider must receive the delegated user input");
         assert_eq!(user_message["content"], "dynamic_alias");
+    }
+
+    /// The endpoint stalls only after a real child decision request arrives.
+    /// This spends more wall time than the unchanged 500 ms decision budget.
+    #[tokio::test(start_paused = true)]
+    async fn delegate_empty_context_executes_child_after_wall_preemption() {
+        let fixture = DELEGATE_CHILD_RESPONSE.scope(
+            crate::agent::agent::native_decision_fixture::ChildResponseControl::WallStall(
+                std::time::Duration::from_millis(600),
+            ),
+            async {
+                #[cfg(unix)]
+                super::delegate_diagnostic::scope(assert_empty_delegate_context)
+                    .await
+                    .expect("owned preemption diagnostic");
+                #[cfg(not(unix))]
+                assert_empty_delegate_context().await;
+            },
+        );
+        tokio::pin!(fixture);
+        let started = std::time::Instant::now();
+        loop {
+            if futures::poll!(fixture.as_mut()).is_ready() {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "fixture wall hang guard"
+            );
+            // Keep this task runnable while real socket/SQLite I/O completes;
+            // paused Tokio transport timers must not auto-advance on idle.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Logical decision time still expires: a clock fixture is not permission
+    /// to execute after the production admission budget has been spent.
+    #[tokio::test]
+    async fn delegate_child_logical_deadline_still_refuses_provider_calls() {
+        let clock = crate::causal_tree::logical_clock::ManualClock::new();
+        let control = crate::agent::agent::native_decision_fixture::ChildResponseControl::AdvanceClock(
+            Arc::clone(&clock),
+            std::time::Duration::from_millis(600),
+        );
+        let (result, requests) = crate::causal_tree::logical_clock::scope_local(
+            clock,
+            DELEGATE_CHILD_RESPONSE.scope(
+                control,
+                run_configured_delegate_fixture(
+                    vec!["dynamic_alias".to_owned()],
+                    vec![Arc::new(DynamicAliasTool)],
+                    "dynamic_alias",
+                    json!({}),
+                    None,
+                    false,
+                    Some(""),
+                ),
+            ),
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            requests.is_empty(),
+            "expired child admission must not reach the provider"
+        );
     }
 
     #[test]
@@ -2888,6 +2964,9 @@ pub(crate) mod tests {
     }
 
     tokio::task_local! { static CONFIGURED_DELEGATE_ENDPOINT: String; }
+    tokio::task_local! {
+        static DELEGATE_CHILD_RESPONSE: crate::agent::agent::native_decision_fixture::ChildResponseControl;
+    }
 
     async fn run_configured_delegate_fixture(
         allowed_tools: Vec<String>,
@@ -2903,9 +2982,17 @@ pub(crate) mod tests {
             .await
             .expect("owned compatible decision listener")
             .retain_evidence_at(retained.path().to_path_buf());
+        if let Ok(control) = DELEGATE_CHILD_RESPONSE.try_with(Clone::clone) {
+            driver.control_child_response(control);
+        }
         let endpoint = driver.endpoint().to_owned();
-        driver
-            .run_factory(true, move || async move {
+        let clock = crate::causal_tree::logical_clock::capture()
+            .unwrap_or_else(crate::causal_tree::logical_clock::ManualClock::new);
+        // These tests assert child tool behavior. Exclude OS preemption from
+        // admission while leaving production budgets and real I/O intact.
+        crate::causal_tree::logical_clock::scope_local(
+            clock,
+            driver.run_factory(true, move || async move {
                 observe_owned_delegate_workspace(move |workspace| async move {
                     CONFIGURED_DELEGATE_ENDPOINT
                         .scope(
@@ -2926,8 +3013,9 @@ pub(crate) mod tests {
                         .await
                 })
                 .await
-            })
-            .await
+            }),
+        )
+        .await
     }
 
     /// Runs the one native-tool delegation of

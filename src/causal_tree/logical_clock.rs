@@ -165,6 +165,12 @@ where
     CLOCK.scope(clock, fut)
 }
 
+/// Runs a fixture on its calling task without requiring its full future to be Send.
+#[cfg(test)]
+pub(crate) fn scope_local<F: Future>(clock: Arc<ManualClock>, fut: F) -> impl Future<Output = F::Output> {
+    CLOCK.scope(clock, fut)
+}
+
 /// The clock installed on this task, if any. Spawned work does not see it
 /// until the caller passes this handle back in through [`scope`] or [`sync_scope`].
 #[cfg(test)]
