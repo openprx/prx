@@ -1566,6 +1566,25 @@ mod mode_tests {
     }
 
     #[tokio::test]
+    async fn slash_msg_stays_unregistered_in_command_dispatch() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new("mock", "prx-model");
+        let ctx = CommandContext {
+            model_name: "prx-model",
+            provider_name: "mock",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+        assert!(matches!(
+            super::dispatch("/msg local prx-session hello", &ctx).await,
+            CommandResult::HandledWithOutput(text)
+                if text == "Unknown command: /msg local prx-session hello. Type /help for available commands."
+        ));
+    }
+
+    #[tokio::test]
     async fn slash_resume_parses_list_last_and_id() {
         let memory = NoneMemory::new();
         let tools: Vec<Box<dyn Tool>> = Vec::new();
