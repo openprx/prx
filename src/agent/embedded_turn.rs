@@ -194,7 +194,7 @@ pub(super) async fn run(agent: &mut Agent, input: &str) -> anyhow::Result<String
         .await;
     match (result, agent.cleanup_state.confirm().await) {
         (Err(error), Err(cleanup)) => Err(error.context(cleanup)),
-        (_, Err(cleanup)) => Err(cleanup.into()),
+        (_, Err(cleanup)) => Err(cleanup),
         (result, Ok(())) => result,
     }
 }
