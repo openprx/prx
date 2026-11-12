@@ -514,6 +514,10 @@ default_temperature = 0.3
 # targeted_agents = false
 
 [runtime]
+# `kind` accepts "native" (default) or "docker". `kind = "cloudflare"` is
+# recognized by name only: runtime creation fails with a "not implemented" error.
+# kind = "native"
+
 # Extra host environment variable names available to the generic shell tool.
 # Default: []; exact uppercase ASCII names only, no wildcards or values.
 # Adding a name grants access to its value and is a high-risk config change.
@@ -612,6 +616,8 @@ signing_secret = "replace-with-a-separate-hmac-secret"
 
 [channels_config.signal]
 account = "+1234567890"
+# `dm_policy = "pairing"` is accepted but has no pairing flow: it is evaluated
+# exactly as "allowlist" and logs a warning.
 dm_policy = "allowlist"
 allowed_from = ["uuid:your-uuid"]
 

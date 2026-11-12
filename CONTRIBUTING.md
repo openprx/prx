@@ -8,24 +8,17 @@ Thanks for your interest in contributing!
 git clone https://github.com/openprx/prx.git
 cd prx
 
-# Normal local development loop
+# Local checks before opening a pull request, scoped to what you changed
 cargo fmt --all
-cargo fmt --all -- --check
-cargo check -p openprx --all-features
-cargo test -p openprx <affected-test-filter>
+cargo clippy --all-targets -- -D warnings          # add --all-features only for feature-gated changes
+cargo test --lib <module::path>                    # the tests you added or changed, plus the touched module
+cargo test --test architecture_boundaries          # fast architecture boundary guard
 ```
 
-The normal local loop must run focused tests that execute at least one test.
-The full engineering gate is reserved for a GitHub delivery, an explicitly
-authorized release/deploy, or a comprehensive audit:
-
-```bash
-cargo test --locked
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --test architecture_boundaries
-cargo deny check
-cargo build --release --locked
-```
+Keep the local loop scoped: the focused tests must execute at least one test.
+Do not run the full test suite, an all-features workspace clippy or
+`cargo deny` locally as a precondition for a pull request. Pull request CI is
+the only full gate; it runs the complete test suite and the all-features lint.
 
 ## Source file size
 
@@ -75,11 +68,11 @@ src/
 
 ## Pull Request Checklist
 
-- [ ] `cargo fmt --all -- --check` and `cargo check -p openprx --all-features` pass
-- [ ] Focused affected tests ran and executed at least one test
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo test --locked` passes
-- [ ] Architecture boundaries and `cargo deny check` pass
+- [ ] `cargo fmt --all` leaves no diff
+- [ ] `cargo clippy --all-targets -- -D warnings` passes (with `--all-features` only for feature-gated changes)
+- [ ] The tests you added or changed and the touched module's tests ran and executed at least one test
+- [ ] `cargo test --test architecture_boundaries` passes
+- [ ] Pull request CI (the full gate) is green
 - [ ] New code has tests
 - [ ] No new dependencies unless necessary
 - [ ] README/docs updated if adding user-facing features

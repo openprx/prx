@@ -1185,7 +1185,7 @@ agent or persona still requires that identity in addition to the owner, as do
 other private events. Another owner cannot read the event. No ingest path
 produces `agent` visibility today.
 
-The `private` arm requires the owner for **every** reader (OQ-1, closed): a
+The `private` arm requires the owner for **every** reader: a
 `private` event is readable only when its `owner_id` equals the reader's own,
 for an owner-isolated caller and an in-process turn alike, on both adapters.
 Except for the owner-authored tool-ingest row described above, it also requires

@@ -24,7 +24,6 @@ Key extension points:
 - `src/memory/traits.rs` (`Memory`)
 - `src/observability/traits.rs` (`Observer`)
 - `src/runtime/traits.rs` (`RuntimeAdapter`)
-- `src/peripherals/traits.rs` (`Peripheral`) — hardware boards (STM32, RPi GPIO)
 
 ## 2) Deep Architecture Observations (Why This Protocol Exists)
 
@@ -175,7 +174,6 @@ Test code is attack surface too: a test that reads a hostile fixture, socket, su
 - `src/providers/` — model providers and resilient wrapper
 - `src/channels/` — Telegram/Discord/Slack/etc channels
 - `src/tools/` — tool execution surface (shell, file, memory, browser)
-- `src/peripherals/` — hardware peripherals (STM32, RPi GPIO); see `docs/hardware-peripherals-design.md`
 - `src/runtime/` — runtime adapters (currently native)
 - `docs/` — task-oriented documentation system (hubs, unified TOC, references, operations, security proposals, multilingual guides)
 - `.github/` — CI, templates, automation workflows
@@ -304,21 +302,14 @@ Use these rules to keep the trait/factory architecture stable under growth.
 - Validate and sanitize all inputs.
 - Return structured `ToolResult`; no panics anywhere in production code (§3.9).
 
-### 7.4 Adding a Peripheral
-
-- Implement `Peripheral` in `src/peripherals/`.
-- Peripherals expose `tools()` — each tool delegates to the hardware (GPIO, sensors, etc.).
-- Register board type in config schema if needed.
-- See `docs/hardware-peripherals-design.md` for protocol and firmware notes.
-
-### 7.5 Security / Runtime / Gateway Changes
+### 7.4 Security / Runtime / Gateway Changes
 
 - Include threat/risk notes and rollback strategy.
 - Add/update tests or validation evidence for failure modes and boundaries.
 - Keep observability useful but non-sensitive.
 - For `.github/workflows/**` changes, include Actions allowlist impact in PR notes and update `docs/actions-source-policy.md` when sources change.
 
-### 7.6 Docs System / README / IA Changes
+### 7.5 Docs System / README / IA Changes
 
 - Treat docs navigation as product UX: preserve clear pathing from README to
   installation and runtime-topic docs.
@@ -341,7 +332,7 @@ cargo test --test architecture_boundaries
 
 Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes) and a break-the-fix check for every key fix.
 
-Do not run the full suite, mutation batches, stress loops or a local full CI (`./dev/ci.sh all`) locally. PR CI is the only full gate.
+Do not run the full suite, mutation batches, stress loops or a full CI run locally. PR CI is the only full gate.
 
 Additional expectations by change type:
 

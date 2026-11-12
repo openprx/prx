@@ -55,6 +55,10 @@ webhook_secret = "replace-with-secret"
 store_dir = "/path/to/wacli-store"
 ```
 
+`dm_policy` accepts `allowlist` (default), `open`, `disabled` and `pairing`;
+`pairing` has no pairing flow yet and is evaluated exactly as `allowlist`, with
+a warning in the log.
+
 To treat messages you type in WhatsApp's **Message Yourself** chat as owner
 commands, configure `bot_jid` (or `bot_number`) and set
 `self_chat_mode = true`. This mode requires a wacli build with the experimental

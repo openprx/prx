@@ -401,7 +401,7 @@ the dialect was declared and the configuration that would fix it (see
 [Refused tools and how to exclude them](#refused-tools-and-how-to-exclude-them)).
 On a current build roughly a third of the published tools are refused this way
 on such an endpoint; the rest lower or pass through unchanged. Fail-closed is
-the operator's decision (OQ-26): the rules are not carried into
+the operator's decision: the rules are not carried into
 prompt-visible descriptions to keep the tools available.
 
 **What "merged losslessly" means, exactly.** The same document is enforced
