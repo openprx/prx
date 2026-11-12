@@ -418,14 +418,16 @@ const TELEGRAM_DIAGNOSTIC_TRUNCATED: &str = "… [truncated]";
 /// the bot token in its path, and other hosts sign their URLs in the path or
 /// the query, so neither is ever written to a log.
 fn loggable_media_url(url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(parsed) => match parsed.host_str() {
-            Some(host) => format!("{}://{host}/{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
-            None => format!("{}:{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
-        },
+    reqwest::Url::parse(url).map_or_else(
         // Not a URL (a Telegram file id, for example): nothing of it is safe to show.
-        Err(_) => TELEGRAM_REDACTION_MARKER.to_string(),
-    }
+        |_| TELEGRAM_REDACTION_MARKER.to_string(),
+        |parsed| {
+            parsed.host_str().map_or_else(
+                || format!("{}:{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
+                |host| format!("{}://{host}/{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
+            )
+        },
+    )
 }
 
 /// Telegram's Bot API origin.
