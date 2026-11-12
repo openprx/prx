@@ -3,6 +3,9 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
+/// Environment variable `cloudflared tunnel run` reads the tunnel token from.
+const CLOUDFLARED_TOKEN_ENV: &str = "TUNNEL_TOKEN";
+
 /// Cloudflare Tunnel — wraps the `cloudflared` binary.
 ///
 /// Requires `cloudflared` installed and a tunnel token from the
@@ -19,6 +22,25 @@ impl CloudflareTunnel {
             proc: new_shared_process(),
         }
     }
+
+    /// Build the `cloudflared` invocation.
+    ///
+    /// The tunnel token goes to the child through `TUNNEL_TOKEN`, which
+    /// `cloudflared tunnel run` reads in place of `--token`. Arguments are
+    /// readable by every local user (`ps`, `/proc/<pid>/cmdline`) for the
+    /// tunnel's whole lifetime; the child's environment is not.
+    fn build_command(&self, local_port: u16) -> Command {
+        // cloudflared tunnel --no-autoupdate run --url http://localhost:<port>
+        let mut command = Command::new("cloudflared");
+        command
+            .args(["tunnel", "--no-autoupdate", "run", "--url"])
+            .arg(format!("http://localhost:{local_port}"))
+            .env(CLOUDFLARED_TOKEN_ENV, &self.token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
 }
 
 #[async_trait::async_trait]
@@ -28,21 +50,7 @@ impl Tunnel for CloudflareTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        // cloudflared tunnel --no-autoupdate run --token <TOKEN> --url http://localhost:<port>
-        let mut child = Command::new("cloudflared")
-            .args([
-                "tunnel",
-                "--no-autoupdate",
-                "run",
-                "--token",
-                &self.token,
-                "--url",
-                &format!("http://localhost:{local_port}"),
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut child = self.build_command(local_port).spawn()?;
 
         // Read stderr to find the public URL (cloudflared prints it there)
         let stderr = child
@@ -115,6 +123,38 @@ mod tests {
     fn constructor_stores_token() {
         let tunnel = CloudflareTunnel::new("cf-token".into());
         assert_eq!(tunnel.token, "cf-token");
+    }
+
+    #[test]
+    fn command_carries_the_token_in_the_environment_not_in_arguments() {
+        const SECRET: &str = "cf-secret-token-eyJhIjoiYWJjIn0";
+        let tunnel = CloudflareTunnel::new(SECRET.into());
+        let command = tunnel.build_command(8080);
+        let std_command = command.as_std();
+
+        let args: Vec<String> = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().all(|arg| !arg.contains(SECRET)),
+            "the tunnel token must not be visible in the process arguments: {args:?}"
+        );
+        assert_eq!(
+            args,
+            ["tunnel", "--no-autoupdate", "run", "--url", "http://localhost:8080"],
+            "only the --token pair may leave the cloudflared invocation"
+        );
+
+        let token_env = std_command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("TUNNEL_TOKEN"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            token_env,
+            Some(std::ffi::OsStr::new(SECRET)),
+            "cloudflared reads the token from TUNNEL_TOKEN, so the child must receive it there"
+        );
     }
 
     #[test]

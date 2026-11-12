@@ -3,6 +3,9 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
+/// Environment variable the ngrok agent reads its authtoken from.
+const NGROK_AUTHTOKEN_ENV: &str = "NGROK_AUTHTOKEN";
+
 /// ngrok Tunnel — wraps the `ngrok` binary.
 ///
 /// Requires `ngrok` installed. Optionally set a custom domain
@@ -21,6 +24,30 @@ impl NgrokTunnel {
             proc: new_shared_process(),
         }
     }
+
+    /// Build the `ngrok` invocation.
+    ///
+    /// The authtoken goes to the child through `NGROK_AUTHTOKEN`, which the
+    /// ngrok agent reads at start. Arguments are readable by every local user
+    /// (`ps`, `/proc/<pid>/cmdline`); the child's environment is not. This
+    /// replaces the earlier `ngrok config add-authtoken <TOKEN>` call, which
+    /// put the token on a command line.
+    fn build_command(&self, local_port: u16) -> Command {
+        // ngrok http <port> [--domain <domain>] --log stdout --log-format logfmt
+        let mut command = Command::new("ngrok");
+        command.arg("http").arg(local_port.to_string());
+        if let Some(domain) = self.domain.as_deref() {
+            command.args(["--domain", domain]);
+        }
+        // Output log to stdout for URL extraction
+        command
+            .args(["--log", "stdout", "--log-format", "logfmt"])
+            .env(NGROK_AUTHTOKEN_ENV, &self.auth_token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
 }
 
 #[async_trait::async_trait]
@@ -30,31 +57,7 @@ impl Tunnel for NgrokTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        // Set auth token
-        Command::new("ngrok")
-            .args(["config", "add-authtoken", &self.auth_token])
-            .kill_on_drop(true)
-            .output()
-            .await?;
-
-        // Build command: ngrok http <port> [--domain <domain>]
-        let mut args = vec!["http".to_string(), local_port.to_string()];
-        if let Some(ref domain) = self.domain {
-            args.push("--domain".into());
-            args.push(domain.clone());
-        }
-        // Output log to stdout for URL extraction
-        args.push("--log".into());
-        args.push("stdout".into());
-        args.push("--log-format".into());
-        args.push("logfmt".into());
-
-        let mut child = Command::new("ngrok")
-            .args(&args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut child = self.build_command(local_port).spawn()?;
 
         let stdout = child
             .stdout
@@ -126,6 +129,63 @@ mod tests {
     fn constructor_stores_domain() {
         let tunnel = NgrokTunnel::new("ngrok-token".into(), Some("my.ngrok.app".into()));
         assert_eq!(tunnel.domain.as_deref(), Some("my.ngrok.app"));
+    }
+
+    #[test]
+    fn command_carries_the_authtoken_in_the_environment_not_in_arguments() {
+        const SECRET: &str = "ngrok-secret-2abcDEF_authtoken";
+        let tunnel = NgrokTunnel::new(SECRET.into(), Some("my.ngrok.app".into()));
+        let command = tunnel.build_command(8080);
+        let std_command = command.as_std();
+
+        let args: Vec<String> = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().all(|arg| !arg.contains(SECRET)),
+            "the authtoken must not be visible in the process arguments: {args:?}"
+        );
+        assert_eq!(
+            args,
+            [
+                "http",
+                "8080",
+                "--domain",
+                "my.ngrok.app",
+                "--log",
+                "stdout",
+                "--log-format",
+                "logfmt"
+            ],
+            "the tunnel invocation itself must stay as it was"
+        );
+
+        let token_env = std_command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("NGROK_AUTHTOKEN"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            token_env,
+            Some(std::ffi::OsStr::new(SECRET)),
+            "ngrok reads the authtoken from NGROK_AUTHTOKEN, so the child must receive it there"
+        );
+    }
+
+    #[test]
+    fn command_without_a_domain_has_no_domain_flag() {
+        let tunnel = NgrokTunnel::new("ngrok-token".into(), None);
+        let command = tunnel.build_command(3000);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["http", "3000", "--log", "stdout", "--log-format", "logfmt"],
+            "no --domain flag may appear when no custom domain is configured"
+        );
     }
 
     #[test]
