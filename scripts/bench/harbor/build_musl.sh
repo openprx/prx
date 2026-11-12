@@ -23,7 +23,13 @@ build() {
       -v "$slot/bench-source/$sha:/source:ro" -v "$slot:/build" -w /build \
       -e TOOLCHAIN="$toolchain" -e BUILD_TARGET="$target" -e PACKAGES="$packages" \
       "docker.io/library/rust:1-$image" sh -ec '
-        if command -v apk >/dev/null; then apk add $PACKAGES; else apt-get update && apt-get install -y $PACKAGES; fi
+        if command -v apk >/dev/null; then
+            apk add $PACKAGES
+        else
+            sed -i "s|http://deb.debian.org|https://deb.debian.org|g" /etc/apt/sources.list
+            apt-get -o Acquire::Retries=3 -o Acquire::https::No-Cache=true update
+            apt-get -o Acquire::Retries=3 -o Acquire::https::No-Cache=true install -y --no-install-recommends $PACKAGES
+        fi
         rm -rf /build/container-source
         mkdir /build/container-source
         cp -a /source/. /build/container-source/
