@@ -260,6 +260,47 @@ fn parse_custom_provider_url(raw_url: &str, provider_label: &str, format_hint: &
     }
 }
 
+/// Why the root `api_url` cannot replace a built-in provider's endpoint.
+/// The messages never quote the URL: it may carry a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum EndpointOverrideError {
+    #[error("`api_url` is not a valid URL with a host")]
+    Invalid,
+    #[error("`api_url` must be https, or http only for loopback and host.containers.internal")]
+    Scheme,
+    #[error("`api_url` must not carry userinfo, a query or a fragment")]
+    Decorated,
+}
+
+/// The base URL of a built-in provider with a fixed endpoint: `default` when
+/// the root `api_url` is unset or blank, otherwise the validated override.
+/// The provider name, and with it the catalog entry and billing, is unchanged.
+fn builtin_endpoint<'a>(api_url: Option<&'a str>, default: &'a str) -> Result<&'a str, EndpointOverrideError> {
+    let Some(raw) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    let url = reqwest::Url::parse(raw).map_err(|_| EndpointOverrideError::Invalid)?;
+    let host = url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .ok_or(EndpointOverrideError::Invalid)?;
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err(EndpointOverrideError::Decorated);
+    }
+    let local = host == "localhost"
+        || host == "host.containers.internal"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    match url.scheme() {
+        "https" => Ok(raw),
+        "http" if local => Ok(raw),
+        _ => Err(EndpointOverrideError::Scheme),
+    }
+}
+
 /// Factory: create the right provider from config (without custom URL)
 #[cfg(test)]
 pub fn create_provider(name: &str, api_key: Option<&str>) -> anyhow::Result<Box<dyn Provider>> {
@@ -419,7 +460,7 @@ fn create_provider_with_url_and_options(
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
-                "https://api.kimi.com/coding/v1",
+                builtin_endpoint(api_url, "https://api.kimi.com/coding/v1")?,
                 key,
                 AuthStyle::Bearer,
                 crate::PRX_USER_AGENT,

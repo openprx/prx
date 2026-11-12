@@ -2991,3 +2991,52 @@ async fn r4b_factory_attaches_shared_breaker_to_real_transport() {
 async fn r4c_factory_disabled_breaker_keeps_sending() {
     breaker_factory_probe(false).await;
 }
+
+#[test]
+fn builtin_endpoint_keeps_the_default_when_api_url_is_unset_or_blank() {
+    const DEFAULT: &str = "https://api.kimi.com/coding/v1";
+    assert_eq!(builtin_endpoint(None, DEFAULT), Ok(DEFAULT));
+    assert_eq!(builtin_endpoint(Some("  "), DEFAULT), Ok(DEFAULT));
+}
+
+#[test]
+fn builtin_endpoint_accepts_https_and_local_http_overrides_only() {
+    const DEFAULT: &str = "https://api.kimi.com/coding/v1";
+    for accepted in [
+        "https://proxy.example/coding/v1",
+        "http://host.containers.internal:4123/coding/v1",
+        "http://127.0.0.1:4123/coding/v1",
+        "http://localhost:4123/coding/v1",
+        "http://[::1]:4123/coding/v1",
+    ] {
+        assert_eq!(builtin_endpoint(Some(accepted), DEFAULT), Ok(accepted), "{accepted}");
+    }
+    for (refused, error) in [
+        ("http://proxy.example/coding/v1", EndpointOverrideError::Scheme),
+        ("http://10.0.0.1:4123/coding/v1", EndpointOverrideError::Scheme),
+        ("ftp://127.0.0.1/coding/v1", EndpointOverrideError::Scheme),
+        ("https://user:pw@proxy.example/v1", EndpointOverrideError::Decorated),
+        ("https://user@proxy.example/v1", EndpointOverrideError::Decorated),
+        ("https://proxy.example/v1?sig=1", EndpointOverrideError::Decorated),
+        ("https://proxy.example/v1#frag", EndpointOverrideError::Decorated),
+        ("not a url", EndpointOverrideError::Invalid),
+        ("unix:/run/socket", EndpointOverrideError::Invalid),
+    ] {
+        assert_eq!(builtin_endpoint(Some(refused), DEFAULT), Err(error), "{refused}");
+    }
+}
+
+#[test]
+fn kimi_code_refuses_an_unsafe_api_url_with_a_typed_error() {
+    let refused = create_provider_with_url("kimi-code", Some("fixture-key"), Some("http://proxy.example/coding/v1"));
+    assert_eq!(
+        refused
+            .err()
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<EndpointOverrideError>()),
+        Some(&EndpointOverrideError::Scheme)
+    );
+    let local = "http://host.containers.internal:4123/coding/v1";
+    assert!(create_provider_with_url("kimi-code", Some("fixture-key"), Some(local)).is_ok());
+    assert!(create_provider_with_url("kimi-code", Some("fixture-key"), None).is_ok());
+}

@@ -173,10 +173,40 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent._metadata['container_config_key_scan'], 'leak')
                 self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
 
-    async def test_built_in_provider_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, 'host key proxy'):
-            adapter.require_proxy_route('kimi-code')
-        adapter.require_proxy_route('custom:https://api.example.test/v1')
+    async def test_only_proxyable_providers_are_accepted(self):
+        for refused in ('openai', 'anthropic', 'moonshot'):
+            with self.subTest(provider=refused), self.assertRaisesRegex(ValueError, 'host key proxy'):
+                adapter.require_proxy_route(refused)
+        for accepted in ('kimi-code', 'kimi_coding', 'custom:https://api.example.test/v1'):
+            adapter.require_proxy_route(accepted)
+
+    async def test_built_in_provider_keeps_its_name_and_gets_the_proxy_as_api_url(self):
+        secret = 'prx-fixture-secret-not-exported'
+        for mode in ('normal', 'timeout'):
+            with self.subTest(mode=mode):
+                agent = self.proxied_agent()
+                agent.model_name = 'kimi-code/kimi-for-coding'
+                agent.provider_override = None
+                agent.provider = 'kimi-code'
+                agent.model = 'kimi-for-coding'
+                environment = FakeEnvironment(mode)
+                with patch.object(adapter, 'read_key_file', return_value=secret):
+                    await agent.run('fixture instruction', environment, None)
+                content = environment.uploads[0]['content']
+                port = int(content.split('host.containers.internal:')[1].split('/')[0])
+                self.assertIn('default_provider = "kimi-code"\n', content)
+                self.assertIn(f'api_url = "http://host.containers.internal:{port}/coding/v1"\n', content)
+                self.assertNotIn('api.kimi.com', content, 'container must only know the proxy')
+                self.assertNotIn('[[providers.models]]', content)
+                self.assertNotIn(secret[:8], content)
+                with self.assertRaises(OSError, msg='proxy must be stopped after the trial'):
+                    socket.create_connection(('127.0.0.1', port), timeout=2).close()
+                self.assertEqual(agent._metadata['provider'], 'kimi-code')
+                self.assertEqual(agent._metadata['settlement_provider'], 'kimi-code')
+                self.assertNotIn('api_url', agent._metadata['profile_values'])
+                invocation = next(c['command'] for c in environment.calls if 'agent -t' in c['command'])
+                self.assertIn('NO_PROXY=host.containers.internal', invocation)
+                self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
 
     async def test_key_file_rejects_wrong_path_and_mode(self):
         with self.assertRaises(ValueError):
