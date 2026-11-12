@@ -513,6 +513,11 @@ async fn run_owned_manifest(
     let configured_memory_backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     validate_parent_memory_backend(&manifest, &configured_memory_backend)?;
+    // Read-only skills retain the authenticated parent's catalog location.
+    // The worker's private workspace scopes mutable tools, but rebuilding the
+    // reader there would lose the signed skill bindings inherited by the child.
+    let skill_read_config = (child_parent.is_some() || ordinary_snapshots.is_some() || operator_snapshots.is_some())
+        .then(|| config.clone());
     config.workspace_dir = manifest.workspace_dir.clone();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
@@ -819,6 +824,17 @@ async fn run_owned_manifest(
         Some(Arc::clone(&hooks)),
     )
     .tools;
+
+    if let Some(source_config) = skill_read_config {
+        let reader = full_tools
+            .iter_mut()
+            .find(|tool| tool.name() == "skill_read")
+            .context("worker registry missing skill_read")?;
+        *reader = Box::new(crate::tools::SkillReadTool::new(
+            source_config.workspace_dir.clone(),
+            source_config,
+        ));
+    }
 
     // Recreate the same orchestration surfaces that owning entrypoints append
     // after the base factory. Without this block process workers silently lose

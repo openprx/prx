@@ -244,18 +244,29 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
                 101,
             ));
         }
-        let spawned = messages
+        let latest = messages
             .iter()
             .rev()
             .find(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
-            .context("actual parent spawn result")?;
+            .context("actual parent tool result")?;
+        if round == 2 {
+            ensure!(
+                latest.to_string().contains("Sub-agent spawned"),
+                "parent spawn failed: {latest}"
+            );
+            return Ok(tool_call("sessions_spawn", &json!({"action":"list"}), 102));
+        }
         ensure!(
-            spawned.to_string().contains("Sub-agent spawned"),
-            "parent spawn failed: {spawned}"
+            !latest.to_string().contains("failed:"),
+            "worker failed before probe completion: {latest}"
         );
         let notified = state.completion.notified();
-        if !state.completed.load(Ordering::Acquire) {
-            tokio::time::timeout(Duration::from_secs(60), notified).await?;
+        if !state.completed.load(Ordering::Acquire)
+            && tokio::time::timeout(Duration::from_secs(60), notified).await.is_err()
+        {
+            // Read the runtime's terminal status through the same admitted
+            // tool before the next response can claim parent completion.
+            return Ok(tool_call("sessions_spawn", &json!({"action":"list"}), 103));
         }
         return Ok(json!({"role":"assistant","content":"PRX_PARENT_FINISHED"}));
     }

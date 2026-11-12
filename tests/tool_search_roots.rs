@@ -120,21 +120,29 @@ async fn interactive(mut command: Command, input: &str, marker: &str) -> Result<
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take().context("interactive input")?;
     let stdout = child.stdout.take().context("interactive output")?;
-    let mut stderr = child.stderr.take().context("interactive diagnostics")?;
+    let stderr = child.stderr.take().context("interactive diagnostics")?;
     let diagnostics = tokio::spawn(async move {
         let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await?;
-        Ok::<_, std::io::Error>(bytes)
+        stderr.take(1024 * 1024 + 1).read_to_end(&mut bytes).await?;
+        ensure!(
+            bytes.len() <= 1024 * 1024,
+            "interactive diagnostics exceeded capture bound"
+        );
+        Ok::<_, anyhow::Error>(bytes)
     });
+    let mut text = String::new();
     let result = async {
         stdin.write_all(format!("{input}\n").as_bytes()).await?;
         stdin.flush().await?;
-        let mut lines = BufReader::new(stdout).lines();
+        let mut lines = BufReader::new(stdout.take(1024 * 1024 + 1)).lines();
         let observed = tokio::time::timeout(Duration::from_secs(90), async {
-            let mut text = String::new();
             while let Some(line) = lines.next_line().await? {
                 text.push_str(&line);
                 text.push('\n');
+                ensure!(
+                    !line.trim_start().starts_with("Error:"),
+                    "interactive turn failed: {line}"
+                );
                 if text.contains(marker) {
                     return Ok::<_, anyhow::Error>(());
                 }
@@ -157,7 +165,12 @@ async fn interactive(mut command: Command, input: &str, marker: &str) -> Result<
         let _ = child.wait().await;
     }
     let bytes = diagnostics.await??;
-    result.with_context(|| format!("interactive diagnostics: {}", String::from_utf8_lossy(&bytes)))
+    result.with_context(|| {
+        format!(
+            "interactive output: {text}; diagnostics: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
 async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool) -> Result<()> {
@@ -230,9 +243,14 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
     }
     .await;
     let wire = probe.finish().await;
+    let evidence = if result.is_err() || wire.is_err() {
+        Some(scratch.keep())
+    } else {
+        None
+    };
     result.with_context(|| {
         format!(
-            "{root:?} advice={advice} native={native}; wire failure: {:?}",
+            "{root:?} advice={advice} native={native}; retained={evidence:?}; wire failure: {:?}",
             wire.as_ref().err()
         )
     })?;
