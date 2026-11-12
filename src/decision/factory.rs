@@ -70,6 +70,8 @@ const MIN_ATTEMPT: Duration = Duration::from_millis(20);
 pub enum Exclusion {
     /// The decision plane is disabled: nothing leaves PRX.
     Disabled,
+    /// The advisory engine is off, so no physical backend is constructed.
+    EngineDisabled,
     /// A remote backend while `remote_enabled` is false.
     RemoteDisabled,
     /// The backend's breaker is open.
@@ -90,6 +92,7 @@ impl Exclusion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::EngineDisabled => "engine_disabled",
             Self::RemoteDisabled => "remote_disabled",
             Self::CircuitOpen => "circuit_open",
             Self::NotConfigured => "not_configured",
@@ -823,6 +826,10 @@ impl DecisionBackendFactory {
             }
             if let Some(exclusion) = planned.exclusion {
                 excluded.push((planned.kind, planned.locality, exclusion));
+                continue;
+            }
+            if !config.decision_engine.enabled {
+                excluded.push((planned.kind, planned.locality, Exclusion::EngineDisabled));
                 continue;
             }
             let (Some(key), Some((provider, resolved))) = (deps.key.clone(), selected.as_ref()) else {
@@ -1748,6 +1755,7 @@ mod tests {
         config.workspace_dir = temp.path().to_path_buf();
         config.config_path = temp.path().join("config.toml");
         config.api_key = Some("sk-ROOT-FACTORY-SENTINEL".to_string());
+        config.decision_engine.enabled = true;
         config.causal_tree.enabled = true;
         change(&mut config.causal_tree);
         config

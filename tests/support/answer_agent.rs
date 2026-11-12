@@ -267,6 +267,7 @@ where
         config.providers.models.push(serde_json::from_value(json!({
             "provider":"ollama", "model":"prx-local-model", "operations":["chat"], "native_tools":false
         }))?);
+        config.decision_engine.enabled = true;
         config.causal_tree.enabled = true;
         config.causal_tree.backend.kind = serde_json::from_value(json!("compatible_http"))?;
         config.causal_tree.backend.endpoint.clone_from(&endpoint);

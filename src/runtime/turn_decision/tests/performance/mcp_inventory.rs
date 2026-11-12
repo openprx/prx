@@ -16,6 +16,9 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
         crate::decision::builtin::allocation_counter::count_process_future(async {
             let setup_started = Instant::now();
             let mut config = crate::config::Config::default();
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_path_buf();
             config.causal_tree.enabled = true;
             assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
@@ -127,7 +130,7 @@ async fn owned_mcp_inventory_catalog_growth_profile() {
         crate::decision::builtin::allocation_counter::count_process_future(async {
             let started = Instant::now();
             let context = service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
                 .await
                 .expect("actual decision");
             drain_required(&service).await;

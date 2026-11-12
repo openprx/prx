@@ -36,6 +36,7 @@ async fn plane() -> Plane {
         ..openprx::config::Config::default()
     };
     config.causal_tree.enabled = true;
+    config.decision_engine.enabled = true;
     config.causal_tree.backend.kind = serde_json::from_value(serde_json::json!("compatible_http")).unwrap();
     config.causal_tree.backend.endpoint.clone_from(&endpoint);
     "jev-1.13.0".clone_into(&mut config.causal_tree.backend.model);

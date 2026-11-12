@@ -366,7 +366,6 @@ impl crate::tools::Tool for DispatchSpy {
 }
 struct TurnProbe {
     requests: Vec<serde_json::Value>,
-    trace: crate::agent::turn_contracts::ToolLoopTrace,
     store: std::path::PathBuf,
     dispatches: usize,
     store_opens: usize,
@@ -405,7 +404,7 @@ async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAna
         ChatMessage::system("system policy"),
         ChatMessage::user("Use file_read to inspect ./fixture.txt."),
     ];
-    let (_, trace) = crate::agent::turn_engine::run_turn(
+    let (_, _trace) = crate::agent::turn_engine::run_turn(
         &mut history,
         TurnRequest {
             advice,
@@ -455,7 +454,6 @@ async fn exercise(config: Option<DecisionEngineConfig>, advice: Option<IntentAna
     drop(admission);
     TurnProbe {
         requests: provider.requests.into_inner(),
-        trace,
         store,
         dispatches: calls.load(Ordering::SeqCst),
         store_opens: spy.counts.stores.load(Ordering::SeqCst),
@@ -552,10 +550,15 @@ async fn disabled_engine_is_byte_identical_in_one_build() {
     assert_eq!(after.credential_reads, 0);
     assert!(!before.store.exists());
     assert!(!after.store.exists());
-    assert!(after.trace.decision_brief_sha256.is_none());
+    assert!(
+        !serde_json::to_string(&after.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
 }
 #[tokio::test]
-async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
+async fn pre_mode_brief_is_bounded_redacted_and_deterministic() {
     let first = exercise(Some(enabled(DecisionMode::Pre)), Some(long_analysis())).await;
     let second = exercise(Some(enabled(DecisionMode::Pre)), Some(long_analysis())).await;
     let messages = first
@@ -563,7 +566,7 @@ async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
         .get(0)
         .and_then(|request| request.get("messages"))
         .and_then(serde_json::Value::as_array)
-        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: request messages missing");
+        .expect("pre_mode_brief_is_bounded_redacted_and_deterministic: request messages missing");
     let system_messages = messages
         .iter()
         .enumerate()
@@ -572,31 +575,32 @@ async fn pre_mode_brief_is_bounded_redacted_deterministic_and_traced() {
     assert_eq!(system_messages.len(), 1);
     let (system_index, system_message) = system_messages
         .get(0)
-        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: leading system message missing");
+        .expect("pre_mode_brief_is_bounded_redacted_and_deterministic: leading system message missing");
     assert_eq!(*system_index, 0);
     let system = system_message
         .get("content")
         .and_then(serde_json::Value::as_str)
-        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: system content missing");
+        .expect("pre_mode_brief_is_bounded_redacted_and_deterministic: system content missing");
     let expected_brief = render::render_decision_brief(&long_analysis(), 50, enabled(DecisionMode::Pre).candidates);
     assert!(system.ends_with(&expected_brief));
     let brief = system
         .get(system.len() - expected_brief.len()..)
-        .expect("pre_mode_brief_is_bounded_redacted_deterministic_and_traced: brief suffix missing");
+        .expect("pre_mode_brief_is_bounded_redacted_and_deterministic: brief suffix missing");
     assert!(crate::agent::context_budget::count_tokens(brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert_eq!(first.requests, second.requests);
-    assert_eq!(
-        first.trace.decision_brief_sha256.as_deref(),
-        Some(crate::agent::prompt::prompt_sha256(brief).as_str())
-    );
     assert_eq!(first.dispatches, 1);
 }
 #[tokio::test]
 async fn post_mode_records_outcome_without_brief() {
     let probe = exercise(Some(enabled(DecisionMode::Post)), None).await;
     assert_eq!(probe.store_opens, 1, "post mode must open the telemetry store once");
-    assert!(probe.trace.decision_brief_sha256.is_none());
+    assert!(
+        !serde_json::to_string(&probe.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
     assert!(
         !serde_json::to_string(&probe.requests)
             .unwrap()
@@ -615,7 +619,12 @@ async fn post_mode_records_outcome_without_brief() {
 async fn both_mode_links_outcome_to_analysis_decision_id() {
     let probe = exercise(Some(enabled(DecisionMode::Both)), Some(long_analysis())).await;
     assert_eq!(probe.store_opens, 1, "both mode must open the telemetry store once");
-    assert!(probe.trace.decision_brief_sha256.is_some());
+    assert!(
+        serde_json::to_string(&probe.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
     let records = recorded(&probe).await;
     let outcome = records
         .get(0)
@@ -633,7 +642,12 @@ async fn zero_telemetry_cap_opens_no_store_and_still_renders_brief() {
         Some(long_analysis()),
     )
     .await;
-    assert!(probe.trace.decision_brief_sha256.is_some());
+    assert!(
+        serde_json::to_string(&probe.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
     assert!(!probe.store.exists());
     assert_eq!(probe.dispatches, 1);
 }
@@ -686,7 +700,12 @@ async fn analyze_timeout_delays_at_most_timeout_ms_and_tool_still_dispatches() {
     tokio::time::resume();
     let probe = exercise(Some(enabled(DecisionMode::Pre)), advice).await;
     assert_eq!(probe.dispatches, 1);
-    assert!(probe.trace.decision_brief_sha256.is_none());
+    assert!(
+        !serde_json::to_string(&probe.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
 }
 #[tokio::test]
 async fn analyze_error_yields_no_brief_and_tool_still_dispatches() {
@@ -694,7 +713,12 @@ async fn analyze_error_yields_no_brief_and_tool_still_dispatches() {
     assert!(advice.is_none());
     let probe = exercise(Some(enabled(DecisionMode::Pre)), advice).await;
     assert_eq!(probe.dispatches, 1);
-    assert!(probe.trace.decision_brief_sha256.is_none());
+    assert!(
+        !serde_json::to_string(&probe.requests)
+            .expect("test: serialized wire requests")
+            .contains("Decision advice"),
+        "test: advice presence must follow engine mode"
+    );
 }
 
 #[tokio::test]

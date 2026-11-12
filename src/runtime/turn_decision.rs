@@ -2010,27 +2010,6 @@ impl TurnDecisionService {
         }))
     }
 
-    /// Run a source-bound Agent decision through the pinned catalog and gates.
-    /// Selected evidence reads and catalog discoveries feed bounded dependent
-    /// hops. Selected Execute is retained as exact immutable metadata;
-    /// dispatch remains owned by the later constrained execution reader.
-    #[cfg(test)]
-    pub(crate) async fn decide_agent_initial(
-        &self,
-        proof: &dyn TurnSourceProof,
-        kind: AgentTurnKind,
-        cancellation: &CancellationToken,
-    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        // R1a: keeps open_turn_context reachable; removed when R3b switches agent entries.
-        if cancellation.is_cancelled() && !self.generation.effective.decision_engine.enabled {
-            return self.open_turn_context(proof, kind, cancellation).await;
-        }
-        let context = self
-            .decide_agent_initial_inner(proof, kind, cancellation, None, None)
-            .await?;
-        self.record_issued_decision(proof, context, cancellation).await
-    }
-
     pub(crate) async fn open_issued_resume_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
@@ -2920,21 +2899,6 @@ impl TurnDecisionService {
             .or_else(|| self.ordinary_parent.as_ref().map(OrdinaryChildPublication::scope))
             .or_else(|| self.ordinary_task.as_ref().map(|task| task.publication().scope()))
             .or_else(|| self.ordinary_process.as_ref().map(|process| &process.snapshots().scope))
-    }
-
-    /// Retain the existing source/catalog gate around decision-free binding admission.
-    #[cfg(test)]
-    pub(crate) fn validate_agent_execution_model(
-        &self,
-        proof: &dyn TurnSourceProof,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), TurnModelError> {
-        if (proof.provider_name(), proof.model_name()) != (provider, model) {
-            self.resolve_agent_model(proof)?;
-        }
-        crate::runtime::turn_model::validate_execution(proof, provider, model)
-            .map_err(|_| TurnModelError::SelectionDrift)
     }
 
     pub(crate) fn resolve_agent_model(&self, proof: &dyn TurnSourceProof) -> Result<ResolvedModel, TurnModelError> {

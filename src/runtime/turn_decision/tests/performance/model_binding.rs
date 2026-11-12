@@ -81,6 +81,8 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
         axum::serve(listener, router).await.expect("owned server");
     });
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.as_path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -148,14 +150,14 @@ async fn actual_compiler_binds_decision_model_before_real_http() {
     )
     .await;
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
         .await
         .expect("actual admitted builtin hop");
     drain_required(&service).await;
     let hop = context.audit_hops().next().expect("actual first hop");
     assert!(hop.request_compiled && hop.scored_count > 0);
     let mut decision_config = config.clone();
-    decision_config.causal_tree.backend.kind =
+    decision_config.decision_engine.enabled = true;    decision_config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
     decision_config.causal_tree.backend.endpoint = endpoint.clone();
     decision_config.causal_tree.backend.model = "prx-decision-model".to_owned();

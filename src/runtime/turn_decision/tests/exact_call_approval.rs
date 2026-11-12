@@ -173,6 +173,9 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         }
     };
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
@@ -274,7 +277,7 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         assert!(service.model_can_call_tools(proof.as_ref()));
         let cancel = CancellationToken::new();
         let context = service
-            .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_turn_context(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
         assert!(

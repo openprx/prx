@@ -1024,7 +1024,7 @@ async fn run_admitted_webhook_spawn(
         .retain_service(Arc::clone(&service));
     let cancellation = tokio_util::sync::CancellationToken::new();
     let context = service
-        .decide_agent_initial(
+        .open_issued_turn_context(
             &proof,
             crate::runtime::turn_decision::AgentTurnKind::SingleShot,
             &cancellation,

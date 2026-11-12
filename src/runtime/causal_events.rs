@@ -137,31 +137,6 @@ impl DurableCausalEventSink {
         .unwrap_or(false)
     }
 
-    /// Admission is the cancellation boundary: an admitted verified event
-    /// persists as completion telemetry even if the caller later cancels.
-    /// Queue or store failure never changes an already committed close.
-    #[cfg(test)]
-    pub(super) fn emit_applied(&self, application: VerifiedDirectiveApplication) {
-        let (event, idempotency_key, original_generation) = application.into_parts();
-        let lineage = event.lineage.clone();
-        let Some(memory) = self.memory.upgrade() else {
-            report_incomplete(self.observer.as_ref(), lineage, IncompleteReason::StoreDropped);
-            return;
-        };
-        if self
-            .control_queue
-            .try_send(QueueItem::Applied {
-                memory,
-                event: Box::new(event),
-                idempotency_key,
-                original_generation,
-                acknowledgement: None,
-            })
-            .is_err()
-        {
-            report_incomplete(self.observer.as_ref(), lineage, IncompleteReason::StoreDropped);
-        }
-    }
     /// Recovery waits for the actual idempotent insert/readback result, not
     /// merely queue admission. The private application carries authenticated
     /// original-generation metadata across a service restart.
@@ -671,7 +646,11 @@ mod tests {
             "generic emit has no application authority"
         );
         for _ in 0..2 {
-            sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
+            sink.repair_applied(
+                VerifiedDirectiveApplication::fixture(event.clone(), key.clone()),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
         }
         assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
         assert_eq!(
@@ -694,11 +673,21 @@ mod tests {
         let restarted_observer = Arc::new(RecordingSink::default());
         let restarted = DurableCausalEventSink::new(&generation, reopened.clone(), restarted_observer.clone())
             .expect("reconstructed sink");
-        restarted.emit_applied(VerifiedDirectiveApplication::fixture(event, key.clone()));
-        restarted.emit_applied(VerifiedDirectiveApplication::fixture(
-            applied_fixture(&workspace.path().to_string_lossy(), "prx_other_terminal"),
-            key.clone(),
-        ));
+        restarted
+            .repair_applied(
+                VerifiedDirectiveApplication::fixture(event, key.clone()),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
+        restarted
+            .repair_applied(
+                VerifiedDirectiveApplication::fixture(
+                    applied_fixture(&workspace.path().to_string_lossy(), "prx_other_terminal"),
+                    key.clone(),
+                ),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
         assert!(
             restarted
                 .drain(Instant::now() + std::time::Duration::from_secs(5))
@@ -770,7 +759,11 @@ mod tests {
             });
         }
         assert_eq!(sink.ordinary_slots.available_permits(), 0);
-        sink.emit_applied(VerifiedDirectiveApplication::fixture(event, key.clone()));
+        sink.repair_applied(
+            VerifiedDirectiveApplication::fixture(event, key.clone()),
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
         assert!(
             !observer
                 .events
@@ -798,78 +791,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn applied_queue_or_store_failure_leaves_retry_available() {
-        let workspace = tempfile::tempdir().expect("test workspace");
-        let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.path().to_path_buf();
-        let generation = crate::config::new_shared(config).pin();
-        let memory = Arc::new(SqliteMemory::new(workspace.path()).expect("event backend"));
-        let observer = Arc::new(RecordingSink::default());
-        let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone()).expect("sink");
-        let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
-        let key = "causal:prx_decision:directive-applied".to_owned();
-        // Saturate the actual channel with controls: ordinary telemetry now
-        // reserves one entry for Applied. The overflow/retry oracle is intact.
-        for _ in 0..EVENT_QUEUE_CAPACITY {
-            let (completion, _receiver) = oneshot::channel();
-            assert!(sink.control_queue.try_send(QueueItem::Drain(completion)).is_ok());
-        }
-        sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
-        assert!(
-            observer
-                .events
-                .lock()
-                .iter()
-                .any(|event| event.fields.incomplete == Some(IncompleteReason::StoreDropped))
-        );
-        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
-        assert!(
-            memory
-                .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), &key)
-                .await
-                .expect("dropped admission")
-                .is_none()
-        );
-        let failed_observer = Arc::new(RecordingSink::default());
-        let unavailable_memory = Arc::new(NoneMemory);
-        let failed = DurableCausalEventSink::new(&generation, unavailable_memory.clone(), failed_observer.clone())
-            .expect("failing sink");
-        failed.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.clone()));
-        assert!(failed.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
-        assert!(
-            failed_observer
-                .events
-                .lock()
-                .iter()
-                .any(|event| event.fields.incomplete == Some(IncompleteReason::StoreFailed))
-        );
-        assert!(
-            failed_observer
-                .events
-                .lock()
-                .iter()
-                .all(|event| event.kind != CausalEventKind::DirectiveApplied)
-        );
-        sink.emit_applied(VerifiedDirectiveApplication::fixture(event, key.clone()));
-        assert!(sink.drain(Instant::now() + std::time::Duration::from_secs(5)).await);
-        assert!(
-            memory
-                .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), &key)
-                .await
-                .expect("valid retry")
-                .is_some()
-        );
-        assert_eq!(
-            observer
-                .events
-                .lock()
-                .iter()
-                .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
-                .count(),
-            1
-        );
-    }
-    #[tokio::test(flavor = "current_thread")]
     async fn full_ordinary_queue_and_waiting_drain_leave_room_for_multiple_applications() {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
@@ -890,7 +811,11 @@ mod tests {
         let (completion, received) = oneshot::channel();
         assert!(sink.control_queue.try_send(QueueItem::Drain(completion)).is_ok());
         for key in ["prx_first_application", "prx_second_application"] {
-            sink.emit_applied(VerifiedDirectiveApplication::fixture(event.clone(), key.into()));
+            sink.repair_applied(
+                VerifiedDirectiveApplication::fixture(event.clone(), key.into()),
+                Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .await;
         }
         assert!(
             !observer
@@ -919,5 +844,68 @@ mod tests {
                 .count(),
             2
         );
+    }
+    #[tokio::test]
+    async fn applied_recovery_store_failure_leaves_retry_available() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let workspace = tempfile::tempdir().expect("test: isolated recovery workspace");
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.path().to_owned();
+            let generation = crate::config::new_shared(config).pin();
+            let unavailable: Arc<dyn Memory> = Arc::new(NoneMemory);
+            let failed =
+                DurableCausalEventSink::new(&generation, unavailable.clone(), Arc::new(RecordingSink::default()))
+                    .expect("test: failing sink");
+            let event = applied_fixture(&workspace.path().to_string_lossy(), "prx_terminal");
+            let key = "causal:prx_decision:directive-applied".to_owned();
+            assert!(
+                !failed
+                    .repair_applied(
+                        VerifiedDirectiveApplication::fixture(event.clone(), key.clone()),
+                        Instant::now() + std::time::Duration::from_secs(5)
+                    )
+                    .await,
+                "test: unavailable store cannot acknowledge an application"
+            );
+            let memory = Arc::new(SqliteMemory::new(workspace.path()).expect("test: recovered event backend"));
+            let observer = Arc::new(RecordingSink::default());
+            let sink = DurableCausalEventSink::new(&generation, memory.clone(), observer.clone())
+                .expect("test: recovered sink");
+            for _ in 0..EVENT_QUEUE_CAPACITY {
+                let (completion, _received) = oneshot::channel();
+                assert!(
+                    sink.control_queue.try_send(QueueItem::Drain(completion)).is_ok(),
+                    "test: fill the bounded control queue before recovery"
+                );
+            }
+            assert!(
+                sink.repair_applied(
+                    VerifiedDirectiveApplication::fixture(event, key.clone()),
+                    Instant::now() + std::time::Duration::from_secs(5)
+                )
+                .await,
+                "test: acknowledged recovery waits for room and durably retries"
+            );
+            assert!(
+                memory
+                    .find_message_event_by_idempotency_key(&workspace.path().to_string_lossy(), &key)
+                    .await
+                    .expect("test: read recovered row")
+                    .is_some(),
+                "test: successful acknowledgement requires the actual persisted row"
+            );
+            assert_eq!(
+                observer
+                    .events
+                    .lock()
+                    .iter()
+                    .filter(|event| event.kind == CausalEventKind::DirectiveApplied)
+                    .count(),
+                1,
+                "test: the recovered application is emitted exactly once"
+            );
+        })
+        .await
+        .expect("test: applied recovery has a bounded deadline");
     }
 }

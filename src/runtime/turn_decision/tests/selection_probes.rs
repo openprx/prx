@@ -391,6 +391,9 @@ async fn selected_execute_retains_exact_gated_refs_without_dispatch() {
     for (enabled, keyless) in [(false, false), (true, false), (true, true)] {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = enabled;
         if keyless {
@@ -491,13 +494,13 @@ async fn selected_execute_retains_exact_gated_refs_without_dispatch() {
         cancelled.cancel();
         assert!(matches!(
             service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancelled)
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancelled)
                 .await,
             Err(AgentDecisionError::Cancelled)
         ));
         assert_eq!(predictions.load(Ordering::SeqCst), 0);
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .expect("gated service result");
         assert!(
@@ -828,6 +831,9 @@ pub(super) async fn run_retrieve_probe_case(
 ) {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     // This fixture observes an in-process probe backend, not a durable
     // event-store adapter. Its source proof and phase assertions are off-mode.
@@ -925,7 +931,7 @@ pub(super) async fn run_retrieve_probe_case(
     if mode == ProbeCancelMode::Before {
         cancellation.cancel();
     }
-    let decision = service.decide_agent_initial(&proof, AgentTurnKind::SingleShot, &cancellation);
+    let decision = service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation);
     let context = match mode {
         ProbeCancelMode::Never | ProbeCancelMode::Before | ProbeCancelMode::CatalogDriftRead => decision.await,
         ProbeCancelMode::Backend | ProbeCancelMode::Read => {

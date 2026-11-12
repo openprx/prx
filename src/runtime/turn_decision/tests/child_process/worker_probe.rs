@@ -111,7 +111,7 @@ where
                 .await;
                 let cancellation = CancellationToken::new();
                 let context = service
-                    .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+                    .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
                     .await?;
                 assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
                 assert!(context.record_admitted.load(Ordering::Acquire));

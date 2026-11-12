@@ -319,6 +319,9 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
             std::fs::create_dir_all(path)?;
         }
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.clone();
         config.config_path = config_dir.join("config.toml");
         config.default_provider = Some("ollama".into());
@@ -449,7 +452,7 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         };
         let cancellation = CancellationToken::new();
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
             .await?;
         assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
         assert!(context.record_admitted.load(Ordering::Acquire));
@@ -905,6 +908,9 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         std::fs::create_dir_all(path)?;
     }
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());
@@ -1030,7 +1036,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     .await;
     let cancellation = CancellationToken::new();
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await?;
     assert_eq!(
         context.engine.state.trusted.parts().owner_id.as_deref(),
@@ -1226,6 +1232,9 @@ async fn durability_readback_body(
         std::fs::create_dir_all(path)?;
     }
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());
@@ -1330,7 +1339,7 @@ async fn durability_readback_body(
     .await;
     let cancellation = CancellationToken::new();
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await?;
     anyhow::ensure!(
         matches!(context.directive(), TurnExecutionDirective::Delegate { .. }),

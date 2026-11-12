@@ -1316,6 +1316,7 @@ mod tests {
             ..Config::default()
         };
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
         config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
@@ -1429,6 +1430,7 @@ mod tests {
             ..Config::default()
         };
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(BackendKind::Builtin);
         let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
         let plane = HttpPlane {
@@ -1473,6 +1475,7 @@ mod tests {
             ..Config::default()
         };
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
         config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
@@ -1796,6 +1799,7 @@ mod tests {
     async fn setup_checks_the_written_configuration() {
         let temp = tempfile::TempDir::new().expect("test: temp");
         let config = written(temp.path(), |config| {
+            config.decision_engine.enabled = true;
             config.causal_tree.backend.kind =
                 crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
             config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".to_string();

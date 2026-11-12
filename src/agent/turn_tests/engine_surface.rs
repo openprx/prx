@@ -1530,9 +1530,6 @@ async fn an_interrupted_tool_batch_still_records_the_calls_that_ran() {
     let ledger_dir = TempDir::new().expect("test: ledger dir should be creatable");
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(interrupted_batch_registry(&audit));
     let provider = ScriptedProvider::from_text_responses(vec![
-        r#"<tool_call>
-{"name":"capability_search","arguments":{"query":"wedge","limit":1}}
-</tool_call>"#,
         "<tool_call>\n{\"name\":\"append_line\",\"arguments\":{}}\n</tool_call>\n<tool_call>\n{\"name\":\"wedge\",\"arguments\":{}}\n</tool_call>",
     ]);
     let mut history = vec![
@@ -1542,132 +1539,120 @@ async fn an_interrupted_tool_batch_still_records_the_calls_that_ran() {
     let hooks_dir = TempDir::new().expect("test: hooks dir should be creatable");
     let mut mechanics_config = crate::config::Config::default();
     mechanics_config.workspace_dir = ledger_dir.path().to_path_buf();
+    mechanics_config.tool_tiering.always_include = ["append_line", "wedge"].map(str::to_owned).to_vec();
     let mechanics_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).expect("mechanics memory"));
-    // All targeted fixture tools use native adapters with no filesystem/memory category.
-    // Driver validates an actual use_tool/native_tool candidate in the compiled request.
-    let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
-        .await
-        .expect("owned mechanics decision listener");
-    let endpoint = driver.endpoint().to_owned();
-    driver
-        .run_factory(true, || async {
-            use futures::FutureExt as _;
-            let cleanup =
-                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
-                    .expect("mechanics cleanup owner");
-            let mut original_panic = None;
-            let drained = cleanup
-                .run(q79_boxed_fixture_work(async {
-                    let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
-                        let admission = crate::agent::turn_tests::admission::AdmittedTurn::configured_mechanics(
-                            mechanics_config,
-                            &history.last().expect("source input").content,
-                            Arc::clone(&tools_registry),
-                            mechanics_memory,
-                            &endpoint,
-                            &provider,
-                        )
-                        .await;
-
-                        let result = crate::agent::idle::with_guard(
-                            crate::agent::idle::IdleGuard {
-                                idle: Some(Duration::from_millis(200)),
-                            },
-                            run_turn(
-                                &mut history,
-                                crate::agent::turn_request::TurnRequest {
-                                    advice: None,
-                                    channel_name: "cli",
-                                    scope: None,
-                                    mode: ChatMode::default(),
-                                    silent: true,
-                                    expose_stay_silent: false,
-                                    multimodal: &crate::config::MultimodalConfig::default(),
-                                    schedule: crate::agent::turn_request::TurnSchedule {
-                                        read_only_tool_concurrency_window: 2,
-                                        priority_scheduling_enabled: false,
-                                        low_priority_tool_names: Vec::new(),
-                                    },
-                                    compaction: None,
-                                    decision: admission.decision(),
-                                },
-                                crate::agent::turn_request::TurnServices {
-                                    provider: &provider,
-                                    provider_name: "ollama",
-                                    model: "prx-local-model",
-                                    temperature: 0.0,
-                                    tools_registry,
-                                    observer: &NoopObserver,
-                                    hooks: &crate::hooks::HookManager::new(hooks_dir.path().to_path_buf()),
-                                    approval: None,
-                                    approval_resolver: None,
-                                    runtime_adapter: Some(admission.adapter()),
-                                    memory: admission.memory_runtime(),
-                                },
-                                crate::agent::turn_request::TurnDelivery {
-                                    cancellation: None,
-                                    on_delta: None,
-                                    on_tool_call: None,
-                                },
-                            ),
-                        )
-                        .await;
-
-                        let error = result.expect_err("the wedged batch must end the turn");
-                        assert!(
-                            crate::agent::idle::is_hang_termination(&error),
-                            "the turn must end through the stall detector, not a clock: {error}"
-                        );
-
-                        let audited = std::fs::read_to_string(&audit)
-                            .expect("test: the appending tool must have written the file");
-                        assert_eq!(
-                            audited.lines().filter(|line| !line.is_empty()).count(),
-                            1,
-                            "the appending tool must have run exactly once: {audited:?}"
-                        );
-
-                        assert!(
-                            history
-                                .iter()
-                                .any(|message| message.role == "assistant" && message.content.contains("append_line")),
-                            "the assistant message requesting the batch must survive the interruption: {history:?}"
-                        );
-                        let record = history
-                            .iter()
-                            .find(|message| {
-                                message.role == "user"
-                                    && message
-                                        .content
-                                        .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)
-                                    && message.content.contains("name=\"append_line\"")
-                            })
-                            .expect("the executed call must leave a tool-result record in history");
-                        assert!(
-                            record.content.contains("appended one line"),
-                            "the completed call's own output must be what is recorded: {:?}",
-                            record.content
-                        );
-                        assert!(
-                            record.content.contains(INTERRUPTED_TOOL_RESULT),
-                            "the call that never completed must be marked as not having happened: {:?}",
-                            record.content
-                        );
-                    }))
-                    .catch_unwind()
-                    .await;
-                    if let Err(panic) = caught {
-                        original_panic = Some(panic);
-                    }
-                    Ok(())
-                }))
+    use futures::FutureExt as _;
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
+        .expect("mechanics cleanup owner");
+    let mut original_panic = None;
+    let drained = cleanup
+        .run(q79_boxed_fixture_work(async {
+            let caught = std::panic::AssertUnwindSafe(q79_boxed_fixture_work(async {
+                let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+                    mechanics_config,
+                    &history.last().expect("source input").content,
+                    Arc::clone(&tools_registry),
+                    mechanics_memory,
+                )
                 .await;
-            if let Some(panic) = original_panic {
-                std::panic::resume_unwind(panic);
+
+                let result = crate::agent::idle::with_guard(
+                    crate::agent::idle::IdleGuard {
+                        idle: Some(Duration::from_millis(200)),
+                    },
+                    run_turn(
+                        &mut history,
+                        crate::agent::turn_request::TurnRequest {
+                            advice: None,
+                            channel_name: "cli",
+                            scope: None,
+                            mode: ChatMode::default(),
+                            silent: true,
+                            expose_stay_silent: false,
+                            multimodal: &crate::config::MultimodalConfig::default(),
+                            schedule: crate::agent::turn_request::TurnSchedule {
+                                read_only_tool_concurrency_window: 2,
+                                priority_scheduling_enabled: false,
+                                low_priority_tool_names: Vec::new(),
+                            },
+                            compaction: None,
+                            decision: admission.decision(),
+                        },
+                        crate::agent::turn_request::TurnServices {
+                            provider: &provider,
+                            provider_name: "ollama",
+                            model: "prx-local-model",
+                            temperature: 0.0,
+                            tools_registry,
+                            observer: &NoopObserver,
+                            hooks: &crate::hooks::HookManager::new(hooks_dir.path().to_path_buf()),
+                            approval: None,
+                            approval_resolver: None,
+                            runtime_adapter: Some(admission.adapter()),
+                            memory: admission.memory_runtime(),
+                        },
+                        crate::agent::turn_request::TurnDelivery {
+                            cancellation: None,
+                            on_delta: None,
+                            on_tool_call: None,
+                        },
+                    ),
+                )
+                .await;
+
+                let error = result.expect_err("the wedged batch must end the turn");
+                assert!(
+                    crate::agent::idle::is_hang_termination(&error),
+                    "the turn must end through the stall detector, not a clock: {error}"
+                );
+
+                let audited =
+                    std::fs::read_to_string(&audit).expect("test: the appending tool must have written the file");
+                assert_eq!(
+                    audited.lines().filter(|line| !line.is_empty()).count(),
+                    1,
+                    "the appending tool must have run exactly once: {audited:?}"
+                );
+
+                assert!(
+                    history
+                        .iter()
+                        .any(|message| message.role == "assistant" && message.content.contains("append_line")),
+                    "the assistant message requesting the batch must survive the interruption: {history:?}"
+                );
+                let record = history
+                    .iter()
+                    .find(|message| {
+                        message.role == "user"
+                            && message
+                                .content
+                                .starts_with(crate::agent::turn_contracts::TOOL_RESULTS_PREFIX)
+                            && message.content.contains("name=\"append_line\"")
+                    })
+                    .expect("the executed call must leave a tool-result record in history");
+                assert!(
+                    record.content.contains("appended one line"),
+                    "the completed call's own output must be what is recorded: {:?}",
+                    record.content
+                );
+                assert!(
+                    record.content.contains(INTERRUPTED_TOOL_RESULT),
+                    "the call that never completed must be marked as not having happened: {:?}",
+                    record.content
+                );
+            }))
+            .catch_unwind()
+            .await;
+            if let Err(panic) = caught {
+                original_panic = Some(panic);
             }
-            drained.expect("mechanics services must drain");
-        })
+            Ok(())
+        }))
         .await;
+    if let Some(panic) = original_panic {
+        std::panic::resume_unwind(panic);
+    }
+    drained.expect("mechanics services must drain");
 }
 
 /// A tool whose only job is to be present in the registry under a chosen

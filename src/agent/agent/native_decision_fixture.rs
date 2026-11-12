@@ -256,6 +256,7 @@ impl Driver {
 }
 
 pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> Result<()> {
+    config.decision_engine.enabled = true;
     config.causal_tree.enabled = true;
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);

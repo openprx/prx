@@ -172,7 +172,7 @@ impl EmbeddedAgentBinding {
         };
         // Preserve a route-specific credential proof when canonicalizing the
         // spelling would change its credential slot. Execution uses the
-        // resolved destination accepted by validate_agent_execution_model.
+        // resolved destination accepted by the ingress model binding.
         let (provider, model) = selected.resolved_selection();
         let choice = match super::entry::resolve_agent_model_choice(config, Some(provider), Some(model)) {
             Ok(concrete)

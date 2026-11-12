@@ -266,6 +266,7 @@ pub(super) fn template(root: &Path, loopback: &Loopback) -> Config {
     // These acceptance scenarios assert selected skill receipts and logical
     // prediction deadlines. Request the local backend explicitly; default
     // Auto turns intentionally keep their decision-free Direct surface.
+    config.decision_engine.enabled = true;
     config.causal_tree.enabled = true;
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
@@ -539,7 +540,7 @@ impl World {
         label: &str,
     ) -> Vec<SkillExperience> {
         let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
-        let cap = tokio::time::sleep(std::time::Duration::from_secs(60));
+        let cap = tokio::time::sleep(std::time::Duration::from_secs(20));
         tokio::pin!(cap);
         loop {
             let runs: Vec<SkillExperience> = self.experiences().into_iter().filter(&ready).collect();
@@ -612,14 +613,14 @@ pub(super) fn selection_count(store: &SkillLifecycleStore) -> usize {
 }
 
 /// Waits until more than `before` experiences hold a selection receipt.
-/// The 60 s bound is a failure cap. The receipt write is the readiness signal.
+/// The 20 s bound is a failure cap. The receipt write is the readiness signal.
 pub(super) fn wait_for_selection_beyond(store: &SkillLifecycleStore, before: usize) {
     if selection_count(store) > before {
         return;
     }
     let activity = crate::skills::lifecycle::receipts::lifecycle_activity();
     let wait = async {
-        let cap = tokio::time::sleep(std::time::Duration::from_secs(60));
+        let cap = tokio::time::sleep(std::time::Duration::from_secs(20));
         tokio::pin!(cap);
         loop {
             if selection_count(store) > before {

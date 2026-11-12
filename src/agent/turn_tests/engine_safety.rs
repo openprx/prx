@@ -99,18 +99,12 @@ async fn execution_model_differs_from_bound_model_is_refused() {
     let admitted = AdmittedTurn::with_config(workspace_config(workspace.path()), "reply", Arc::clone(&registry)).await;
     let decision = admitted.decision();
     assert!(
-        decision
-            .service
-            .validate_agent_execution_model(decision.proof, "ollama", "prx-local-model")
-            .is_ok(),
+        crate::runtime::turn_model::validate_execution(decision.proof, "ollama", "prx-local-model").is_ok(),
         "the ingress binding must admit itself"
     );
     for (provider_name, model) in [("ollama", "prx-other-model"), ("openai", "prx-local-model")] {
         assert!(
-            decision
-                .service
-                .validate_agent_execution_model(decision.proof, provider_name, model)
-                .is_err(),
+            crate::runtime::turn_model::validate_execution(decision.proof, provider_name, model).is_err(),
             "{provider_name}/{model} is outside the ingress binding"
         );
         let provider = NativeScriptedProvider::new(vec![ChatResponse {

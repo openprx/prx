@@ -35,6 +35,9 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = "config_reload";
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
@@ -137,7 +140,7 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
         assert!(service.model_can_call_tools(proof.as_ref()));
         let cancel = CancellationToken::new();
         let context = service
-            .decide_agent_initial(proof.as_ref(), AgentTurnKind::Repl, &cancel)
+            .open_issued_turn_context(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
         assert!(

@@ -19,7 +19,7 @@ async fn fresh_terminal_run(
     )
     .await;
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("test: fresh terminal decision");
     let mut scope = crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
@@ -35,6 +35,9 @@ async fn fresh_terminal_run(
 async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -84,14 +87,14 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     cancelled.cancel();
     assert!(matches!(
         service
-            .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &cancelled)
+            .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancelled)
             .await,
         Err(AgentDecisionError::Cancelled)
     ));
     assert_eq!(service.store.reader().counts().expect("counts").decisions, 0);
 
     let mut context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("successful local decision");
     {
@@ -294,7 +297,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     assert_eq!(outcome.settlement_id, "linked-terminal-1");
     assert_eq!(outcome.classification, "failed");
     let conflicting_context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("second local decision");
     let mut conflicting_commit = linked_commit.clone();
@@ -339,7 +342,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let (race_proof, race_a_context, race_scope) =
         fresh_terminal_run(&service, &generation, Arc::clone(&memory), "prx_concurrent_run").await;
     let race_b_context = service
-        .decide_agent_initial(&race_proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&race_proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("test: competing terminal decision");
     let mut concurrent_a = linked_commit.clone();
@@ -914,6 +917,9 @@ async fn disabled_service_ignores_an_unsafe_store_path_without_touching_it() {
     std::fs::create_dir(workspace.path().join("self")).expect("test self directory");
     symlink(outside.path(), workspace.path().join("self/causal_tree")).expect("test unsafe store path");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.enabled = false;
     config.workspace_dir = workspace.path().to_path_buf();
     let generation = crate::config::new_shared(config.clone()).pin();

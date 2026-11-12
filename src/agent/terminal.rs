@@ -1532,7 +1532,7 @@ mod tests {
                 Duration::from_secs(5),
                 crate::causal_tree::logical_clock::scope(
                     crate::causal_tree::logical_clock::ManualClock::new(),
-                    service.decide_agent_initial(
+                    service.open_issued_turn_context(
                         &proof,
                         crate::runtime::turn_decision::AgentTurnKind::Repl,
                         &cancellation,

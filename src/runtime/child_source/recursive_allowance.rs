@@ -21,7 +21,6 @@ pub(crate) struct RecursiveAllowance {
     funded: bool,
     retention: Option<Weak<Registry>>,
     contexts: AtomicUsize,
-    pending_until: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 impl RecursiveAllowance {
@@ -32,7 +31,6 @@ impl RecursiveAllowance {
             funded: true,
             retention: None,
             contexts: AtomicUsize::new(0),
-            pending_until: parking_lot::Mutex::new(None),
         }
     }
 
@@ -163,10 +161,8 @@ impl RunAllowances {
                     funded: false,
                     retention: Some(Arc::downgrade(registry)),
                     contexts: AtomicUsize::new(0),
-                    pending_until: parking_lot::Mutex::new(None),
                 })
             });
-        *original.pending_until.lock() = None;
         entries.insert(Self::key(proof), Arc::clone(&original));
         ContextAllowance::new(original)
     }
@@ -188,7 +184,6 @@ impl RunAllowances {
                 funded: true,
                 retention: Some(Arc::downgrade(registry)),
                 contexts: AtomicUsize::new(0),
-                pending_until: parking_lot::Mutex::new(None),
             })
         })))
     }
@@ -215,37 +210,8 @@ impl Drop for ContextAllowance {
         if last {
             // Lease acquisition holds the same registry lock. Recheck after
             // taking it so a concurrent resume cannot lose its registry entry.
-            self.0
-                .retire_if(|| self.0.contexts.load(Ordering::Acquire) == 0 && self.0.pending_until.lock().is_none());
+            self.0.retire_if(|| self.0.contexts.load(Ordering::Acquire) == 0);
         }
-    }
-}
-
-impl RecursiveAllowance {
-    #[cfg(test)]
-    pub(in crate::runtime) fn retain_pending(self: &Arc<Self>, expires_at: chrono::DateTime<chrono::Utc>) {
-        let remaining = (expires_at - chrono::Utc::now()).to_std().unwrap_or_default();
-        let Some(deadline) = std::time::Instant::now().checked_add(remaining) else {
-            self.retire();
-            return;
-        };
-        *self.pending_until.lock() = Some(deadline);
-        let owner = Arc::downgrade(self);
-        tokio::spawn(async move {
-            tokio::time::sleep_until(deadline.into()).await;
-            if let Some(owner) = owner.upgrade() {
-                // Serialize expiry with resume's alias/lease publication.
-                owner.retire_if(|| {
-                    let mut pending = owner.pending_until.lock();
-                    if *pending == Some(deadline) {
-                        *pending = None;
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
-        });
     }
 }
 
@@ -260,7 +226,6 @@ impl RunAllowances {
         let key: [u8; 32] = hash.finalize().into();
         let entry = self.existing().and_then(|registry| registry.lock().get(&key).cloned());
         if let Some(entry) = entry {
-            *entry.pending_until.lock() = None;
             entry.retire();
         }
     }

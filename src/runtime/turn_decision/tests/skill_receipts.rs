@@ -131,6 +131,9 @@ fn managed_store(workspace: &std::path::Path, owner: &str) -> SkillLifecycleStor
 
 fn base_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.to_owned();
     config.skills.open_skills_dir = Some(workspace.join("missing-open-skills").to_string_lossy().to_string());
     config.skills.openclaw_skills_dir = Some(workspace.join("missing-openclaw-skills").to_string_lossy().to_string());
@@ -264,7 +267,7 @@ async fn selected_skill_target_turn(lifecycle: bool, execute: bool) -> SelectedS
     )
     .await;
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
         .await
         .expect("test: decision");
     assert!(
@@ -354,6 +357,9 @@ async fn crashed_after_marker(
 ) -> (tempfile::TempDir, Arc<TurnDecisionService>, String, String) {
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     let generation = crate::config::new_shared(config.clone()).pin();
@@ -368,7 +374,7 @@ async fn crashed_after_marker(
     )
     .await;
     let context = service
-        .decide_agent_initial(&proof, kind, &CancellationToken::new())
+        .open_issued_turn_context(&proof, kind, &CancellationToken::new())
         .await
         .expect("test: decision");
     let now = chrono::Utc::now();

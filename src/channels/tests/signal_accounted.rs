@@ -158,7 +158,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         // These accounting fixtures require an actual selected private read;
         // the text-only case omits vision, not the explicit local prediction.
         config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind =
+        config.decision_engine.enabled = true;        config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         // Narrow the allowed hops: one genuine memory read, then the existing
         // fresh-evidence terminal gate. Scoring thresholds remain unchanged.

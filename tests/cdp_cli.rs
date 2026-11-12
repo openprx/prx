@@ -179,6 +179,7 @@ fn enabled_loopback(temp: &TempDir, endpoint: &str) -> PathBuf {
         &[
             (&["api_key"], toml::Value::String(SECRET.to_string())),
             (&["causal_tree", "enabled"], toml::Value::Boolean(true)),
+            (&["decision_engine", "enabled"], toml::Value::Boolean(true)),
             (
                 &["causal_tree", "backend", "kind"],
                 toml::Value::String("compatible_http".to_string()),
@@ -676,7 +677,14 @@ fn init_with_a_loopback_decision_backend_writes_a_valid_config() {
     );
     let status = stdout_json(&causal(&target, &["status", "--json"]));
     assert_eq!(status["enabled"], true, "{status}");
-    assert_eq!(status["order"][0]["kind"], "compatible_http", "{status}");
+    assert_eq!(
+        status["order"][0]["kind"], "builtin",
+        "test: init keeps the advisory engine off: {status}"
+    );
+    assert_eq!(
+        status["excluded"][0]["reason"], "engine_disabled",
+        "test: configured loopback is excluded until engine opt-in: {status}"
+    );
     assert_eq!(status["factory_error"], serde_json::Value::Null, "{status}");
 }
 
@@ -765,4 +773,34 @@ fn quick_setup_decision_flags_use_the_shared_service() {
     );
     assert!(!output.status.success());
     assert!(!hosted.join("config.toml").exists(), "nothing was written");
+}
+
+#[test]
+fn prx_causal_status_distinguishes_disabled_engine_from_missing_key() {
+    let temp = TempDir::new().expect("test: isolated CLI directory");
+    let (endpoint, _) = refusing_stub();
+    let dir = enabled_loopback(&temp, &endpoint);
+    let first = stdout_json(&causal(&dir, &["status", "--json"]));
+    assert_eq!(
+        first["key_available"], true,
+        "test: enabled fixture has a real available key"
+    );
+    let path = dir.join("config.toml");
+    let source = std::fs::read_to_string(&path).expect("test: owned config");
+    let mut config: toml::Value = toml::from_str(&source).expect("test: parse owned config");
+    config["decision_engine"]["enabled"] = toml::Value::Boolean(false);
+    std::fs::write(
+        &path,
+        toml::to_string_pretty(&config).expect("test: serialize owned config"),
+    )
+    .expect("test: disable engine");
+    let status = stdout_json(&causal(&dir, &["status", "--json"]));
+    assert_eq!(
+        status["key_available"], true,
+        "test: disabling the engine must not misreport its existing key"
+    );
+    assert_eq!(
+        status["excluded"][0]["reason"], "engine_disabled",
+        "test: no physical backend is built while the engine is off"
+    );
 }

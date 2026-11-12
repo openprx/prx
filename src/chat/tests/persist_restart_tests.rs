@@ -206,9 +206,7 @@ async fn persist_completed_chat(
     use crate::agent::terminal::{
         TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalStatus, TurnTerminalTelemetry,
     };
-    use crate::agent::turn_request::{
-        ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices,
-    };
+    use crate::agent::turn_request::{ToolLoopMemory, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
     struct FixtureProvider;
     #[async_trait::async_trait]
     impl Provider for FixtureProvider {
@@ -249,11 +247,7 @@ async fn persist_completed_chat(
                 low_priority_tool_names: Vec::new(),
             },
             compaction: None,
-            decision: TurnDecision {
-                service: routing.service,
-                context: routing.context,
-                proof: routing.proof,
-            },
+            decision: routing,
         },
         TurnServices {
             provider: &FixtureProvider,
@@ -334,7 +328,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                 .unwrap();
             let service = publish(memory.clone(), generation).await.unwrap();
             let cancel = CancellationToken::new();
-            binding.decide(&service, &cancel).await.unwrap();
+            binding.issue_decision(&service, &cancel, false).await.unwrap();
             let fabric = MemoryFabric::new(memory.clone(), workspace.to_string_lossy());
             let receipt = persist_completed_chat(&binding, &fabric, workspace, 2).await;
             if !matches!(fault, Fault::None) {
@@ -483,7 +477,7 @@ async fn chat_drained_service_releases_ingress_lease_before_restart() {
             )?;
             let service = publish(memory.clone(), generation).await?;
             let cancel = CancellationToken::new();
-            binding.decide(&service, &cancel).await?;
+            binding.issue_decision(&service, &cancel, false).await?;
             let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
             let _ = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             guard.handoff();
@@ -974,7 +968,7 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
                 .expect("writer hold ready");
 
             let cancel = CancellationToken::new();
-            binding.decide(&service, &cancel).await?;
+            binding.issue_decision(&service, &cancel, false).await?;
             let fabric = MemoryFabric::new(memory.clone(), dir.path().to_string_lossy());
             let receipt = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             let mut payload: serde_json::Value = serde_json::from_str(

@@ -844,15 +844,6 @@ impl ChatTurnBinding {
         }
     }
 
-    #[cfg(test)]
-    pub(super) async fn decide(
-        &self,
-        service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
-        self.issue_decision(service, cancellation, false).await
-    }
-
     pub(super) async fn issue_decision(
         &self,
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
@@ -1395,21 +1386,23 @@ pub(crate) mod admission_failure_tests {
             ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = binding.decide(&service, &cancellation).await?;
+        let context = binding.issue_decision(&service, &cancellation, false).await?;
         use crate::tools::Tool as _;
-        let search = service.capability_search_port(binding.as_ref(), context)?;
-        let found = crate::tools::capability::search_tool::with_search_authority(
-            Some(search),
-            crate::tools::capability::search_tool::CapabilitySearchTool
-                .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
-        )
-        .await?;
-        anyhow::ensure!(found.success, "source-owned spawn search failed");
-        service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
         let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
-        specs
-            .specs
-            .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
+        if !specs.specs.iter().any(|spec| spec.name == "sessions_spawn") {
+            let search = service.capability_search_port(binding.as_ref(), context)?;
+            let found = crate::tools::capability::search_tool::with_search_authority(
+                Some(search),
+                crate::tools::capability::search_tool::CapabilitySearchTool
+                    .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
+            )
+            .await?;
+            anyhow::ensure!(found.success, "source-owned spawn search failed");
+            service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
+            specs
+                .specs
+                .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
+        }
         anyhow::ensure!(
             specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
             "genuine model admission did not select sessions_spawn"
@@ -1509,21 +1502,23 @@ pub(crate) mod admission_failure_tests {
             ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = binding.decide(&service, &cancellation).await?;
+        let context = binding.issue_decision(&service, &cancellation, false).await?;
         use crate::tools::Tool as _;
-        let search = service.capability_search_port(binding.as_ref(), context)?;
-        let found = crate::tools::capability::search_tool::with_search_authority(
-            Some(search),
-            crate::tools::capability::search_tool::CapabilitySearchTool
-                .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
-        )
-        .await?;
-        anyhow::ensure!(found.success, "source-owned spawn search failed");
-        service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
         let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
-        specs
-            .specs
-            .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
+        if !specs.specs.iter().any(|spec| spec.name == "sessions_spawn") {
+            let search = service.capability_search_port(binding.as_ref(), context)?;
+            let found = crate::tools::capability::search_tool::with_search_authority(
+                Some(search),
+                crate::tools::capability::search_tool::CapabilitySearchTool
+                    .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
+            )
+            .await?;
+            anyhow::ensure!(found.success, "source-owned spawn search failed");
+            service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
+            specs
+                .specs
+                .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
+        }
         anyhow::ensure!(
             specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
             "genuine model admission did not select sessions_spawn"
@@ -1805,7 +1800,7 @@ pub(crate) mod admission_failure_tests {
             });
         }
         binding
-            .decide(&service, &tokio_util::sync::CancellationToken::new())
+            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
             .await
             .unwrap();
         (binding, service, event)
@@ -1841,7 +1836,7 @@ pub(crate) mod admission_failure_tests {
         let service = service(&fabric, &binding).await;
         assert!(service.execution_approval_ledger().is_some(), "durable fixture ledger");
         binding
-            .decide(&service, &tokio_util::sync::CancellationToken::new())
+            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
             .await
             .unwrap();
         assert!(
@@ -1886,7 +1881,7 @@ pub(crate) mod admission_failure_tests {
             .await;
             let service = service(&fabric, &binding).await;
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let context = binding.decide(&service, &cancellation).await.unwrap();
+            let context = binding.issue_decision(&service, &cancellation, false).await.unwrap();
             let advice = binding.decision_advice();
             if enabled && mode != DecisionMode::Post {
                 let advice = advice.expect("pre/both analysis from actual chat decision");
@@ -1962,7 +1957,7 @@ pub(crate) mod admission_failure_tests {
             let copied = OwnedTurnSourceProof::capture(&owned);
             assert!(owned.intercepts_writes() && copied.intercepts_writes());
             let service = service(&fabric, &binding).await;
-            let context = binding.decide(&service, &cancellation).await.unwrap();
+            let context = binding.issue_decision(&service, &cancellation, false).await.unwrap();
             assert!(
                 context
                     .inherited_constraint_codes()
@@ -2045,7 +2040,7 @@ pub(crate) mod admission_failure_tests {
         let service = service(&fabric, &operator).await;
         assert!(
             operator
-                .decide(&service, &tokio_util::sync::CancellationToken::new())
+                .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
                 .await
                 .is_err()
         );
@@ -2180,7 +2175,7 @@ pub(crate) mod admission_failure_tests {
             .await
             .unwrap();
         let result = binding
-            .decide(&service, &tokio_util::sync::CancellationToken::new())
+            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
             .await;
         assert!(
             result
@@ -2200,7 +2195,7 @@ pub(crate) mod admission_failure_tests {
         let (dir, fabric, binding) = fixture(true).await;
         let service = service(&fabric, &binding).await;
         binding
-            .decide(&service, &tokio_util::sync::CancellationToken::new())
+            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
             .await
             .unwrap();
         assert!(

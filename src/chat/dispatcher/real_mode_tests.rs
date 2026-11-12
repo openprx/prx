@@ -195,7 +195,9 @@ async fn admit_start_turn_fixture(
         &selected,
         crate::chat::decision_source::ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
-    let context = binding.decide(&service, &CancellationToken::new()).await?;
+    let context = binding
+        .issue_decision(&service, &CancellationToken::new(), false)
+        .await?;
     if context.engine().prediction.is_some() {
         eprintln!(
             "PRX_Q42_ADMISSION unexpected prediction on open_turn_context: {:?}",

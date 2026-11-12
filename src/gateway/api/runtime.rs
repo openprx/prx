@@ -733,7 +733,7 @@ mod tests {
                         memory:Arc::clone(&memory), plugin_generation:0,
                     }.publish(crate::causal_tree::state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
-                    let context = service.decide_agent_initial(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
+                    let context = service.open_issued_turn_context(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
                     anyhow::ensure!(
                         matches!(
                             context.engine().selection,

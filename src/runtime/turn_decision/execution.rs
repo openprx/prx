@@ -901,23 +901,9 @@ impl TurnDecisionService {
             context.catalog_generation() == catalog.generation(),
             "decision catalog changed"
         );
-        #[cfg(test)]
-        let abstention_answer;
         let selected_id = match &context.engine.selection {
             crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
             crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
-            #[cfg(test)]
-            crate::causal_tree::decision_select::Selection::Abstain {
-                action: crate::causal_tree::branch::CausalActionKind::Answer,
-                ..
-            } => {
-                abstention_answer = crate::causal_tree::branch::CandidateId::new(
-                    crate::causal_tree::branch::CausalActionKind::Answer,
-                    crate::causal_tree::branch::CapabilityTarget::None,
-                    None,
-                );
-                &abstention_answer
-            }
 
             _ => {
                 if let Some(reply) = context.refusal_reply() {

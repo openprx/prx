@@ -230,33 +230,46 @@ impl LifecycleFixture {
             scope,
             grant,
         };
-        fixture
-            .ledger()
-            .persist_pending_record_receipt(
-                PendingRecord {
-                    h2_origin: None,
-                    subject: fixture.subject.clone(),
-                    binding: fixture.binding.clone(),
-                    source_event_id: source.event_id.clone(),
-                    source_mac: fixture.key.hmac(
-                        KeyDomain::ApprovalState,
-                        &[b"source", &serde_json::to_vec(&source).unwrap()],
-                    ),
-                    run_id: "prx_run".into(),
-                    decision_digests: vec![(id.to_string(), digest)],
-                    policy_version: "prx_policy".into(),
-                    capabilities: vec![],
-                    op_ids: vec!["prx_operation".into()],
-                    effect: "local_write".into(),
-                    risk: None,
-                    schema_dialect: None,
-                    sealed_call: None,
-                    expires_at,
-                },
-                &source,
+        let record = PendingRecord {
+            h2_origin: None,
+            subject: fixture.subject.clone(),
+            binding: fixture.binding.clone(),
+            source_event_id: source.event_id.clone(),
+            source_mac: fixture.key.hmac(
+                KeyDomain::ApprovalState,
+                &[b"source", &serde_json::to_vec(&source).unwrap()],
+            ),
+            run_id: "prx_run".into(),
+            decision_digests: vec![(id.to_string(), digest)],
+            policy_version: "prx_policy".into(),
+            capabilities: vec![],
+            op_ids: vec!["prx_operation".into()],
+            effect: "local_write".into(),
+            risk: None,
+            schema_dialect: None,
+            sealed_call: None,
+            expires_at,
+        };
+        let signed = super::pending::SignedPending {
+            mac: fixture.key.hmac(
+                KeyDomain::ApprovalState,
+                &[
+                    b"pending",
+                    &serde_json::to_vec(&record).expect("test: historical pending bytes"),
+                ],
+            ),
+            record,
+        };
+        crate::memory::MemoryFabric::new(fixture.memory.clone(), &source.workspace_id)
+            .record_runtime_event_idempotent(
+                super::pending::scope_from_source(&source),
+                "approval.decision.pending",
+                "decision awaiting human approval",
+                Some(serde_json::to_string(&signed).expect("test: historical pending payload")),
+                DecisionAuthority(id).pending_key(),
             )
             .await
-            .unwrap();
+            .expect("test: seed historical pending row");
         fixture
             .ledger()
             .store_decision_grant(

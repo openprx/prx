@@ -1,6 +1,5 @@
 #![cfg(test)]
 pub(crate) mod admission_matrix;
-mod collection_arguments;
 mod exact_call_observation;
 use super::*;
 use crate::security::policy::AutonomyLevel;

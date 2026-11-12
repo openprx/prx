@@ -3814,29 +3814,6 @@ pub(crate) fn enforce_command_contract(
     Ok(())
 }
 
-/// Validate effect arguments for a non-executing approval proposal.
-///
-/// The owning collection lease verifies source and capability authority. This
-/// function returns only schema-normalized effect arguments, with no grant or
-/// runtime scope injected. The normal executor authors those fields only after
-/// approval; the pending-call digest binds its source separately.
-#[cfg(test)]
-pub(crate) fn normalize_collection_arguments(
-    arguments: &serde_json::Value,
-    descriptor: &ToolDescriptor,
-    dialect: ToolSchemaDialect,
-) -> Result<serde_json::Value, String> {
-    let root = arguments
-        .as_object()
-        .ok_or_else(|| "collection arguments must be a JSON object".to_string())?;
-    if root.keys().any(|key| is_runtime_only_arg(key)) {
-        return Err("collection arguments contain reserved runtime fields".to_string());
-    }
-    let mut normalized = arguments.clone();
-    enforce_command_contract(&mut normalized, descriptor, dialect)?;
-    Ok(normalized)
-}
-
 fn normalize_arguments(
     arguments: &serde_json::Value,
     context: &ToolExecutionContext,

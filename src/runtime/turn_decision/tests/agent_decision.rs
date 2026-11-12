@@ -644,6 +644,9 @@ async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
 async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = false;
     let generation = crate::config::new_shared(config.clone()).pin();
@@ -655,7 +658,7 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         "Explain `2 + 2`.",
     );
     let result = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("source-bound builtin decision");
     assert!(matches!(result.directive(), TurnExecutionDirective::AnswerDirectly));
@@ -739,6 +742,9 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
 async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.enabled = false;
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.backend.max_request_bytes = 4096;
@@ -749,7 +755,7 @@ async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
         crate::agent::entry::test_cli_agent_turn_proof_with_input(&generation, "ollama", "prx-local-model", &raw);
     assert!(matches!(
         service
-            .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
             .await,
         Err(AgentDecisionError::Engine(EngineError::Compiler(
             crate::causal_tree::questions::CompileError::Budget
@@ -762,7 +768,7 @@ async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
     let wide_proof =
         crate::agent::entry::test_cli_agent_turn_proof_with_input(&wide_generation, "ollama", "prx-local-model", &raw);
     let wide_result = wide_service
-        .decide_agent_initial(&wide_proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&wide_proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("the same projected request fits the wider configured cap");
     assert_eq!(
@@ -780,6 +786,9 @@ async fn agent_initial_decision_respects_configured_four_kib_wire_limit() {
 async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_owned();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.max_decision_hops = 0;
@@ -849,7 +858,7 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
             "publication fixture requires real tool-operation support"
         );
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .unwrap();
         assert!(matches!(

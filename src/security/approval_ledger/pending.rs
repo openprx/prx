@@ -4,8 +4,6 @@ use super::keys::{ApprovalAuthority, DecisionAuthority};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject};
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
-#[cfg(test)]
-use crate::memory::MemoryFabric;
 use crate::memory::{MessageEvent, MessageEventScope};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -319,53 +317,6 @@ impl ApprovalLedger<'_> {
             }
         }
         Ok(true)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn persist_pending_record_receipt(
-        &self,
-        record: PendingRecord,
-        source: &MessageEvent,
-    ) -> anyhow::Result<MessageEvent> {
-        let record_owner = record.subject.owner_id.clone();
-        let record_decision = record.binding.decision_id.clone();
-        let signed = SignedPending {
-            mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"pending", &serde_json::to_vec(&record)?]),
-            record,
-        };
-        let expected = serde_json::to_value(&signed)?;
-        let fabric = MemoryFabric::new(self.memory.clone(), &source.workspace_id);
-        let event = fabric
-            .record_runtime_event_idempotent(
-                scope_from_source(source),
-                "approval.decision.pending",
-                "decision awaiting human approval",
-                Some(serde_json::to_string(&signed)?),
-                DecisionAuthority(DecisionId::parse(&record_decision)?).pending_key(),
-            )
-            .await?;
-        let durable = self
-            .memory
-            .find_owned_message_event(&source.workspace_id, &record_owner, &event.event_id)
-            .await?
-            .context("pending approval receipt is not durable")?;
-        anyhow::ensure!(
-            durable.id > 0
-                && durable.event_type == "approval.decision.pending"
-                && durable.session_key == source.session_key
-                && durable.run_id == source.run_id
-                && serde_json::to_value(&event)? == serde_json::to_value(&durable)?
-                && serde_json::from_str::<serde_json::Value>(
-                    durable
-                        .raw_payload_json
-                        .as_deref()
-                        .context("pending approval payload missing")?
-                )? == expected,
-            "pending approval receipt conflicts with issued scope"
-        );
-        Ok(durable)
     }
 
     pub(crate) async fn load_pending_decision_approval(

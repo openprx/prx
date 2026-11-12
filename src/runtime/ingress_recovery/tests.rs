@@ -16,19 +16,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const CHILD: &str = "runtime::ingress_recovery::tests::fresh_process_ingress_child";
 const MODEL: &str = "prx-ingress-model";
 const INPUT: &str = "memory_search: Explain the Rust expression `2 + 2`.";
-const PROBE: &str = "  ";
+const PROBE: &str = "Explain the current probe result.";
 const ACK: &str = "PRX_INGRESS_ACK:";
 
 #[derive(Serialize, Deserialize)]
 struct Report {
     pid: u32,
     calls: usize,
+    historical_resends: usize,
     key_sha256: String,
     store_workspace_id: String,
     events: Vec<MessageEvent>,
 }
 
-async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize) -> Report {
+async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize, historical_resends: usize) -> Report {
     let workspace_id = workspace.to_string_lossy().into_owned();
     let owner_id = format!("owner:{workspace_id}:agent_api:embedded-caller");
     let event_ids = {
@@ -74,6 +75,7 @@ async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize) -> Rep
     Report {
         pid: std::process::id(),
         calls,
+        historical_resends,
         store_workspace_id: crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace)
             .workspace_id()
             .expect("actual decision Store UUID must already exist")
@@ -94,6 +96,7 @@ struct RecordedProvider {
     memory: Arc<dyn Memory>,
     workspace: PathBuf,
     calls: Arc<AtomicUsize>,
+    historical_resends: Arc<AtomicUsize>,
     mode: String,
 }
 
@@ -103,16 +106,32 @@ impl Provider for RecordedProvider {
         anyhow::bail!("fixture requires the actual traced provider dispatch")
     }
 
-    async fn chat_traced(&self, _: ChatRequest<'_>, model: &str, _: f64) -> anyhow::Result<ChatTrace> {
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, _: f64) -> anyhow::Result<ChatTrace> {
         assert_eq!(model, MODEL);
         let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        assert_ne!(
-            self.mode, "probe",
-            "fresh probe must close without another provider dispatch"
-        );
+        if self.mode == "probe" {
+            let resent = request.messages.iter().any(|message| message.content.contains(INPUT));
+            self.historical_resends.fetch_add(usize::from(resent), Ordering::SeqCst);
+            assert!(
+                !resent,
+                "test: recovery must never resend the historical input to the provider"
+            );
+            assert!(
+                request.messages.iter().any(|message| message.content.contains(PROBE)),
+                "test: the new probe owns this provider request"
+            );
+        }
         assert_eq!(calls, 1, "a source may not be resent");
         if self.mode == "pending" {
-            acknowledge(&report(&self.memory, &self.workspace, calls).await);
+            acknowledge(
+                &report(
+                    &self.memory,
+                    &self.workspace,
+                    calls,
+                    self.historical_resends.load(Ordering::SeqCst),
+                )
+                .await,
+            );
             // Parent kills only this owned process after the durable-source/provider-entry acknowledgement.
             // No fabricated provider completion, token usage or terminal is returned.
             std::future::pending::<()>().await;
@@ -170,10 +189,6 @@ async fn fresh_process_ingress_child() {
     config.config_path = workspace.join("config.toml");
     config.default_model = Some(MODEL.into());
     config.causal_tree.enabled = true;
-    // The child proves recovery after a real selected private read. Request
-    // local prediction explicitly; ordinary Auto turns remain Direct.
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.policy.max_decision_hops = 1;
     if mode.starts_with("float-") {
         config.cost.prices.insert(
@@ -194,12 +209,14 @@ async fn fresh_process_ingress_child() {
         .unwrap(),
     );
     let calls = Arc::new(AtomicUsize::new(0));
+    let historical_resends = Arc::new(AtomicUsize::new(0));
     let mut agent = Agent::builder()
         .runtime_config(config, "ollama")
         .provider(Box::new(RecordedProvider {
             memory: Arc::clone(&memory),
             workspace: workspace.clone(),
             calls: Arc::clone(&calls),
+            historical_resends: Arc::clone(&historical_resends),
             mode: mode.clone(),
         }))
         .tools(vec![Box::new(crate::tools::memory_search::MemorySearchTool::new(
@@ -224,9 +241,21 @@ async fn fresh_process_ingress_child() {
     }
     let result = turn(&mut agent, input).await;
     assert!(result.is_ok(), "actual ingress failed: {result:?}");
-    assert_eq!(calls.load(Ordering::SeqCst), usize::from(mode != "probe"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "test: every new input owns exactly one provider call"
+    );
     drop(agent);
-    acknowledge(&report(&memory, &workspace, calls.load(Ordering::SeqCst)).await);
+    acknowledge(
+        &report(
+            &memory,
+            &workspace,
+            calls.load(Ordering::SeqCst),
+            historical_resends.load(Ordering::SeqCst),
+        )
+        .await,
+    );
 }
 
 struct OwnedChild {
@@ -347,7 +376,11 @@ fn verify_recovery(completed: bool) {
     assert_eq!(after.pid, next.child.id());
     next.finish(false);
     assert_ne!(before.pid, after.pid);
-    assert_eq!(after.calls, 0, "no historical provider call may be resent");
+    assert_eq!(after.calls, 1, "test: the new probe owns one provider call");
+    assert_eq!(
+        after.historical_resends, 0,
+        "test: no historical provider call may be resent"
+    );
     assert_eq!(before.key_sha256, after.key_sha256);
     assert_eq!(before.store_workspace_id, after.store_workspace_id);
     let restored = source(&after, INPUT);
@@ -365,19 +398,19 @@ fn verify_recovery(completed: bool) {
     let old_capsule = capsule_from_event(original).unwrap();
     let new_capsule = capsule_from_event(probe).unwrap();
     assert_eq!(old_capsule.backend_namespace, new_capsule.backend_namespace);
-    let probe_final = final_for(&after, probe).expect("actual fixed-close probe terminal");
-    let probe_payload: serde_json::Value =
-        serde_json::from_str(probe_final.raw_payload_json.as_ref().unwrap()).unwrap();
-    assert_eq!(
-        probe_payload
-            .pointer("/terminal_replay_v1/fixed_close")
-            .and_then(serde_json::Value::as_bool),
-        Some(true)
-    );
+    let probe_final = final_for(&after, probe).expect("test: actual provider-completed probe terminal");
+    let probe_payload: serde_json::Value = serde_json::from_str(
+        probe_final
+            .raw_payload_json
+            .as_ref()
+            .expect("test: probe terminal payload"),
+    )
+    .expect("test: probe terminal JSON");
     assert!(
         probe_payload
             .get("provider_outcome")
-            .is_none_or(serde_json::Value::is_null)
+            .is_some_and(|value| !value.is_null()),
+        "test: the probe terminal retains its own provider outcome"
     );
     assert_eq!(
         probe_payload

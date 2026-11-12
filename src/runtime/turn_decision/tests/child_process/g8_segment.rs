@@ -197,6 +197,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         std::fs::create_dir_all(path)?;
     }
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());
@@ -353,7 +356,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
     .await;
     let cancellation = CancellationToken::new();
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await?;
 
     assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
@@ -538,7 +541,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .ok_or_else(|| anyhow::anyhow!("budgeted child input receipt"))?;
         let budget_proof = budget_binding.source_proof(&budgeted, &budget_input, &budget_provider)?;
         let budget_context = budget_child
-            .decide_agent_initial(&budget_proof, AgentTurnKind::Repl, &cancellation)
+            .open_issued_turn_context(&budget_proof, AgentTurnKind::Repl, &cancellation)
             .await?;
         let funding = budgeted
             .recursive_child_allowance()
@@ -591,7 +594,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         "the configured non-agentic Delegate source must disable tool calls"
     );
     let restricted_context = child_service
-        .decide_agent_initial(&restricted_proof, AgentTurnKind::Repl, &cancellation)
+        .open_issued_turn_context(&restricted_proof, AgentTurnKind::Repl, &cancellation)
         .await?;
     assert!(
         matches!(restricted_context.directive(), TurnExecutionDirective::AnswerDirectly),

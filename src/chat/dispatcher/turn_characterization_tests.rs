@@ -573,7 +573,7 @@ async fn admit_chat_fixture_with_mode(
         .expect("source/provider binding");
     // The scenarios cancel after admission, while the provider turn is running.
     binding
-        .decide(&decisions, &CancellationToken::new())
+        .issue_decision(&decisions, &CancellationToken::new(), false)
         .await
         .expect("chat decision");
     let routing = binding.decision_routing().expect("test: chat decision routing");

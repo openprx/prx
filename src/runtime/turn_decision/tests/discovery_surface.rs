@@ -16,6 +16,8 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
         for excluded in [false, true] {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
             config.causal_tree.enabled = true;
             config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -98,7 +100,7 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
                 ("ollama", "prx-local-model"),
             ).await;
             let context = service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .unwrap();
             let published = service.agent_execution_specs(&proof, &context);
@@ -141,6 +143,8 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
         for (excluded, shell_excluded) in [(false, false), (true, false), (false, true)] {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
             config.causal_tree.enabled = true;
             config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -226,7 +230,7 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
                 ("ollama", "prx-local-model"),
             ).await;
             let context = service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .unwrap();
             let published = service.agent_execution_specs(&proof, &context);
@@ -306,6 +310,9 @@ impl Tool for DiscoverySurfaceTool {
 async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_owned();
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -376,7 +383,7 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     .await;
 
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
         .await
         .unwrap();
     assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
@@ -434,6 +441,9 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
         for (exclude_target, plan) in [(false, false), (true, false), (false, true)] {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
             config.causal_tree.enabled = true;
             config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -539,7 +549,7 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                 crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli)
             };
             let context = service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .unwrap();
             assert!(predictions.load(Ordering::SeqCst) > 0);
@@ -687,6 +697,9 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
     ] {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_owned();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -783,7 +796,7 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
         .await;
         let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .unwrap();
         assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
@@ -909,6 +922,9 @@ async fn discovered_tools_are_capped_per_turn_and_admitted_in_search_rank_order(
         let autonomy = crate::security::AutonomyLevel::Full;
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_owned();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -997,7 +1013,7 @@ async fn discovered_tools_are_capped_per_turn_and_admitted_in_search_rank_order(
         .await;
         let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .unwrap();
         assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
@@ -1106,6 +1122,9 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     )
     .unwrap();
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_owned();
     config.skills.open_skills_dir = Some(
         workspace
@@ -1206,7 +1225,7 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     .await;
     let cancellation = CancellationToken::new();
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await
         .unwrap();
     assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
@@ -1307,6 +1326,9 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_owned();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -1375,7 +1397,7 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
         .await;
         let proof = crate::runtime::turn_source::OwnedTurnSourceProof::capture(&cli);
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .unwrap();
         assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));

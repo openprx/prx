@@ -92,6 +92,8 @@ async fn run_witness(slow: bool) {
         let mut retained_service = None;
         let business = std::panic::AssertUnwindSafe(async {
         let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.clone();
         config.config_path = workspace.join("config.toml");
         let provider = format!("custom:{endpoint}");
@@ -137,7 +139,7 @@ async fn run_witness(slow: bool) {
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(&generation,Arc::clone(&memory),"Hello PRX, reply with a brief greeting.","prx_original_wire_run").await;
         let cancellation = CancellationToken::new();
         let started=Instant::now();
-        let (context, observed)=diagnostic_timing.scope(Box::pin(crate::causal_tree::decision_engine::original_observation::material::capture("actual-compatible-service-wire",service.decide_agent_initial(&proof,AgentTurnKind::Repl,&cancellation)))).await.expect("actual original observer");
+        let (context, observed)=diagnostic_timing.scope(Box::pin(crate::causal_tree::decision_engine::original_observation::material::capture("actual-compatible-service-wire",service.open_issued_turn_context(&proof,AgentTurnKind::Repl,&cancellation)))).await.expect("actual original observer");
 
         let context=context.expect("actual configured decision or bounded builtin fallback");
         let hops=context.audit_hops().collect::<Vec<_>>();

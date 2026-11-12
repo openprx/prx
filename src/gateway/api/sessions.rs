@@ -3180,7 +3180,7 @@ mod tests {
                         let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
                         let cancellation = tokio_util::sync::CancellationToken::new();
                         let context = service
-                            .decide_agent_initial(
+                            .open_issued_turn_context(
                                 &proof,
                                 crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                                 &cancellation,
@@ -3294,7 +3294,7 @@ mod tests {
                 let service = runtime.decision_slot.publish(&runtime, &state).await?.clone();
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let context = service
-                    .decide_agent_initial(
+                    .open_issued_turn_context(
                         &proof,
                         crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                         &cancellation,
@@ -3550,7 +3550,7 @@ mod tests {
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let (context, observed) = crate::causal_tree::decision_engine::original_observation::capture(
                     "console-owned-file-window-diagnostic",
-                    service.decide_agent_initial(
+                    service.open_issued_turn_context(
                         &proof,
                         crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                         &cancellation,

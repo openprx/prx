@@ -108,21 +108,13 @@ async fn agent_hint_route_drift_is_refused_before_credential_resolution() {
     let proof = crate::agent::entry::test_cli_agent_turn_proof(&generation, "ollama", "hint:fast");
     let matching = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
     assert!(matching.resolve_agent_model(&proof).is_ok());
-    assert!(
-        matching
-            .validate_agent_execution_model(&proof, "ollama", "hint:fast")
-            .is_ok()
-    );
-    assert!(
-        matching
-            .validate_agent_execution_model(&proof, "openai", "gpt-4o-mini")
-            .is_ok()
-    );
+    assert!(crate::runtime::turn_model::validate_execution(&proof, "ollama", "hint:fast").is_ok());
+    assert!(crate::runtime::turn_model::validate_execution(&proof, "openai", "gpt-4o-mini").is_ok());
     for (provider, model) in [("ollama", "gpt-4o-mini"), ("openai", "hint:fast"), ("openai", "gpt-4o")] {
-        assert!(matches!(
-            matching.validate_agent_execution_model(&proof, provider, model),
-            Err(TurnModelError::SelectionDrift)
-        ));
+        assert!(
+            crate::runtime::turn_model::validate_execution(&proof, provider, model).is_err(),
+            "test: mismatched execution model must be refused by the ingress binding"
+        );
     }
 
     let mut foreign = config.clone();
@@ -132,10 +124,7 @@ async fn agent_hint_route_drift_is_refused_before_credential_resolution() {
         stale.resolve_agent_model(&proof),
         Err(TurnModelError::RouteDrift)
     ));
-    assert!(matches!(
-        stale.validate_agent_execution_model(&proof, "openai", "gpt-4o-mini"),
-        Err(TurnModelError::RouteDrift)
-    ));
+
     assert!(!stale.model_can_call_tools(&proof));
 
     let route = foreign.model_routes.first_mut().expect("configured route");
@@ -403,6 +392,9 @@ async fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
 async fn validated_usage_and_provider_request_id_reach_the_durable_decision() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -468,7 +460,7 @@ async fn validated_usage_and_provider_request_id_reach_the_durable_decision() {
     )
     .await;
     let context = service
-        .decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("scripted validated decision");
     let request_id = {
@@ -513,6 +505,9 @@ async fn validated_usage_and_provider_request_id_reach_the_durable_decision() {
 async fn cancellation_while_backend_pending_admits_no_decision_or_outcome() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -580,7 +575,7 @@ async fn cancellation_while_backend_pending_admits_no_decision_or_outcome() {
     )
     .await;
     let cancellation = CancellationToken::new();
-    let decision = service.decide_agent_initial(&proof, AgentTurnKind::SingleShot, &cancellation);
+    let decision = service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation);
     let cancel_when_entered = async {
         entered.notified().await;
         cancellation.cancel();

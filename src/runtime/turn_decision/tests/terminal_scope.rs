@@ -23,6 +23,9 @@ impl LinkedFixture {
     async fn with_enabled(enabled: bool) -> Self {
         let workspace = tempfile::tempdir().expect("owned workspace");
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = enabled;
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -71,7 +74,7 @@ impl LinkedFixture {
         .await;
         changed.store(true, Ordering::SeqCst);
         let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+            .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .expect("genuine catalog drift terminal");
         if enabled {

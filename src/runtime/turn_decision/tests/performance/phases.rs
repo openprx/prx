@@ -180,6 +180,9 @@ async fn actual_builtin_phase_characterization() {
     let reverse = std::env::var("PRX_CDP_PERF_REVERSE").is_ok_and(|v| v == "1");
     let workspace = tempfile::tempdir().expect("isolated workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5000;
@@ -332,7 +335,7 @@ async fn actual_builtin_phase_characterization() {
             let context = if mode == "decision" {
                 Some(
                     service
-                        .decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation)
+                        .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
                         .await
                         .expect("actual builtin decision"),
                 )

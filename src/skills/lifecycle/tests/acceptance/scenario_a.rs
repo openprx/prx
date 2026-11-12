@@ -457,14 +457,29 @@ async fn a_wall_stall_past_the_latency_budget_still_answers() {
 }
 
 #[tokio::test]
-async fn advancing_the_logical_latency_budget_clarifies_before_a_plain_answer() {
+async fn advancing_the_logical_latency_budget_keeps_advice_advisory() {
     let world = World::new().await;
     let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
     let reply = world
         .run_plain_after_logical_budget(&config)
         .await
-        .expect("test: a spent logical budget completes as a clarification");
-    // Deadline exhaustion closes locally with Clarify on text-capable CLI.
-    // The wall-stall sibling still receives the model answer.
-    assert_eq!(reply, "Could you narrow your request so I can finish it in time?");
+        .expect("test: advisory Clarify must complete under the execution owner");
+    assert_eq!(
+        reply, "plain answer",
+        "test: advisory Clarify cannot restore the deleted fixed-close path"
+    );
+    assert_eq!(
+        world.loopback.requests(),
+        1,
+        "test: the execution owner completes exactly one provider turn"
+    );
+    assert!(
+        world
+            .loopback
+            .bodies
+            .lock()
+            .iter()
+            .all(|body| !body.contains("tool_result")),
+        "test: a plain advisory turn must execute no tool the advice did not allow"
+    );
 }

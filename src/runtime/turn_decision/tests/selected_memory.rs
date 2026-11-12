@@ -14,6 +14,9 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
 
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.providers.models.push(
         toml::from_str(
@@ -116,7 +119,9 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         trusted.source_event_id = proof_a.source_event_id().map(Arc::from);
         trusted.catalog_generation = view.generation();
         trusted.policy_version = Arc::clone(&service.policy_version);
-        trusted.bind_resolved_model(model.provider_label(), model.model());
+        trusted.resolved_provider = Arc::from(model.provider_label());
+        trusted.resolved_model_id = Arc::from(model.model());
+        trusted.resolved_model = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
         let effective = effective_agent_exclusions(
             &config,
             &service.registry,
@@ -607,6 +612,9 @@ async fn builtin_agent_discovery_runs_a_bounded_dependent_hop() {
 
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
     config.providers.models.push(
@@ -674,7 +682,7 @@ async fn builtin_agent_discovery_runs_a_bounded_dependent_hop() {
             );
             assert!(matches!(discovered_entry.exposure, Exposure::Searchable));
             let context = service
-                .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
+                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .expect("bounded builtin decision");
             let discovery_decision = context
@@ -887,6 +895,9 @@ async fn selected_discovery_is_source_bound_and_never_dispatches_a_tool() {
 
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     let generation = crate::config::new_shared(config.clone()).pin();
     let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
@@ -960,7 +971,9 @@ async fn selected_discovery_is_source_bound_and_never_dispatches_a_tool() {
         trusted.source_event_id = proof.source_event_id().map(Arc::from);
         trusted.catalog_generation = view.generation();
         trusted.policy_version = Arc::clone(&service.policy_version);
-        trusted.bind_resolved_model(model.provider_label(), model.model());
+        trusted.resolved_provider = Arc::from(model.provider_label());
+        trusted.resolved_model_id = Arc::from(model.model());
+        trusted.resolved_model = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
         let effective = effective_agent_exclusions(
             &config,
             &service.registry,

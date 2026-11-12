@@ -193,10 +193,10 @@ async fn open_turn_context_g6_slice_is_literal() {
     assert_eq!(crate::agent::send_admission::live_g6_tokens(&context), 3584);
 }
 
-/// Cancelled token plus engine off: `decide_agent_initial` returns Cancelled
+/// Cancelled token plus engine off: `open_issued_turn_context` returns Cancelled
 /// through `open_turn_context` (L1).
 #[tokio::test]
-async fn decide_agent_initial_cancelled_with_engine_off_returns_cancelled() {
+async fn issued_turn_context_cancelled_with_engine_off_returns_cancelled() {
     let workspace = tempfile::tempdir().expect("cancelled-open workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
@@ -210,7 +210,7 @@ async fn decide_agent_initial_cancelled_with_engine_off_returns_cancelled() {
     cancellation.cancel();
     let result = decision
         .service
-        .decide_agent_initial(
+        .open_issued_turn_context(
             decision.proof,
             crate::runtime::turn_decision::AgentTurnKind::SingleShot,
             &cancellation,
@@ -553,7 +553,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
     .await
     .expect("test: child worker service");
     let child_context = child_service
-        .decide_agent_initial(
+        .open_issued_turn_context(
             &child_proof,
             AgentTurnKind::Repl,
             &tokio_util::sync::CancellationToken::new(),

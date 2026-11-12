@@ -151,14 +151,6 @@ impl TrustedParts {
         self.constraints.iter().any(|code| code.as_str() == "owner_isolated")
     }
 
-    /// Bind the PMM provider/model pair and the joined `resolved_model` ref.
-    #[cfg(test)]
-    pub(crate) fn bind_resolved_model(&mut self, provider: &str, model: &str) {
-        self.resolved_provider = Arc::from(provider);
-        self.resolved_model_id = Arc::from(model);
-        self.resolved_model = Arc::from(format!("{provider}:{model}"));
-    }
-
     pub(crate) fn excludes_entry(
         &self,
         entry: crate::causal_tree::state::model_admission::ModelAdmissionEntry<'_>,

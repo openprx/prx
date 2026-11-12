@@ -1267,6 +1267,7 @@ mod tests {
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
             config.causal_tree.enabled = true;
+            config.decision_engine.enabled = true;
             config.causal_tree.backend.kind =
                 crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             config.causal_tree.backend.remote_enabled = false;
@@ -2009,6 +2010,7 @@ mod tests {
         config.default_provider = Some(LABEL.to_owned());
         config.default_model = Some("model-a".to_owned());
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.causal_tree.backend.remote_enabled = false;
@@ -2249,6 +2251,7 @@ mod tests {
         let mut builder = embedded_provider_builder(workspace.path());
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.causal_tree.backend.remote_enabled = false;
@@ -2815,6 +2818,7 @@ mod tests {
         config.memory.auto_save = false;
         // Owned local fixture records the genuine Builtin decision chain; no remote backend.
         config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
             crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.causal_tree.backend.remote_enabled = false;

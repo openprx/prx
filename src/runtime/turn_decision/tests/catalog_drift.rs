@@ -54,6 +54,9 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
     for catalog_size in [64_usize, 0, 64, 0] {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -113,7 +116,7 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
             super::super::super::turn_cost::build_cost_model(&catalog, &model, &config.cost, &BTreeMap::new())
         });
         let (result, allocations) = crate::decision::builtin::allocation_counter::count_future(
-            service.decide_agent_initial(&proof, AgentTurnKind::SingleShot, &cancellation),
+            service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation),
         )
         .await;
         let context = result.expect("builtin service decision");
@@ -152,6 +155,9 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
     for catalog_size in [64_usize, 0, 64, 0] {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = true;
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -209,7 +215,7 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         .expect("enabled synthetic service");
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof(&generation, memory).await;
         let (result, allocations) = crate::decision::builtin::allocation_counter::count_future(
-            service.decide_agent_initial(&proof, AgentTurnKind::SingleShot, &CancellationToken::new()),
+            service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new()),
         )
         .await;
         let context = result.expect("builtin service decision");
@@ -362,6 +368,9 @@ async fn run_catalog_drift_probe(
 ) -> (Result<Arc<TurnDecisionContext>, AgentDecisionError>, usize, usize) {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.policy.extra_latency_budget_ms = if moment == CatalogDriftMoment::WhileBackendPending {
         500
@@ -444,7 +453,7 @@ async fn run_catalog_drift_probe(
         )
         .await;
         let cancellation = CancellationToken::new();
-        let decision = service.decide_agent_initial(&proof, AgentTurnKind::Repl, &cancellation);
+        let decision = service.open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation);
         let context = if moment == CatalogDriftMoment::WhileBackendPending {
             let change_during_wait = async {
                 backend_entered.notified().await;

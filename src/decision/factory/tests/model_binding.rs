@@ -42,6 +42,7 @@ async fn configured_http_wrong_model_is_refused_before_send() {
     config.workspace_dir = workspace.path().to_path_buf();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
+    config.decision_engine.enabled = true;
     config.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
     config.causal_tree.backend.endpoint = endpoint.clone();
     config.causal_tree.backend.model = "prx-decision-model".to_owned();

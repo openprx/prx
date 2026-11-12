@@ -629,6 +629,11 @@ impl AdmittedTurn {
     ) -> Self {
         let workspace_path = config.workspace_dir.clone();
         let workspace = workspace_path.as_path();
+        if keep_builtin_enabled {
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        }
         if configured_native_tools.is_none() && !keep_builtin_enabled {
             config.causal_tree.enabled = false;
         }
@@ -790,7 +795,7 @@ impl AdmittedTurn {
             }
         };
         let context = service
-            .decide_agent_initial(
+            .open_issued_turn_context(
                 proof.as_ref(),
                 AgentTurnKind::Repl,
                 &tokio_util::sync::CancellationToken::new(),
