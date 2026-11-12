@@ -58,6 +58,8 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record['usage']['uncached_input'], 17)
         self.assertEqual(record['usage']['cache_write'], 2)
         self.assertEqual(record['cost'], 0.1)
+        self.assertEqual(record['resource_limits']['memory_mb'], 4096)
+        self.assertEqual(record['resource_limits']['storage_mb'], 10240)
         for value in (record['usage']['reasoning'], record['timings']['queue'], record['diff'],
                       record['resource_limits']['gpu'], record['trajectory']['commands'],
                       record['harness_prompt_sha256'], record['image_digest']):
@@ -111,6 +113,10 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record['attempt_status'], 'timeout')
         self.assertEqual(record['usage'], unavailable('killed_before_settlement'))
         self.assertEqual(record['unsettled_dispatched_requests'], 0)
+        agent = {**self.agent, 'exit_code': 124, 'costs_rows': [],
+                 'per_attempt_models': {'status': 'available', 'attempts': [
+                     {'provider': 'prx', 'model': 'other', 'status': 'failed'}]}}
+        self.assertEqual(classify(agent, {}, 0, '', ''), ('timeout', 'agent_timeout'))
 
     def test_secrets_full_and_prefix_scan_all_export_surfaces(self):
         finalize(self.root)
@@ -145,3 +151,15 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(evidence['status'], 'available')
         self.assertEqual([a['model'] for a in evidence['attempts']], ['model', 'model'])
         self.assertEqual(per_attempt_models(self.root / 'absent.db', 'sha'), unavailable('no per-attempt ledger at sha'))
+
+    def test_failed_attempt_substitution_cannot_hide_behind_final_model(self):
+        agent = {**self.agent, 'per_attempt_models': {'status': 'available', 'attempts': [
+            {'seq': 1, 'provider': 'prx', 'model': 'other', 'status': 'failed'},
+            {'seq': 2, 'provider': 'prx', 'model': 'model', 'status': 'success'}]}}
+        self.assertEqual(classify(agent, {}, 1, '', ''), ('infra_error', 'model_substitution'))
+
+    def test_incomplete_phase_times_use_unavailable_markers(self):
+        write(self.root / 'result.json', {**self.result,
+              'agent_execution': {'started_at': self.result['started_at'], 'finished_at': None}})
+        record = finalize(self.root)
+        self.assertEqual(record['timings']['agent_execution']['finished_at']['status'], 'unavailable')

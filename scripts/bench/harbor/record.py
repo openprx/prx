@@ -1,5 +1,6 @@
 """Two-stage trial records; this module has no Harbor dependency."""
 import argparse
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -87,7 +88,7 @@ def per_attempt_models(database, git_sha):
     if database.stat().st_size > 64 * 1024 * 1024:
         raise ValueError("event database exceeds benchmark collection bound")
     deadline = time.monotonic() + 5
-    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1)) as connection:
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         rows = connection.execute(
             "SELECT raw_payload_json FROM message_events WHERE event_type='turn.finalized' ORDER BY rowid LIMIT 257"
@@ -129,8 +130,15 @@ def classify(agent, result, reward, stdout, stderr):
     exception_name = exception.get("exception_type", "")
     code = agent["exit_code"]
     provider, model = agent["settlement_provider"], agent["model_id"]
+    if code == 124 and not agent["costs_rows"]:
+        return "timeout", "agent_timeout"
     if any(row.get("usage", {}).get("model") != f"{provider}/{model}" or
            row.get("settlement_provider") != provider for row in agent["costs_rows"]):
+        return "infra_error", "model_substitution"
+    evidence = agent.get("per_attempt_models", {})
+    if evidence.get("status") == "available" and any(
+            attempt.get("model") != model or attempt.get("provider") != provider
+            for attempt in evidence.get("attempts", [])):
         return "infra_error", "model_substitution"
     if exception_name == "AgentTimeoutError" or code == 124:
         return "timeout", "agent_timeout"
@@ -145,6 +153,30 @@ def classify(agent, result, reward, stdout, stderr):
     if code == 0:
         return ("pass", "verifier_reward") if reward == 1.0 else ("fail", "verifier_reward")
     return "infra_error", "missing_or_unknown_exit"
+
+
+def resource_mb(environment, name):
+    value = environment.get(name + "_mb")
+    if value is not None:
+        return value
+    legacy = environment.get(name)
+    if legacy is None:
+        return unavailable("not declared")
+    units = {"G": 1024, "M": 1, "K": 1 / 1024}
+    suffix = str(legacy).strip().upper()
+    if suffix[-1:] not in units:
+        raise ValueError("invalid legacy resource unit")
+    return int(float(suffix[:-1]) * units[suffix[-1:]])
+
+
+def mark_unavailable(value):
+    if value is None:
+        return unavailable("not exported")
+    if isinstance(value, dict):
+        return {key: mark_unavailable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mark_unavailable(item) for item in value]
+    return value
 
 
 def finalize(trial):
@@ -192,11 +224,11 @@ def finalize(trial):
         "model_id": agent["model_id"], "provider": agent["provider"],
         "sampling": agent["sampling"], "profile_values": agent["profile_values"],
         "resource_limits": {"cpus": env.get("cpus", unavailable("not declared")),
-                            "memory_mb": env.get("memory_mb", env.get("memory", unavailable("not declared"))),
-                            "storage_mb": env.get("storage_mb", env.get("storage", unavailable("not declared"))),
+                            "memory_mb": resource_mb(env, "memory"),
+                            "storage_mb": resource_mb(env, "storage"),
                             "gpu": unavailable("v1 GPU inspection unavailable"),
                             "agent_timeout_sec": agent["agent_timeout_sec"],
-                            "network_mode": task.get("agent", {}).get("network", {}).get("network_mode", "public")},
+                            "network_mode": task.get("agent", {}).get("network_mode") or env.get("network_mode", "public")},
         "score": reward, "verifier_details": {"result": result.get("verifier_result") or unavailable("no verifier result"),
             "reward_txt": text(trial / "verifier/reward.txt") or unavailable("not produced"),
             "ctrf": optional(trial / "verifier/ctrf.json"),
@@ -211,6 +243,7 @@ def finalize(trial):
     }
     if status == "refusal":
         record["refusal_kind"] = "harness_policy"
+    record = mark_unavailable(record)
     write(logs / "prx-trial.json", record)
     return record
 

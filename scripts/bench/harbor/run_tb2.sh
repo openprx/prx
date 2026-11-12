@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # QA host only. Positional arguments are names in the pinned TB2 dataset.
 set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$script_dir/../../.."
 export DOCKER_HOST=unix:///run/user/1000/podman/podman.sock
 export PODMAN_COMPOSE_PROVIDER=/opt/ops/bench/bin/docker-compose
 export PODMAN_COMPOSE_WARNING_LOGS=false
 export PYTHONPATH="$PWD/scripts/bench/harbor${PYTHONPATH:+:$PYTHONPATH}"
 exec /opt/ops/bench/venv/bin/python - "$@" <<'PY'
 import argparse
-import json
 import math
 import os
 from pathlib import Path
@@ -38,8 +38,9 @@ digest = read_bounded(sha_file).decode().split()[0]
 dataset = Path('/opt/ops/bench/datasets/terminal-bench-2.0')
 manifest = dataset / 'prx-dataset.json'
 if not manifest.is_file():
-    subprocess.run(['/opt/ops/bench/venv/bin/harbor', 'download', 'terminal-bench@2.0',
-                    '-o', str(dataset)], timeout=900, check=True)
+    if not any(dataset.glob('*/task.toml')) and not any(dataset.glob('terminal-bench/*/task.toml')):
+        subprocess.run(['/opt/ops/bench/venv/bin/harbor', 'download', 'terminal-bench@2.0',
+                        '-o', str(dataset)], timeout=900, check=True)
     # Harbor 0.25 export adds a dataset-name directory. Normalize it once.
     nested = dataset / 'terminal-bench'
     if nested.is_dir():
@@ -67,7 +68,7 @@ for index, task_name in enumerate(a.tasks):
     if not math.isfinite(seconds) or seconds <= 30:
         p.error('effective task timeout must exceed 30 seconds')
     deadline = time.monotonic() + 240 * 60
-    while float(Path('/proc/loadavg').read_text().split()[0]) >= 8:
+    while float(read_bounded('/proc/loadavg', 1024).decode().split()[0]) >= 8:
         if time.monotonic() >= deadline:
             raise SystemExit(75)
         time.sleep(30)

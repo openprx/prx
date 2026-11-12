@@ -115,7 +115,7 @@ class PrxAgent(BaseInstalledAgent):
                     command=(f"test ! -f {CONFIG_DIR}/workspace/state/costs.jsonl || "
                              f"cp {CONFIG_DIR}/workspace/state/costs.jsonl {LOG_DIR}/costs.jsonl; "
                              f"env -u PRX_BENCH_API_KEY prx --config-dir {CONFIG_DIR} cost --json "
-                             f">{LOG_DIR}/prx-cost.json 2>{LOG_DIR}/prx-cost-stderr.txt"),
+                             f">{LOG_DIR}/prx-cost.json 2>/dev/null || rm -f {LOG_DIR}/prx-cost.json"),
                     user="root", timeout_sec=15)
                 with tempfile.TemporaryDirectory(prefix="prx-bench-events-") as directory:
                     database = Path(directory) / "brain.db"

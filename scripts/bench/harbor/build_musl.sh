@@ -9,8 +9,8 @@ toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
 res=${PRX_RESOURCE_SCRIPT:-/Users/xx/work/code/ramflux/ops/orchestration/tools/res.sh}
 claim=$("$res" claim qa 1 prx bench-musl)
 trap '"$res" release "$claim"' EXIT
-ssh -o ConnectTimeout=10 qa 'mkdir -p /opt/ops/prx-lanes/prx-bench/bench-source'
-git archive HEAD | ssh -o ConnectTimeout=10 qa 'tar -xf - -C /opt/ops/prx-lanes/prx-bench/bench-source'
+ssh -o ConnectTimeout=10 qa "mkdir -p /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
+git archive HEAD | ssh -o ConnectTimeout=10 qa "tar -xf - -C /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
 ssh -o ConnectTimeout=10 qa bash -s -- "$sha" "$toolchain" <<'REMOTE'
 set -euo pipefail
 sha=$1 toolchain=$2
@@ -20,7 +20,7 @@ mkdir -p "$slot/tmp" /opt/ops/bench/artifacts
 build() {
     local image=$1 target=$2 packages=$3
     timeout 1800 podman run --rm --network host \
-      -v "$slot/bench-source:/source:ro" -v "$slot:/build" -w /build \
+      -v "$slot/bench-source/$sha:/source:ro" -v "$slot:/build" -w /build \
       -e TOOLCHAIN="$toolchain" -e BUILD_TARGET="$target" -e PACKAGES="$packages" \
       "docker.io/library/rust:1-$image" sh -ec '
         if command -v apk >/dev/null; then apk add $PACKAGES; else apt-get update && apt-get install -y $PACKAGES; fi
@@ -37,7 +37,7 @@ build() {
 target=x86_64-unknown-linux-musl
 if build alpine "$target" 'build-base cmake perl clang linux-headers'; then
     binary="$slot/target/$target/ci/prx"
-    file "$binary" | grep -q 'statically linked'
+    file "$binary" | grep -Eq 'statically linked|static-pie linked'
     if ldd "$binary"; then echo 'musl artifact unexpectedly dynamic' >&2; exit 1; fi
 else
     echo 'musl build failed; falling back to bullseye glibc 2.31' >&2

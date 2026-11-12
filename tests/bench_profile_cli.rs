@@ -248,6 +248,18 @@ fn exercise(status: u16, refusal: bool) {
         );
     }
     std::fs::write(&config_path, config).expect("test: write fixture mutation");
+    if status == 503 && std::env::var_os("PRX_BENCH_BREAK_FALLBACK").is_some() {
+        let mut checker = Command::new("python3");
+        checker
+            .args(["scripts/bench/harbor/profile.py", "check"])
+            .arg(&config_path);
+        let (validation_exit, out, err) = run(&mut checker, Duration::from_secs(30));
+        assert_eq!(
+            validation_exit.code(),
+            Some(2),
+            "static check accepted injected fallback: {out} {err}"
+        );
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
     command
         .args(["--config-dir"])
@@ -290,13 +302,7 @@ fn exercise(status: u16, refusal: bool) {
             "sampling changed: {requests:?}"
         );
     }
-    let expected_exit = if refusal {
-        2
-    } else if status == 503 {
-        1
-    } else {
-        0
-    };
+    let expected_exit = if refusal { 2 } else { i32::from(status == 503) };
     assert_eq!(
         exit.code(),
         Some(expected_exit),
