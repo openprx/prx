@@ -35,7 +35,8 @@ impl ShellCgroup {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: successful fstatfs initialized the structure.
-        if unsafe { stat.assume_init() }.f_type != libc::CGROUP2_SUPER_MAGIC {
+        let stat = unsafe { stat.assume_init() };
+        if !is_cgroup_v2_magic(i128::from(stat.f_type)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cgroup root is not on cgroup v2",
@@ -106,6 +107,16 @@ impl ShellCgroup {
     }
 }
 
+/// Whether a `statfs.f_type` value names a cgroup v2 filesystem.
+///
+/// `f_type` and `libc::CGROUP2_SUPER_MAGIC` are signed on some libc targets and
+/// unsigned on others (glibc versus musl), so both sides are widened losslessly
+/// to `i128` instead of being compared in either native type.
+#[cfg(target_os = "linux")]
+fn is_cgroup_v2_magic(filesystem_type: i128) -> bool {
+    filesystem_type == i128::from(libc::CGROUP2_SUPER_MAGIC)
+}
+
 impl Drop for ShellCgroup {
     fn drop(&mut self) {
         // Abort/panic still kills escaped session leaders synchronously. Directory
@@ -123,6 +134,24 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(ShellCgroup::create(temp.path()).is_err());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_the_cgroup_v2_magic_is_accepted_for_either_signedness() {
+        assert!(
+            is_cgroup_v2_magic(0x6367_7270),
+            "the cgroup v2 superblock magic must be accepted"
+        );
+        assert!(!is_cgroup_v2_magic(0xEF53), "an ext4 mount must be refused");
+        assert!(
+            !is_cgroup_v2_magic(i128::from(-1_i64)),
+            "a negative signed f_type must be refused, not wrapped"
+        );
+        assert!(
+            !is_cgroup_v2_magic(i128::from(u64::MAX)),
+            "the largest unsigned f_type must be refused, not wrapped"
+        );
     }
 
     #[cfg(target_os = "linux")]
