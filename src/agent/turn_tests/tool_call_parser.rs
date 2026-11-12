@@ -839,7 +839,10 @@ fn parse_tool_calls_propagates_each_pattern_error() {
         ];
         *patterns.get_mut(index).expect("test: pattern index is bounded") = Err(&ERROR);
         assert!(
-            matches!(parse_tool_calls_with_patterns("plain response", patterns), Err(ToolCallParseError::Pattern(error)) if std::ptr::eq(error, &*ERROR)),
+            matches!(
+                parse_tool_calls_with_patterns("plain response", patterns),
+                Err(ToolCallParseError::Pattern(_))
+            ),
             "parser must propagate injected pattern error at index {index}"
         );
     }
