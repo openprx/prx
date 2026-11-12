@@ -13,6 +13,8 @@ fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Res
     std::fs::write(&barrier, b"hold")?;
     let mut child = Receiver(
         Command::new(env!("CARGO_BIN_EXE_prx"))
+            .arg("--config-dir")
+            .arg(dir.path())
             .args(["__mailbox-harness", "accept-adopt", "--workspace"])
             .arg(dir.path())
             .env("OPENPRX_TEST_MAILBOX_BARRIER", format!("{stage}={}", barrier.display()))
@@ -64,6 +66,8 @@ impl Drop for Receiver {
 fn restart(workspace: &Path) -> Result<()> {
     let mut receiver = Receiver(
         Command::new(env!("CARGO_BIN_EXE_prx"))
+            .arg("--config-dir")
+            .arg(workspace)
             .args(["__mailbox-harness", "accept-adopt", "--workspace"])
             .arg(workspace)
             .env_remove("OPENPRX_TEST_MAILBOX_BARRIER")

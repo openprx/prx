@@ -900,7 +900,9 @@ Examples:
     },
 
     #[cfg(feature = "test-mock")]
-    #[command(name = "__mailbox-harness", hide = true)]
+    // Bash completion uses `__` as its path separator. Keep the contracted
+    // fixture spelling as a hidden alias, outside completion's command tree.
+    #[command(name = "mailbox-harness", alias = "__mailbox-harness", hide = true)]
     MailboxHarness {
         #[arg(value_parser=["accept-adopt"])]
         action: String,
@@ -4621,10 +4623,21 @@ mod tests {
     }
 
     #[test]
-    fn completion_generation_mentions_binary_name() {
-        let mut output = Vec::new();
-        write_shell_completion(CompletionShell::Bash, &mut output).expect("completion generation should succeed");
-        let script = String::from_utf8(output).expect("completion output should be valid utf-8");
-        assert!(script.contains("prx"), "completion script should reference binary name");
+    fn completion_generation_mentions_binary_name() -> Result<()> {
+        const SHELLS: [CompletionShell; 5] = [
+            CompletionShell::Bash,
+            CompletionShell::Fish,
+            CompletionShell::Zsh,
+            CompletionShell::PowerShell,
+            CompletionShell::Elvish,
+        ];
+        for shell in SHELLS {
+            let mut output = Vec::new();
+            write_shell_completion(shell, &mut output)
+                .with_context(|| format!("test: generate {shell:?} completion for the complete CLI tree"))?;
+            let script = String::from_utf8(output).context("test: completion output must be UTF-8")?;
+            assert!(script.contains("prx"), "{shell:?} completion lost the binary name");
+        }
+        Ok(())
     }
 }
