@@ -32,6 +32,9 @@ fn re_tags() -> Result<&'static Regex, &'static regex::Error> {
     RE_TAGS.as_ref()
 }
 
+/// Redirect hops `web_fetch` follows before it gives up.
+const MAX_REDIRECTS: u32 = 5;
+
 /// Web fetch tool — fetches a URL and returns clean readable text.
 pub struct WebFetchTool {
     allowed_domains: Vec<String>,
@@ -148,16 +151,60 @@ impl WebFetchTool {
         self.validate_url(&next_url)
     }
 
-    /// The client of one hop: `validated_url`'s host is resolved once, every
-    /// address is checked, and the client is pinned to those addresses.
-    /// Redirects are never followed by the client itself.
-    async fn pinned_client(&self, validated_url: &str) -> anyhow::Result<reqwest::Client> {
-        let target = super::http_request::resolve_pinned_target(validated_url).await?;
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; PRX/1.0; +https://openprx.dev)")
-            .redirect(reqwest::redirect::Policy::none());
-        Ok(target.pin(builder).build()?)
+    /// The client of one hop to a checked target: pinned to the checked
+    /// addresses, never following redirects itself, and connecting directly.
+    /// Proxies (inherited environment variables included) are switched off:
+    /// a proxy resolves the name itself, so the pin would not bind the
+    /// address that is finally connected to (same rule as media downloads).
+    fn client_for(&self, target: &super::http_request::PinnedTarget) -> reqwest::Result<reqwest::Client> {
+        target
+            .pin(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(self.timeout_secs))
+                    .user_agent("Mozilla/5.0 (compatible; PRX/1.0; +https://openprx.dev)")
+                    .redirect(reqwest::redirect::Policy::none())
+                    .no_proxy(),
+            )
+            .build()
+    }
+
+    /// Fetch `url`, whose host was checked and pinned as `first`, following
+    /// redirects manually. Every redirect target goes through the same steps
+    /// as the first URL (allowlist and private-address validation, one
+    /// resolution, every address checked) and is fetched by a client pinned
+    /// to exactly the checked addresses, so no name is resolved a second
+    /// time between its check and its connection (DNS rebinding).
+    async fn fetch_following_redirects(
+        &self,
+        url: &str,
+        first: super::http_request::PinnedTarget,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut current_url = url.to_string();
+        let mut target = first;
+        let mut redirect_count: u32 = 0;
+        loop {
+            let client = self.client_for(&target)?;
+            let resp = client
+                .get(&current_url)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to fetch {current_url}: {e}"))?;
+
+            if !resp.status().is_redirection() {
+                return Ok(resp);
+            }
+            if redirect_count >= MAX_REDIRECTS {
+                anyhow::bail!("Too many redirects fetching {url}");
+            }
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?;
+            current_url = self.redirect_target(&current_url, location)?;
+            target = super::http_request::resolve_pinned_target(&current_url).await?;
+            redirect_count += 1;
+        }
     }
 }
 
@@ -170,7 +217,9 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch and extract readable content from a URL. \
          Downloads the page and returns clean text with HTML tags removed. \
-         Useful for reading articles, documentation, or any web page."
+         Useful for reading articles, documentation, or any web page. \
+         Connects directly to the checked public address of each host, redirect targets included \
+         (private and local addresses are refused); proxies are never used."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -208,37 +257,8 @@ impl Tool for WebFetchTool {
 
         tracing::info!("Fetching URL: {}", url);
 
-        // Follow redirects manually. Every hop (the first URL and each
-        // redirect target) is validated against the allowlist and private-IP
-        // rules, resolved once, and fetched by a client pinned to exactly the
-        // checked addresses, so the name is never resolved a second time
-        // between the check and the connection (DNS rebinding).
-        let mut current_url = url.clone();
-        let max_redirects: u32 = 5;
-        let mut redirect_count: u32 = 0;
-        let response = loop {
-            let client = self.pinned_client(&current_url).await?;
-            let resp = client
-                .get(&current_url)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to fetch {}: {}", current_url, e))?;
-
-            if resp.status().is_redirection() {
-                if redirect_count >= max_redirects {
-                    anyhow::bail!("Too many redirects fetching {}", url);
-                }
-                let location = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?;
-                current_url = self.redirect_target(&current_url, location)?;
-                redirect_count += 1;
-            } else {
-                break resp;
-            }
-        };
+        let target = super::http_request::resolve_pinned_target(&url).await?;
+        let response = self.fetch_following_redirects(&url, target).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -643,24 +663,120 @@ mod tests {
         );
     }
 
-    /// M2: the per-hop client is refused when the host resolves to one
-    /// public and one private address, and built when every address is public.
+    /// Deadline of every await in these tests (AGENTS §3.9).
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
+    /// How long a listener is watched for a connection that must not come.
+    const NO_CONNECTION_WINDOW: Duration = Duration::from_millis(300);
+    /// A name no resolver answers (RFC 6761): only a pinned client reaches it.
+    const PIN_PROOF_HOST: &str = "pin-proof.invalid";
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_DEADLINE, future)
+            .await
+            .expect("test: the step must finish within the deadline")
+    }
+
+    /// An owned loopback listener that answers one request with `response`,
+    /// then watches for a second connection. Yields the request head and
+    /// whether a second connection arrived.
+    async fn one_shot_server(response: String) -> (std::net::SocketAddr, tokio::task::JoinHandle<(String, bool)>) {
+        let listener = within(tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("test: bind an owned loopback listener");
+        let address = listener.local_addr().expect("test: listener address");
+        let server = tokio::spawn(async move {
+            let head = super::super::http_request::serve_one_request(&listener, &response)
+                .await
+                .expect("test: the listener serves one request");
+            let second = tokio::time::timeout(NO_CONNECTION_WINDOW, listener.accept())
+                .await
+                .is_ok();
+            (head, second)
+        });
+        (address, server)
+    }
+
+    fn proof_target(address: std::net::SocketAddr) -> super::super::http_request::PinnedTarget {
+        // The layer below the address check: the list is given as already
+        // validated, exactly as `resolve_pinned_target` hands it over.
+        super::super::http_request::PinnedTarget {
+            host: PIN_PROOF_HOST.to_string(),
+            addrs: vec![address],
+        }
+    }
+
+    /// M2: a host that resolves to one public and one private address, or a
+    /// private literal, is refused before any connection.
     #[tokio::test]
-    async fn pinned_client_refuses_a_host_with_a_private_address() {
+    async fn execute_refuses_a_host_with_a_private_address() {
         let tool = WebFetchTool::new(vec![], 10000, 15);
         for url in ["https://mixed.test/", "http://10.0.0.1/"] {
-            let error = tool
-                .pinned_client(url)
+            let error = within(tool.execute(json!({"url": url})))
                 .await
-                .expect_err("test: a non-global hop must not get a client");
+                .expect_err("test: a non-global host must not be fetched");
             assert!(
                 error.to_string().contains("Blocked local/private host"),
                 "{url}: expected an SSRF block, got {error}"
             );
         }
-        tool.pinned_client("https://example.com/docs")
+    }
+
+    /// Review r1 finding 5 (a), real wire: the fetch reaches the pinned
+    /// address although the name cannot resolve, with the name in `Host`.
+    /// Break-the-fix: drop `resolve_to_addrs` in `PinnedTarget::pin`.
+    #[tokio::test]
+    async fn the_fetch_reaches_the_pinned_address_with_the_host_header() {
+        let (address, server) =
+            one_shot_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()).await;
+        let tool = WebFetchTool::new(vec![], 10000, 15);
+        let url = format!("http://{PIN_PROOF_HOST}:{}/page", address.port());
+
+        let response = within(tool.fetch_following_redirects(&url, proof_target(address)))
             .await
-            .expect("test: a public hop gets a pinned client");
+            .expect("test: the fetch must reach the pinned listener");
+        assert_eq!(response.status().as_u16(), 200, "the listener's answer comes back");
+
+        let (head, second) = within(server).await.expect("test: server task joins");
+        assert!(
+            head.starts_with("GET /page HTTP/1.1\r\n"),
+            "the listener must receive the request line, got {head}"
+        );
+        let host_header = format!("host: {PIN_PROOF_HOST}:{}\r\n", address.port());
+        assert!(
+            head.to_ascii_lowercase().contains(&host_header),
+            "the Host header must keep the name, got {head}"
+        );
+        assert!(!second, "one request means one connection");
+    }
+
+    /// Review r1 finding 5 (b), real wire: the listener answers 302 to a
+    /// private literal and to a host whose resolution is private. The fetch
+    /// is refused at the hop check and no second connection is made.
+    #[tokio::test]
+    async fn a_redirect_over_the_wire_to_a_private_target_is_refused_at_the_hop() {
+        for location in ["http://127.0.0.1:1/", "http://rebind.test/internal"] {
+            let (address, server) = one_shot_server(format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ))
+            .await;
+            let tool = WebFetchTool::new(vec![], 10000, 15);
+            let url = format!("http://{PIN_PROOF_HOST}:{}/start", address.port());
+
+            let error = within(tool.fetch_following_redirects(&url, proof_target(address)))
+                .await
+                .expect_err("test: a redirect to a private target must be refused");
+            assert!(
+                error.to_string().contains("Blocked local/private host"),
+                "{location}: expected the hop check to refuse, got {error}"
+            );
+
+            let (head, second) = within(server).await.expect("test: server task joins");
+            assert!(
+                head.starts_with("GET /start HTTP/1.1\r\n"),
+                "{location}: the first hop must reach the listener, got {head}"
+            );
+            assert!(!second, "{location}: no second connection may be made");
+        }
     }
 
     #[test]

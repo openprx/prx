@@ -4,6 +4,9 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// The proxy service key of this tool (`proxy.services`).
+const PROXY_SERVICE_KEY: &str = "tool.http_request";
+
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
 pub struct HttpRequestTool {
@@ -112,14 +115,7 @@ impl HttpRequestTool {
         // second time (DNS rebinding). Redirects are never followed, so this
         // is the only hop.
         let target = resolve_pinned_target(url).await?;
-        let builder = target.pin(
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(self.timeout_secs))
-                .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none()),
-        );
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
-        let client = builder.build()?;
+        let client = self.client_for(&target, &crate::config::runtime_proxy_config())?;
 
         let mut request = client.request(method, url);
 
@@ -132,6 +128,29 @@ impl HttpRequestTool {
         }
 
         Ok(request.send().await?)
+    }
+
+    /// The client of one request to a checked target: pinned to the checked
+    /// addresses, never following redirects, and connecting directly. A
+    /// general or inherited proxy is switched off, because a proxy resolves
+    /// the name itself and the pin would not bind the final address. Only an
+    /// operator who lists this tool in `proxy.services` (scope `services`)
+    /// routes it through the proxy; the local checks have run all the same.
+    fn client_for(
+        &self,
+        target: &PinnedTarget,
+        proxy: &crate::config::ProxyConfig,
+    ) -> reqwest::Result<reqwest::Client> {
+        let builder = target.pin(
+            reqwest::Client::builder()
+                .user_agent(crate::PRX_USER_AGENT)
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none()),
+        );
+        proxy
+            .apply_explicit_selection_to_reqwest_builder(builder, PROXY_SERVICE_KEY)
+            .build()
     }
 
     async fn read_bounded_response(&self, mut response: reqwest::Response) -> anyhow::Result<String> {
@@ -173,7 +192,9 @@ impl Tool for HttpRequestTool {
     }
 
     fn description(&self) -> &str {
-        "Make unrestricted HTTP requests. Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS methods."
+        "Make unrestricted HTTP requests. Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS methods. \
+         Connects directly to the checked public address of the host (private and local addresses are refused, \
+         redirects are not followed); a proxy is used only when the operator lists tool.http_request in proxy.services."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -502,6 +523,31 @@ fn unbracketed(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
         .unwrap_or(host)
+}
+
+/// Test support: accept one connection on `listener`, read one request head
+/// (bounded), answer with `response`, and return the head that was received.
+#[cfg(test)]
+pub(crate) async fn serve_one_request(listener: &tokio::net::TcpListener, response: &str) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const MAX_HEAD_BYTES: usize = 8 * 1024;
+    let (mut stream, _) = listener.accept().await?;
+    let mut head = Vec::new();
+    let mut buffer = [0_u8; 512];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() >= MAX_HEAD_BYTES {
+            return Err(std::io::Error::other("test server: request head exceeds the bound"));
+        }
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        head.extend_from_slice(buffer.get(..read).unwrap_or_default());
+    }
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
 /// Under test: an IP literal is itself, a name comes from the fixed table,
@@ -1053,11 +1099,55 @@ mod tests {
         );
     }
 
+    /// Deadline of every await in these tests (AGENTS §3.9).
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
+    /// How long a listener is watched for a connection that must not come.
+    const NO_CONNECTION_WINDOW: Duration = Duration::from_millis(300);
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    /// A name no resolver answers (RFC 6761): only a pinned client reaches it.
+    const PIN_PROOF_HOST: &str = "pin-proof.invalid";
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_DEADLINE, future)
+            .await
+            .expect("test: the step must finish within the deadline")
+    }
+
+    async fn loopback_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = within(tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("test: bind an owned loopback listener");
+        let address = listener.local_addr().expect("test: listener address");
+        (listener, address)
+    }
+
+    fn proof_target(address: std::net::SocketAddr) -> PinnedTarget {
+        // The layer below the address check: the list is given as already
+        // validated, exactly as `resolve_pinned_target` hands it over.
+        PinnedTarget {
+            host: PIN_PROOF_HOST.to_string(),
+            addrs: vec![address],
+        }
+    }
+
+    fn proxy_config(
+        scope: crate::config::ProxyScope,
+        services: &[&str],
+        proxy: std::net::SocketAddr,
+    ) -> crate::config::ProxyConfig {
+        crate::config::ProxyConfig {
+            http_proxy: Some(format!("http://{proxy}")),
+            scope,
+            services: services.iter().map(|service| (*service).to_string()).collect(),
+            ..crate::config::ProxyConfig::default()
+        }
+    }
+
     /// M2: the per-hop step resolves once (test table, never the network),
     /// checks every address and pins them with the URL's port.
     #[tokio::test]
     async fn resolve_pinned_target_checks_every_resolved_address() {
-        let target = resolve_pinned_target("https://example.com/v1")
+        let target = within(resolve_pinned_target("https://example.com/v1"))
             .await
             .expect("test: public table name pins");
         assert_eq!(target.host, "example.com", "host comes from the parsed URL");
@@ -1073,7 +1163,7 @@ mod tests {
             "http://10.0.0.1/secret",
             "http://127.0.0.1:8080/",
         ] {
-            let error = resolve_pinned_target(url)
+            let error = within(resolve_pinned_target(url))
                 .await
                 .expect_err("test: a non-global target must not pin");
             assert!(
@@ -1082,14 +1172,14 @@ mod tests {
             );
         }
 
-        let error = resolve_pinned_target("https://unlisted.test/")
+        let error = within(resolve_pinned_target("https://unlisted.test/"))
             .await
             .expect_err("test: an unresolvable name must not pin");
         assert!(
             matches!(error, PinError::Lookup { .. }),
             "expected Lookup, got {error:?}"
         );
-        let error = resolve_pinned_target("not a url")
+        let error = within(resolve_pinned_target("not a url"))
             .await
             .expect_err("test: a malformed URL must not pin");
         assert!(
@@ -1098,13 +1188,116 @@ mod tests {
         );
     }
 
+    /// Review r1 finding 5 (a), real wire: the production client of a
+    /// checked target connects to the pinned address although the name
+    /// cannot resolve, and the request keeps the name in its `Host` header.
+    /// Break-the-fix: drop `resolve_to_addrs` in `PinnedTarget::pin` and the
+    /// send fails with a DNS error.
+    #[tokio::test]
+    async fn the_pinned_client_reaches_the_pinned_address_with_the_host_header() {
+        let (listener, address) = loopback_listener().await;
+        let server = tokio::spawn(async move { serve_one_request(&listener, OK_RESPONSE).await });
+        let client = test_tool(Vec::new())
+            .client_for(&proof_target(address), &crate::config::ProxyConfig::default())
+            .expect("test: the pinned client builds");
+
+        let url = format!("http://{PIN_PROOF_HOST}:{}/probe", address.port());
+        let response = within(client.get(&url).send())
+            .await
+            .expect("test: the request must reach the pinned listener");
+        assert_eq!(response.status().as_u16(), 200, "the listener's answer comes back");
+
+        let head = within(server)
+            .await
+            .expect("test: server task joins")
+            .expect("test: the listener served one request");
+        assert!(
+            head.starts_with("GET /probe HTTP/1.1\r\n"),
+            "the listener must receive the request line, got {head}"
+        );
+        let host_header = format!("host: {PIN_PROOF_HOST}:{}\r\n", address.port());
+        assert!(
+            head.to_ascii_lowercase().contains(&host_header),
+            "the Host header must keep the name, got {head}"
+        );
+    }
+
+    /// Review r1 finding 1, real wire: with a general (not selected) proxy
+    /// configured, the tool's client still connects directly to the pinned
+    /// address and the proxy sees no connection.
+    #[tokio::test]
+    async fn a_general_proxy_is_not_used_by_the_pinned_client() {
+        let (target_listener, target_address) = loopback_listener().await;
+        let (proxy_listener, proxy_address) = loopback_listener().await;
+        let server = tokio::spawn(async move { serve_one_request(&target_listener, OK_RESPONSE).await });
+        let general = proxy_config(crate::config::ProxyScope::Zeroclaw, &[], proxy_address);
+        assert!(
+            general.should_apply_to_service(PROXY_SERVICE_KEY),
+            "test setup: ordinary clients would use this proxy"
+        );
+        let client = test_tool(Vec::new())
+            .client_for(&proof_target(target_address), &general)
+            .expect("test: the pinned client builds");
+
+        let url = format!("http://{PIN_PROOF_HOST}:{}/direct", target_address.port());
+        within(client.get(&url).send())
+            .await
+            .expect("test: the request must go directly to the pinned listener");
+        let head = within(server)
+            .await
+            .expect("test: server task joins")
+            .expect("test: the target served one request");
+        assert!(
+            head.starts_with("GET /direct HTTP/1.1\r\n"),
+            "the target must receive an origin-form request, got {head}"
+        );
+        assert!(
+            tokio::time::timeout(NO_CONNECTION_WINDOW, proxy_listener.accept())
+                .await
+                .is_err(),
+            "the general proxy must not be connected to"
+        );
+    }
+
+    /// Review r1 finding 1, real wire: an operator who lists the tool in
+    /// `proxy.services` routes it through the proxy (absolute-form request
+    /// at the proxy, nothing at the target).
+    #[tokio::test]
+    async fn an_explicit_services_selection_routes_the_client_through_the_proxy() {
+        let (target_listener, target_address) = loopback_listener().await;
+        let (proxy_listener, proxy_address) = loopback_listener().await;
+        let proxy_server = tokio::spawn(async move { serve_one_request(&proxy_listener, OK_RESPONSE).await });
+        let selected = proxy_config(crate::config::ProxyScope::Services, &[PROXY_SERVICE_KEY], proxy_address);
+        let client = test_tool(Vec::new())
+            .client_for(&proof_target(target_address), &selected)
+            .expect("test: the proxied client builds");
+
+        let url = format!("http://{PIN_PROOF_HOST}:{}/via-proxy", target_address.port());
+        within(client.get(&url).send())
+            .await
+            .expect("test: the request must be answered by the proxy");
+        let head = within(proxy_server)
+            .await
+            .expect("test: proxy task joins")
+            .expect("test: the proxy served one request");
+        assert!(
+            head.starts_with(&format!("GET {url} HTTP/1.1\r\n")),
+            "the proxy must receive the absolute-form request, got {head}"
+        );
+        assert!(
+            tokio::time::timeout(NO_CONNECTION_WINDOW, target_listener.accept())
+                .await
+                .is_err(),
+            "the target must not be connected to directly"
+        );
+    }
+
     /// M2: `execute_request` refuses before any connection when the host
     /// resolves to a private address, even if only one of several is private.
     #[tokio::test]
     async fn execute_request_refuses_a_host_that_resolves_privately() {
         let tool = test_tool(Vec::new());
-        let error = tool
-            .execute_request("http://mixed.test/", reqwest::Method::GET, Vec::new(), None)
+        let error = within(tool.execute_request("http://mixed.test/", reqwest::Method::GET, Vec::new(), None))
             .await
             .expect_err("test: a mixed public/private host must be refused");
         assert!(

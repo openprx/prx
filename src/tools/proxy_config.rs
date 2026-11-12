@@ -20,18 +20,25 @@ struct PreparedSet {
     revision: Option<String>,
 }
 
-/// Why a `proxy_config` action that used to write the process environment is
-/// refused. Mutating the environment of a running multi-threaded process is
-/// undefined behaviour (other threads read it through `getenv`), so no agent
-/// action does it; the proxy is activated through the configuration instead.
+/// Why a `proxy_config` request that depended on writing the process
+/// environment is refused. Mutating the environment of a running
+/// multi-threaded process is undefined behaviour (other threads read it
+/// through `getenv`), so no agent action does it; the proxy is activated
+/// through the configuration instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProxyEnvError {
     #[error(
         "'{action}' is not supported: PRX does not modify the process environment at runtime. \
-         Use action 'set' with scope 'prx' or 'services' to route PRX traffic through the proxy, \
-         or start the process with HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY set for scope 'environment'"
+         Use action 'set' with scope 'prx' or 'services' to route PRX traffic through the proxy"
     )]
     RuntimeMutationUnsupported { action: &'static str },
+    /// `set` asked for (or would keep) the `environment` scope, which no
+    /// longer applies anything: nothing is saved.
+    #[error(
+        "scope 'environment' is refused and nothing was changed: {}",
+        ProxyConfig::ENVIRONMENT_SCOPE_INACTIVE
+    )]
+    EnvironmentScopeUnsupported,
 }
 
 pub struct ProxyConfigTool {
@@ -255,6 +262,14 @@ impl ProxyConfigTool {
             MaybeSet::Unset => {}
         }
 
+        // The environment scope applies nothing (PRX never writes the
+        // process environment). Saving it would report an activation that
+        // does not exist while traffic leaves directly, so the request is
+        // refused, whether it names the scope or would keep a saved one.
+        if proxy.scope == ProxyScope::Environment {
+            return Err(ProxyEnvError::EnvironmentScopeUnsupported.into());
+        }
+
         if let Some(no_proxy_raw) = args.get("no_proxy") {
             proxy.no_proxy = Self::parse_string_list(no_proxy_raw, "no_proxy")?;
         }
@@ -375,12 +390,12 @@ impl ProxyConfigTool {
                             "type": "string",
                             "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
                             "default": "get",
-                            "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'."
+                            "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors. 'apply_env' and 'clear_env' are always refused: PRX never modifies the process environment. Defaults to 'get'."
                         },
                         "scope": {
                             "type": "string",
                             "enum": ["environment", "env", "prx", "internal", "core", "services", "service"],
-                            "description": "Proxy scope. Canonical values: environment, prx, services."
+                            "description": "Proxy scope. Canonical values: prx, services. 'environment' (alias 'env') is refused by 'set': it is inactive because PRX never modifies the process environment."
                         },
                         "http_proxy": {
                             "type": "string",
@@ -433,7 +448,7 @@ impl Tool for ProxyConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors; 'apply_env' and 'clear_env' are refused (PRX never modifies the process environment at runtime)"
+        "Manage ZeroClaw proxy settings (scope: prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors; 'apply_env', 'clear_env' and scope 'environment' are refused (PRX never modifies the process environment)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -772,18 +787,26 @@ mod tests {
         PROXY_ENV_NAMES.iter().map(std::env::var_os).collect()
     }
 
+    /// Deadline of every await in these tests (AGENTS §3.9).
+    const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(TEST_DEADLINE, future)
+            .await
+            .expect("test: the step must finish within the deadline")
+    }
+
     /// M4, RED before: `apply_env` and `clear_env` called `set_var` /
     /// `remove_var` inside the multi-threaded runtime. After: both are
     /// refused with a typed error and the process environment is untouched.
     #[tokio::test]
     async fn env_actions_are_refused_and_never_touch_the_process_environment() {
         let tmp = TempDir::new().expect("test: temp dir");
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ProxyConfigTool::new(within(test_config(&tmp)).await, test_security());
         let before = proxy_env();
 
         for action in ["apply_env", "clear_env"] {
-            let result = tool
-                .execute(json!({"action": action}))
+            let result = within(tool.execute(json!({"action": action})))
                 .await
                 .expect("test: a refused action is a tool result, not a crash");
             assert!(!result.success, "{action} must be refused");
@@ -801,33 +824,45 @@ mod tests {
         assert_eq!(proxy_env(), before, "the process environment must be unchanged");
     }
 
-    /// M4, RED before: a `set` with scope `environment` exported the proxy
-    /// URLs into the process environment. After: the configuration is saved
-    /// and the environment is untouched.
+    /// Review r1 finding 2, RED before: a `set` with scope `environment`
+    /// answered "updated and activated" although nothing applies that scope.
+    /// After: it is refused with the typed error and the migration text, and
+    /// neither the configuration file nor the environment changes.
     #[tokio::test]
-    async fn set_with_environment_scope_saves_config_without_touching_the_environment() {
+    async fn set_with_environment_scope_is_refused_and_changes_nothing() {
         const PROXY_URL: &str = "http://proxy-m4-sentinel.example:3128";
         let tmp = TempDir::new().expect("test: temp dir");
-        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
-        let before = proxy_env();
+        let tool = ProxyConfigTool::new(within(test_config(&tmp)).await, test_security());
+        let config_path = tool.config.load().config_path.clone();
+        let file_before = fs::read(&config_path).expect("test: config file is readable");
+        let env_before = proxy_env();
 
-        let result = tool
-            .execute(json!({"action": "set", "scope": "environment", "http_proxy": PROXY_URL}))
-            .await
-            .expect("test: set runs");
-        assert!(result.success, "set must still persist the proxy: {:?}", result.error);
+        for scope in ["environment", "env"] {
+            let result = within(tool.execute(json!({"action": "set", "scope": scope, "http_proxy": PROXY_URL})))
+                .await
+                .expect("test: a refused set is a tool result, not a crash");
+            assert!(!result.success, "scope '{scope}' must be refused");
+            let error = result.error.unwrap_or_default();
+            assert_eq!(
+                error,
+                ProxyEnvError::EnvironmentScopeUnsupported.to_string(),
+                "scope '{scope}': the refusal is the typed error"
+            );
+            assert!(
+                error.contains("nothing was changed") && error.contains("zeroclaw") && error.contains("services"),
+                "the refusal must carry the migration text, got {error}"
+            );
+        }
 
-        let desired = tool.config.desired().config.proxy.clone();
-        assert_eq!(desired.scope, ProxyScope::Environment, "the scope is saved");
-        assert_eq!(desired.http_proxy.as_deref(), Some(PROXY_URL), "the URL is saved");
-        assert_eq!(proxy_env(), before, "the process environment must be unchanged");
-        assert!(
-            !proxy_env()
-                .iter()
-                .flatten()
-                .any(|value| value.to_string_lossy().contains("proxy-m4-sentinel")),
-            "the configured URL must not be exported"
+        assert_eq!(
+            fs::read(&config_path).expect("test: config file is readable"),
+            file_before,
+            "a refused set must not write the configuration"
         );
+        let desired = tool.config.desired().config.proxy.clone();
+        assert_ne!(desired.scope, ProxyScope::Environment, "the refused scope is not saved");
+        assert!(desired.http_proxy.is_none(), "the refused URL is not saved");
+        assert_eq!(proxy_env(), env_before, "the process environment must be unchanged");
     }
 
     /// RED before SECRETS-OTHER: `set` and `get` returned a proxy URL's

@@ -2060,6 +2060,45 @@ A rollback to a history record taken while encryption was on restores
 `enc2:` values: if one happens after encryption was turned off, turn it off
 again before downgrading.
 
+### Outbound proxy (`[proxy]`)
+
+`[proxy]` routes PRX's outbound HTTP through `http_proxy`, `https_proxy` or
+`all_proxy`. `scope = "zeroclaw"` (the default; `prx` in the agent
+`proxy_config` tool) applies the proxy to all PRX-managed traffic;
+`scope = "services"` applies it only to the selectors in `proxy.services`
+(`provider.openai`, `tool.http_request`, `tool.*`, ...; the `proxy_config`
+action `list_services` prints them).
+
+PRX never writes the process environment. A running multi-threaded process
+cannot change `HTTP_PROXY` and its relatives safely, so:
+
+- `scope = "environment"` is inactive. A saved configuration that still has
+  it loads, with one warning, and its proxy URLs route no traffic. Migrate
+  to `scope = "zeroclaw"` to proxy all PRX traffic, or to
+  `scope = "services"` with a `proxy.services` list. To rely on inherited
+  variables instead, start PRX with `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
+  and `NO_PROXY` already set and leave the `[proxy]` URLs empty.
+- The agent `proxy_config` tool refuses `set` with scope `environment` (or a
+  `set` that would keep a saved `environment` scope), and refuses
+  `apply_env` and `clear_env`. Nothing is changed by a refused call.
+
+The `web_fetch` and `http_request` tools connect directly by default. Both
+resolve the host once, refuse it when any address is private or local, and
+connect to exactly the checked address; `web_fetch` repeats this for every
+redirect hop and `http_request` does not follow redirects. A proxy resolves
+the host name itself, so through a proxy the checked address would not be
+the one connected to. A general proxy (`scope = "zeroclaw"`) and proxy
+variables inherited from the environment are therefore not used by these two
+tools:
+
+- `web_fetch` never uses a proxy. On a host whose only way out is a proxy,
+  `web_fetch` cannot reach the network.
+- `http_request` uses the proxy only when the operator selects it by name:
+  `scope = "services"` with `tool.http_request` (or `tool.*`) in
+  `proxy.services`. PRX still runs every local check, but the proxy then
+  resolves the name, so the proxy must enforce its own egress rules (deny
+  private, loopback and metadata destinations).
+
 ### MCP server launch environment
 
 A stdio MCP server is a program PRX starts as its own user. It starts from a

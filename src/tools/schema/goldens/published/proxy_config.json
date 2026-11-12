@@ -3,7 +3,7 @@
   "properties": {
     "action": {
       "default": "get",
-      "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, 'clear_env' removes it. Defaults to 'get'.",
+      "description": "Action to perform: 'get' reads the effective proxy settings, 'set' writes them, 'list_services' lists the routable service selectors. 'apply_env' and 'clear_env' are always refused: PRX never modifies the process environment. Defaults to 'get'.",
       "enum": [
         "get",
         "set",
@@ -40,7 +40,7 @@
       ]
     },
     "scope": {
-      "description": "Proxy scope. Canonical values: environment, prx, services.",
+      "description": "Proxy scope. Canonical values: prx, services. 'environment' (alias 'env') is refused by 'set': it is inactive because PRX never modifies the process environment.",
       "enum": [
         "environment",
         "env",
