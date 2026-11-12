@@ -1128,7 +1128,8 @@ impl DelegateTool {
                 .await
         }
         .instrument(span);
-        let work = async move {
+        // Keep ambient scope wrappers pointer-sized while polling the child loop.
+        let work = Box::pin(async move {
             let work = async move {
                 match spawn_metadata {
                     Some(metadata) => {
@@ -1144,7 +1145,7 @@ impl DelegateTool {
                 Some(id) => crate::runtime::registry::scope_current(id, work).await,
                 None => work.await,
             }
-        };
+        });
         #[cfg(test)]
         let work = crate::causal_tree::logical_clock::inherit(work);
         #[cfg(all(test, unix))]
