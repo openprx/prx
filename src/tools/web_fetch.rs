@@ -131,6 +131,34 @@ impl WebFetchTool {
 
         Ok(url.to_string())
     }
+
+    /// The validated URL a redirect from `current_url` to `location` leads
+    /// to. A relative `location` is resolved against the current URL; the
+    /// result goes through the same checks as the first URL, so a redirect
+    /// to a private literal or to a host outside the allowlist is refused.
+    fn redirect_target(&self, current_url: &str, location: &str) -> anyhow::Result<String> {
+        let next_url = if location.starts_with("http://") || location.starts_with("https://") {
+            location.to_string()
+        } else {
+            let base = reqwest::Url::parse(current_url).map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
+            base.join(location)
+                .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
+                .to_string()
+        };
+        self.validate_url(&next_url)
+    }
+
+    /// The client of one hop: `validated_url`'s host is resolved once, every
+    /// address is checked, and the client is pinned to those addresses.
+    /// Redirects are never followed by the client itself.
+    async fn pinned_client(&self, validated_url: &str) -> anyhow::Result<reqwest::Client> {
+        let target = super::http_request::resolve_pinned_target(validated_url).await?;
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (compatible; PRX/1.0; +https://openprx.dev)")
+            .redirect(reqwest::redirect::Policy::none());
+        Ok(target.pin(builder).build()?)
+    }
 }
 
 #[async_trait]
@@ -180,20 +208,16 @@ impl Tool for WebFetchTool {
 
         tracing::info!("Fetching URL: {}", url);
 
-        // Disable automatic redirect following so every redirect target is
-        // re-validated against the allowlist and private-IP rules before
-        // being followed (prevents SSRF via open-redirect).
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; PRX/1.0; +https://openprx.dev)")
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-
-        // Follow redirects manually, re-validating each hop.
+        // Follow redirects manually. Every hop (the first URL and each
+        // redirect target) is validated against the allowlist and private-IP
+        // rules, resolved once, and fetched by a client pinned to exactly the
+        // checked addresses, so the name is never resolved a second time
+        // between the check and the connection (DNS rebinding).
         let mut current_url = url.clone();
         let max_redirects: u32 = 5;
         let mut redirect_count: u32 = 0;
         let response = loop {
+            let client = self.pinned_client(&current_url).await?;
             let resp = client
                 .get(&current_url)
                 .send()
@@ -208,20 +232,8 @@ impl Tool for WebFetchTool {
                     .headers()
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?
-                    .to_string();
-                // Resolve relative redirects against the current URL.
-                let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-                    location
-                } else {
-                    let base =
-                        reqwest::Url::parse(&current_url).map_err(|e| anyhow::anyhow!("Invalid base URL: {e}"))?;
-                    base.join(&location)
-                        .map_err(|e| anyhow::anyhow!("Invalid redirect URL: {e}"))?
-                        .to_string()
-                };
-                // Re-validate the redirect target before following.
-                current_url = self.validate_url(&next_url)?;
+                    .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?;
+                current_url = self.redirect_target(&current_url, location)?;
                 redirect_count += 1;
             } else {
                 break resp;
@@ -588,6 +600,67 @@ mod tests {
     fn hostname_checks_use_the_test_resolver_and_never_the_network() {
         assert!(is_private_or_local_host("rebind.test"));
         assert!(!is_private_or_local_host("example.com"));
+    }
+
+    /// M2: a redirect to a private literal is refused before any client is
+    /// built for it; a relative redirect stays on the checked host.
+    #[test]
+    fn redirect_to_a_private_literal_is_refused() {
+        let tool = WebFetchTool::new(vec![], 10000, 15);
+        for location in [
+            "http://10.0.0.1/admin",
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/latest/meta-data",
+            "https://rebind.test/internal",
+        ] {
+            let error = tool
+                .redirect_target("https://example.com/start", location)
+                .expect_err("test: a redirect to a private target must be refused");
+            assert!(
+                error.to_string().contains("Blocked local/private host"),
+                "{location}: expected an SSRF block, got {error}"
+            );
+        }
+
+        let next = tool
+            .redirect_target("https://example.com/a/b", "../c")
+            .expect("test: a relative redirect on a public host is followed");
+        assert_eq!(
+            next, "https://example.com/c",
+            "relative redirects resolve against the hop"
+        );
+    }
+
+    #[test]
+    fn redirect_outside_the_allowlist_is_refused() {
+        let tool = WebFetchTool::new(vec!["example.com".into()], 10000, 15);
+        let error = tool
+            .redirect_target("https://example.com/start", "https://mixed.test/")
+            .expect_err("test: a redirect leaving the allowlist must be refused");
+        assert!(
+            error.to_string().contains("not in browser.allowed_domains"),
+            "expected an allowlist refusal, got {error}"
+        );
+    }
+
+    /// M2: the per-hop client is refused when the host resolves to one
+    /// public and one private address, and built when every address is public.
+    #[tokio::test]
+    async fn pinned_client_refuses_a_host_with_a_private_address() {
+        let tool = WebFetchTool::new(vec![], 10000, 15);
+        for url in ["https://mixed.test/", "http://10.0.0.1/"] {
+            let error = tool
+                .pinned_client(url)
+                .await
+                .expect_err("test: a non-global hop must not get a client");
+            assert!(
+                error.to_string().contains("Blocked local/private host"),
+                "{url}: expected an SSRF block, got {error}"
+            );
+        }
+        tool.pinned_client("https://example.com/docs")
+            .await
+            .expect("test: a public hop gets a pinned client");
     }
 
     #[test]
