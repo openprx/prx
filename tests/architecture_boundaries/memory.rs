@@ -7,25 +7,16 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // Architecture review Q73B/Q74: exact test-owned read-only ACL and generation-scoped Retrieve witnesses.
     "src/channels/tests/factory_reload_fixture.rs::run::let connection = rusqlite::Connection::open_with_flags(",
     "src/channels/tests/factory_reload_fixture.rs::run::let decisions = rusqlite::Connection::open_with_flags(tmp.path().join(\"self/causal_tree/decisions.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect(\"durable decision evidence\");",
-    // Reviewed isolated paid Router test observers; exact callsites only.
-    "src/runtime/turn_decision/routing/tests/paid_embedding.rs::embedding::let database = Connection::open_with_flags(",
-    "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let db = Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
-    "src/runtime/turn_decision/routing/tests/paid_embedding.rs::run::let decisions = Connection::open(workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
     // Isolated child-process AUT: consistent snapshot and one copied completion tamper.
     "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let logical_db = rusqlite::Connection::open(workspace.join(\"memory/brain.db\"))?;",
     "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let copy = rusqlite::Connection::open(&copied_db)?;",
     // Fresh-process fixture: bounded, read-only enumeration before owned repository readback.
     "src/runtime/ingress_recovery/tests.rs::report::let conn = rusqlite::Connection::open_with_flags(",
-    // Failure-only, read-only decision diagnostics in the actual Router fixture.
-    "src/runtime/turn_decision/routing/tests.rs::seed_diagnostics::let store = Connection::open_with_flags(",
     // Test-only isolated fixtures: actual instance routing, source scope, and durable turn receipts.
     "src/agent/agent.rs::embedded_turn_routes_to_the_registered_instance_and_returns_to_default::let conn = rusqlite::Connection::open_with_flags(",
     "src/agent/embedded_source.rs::embedded_autosave_respects_configuration_and_keeps_original_source::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/agent/embedded_source.rs::embedded_cross_provider_selection_is_refused_before_input_recording::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/agent/tests.rs::turn_returns_text_when_no_tools_called::let conn = rusqlite::Connection::open_with_flags(",
-    // Test-only: mutate isolated Router history and inspect actual decision receipts.
-    "src/runtime/turn_decision/routing/tests.rs::database::Connection::open(self.workspace.path().join(\"memory/brain.db\")).unwrap()",
-    "src/runtime/turn_decision/routing/tests.rs::latest_router_receipt::let store = Connection::open(self.workspace.path().join(\"self/causal_tree/decisions.db\")).unwrap();",
     "src/agent/turn_tests/context_recall.rs::build_agent_context_includes_document_evidence_with_source_ids::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/agent/turn_tests/compaction.rs::configurable_compaction_records_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/agent/turn_tests/compaction.rs::named_compaction_stamps_the_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
