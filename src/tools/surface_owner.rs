@@ -90,5 +90,6 @@ pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
                 })
         },
     )
+    .with_catalog_identities(parts.catalog)
     .with_tool_calls(parts.tool_calls_allowed)
 }

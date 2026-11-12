@@ -2,7 +2,7 @@
 use super::{ToolDescriptor, ToolExecutionContext, ToolExecutionService, ToolExecutionStatus};
 use crate::config::ToolTieringConfig;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Live spend ceiling in micro-USD and the candidate money estimate, built from
@@ -84,6 +84,7 @@ impl Eq for CallTokenBudget {}
 pub(crate) struct TurnSurface {
     registry_generation: Option<[u8; 32]>,
     published: BTreeSet<String>,
+    capability_ids: BTreeMap<String, String>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
 }
@@ -113,6 +114,7 @@ impl TurnSurface {
         let mut surface = Self {
             registry_generation: live_generation(service),
             published: BTreeSet::new(),
+            capability_ids: BTreeMap::new(),
             exclusions,
             model_allowlist,
         };
@@ -148,6 +150,27 @@ impl TurnSurface {
         let mut surface = self.clone();
         surface.published.retain(|name| names.contains(name.as_str()));
         surface
+    }
+
+    /// Observation identities from the source's pinned catalog. These names
+    /// never widen publication or authorize dispatch.
+    pub(crate) fn with_catalog_identities(
+        mut self,
+        catalog: &crate::tools::capability::catalog::CapabilityCatalog,
+    ) -> Self {
+        self.capability_ids = catalog
+            .public_names()
+            .filter_map(|name| {
+                catalog
+                    .entry_for_public_name(name)
+                    .map(|entry| (name.to_owned(), entry.id.as_str().to_owned()))
+            })
+            .collect();
+        self
+    }
+
+    pub(crate) fn observed_capability_id(&self, name: &str) -> Option<&str> {
+        self.capability_ids.get(name).map(String::as_str)
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {

@@ -2506,14 +2506,21 @@ impl ToolExecutionService {
             // Decision-free model turns still observe the identity of the
             // concrete registered tool. An unknown name remains unbound;
             // identifying a call never grants dispatch or marks it selected.
-            let observed = self
-                .current_descriptor(&command.name)
-                .and_then(|descriptor| super::capability::catalog::descriptor_identity(&descriptor).ok());
+            let observed = self.current_descriptor(&command.name).and_then(|descriptor| {
+                context
+                    .turn_surface
+                    .as_ref()
+                    .and_then(|surface| surface.observed_capability_id(&command.name))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        super::capability::catalog::descriptor_identity(&descriptor)
+                            .ok()
+                            .map(|id| id.as_str().to_owned())
+                    })
+            });
             trace.begin(
                 &command.operation_id,
-                binding
-                    .map(|binding| binding.capability_id())
-                    .or_else(|| observed.as_ref().map(|id| id.as_str())),
+                binding.map(|binding| binding.capability_id()).or(observed.as_deref()),
                 binding.is_some_and(|binding| binding.is_selected()),
             )
         });

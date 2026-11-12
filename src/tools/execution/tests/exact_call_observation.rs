@@ -249,3 +249,69 @@ async fn actual_unsent_abandonment_continues_but_dropped_reservation_stays_unkno
         }
     }
 }
+
+#[tokio::test]
+async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
+    use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
+    use crate::tools::execution::admission::TurnSurface;
+    let workspace = tempfile::tempdir().expect("test: MCP trace workspace");
+    let fixture = fixture();
+    let alias = "mcp__prx_service__read";
+    let service = fixture.service("mcp_call", vec![alias], ToolExecutionDecision::Allow, approved(), true);
+    let descriptor = service.current_descriptor(alias).expect("test: live alias");
+    let tool = RecordingTool {
+        root_name: "mcp_call",
+        aliases: vec![alias],
+        calls: Arc::clone(&fixture.calls),
+        arguments: Arc::clone(&fixture.arguments),
+        stages: Arc::clone(&fixture.stages),
+    };
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+    let sources = CatalogSources {
+        mcp: vec![crate::tools::mcp::McpCapabilitySpec {
+            server: "prx_service".to_owned(),
+            tool: "read".to_owned(),
+            state_digest: [7; 32],
+            spec: crate::tools::ToolSpec {
+                name: descriptor.public_name,
+                description: descriptor.description,
+                parameters: descriptor.parameters,
+            },
+        }],
+        ..CatalogSources::default()
+    };
+    let catalog =
+        CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).expect("test: discovered MCP catalog");
+    let key = crate::decision::DecisionKey::ephemeral();
+    let (mut context, trace) = traced_context(workspace.path(), &key, "prx_mcp_run");
+    context.turn_surface = Some(Arc::new(
+        TurnSurface::build_from(
+            &service,
+            service.current_descriptors(),
+            &crate::config::ToolTieringConfig::default(),
+            "prx_model",
+            false,
+            |_| true,
+        )
+        .with_catalog_identities(&catalog),
+    ));
+    let outcome = service
+        .execute(
+            ToolExecutionCommand::new(alias, serde_json::json!({"value":1})),
+            context,
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "the actual registered backend executes once"
+    );
+    let snapshot = trace.seal();
+    assert_eq!(snapshot.unbound_attempts, 0);
+    assert_eq!(
+        snapshot.calls.first().expect("test: observed MCP call").capability_id,
+        "mcp:prx_service:mcp__prx_service__read"
+    );
+}

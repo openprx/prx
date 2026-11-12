@@ -142,12 +142,22 @@ fn completed_decision(guard: &HarnessGuard) -> Option<String> {
 // Poll a durable semantic event while servicing terminal DSR; no timing guess
 // establishes completion. TrackedSession owns kill/reap on every failure path.
 fn wait_for_completion(guard: &HarnessGuard, session: &mut TrackedSession) -> (String, String) {
+    wait_for_completion_after(guard, session, None)
+}
+
+fn wait_for_completion_after(
+    guard: &HarnessGuard,
+    session: &mut TrackedSession,
+    previous: Option<&str>,
+) -> (String, String) {
     let deadline = std::time::Instant::now() + TURN_TIMEOUT;
     let mut output = String::new();
     let mut pending = String::new();
     let mut buffer = [0u8; 4096];
     loop {
-        if let Some(id) = completed_decision(guard) {
+        if let Some(id) = completed_decision(guard)
+            && Some(id.as_str()) != previous
+        {
             return (id, output);
         }
         match session.try_read(&mut buffer) {
@@ -198,6 +208,19 @@ fn later_input_and_exit(session: &mut TrackedSession) {
     read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
     session.send("/exit\r").expect("test: exit");
     assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat exits after later input");
+}
+
+fn tui_later_input_and_exit(guard: &HarnessGuard, session: &mut TrackedSession) {
+    session.send("/help\r").expect("test: TUI help after tool turn");
+    read_until_with_dsr(session, "Show token usage estimate", TURN_TIMEOUT);
+    let previous = completed_decision(guard).expect("test: original turn is durable");
+    session.send("hi\r").expect("test: fresh TUI input");
+    read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
+    // A repaint can contain the previous identical mock reply. Require a new
+    // durable source turn before exit rather than accepting that repaint.
+    wait_for_completion_after(guard, session, Some(&previous));
+    session.send("/exit\r").expect("test: exit after fresh TUI completion");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "TUI exits after later input");
 }
 
 fn completed_publish(extra: &[(&str, &str)]) -> (HarnessGuard, SessionGuard, String, String) {
@@ -341,7 +364,7 @@ fn supervised_import(approved: bool) {
         .send(format!("/resume-decision {id}\r"))
         .expect("test: no replay authority");
     read_until_with_dsr(process.session(), REFUSAL, TURN_TIMEOUT);
-    later_input_and_exit(process.session());
+    tui_later_input_and_exit(&guard, process.session());
     assert_import_generation(&guard, &revision, usize::from(approved));
     assert_eq!(executed_receipts(&guard), usize::from(approved));
 }
