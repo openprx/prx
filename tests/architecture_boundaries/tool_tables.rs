@@ -559,6 +559,14 @@ pub(super) struct NonToolCallSite {
 /// waved through by its name.
 pub(super) const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
     NonToolCallSite {
+        entry: "src/chat/decision_source/mailbox_fixture.rs::spawn",
+        receiver: "execution",
+        occurrences: 1,
+        evidence_file: "src/runtime/turn_decision/execution.rs",
+        evidence: ") -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {",
+        reason: "test-mock mailbox ingress binds the genuine recorded source through bind_agent_execution; this receiver is the approved execution service, not a direct Tool call",
+    },
+    NonToolCallSite {
         entry: "src/agent/embedded_turn.rs::run_work",
         receiver: "execution",
         occurrences: 1,
