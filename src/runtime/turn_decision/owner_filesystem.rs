@@ -123,7 +123,12 @@ impl TurnDecisionService {
             .await?
         } else {
             let target = crate::security::approval_operation::resolve_file_target(
-                &self.security.workspace_dir,
+                self.generation
+                    .effective
+                    .runtime
+                    .workdir
+                    .as_deref()
+                    .unwrap_or(&self.security.workspace_dir),
                 path,
                 tool == "file_write",
             )

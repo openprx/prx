@@ -119,11 +119,19 @@ pub struct ConfigGeneration {
     pub deferred_changes: Arc<[DeferredConfigChange]>,
 }
 
+/// A worker cannot replace the working root selected by its parent.
+#[derive(Debug, thiserror::Error)]
+#[error("worker working root differs from signed parent configuration")]
+pub(crate) struct ProcessWorkingRootMismatch;
+
 /// Metadata and keyed effective-snapshot digest carried to a child process.
 /// Configuration and credential values are never included in this transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessGenerationBinding {
+    /// Parent in-memory working root, authenticated by the effective-config seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_root: Option<PathBuf>,
     pub id: ConfigGenerationId,
     pub source_revision: ConfigSourceRevision,
     pub applied_at: DateTime<Utc>,
@@ -211,6 +219,7 @@ impl ConfigGeneration {
             "process configuration source revision is unavailable"
         );
         let mut binding = ProcessGenerationBinding {
+            working_root: self.effective.runtime.workdir.clone(),
             id: self.id,
             source_revision: self.source_revision.clone(),
             applied_at: self.applied_at,
@@ -236,7 +245,8 @@ impl ConfigGeneration {
     ) -> anyhow::Result<()> {
         let deferred_changes_match = self.deferred_changes.as_ref() == binding.deferred_changes.as_slice();
         anyhow::ensure!(
-            self.id == binding.id
+            self.effective.runtime.workdir == binding.working_root
+                && self.id == binding.id
                 && self.source_revision == binding.source_revision
                 && self.applied_at == binding.applied_at
                 && self.trigger == binding.trigger
@@ -264,6 +274,9 @@ impl ConfigGeneration {
         binding: &ProcessGenerationBinding,
         key: &crate::decision::key::DecisionKey,
     ) -> anyhow::Result<Arc<Self>> {
+        if config.runtime.workdir != binding.working_root {
+            return Err(ProcessWorkingRootMismatch.into());
+        }
         anyhow::ensure!(
             ConfigSourceRevision::from_config(&config)? == binding.source_revision,
             "process configuration source differs from parent generation"
@@ -2068,6 +2081,38 @@ mod pinned_parent_process_binding_tests {
         let key =
             crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")?;
         Ok((home, generation, key))
+    }
+
+    #[test]
+    fn working_root_binding_rejects_worker_widening_and_tampering() -> anyhow::Result<()> {
+        let (home, mut generation, key) = fixture()?;
+        let root = home.path().join("root");
+        std::fs::create_dir(&root)?;
+        Arc::make_mut(&mut generation.effective).runtime.workdir = Some(root.clone());
+        let binding = generation.bind_process(&key)?;
+        assert_eq!(
+            binding.working_root.as_ref(),
+            Some(&root),
+            "test: parent root is carried"
+        );
+        ConfigGeneration::restore_process(generation.effective.as_ref().clone(), &binding, &key)?;
+        for candidate in [None, Some(home.path().to_path_buf())] {
+            let mut child = generation.effective.as_ref().clone();
+            child.runtime.workdir = candidate;
+            let error = ConfigGeneration::restore_process(child, &binding, &key)
+                .expect_err("test: worker cannot widen or discard signed parent root");
+            assert!(
+                error.downcast_ref::<ProcessWorkingRootMismatch>().is_some(),
+                "test: root mismatch is a typed refusal"
+            );
+        }
+        let mut tampered = binding;
+        tampered.working_root = Some(home.path().to_path_buf());
+        assert!(
+            generation.verify_pinned_process_binding(&tampered, &key).is_err(),
+            "test: carrier cannot differ from pinned parent root"
+        );
+        Ok(())
     }
 
     #[test]

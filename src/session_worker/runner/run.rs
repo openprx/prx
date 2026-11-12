@@ -470,6 +470,27 @@ async fn run_owned_manifest(
         "session-worker parent workspace differs from configuration"
     );
     config.workspace_dir = PathBuf::from(source_workspace);
+    // All three sources are covered by the worker transport signature. The
+    // effective-config seal below additionally authenticates this override.
+    let binding = manifest
+        .child_source
+        .as_ref()
+        .map(|source| &source.config_generation)
+        .or_else(|| {
+            manifest
+                .ordinary_source
+                .as_ref()
+                .map(|source| &source.config_generation)
+        })
+        .or_else(|| {
+            manifest
+                .operator_source
+                .as_ref()
+                .map(|source| &source.config_generation)
+        })
+        .context("session-worker signed configuration binding missing")?;
+    config.runtime.workdir = binding.working_root.clone();
+
     let operator_snapshots = if manifest.operator_source.is_some() {
         Some(super::operator_source::restore(
             &manifest,

@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 use crate::providers::{ChatRequest, ChatResponse};
 use std::sync::atomic::AtomicBool;
@@ -191,4 +192,47 @@ async fn full_gateway_turn_runs_git_through_native_shell() {
     })
     .await
     .expect("test: gateway deadline");
+}
+
+#[tokio::test]
+async fn generation_swap_changes_git_outcome_between_calls() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let root = tempfile::tempdir().expect("test: root");
+        let mut config = Config::default();
+        config.workspace_dir = root.path().join("workspace");
+        config.config_path = root.path().join("config.toml");
+        config.default_provider = Some("ollama".into());
+        config.default_model = Some("prx-shell-parity".into());
+        config.causal_tree.enabled = false;
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"ollama","model":"prx-shell-parity","operations":["chat"],"native_tools":true})).expect("test: model"));
+        config.cost.prices.insert("ollama/prx-shell-parity".into(), crate::config::schema::ModelPricing { input: 1.0, output: 1.0, cache_write: 1.0, cache_read: 1.0 });
+        let shared = crate::config::new_shared(config.clone());
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&config.workspace_dir).expect("test: memory"));
+        let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
+        let runtime = build_gateway_turn_runtime(shared.pin(), shared.clone(), memory.clone(), None, None, None, None, hooks.clone(), #[cfg(feature = "wasm-plugins")] None).expect("test: initial gateway");
+        let owner = Arc::new(GatewayTurnRuntimeOwner::new(runtime, shared.clone(), memory.clone(), None, None, None, None, hooks.clone(), #[cfg(feature = "wasm-plugins")] None));
+        let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = owner.clone();
+        shared.register_participant(&participant);
+        let mut state = webhook_test_state_at(Arc::new(GitProvider::default()), config.workspace_dir.clone());
+        state.config = shared.clone();
+        state.mem = memory;
+        state.hooks = hooks;
+        state.turn_runtime = Some(owner.clone());
+        for level in [crate::security::AutonomyLevel::Full, crate::security::AutonomyLevel::Supervised] {
+            config.autonomy.level = level;
+            shared.apply_runtime_config(config.clone(), crate::config::ConfigReloadTrigger::Test).expect("test: live gateway reload");
+            let runtime = owner.pin();
+            let service = runtime.decision_slot.publish(&runtime, &state).await.expect("test: live publication");
+            let context = crate::tools::ToolExecutionContext::new(crate::runtime::envelope::RuntimeEnvelope::agent("workspace-a", "parity-reload").with_owner_id("prx_user").with_channel("terminal"), "dm");
+            let outcome = service.execution().execute(crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command":"git --version"})), context, None).await;
+            let success = outcome.result.as_ref().is_some_and(|result| result.success);
+            assert_eq!(success, level == crate::security::AutonomyLevel::Full, "test: existing gateway adopts generation policy");
+        }
+        let cleanup = owner.cleanup.clone();
+        drop(state);
+        drop(participant);
+        drop(owner);
+        cleanup.drain(tokio::time::Instant::now() + Duration::from_secs(5)).await.expect("test: reload cleanup");
+    }).await.expect("test: live reload deadline");
 }

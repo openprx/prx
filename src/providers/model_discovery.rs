@@ -906,70 +906,63 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
 /// Map provider name to its conventional env var
 /// The environment variable that holds `name`'s own credential, if the
 /// provider has one. Model discovery reads only this.
-pub(crate) const PROVIDER_CREDENTIAL_ENV: &[&str] = &[
-    "OPENROUTER_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "OLLAMA_API_KEY",
-    "LLAMACPP_API_KEY",
-    "VENICE_API_KEY",
-    "GROQ_API_KEY",
-    "MISTRAL_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "XAI_API_KEY",
-    "TOGETHER_API_KEY",
-    "FIREWORKS_API_KEY",
-    "PERPLEXITY_API_KEY",
-    "COHERE_API_KEY",
-    "KIMI_CODE_API_KEY",
-    "MOONSHOT_API_KEY",
-    "GLM_API_KEY",
-    "MINIMAX_API_KEY",
-    "DASHSCOPE_API_KEY",
-    "QIANFAN_API_KEY",
-    "ZAI_API_KEY",
-    "SYNTHETIC_API_KEY",
-    "OPENCODE_API_KEY",
-    "VERCEL_API_KEY",
-    "CLOUDFLARE_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "GEMINI_API_KEY",
-    "NVIDIA_API_KEY",
-    "ASTRAI_API_KEY",
+pub(crate) const PROVIDER_CREDENTIAL_ENV: &[(&[&str], &str)] = &[
+    (&["openrouter"], "OPENROUTER_API_KEY"),
+    (&["anthropic"], "ANTHROPIC_API_KEY"),
+    (&["openai"], "OPENAI_API_KEY"),
+    (&["ollama"], "OLLAMA_API_KEY"),
+    (&["llamacpp"], "LLAMACPP_API_KEY"),
+    (&["venice"], "VENICE_API_KEY"),
+    (&["groq"], "GROQ_API_KEY"),
+    (&["mistral"], "MISTRAL_API_KEY"),
+    (&["deepseek"], "DEEPSEEK_API_KEY"),
+    (&["xai"], "XAI_API_KEY"),
+    (&["together-ai"], "TOGETHER_API_KEY"),
+    (&["fireworks", "fireworks-ai"], "FIREWORKS_API_KEY"),
+    (&["perplexity"], "PERPLEXITY_API_KEY"),
+    (&["cohere"], "COHERE_API_KEY"),
+    (&["kimi-code"], "KIMI_CODE_API_KEY"),
+    (&["moonshot"], "MOONSHOT_API_KEY"),
+    (&["glm"], "GLM_API_KEY"),
+    (&["minimax"], "MINIMAX_API_KEY"),
+    (&["qwen"], "DASHSCOPE_API_KEY"),
+    (&["qianfan"], "QIANFAN_API_KEY"),
+    (&["zai"], "ZAI_API_KEY"),
+    (&["synthetic"], "SYNTHETIC_API_KEY"),
+    (&["opencode", "opencode-zen"], "OPENCODE_API_KEY"),
+    (&["vercel", "vercel-ai"], "VERCEL_API_KEY"),
+    (&["cloudflare", "cloudflare-ai"], "CLOUDFLARE_API_KEY"),
+    (&["bedrock", "aws-bedrock"], "AWS_ACCESS_KEY_ID"),
+    (&["gemini"], "GEMINI_API_KEY"),
+    (&["nvidia", "nvidia-nim", "build.nvidia.com"], "NVIDIA_API_KEY"),
+    (&["astrai"], "ASTRAI_API_KEY"),
 ];
 
 pub(crate) fn provider_credential_env_var(name: &str) -> Option<&'static str> {
-    let index = match canonical_provider_name(name) {
-        "openrouter" => 0,
-        "anthropic" => 1,
-        "openai" => 2,
-        "ollama" => 3,
-        "llamacpp" => 4,
-        "venice" => 5,
-        "groq" => 6,
-        "mistral" => 7,
-        "deepseek" => 8,
-        "xai" => 9,
-        "together-ai" => 10,
-        "fireworks" | "fireworks-ai" => 11,
-        "perplexity" => 12,
-        "cohere" => 13,
-        "kimi-code" => 14,
-        "moonshot" => 15,
-        "glm" => 16,
-        "minimax" => 17,
-        "qwen" => 18,
-        "qianfan" => 19,
-        "zai" => 20,
-        "synthetic" => 21,
-        "opencode" | "opencode-zen" => 22,
-        "vercel" | "vercel-ai" => 23,
-        "cloudflare" | "cloudflare-ai" => 24,
-        "bedrock" | "aws-bedrock" => 25,
-        "gemini" => 26,
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => 27,
-        "astrai" => 28,
-        _ => return None,
-    };
-    PROVIDER_CREDENTIAL_ENV.get(index).copied()
+    let canonical = canonical_provider_name(name);
+    PROVIDER_CREDENTIAL_ENV
+        .iter()
+        .find_map(|(aliases, variable)| aliases.contains(&canonical).then_some(*variable))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn credential_names_preserve_aliases_and_unknown_provider_refusal() {
+        assert_eq!(
+            super::provider_credential_env_var("nvidia-nim"),
+            Some("NVIDIA_API_KEY"),
+            "test: NVIDIA aliases must resolve to the NVIDIA credential"
+        );
+        assert_eq!(
+            super::provider_credential_env_var("fireworks-ai"),
+            Some("FIREWORKS_API_KEY"),
+            "test: Fireworks aliases must resolve to the Fireworks credential"
+        );
+        assert_eq!(
+            super::provider_credential_env_var("prx_unknown_provider"),
+            None,
+            "test: unknown providers must not borrow a configured provider credential"
+        );
+    }
 }

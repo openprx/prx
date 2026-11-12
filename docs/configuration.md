@@ -3453,6 +3453,9 @@ it before agent startup; invalid CLI paths fail with exit 2, invalid configurati
 paths with exit 1. The CLI canonicalizes the directory. The default remains the
 workspace directory. Changes require restart and setting or changing the directory
 is classified as a privilege widening. Remove the key to restore the default.
+Process workers inherit the effective root through the signed parent configuration
+binding. They restore it after loading disk configuration and before authenticating
+the effective snapshot; a worker cannot replace or discard that signed root.
 The security workspace, memory ACL and audit/experiment roots do not move.
 Docker also requires the directory to satisfy `runtime.docker.allowed_workspace_roots`.
 

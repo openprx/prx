@@ -4,10 +4,10 @@ use std::sync::OnceLock;
 
 /// Environment variable carrying the sealed session-worker capability to the
 /// child process.
-pub(super) const SESSION_WORKER_CAP_ENV: &str = "OPENPRX_SESSION_WORKER_CAPABILITY";
+pub(crate) const SESSION_WORKER_CAP_ENV: &str = "OPENPRX_SESSION_WORKER_CAPABILITY";
 /// Environment variable carrying the capability's absolute expiry (unix secs),
 /// which is bound into the capability HMAC.
-pub(super) const SESSION_WORKER_CAP_EXPIRY_ENV: &str = "OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY";
+pub(crate) const SESSION_WORKER_CAP_EXPIRY_ENV: &str = "OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY";
 /// Capability time-to-live in seconds.
 pub(super) const SESSION_WORKER_CAP_TTL_SECS: u64 = 300;
 
