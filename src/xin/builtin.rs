@@ -22,11 +22,17 @@ pub struct BuiltinRegistry {
 impl BuiltinRegistry {
     pub fn new() -> Self {
         let mut handlers: HashMap<&'static str, HandlerFn> = HashMap::new();
-        handlers.insert("xin:health_check", |cfg| Box::pin(handle_health_check(cfg)));
-        handlers.insert("xin:stale_cleanup", |cfg| Box::pin(handle_stale_cleanup(cfg)));
-        handlers.insert("xin:memory_evolution", |cfg| Box::pin(handle_memory_evolution(cfg)));
+        handlers.insert("xin:health_check", |_cfg| Box::pin(async { Ok(handle_health_check()) }));
+        handlers.insert("xin:stale_cleanup", |cfg| {
+            Box::pin(async move { handle_stale_cleanup(&cfg) })
+        });
+        handlers.insert("xin:memory_evolution", |cfg| {
+            Box::pin(async move { handle_memory_evolution(cfg) })
+        });
         handlers.insert("xin:fitness_report", |cfg| Box::pin(handle_fitness_report(cfg)));
-        handlers.insert("xin:memory_hygiene", |cfg| Box::pin(handle_memory_hygiene(cfg)));
+        handlers.insert("xin:memory_hygiene", |cfg| {
+            Box::pin(async move { handle_memory_hygiene(&cfg) })
+        });
         Self { handlers }
     }
 
@@ -108,25 +114,22 @@ pub const fn retired_builtin_task_names() -> &'static [&'static str] {
 
 // ── Handlers ────────────────────────────────────────────────────────────
 
-#[allow(clippy::unused_async)]
-async fn handle_health_check(_config: Config) -> Result<String> {
+fn handle_health_check() -> String {
     let snapshot = crate::health::snapshot_json();
     let summary =
         serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "failed to serialize health snapshot".into());
-    Ok(format!("health check completed\n{summary}"))
+    format!("health check completed\n{summary}")
 }
 
-#[allow(clippy::unused_async)]
-async fn handle_stale_cleanup(config: Config) -> Result<String> {
-    let stale_count = crate::xin::store::mark_stale(&config, config.xin.stale_timeout_minutes)?;
-    let removed = crate::xin::store::remove_completed(&config)?;
+fn handle_stale_cleanup(config: &Config) -> Result<String> {
+    let stale_count = crate::xin::store::mark_stale(config, config.xin.stale_timeout_minutes)?;
+    let removed = crate::xin::store::remove_completed(config)?;
     Ok(format!(
         "stale cleanup: marked {stale_count} stale, removed {removed} completed"
     ))
 }
 
-#[allow(clippy::unused_async)]
-async fn handle_memory_evolution(config: Config) -> Result<String> {
+fn handle_memory_evolution(config: Config) -> Result<String> {
     let scheduler = crate::xin::evolution::DraftEvolutionScheduler::load(config)?;
     let report = scheduler.tick()?;
     Ok(format!(
@@ -146,8 +149,7 @@ async fn handle_fitness_report(config: Config) -> Result<String> {
     ))
 }
 
-#[allow(clippy::unused_async)]
-async fn handle_memory_hygiene(config: Config) -> Result<String> {
+fn handle_memory_hygiene(config: &Config) -> Result<String> {
     match crate::memory::hygiene::run_if_due(&config.memory, &config.workspace_dir)? {
         crate::memory::hygiene::HygieneRunOutcome::Skipped => {
             Ok("memory hygiene skipped: cadence window has not elapsed".into())

@@ -24,7 +24,6 @@ const MODEL: &str = "unsloth/Qwen3.8-27B-GGUF:UD-Q6_K_L";
 #[derive(Clone)]
 pub(super) struct SupportedProfile {
     pub sha256: String,
-    pub boundary_tokens: u64,
     runtime_signature: String,
     files: Vec<(PathBuf, u64, std::time::SystemTime)>,
 }
@@ -291,7 +290,6 @@ fn verify_profile() -> Result<SupportedProfile, LifecycleError> {
     ));
     Ok(SupportedProfile {
         sha256: digest(&serde_json::to_vec(&body).map_err(|_| refusal("tokenizer profile encoding failed"))?),
-        boundary_tokens,
         runtime_signature,
         files,
     })

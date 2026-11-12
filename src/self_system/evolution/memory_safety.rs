@@ -4,7 +4,6 @@
 //! memory write path. Evolution still re-exports these types for historical
 //! callers and for offline cleanup workflows.
 
-#[allow(unused_imports)]
 pub use crate::memory::filter::{
     ConflictChecker, MemorySafetyFilter, SafetyCheckResult, SafetyIssue, SafetyIssueKind, SourceMetadata,
 };

@@ -34,9 +34,6 @@ pub(in crate::skills::lifecycle) struct VerifiedGateReviewHistory {
     gate_decided_at: chrono::DateTime<Utc>,
     gate_expires_at: chrono::DateTime<Utc>,
 }
-// The immediately following adoption package consumes this explicit internal
-// contract; the current qualifier already constructs the verified result.
-#[allow(dead_code)]
 impl VerifiedGateReviewHistory {
     pub const fn binding(&self) -> &crate::skills::lifecycle::GateExperimentBinding {
         &self.witness.binding
@@ -152,7 +149,6 @@ fn verifier_evidence(journal: &ExperimentJournal, verifier: &str, evaluation: &s
 }
 impl SkillsLifecycleService {
     /// Exact source-owned historical proof, not a caller-created witness.
-    #[allow(dead_code)] // Cross-branch adoption API, independently tested here.
     pub(in crate::skills::lifecycle) fn verify_gate_review_witness(
         &self,
         experiment_id: &crate::skills::lifecycle::experiment::ExperimentId,

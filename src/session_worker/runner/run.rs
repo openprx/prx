@@ -786,12 +786,15 @@ async fn run_owned_manifest(
         (None, None)
     };
 
-    #[allow(unused_mut)]
-    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    let extensions = hooks.control_tool_arcs(Arc::clone(&security));
     #[cfg(feature = "wasm-plugins")]
-    if let Some(plugin_runtime) = &wasm_plugin_runtime {
-        extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
-    }
+    let extensions = {
+        let mut extensions = extensions;
+        if let Some(plugin_runtime) = &wasm_plugin_runtime {
+            extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
+        }
+        extensions
+    };
     let mut full_tools = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         shared_config.clone(),

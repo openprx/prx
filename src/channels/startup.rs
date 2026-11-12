@@ -124,12 +124,15 @@ pub async fn start_channels_with_config(
     let workspace = config.workspace_dir.clone();
     // Keep as mutable Vec so we can append channel-aware tools (e.g. sessions_spawn)
     // before wrapping in Arc below.
-    #[allow(unused_mut)]
-    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    let extensions = hooks.control_tool_arcs(Arc::clone(&security));
     #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = &wasm_plugin_runtime {
-        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
-    }
+    let extensions = {
+        let mut extensions = extensions;
+        if let Some(runtime) = &wasm_plugin_runtime {
+            extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+        }
+        extensions
+    };
     let tool_build = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::new(config.clone()),
         Arc::clone(&shared_config),

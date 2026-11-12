@@ -76,7 +76,7 @@ use crate::router::RouterEngine;
 /// are built by each mode. Only the read-only core lives in `AppContext`.
 pub struct AppContext {
     pub(crate) controlled_entry: Option<Arc<super::h2_entry::ControlledH2Profile>>,
-    #[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
+    #[cfg(feature = "terminal-tui")]
     pub(crate) terminal_producer: parking_lot::Mutex<Option<super::h2_entry::TerminalInputProducer>>,
     pub(crate) controlled_case: Option<Arc<super::h2_entry::ControlledCaseScope>>,
     /// Sole configuration generation owner for this process/runtime bootstrap.
@@ -420,6 +420,7 @@ impl RuntimeBootstrap {
             }
             _ => None,
         };
+        #[cfg(feature = "terminal-tui")]
         let mut terminal_producer = None;
         let controlled_case = match &config_source {
             AgentRuntimeConfig::ControlledCase { config, scope } => {
@@ -435,7 +436,13 @@ impl RuntimeBootstrap {
                 (manager, generation)
             }
             AgentRuntimeConfig::ControlledEntry { config, producer } => {
-                terminal_producer = Some(*producer);
+                // Only the TUI listener consumes the controlled producer.
+                #[cfg(feature = "terminal-tui")]
+                {
+                    terminal_producer = Some(*producer);
+                }
+                #[cfg(not(feature = "terminal-tui"))]
+                drop(producer);
                 let manager = crate::config::new_shared(*config);
                 let generation = manager.pin();
                 (manager, generation)
@@ -582,12 +589,15 @@ impl RuntimeBootstrap {
             } else {
                 (None, None)
             };
-            #[allow(unused_mut)]
-            let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+            let extensions = hooks.control_tool_arcs(Arc::clone(&security));
             #[cfg(feature = "wasm-plugins")]
-            if let Some(plugin_runtime) = &plugin_runtime {
-                extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
-            }
+            let extensions = {
+                let mut extensions = extensions;
+                if let Some(plugin_runtime) = &plugin_runtime {
+                    extensions.extend(plugin_runtime.control_tool_arcs(Arc::clone(&security)));
+                }
+                extensions
+            };
             if let Some(case) = &controlled_case {
                 tools = Some(Arc::new(case.registry(&config, &security)?));
             } else if let Some(entry) = &controlled_entry {
@@ -627,6 +637,7 @@ impl RuntimeBootstrap {
 
         let mut context = AppContext {
             controlled_entry,
+            #[cfg(feature = "terminal-tui")]
             terminal_producer: parking_lot::Mutex::new(terminal_producer),
             controlled_case,
             config_manager,

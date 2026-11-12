@@ -150,7 +150,7 @@ pub(super) fn validate_input(controlled: bool, proof: bool, text: &str) -> anyho
     Ok(())
 }
 
-#[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
+#[cfg(feature = "terminal-tui")]
 pub(super) fn take_producer(context: &AppContext) -> Option<TerminalInputProducer> {
     context.terminal_producer.lock().take()
 }

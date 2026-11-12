@@ -32,7 +32,6 @@ pub use backend::{
     MemoryBackendKind, classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, serves_tool_execution_ledger,
 };
-#[allow(unused_imports)]
 pub use fabric::{MemoryEventRecording, MemoryEventWatcher, MemoryFabric, MessageEventScope, RuntimeAuthorityGuard};
 pub use filter::{should_autosave_content, should_autosave_content_with_min};
 pub use lucid::LucidMemory;
@@ -47,7 +46,6 @@ pub use router_history::{
 pub use sqlite::SqliteMemory;
 pub use traits::LifecycleState;
 pub use traits::Memory;
-#[allow(unused_imports)]
 pub use traits::{
     AgentPartition, AgentScopeRefused, AgentScopeUnsupported, ChatProfile, CompactionRun, CompactionRunInput,
     CompactionSourceEventRange, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,

@@ -1394,11 +1394,11 @@ async fn run_turn_unguarded(
                         trace.tokens_used.is_reported() && trace.tokens_used.has_any_tokens(),
                     );
                 }
-                #[allow(unused_mut)]
-                let mut resp = trace.response;
+                let resp = trace.response;
 
                 #[cfg(feature = "wasm-plugins")]
-                {
+                let resp = {
+                    let mut resp = resp;
                     let transformed = hooks
                         .process_wasm_middleware(
                             crate::plugins::capabilities::middleware::MiddlewareStage::LlmResponse,
@@ -1430,7 +1430,8 @@ async fn run_turn_unguarded(
                             reasoning.as_str().map(ToString::to_string).or(resp.reasoning_content)
                         };
                     }
-                }
+                    resp
+                };
                 let duration = llm_started_at.elapsed();
                 hooks
                     .emit(
@@ -1691,7 +1692,6 @@ async fn run_turn_unguarded(
                 Ok(values) => values,
             };
 
-        #[allow(unused_mut)]
         let mut display_text = if parsed_text.is_empty() {
             response_text.clone()
         } else {

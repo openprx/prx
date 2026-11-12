@@ -67,7 +67,6 @@ mod tool_dialect_config_tests;
 pub(crate) mod tool_schema_refusal_tests;
 
 pub use attempt_accounting::AccountingTargets;
-#[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ProviderCapabilities,
     ProviderCapabilityError, ToolCall, ToolResultMessage,

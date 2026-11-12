@@ -492,7 +492,6 @@ pub(super) async fn shutdown_child_sessions_for_exit(
 /// closure is in scope — can use it. Behaviour mirrors `emit_chat_output`:
 /// route through the dispatcher (single source, reaches both render paths) and
 /// nudge the renderer on the TUI path; fall back to plain stdout otherwise.
-#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
 pub(super) fn surface_session_message(
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
@@ -512,6 +511,8 @@ pub(super) fn surface_session_message(
     }
     #[cfg(not(feature = "terminal-tui"))]
     {
+        // Without the TUI there is no dispatcher-driven renderer to notify.
+        let _ = (dispatcher, redraw_tx);
         print_fallback_chat_output(text);
     }
 }

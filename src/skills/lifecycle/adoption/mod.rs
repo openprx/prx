@@ -1,6 +1,5 @@
 //! Adopted-history data contracts. Serializable pins are untrusted input;
 //! only this owner's verified factory may construct prepared guidance.
-#![allow(dead_code)]
 mod context;
 mod lookup;
 mod profile;
@@ -10,11 +9,9 @@ mod retention;
 mod snapshot;
 mod status;
 pub use context::LessonRef;
-#[allow(unused_imports)]
-pub(crate) use context::{
-    LessonCompatibility, LessonHandoffGuard, LessonLimits, LessonPlacement, LessonSnapshot, LessonSnapshotEntry,
-    LessonSnapshotStats, PreparedLessonContext,
-};
+#[cfg(test)]
+pub(crate) use context::{LessonCompatibility, LessonSnapshotEntry};
+pub(crate) use context::{LessonLimits, LessonPlacement, LessonSnapshot, PreparedLessonContext};
 pub(crate) use lookup::LessonQuery;
 pub use proof::RecordAdoptionRequest;
 

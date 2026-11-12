@@ -90,7 +90,6 @@ fn certified_fixture(model: &ModelBinding) -> Result<SupportedProfile, Lifecycle
     });
     Ok(SupportedProfile {
         sha256: digest(&serde_json::to_vec(&certificate).map_err(|_| refusal("fixture certificate encoding failed"))?),
-        boundary_tokens: 320,
         runtime_signature: String::new(),
         files: Vec::new(),
     })

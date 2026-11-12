@@ -18,7 +18,6 @@ pub use schedule::{next_run_for_schedule, schedule_cron_expression, validate_sch
 #[cfg(test)]
 pub use store::add_job;
 pub(crate) use store::finish_claimed_run_preserving_schedule;
-#[allow(unused_imports)]
 pub use store::{
     abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
     add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,

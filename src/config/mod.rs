@@ -21,7 +21,6 @@ pub use generation::{
 pub use hotreload::{HotReloadManager, SharedConfig, new_shared};
 pub(crate) use schema::set_runtime_proxy_config;
 
-#[allow(unused_imports)]
 pub use schema::{
     A2aConfig, A2aCredential, A2aPeer, A2aPeerAuth, AgentCompactionConfig, AgentCompactionMode, AgentConfig,
     AuditConfig, AuthConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ChatConfig,

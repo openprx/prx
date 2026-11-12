@@ -4,7 +4,6 @@ use crate::skills::lifecycle::generation::StoreLock;
 use crate::skills::lifecycle::{LifecycleError, ModelBinding, OwnerScope, RevisionId, SkillId, SkillLifecycleStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// Pure data. Deserialization or a matching hash is never adoption authority.
@@ -145,22 +144,6 @@ impl PreparedLessonContext {
         self.placement
     }
 
-    /// Checks the COMPLETE decoded logical slot. The actual wire parser and
-    /// duplicate/placement checks remain B's existing-transport responsibility.
-    pub(crate) fn compare_actual_user_slot(&self, actual: &str) -> Result<String, LifecycleError> {
-        let digest = hex::encode(Sha256::digest(actual.as_bytes()));
-        if u64::try_from(actual.len()).unwrap_or(u64::MAX) != self.expected_user_slot_bytes
-            || digest != self.expected_user_slot_sha256
-            || self.block.is_empty()
-            || actual.matches(&self.block).count() != 1
-        {
-            return Err(LifecycleError::ProposalRefused(
-                "lesson user slot was clipped, changed or duplicated".into(),
-            ));
-        }
-        Ok(digest)
-    }
-
     /// Hold the existing store shared owner through B's durable handoff write.
     /// Status invalidation and retention take this same owner exclusively.
     pub(crate) fn lock_handoff(
@@ -223,9 +206,6 @@ impl LessonHandoffGuard<'_> {
     }
     pub(in crate::skills::lifecycle) const fn skill_id(&self) -> &SkillId {
         &self.prepared.skill_id
-    }
-    pub(in crate::skills::lifecycle) const fn prepared(&self) -> &PreparedLessonContext {
-        self.prepared
     }
     /// B calls only after taking this target skill lock, before its first
     /// durable handoff write. Publication cannot change the active target in

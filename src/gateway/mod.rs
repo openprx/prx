@@ -1542,12 +1542,15 @@ fn build_gateway_turn_runtime(
     } else {
         (None, None)
     };
-    #[allow(unused_mut)]
-    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    let extensions = hooks.control_tool_arcs(Arc::clone(&security));
     #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = &plugin_runtime {
-        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
-    }
+    let extensions = {
+        let mut extensions = extensions;
+        if let Some(runtime) = &plugin_runtime {
+            extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+        }
+        extensions
+    };
     let tools_result = tools::all_tools_with_runtime_ext_and_extensions(
         Arc::clone(&generation.effective),
         Arc::clone(&shared_config),
@@ -1765,12 +1768,15 @@ async fn run_gateway_inner(
     };
 
     // Build the base tool list (mutable so we can append channel-aware tools below)
-    #[allow(unused_mut)]
-    let mut extensions = hooks.control_tool_arcs(Arc::clone(&security));
+    let extensions = hooks.control_tool_arcs(Arc::clone(&security));
     #[cfg(feature = "wasm-plugins")]
-    if let Some(runtime) = &wasm_plugin_runtime {
-        extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
-    }
+    let extensions = {
+        let mut extensions = extensions;
+        if let Some(runtime) = &wasm_plugin_runtime {
+            extensions.extend(runtime.control_tool_arcs(Arc::clone(&security)));
+        }
+        extensions
+    };
     let tools_result = if let Some(profile) = &controlled {
         tools::ToolsRegistryResult {
             tools: profile.registry(&config, &security)?,
