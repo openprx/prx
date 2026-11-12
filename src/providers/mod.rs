@@ -272,6 +272,16 @@ pub(crate) enum EndpointOverrideError {
     Decorated,
 }
 
+/// Kimi Code's own endpoint, used when the root `api_url` is unset.
+pub(crate) const KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+
+/// The base URL every Kimi Code request addresses: chat, model listing and
+/// the live connection test all resolve it here, so a configured `api_url`
+/// applies to each of them and a refused one stops each of them.
+pub(crate) fn kimi_code_base_url(api_url: Option<&str>) -> Result<&str, EndpointOverrideError> {
+    builtin_endpoint(api_url, KIMI_CODE_BASE_URL)
+}
+
 /// The base URL of a built-in provider with a fixed endpoint: `default` when
 /// the root `api_url` is unset or blank, otherwise the validated override.
 /// The provider name, and with it the catalog entry and billing, is unchanged.
@@ -460,7 +470,7 @@ fn create_provider_with_url_and_options(
         "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(Box::new(
             OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
-                builtin_endpoint(api_url, "https://api.kimi.com/coding/v1")?,
+                kimi_code_base_url(api_url)?,
                 key,
                 AuthStyle::Bearer,
                 crate::PRX_USER_AGENT,

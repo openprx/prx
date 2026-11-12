@@ -83,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- BREAKING (operators): Kimi Code (`kimi-code` and its aliases) now honours the
+  root `api_url` for chat, `prx models refresh` and `prx providers test --live`;
+  it was ignored before. The URL must be `https`, or `http` only for loopback
+  and `host.containers.internal`, without userinfo, query or fragment; any other
+  value fails provider construction and never falls back to `api.kimi.com`.
+  A configuration with a stray `api_url` next to a Kimi default now sends the
+  Kimi credential there: clear it with
+  `prx providers update kimi-code --clear-api-url` unless it is intended.
 - Markdown memory stores each value on one line: line breaks in a key or value
   are replaced with spaces, so a multi-line value reads back as one entry with
   its own key. Existing multi-line files are read as before.

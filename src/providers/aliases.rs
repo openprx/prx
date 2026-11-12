@@ -125,11 +125,16 @@ pub(crate) fn is_vllm_alias(name: &str) -> bool {
     matches!(name, "vllm" | "v-llm")
 }
 
+pub(crate) fn is_kimi_code_alias(name: &str) -> bool {
+    matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
+}
+
 /// The base URL provider construction addresses for the catalog provider
 /// spelled `name` when its connection carries `api_url`: `Some` for the
 /// adapters that honour a configured endpoint (`openai`, `ollama`,
-/// llama.cpp, the Qwen OAuth aliases, LiteLLM, vLLM), `None` for the ones
-/// that always use their own fixed endpoint. Everything that sends this
+/// llama.cpp, the Qwen OAuth aliases, LiteLLM, vLLM, and Kimi Code when the
+/// URL passes [`kimi_code_base_url`](super::kimi_code_base_url)), `None` for
+/// the ones that always use their own fixed endpoint. Everything that sends this
 /// provider's key somewhere other than a generation — the live connection
 /// test, `prx models refresh` — takes its host from here, so it addresses
 /// exactly the host the provider itself does (D-095 M-1, D-078 T-7).
@@ -139,7 +144,8 @@ pub(crate) fn honoured_base_url<'a>(name: &str, api_url: Option<&'a str>) -> Opt
     let honours = matches!(name.as_str(), "openai" | "ollama" | "llamacpp" | "llama.cpp")
         || is_qwen_oauth_alias(&name)
         || is_litellm_alias(&name)
-        || is_vllm_alias(&name);
+        || is_vllm_alias(&name)
+        || (is_kimi_code_alias(&name) && super::kimi_code_base_url(Some(api_url)).is_ok());
     honours.then_some(api_url)
 }
 
