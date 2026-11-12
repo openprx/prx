@@ -165,22 +165,49 @@ fn blank_comments_and_literals_uncached(source: &str) -> String {
 }
 /// Whether a predicate requires the test configuration in every case.
 fn requires_test(predicate: &str) -> bool {
-    if predicate == "test" { return true; }
-    let Some(inner) = predicate.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) else { return false; };
+    if predicate == "test" {
+        return true;
+    }
+    let Some(inner) = predicate.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    // A test flag is required only if every enclosing predicate is `all`.
+    // Skip any/unknown groups by depth, without recursion or an input-sized stack.
+    let bytes = inner.as_bytes();
+    let mut cursor = 0usize;
     let mut depth = 0usize;
-    let mut start = 0;
-    for (index, ch) in inner.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                if requires_test(&inner[start..index]) { return true; }
-                start = index + 1;
+    let mut blocked_at = None;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
+            let start = cursor;
+            while bytes.get(cursor).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte >= 0x80) {
+                cursor += 1;
+            }
+            let word = inner.get(start..cursor);
+            if blocked_at.is_none() {
+                if word == Some("test") && matches!(bytes.get(cursor), None | Some(b',' | b')')) {
+                    return true;
+                }
+                if word != Some("all") && bytes.get(cursor) == Some(&b'(') {
+                    blocked_at = Some(depth + 1);
+                }
+            }
+            continue;
+        }
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                if blocked_at == Some(depth) {
+                    blocked_at = None;
+                }
+                depth = depth.saturating_sub(1);
             }
             _ => {}
         }
+        cursor += 1;
     }
-    requires_test(&inner[start..])
+    false
 }
 
 fn test_cfg_attribute(masked: &[char], index: usize, inner: bool) -> Option<usize> {

@@ -323,3 +323,30 @@ fn all_cfg_requires_test_but_any_cfg_does_not() {
         );
     }
 }
+
+#[test]
+fn deeply_nested_cfg_is_iterative_and_value_tests_stay_production() {
+    const NESTING_DEPTH: usize = 1024;
+    let predicate = format!("{}test{}", "all(".repeat(NESTING_DEPTH), ")".repeat(NESTING_DEPTH));
+    let source = format!("#[cfg({predicate})] fn helper() {{ value.unwrap(); }}\nfn production() {{ keep(); }}");
+    let stripped = strip_cfg_test_items(&blank_comments_and_literals(&source));
+    assert!(
+        !stripped.contains("unwrap"),
+        "deep all(test) predicates must be recognized without recursive traversal"
+    );
+    assert!(
+        stripped.contains("keep"),
+        "deep test predicates must preserve following production code"
+    );
+    for predicate in [
+        "test = \"enabled\"",
+        "all(test = \"enabled\", unix)",
+        "all(any(test, unix), feature = \"probe\")",
+    ] {
+        let source = format!("#[cfg({predicate})] fn helper() {{ value.unwrap(); }}");
+        assert!(
+            strip_cfg_test_items(&blank_comments_and_literals(&source)).contains("unwrap"),
+            "a test value or an any branch must remain production: {predicate}"
+        );
+    }
+}
