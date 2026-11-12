@@ -253,7 +253,6 @@ async fn actual_unsent_abandonment_continues_but_dropped_reservation_stays_unkno
 #[tokio::test]
 async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
     use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
-    use crate::tools::execution::admission::TurnSurface;
     let workspace = tempfile::tempdir().expect("test: MCP trace workspace");
     let fixture = fixture();
     let alias = "mcp__prx_service__read";
@@ -284,17 +283,27 @@ async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
         CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).expect("test: discovered MCP catalog");
     let key = crate::decision::DecisionKey::ephemeral();
     let (mut context, trace) = traced_context(workspace.path(), &key, "prx_mcp_run");
-    context.turn_surface = Some(Arc::new(
-        TurnSurface::build_from(
-            &service,
-            service.current_descriptors(),
-            &crate::config::ToolTieringConfig::default(),
-            "prx_model",
-            false,
-            |_| true,
-        )
-        .with_catalog_identities(&catalog),
-    ));
+    let security = crate::security::SecurityPolicy {
+        workspace_dir: workspace.path().to_owned(),
+        autonomy: crate::security::AutonomyLevel::Full,
+        ..crate::security::SecurityPolicy::default()
+    };
+    context.turn_surface = Some(Arc::new(crate::tools::surface_owner::build(
+        crate::tools::surface_owner::SurfaceParts {
+            execution: &service,
+            catalog: &catalog,
+            publication_policy: &SurfacePolicy::default(),
+            tiering: &crate::config::ToolTieringConfig::default(),
+            security: &security,
+            pinned_model: "prx_model",
+            channel: false,
+            inherited_exclusions: &[],
+            sender: "prx_user",
+            channel_name: "terminal",
+            chat_type: "private",
+            tool_calls_allowed: true,
+        },
+    )));
     let outcome = service
         .execute(
             ToolExecutionCommand::new(alias, serde_json::json!({"value":1})),

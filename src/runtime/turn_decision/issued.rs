@@ -22,17 +22,18 @@ impl TurnDecisionService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if self.should_run_prediction_hop() {
-            let admission = self
-                .decide_agent_initial_inner(
-                    proof,
-                    kind,
-                    cancellation,
-                    None,
-                    None,
-                    #[cfg(all(test, feature = "llm-router"))]
-                    None,
-                )
-                .await?;
+            // Keep the optional prediction state out of every caller's
+            // async frame, including child admission on ordinary stacks.
+            let admission = Box::pin(self.decide_agent_initial_inner(
+                proof,
+                kind,
+                cancellation,
+                None,
+                None,
+                #[cfg(all(test, feature = "llm-router"))]
+                None,
+            ))
+            .await?;
             return self.record_issued_decision(proof, admission, cancellation).await;
         }
         let opened = self.open_turn_context(proof, kind, cancellation).await?;
@@ -46,17 +47,18 @@ impl TurnDecisionService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if self.should_run_prediction_hop() {
-            let admission = self
-                .decide_agent_initial_inner(
-                    proof,
-                    super::AgentTurnKind::SingleShot,
-                    cancellation,
-                    None,
-                    observation,
-                    #[cfg(all(test, feature = "llm-router"))]
-                    None,
-                )
-                .await?;
+            // Keep the optional prediction state out of every caller's
+            // async frame, including child admission on ordinary stacks.
+            let admission = Box::pin(self.decide_agent_initial_inner(
+                proof,
+                super::AgentTurnKind::SingleShot,
+                cancellation,
+                None,
+                observation,
+                #[cfg(all(test, feature = "llm-router"))]
+                None,
+            ))
+            .await?;
             return self.record_issued_decision(proof, admission, cancellation).await;
         }
         let opened = self.open_segment_turn_context(proof, observation, cancellation).await?;

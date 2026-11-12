@@ -192,8 +192,11 @@ pub(super) async fn run(agent: &mut Agent, input: &str) -> anyhow::Result<String
     let result = cleanup
         .run(boxed_turn_work(agent, input, &generation, &binding, &cancellation))
         .await;
-    agent.cleanup_state.confirm().await?;
-    result
+    match (result, agent.cleanup_state.confirm().await) {
+        (Err(error), Err(cleanup)) => Err(error.context(cleanup)),
+        (_, Err(cleanup)) => Err(cleanup.into()),
+        (result, Ok(())) => result,
+    }
 }
 
 // Construct the owned work in a synchronous frame that returns before polling.

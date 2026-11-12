@@ -49,12 +49,12 @@ async fn decision_reply(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<
 }
 
 #[tokio::test]
-async fn actual_operator_task_decision_accounts_physical_send_and_drains() -> anyhow::Result<()> {
+async fn operator_task_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
     run_operator_case(false).await
 }
 
 #[tokio::test]
-async fn restored_operator_process_decision_accounts_physical_send_without_os_spawn() -> anyhow::Result<()> {
+async fn restored_operator_process_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
     run_operator_case(true).await
 }
 
@@ -84,10 +84,10 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
-        config.causal_tree.backend.endpoint = endpoint.clone();
-        config.causal_tree.backend.model = "prx-operator-decision".to_owned();
+        // These cases assert Direct admission without a prediction send.
+        // The declared loopback endpoint below remains a real traffic probe;
+        // leave Auto empty rather than explicitly selecting that backend.
+        config.causal_tree.backend = crate::causal_tree::config::CausalTreeConfig::default().backend;
         assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
         let priced_provider = format!("custom:{endpoint}");
         config.providers.models.push(serde_json::from_value(json!({

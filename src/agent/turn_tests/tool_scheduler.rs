@@ -1208,15 +1208,15 @@ impl Tool for GrantBoundProbe {
 /// later import of a different bundle hash. Calls that need no approval are
 /// unaffected.
 #[tokio::test]
-async fn always_allowlisting_never_approves_a_grant_bound_lifecycle_call() {
+async fn supervised_allowlisting_does_not_approve_a_different_lifecycle_target() {
     let _test_guard = TOOL_SCHEDULER_TEST_LOCK.lock().await;
     let executions = Arc::new(AtomicUsize::new(0));
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(GrantBoundProbe(Arc::clone(&executions)))];
     let policy = crate::security::SecurityPolicy {
-        autonomy: crate::security::AutonomyLevel::Full,
+        autonomy: crate::security::AutonomyLevel::Supervised,
         ..crate::security::SecurityPolicy::default()
     };
-    let scope_ctx = scheduler_scope(&policy, "user@example.com");
+    let scope_ctx = scheduler_scope(&policy, "prx_user");
     let manager = Arc::new(ApprovalManager::new());
     manager.record_decision(
         "skills_manage",
