@@ -25,7 +25,6 @@ impl MailboxClock for Clock {
 }
 
 struct Fixture {
-    _dir: TempDir,
     memory: SqliteMemory,
     store: SqliteMailbox,
     clock: Arc<Clock>,
@@ -34,6 +33,8 @@ struct Fixture {
     sender: MailboxScope,
     recipient: MailboxScope,
     authority: MailboxAuthority,
+    // Close every owned connection before removing its database directory.
+    _dir: TempDir,
 }
 impl Fixture {
     fn new() -> Self {
@@ -2103,12 +2104,13 @@ async fn pending_send_resolver_keeps_payload_in_scope_until_cancel_join() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        f.memory.mailbox_runtime.has_scope_leases(f.sender.scope_id),
-        "queued send lost its body lease while resolver was pending"
-    );
+    let kept_payload_scope = f.memory.mailbox_runtime.has_scope_leases(f.sender.scope_id);
     sending.abort();
     assert!(sending.await.unwrap_err().is_cancelled());
+    assert!(
+        kept_payload_scope,
+        "queued send lost its body lease while resolver was pending"
+    );
     assert!(
         !f.memory.mailbox_runtime.has_scope_leases(f.sender.scope_id),
         "cancel join retained the send payload"

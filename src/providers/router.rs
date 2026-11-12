@@ -866,7 +866,8 @@ impl Provider for MockEnvProvider {
 
         #[cfg(feature = "test-mock")]
         if let Err(error) = self.response_effect() {
-            return futures::stream::once(async move { Err(error) }).boxed();
+            return futures::stream::once(async move { Err(super::traits::StreamError::Provider(error.to_string())) })
+                .boxed();
         }
         let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
         let response = self.response.clone();
