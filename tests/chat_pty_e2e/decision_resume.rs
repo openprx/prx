@@ -168,7 +168,7 @@ fn wait_for_completion_after(
                 assert!(output.len() <= 2 * 1024 * 1024, "bounded PTY capture");
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20))
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => panic!("test: completion PTY read: {error}"),
         }
@@ -264,7 +264,7 @@ fn wait_for_path(session: &mut TrackedSession, path: &std::path::Path, total: Du
             Ok(0) => panic!("test: EOF before semantic hold event"),
             Ok(n) => ack_all_dsr_with_pending(session, &buffer[..n], &mut pending),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20))
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => panic!("test: held turn read: {error}"),
         }
