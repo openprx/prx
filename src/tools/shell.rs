@@ -9,11 +9,20 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+const fn shell_git_policy(level: crate::security::AutonomyLevel) -> crate::runtime::shell_process::ShellGitPolicy {
+    use crate::runtime::shell_process::ShellGitPolicy::{PlainGit, RefuseGit};
+    use crate::security::AutonomyLevel::Full;
+    match level {
+        Full => PlainGit,
+        _ => RefuseGit,
+    }
+}
+
 /// Direct host shell command execution tool.
 ///
 /// Authorization belongs to the orchestration boundary. This executor passes
 /// command text unchanged to the configured runtime and applies no ACL, path
-/// parser or OS sandbox. The child environment is cleared and allowlisted.
+/// parser or OS sandbox. Runtime authority selects git and environment policy.
 pub struct ShellTool {
     process: ShellProcessAdapter,
     workspace_dir: std::path::PathBuf,
@@ -77,7 +86,9 @@ impl ShellTool {
                 workspace_dir: &self.workspace_dir,
                 timeout: None,
                 cancellation,
-                git: crate::runtime::shell_process::ShellGitPolicy::RefuseGit,
+                git: shell_git_policy(
+                    super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),
+                ),
             })
             .await
         {
@@ -170,7 +181,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command directly in the workspace directory"
+        "Execute a shell command directly in the working directory"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

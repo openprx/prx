@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-/// Perform an exact string replacement inside an existing workspace file.
+/// Perform an exact string replacement inside an existing file.
 ///
 /// This is the surgical counterpart to `file_write` (which overwrites whole
 /// files). It reads the target, replaces `old_string` with `new_string`, and
@@ -21,6 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 /// on disk is left untouched (the operation is atomic with respect to errors).
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    working_root: Option<std::path::PathBuf>,
     controlled_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
 }
 
@@ -31,18 +32,29 @@ impl FileEditTool {
     ) -> Self {
         Self {
             security,
+            working_root: None,
             controlled_filesystem: Some(filesystem),
         }
     }
     pub const fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             security,
+            working_root: None,
             controlled_filesystem: None,
         }
     }
 }
 
 impl FileEditTool {
+    pub fn with_workdir(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.working_root = root;
+        self
+    }
+
+    fn working_root(&self) -> &std::path::Path {
+        self.working_root.as_deref().unwrap_or(&self.security.workspace_dir)
+    }
+
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(expected) = &self.controlled_filesystem {
             anyhow::ensure!(
@@ -103,8 +115,9 @@ impl FileEditTool {
             });
         }
 
+        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         // Security check: validate path is within workspace (same policy as file_write).
-        if !self.security.is_path_allowed(path) {
+        if !full && !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -113,9 +126,7 @@ impl FileEditTool {
         }
 
         let resolved_target =
-            match crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, false)
-                .await
-            {
+            match crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await {
                 Ok(target) => target,
                 Err(error) => {
                     return Ok(ToolResult {
@@ -128,7 +139,7 @@ impl FileEditTool {
         let resolved_parent = resolved_target
             .parent()
             .ok_or_else(|| anyhow::anyhow!("file parent missing"))?;
-        if !self.security.is_resolved_path_allowed(resolved_parent) {
+        if !full && !self.security.is_resolved_path_allowed(resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -339,7 +350,7 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Perform an exact string replacement in an existing workspace file (like Claude Code's Edit). \
+        "Perform an exact string replacement in an existing file (like Claude Code's Edit). \
          Reads the file, replaces 'old_string' with 'new_string', and writes it back. \
          Prefer this over file_write for targeted edits to large files — it never rewrites \
          unrelated content. By default 'old_string' must match exactly once: include enough \
@@ -354,7 +365,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "File path, relative to the working directory or absolute when policy permits"
                 },
                 "old_string": {
                     "type": "string",

@@ -1609,8 +1609,8 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
-        // Full autonomy bypasses approval risk grading, but workspace path
-        // boundaries above remain a shared invariant for every shell entry.
+        // Full autonomy bypasses approval risk grading here. Native shell
+        // dispatch separately selects its effective autonomy and git policy.
         if self.autonomy == AutonomyLevel::Full {
             return Ok(risk);
         }

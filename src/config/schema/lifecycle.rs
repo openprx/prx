@@ -721,6 +721,12 @@ impl Config {
             }
         }
 
+        if let Some(workdir) = &self.runtime.workdir {
+            let root = super::RuntimeConfig::validate_workdir(workdir)?;
+            if self.runtime.kind == "docker" {
+                crate::runtime::docker::DockerRuntime::new(self.runtime.docker.clone()).workspace_mount_path(&root)?;
+            }
+        }
         super::RuntimeConfig::validate_shell_env_allowlist(&self.runtime.shell_env_allowlist)?;
 
         // Runtime. A zero-sized blocking pool cannot run any blocking work, so

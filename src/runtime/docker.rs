@@ -15,7 +15,7 @@ impl DockerRuntime {
         Self { config }
     }
 
-    fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
+    pub(crate) fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
         let resolved = workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| workspace_dir.to_path_buf());

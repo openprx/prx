@@ -43,7 +43,14 @@ approval checks remain enforced.
 
 ## Shell environment
 
-The generic `shell` tool clears the child environment before launch. It keeps
+At effective Full autonomy, the native `shell` tool inherits its parent environment
+except known provider credentials, worker secrets, `MINIMAX_OAUTH_*` and `OPENPRX_*`.
+This is environment hygiene: Full shells can still read local configuration.
+The effective level is the lower of service policy and child-manifest authority;
+without runtime dispatch context, tools retain the Supervised behavior.
+
+At Supervised or ReadOnly autonomy, the generic `shell` tool clears the child
+environment before launch. It keeps
 only `PATH`, `HOME`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
 `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME`, `TZ`, `USER`, `SHELL`
 and `TMPDIR` when present. Without a parent `PATH`, it uses
@@ -53,21 +60,37 @@ are matched exactly; an arbitrary name beginning with `LC_` is not admitted.
 
 Operators can set `[runtime] shell_env_allowlist = ["PRX_BUILD_CACHE"]` to
 inherit additional variables by exact uppercase ASCII name. There is no
-wildcard or inherit-all option, and tool-call arguments cannot alter this list.
+wildcard option, and tool-call arguments cannot alter this list. Native Full
+ignores the list for admission, while still rejecting invalid entries and stripping
+the credential denylist.
 Missing variables remain absent. Adding names is classified as a high-risk
 configuration change. Restart PRX after editing the list; remove a name and
-restart to revoke its inheritance. This changes the previous full-inheritance
-behavior: explicitly list variables needed by local build tools or clients.
+restart to revoke its inheritance in restricted shells or Docker. Explicitly list
+variables needed there by local build tools or clients.
 Allowing a credential or loader/startup variable gives shell commands access
 to it, so review each addition.
 
-For Docker, the client gets the cleared host environment, while only explicitly
+At every autonomy level in Docker, the client gets the cleared host environment, while only explicitly
 listed additions are forwarded into the container. Image defaults such as
 `PATH` and `HOME` remain intact unless explicitly overridden. This policy
 applies to the generic shell tool; managed skill execution keeps its separate,
 stricter environment, and operator cron/Xin jobs keep their existing policy.
 Environment filtering does not restrict which host files native shell commands
 can read, and does not change command authorization or process lifetime.
+
+## Shell git policy and file working root
+
+Effective Full shells run ordinary git, including repository hooks. Supervised
+and ReadOnly shells refuse git before spawning; approval does not change that
+policy. `git_operations` keeps its hardened launch at every level. Skill scripts
+and cron/Xin shell jobs keep their existing git policy.
+
+`runtime.workdir` or `prx agent --workdir /absolute/task` selects the working root
+for shell, native file tools and `git_operations`; otherwise they use the workspace.
+Full native file tools bypass workspace and forbidden-path confinement, while
+still refusing `..`. Owner-private routing and memory ACLs remain enforced.
+See [working-directory configuration](configuration.md#native-tool-working-directory-and-full-autonomy)
+for validation, restart and Docker mount rules.
 
 ## Shell execution results
 

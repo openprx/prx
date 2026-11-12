@@ -9,6 +9,11 @@ pub struct RuntimeConfig {
     #[serde(default = "default_runtime_kind")]
     pub kind: String,
 
+    /// Optional absolute existing working directory for shell, native files and git.
+    /// Restart-only; does not change the security workspace or memory ACL root.
+    #[serde(default)]
+    pub workdir: Option<std::path::PathBuf>,
+
     /// Extra parent environment names inherited by the generic `shell` tool.
     /// Empty by default. Exact uppercase ASCII names only; no wildcards.
     /// This grants the shell access to their values and takes effect on restart.
@@ -160,6 +165,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
+            workdir: None,
             shell_env_allowlist: Vec::new(),
             managed_cgroup_root: None,
             docker: DockerRuntimeConfig::default(),
@@ -174,6 +180,15 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    pub fn validate_workdir(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        anyhow::ensure!(path.is_absolute(), "runtime.workdir must be absolute");
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("invalid runtime.workdir: {error}"))?;
+        anyhow::ensure!(canonical.is_dir(), "runtime.workdir must be an existing directory");
+        Ok(canonical)
+    }
+
     pub(crate) fn validate_shell_env_allowlist(names: &[String]) -> anyhow::Result<()> {
         for name in names {
             let valid_first = name.bytes().next().is_some_and(|b| b.is_ascii_uppercase() || b == b'_');
@@ -355,5 +370,54 @@ impl Default for SchedulerConfig {
             max_tasks: default_scheduler_max_tasks(),
             claim_lease_secs: default_scheduler_claim_lease_secs(),
         }
+    }
+}
+
+#[cfg(test)]
+mod workdir_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn workdir_validation_and_restart_contract() {
+        let root = tempfile::tempdir().expect("test: root");
+        let mut config = crate::config::Config::default();
+        for path in [std::path::PathBuf::from("relative"), root.path().join("missing")] {
+            config.runtime.workdir = Some(path);
+            assert!(config.validate().is_err(), "test: invalid working root rejected");
+        }
+        let file = root.path().join("file");
+        std::fs::write(&file, b"file").expect("test: file");
+        assert!(
+            RuntimeConfig::validate_workdir(&file).is_err(),
+            "test: file is not directory"
+        );
+        config.runtime.workdir = Some(root.path().into());
+        config.validate().expect("test: valid root");
+        let manager = crate::config::ConfigGenerationManager::new(crate::config::Config::default());
+        let report = manager
+            .apply_runtime_config(config, crate::config::ConfigReloadTrigger::Test)
+            .expect("test: reload");
+        assert!(
+            report.restart_required.iter().any(|field| field == "runtime"),
+            "test: workdir is restart-only"
+        );
+        assert!(
+            manager.pin().effective.runtime.workdir.is_none(),
+            "test: running root stays pinned"
+        );
+    }
+
+    #[test]
+    fn docker_workdir_must_pass_mount_allowlist_at_startup() {
+        let root = tempfile::tempdir().expect("test: root");
+        let allowed = tempfile::tempdir().expect("test: allowed root");
+        let mut config = crate::config::Config::default();
+        config.runtime.kind = "docker".into();
+        config.runtime.workdir = Some(root.path().into());
+        config.runtime.docker.allowed_workspace_roots = vec![allowed.path().to_string_lossy().into_owned()];
+        assert!(config.validate().is_err(), "test: docker root refused before execution");
+        config.runtime.workdir = Some(allowed.path().into());
+        config.validate().expect("test: allowed docker root");
     }
 }

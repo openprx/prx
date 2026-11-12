@@ -596,7 +596,8 @@
         "managed_cgroup_root": null,
         "max_blocking_threads": null,
         "reasoning_enabled": null,
-        "shell_env_allowlist": []
+        "shell_env_allowlist": [],
+        "workdir": null
       }
     },
     "scheduler": {
@@ -5308,6 +5309,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "workdir": {
+          "description": "Optional absolute existing working directory for shell, native files and git.\nRestart-only; does not change the security workspace or memory ACL root.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       }
     },

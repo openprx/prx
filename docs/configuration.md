@@ -3444,3 +3444,27 @@ observe_queue = 64           # 1–1024; overflow drops and counts
 An explicit empty backend table selects defaults. Existing causal admission,
 approvals and remote-processing restrictions continue to apply. Roll back by
 setting `enabled = false` and restarting; retained telemetry stays in the workspace.
+
+### Native tool working directory and Full autonomy
+
+`runtime.workdir` optionally selects an absolute, existing directory for the shell,
+native file tools and `git_operations`. `prx agent --workdir /absolute/task` overrides
+it before agent startup; invalid CLI paths fail with exit 2, invalid configuration
+paths with exit 1. The CLI canonicalizes the directory. The default remains the
+workspace directory. Changes require restart and setting or changing the directory
+is classified as a privilege widening. Remove the key to restore the default.
+The security workspace, memory ACL and audit/experiment roots do not move.
+Docker also requires the directory to satisfy `runtime.docker.allowed_workspace_roots`.
+
+At effective Full autonomy the shell runs ordinary git (including repository hooks)
+and inherits the parent environment except known provider credentials, worker secrets,
+`MINIMAX_OAUTH_*` and `OPENPRX_*`. This environment hygiene is not a security boundary:
+a Full shell can read local configuration. Native file tools may access paths outside
+the workspace and forbidden paths; parent traversal (`..`) remains refused. Private
+owner filesystems and memory ACL checks retain their own rules. Supervised and ReadOnly
+keep their existing restrictions; an approval does not enable git in a Supervised shell.
+A child's effective level cannot exceed its manifest or the current service level.
+Direct tool calls without runtime authority keep the Supervised behavior.
+Docker continues to use the shell environment allowlist at every level. Native Full
+ignores that allowlist for admission, but invalid entries are still rejected.
+`git_operations`, skill scripts and scheduled shell jobs retain their existing git policy.

@@ -1160,6 +1160,7 @@ pub enum ToolExecutionDecision {
 
 /// Pure side-effect policy port.
 pub trait EffectPolicy: Send + Sync {
+    fn autonomy_level(&self) -> crate::security::AutonomyLevel;
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision;
 }
 
@@ -1176,6 +1177,9 @@ impl SecurityEffectPolicy {
 }
 
 impl EffectPolicy for SecurityEffectPolicy {
+    fn autonomy_level(&self) -> crate::security::AutonomyLevel {
+        self.policy.autonomy
+    }
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision {
         let policy_name = if descriptor.adapter == ToolAdapterKind::Skill {
             &descriptor.backend_name
@@ -2785,6 +2789,10 @@ impl ToolExecutionService {
             }
         };
 
+        let service_level = self.policy.autonomy_level();
+        let effective_level = context.child_scope.as_ref().map_or(service_level, |scope| {
+            service_level.min(scope.gate_inputs().0.authority.level)
+        });
         let decision = admission::child_autonomy(&context, &descriptor, self.policy.decide(&descriptor, &context));
         // A call the tool itself only accepts with a signed one-shot grant
         // needs a human approval at every autonomy level, also where policy
@@ -3359,7 +3367,10 @@ impl ToolExecutionService {
                                             backend_h2_invocation.map(|invocation| {
                                                 (invocation, backend_cancellation.clone().unwrap_or_default())
                                             }),
-                                            backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                            super::effective_autonomy::scope(
+                                                effective_level,
+                                                backend.invoke_observed(public_name, arguments, backend_cancellation),
+                                            ),
                                         ),
                                     ),
                                 )

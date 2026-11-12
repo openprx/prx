@@ -317,6 +317,9 @@ struct FixedPolicy {
 }
 
 impl EffectPolicy for FixedPolicy {
+    fn autonomy_level(&self) -> crate::security::AutonomyLevel {
+        crate::security::AutonomyLevel::Supervised
+    }
     fn decide(&self, _descriptor: &ToolDescriptor, _context: &ToolExecutionContext) -> ToolExecutionDecision {
         self.stages.lock().push("policy");
         self.decision
