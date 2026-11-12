@@ -7,18 +7,27 @@ fixed HTTPS upstream. Standard library only. Nothing here logs or returns
 headers, bodies or credentials, and the real key is scrubbed from everything
 sent back.
 
-Exposure: the listener is reachable by anything that can reach its bind
-address. The adapter cannot learn the container network's addresses (Harbor's
-compose file creates the network), so by default the token is the only gate.
-`allowed_peers` adds a source-address filter once the operator knows the
-address container traffic arrives from.
+Operator notes (also printed by `run_tb2.sh --help`):
+- The listener is reachable by anything that can reach its bind address (by
+  default the host's primary IPv4 address, so the LAN). The adapter cannot
+  learn the container network's addresses (Harbor's compose file creates the
+  network), so by default the token is the only gate. A client without the
+  token gets nothing forwarded, but it can hold the 16 connection slots for
+  up to 120 seconds each and so delay or fail a trial.
+- Run the benchmark host on an isolated network, or pass `--proxy-peers` with
+  the source network container traffic arrives from; other peers are then
+  dropped at accept, before a slot is taken.
+- The upstream host is resolved once when the proxy starts; a trial uses those
+  addresses until it ends.
 """
+import errno
 import hmac
 import http.client
 import http.server
 import ipaddress
 import logging
 import secrets
+import select
 import socket
 import ssl
 import threading
@@ -27,11 +36,14 @@ from urllib.parse import urlsplit
 
 MAX_BODY = 32 * 1024 * 1024
 MAX_INFLIGHT = 16
+MAX_ADDRESSES = 8
 CLIENT_TIMEOUT = 60      # inactivity, client socket
-CONNECT_TIMEOUT = 10     # upstream connect and TLS handshake
+CONNECT_TIMEOUT = 10     # upstream TCP connect plus TLS handshake, per address
 UPSTREAM_TIMEOUT = 600   # inactivity, upstream socket
 READ_DEADLINE = 120      # absolute: request head and body fully received
 REQUEST_DEADLINE = 1800  # absolute: whole exchange, upstream response included
+STOP_JOIN = 5            # stop(): every blocking call is cut or polls within POLL
+POLL = 0.05
 CHUNK = 65536
 CONTAINER_HOST = "host.containers.internal"
 MARK = b"[redacted]"
@@ -68,6 +80,15 @@ def primary_ipv4():
     return address
 
 
+def resolve(host, port):
+    """Resolve the upstream once; the standard library cannot bound or cancel a DNS lookup."""
+    addresses = []
+    for family, _, _, _, address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        if (family, address) not in addresses and len(addresses) < MAX_ADDRESSES:
+            addresses.append((family, address))
+    return addresses
+
+
 def holds_key(data, key):
     """True when data contains the key or its 8-byte prefix."""
     raw = key.encode()
@@ -78,73 +99,88 @@ def _printable(value):
     return all(0x21 <= ord(char) <= 0x7e for char in value)
 
 
-class _Stopped(OSError):
-    """The proxy was stopped while this exchange was in flight."""
+class _Cancelled(OSError):
+    """The exchange was cancelled: proxy stopped, deadline passed, or cut."""
 
 
 class Scrubber:
-    """Replace the key, and any run of 8 or more of its leading bytes, in a byte stream.
+    """Streaming `data.replace(key, MARK)` that never lets the key out in pieces.
 
-    A tail that could be the start of the key is held back until the next
-    chunk decides, so a key split across chunks never leaves in pieces. Only
-    such a tail is delayed (at most key length minus one bytes).
+    feed() replaces every complete occurrence (leftmost first, exactly as
+    bytes.replace does on the whole stream) and emits every byte that can no
+    longer be part of an occurrence. The only bytes held back are the longest
+    tail of the stream that is a proper prefix of the key, at most key length
+    minus one, because an occurrence can only continue from such a tail.
+
+    flush() ends the stream. Whatever is still held is a proper prefix of the
+    key (the stream stopped where the key could have been in progress), and it
+    is replaced by the marker rather than emitted. The cost of that rule: a
+    stream whose last bytes happen to equal the first bytes of the key ends in
+    the marker instead.
     """
 
     def __init__(self, key):
+        if not key:
+            raise ValueError("empty key")
         self.key = key
-        self.short = key[:8]
         self.held = b""
-
-    def _runs(self, data):
-        out = bytearray()
-        start = 0
-        while True:
-            found = data.find(self.short, start)
-            if found < 0:
-                out += data[start:]
-                return bytes(out)
-            size = len(self.short)
-            while found + size < len(data) and size < len(self.key) and data[found + size] == self.key[size]:
-                size += 1
-            out += data[start:found]
-            out += MARK
-            start = found + size
 
     def feed(self, data):
         buffer = self.held + data
+        key = self.key
+        out = bytearray()
+        start = 0
+        while True:
+            found = buffer.find(key, start)
+            if found < 0:
+                break
+            out += buffer[start:found]
+            out += MARK
+            start = found + len(key)
+        rest = buffer[start:]
         keep = 0
-        limit = min(len(buffer), len(self.key) - 1)
-        if limit and self.key[:1] in buffer[-limit:]:
+        limit = min(len(rest), len(key) - 1)
+        if limit and key[:1] in rest[-limit:]:
             for size in range(limit, 0, -1):
-                if buffer.endswith(self.key[:size]):
+                if rest.endswith(key[:size]):
                     keep = size
                     break
-        self.held = buffer[len(buffer) - keep:]
-        return self._runs(buffer[:len(buffer) - keep])
+        out += rest[:len(rest) - keep]
+        self.held = rest[len(rest) - keep:]
+        return bytes(out)
 
     def flush(self):
-        out, self.held = self._runs(self.held), b""
+        out, self.held = (MARK if self.held else b""), b""
         return out
 
 
 class _Exchange:
-    """One accepted client connection and, later, its upstream connection."""
+    """One accepted client connection and, later, its upstream socket.
 
-    def __init__(self, client, deadline):
+    Both deadlines are absolute, set once at admission and never replaced.
+    Cancellation is terminal.
+    """
+
+    def __init__(self, client, read_by, deadline):
         self.client = client
-        self.started = time.monotonic()
-        self.deadline = deadline
-        self.upstream = None       # http.client connection, registered before connect()
-        self.upstream_sock = None  # kept separately: http.client detaches it on Connection: close
+        self.read_by = read_by      # request head and body fully received
+        self.deadline = deadline    # whole exchange
+        self.body_done = False
+        self.cancelled = False
+        self.upstream_sock = None   # registered before connect(); TLS replaces it before the handshake
         self.thread = None
 
-    def cut(self):
-        for sock in (self.client, self.upstream_sock):
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+    def expired(self, now):
+        return now >= self.deadline or (not self.body_done and now >= self.read_by)
+
+
+def _shut(sock):
+    if sock is not None:
+        try:
+            # The plain method: SSLSocket.shutdown would first try a TLS unwrap.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -167,14 +203,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.sent = 0
         try:
             if self.exchange is None:
-                raise _Stopped()
-            self._relay(proxy)
-        except (OSError, http.client.HTTPException, ValueError):
+                raise _Cancelled()
+            self._relay(proxy, self.exchange)
+        except (OSError, http.client.HTTPException, ValueError) as error:
             # Exception text may quote header values; report a bare status only.
             # After the head went out the only honest signal is a cut connection.
             if not self.head_sent:
                 try:
-                    self._head(503 if proxy.stopped.is_set() else 502)
+                    self._head(503 if isinstance(error, _Cancelled) else 502)
                 except OSError:
                     self.status = self.status or 502
         finally:
@@ -194,12 +230,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
         self.wfile.flush()
 
-    def _relay(self, proxy):
+    def _raw_target(self):
+        """The request target exactly as sent; http.server rewrites `self.path`."""
+        words = self.raw_requestline.split(b" ")
+        return words[1] if len(words) == 3 else None
+
+    def _relay(self, proxy, exchange):
+        proxy.check(exchange)
         if not proxy.authorized(self.headers.get("Authorization")):
             return self._head(401)
-        if proxy.stopped.is_set():
-            return self._head(503)
-        if not proxy.call_allowed(self.command, self.path):
+        path = proxy.allowed_path(self.command, self._raw_target())
+        if path is None:
             return self._head(403)
         if self.headers.get("Transfer-Encoding") is not None:
             return self._head(411)
@@ -211,25 +252,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         length = int(declared)
         if length > proxy.max_body:
             return self._head(413)
+        proxy.check(exchange)
         body = self.rfile.read(length) if length else b""
         self.received = len(body)
         if len(body) != length:
             return self._head(400)
-        # The request is in: from here the whole-exchange deadline applies.
-        self.exchange.deadline = self.exchange.started + proxy.request_deadline
-        connection = proxy.connect(self.exchange)
-        connection.putrequest(self.command, self.path, skip_accept_encoding=True)
-        for name in REQUEST_HEADERS:
-            value = self.headers.get(name)
-            if value is not None:
-                connection.putheader(name, value)
-        connection.putheader("Accept-Encoding", "identity")
-        connection.putheader("Authorization", "Bearer " + proxy.key)
-        connection.putheader("Content-Length", str(length))
-        connection.endheaders(body or None)
-        self._respond(proxy, connection.getresponse())
+        # A body that was already buffered when the exchange expired or was
+        # cut still arrives here; it must not start an upstream request.
+        proxy.check(exchange)
+        exchange.body_done = True
+        connection = proxy.connect(exchange)
+        try:
+            connection.putrequest(self.command, path, skip_accept_encoding=True)
+            for name in REQUEST_HEADERS:
+                value = self.headers.get(name)
+                if value is not None:
+                    connection.putheader(name, value)
+            connection.putheader("Accept-Encoding", "identity")
+            connection.putheader("Authorization", "Bearer " + proxy.key)
+            connection.putheader("Content-Length", str(length))
+            connection.endheaders(body or None)
+            response = connection.getresponse()
+            try:
+                self._respond(proxy, exchange, response)
+            finally:
+                response.close()
+        finally:
+            connection.close()
 
-    def _respond(self, proxy, response):
+    def _respond(self, proxy, exchange, response):
         encoding = response.getheader("Content-Encoding")
         if encoding is not None and encoding.strip().lower() != "identity":
             raise ValueError("encoded upstream body cannot be scrubbed")
@@ -238,9 +289,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             value = response.getheader(name)
             if value is None:
                 continue
-            value = proxy.redact(value.encode("latin-1", "replace")).decode("latin-1")
+            value = proxy.scrub_value(value)
             if "\r" not in value and "\n" not in value:
                 headers.append((name.title(), value))
+        proxy.check(exchange)
         if response.status in (204, 304):
             return self._head(response.status, headers, "Upstream")
         headers.append(("Transfer-Encoding", "chunked"))
@@ -250,8 +302,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         scrubber = Scrubber(proxy.key.encode())
         while True:
             data = response.read1(CHUNK)
-            if proxy.stopped.is_set():
-                raise _Stopped()
+            proxy.check(exchange)
+            if not data and response.length:
+                # Upstream closed before its Content-Length was delivered: cut
+                # the client too, so it sees a transport failure, not a reply.
+                raise ValueError("short upstream body")
             out = scrubber.feed(data) if data else scrubber.flush()
             if out:
                 self.wfile.write(b"%x\r\n%b\r\n" % (len(out), out))
@@ -310,8 +365,8 @@ class KeyProxy:
         if not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
             raise ValueError("proxy upstream must be a plain base URL")
         prefix = parts.path.rstrip("/")
-        if (not prefix.startswith("/") or not _printable(prefix) or "\\" in prefix or "%" in prefix
-                or any(segment in (".", "..") for segment in prefix.split("/"))):
+        if (not prefix.startswith("/") or prefix.startswith("//") or not _printable(prefix) or "\\" in prefix
+                or "%" in prefix or any(segment in (".", "..") for segment in prefix.split("/"))):
             raise ValueError("proxy upstream needs a plain, non-empty API path prefix")
         if not key or not _printable(key):
             # Never echo the value: http.client would quote it in its own error.
@@ -321,6 +376,9 @@ class KeyProxy:
             self.peers = [ipaddress.ip_network(peer.strip(), strict=False) for peer in allowed_peers]
         self.scheme, self.host, self.prefix = parts.scheme, parts.hostname, prefix
         self.port = parts.port or (443 if parts.scheme == "https" else 80)
+        # Resolved here, once, on the caller's thread, so no handler ever
+        # waits in a DNS lookup that stop() could not interrupt.
+        self.addresses = resolve(self.host, self.port)
         self.key = key
         self.token = secrets.token_urlsafe(32)
         self.max_body = max_body
@@ -334,7 +392,7 @@ class KeyProxy:
         self._exchanges = {}
         self._server = _Server((bind, port), _Handler)
         self._server.proxy = self
-        self._thread = threading.Thread(target=self._server.serve_forever, args=(0.05,), daemon=True)
+        self._thread = threading.Thread(target=self._server.serve_forever, args=(POLL,), daemon=True)
         self._started = False
 
     @property
@@ -357,10 +415,12 @@ class KeyProxy:
                 return None
             if not any(peer in network for network in self.peers):
                 return None
+        now = time.monotonic()
         with self._lock:
             if self.stopped.is_set() or len(self._exchanges) >= self.max_inflight:
                 return None
-            exchange = _Exchange(request, time.monotonic() + self.read_deadline)
+            exchange = _Exchange(request, now + min(self.read_deadline, self.request_deadline),
+                                 now + self.request_deadline)
             self._exchanges[id(request)] = exchange
             return exchange
 
@@ -368,34 +428,58 @@ class KeyProxy:
         with self._lock:
             return self._exchanges.get(id(request))
 
+    def cancel(self, exchange):
+        """Terminal: flag the exchange and shut both of its sockets."""
+        with self._lock:
+            exchange.cancelled = True
+            sockets = (exchange.client, exchange.upstream_sock)
+        for sock in sockets:
+            _shut(sock)
+
+    def check(self, exchange):
+        """Raise unless the exchange may still read, connect or forward."""
+        if exchange.cancelled or self.stopped.is_set():
+            raise _Cancelled()
+        if exchange.expired(time.monotonic()):
+            self.cancel(exchange)
+            raise _Cancelled()
+
+    def _register(self, exchange, sock):
+        """Make `sock` the exchange's tracked upstream socket, or refuse it."""
+        with self._lock:
+            if not (exchange.cancelled or self.stopped.is_set() or exchange.expired(time.monotonic())):
+                exchange.upstream_sock = sock
+                return
+        raise _Cancelled()
+
     def release(self, exchange):
         with self._lock:
             self._exchanges.pop(id(exchange.client), None)
-            connection, exchange.upstream = exchange.upstream, None
-        if connection is not None:
-            connection.close()
-        if exchange.upstream_sock is not None:
+            sock, exchange.upstream_sock = exchange.upstream_sock, None
+        if sock is not None:
             try:
-                exchange.upstream_sock.close()
+                sock.close()
             except OSError:
                 pass
 
     def reap(self):
-        """Cut every exchange past its absolute deadline; called from the accept loop."""
+        """Cancel every exchange past a deadline; called from the accept loop."""
         now = time.monotonic()
         with self._lock:
-            late = [exchange for exchange in self._exchanges.values() if now >= exchange.deadline]
+            late = [exchange for exchange in self._exchanges.values()
+                    if not exchange.cancelled and exchange.expired(now)]
         for exchange in late:
-            exchange.cut()
+            self.cancel(exchange)
 
-    def stop(self, join_timeout=CONNECT_TIMEOUT + 2):
-        """Stop serving and cut every exchange; the token is dead afterwards.
+    def stop(self, join_timeout=STOP_JOIN):
+        """Stop serving, cancel every exchange and wait for its handler.
 
-        Returns True when no handler thread is left. After this call no
-        handler can open an upstream connection or send on an existing one:
-        new connections are refused under the same lock that sets the flag,
-        every registered socket is shut down, and a connection still inside
-        connect() is closed by its own thread before it sends anything.
+        Returns True when no handler thread is left; the caller must treat
+        False as a failed trial. After the flag is set no handler can register
+        an upstream socket; every registered socket, including one inside a
+        TCP connect or TLS handshake, is shut down here, and those two steps
+        also poll the flag every POLL seconds, so each handler ends well
+        within `join_timeout`. The token is dead afterwards.
         """
         with self._lock:
             already = self.stopped.is_set()
@@ -406,7 +490,7 @@ class KeyProxy:
                 self._server.shutdown()
             self._server.server_close()
         for exchange in exchanges:
-            exchange.cut()
+            self.cancel(exchange)
         deadline = time.monotonic() + join_timeout
         threads = [exchange.thread for exchange in exchanges if exchange.thread is not None]
         if self._started:
@@ -421,40 +505,93 @@ class KeyProxy:
             return False
         return hmac.compare_digest(header[7:].strip().encode("latin-1", "replace"), self.token.encode())
 
-    def call_allowed(self, method, target):
-        """Exact (method, path) pairs only: no query, no other path, and the host is never taken from the request."""
-        return any(method == allowed and target == self.prefix + suffix for allowed, suffix in ALLOWED)
+    def allowed_path(self, method, raw_target):
+        """The upstream path for an allowlisted call, else None.
+
+        `raw_target` is the request target as bytes from the request line. It
+        must be byte-identical to `<prefix><path>`: no query, no extra slash,
+        no absolute form. The upstream host is never taken from the request.
+        """
+        for allowed, suffix in ALLOWED:
+            path = self.prefix + suffix
+            if method == allowed and raw_target == path.encode():
+                return path
+        return None
+
+    def _until(self, exchange, sock, end, step):
+        """Run one non-blocking step to completion, polling for cancellation."""
+        while True:
+            self.check(exchange)
+            if time.monotonic() >= end:
+                raise TimeoutError("upstream connect timed out")
+            wait = step()
+            if wait is None:
+                return
+            select.select(*(([sock], [], []) if wait == "read" else ([], [sock], [])), POLL)
 
     def connect(self, exchange):
-        """Open the upstream connection for one exchange, never after stop()."""
-        if self.scheme == "https":
-            connection = http.client.HTTPSConnection(self.host, self.port, timeout=CONNECT_TIMEOUT, context=self.tls)
-        else:
-            connection = http.client.HTTPConnection(self.host, self.port, timeout=CONNECT_TIMEOUT)
-        with self._lock:
-            if self.stopped.is_set():
-                raise _Stopped()
-            exchange.upstream = connection
-        try:
-            connection.connect()
-        except BaseException:
-            with self._lock:
-                exchange.upstream = None
-            connection.close()
-            raise
-        with self._lock:
-            exchange.upstream_sock = connection.sock
-            stopped = self.stopped.is_set()
-        if stopped:
-            # stop() ran while connect() was in flight and could not see this socket.
-            exchange.cut()
-            raise _Stopped()
-        connection.sock.settimeout(self.upstream_timeout)
-        return connection
+        """Open the upstream connection for one exchange.
 
-    def redact(self, data):
-        scrubber = Scrubber(self.key.encode())
-        return scrubber.feed(data) + scrubber.flush()
+        The socket is registered with the exchange before the TCP connect
+        starts and again when TLS takes it over, and both steps are
+        non-blocking, so stop() and expiry abort them at once.
+        """
+        failure = OSError("upstream has no address")
+        for family, address in self.addresses:
+            self.check(exchange)
+            end = time.monotonic() + CONNECT_TIMEOUT
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                sock.setblocking(False)
+                self._register(exchange, sock)
+                code = sock.connect_ex(address)
+                if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+                    raise OSError(code, "upstream connect failed")
+
+                def connected(sock=sock):
+                    if not select.select([], [sock], [], 0)[1]:
+                        return "write"
+                    code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    if code:
+                        raise OSError(code, "upstream connect failed")
+                    return None
+
+                self._until(exchange, sock, end, connected)
+                if self.tls is not None:
+                    sock = self.tls.wrap_socket(sock, server_hostname=self.host, do_handshake_on_connect=False)
+                    self._register(exchange, sock)
+
+                    def shaken(sock=sock):
+                        try:
+                            sock.do_handshake()
+                        except ssl.SSLWantReadError:
+                            return "read"
+                        except ssl.SSLWantWriteError:
+                            return "write"
+                        return None
+
+                    self._until(exchange, sock, end, shaken)
+                sock.settimeout(self.upstream_timeout)
+                self.check(exchange)
+            except _Cancelled:
+                sock.close()
+                raise
+            except (OSError, ValueError) as error:
+                with self._lock:
+                    exchange.upstream_sock = None
+                sock.close()
+                failure = error
+                continue
+            kind = http.client.HTTPSConnection if self.tls is not None else http.client.HTTPConnection
+            options = {"context": self.tls} if self.tls is not None else {}
+            connection = kind(self.host, self.port, **options)
+            connection.sock = sock  # already connected: http.client never opens its own
+            return connection
+        raise failure
+
+    def scrub_value(self, value):
+        """A header value is a complete string: plain replacement."""
+        return value.replace(self.key, MARK.decode())
 
     def log(self, method, target, status, received, sent):
         # Method, path, status and byte counts only: no query, headers or bodies.
