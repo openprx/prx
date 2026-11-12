@@ -331,7 +331,7 @@ pub(crate) mod tests {
             CapabilityTarget::NativeTool,
             CandidateSpec {
                 namespace: None,
-                required_capabilities: vec![reference.clone()],
+                required_capabilities: vec![reference],
                 side_effect: SideEffectClass::LocalWrite,
                 approval: ApprovalRequirement::Required {
                     op_ids: vec![op_id.clone()],
@@ -397,7 +397,7 @@ pub(crate) mod tests {
             selection: Selection::RequestApproval {
                 terminal_id,
                 pending_candidate_id: pending_id.clone(),
-                op_ids: vec![op_id.clone()],
+                op_ids: vec![op_id],
                 reason_code: "approval_only",
             },
             exploration_propensities: BTreeMap::new(),
