@@ -124,8 +124,8 @@ pub struct ConfigGeneration {
 #[error("worker working root differs from signed parent configuration")]
 pub(crate) struct ProcessWorkingRootMismatch;
 
-/// Metadata and keyed effective-snapshot digest carried to a child process.
-/// Configuration and credential values are never included in this transport.
+/// Metadata, a working root override and a keyed effective snapshot digest.
+/// Credential values and other configuration overrides are not transported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessGenerationBinding {
