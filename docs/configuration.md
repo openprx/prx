@@ -25,6 +25,8 @@ For decision admission, backend gates, inspection and rollback, see the
 When `[decision_engine] enabled = false`, `prx causal status` reports
 `engine_disabled` for a configured backend excluded by that switch. The separate
 `key_available` field still reports the workspace key's actual availability.
+Engine-on `clarify` selections return a typed refusal naming `clarify`, with no
+serving-provider request or tool execution.
 
 The embedded [model catalog](model-catalog.md) owns declared request parameter
 defaults and model levels. The existing Codex reasoning override remains an

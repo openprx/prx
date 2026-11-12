@@ -53,6 +53,8 @@ pub(crate) struct DirectiveContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum DirectiveError {
+    #[error("decision selection {kind} is not executable")]
+    NonExecutableSelection { kind: &'static str },
     #[error("selected candidate is absent or did not pass the final gate")]
     NotAdmitted,
     #[error("selected action cannot be converted to a directive")]

@@ -457,29 +457,43 @@ async fn a_wall_stall_past_the_latency_budget_still_answers() {
 }
 
 #[tokio::test]
-async fn advancing_the_logical_latency_budget_keeps_advice_advisory() {
+async fn advancing_the_logical_latency_budget_refuses_clarify_without_provider_or_tools() {
     let world = World::new().await;
     let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
-    let reply = world
+    let remaining =
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: initial budget");
+    let error = world
         .run_plain_after_logical_budget(&config)
         .await
-        .expect("test: advisory Clarify must complete under the execution owner");
-    assert_eq!(
-        reply, "plain answer",
-        "test: advisory Clarify cannot restore the deleted fixed-close path"
+        .expect_err("test: engine Clarify is a typed refusal under R177-6 rev 2");
+    assert!(
+        matches!(
+            error.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
+            Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind: "clarify" })
+        ),
+        "test: refusal must preserve the clarify selection kind: {error:#}"
     );
     assert_eq!(
         world.loopback.requests(),
-        1,
-        "test: the execution owner completes exactly one provider turn"
+        0,
+        "test: Clarify refuses before any serving-provider dispatch"
     );
-    assert!(
-        world
-            .loopback
-            .bodies
-            .lock()
-            .iter()
-            .all(|body| !body.contains("tool_result")),
-        "test: a plain advisory turn must execute no tool the advice did not allow"
+    assert_eq!(
+        crate::cost::tracker::settle_metered_call_count(&world.ws),
+        0,
+        "test: no physical call can be settled for a refused selection"
     );
+    assert_eq!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: refused budget"),
+        remaining,
+        "test: Clarify preserves the same unspent serving budget as Abstain"
+    );
+    let decisions = rusqlite::Connection::open_with_flags(
+        world.ws.join("self/causal_tree/decisions.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: actual decision ledger");
+    let (rows, executed): (i64, i64) = decisions.query_row("SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(tool_calls_json, '[]') IN ('[]', 'null') THEN 0 ELSE 1 END), 0) FROM outcomes", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("test: actual terminal accounting");
+    assert!(rows > 0, "test: refused turn must retain its terminal accounting row");
+    assert_eq!(executed, 0, "test: no tool execution may appear in the refused outcome");
 }

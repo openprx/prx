@@ -50,12 +50,55 @@ fn config_dir(temp: &TempDir, overrides: &[(&[&str], toml::Value)]) -> PathBuf {
     dir
 }
 
+const MAX_CLI_OUTPUT_BYTES: usize = 1_048_576;
+
+fn bounded_cli_output(command: Command) -> Output {
+    use tokio::io::AsyncReadExt as _;
+    async fn read_output(stream: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stream
+            .take((MAX_CLI_OUTPUT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_CLI_OUTPUT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "CLI output exceeded its test bound",
+            ));
+        }
+        Ok(bytes)
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test: bounded CLI runtime")
+        .block_on(async {
+            let mut child = tokio::process::Command::from(command)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("test: owned CLI child");
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                let stdout = child.stdout.take().expect("test: owned stdout pipe");
+                let stderr = child.stderr.take().expect("test: owned stderr pipe");
+                let (stdout, stderr, status) = tokio::try_join!(read_output(stdout), read_output(stderr), child.wait())
+                    .expect("test: bounded CLI process and output");
+                Output { status, stdout, stderr }
+            })
+            .await
+            .expect("test: CLI must finish within its deadline")
+        })
+}
+
 fn causal(dir: &Path, args: &[&str]) -> Output {
     // HOME and the XDG directories point into the test's own directory
     // (D-091 F-15): nothing of the developer's home is read or written.
     let home = dir.parent().unwrap_or(dir).join("home");
     std::fs::create_dir_all(&home).expect("test: home");
-    Command::new(env!("CARGO_BIN_EXE_prx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
         .arg("--config-dir")
         .arg(dir)
         .arg("causal")
@@ -67,9 +110,8 @@ fn causal(dir: &Path, args: &[&str]) -> Output {
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("RUST_LOG", "info")
-        .output()
-        .expect("test: run prx")
+        .env("RUST_LOG", "info");
+    bounded_cli_output(command)
 }
 
 /// Every file under `dir`, with its bytes.
@@ -633,7 +675,8 @@ fn live_tests_and_credentials_wait_for_confirmation() {
 fn prx(root: &Path, args: &[&str]) -> Output {
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("test: home");
-    Command::new(env!("CARGO_BIN_EXE_prx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
         .args(args)
         .env_remove("OPENPRX_CONFIG_DIR")
         .env_remove("OPENPRX_WORKSPACE")
@@ -641,9 +684,8 @@ fn prx(root: &Path, args: &[&str]) -> Output {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .output()
-        .expect("test: run prx")
+        .env("XDG_STATE_HOME", home.join(".local/state"));
+    bounded_cli_output(command)
 }
 
 /// CDP-14: `prx init` with a loopback decision backend writes a

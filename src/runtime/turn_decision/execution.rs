@@ -905,11 +905,18 @@ impl TurnDecisionService {
             crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
             crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
 
-            _ => {
-                if let Some(reply) = context.refusal_reply() {
-                    anyhow::bail!("{reply}");
+            crate::causal_tree::decision_select::Selection::Abstain { action, .. } => {
+                let error = anyhow::Error::new(super::DirectiveError::NonExecutableSelection { kind: action.as_str() });
+                return Err(match context.refusal_reply() {
+                    Some(reply) => error.context(reply.into_owned()),
+                    None => error,
+                });
+            }
+            crate::causal_tree::decision_select::Selection::RequestApproval { .. } => {
+                return Err(super::DirectiveError::NonExecutableSelection {
+                    kind: "request_approval",
                 }
-                anyhow::bail!("decision has no executable selection");
+                .into());
             }
         };
         let candidates = match &context.engine.candidates {
@@ -1001,7 +1008,12 @@ impl TurnDecisionService {
                 );
                 selected_references
             }
-            _ => anyhow::bail!("terminal or intermediate directive cannot enter the tool loop"),
+            _ => {
+                return Err(super::DirectiveError::NonExecutableSelection {
+                    kind: selected.action().as_str(),
+                }
+                .into());
+            }
         };
         anyhow::ensure!(
             HardGates::check_one(&context.engine.state, &catalog, selected, &gates) == GateOutcome::Passed,

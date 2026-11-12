@@ -484,12 +484,21 @@ async fn cli_readonly_shell_request_is_refused_by_policy_before_the_model() {
         None,
     )
     .await
-    .expect_err("test: a refused CLI turn is Err(AgentTurnRefused)");
-    let reply = &err
-        .downcast_ref::<crate::agent::AgentTurnRefused>()
-        .expect("test: a refused turn still returns its terminal text")
-        .reply;
-    assert!(!reply.contains(crate::providers::credential_probe::PROBE_REPLY));
+    .expect_err("test: an engine refusal prevents the CLI provider turn");
+    assert!(
+        matches!(
+            err.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
+            Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection {
+                kind: "refuse" | "clarify"
+            })
+        ),
+        "test: refused selection preserves its typed kind: {err:#}"
+    );
+    assert!(
+        !err.to_string()
+            .contains(crate::providers::credential_probe::PROBE_REPLY),
+        "test: a refused selection cannot fabricate a provider reply"
+    );
     assert!(!cli_agent_probe_saw_a_chat_request(&probe), "refused before the model");
     assert!(!config.workspace_dir.join("f112-readonly-ran.txt").exists());
 }

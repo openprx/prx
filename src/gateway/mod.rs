@@ -2702,7 +2702,7 @@ async fn run_gateway_chat_with_multimodal(
         admission_acknowledgement,
     )?;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
-        .run(Box::pin(async {
+        .run(async {
             let mem_context = crate::agent::context_recall::scoped_recall(
                 state.mem.as_ref(),
                 &crate::agent::context_recall::RecallScope::from_envelope(
@@ -2838,7 +2838,6 @@ async fn run_gateway_chat_with_multimodal(
             // boundary a child must therefore inherit is exactly `always_exclude` — the
             // gateway's own tool set minus what the operator hid from it — so a spawn can
             // never be a way to get back a tool the gateway itself may not call.
-            let advice = service.analyze_advisory(&context, &cancellation).await;
             let loop_result = within_gateway_turn_spawn_context(
                 runtime_envelope
                     .run_id
@@ -2850,7 +2849,7 @@ async fn run_gateway_chat_with_multimodal(
                     run_turn(
                         &mut history,
                         crate::agent::turn_request::TurnRequest {
-                            advice,
+                            advice: service.analyze_advisory(&context, &cancellation).await,
                             // no approval manager
                             channel_name: "webhook",
                             // no streaming delta sender
@@ -3037,7 +3036,7 @@ async fn run_gateway_chat_with_multimodal(
                 response,
                 replay_unavailable,
             })
-        }))
+        })
         .await;
     if let Err(error) = &turn_result {
         terminal_guard

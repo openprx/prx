@@ -633,7 +633,10 @@ async fn configured_small_native_schema_fixture() {
                     assert_eq!(calls.load(Ordering::SeqCst), 0, "excluded tool admits no provider work");
                     let error = result.expect_err("the low-level engine must reject a closed admission");
                     assert!(
-                        error.to_string().contains("decision has no executable selection"),
+                        matches!(
+                            error.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
+                            Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection { .. })
+                        ),
                         "{error:#}"
                     );
                     return Ok(());

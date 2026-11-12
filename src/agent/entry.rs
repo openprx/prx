@@ -2112,7 +2112,7 @@ pub(crate) async fn run_with_runtime_envelope(
                 let turn_result = crate::tools::execution::with_scheduled_job_tool_scope(
                     scheduled_tool_scope,
                     crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(turn_spawn_ctx, async {
-                        run_turn(
+                        Box::pin(run_turn(
                             &mut history,
                             crate::agent::turn_request::TurnRequest {
                                 advice: advice.clone(),
@@ -2152,7 +2152,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 on_delta: None,
                                 on_tool_call: None,
                             },
-                        )
+                        ))
                         .await
                         .map(|(outcome, trace)| (outcome.into_text(), trace))
                     }),
