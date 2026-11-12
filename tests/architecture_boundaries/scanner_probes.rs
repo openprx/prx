@@ -301,6 +301,12 @@ planted_violation_probes! {
     probe_panic_restriction_conditional: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
         "#[cfg_attr(unix, allow(clippy::restriction))] fn a() {}\n";
+    probe_panic_option_turbofish: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn p(v: Option<u8>) { let _ = Option::<u8>::unwrap(v); }\n";
+    probe_panic_qualified_path: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn p(v: Option<u8>) { let _ = <Option<u8>>::unwrap(v); }\n";
     probe_panic_option_unwrap_call: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
         "fn p(v: Option<u8>) { let _ = Option::unwrap(v); }\n";
@@ -1023,4 +1029,18 @@ fn panic_ratchet_rejects_new_production_and_test_files() {
             "a new catch_unwind file must fail even when it is test-only"
         );
     }
+}
+
+#[test]
+fn panic_guard_permits_generic_unwrap_or() {
+    assert!(
+        !scanner_fails_with(
+            production_has_no_panic_shortcuts,
+            vec![(
+                "src/panic_policy_probe.rs".to_string(),
+                "fn p(v: Option<u8>) { let _ = Option::<u8>::unwrap_or(v, 0); }\n".to_string(),
+            )]
+        ),
+        "generic unwrap_or must remain permitted by the panic guard"
+    );
 }

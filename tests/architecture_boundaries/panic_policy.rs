@@ -30,14 +30,41 @@ fn violations(source: &str) -> Vec<String> {
             found.push(".expect(".to_string());
         }
     }
-    for window in lexed.windows(4) {
-        if matches!(window[0], "Option" | "Result")
-            && window[1] == ":"
-            && window[2] == ":"
-            && matches!(window[3], "unwrap" | "expect")
-        {
-            found.push(format!("{}::{}", window[0], window[3]));
+    for (index, token) in lexed.iter().enumerate() {
+        if !matches!(*token, "Option" | "Result") {
+            continue;
         }
+        let mut next = index + 1;
+        // A turbofish has a separator before its generic arguments.
+        if lexed.get(next..next + 3) == Some(&[":", ":", "<"]) {
+            next += 2;
+        }
+        if lexed.get(next) == Some(&"<") {
+            let mut depth = 0;
+            // Every step consumes a token, so even unbalanced input is bounded.
+            while let Some(part) = lexed.get(next) {
+                next += 1;
+                match *part {
+                    "<" => depth += 1,
+                    ">" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Qualified paths such as <Option<u8>>::unwrap have an outer closer.
+        while lexed.get(next) == Some(&">") {
+            next += 1;
+        }
+        if let Some([":", ":", method @ ("unwrap" | "expect")]) = lexed.get(next..next + 3) {
+            found.push(format!("{token}::{method}"));
+        }
+    }
+    for window in lexed.windows(4) {
         if window[0] == "." && window[1] == "unwrap" && window[2] == "(" && window[3] == ")" {
             found.push(".unwrap()".to_string());
         }
