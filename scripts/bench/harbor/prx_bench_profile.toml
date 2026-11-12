@@ -10,7 +10,7 @@ enabled = false
 mode = "off"
 memory_flush = false
 [memory]
-backend = "none"
+backend = "sqlite"
 auto_save = false
 embedding_provider = "none"
 [auth]

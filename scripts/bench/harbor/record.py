@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 import sys
+import sqlite3
+import time
 import tomllib
 from urllib.parse import urlsplit, urlunsplit
 from profile import read_bounded
@@ -77,6 +79,36 @@ def usage(rows, exit_code):
     return result
 
 
+def per_attempt_models(database, git_sha):
+    """Read finalized provider attempts from a stopped trial's private SQLite copy."""
+    database = Path(database)
+    if not database.is_file():
+        return unavailable(f"no per-attempt ledger at {git_sha}")
+    if database.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError("event database exceeds benchmark collection bound")
+    deadline = time.monotonic() + 5
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=1) as connection:
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        rows = connection.execute(
+            "SELECT raw_payload_json FROM message_events WHERE event_type='turn.finalized' ORDER BY rowid LIMIT 257"
+        ).fetchall()
+    if len(rows) > 256:
+        raise ValueError("too many finalized turns")
+    attempts = []
+    for (payload,) in rows:
+        if payload is None:
+            continue
+        if len(payload) > MAX_ARTIFACT:
+            raise ValueError("terminal payload exceeds collection bound")
+        outcome = json.loads(payload).get("provider_outcome") or {}
+        for attempt in outcome.get("attempts", []):
+            if len(attempts) >= 256:
+                raise ValueError("too many provider attempts")
+            attempts.append({"seq": attempt["seq"], "provider": serving_provider(attempt["provider"]),
+                             "model": attempt["model"], "status": attempt["status"]})
+    return {"status": "available", "attempts": attempts} if attempts else unavailable(f"no per-attempt ledger at {git_sha}")
+
+
 def build_agent(logs, metadata):
     logs = Path(logs)
     code_path = logs / "prx-exit-code"
@@ -147,9 +179,10 @@ def finalize(trial):
     record = {
         "schema_version": 1, "run_id": config.get("job_id") or unavailable("job ID missing"),
         "trial_id": result["id"], "created_at": result["started_at"],
-        "benchmark": "terminal-bench", "dataset_tag": "2.0", "task_id": result["task_name"],
+        "benchmark": "terminal-bench", "dataset_tag": "terminal-bench@2.0", "task_id": task_path.name,
         "repo_revision": config["task"].get("git_commit_id") or unavailable("local task has no git revision"),
         "task_checksum": result.get("task_checksum") or unavailable("task checksum missing"),
+        "dataset_provenance": optional(task_path.parent / "prx-dataset.json"),
         "image": env.get("docker_image") or unavailable("no image declared"),
         "image_digest": unavailable("image not inspected"),
         "harness_name": "prx", "version": agent["version"] or unavailable("version not detected"), "git_sha": agent["git_sha"],

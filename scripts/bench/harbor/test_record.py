@@ -4,7 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from record import build_agent, classify, finalize, scan_secrets, unavailable, write
+from record import build_agent, classify, finalize, scan_secrets, unavailable, write, per_attempt_models
+import sqlite3
 
 
 class RecordTests(unittest.TestCase):
@@ -52,6 +53,8 @@ class RecordTests(unittest.TestCase):
                       'attempt_status', 'usage', 'cost', 'timings', 'trajectory', 'diff', 'artifacts'):
             self.assertIn(field, record, f'handbook field missing: {field}')
         self.assertEqual(record['attempt_status'], 'pass')
+        self.assertEqual(record['dataset_tag'], 'terminal-bench@2.0')
+        self.assertEqual(record['task_id'], 'task')
         self.assertEqual(record['usage']['uncached_input'], 17)
         self.assertEqual(record['usage']['cache_write'], 2)
         self.assertEqual(record['cost'], 0.1)
@@ -129,3 +132,16 @@ class RecordTests(unittest.TestCase):
         record = finalize(self.root)
         self.assertEqual(record['attempt_status'], 'infra_error')
         self.assertEqual(record['profile_sha256']['status'], 'unavailable')
+
+    def test_sqlite_provider_attempts_read_from_finalized_turn(self):
+        database = self.root / 'brain.db'
+        with sqlite3.connect(database) as connection:
+            connection.execute('CREATE TABLE message_events (event_type TEXT, raw_payload_json TEXT)')
+            payload = {'provider_outcome': {'attempts': [
+                {'seq': 1, 'provider': 'prx', 'model': 'model', 'status': 'failed'},
+                {'seq': 2, 'provider': 'prx', 'model': 'model', 'status': 'success'}]}}
+            connection.execute('INSERT INTO message_events VALUES (?, ?)', ('turn.finalized', json.dumps(payload)))
+        evidence = per_attempt_models(database, 'sha')
+        self.assertEqual(evidence['status'], 'available')
+        self.assertEqual([a['model'] for a in evidence['attempts']], ['model', 'model'])
+        self.assertEqual(per_attempt_models(self.root / 'absent.db', 'sha'), unavailable('no per-attempt ledger at sha'))

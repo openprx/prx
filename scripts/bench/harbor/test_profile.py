@@ -25,7 +25,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(c['reliability'], {'fallback_providers': [], 'model_fallbacks': {},
                                          'api_keys': [], 'provider_retries': 1})
         self.assertEqual(c['agent']['compaction'], {'mode': 'off', 'memory_flush': False})
-        self.assertEqual(c['memory'], {'backend': 'none', 'auto_save': False, 'embedding_provider': 'none'})
+        self.assertEqual(c['memory'], {'backend': 'sqlite', 'auto_save': False, 'embedding_provider': 'none'})
         self.assertFalse(c['auth']['codex_auth_json_auto_import'])
         self.assertEqual(c['autonomy'], {'level': 'full', 'workspace_only': False,
             'forbidden_paths': [], 'acknowledge_unrestricted_profile': True, 'max_cost_per_day_cents': 100000})

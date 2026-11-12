@@ -30,7 +30,7 @@ build() {
         cd /build/container-source
         rustup toolchain install "$TOOLCHAIN" --profile minimal
         rustup target add --toolchain "$TOOLCHAIN" "$BUILD_TARGET"
-        export CARGO_TARGET_DIR=/build/target TMPDIR=/build/tmp
+        export CARGO_TARGET_DIR=/build/target TMPDIR=/build/tmp CARGO_BUILD_JOBS=4
         cargo +"$TOOLCHAIN" build --locked --profile ci --bin prx --target "$BUILD_TARGET"
       '
 }

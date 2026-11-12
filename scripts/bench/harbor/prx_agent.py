@@ -8,7 +8,7 @@ import tempfile
 from harbor.agents.installed.base import BaseInstalledAgent
 
 from profile import PRICES, check, identity, read_bounded, render
-from record import build_agent, endpoint, serving_provider, sha256, unavailable
+from record import build_agent, endpoint, serving_provider, sha256, unavailable, per_attempt_models
 
 CONFIG_DIR = "/opt/prx-bench"
 LOG_DIR = "/logs/agent"
@@ -81,7 +81,7 @@ class PrxAgent(BaseInstalledAgent):
             "per_attempt_models": unavailable(f"no per-attempt ledger at {self.git_sha}"),
         }
         setup = await environment.exec(
-            command="mkdir -p /opt/prx-bench /logs/agent && chown root:root /opt/prx-bench && chmod 0700 /opt/prx-bench",
+            command="test ! -e /opt/prx-bench && mkdir -p /opt/prx-bench /logs/agent && chown root:root /opt/prx-bench && chmod 0700 /opt/prx-bench",
             user="root", timeout_sec=30)
         if setup.return_code != 0:
             raise RuntimeError("cannot create private config directory")
@@ -117,6 +117,14 @@ class PrxAgent(BaseInstalledAgent):
                              f"env -u PRX_BENCH_API_KEY prx --config-dir {CONFIG_DIR} cost --json "
                              f">{LOG_DIR}/prx-cost.json 2>{LOG_DIR}/prx-cost-stderr.txt"),
                     user="root", timeout_sec=15)
+                with tempfile.TemporaryDirectory(prefix="prx-bench-events-") as directory:
+                    database = Path(directory) / "brain.db"
+                    for suffix in ("", "-wal"):
+                        remote = CONFIG_DIR + "/workspace/memory/brain.db" + suffix
+                        exists = await environment.exec(command=f"test -f {remote} && test $(wc -c < {remote}) -le 67108864", timeout_sec=5)
+                        if exists.return_code == 0:
+                            await asyncio.wait_for(environment.download_file(remote, str(database) + suffix), timeout=10)
+                    self._metadata["per_attempt_models"] = per_attempt_models(database, self.git_sha)
             finally:
                 await environment.exec(command="rm -rf /opt/prx-bench", user="root", timeout_sec=5)
 

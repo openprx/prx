@@ -102,8 +102,12 @@ fn read_request(stream: &mut TcpStream) -> Request {
     assert!(length <= MAX_BODY, "HTTP body overflow: {length}");
     let mut body = Vec::new();
     while body.len() < length {
-        let remaining_time = end.checked_duration_since(Instant::now()).expect("test: HTTP body deadline");
-        stream.set_read_timeout(Some(remaining_time)).expect("test: body read deadline");
+        let remaining_time = end
+            .checked_duration_since(Instant::now())
+            .expect("test: HTTP body deadline");
+        stream
+            .set_read_timeout(Some(remaining_time))
+            .expect("test: body read deadline");
         let mut chunk = [0_u8; 8192];
         let remaining = length - body.len();
         let buffer = chunk.get_mut(..remaining.min(8192)).expect("test: bounded chunk");
