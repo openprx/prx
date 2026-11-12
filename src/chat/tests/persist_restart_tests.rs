@@ -54,7 +54,7 @@ fn config_at(workspace: &Path) -> crate::config::Config {
             cache_read: 1.0,
         },
     );
-    // Recovery fixtures deliberately exercise a local, selected Close terminal.
+    // Recovery fixtures persist a real completed provider turn.
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.policy.max_decision_hops = 1;

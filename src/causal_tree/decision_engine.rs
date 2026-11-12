@@ -526,8 +526,6 @@ pub(crate) enum FallbackCause {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EngineError {
-    #[error("state fingerprint serialization failed")]
-    Fingerprint(#[source] serde_json::Error),
     #[error(transparent)]
     Gates(#[from] GateError),
     #[error(transparent)]

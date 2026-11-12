@@ -780,13 +780,21 @@ impl<'a> CatalogView<'a> {
     }
 
     /// Narrow a view without copying entries, schemas, bindings or the search index.
-    pub(crate) fn with_surface(mut self, surface: &'a SurfacePolicy) -> Self {
-        self.surface = Some(surface);
-        #[cfg(test)]
-        {
-            self.entries = OnceLock::new();
+    pub(crate) const fn with_surface(&self, surface: &'a SurfacePolicy) -> Self {
+        Self {
+            surface: Some(surface),
+            #[cfg(test)]
+            entries: OnceLock::new(),
+            generation: self.generation,
+            by_id: self.by_id,
+            model_names: self.model_names,
+            model_root_slots: self.model_root_slots,
+            model_layout: self.model_layout,
+            search_index: self.search_index,
+            all_entries: self.all_entries,
+            families: self.families,
+            channel: self.channel,
         }
-        self
     }
 
     pub(crate) fn surface_excludes(&self, entry: &CapabilityEntry) -> bool {

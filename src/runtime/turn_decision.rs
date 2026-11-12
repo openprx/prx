@@ -1770,10 +1770,8 @@ impl TurnDecisionService {
         })
     }
 
-    /// Compile a prediction when recovery is on and a local backend can
-    /// answer (loopback HTTP, or an explicit Builtin), or the operator
-    /// enabled the decision engine with a remote backend. Default
-    /// Auto-without-endpoint and engine-off remote stay on the Direct surface.
+    /// Compile prediction only after the operator enables the decision engine
+    /// and selects an available backend. Disabled engines use the Direct surface.
     pub(super) fn should_run_prediction_hop(&self) -> bool {
         let config = &self.generation.effective;
         if !config.decision_engine.enabled {
