@@ -50,18 +50,28 @@ async fn decision_reply(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<
 
 #[tokio::test]
 async fn operator_task_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
-    run_operator_case(false).await
+    run_operator_case(false, false).await
 }
 
 #[tokio::test]
 async fn restored_operator_process_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
-    run_operator_case(true).await
+    run_operator_case(true, false).await
 }
 
-// Both cases also assert the operator child approval-ledger opt-in (task mode and
+#[tokio::test]
+async fn actual_operator_task_decision_accounts_physical_send_and_drains() -> anyhow::Result<()> {
+    run_operator_case(false, true).await
+}
+
+#[tokio::test]
+async fn restored_operator_process_decision_accounts_physical_send_without_os_spawn() -> anyhow::Result<()> {
+    run_operator_case(true, true).await
+}
+
+// All cases also assert the operator child approval-ledger opt-in (task mode and
 // restored process mode) inside `run_operator_case`.
 
-async fn run_operator_case(process: bool) -> anyhow::Result<()> {
+async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let cleanup_scope = crate::runtime::turn_cleanup::CleanupScope::new(Some(&owner), CancellationToken::new())?;
@@ -84,10 +94,14 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = true;
-        // These cases assert Direct admission without a prediction send.
-        // The declared loopback endpoint below remains a real traffic probe;
-        // leave Auto empty rather than explicitly selecting that backend.
-        config.causal_tree.backend = crate::causal_tree::config::CausalTreeConfig::default().backend;
+        if prediction {
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+            config.causal_tree.backend.endpoint = endpoint.clone();
+            config.causal_tree.backend.model = "prx-operator-decision".to_owned();
+        }
+        // Auto without a configured backend stays Direct. Explicit loopback
+        // prediction owns and settles one physical request before fallback.
         assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
         let priced_provider = format!("custom:{endpoint}");
         config.providers.models.push(serde_json::from_value(json!({
@@ -284,8 +298,8 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                 );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
-                    0,
-                    "ungated child admission does not call the decision backend"
+                    usize::from(prediction),
+                    "only explicit prediction sends to the decision backend"
                 );
                 assert!(
                     !turn.is_close()?,
@@ -323,7 +337,19 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         Ok(Ok(result)) => {
             anyhow::ensure!(confirmed, "operator accounting cleanup unconfirmed");
             result?;
-            let journal = std::fs::read_to_string(costs_workspace.as_path().join("state/costs.reservations.jsonl"))?;
+            let journal_path = costs_workspace.join("state/costs.reservations.jsonl");
+            if !prediction {
+                assert!(
+                    !journal_path.exists(),
+                    "test: Direct admission invents no reservation journal"
+                );
+                assert!(
+                    !costs_workspace.join("state/costs.jsonl").exists(),
+                    "test: Direct admission invents no cost settlement"
+                );
+                return Ok(());
+            }
+            let journal = std::fs::read_to_string(journal_path)?;
             let rows: Vec<Value> = journal.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
             let matching = |event: &str| {
                 rows.iter()

@@ -36,9 +36,17 @@ enum RecordedDirective {
     Discover,
     Execute,
     Delegate,
-    Clarify { reason_code: String },
-    RequestApproval { decision_id: String, effect: String },
-    Refuse { policy_code: String },
+    Clarify {
+        reason_code: String,
+    },
+    RequestApproval {
+        decision_id: String,
+        effect: String,
+    },
+    Refuse {
+        policy_code: String,
+        user_hint: Option<String>,
+    },
 }
 
 const APPROVAL_UNAVAILABLE_REPLY: &str =
@@ -93,9 +101,14 @@ fn recorded_from_hop(
                 effect,
             }
         }
-        "refuse" => RecordedDirective::Refuse {
-            policy_code: row.decision.abstention_reason.clone().unwrap_or_default(),
-        },
+        "refuse" => {
+            let policy_code = row.decision.abstention_reason.clone().unwrap_or_default();
+            // The persisted hop has already been compared with the issued
+            // record. Reconstruct its configuration hint from those same
+            // authenticated gate facts, never from assistant-provided text.
+            let user_hint = crate::causal_tree::refusal::RefusalReason::classify(&policy_code, hop).user_hint();
+            RecordedDirective::Refuse { policy_code, user_hint }
+        }
         other => anyhow::bail!("unrecognized recorded directive_kind {other}"),
     })
 }
@@ -118,14 +131,13 @@ fn render_recorded_terminal(directive: &RecordedDirective) -> anyhow::Result<std
         RecordedDirective::RequestApproval { decision_id, effect } => Ok(std::borrow::Cow::Owned(format!(
             "Approval is required for decision {decision_id} (effect: {effect}). Review this decision before resuming it. The operation has not run."
         ))),
-        RecordedDirective::Refuse { policy_code } => {
-            tracing::debug!(policy_code = %policy_code, "rendering recorded terminal refusal");
-            Ok(std::borrow::Cow::Borrowed(if policy_code == "approval_requires_call" {
-                APPROVAL_UNAVAILABLE_REPLY
-            } else {
-                "I can't complete this request under the current policy."
-            }))
+        RecordedDirective::Refuse { policy_code, .. } if policy_code == "approval_requires_call" => {
+            Ok(std::borrow::Cow::Borrowed(APPROVAL_UNAVAILABLE_REPLY))
         }
+        RecordedDirective::Refuse { policy_code, user_hint } => Ok(crate::causal_tree::refusal::render_refusal_reply(
+            policy_code,
+            user_hint.as_deref(),
+        )),
         _ => anyhow::bail!("recorded directive is not a terminal close"),
     }
 }
