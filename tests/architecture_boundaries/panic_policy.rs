@@ -320,17 +320,17 @@ fn indexing_allow_is_banned_outside_test_items() {
         "#[allow(clippy::indexing_slicing)] fn probe() {}",
         "#[allow(clippy::indexing_slicing)]\n#[cfg(unix)]\nfn probe() {}",
     ];
+    const TEST_ITEMS: [&str; 3] = [
+        "#[cfg(test)]\n#[allow(clippy::indexing_slicing)]\nmod tests {}",
+        "#[allow(clippy::indexing_slicing)]\n#[cfg(test)]\nmod tests {}",
+        "#[allow(clippy::indexing_slicing)]\n#[cfg(unix)]\n#[cfg(test)]\nfn probe() {}",
+    ];
     for source in PRODUCTION {
         assert!(
             !violations(&production_text(&blank_comments_and_literals(source))).is_empty(),
             "an indexing allow on production code must be reported: {source}"
         );
     }
-    const TEST_ITEMS: [&str; 3] = [
-        "#[cfg(test)]\n#[allow(clippy::indexing_slicing)]\nmod tests {}",
-        "#[allow(clippy::indexing_slicing)]\n#[cfg(test)]\nmod tests {}",
-        "#[allow(clippy::indexing_slicing)]\n#[cfg(unix)]\n#[cfg(test)]\nfn probe() {}",
-    ];
     for source in TEST_ITEMS {
         assert!(
             violations(&production_text(&blank_comments_and_literals(source))).is_empty(),

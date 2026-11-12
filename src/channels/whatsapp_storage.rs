@@ -1319,7 +1319,7 @@ impl DeviceStoreTrait for RusqliteStore {
 
                 // A stored key pair is the 32-byte private key followed by the
                 // 32-byte public key.
-                fn split_key_pair(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+                const fn split_key_pair(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
                     if bytes.len() == 64 {
                         bytes.split_at_checked(32)
                     } else {

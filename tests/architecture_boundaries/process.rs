@@ -325,7 +325,7 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/tools/message_send.rs::auto_generate_voice::let mut npm_cmd = tokio::process::Command::new(\"npm\");",
     "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
     "src/tunnel/cloudflare.rs::start::let mut child = Command::new(\"cloudflared\")",
-    "src/tunnel/custom.rs::start::let mut child = Command::new(parts[0])",
+    "src/tunnel/custom.rs::start::let mut child = Command::new(program)",
     "src/tunnel/ngrok.rs::start::Command::new(\"ngrok\")",
     "src/tunnel/ngrok.rs::start::let mut child = Command::new(\"ngrok\")",
     "src/tunnel/tailscale.rs::start::let child = Command::new(\"tailscale\")",

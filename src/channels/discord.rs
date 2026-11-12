@@ -185,10 +185,7 @@ fn base64_decode(input: &str) -> Option<String> {
     let chars: Vec<u8> = padded.bytes().collect();
 
     // A trailing chunk shorter than four bytes is ignored.
-    for chunk in chars.chunks_exact(4) {
-        let &[c0, c1, c2, c3] = chunk else {
-            break;
-        };
+    for &[c0, c1, c2, c3] in chars.as_chunks::<4>().0 {
         let (v0, v1, v2, v3) = (sextet(c0)?, sextet(c1)?, sextet(c2)?, sextet(c3)?);
 
         bytes.push(((v0 << 2) | (v1 >> 4)) as u8);
