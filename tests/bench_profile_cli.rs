@@ -2,6 +2,7 @@
 #![cfg(test)]
 
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -246,6 +247,15 @@ fn exercise(status: u16, refusal: bool) {
             "model_fallbacks = {}",
             &format!("model_fallbacks = {{\"{MODEL}\" = [\"prx-other-fixture\"]}}"),
         );
+        // A fallback must pass the shipped cost/native-tool admission before
+        // it can reach transport (providers::fallback_admission_for). These
+        // declarations exist only in the deliberately broken fixture.
+        let alternate_price_key = format!("{provider}/prx-other-fixture");
+        write!(
+            config,
+            "\n[cost.prices.{alternate_price_key:?}]\ninput = 1.0\noutput = 1.0\ncache_read = 1.0\ncache_write = 1.0\n\n[[providers.models]]\nprovider = {provider:?}\nmodel = \"prx-other-fixture\"\noperations = [\"chat\"]\nnative_tools = true\n",
+        )
+        .expect("test: append eligible fallback fixture");
     }
     std::fs::write(&config_path, config).expect("test: write fixture mutation");
     if status == 503 && std::env::var_os("PRX_BENCH_BREAK_FALLBACK").is_some() {
