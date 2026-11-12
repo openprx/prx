@@ -1964,8 +1964,13 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
             .execute("DELETE FROM recovery_cost_outbox", [])
             .expect("test: clear");
         mutate(&memory);
-        let error = memory.pending_recovery_costs(workspace, None, 8).expect_err(cell);
-        assert_outbox_error(&error, expected, cell);
+        let listed = memory
+            .pending_recovery_costs(workspace, None, 8)
+            .expect("test: invalid outbox row must not fail the listing");
+        assert!(
+            listed.is_empty(),
+            "test: {cell}: {expected}; invalid row must not be offered for projection"
+        );
     };
 
     let workspace_err = {
@@ -2148,10 +2153,11 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
         )?;
         drop(memory);
         let reopened = SqliteMemory::new_with_path(path.clone())?;
-        let error = reopened
-            .pending_recovery_costs(changed_workspace, None, 8)
-            .expect_err(field);
-        assert_outbox_error(&error, "recovery cost outbox mac is invalid", field);
+        let listed = reopened.pending_recovery_costs(changed_workspace, None, 8)?;
+        assert!(
+            listed.is_empty(),
+            "test: changed {field} must invalidate authentication and prevent projection"
+        );
     }
 
     let memory = SqliteMemory::new_with_path(path.clone())?;
@@ -2175,13 +2181,10 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
         "UPDATE recovery_cost_outbox SET state='error' WHERE settlement_id=?1",
         rusqlite::params![settlement],
     )?;
-    let relabel = memory
-        .pending_recovery_costs(workspace, None, 8)
-        .expect_err("state relabel without state_mac");
-    assert_outbox_error(
-        &relabel,
-        "recovery cost outbox state_mac is invalid",
-        "state relabel without state_mac",
+    let listed = memory.pending_recovery_costs(workspace, None, 8)?;
+    assert!(
+        listed.is_empty(),
+        "test: relabeled state without its MAC must never authorize projection"
     );
     drop(dir);
     Ok(())

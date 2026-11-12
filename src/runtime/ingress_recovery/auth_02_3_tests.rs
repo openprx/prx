@@ -52,11 +52,11 @@ fn assert_closed_outbox_facts(facts: &[u8]) {
     assert_eq!(
         object.len(),
         OUTBOX_FACT_KEYS.len(),
-        "test: invariant: object.len(), OUTBOX_FACT_KEYS.len()"
+        "test: outbox facts schema changed; every authenticated field must be accounted for"
     );
     assert!(
         OUTBOX_FACT_KEYS.iter().all(|key| object.contains_key(*key)),
-        "test: invariant: OUTBOX_FACT_KEYS.iter().all(|key| object.contains_key(*key))"
+        "test: outbox facts lost a required field and can no longer bind the complete usage"
     );
 }
 
@@ -122,18 +122,18 @@ pub(super) async fn recovery_terminal_loser_touches_no_outbox_or_ledger() {
         .expect("test: winner");
     assert!(
         matches!(winner.cost_settlement, Some(CostSettlement::ProjectionPending)),
-        "test: invariant: matches!( winner.cost_settlement, Some(CostSettlement::ProjectionPending) )"
+        "test: winning terminal must retain its durable cost intent until projection"
     );
     let winner_row = first_outbox(&workspace);
     assert_eq!(
         winner_row.settlement_id, terminal_id,
-        "test: invariant: winner_row.settlement_id, terminal_id"
+        "test: winning outbox must belong to the committed terminal"
     );
     let winner_owner = winner_row.owner_id.clone();
     assert_eq!(
         ledger_lines(&workspace, terminal_id),
         1,
-        "test: invariant: ledger_lines(&workspace, terminal_id), 1"
+        "test: winning terminal must be charged exactly once"
     );
 
     let mut loser = commit;
@@ -184,21 +184,21 @@ pub(super) async fn recovery_terminal_loser_touches_no_outbox_or_ledger() {
             outcome,
             crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict
         ),
-        "test: invariant: matches!( outcome, crate::memory::recovery_authority::RecoveryTerminalOutcome::Conflict )"
+        "test: competing terminal must be refused to preserve the original owner"
     );
     let loser_row = first_outbox(&workspace);
     assert_eq!(
         loser_row.owner_id, winner_owner,
-        "test: invariant: loser_row.owner_id, winner_owner"
+        "test: losing commit must not replace the winning outbox owner"
     );
     assert_eq!(
         loser_row.settlement_id, terminal_id,
-        "test: invariant: loser_row.settlement_id, terminal_id"
+        "test: losing commit must not replace the winning settlement identity"
     );
     assert_eq!(
         ledger_lines(&workspace, terminal_id),
         1,
-        "test: invariant: ledger_lines(&workspace, terminal_id), 1"
+        "test: losing commit must not add a second charge"
     );
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
@@ -218,12 +218,12 @@ pub(super) async fn recovery_nonmonetary_pricing_commits_disposition() {
         .expect("test: unknown");
     assert!(
         matches!(unknown_receipt.cost_settlement, Some(CostSettlement::UnknownPricing)),
-        "test: invariant: matches!( unknown_receipt.cost_settlement, Some(CostSettlement::UnknownPricing) )"
+        "test: unpriced usage must remain explicitly classified so it cannot be billed as metered"
     );
     assert_eq!(
         ledger_lines(&workspace, unknown_id),
         0,
-        "test: invariant: ledger_lines(&workspace, unknown_id), 0"
+        "test: unknown pricing must not invent a monetary charge"
     );
     unknown_service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 
@@ -248,26 +248,26 @@ pub(super) async fn recovery_nonmonetary_pricing_commits_disposition() {
         .expect("test: subscription");
     assert!(
         matches!(sub_receipt.cost_settlement, Some(CostSettlement::Subscription { .. })),
-        "test: invariant: matches!( sub_receipt.cost_settlement, Some(CostSettlement::Subscription {{ .. }}) )"
+        "test: subscription usage must retain its nonmonetary disposition"
     );
     assert_eq!(
         ledger_lines(&workspace, sub_id),
         0,
-        "test: invariant: ledger_lines(&workspace, sub_id), 0"
+        "test: subscription usage must not create a monetary ledger entry"
     );
 
     let rows = fixture_readback::outbox_rows(&workspace);
     assert!(
         rows.iter().all(|row| row.state == "acknowledged"),
-        "test: invariant: rows.iter().all(|row| row.state == \"acknowledged\")"
+        "test: nonmonetary dispositions must finish without leaving retryable work"
     );
     assert!(
         rows.iter().any(|row| row.pricing == "unknown"),
-        "test: invariant: rows.iter().any(|row| row.pricing == \"unknown\")"
+        "test: unknown pricing disposition must survive outbox readback"
     );
     assert!(
         rows.iter().any(|row| row.pricing == "subscription"),
-        "test: invariant: rows.iter().any(|row| row.pricing == \"subscription\")"
+        "test: subscription disposition must survive outbox readback"
     );
     for row in &rows {
         assert_closed_outbox_facts(&row.facts);
@@ -493,14 +493,14 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
             .get("semantic_mac_v3")
             .and_then(serde_json::Value::as_str)
             .is_some(),
-        "test: invariant: value .get(\"semantic_mac_v3\") .and_then(serde_json::Value::as_str) .is_some()"
+        "test: terminal claim must carry a MAC so replay can authenticate its semantics"
     );
     assert!(
         value
             .get("recovery_key_id")
             .and_then(serde_json::Value::as_str)
             .is_some(),
-        "test: invariant: value .get(\"recovery_key_id\") .and_then(serde_json::Value::as_str) .is_some()"
+        "test: terminal claim must identify the key needed for replay verification"
     );
     unrecorded_service
         .shutdown(Instant::now() + Duration::from_secs(5))
@@ -522,7 +522,7 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             .unwrap_or_else(|error| panic!("test: {backend} commit: {error:#}"));
         assert!(
             matches!(first.cost_settlement, Some(CostSettlement::ProjectionPending)),
-            "test: invariant: matches!(first.cost_settlement, Some(CostSettlement::ProjectionPending))"
+            "test: terminal commit must retain a pending cost intent before projection"
         );
         assert_eq!(
             crate::cost::tracker::settle_metered_call_count(&workspace),
@@ -545,7 +545,7 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             assert_eq!(
                 first.assistant_event.as_ref().map(|event| event.content.as_str()),
                 Some("done"),
-                "test: invariant: first.assistant_event.as_ref().map(|event| event.content.as_str()), Some(\"done\")"
+                "test: replay must preserve the assistant reply committed by the winner"
             );
         }
         let second = finalize_turn(&fabric, commit.clone(), &cost, &workspace)
@@ -553,12 +553,12 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             .unwrap_or_else(|error| panic!("test: {backend} replay: {error:#}"));
         assert_eq!(
             first.terminal_event.event_id, second.terminal_event.event_id,
-            "test: invariant: first.terminal_event.event_id, second.terminal_event.event_id"
+            "test: replay must reuse the original terminal event instead of creating a duplicate"
         );
         assert_eq!(
             ledger_lines(&workspace, &terminal_id),
             1,
-            "test: invariant: ledger_lines(&workspace, &terminal_id), 1"
+            "test: replaying a committed terminal must not duplicate its charge"
         );
         let owner = commit.scope.owner_id.clone().expect("test: owner");
         let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, true, cost.clone()).await;
@@ -585,12 +585,12 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
         .expect("test: postgres_class");
     assert!(
         matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })),
-        "test: invariant: matches!(receipt.cost_settlement, Some(CostSettlement::Recorded {{ .. }}))"
+        "test: priced usage must reach the ledger before reporting recorded settlement"
     );
     assert_eq!(
         crate::cost::tracker::settle_metered_call_count(&workspace),
         1,
-        "test: invariant: crate::cost::tracker::settle_metered_call_count(&workspace), 1"
+        "test: single terminal projection must invoke metered settlement exactly once"
     );
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
@@ -719,6 +719,11 @@ async fn committed_turn_survives_concurrent_scan_and_tampered_outbox() {
         finalize_turn(&fabric, later, &cost, &workspace)
             .await
             .expect("test: tampered outbox must not fail later committed turns");
+        assert_eq!(
+            ledger_lines(&workspace, id),
+            1,
+            "test: a tampered sibling row must not stop this turn's cost projection"
+        );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
     assert_eq!(
@@ -726,11 +731,12 @@ async fn committed_turn_survives_concurrent_scan_and_tampered_outbox() {
         0,
         "test: tampered row must never project"
     );
+    let listed = repository
+        .pending_recovery_costs(&workspace.to_string_lossy(), None, 64)
+        .expect("test: listing skips the tampered row");
     assert!(
-        repository
-            .pending_recovery_costs(&workspace.to_string_lossy(), None, 64)
-            .is_err(),
-        "test: invalid MAC fails closed"
+        listed.iter().all(|row| row.settlement_id != "prx-corrupt"),
+        "test: a tampered row is never offered for projection"
     );
 }
 
@@ -764,12 +770,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert!(error.to_string().contains("test: crash"), "{error:#}");
         assert!(
             fixture_readback::outbox_rows(&workspace).is_empty(),
-            "test: invariant: fixture_readback::outbox_rows(&workspace).is_empty()"
+            "test: a crash before commit must leave no outbox intent to project"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-before-commit"),
             0,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-before-commit\"), 0"
+            "test: a crash before commit must not charge uncommitted usage"
         );
         crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
             memory.as_ref(),
@@ -780,7 +786,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         .expect("test: scan before commit");
         assert!(
             fixture_readback::outbox_rows(&workspace).is_empty(),
-            "test: invariant: fixture_readback::outbox_rows(&workspace).is_empty()"
+            "test: restart scan must not manufacture an outbox for an uncommitted terminal"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -795,17 +801,17 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             fixture_readback::outbox_rows(&workspace).len(),
             1,
-            "test: invariant: fixture_readback::outbox_rows(&workspace).len(), 1"
+            "test: crash before append must preserve exactly one durable cost intent"
         );
         assert_eq!(
             first_outbox(&workspace).state,
             "pending",
-            "test: invariant: first_outbox(&workspace).state, \"pending\""
+            "test: crash before append must leave the intent retryable for restart"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-before-append"),
             0,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-before-append\"), 0"
+            "test: crash before append must not report usage as charged"
         );
         crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
             memory.as_ref(),
@@ -817,12 +823,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: restart must acknowledge the recovered append so it stops retrying"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-before-append"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-before-append\"), 1"
+            "test: restart must recover the missing charge exactly once"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -837,12 +843,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "pending",
-            "test: invariant: first_outbox(&workspace).state, \"pending\""
+            "test: crash after append must leave the intent retryable until acknowledgement"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-after-append"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-after-append\"), 1"
+            "test: crash after append must preserve the already durable charge"
         );
         crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
             memory.as_ref(),
@@ -854,12 +860,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: restart must acknowledge the previously appended charge"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-after-append"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-after-append\"), 1"
+            "test: restart after append must not duplicate the durable charge"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -875,12 +881,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "pending",
-            "test: invariant: first_outbox(&workspace).state, \"pending\""
+            "test: crash before acknowledgement must leave recovery work pending"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-crash-before-ack"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-crash-before-ack\"), 1"
+            "test: crash before acknowledgement must preserve the durable ledger entry"
         );
         crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
             memory.as_ref(),
@@ -892,7 +898,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: restart must finish the interrupted acknowledgement"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -908,7 +914,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "pending",
-            "test: invariant: first_outbox(&workspace).state, \"pending\""
+            "test: skipping inline projection must retain durable work for the scanner"
         );
         let repository = memory.recovery_repository().expect("test: repository");
         let rows = repository
@@ -940,7 +946,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             ledger_lines(&workspace, "prx-skip-inline"),
             0,
-            "test: invariant: ledger_lines(&workspace, \"prx-skip-inline\"), 0"
+            "test: recording disabled must not append pending usage to the ledger"
         );
         let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, true, cost.clone()).await;
         drop(recovery);
@@ -951,12 +957,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: enabled recovery must acknowledge the usage deferred while recording was disabled"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-skip-inline"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-skip-inline\"), 1"
+            "test: enabled recovery must charge the deferred usage exactly once"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -971,7 +977,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "error",
-            "test: invariant: first_outbox(&workspace).state, \"error\""
+            "test: ledger I/O failure must retain a retryable error disposition"
         );
         crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
             memory.as_ref(),
@@ -983,12 +989,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: retry after I/O failure must acknowledge the repaired projection"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-io-error"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-io-error\"), 1"
+            "test: retry after I/O failure must charge the terminal exactly once"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1013,7 +1019,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             ledger_lines(&workspace, "prx-forged-ack"),
             0,
-            "test: invariant: ledger_lines(&workspace, \"prx-forged-ack\"), 0"
+            "test: forged acknowledgement must not authorize a ledger append"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1042,7 +1048,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             ledger_lines(&workspace, "prx-missing-outbox"),
             0,
-            "test: invariant: ledger_lines(&workspace, \"prx-missing-outbox\"), 0"
+            "test: missing atomic outbox must prevent replay from charging usage"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1068,13 +1074,13 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "blocked",
-            "test: invariant: first_outbox(&workspace).state, \"blocked\""
+            "test: torn ledger tail must block projection to prevent further corruption"
         );
         let after = std::fs::read_to_string(workspace.join("state").join("costs.jsonl"))
             .expect("test: read unchanged ledger tail");
         assert_eq!(
             after, "{\"usage\":{}}",
-            "test: invariant: after, \"{{\\\"usage\\\":{{}}}}\""
+            "test: blocked projection must preserve the torn ledger bytes for repair"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1107,7 +1113,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "error",
-            "test: invariant: first_outbox(&workspace).state, \"error\""
+            "test: ledger lock timeout must retain an error disposition for a later retry"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1152,17 +1158,17 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .expect("test: concurrent replay");
         assert_eq!(
             first.terminal_event.event_id, second.terminal_event.event_id,
-            "test: invariant: first.terminal_event.event_id, second.terminal_event.event_id"
+            "test: concurrent replays must converge on the original terminal event"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-concurrent"),
             1,
-            "test: invariant: ledger_lines(&workspace, \"prx-concurrent\"), 1"
+            "test: concurrent recovery must append only one charge"
         );
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: concurrent recovery must complete acknowledgement after the single append"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1195,12 +1201,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "blocked",
-            "test: invariant: first_outbox(&workspace).state, \"blocked\""
+            "test: conflicting ledger entry must block settlement instead of overwriting history"
         );
         assert_eq!(
             std::fs::read(&ledger).expect("test: conflict bytes after"),
             before,
-            "test: invariant: std::fs::read(&ledger).expect(\"test: conflict bytes after\"), before"
+            "test: blocked settlement must preserve the conflicting ledger bytes"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1223,7 +1229,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         assert_eq!(
             first_outbox(&workspace).state,
             "pending",
-            "test: invariant: first_outbox(&workspace).state, \"pending\""
+            "test: skipped inline projection must preserve the pending intent for replay"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(service);
@@ -1242,21 +1248,21 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .expect("test: reopened terminal");
         assert_eq!(
             final_event.event_id, first.terminal_event.event_id,
-            "test: invariant: final_event.event_id, first.terminal_event.event_id"
+            "test: successful replay must retain the original terminal event identity"
         );
         assert_eq!(
             final_event.raw_payload_json, first.terminal_event.raw_payload_json,
-            "test: invariant: final_event.raw_payload_json, first.terminal_event.raw_payload_json"
+            "test: successful replay must not rewrite the authenticated terminal payload"
         );
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+            "test: successful replay must acknowledge the recovered cost intent"
         );
         assert_eq!(
             ledger_lines(&workspace, &terminal_id),
             1,
-            "test: invariant: ledger_lines(&workspace, &terminal_id), 1"
+            "test: successful replay must settle the original terminal exactly once"
         );
         drop(recovery);
         tracker
@@ -1277,12 +1283,12 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         .expect("test: postgres_class restart");
     assert!(
         matches!(receipt.cost_settlement, Some(CostSettlement::Recorded { .. })),
-        "test: invariant: matches!(receipt.cost_settlement, Some(CostSettlement::Recorded {{ .. }}))"
+        "test: recorded priced terminal must report the durable ledger settlement"
     );
     assert_eq!(
         crate::cost::tracker::settle_metered_call_count(&workspace),
         1,
-        "test: invariant: crate::cost::tracker::settle_metered_call_count(&workspace), 1"
+        "test: recorded terminal must not repeat the metered settlement call"
     );
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
@@ -1321,7 +1327,10 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
         .read_recovery_receipt(&pending_chain)
         .expect("test: authenticated pending receipt")
         .expect("test: pending ingress attestation");
-    assert_eq!(pending.state, "pending", "test: invariant: pending.state, \"pending\"");
+    assert_eq!(
+        pending.state, "pending",
+        "test: deferred settlement must remain pending until its projection runs"
+    );
     assert_eq!(
         fixture_readback::erasure_index_rows_for(&workspace, "recovery_attestations", &origin),
         0,
@@ -1354,7 +1363,7 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
     assert_eq!(
         fixture_readback::row_count(&workspace, "recovery_attestations"),
         0,
-        "test: invariant: fixture_readback::row_count(&workspace, \"recovery_attestations\"), 0"
+        "test: erasure must remove recovery attestations so deleted evidence cannot authenticate"
     );
     for table in ["message_events", "ingress_recovery", "recovery_transport_index"] {
         assert_eq!(
@@ -1366,11 +1375,11 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
 
     assert!(
         fixture_readback::table_exists(&workspace, "ramflux_tombstones"),
-        "test: invariant: fixture_readback::table_exists(&workspace, \"ramflux_tombstones\")"
+        "test: erasure must retain the tombstone table to prevent resurrection"
     );
     assert!(
         fixture_readback::row_count(&workspace, "ramflux_tombstones") >= 1,
-        "test: invariant: fixture_readback::row_count(&workspace, \"ramflux_tombstones\") >= 1"
+        "test: erasure must leave a durable tombstone for the removed evidence"
     );
     assert!(
         fixture_readback::row_count(&workspace, "recovery_tombstones") >= 1,
@@ -1380,7 +1389,7 @@ pub(super) async fn recovery_erasure_indexes_settlement_terminal() {
     assert_closed_outbox_facts(&after_outbox.facts);
     assert_eq!(
         after_outbox.settlement_id, before_outbox.settlement_id,
-        "test: invariant: after_outbox.settlement_id, before_outbox.settlement_id"
+        "test: erasure must preserve settlement identity for cost recovery"
     );
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     drop(dir);
@@ -1397,19 +1406,23 @@ pub(super) fn recovery_restart_from_killed_process() {
     assert_eq!(
         value.get("outbox_state").and_then(serde_json::Value::as_str),
         Some("pending"),
-        "test: invariant: value.get(\"outbox_state\").and_then(serde_json::Value::as_str), Some(\"pending\")"
+        "test: commit phase left the outbox row non-pending before restart"
     );
     let terminal_before = fixture_readback::terminal_rows(&workspace)
         .expect("test: terminal before restart")
         .into_iter()
         .map(|row| row.raw_payload)
         .collect::<Vec<_>>();
-    assert_eq!(terminal_before.len(), 1, "test: invariant: terminal_before.len(), 1");
+    assert_eq!(
+        terminal_before.len(),
+        1,
+        "test: killed process must leave exactly one durable terminal to recover"
+    );
     assert!(
         fixture_readback::indexed_tables(&workspace)
             .iter()
             .any(|table| table == "recovery_attestations"),
-        "test: invariant: fixture_readback::indexed_tables(&workspace) .iter() .any(|table| table == \"recovery_attestations\")"
+        "test: committed recovery evidence must be indexed so erasure can find it"
     );
 
     let (mut restarted, ack) = spawn_recovery_child(&workspace, "repair");
@@ -1431,22 +1444,22 @@ pub(super) fn recovery_restart_from_killed_process() {
     assert_eq!(
         repaired.get("outbox_state").and_then(serde_json::Value::as_str),
         Some("acknowledged"),
-        "test: invariant: repaired.get(\"outbox_state\").and_then(serde_json::Value::as_str), Some(\"acknowledged\")"
+        "test: fresh process must acknowledge the interrupted settlement during repair"
     );
     assert_eq!(
         fixture_readback::outbox_rows(&workspace).len(),
         1,
-        "test: invariant: fixture_readback::outbox_rows(&workspace).len(), 1"
+        "test: restart repair must reuse the original outbox intent"
     );
     assert_eq!(
         first_outbox(&workspace).state,
         "acknowledged",
-        "test: invariant: first_outbox(&workspace).state, \"acknowledged\""
+        "test: restart repair must finish acknowledgement so future scans skip the row"
     );
     assert_eq!(
         ledger_lines(&workspace, "prx-killed"),
         1,
-        "test: invariant: ledger_lines(&workspace, \"prx-killed\"), 1"
+        "test: restart repair must append exactly one ledger row"
     );
     let terminal_after = fixture_readback::terminal_rows(&workspace)
         .expect("test: terminal after restart")
@@ -1461,7 +1474,7 @@ pub(super) fn recovery_restart_from_killed_process() {
         fixture_readback::indexed_tables(&workspace)
             .iter()
             .any(|table| table == "recovery_attestations"),
-        "test: invariant: fixture_readback::indexed_tables(&workspace) .iter() .any(|table| table == \"recovery_attestations\")"
+        "test: restart must preserve the recovery evidence index for later erasure"
     );
     drop(dir);
 }

@@ -67,7 +67,7 @@ pub(super) async fn finalize_recovery_terminal(
     cost_config: &CostConfig,
     workspace_dir: &Path,
     stop_after_marker: bool,
-    mut execution_trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
+    execution_trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     mut prepared_replay: Option<PreparedReplay>,
     reply_and_usage: ReplyAndUsage,
 ) -> anyhow::Result<TurnTerminalReceipt> {
@@ -120,67 +120,83 @@ pub(super) async fn finalize_recovery_terminal(
         .transpose()?;
     let usage_json = serde_json::to_vec(&redacted_usage)?;
     let mac_memory = std::sync::Arc::clone(&memory);
-    let mac_commit = commit.clone();
     let mac_workspace = fabric.workspace_id().to_owned();
-    let mac_trace = execution_trace.clone();
-    let mac_parameters = prepared_parameters.clone();
-    let (key_id, semantic, reply_reference, semantic_bytes, semantic_mac_v3, usage_digest) =
-        crate::runtime::blocking::spawn_blocking(move || {
-            let repository = mac_memory
-                .recovery_repository()
-                .context("recovery repository unavailable")?;
-            let active_id = repository.activate_recovery_authority()?;
-            let key_id = match existing_payload.as_ref() {
-                Some(payload) => payload
-                    .get("recovery_key_id")
+    let (
+        commit,
+        mut execution_trace,
+        prepared_parameters,
+        key_id,
+        semantic,
+        reply_reference,
+        semantic_bytes,
+        semantic_mac_v3,
+        usage_digest,
+    ) = crate::runtime::blocking::spawn_blocking(move || {
+        let repository = mac_memory
+            .recovery_repository()
+            .context("recovery repository unavailable")?;
+        let active_id = repository.activate_recovery_authority()?;
+        let key_id = match existing_payload.as_ref() {
+            Some(payload) => payload
+                .get("recovery_key_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .context("recovery terminal claim key is missing")?,
+            None => active_id,
+        };
+        let (semantic, reply_reference) = claim_semantic(
+            &commit,
+            &mac_workspace,
+            recorded,
+            execution_trace.as_ref(),
+            &prepared_parameters,
+            &key_id,
+            original_reference,
+        )?;
+        let semantic_bytes = serde_json::to_vec(&semantic)?;
+        let mut claim_preimage = semantic_bytes.clone();
+        claim_preimage.extend_from_slice(key_id.as_bytes());
+        if let Some(payload) = existing_payload.as_ref() {
+            let bytes = hex::decode(
+                payload
+                    .get("semantic_mac_v3")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .context("recovery terminal claim key is missing")?,
-                None => active_id,
-            };
-            let (semantic, reply_reference) = claim_semantic(
-                &mac_commit,
-                &mac_workspace,
-                recorded,
-                mac_trace.as_ref(),
-                &mac_parameters,
-                &key_id,
-                original_reference,
+                    .context("recovery terminal claim mac is missing")?,
             )?;
-            let semantic_bytes = serde_json::to_vec(&semantic)?;
-            let mut claim_preimage = semantic_bytes.clone();
-            claim_preimage.extend_from_slice(key_id.as_bytes());
-            if let Some(payload) = existing_payload.as_ref() {
-                let bytes = hex::decode(
-                    payload
-                        .get("semantic_mac_v3")
-                        .and_then(serde_json::Value::as_str)
-                        .context("recovery terminal claim mac is missing")?,
-                )?;
-                let tag = crate::memory::recovery_authority::RecoveryTag {
-                    key_id: key_id.clone(),
-                    tag: bytes
-                        .as_slice()
-                        .try_into()
-                        .context("recovery terminal claim mac length")?,
-                };
-                repository
-                    .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
-                    .context("recovery terminal commit conflict")?;
-            }
-            let claim = hex::encode(
-                repository
-                    .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
-                    .tag,
-            );
-            let usage = hex::encode(
-                repository
-                    .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
-                    .tag,
-            );
-            Ok::<_, anyhow::Error>((key_id, semantic, reply_reference, semantic_bytes, claim, usage))
-        })
-        .await??;
+            let tag = crate::memory::recovery_authority::RecoveryTag {
+                key_id: key_id.clone(),
+                tag: bytes
+                    .as_slice()
+                    .try_into()
+                    .context("recovery terminal claim mac length")?,
+            };
+            repository
+                .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
+                .context("recovery terminal commit conflict")?;
+        }
+        let claim = hex::encode(
+            repository
+                .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
+                .tag,
+        );
+        let usage = hex::encode(
+            repository
+                .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
+                .tag,
+        );
+        Ok::<_, anyhow::Error>((
+            commit,
+            execution_trace,
+            prepared_parameters,
+            key_id,
+            semantic,
+            reply_reference,
+            semantic_bytes,
+            claim,
+            usage,
+        ))
+    })
+    .await??;
     let semantic_mac_v2 = if recorded {
         let recorded_link = commit
             .decision

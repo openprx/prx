@@ -174,7 +174,14 @@ pub(super) fn pending_recovery_costs(
     let rows = statement.query_map(params![workspace_id, after, limit as i64], read_raw)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(authenticate(&directory, row?)?);
+        let raw = row?;
+        let settlement_id = raw.settlement_id.clone();
+        match authenticate(&directory, raw) {
+            Ok(row) => out.push(row),
+            Err(_) => {
+                tracing::warn!(%settlement_id, "recovery cost outbox row failed authentication; left unprojected")
+            }
+        }
     }
     Ok(out)
 }
