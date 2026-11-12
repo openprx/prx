@@ -164,37 +164,44 @@ async fn direct_import(
 
 #[tokio::test]
 async fn a_model_supplied_grant_never_reaches_the_tool_and_a_plain_approval_is_not_a_grant() {
-    for autonomy in [AutonomyLevel::Supervised] {
-        // The default strategy denies: the call was asked, not allowed through.
-        let (denied, active) = direct_import(autonomy, Arc::new(DenyApprovalStrategy), true).await;
-        assert_eq!(denied.status, ToolExecutionStatus::ApprovalDenied, "{autonomy:?}");
-        assert_eq!(
-            denied.decision,
-            Some(crate::tools::ToolExecutionDecision::Ask),
-            "{autonomy:?}"
-        );
-        assert_eq!(active, None, "{autonomy:?}: nothing was published");
+    let autonomy = AutonomyLevel::Supervised;
+    // The default strategy denies: the call was asked, not allowed through.
+    let (denied, active) = direct_import(autonomy, Arc::new(DenyApprovalStrategy), true).await;
+    assert_eq!(denied.status, ToolExecutionStatus::ApprovalDenied, "{autonomy:?}");
+    assert_eq!(
+        denied.decision,
+        Some(crate::tools::ToolExecutionDecision::Ask),
+        "{autonomy:?}"
+    );
+    assert_eq!(active, None, "{autonomy:?}: nothing was published");
 
-        // An approval that carries no grant is not enough either: the tool
-        // refuses, and the injected signed grant was stripped.
-        let (refused, active) = direct_import(autonomy, Arc::new(ApproveWithoutGrant), true).await;
-        assert_ne!(refused.status, ToolExecutionStatus::Succeeded, "{autonomy:?}");
-        let error = refused
-            .result
-            .as_ref()
-            .and_then(|result| result.error.clone())
-            .unwrap_or_default();
-        assert!(error.contains("explicit approval grant"), "{autonomy:?}: {error}");
-        assert_eq!(active, None, "{autonomy:?}: nothing was published");
-    }
+    // An approval that carries no grant is not enough either: the tool
+    // refuses, and the injected signed grant was stripped.
+    let (refused, active) = direct_import(autonomy, Arc::new(ApproveWithoutGrant), true).await;
+    assert_ne!(refused.status, ToolExecutionStatus::Succeeded, "{autonomy:?}");
+    let error = refused
+        .result
+        .as_ref()
+        .and_then(|result| result.error.clone())
+        .unwrap_or_default();
+    assert!(error.contains("explicit approval grant"), "{autonomy:?}: {error}");
+    assert_eq!(active, None, "{autonomy:?}: nothing was published");
 }
 
 #[tokio::test]
 async fn read_only_autonomy_denies_the_import_in_the_execution_service() {
     let (outcome, active) = direct_import(AutonomyLevel::ReadOnly, Arc::new(ApproveWithoutGrant), false).await;
-    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
-    assert_eq!(outcome.decision, Some(crate::tools::ToolExecutionDecision::Deny));
-    assert_eq!(active, None);
+    assert_eq!(
+        outcome.status,
+        ToolExecutionStatus::Denied,
+        "test: ReadOnly denies import"
+    );
+    assert_eq!(
+        outcome.decision,
+        Some(crate::tools::ToolExecutionDecision::Deny),
+        "test: execution policy owns the denial"
+    );
+    assert_eq!(active, None, "test: denied import publishes no lifecycle binding");
 }
 
 fn real_service(registry: Arc<Vec<Box<dyn Tool>>>, security: Arc<SecurityPolicy>) -> ToolExecutionService {
