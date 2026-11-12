@@ -338,3 +338,32 @@ async fn incomplete_cleanup_keeps_the_original_work_failure() {
     assert!(chain.contains("specific ingress failure"));
     assert!(chain.contains("runtime terminal cleanup has unconfirmed failures"));
 }
+
+#[test]
+fn refusal_warnings_are_emitted_once_per_interval_per_owner() {
+    let throttle = super::RefusalLogThrottle::default();
+    let start = tokio::time::Instant::now();
+    assert!(throttle.should_emit(start), "the first refusal must be logged");
+    // 59 further refusals, one per second, all inside the interval.
+    for second in 1..super::REFUSAL_LOG_INTERVAL.as_secs() {
+        assert!(
+            !throttle.should_emit(start + Duration::from_secs(second)),
+            "a refusal {second}s after the logged one must stay silent"
+        );
+    }
+    let next = start + super::REFUSAL_LOG_INTERVAL;
+    assert!(
+        throttle.should_emit(next),
+        "a refusal after the interval must be logged again"
+    );
+    assert!(
+        !throttle.should_emit(next + Duration::from_secs(1)),
+        "the interval restarts from the last logged refusal"
+    );
+
+    let other_owner = super::RefusalLogThrottle::default();
+    assert!(
+        other_owner.should_emit(start),
+        "another owner has its own limit and logs its first refusal"
+    );
+}

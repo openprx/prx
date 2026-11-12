@@ -8,8 +8,33 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct CleanupTracker {
     state: parking_lot::Mutex<State>,
     changed: tokio::sync::Notify,
+    refusal_log: RefusalLogThrottle,
     #[cfg(test)]
     diagnostic: diagnostic::Binding,
+}
+
+/// Minimum spacing between two refusal warnings of one cleanup owner.
+const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-owner limit on refusal warnings. A failed owner refuses every request
+/// until recovery, so the warning must not follow the request rate. The state is
+/// one timestamp inside the owner: it cannot grow and it dies with the owner.
+#[derive(Default)]
+struct RefusalLogThrottle {
+    last_emitted: parking_lot::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl RefusalLogThrottle {
+    /// True for the first refusal and then once `REFUSAL_LOG_INTERVAL` has
+    /// passed since the last refusal that returned true.
+    fn should_emit(&self, now: tokio::time::Instant) -> bool {
+        let mut last_emitted = self.last_emitted.lock();
+        let due = last_emitted.is_none_or(|previous| now.saturating_duration_since(previous) >= REFUSAL_LOG_INTERVAL);
+        if due {
+            *last_emitted = Some(now);
+        }
+        due
+    }
 }
 
 #[derive(Default)]
@@ -47,6 +72,12 @@ pub(crate) struct CleanupTicket {
 impl CleanupTracker {
     pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, work: F) -> F::Output {
         CURRENT_CLEANUP.scope(Arc::clone(self), work).await
+    }
+
+    /// Whether a refusal by this owner should be logged now. Callers log only
+    /// when this returns true, which bounds refusal warnings per owner.
+    pub(crate) fn refusal_log_due(&self) -> bool {
+        self.refusal_log.should_emit(tokio::time::Instant::now())
     }
 
     #[cfg(test)]

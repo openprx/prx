@@ -238,6 +238,55 @@ fn normalize_offset(offset: Option<usize>) -> usize {
     offset.unwrap_or(0)
 }
 
+/// Content-free category of a Console request failure, safe to log.
+///
+/// The error chain itself is never logged: a storage or decode error can quote
+/// stored input. Only these static names leave this function.
+fn console_error_kind(error: &anyhow::Error) -> &'static str {
+    if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>()
+        || error.is::<crate::runtime::ingress_recovery::IngressConflict>()
+    {
+        return "conflict";
+    }
+    if error.is::<crate::memory::AgentScopeRefused>() {
+        return "unauthorized";
+    }
+    for cause in error.chain() {
+        if cause.is::<serde_json::Error>() {
+            return "decode";
+        }
+        if cause.is::<rusqlite::Error>() || cause.is::<tokio_postgres::Error>() {
+            return "storage";
+        }
+        if cause.is::<std::io::Error>() {
+            return "io";
+        }
+        if cause.is::<tokio::time::error::Elapsed>() {
+            return "timeout";
+        }
+    }
+    "other"
+}
+
+/// Logs a cleanup-owner refusal, at most once per throttle interval per owner.
+///
+/// A failed owner refuses every request until recovery, so an unthrottled
+/// warning would follow the request rate. Only a static category and the static
+/// route name are logged.
+fn warn_cleanup_refused(
+    owner: &crate::runtime::turn_cleanup::CleanupTracker,
+    route: &'static str,
+    error: &anyhow::Error,
+) {
+    if owner.refusal_log_due() {
+        tracing::warn!(
+            error_kind = console_error_kind(error),
+            route,
+            "Console request refused by its runtime cleanup owner; repeats are logged at most once per minute"
+        );
+    }
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
@@ -300,9 +349,11 @@ fn history_partition(
                     "Targeted agent incarnation is missing",
                 )));
             };
-            let incarnation = uuid::Uuid::parse_str(raw).map_err(|error| {
+            let incarnation = uuid::Uuid::parse_str(raw).map_err(|_| {
+                // The parse error can quote a character of the stored value, so
+                // only a static category and the validated agent name are logged.
                 tracing::warn!(
-                    error = %error,
+                    error_kind = "invalid_uuid",
                     agent = turn.name.as_str(),
                     "Targeted agent incarnation is not a valid UUID"
                 );
@@ -1185,11 +1236,7 @@ pub(super) async fn get_decision_approval(
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                tracing::warn!(
-                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                    session_id = %session_id,
-                    "Console decision approval read refused: runtime cleanup owner rejected the request"
-                );
+                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console decision approval read", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
@@ -1262,10 +1309,7 @@ pub(super) async fn get_session_approvals(
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                tracing::warn!(
-                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                    "Console approval inbox refused: runtime cleanup owner rejected the request"
-                );
+                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console approval inbox", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
@@ -1463,10 +1507,10 @@ async fn change_decision_approval(
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                tracing::warn!(
-                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                    session_id = %session_id,
-                    "Console decision approval change refused: runtime cleanup owner rejected the request"
+                warn_cleanup_refused(
+                    &runtime.decision_slot.cleanup,
+                    "Console decision approval change",
+                    &error,
                 );
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
@@ -1867,11 +1911,7 @@ pub(super) async fn post_decision_resume(
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                tracing::warn!(
-                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                    session_id = %session_id,
-                    "Console decision resume refused: runtime cleanup owner rejected the request"
-                );
+                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console decision resume", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
@@ -2037,11 +2077,7 @@ async fn submit_console_message(
     let ticket = match turn_runtime.decision_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
         Err(error) => {
-            tracing::warn!(
-                error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                session_id = %session_id,
-                "Console input admission refused: runtime cleanup owner rejected the request"
-            );
+            warn_cleanup_refused(&turn_runtime.decision_slot.cleanup, "Console input admission", &error);
             return json_error(StatusCode::SERVICE_UNAVAILABLE, "Console input admission is closed");
         }
     };
@@ -2068,9 +2104,10 @@ async fn submit_console_message(
                 .into_response();
         }
         Err(error) => {
-            // Only the error chain and the session id are logged; the message body never is.
+            // The chain can quote stored input (a recovery capsule decode error
+            // does), so only its content-free category and the session id are logged.
             tracing::warn!(
-                error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                error_kind = console_error_kind(&error),
                 session_id = %session_id,
                 "Console input persistence failed before admission"
             );
@@ -2085,7 +2122,7 @@ async fn submit_console_message(
     let (cleanup_sender, cleanup_receiver) = tokio::sync::oneshot::channel();
     if let Err(error) = guard.attach_acknowledgement(cleanup_sender) {
         tracing::warn!(
-            error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+            error_kind = console_error_kind(&error),
             session_id = %session_id,
             "Console input cleanup ownership could not be attached"
         );
@@ -2672,6 +2709,43 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::broadcast;
+
+    #[test]
+    fn console_error_kind_never_carries_error_text() {
+        const MARKER: &str = "PRIVATE-STORED-MARKER";
+        let decode = serde_json::from_str::<u32>(&format!("\"{MARKER}\""))
+            .expect_err("test: a string is not a valid integer capsule field");
+        assert!(
+            decode.to_string().contains(MARKER),
+            "the fixture must reproduce a decode error that quotes stored text"
+        );
+        let error = anyhow::Error::from(decode).context(format!("recovery scan failed for {MARKER}"));
+        assert!(
+            format!("{error:#}").contains(MARKER),
+            "the unrestricted chain carries the marker"
+        );
+        let kind = console_error_kind(&error);
+        assert_eq!(
+            kind, "decode",
+            "a serde failure anywhere in the chain is a decode failure"
+        );
+        assert!(!kind.contains(MARKER), "the logged category must not carry error text");
+
+        let untyped = anyhow::anyhow!("untyped failure quoting {MARKER}");
+        assert_eq!(
+            console_error_kind(&untyped),
+            "other",
+            "an untyped error is reported by a static category only"
+        );
+        let conflict = anyhow::Error::from(crate::runtime::ingress_recovery::AlreadyAccepted).context(MARKER);
+        assert_eq!(
+            console_error_kind(&conflict),
+            "conflict",
+            "a typed conflict keeps its category under added context"
+        );
+        let io = anyhow::Error::from(std::io::Error::other(MARKER));
+        assert_eq!(console_error_kind(&io), "io", "an I/O failure is reported as io");
+    }
 
     #[test]
     fn console_runtime_envelope_preserves_session_channel_and_sender() {
@@ -4294,11 +4368,7 @@ async fn call_approval_action(
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(
-                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
-                    session_id = %session,
-                    "Console call approval refused: runtime cleanup owner rejected the request"
-                );
+                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console call approval", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
