@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 const MAX_PROVIDER_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[tokio::test]
-async fn chat_workdir_reaches_real_worker_and_unset_keeps_worker_workspace() {
+async fn chat_config_workdir_reaches_real_worker_and_unset_keeps_worker_workspace() {
     tokio::time::timeout(Duration::from_secs(120), async {
         for override_root in [true, false] {
             Box::pin(root_pwd(true, override_root)).await;

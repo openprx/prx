@@ -3465,7 +3465,10 @@ and inherits the parent environment except known provider credentials, worker se
 a Full shell can read local configuration. Native file tools may access paths outside
 the workspace and forbidden paths; parent traversal (`..`) remains refused. Private
 owner filesystems and memory ACL checks retain their own rules. Supervised and ReadOnly
-keep their existing restrictions; an approval does not enable git in a Supervised shell.
+resolve relative native file requests and shell path arguments against the selected
+working root. All forbidden-path and workspace-only limits are evaluated on that
+resolved path; ReadOnly still refuses mutations. An approval does not enable git
+in a Supervised shell.
 A child's effective level cannot exceed its manifest or the current service level.
 Direct tool calls without runtime authority keep the Supervised behavior.
 Docker continues to use the shell environment allowlist at every level. Native Full

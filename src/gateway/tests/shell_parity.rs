@@ -196,6 +196,19 @@ async fn full_gateway_turn_runs_git_through_native_shell() {
 
 #[tokio::test]
 async fn generation_swap_changes_git_outcome_between_calls() {
+    struct Approve;
+    #[async_trait::async_trait]
+    impl crate::tools::execution::ApprovalStrategy for Approve {
+        async fn resolve(
+            &self,
+            _: crate::tools::execution::ToolApprovalRequest,
+        ) -> crate::tools::execution::ToolApprovalDecision {
+            crate::tools::execution::ToolApprovalDecision::Approved {
+                runtime_approval_granted: true,
+                runtime_grant: None,
+            }
+        }
+    }
     tokio::time::timeout(Duration::from_secs(45), async {
         let root = tempfile::tempdir().expect("test: root");
         let mut config = Config::default();
@@ -225,9 +238,15 @@ async fn generation_swap_changes_git_outcome_between_calls() {
             let runtime = owner.pin();
             let service = runtime.decision_slot.publish(&runtime, &state).await.expect("test: live publication");
             let context = crate::tools::ToolExecutionContext::new(crate::runtime::envelope::RuntimeEnvelope::agent("workspace-a", "parity-reload").with_owner_id("prx_user").with_channel("terminal"), "dm");
-            let outcome = service.execution().execute(crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command":"git --version"})), context, None).await;
+            let outcome = service.execution().with_test_approval(Arc::new(Approve)).execute(crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command":"git --version"})), context, None).await;
             let success = outcome.result.as_ref().is_some_and(|result| result.success);
             assert_eq!(success, level == crate::security::AutonomyLevel::Full, "test: existing gateway adopts generation policy");
+            if level == crate::security::AutonomyLevel::Supervised {
+                assert_eq!(outcome.result.as_ref().and_then(|result| result.error.as_deref()),
+                    Some(crate::runtime::shell_process::ShellProcessError::GitRefused.to_string().as_str()),
+                    "test: the approved call must reach the native git refusal");
+            }
+
         }
         let cleanup = owner.cleanup.clone();
         drop(state);

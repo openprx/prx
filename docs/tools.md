@@ -87,8 +87,10 @@ and cron/Xin shell jobs keep their existing git policy.
 
 `runtime.workdir` or `prx agent --workdir /absolute/task` selects the working root
 for shell, native file tools and `git_operations`; otherwise they use the workspace.
-Full native file tools bypass workspace and forbidden-path confinement, while
-still refusing `..`. Owner-private routing and memory ACLs remain enforced.
+Restricted native file and shell path checks resolve relative requests against
+that root before evaluating forbidden paths and workspace confinement. ReadOnly
+still refuses mutations. Full native file tools bypass workspace and forbidden-path
+confinement, while still refusing `..`. Owner-private routing and memory ACLs remain enforced.
 See [working-directory configuration](configuration.md#native-tool-working-directory-and-full-autonomy)
 for validation, restart and Docker mount rules.
 

@@ -1639,6 +1639,7 @@ fn tool_descriptor(
 }
 
 /// Mandatory application pipeline for native tools and MCP aliases.
+#[cfg_attr(test, derive(Clone))]
 pub struct ToolExecutionService {
     backends: Arc<[Arc<dyn ToolBackend>]>,
     catalog: ToolCatalog,
@@ -1659,6 +1660,14 @@ struct TestPostReservationGate {
 }
 
 impl ToolExecutionService {
+    /// Preserve the published generation and ports while approving a test call.
+    #[cfg(test)]
+    pub(crate) fn with_test_approval(&self, approval: Arc<dyn ApprovalStrategy>) -> Self {
+        let mut service = self.clone();
+        service.approval = approval;
+        service
+    }
+
     #[must_use]
     pub fn new(
         tools: Vec<Arc<dyn Tool>>,

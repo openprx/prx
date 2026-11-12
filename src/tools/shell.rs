@@ -21,11 +21,12 @@ const fn shell_git_policy(level: crate::security::AutonomyLevel) -> crate::runti
 /// Direct host shell command execution tool.
 ///
 /// Authorization belongs to the orchestration boundary. This executor passes
-/// command text unchanged to the configured runtime and applies no ACL, path
-/// parser or OS sandbox. Runtime authority selects git and environment policy.
+/// command text unchanged to the configured runtime after checking path arguments
+/// against its execution root. Runtime authority selects git and environment policy.
 pub struct ShellTool {
     process: ShellProcessAdapter,
     workspace_dir: std::path::PathBuf,
+    path_policy: Option<Arc<crate::security::SecurityPolicy>>,
 }
 
 impl ShellTool {
@@ -33,7 +34,13 @@ impl ShellTool {
         Self {
             process: ShellProcessAdapter::new(runtime).with_environment_allowlist(Vec::new()),
             workspace_dir,
+            path_policy: None,
         }
+    }
+
+    pub(crate) fn with_path_policy(mut self, policy: Arc<crate::security::SecurityPolicy>) -> Self {
+        self.path_policy = Some(policy);
+        self
     }
 
     /// Inherit additional exact environment names configured by the operator.
@@ -79,6 +86,20 @@ impl ShellTool {
             .get("command")
             .and_then(|value| value.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        if super::effective_autonomy::current() != Some(crate::security::AutonomyLevel::Full) {
+            if let Some(policy) = &self.path_policy {
+                if let Err(error) = policy.validate_command_paths_at(&self.workspace_dir, command) {
+                    return Ok(ToolInvocationResult {
+                        result: ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(error),
+                        },
+                        process: None,
+                    });
+                }
+            }
+        }
         match self
             .process
             .execute_observed(ShellProcessRequest {

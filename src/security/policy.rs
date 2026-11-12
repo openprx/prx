@@ -35,10 +35,15 @@ struct ShellLexToken {
 const MAX_NESTED_SHELL_VALIDATION_DEPTH: usize = 4;
 
 fn forbidden_path_argument(policy: &SecurityPolicy, command: &str) -> Option<CommandPathViolation> {
-    forbidden_path_argument_inner(policy, command, 0)
+    forbidden_path_argument_inner(policy, &policy.workspace_dir, command, 0)
 }
 
-fn forbidden_path_argument_inner(policy: &SecurityPolicy, command: &str, depth: usize) -> Option<CommandPathViolation> {
+fn forbidden_path_argument_inner(
+    policy: &SecurityPolicy,
+    root: &Path,
+    command: &str,
+    depth: usize,
+) -> Option<CommandPathViolation> {
     let folded_command = fold_shell_line_continuations(command);
     for segment in split_unquoted_segments(&folded_command) {
         let tokens = shell_words_and_redirections(&segment);
@@ -100,13 +105,14 @@ fn forbidden_path_argument_inner(policy: &SecurityPolicy, command: &str, depth: 
                     || candidate.starts_with("../")
                     || candidate.starts_with("~/")
                     || (candidate.contains('/') && !candidate.chars().any(char::is_whitespace));
-                if looks_like_path && !policy.is_path_allowed(candidate) {
+                if looks_like_path && !policy.is_path_allowed_at(root, candidate) {
                     return Some(CommandPathViolation::Forbidden(candidate.to_string()));
                 }
                 index += 1;
             }
             if let Some(violation) = nested_wrapper_violation(
                 policy,
+                root,
                 &executable.text,
                 tokens.get(arguments_start..index).unwrap_or_default(),
                 depth,
@@ -134,6 +140,7 @@ fn allows_benign_dynamic_arguments(executable: &str) -> bool {
 
 fn nested_wrapper_violation(
     policy: &SecurityPolicy,
+    root: &Path,
     executable: &str,
     arguments: &[ShellLexToken],
     depth: usize,
@@ -170,7 +177,7 @@ fn nested_wrapper_violation(
                 .iter()
                 .position(|word| matches!(*word, "-c" | "-e"))
                 .and_then(|flag| words.get(flag + 1))?;
-            return code_payload_violation(policy, payload);
+            return code_payload_violation(policy, root, payload);
         }
         _ => None,
     }?;
@@ -180,10 +187,10 @@ fn nested_wrapper_violation(
     if depth >= MAX_NESTED_SHELL_VALIDATION_DEPTH {
         return Some(CommandPathViolation::Dynamic(payload));
     }
-    forbidden_path_argument_inner(policy, &payload, depth + 1)
+    forbidden_path_argument_inner(policy, root, &payload, depth + 1)
 }
 
-fn code_payload_violation(policy: &SecurityPolicy, payload: &str) -> Option<CommandPathViolation> {
+fn code_payload_violation(policy: &SecurityPolicy, root: &Path, payload: &str) -> Option<CommandPathViolation> {
     if payload.contains('$') {
         return Some(CommandPathViolation::Dynamic(payload.to_string()));
     }
@@ -194,7 +201,7 @@ fn code_payload_violation(policy: &SecurityPolicy, payload: &str) -> Option<Comm
             || candidate.starts_with("./")
             || candidate.starts_with("../")
             || candidate.starts_with("~/");
-        if looks_like_path && !policy.is_path_allowed(candidate) {
+        if looks_like_path && !policy.is_path_allowed_at(root, candidate) {
             return Some(CommandPathViolation::Forbidden(candidate.to_string()));
         }
     }
@@ -1735,81 +1742,14 @@ impl SecurityPolicy {
         }
     }
 
-    // ── Path Validation ────────────────────────────────────────────────
-    // Layered checks: null-byte injection → component-level traversal →
-    // URL-encoded traversal → tilde expansion → absolute-path block →
-    // forbidden-prefix match. Each layer addresses a distinct escape
-    // technique; together they enforce workspace confinement.
-
-    /// Check if a file path is allowed (no path traversal, within workspace)
-    pub fn is_path_allowed(&self, path: &str) -> bool {
-        // Block null bytes (can truncate paths in C-backed syscalls)
-        if path.contains('\0') {
-            return false;
+    /// Validate shell path arguments against the directory used by the process.
+    pub(crate) fn validate_command_paths_at(&self, root: &Path, command: &str) -> Result<(), String> {
+        match forbidden_path_argument_inner(self, root, command, 0) {
+            None => Ok(()),
+            Some(CommandPathViolation::Forbidden(path)) => Err(format!("forbidden path argument: {path}")),
+            Some(CommandPathViolation::Dynamic(token)) => Err(format!("forbidden dynamic path argument: {token}")),
+            Some(CommandPathViolation::ActiveSubstitution) => Err("forbidden active shell substitution".into()),
         }
-
-        // Block path traversal: check for ".." as a path component
-        if Path::new(path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return false;
-        }
-
-        // Block URL-encoded traversal attempts (e.g. ..%2f)
-        let lower = path.to_lowercase();
-        if lower.contains("..%2f") || lower.contains("%2f..") {
-            return false;
-        }
-
-        // Expand tilde for comparison
-        let expanded = crate::config::expand_home(Path::new(path));
-
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded.is_absolute() {
-            return false;
-        }
-
-        // Block forbidden paths using path-component-aware matching. A relative
-        // path is also matched where it lands inside the workspace, so an absolute
-        // forbidden entry covers `state/x` the same as `<workspace>/state/x`
-        // (".." components were rejected above, so the join cannot leave it).
-        let expanded_path = expanded.as_path();
-        let in_workspace = (!expanded.is_absolute()).then(|| self.workspace_dir.join(expanded_path));
-        for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = crate::config::expand_home(Path::new(forbidden));
-            // Only entries that lie inside the workspace apply to the joined path:
-            // a workspace that itself sits below a forbidden prefix stays usable.
-            // Compared case-insensitively: on a case-insensitive filesystem
-            // `STATE/x` is `state/x`.
-            let fold = |path: &Path| PathBuf::from(path.to_string_lossy().to_lowercase());
-            let covers_relative = fold(&forbidden_expanded).starts_with(fold(&self.workspace_dir))
-                && in_workspace
-                    .as_ref()
-                    .is_some_and(|resolved| fold(resolved).starts_with(fold(&forbidden_expanded)));
-            if expanded_path.starts_with(&forbidden_expanded) || covers_relative {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// Validate that a resolved path is still inside the workspace.
-    /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
-    pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        if !self.workspace_only {
-            return true;
-        }
-
-        // Must be under workspace_dir (prevents symlink escapes).
-        // Prefer canonical workspace root so `/a/../b` style config paths don't
-        // cause false positives or negatives.
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
-        resolved.starts_with(workspace_root)
     }
 
     /// Check if autonomy level permits any action at all

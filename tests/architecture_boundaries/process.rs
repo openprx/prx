@@ -618,3 +618,35 @@ fn stdio_mcp_launches_start_from_a_cleared_environment() {
         );
     }
 }
+
+/// Plain git is an explicit Full-shell exception. Every production spelling is reviewed.
+#[test]
+fn plain_git_policy_has_only_the_reviewed_production_sites() {
+    let mut actual = Vec::new();
+    for path in rust_source_files() {
+        let relative = relative_path(&path);
+        let production = production_part(&read_source(&path));
+        let lines: Vec<_> = production.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if line.contains("PlainGit") {
+                actual.push(format!(
+                    "{relative}::{}::{}",
+                    enclosing_function(&lines, index),
+                    normalize_line(line)
+                ));
+            }
+        }
+    }
+    assert_inventory(
+        "production PlainGit policy uses",
+        actual,
+        &[
+            "src/runtime/shell_process.rs::shell_secret_environment::PlainGit,",
+            "src/tools/shell.rs::shell_git_policy::Full => PlainGit,",
+            "src/tools/shell.rs::shell_git_policy::use crate::runtime::shell_process::ShellGitPolicy::{PlainGit, RefuseGit};",
+        ],
+    );
+}
