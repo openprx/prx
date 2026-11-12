@@ -516,8 +516,13 @@ async fn run_owned_manifest(
     // Read-only skills retain the authenticated parent's catalog location.
     // The worker's private workspace scopes mutable tools, but rebuilding the
     // reader there would lose the signed skill bindings inherited by the child.
-    let skill_read_config = (child_parent.is_some() || ordinary_snapshots.is_some() || operator_snapshots.is_some())
-        .then(|| config.clone());
+    let source_skill_reader = (child_parent.is_some() || ordinary_snapshots.is_some() || operator_snapshots.is_some())
+        .then(|| -> Box<dyn crate::tools::Tool> {
+            Box::new(crate::tools::SkillReadTool::new(
+                config.workspace_dir.clone(),
+                config.clone(),
+            ))
+        });
     config.workspace_dir = manifest.workspace_dir.clone();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
@@ -825,15 +830,12 @@ async fn run_owned_manifest(
     )
     .tools;
 
-    if let Some(source_config) = skill_read_config {
+    if let Some(source_reader) = source_skill_reader {
         let reader = full_tools
             .iter_mut()
             .find(|tool| tool.name() == "skill_read")
             .context("worker registry missing skill_read")?;
-        *reader = Box::new(crate::tools::SkillReadTool::new(
-            source_config.workspace_dir.clone(),
-            source_config,
-        ));
+        *reader = source_reader;
     }
 
     // Recreate the same orchestration surfaces that owning entrypoints append
