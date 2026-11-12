@@ -300,7 +300,12 @@ fn history_partition(
                     "Targeted agent incarnation is missing",
                 )));
             };
-            let incarnation = uuid::Uuid::parse_str(raw).map_err(|_| {
+            let incarnation = uuid::Uuid::parse_str(raw).map_err(|error| {
+                tracing::warn!(
+                    error = %error,
+                    agent = turn.name.as_str(),
+                    "Targeted agent incarnation is not a valid UUID"
+                );
                 Box::new(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Targeted agent incarnation is invalid",
@@ -1179,7 +1184,14 @@ pub(super) async fn get_decision_approval(
     let cleanup =
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
-            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                    session_id = %session_id,
+                    "Console decision approval read refused: runtime cleanup owner rejected the request"
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
+            }
         };
     let result = cleanup
         .run(Box::pin(async {
@@ -1249,7 +1261,13 @@ pub(super) async fn get_session_approvals(
     let cleanup =
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
-            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                    "Console approval inbox refused: runtime cleanup owner rejected the request"
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
+            }
         };
     let result = cleanup
         .run(Box::pin(async {
@@ -1444,7 +1462,14 @@ async fn change_decision_approval(
     let cleanup =
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
-            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                    session_id = %session_id,
+                    "Console decision approval change refused: runtime cleanup owner rejected the request"
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
+            }
         };
     let result = cleanup
         .run(Box::pin(async {
@@ -1841,7 +1866,14 @@ pub(super) async fn post_decision_resume(
     let cleanup =
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
-            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                    session_id = %session_id,
+                    "Console decision resume refused: runtime cleanup owner rejected the request"
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
+            }
         };
     let authorization = cleanup
         .run(Box::pin(async {
@@ -2004,7 +2036,14 @@ async fn submit_console_message(
     let input_cancellation = tokio_util::sync::CancellationToken::new();
     let ticket = match turn_runtime.decision_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
-        Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Console input admission is closed"),
+        Err(error) => {
+            tracing::warn!(
+                error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                session_id = %session_id,
+                "Console input admission refused: runtime cleanup owner rejected the request"
+            );
+            return json_error(StatusCode::SERVICE_UNAVAILABLE, "Console input admission is closed");
+        }
     };
     let pending = ConsolePendingInput {
         state: state.clone(),
@@ -2028,7 +2067,13 @@ async fn submit_console_message(
             )
                 .into_response();
         }
-        Err(_) => {
+        Err(error) => {
+            // Only the error chain and the session id are logged; the message body never is.
+            tracing::warn!(
+                error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                session_id = %session_id,
+                "Console input persistence failed before admission"
+            );
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Console input persistence is unconfirmed",
@@ -2038,7 +2083,12 @@ async fn submit_console_message(
     // Establish monitor ownership synchronously, before constructing work that
     // cancellation or registry abortion can drop without ever polling.
     let (cleanup_sender, cleanup_receiver) = tokio::sync::oneshot::channel();
-    if guard.attach_acknowledgement(cleanup_sender).is_err() {
+    if let Err(error) = guard.attach_acknowledgement(cleanup_sender) {
+        tracing::warn!(
+            error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+            session_id = %session_id,
+            "Console input cleanup ownership could not be attached"
+        );
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Console input cleanup ownership is unconfirmed",
@@ -4243,7 +4293,14 @@ async fn call_approval_action(
     let cleanup =
         match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
             Ok(value) => value,
-            Err(_) => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining"),
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::security::redaction::redact_secrets(&format!("{error:#}")),
+                    session_id = %session,
+                    "Console call approval refused: runtime cleanup owner rejected the request"
+                );
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
+            }
         };
     let result = cleanup
         .run(Box::pin(async {
