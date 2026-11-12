@@ -1231,7 +1231,7 @@ pub(crate) fn sse_bytes_to_chunks(
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(Err(StreamError::Http(e))).await;
+                let _ = tx.send(Err(StreamError::from(e))).await;
                 return;
             }
         }
@@ -1384,7 +1384,7 @@ pub(crate) fn sse_bytes_to_chunks(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::from(e))).await;
                     break;
                 }
             }
@@ -2302,7 +2302,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
+            Err(chat_error) => return Err(chat_error.without_url().into()),
         };
 
         if !response.status().is_success() {
@@ -2492,6 +2492,7 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(error) => {
+                let error = error.without_url();
                 tracing::warn!(
                     "{} native tool call transport failed: {error}; falling back to history path",
                     self.name
@@ -2662,7 +2663,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::from(e))).await;
                     return;
                 }
             };
@@ -2691,7 +2692,7 @@ impl Provider for OpenAiCompatibleProvider {
                 response = match fallback_builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        let _ = tx.send(Err(StreamError::from(e))).await;
                         return;
                     }
                 };
@@ -2764,7 +2765,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::from(e))).await;
                     return;
                 }
             };
@@ -2793,7 +2794,7 @@ impl Provider for OpenAiCompatibleProvider {
                 response = match fallback_builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        let _ = tx.send(Err(StreamError::from(e))).await;
                         return;
                     }
                 };
@@ -2834,7 +2835,8 @@ impl Provider for OpenAiCompatibleProvider {
             let _ = self
                 .apply_auth_header(self.http_client().get(&url), Some(credential.as_str()))
                 .send()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
         }
         Ok(())
     }
@@ -4957,3 +4959,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "compatible_secret_url_tests.rs"]
+mod secret_url_tests;

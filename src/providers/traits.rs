@@ -482,6 +482,12 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
 }
 
+impl From<reqwest::Error> for StreamError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
+}
+
 /// Parse a `Retry-After` HTTP header into milliseconds.
 ///
 /// FIX-P0-33: handles the RFC 7231 delta-seconds form (`Retry-After: 120`),
@@ -1480,5 +1486,38 @@ mod tests {
         assert!(chunk.args.is_empty(), "Streaming chunk MUST have empty args");
         assert_eq!(chunk.arguments_delta.as_deref(), Some(r#"{"path":"#));
         assert_eq!(chunk.status, ToolCallChunkStatus::Streaming);
+    }
+
+    #[tokio::test]
+    async fn secret_url_stream_error_strips_real_request_url() {
+        use crate::secret_url_test_support::{DEADLINE, MARKER, dropping_server};
+        tokio::time::timeout(DEADLINE, async {
+            let (address, server) = dropping_server(1, None).await;
+            let error = reqwest::Client::new()
+                .get(format!(
+                    "http://{address}/v1beta/models/m:streamGenerateContent?alt=sse&key={MARKER}"
+                ))
+                .send()
+                .await
+                .expect_err("test: dropped connection must fail");
+            let stream = StreamError::from(error);
+            for rendered in [
+                stream.to_string(),
+                format!("{stream:?}"),
+                crate::chat::error::TransportError::from(stream).to_string(),
+            ] {
+                assert!(
+                    !rendered.contains(MARKER),
+                    "test: transport diagnostic leaked credential: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("/v1beta/") && !rendered.contains("alt=sse"),
+                    "test: transport diagnostic retained request path/query: {rendered}"
+                );
+            }
+            server.await.expect("test: join owned listener");
+        })
+        .await
+        .expect("test: stream confidentiality deadline");
     }
 }

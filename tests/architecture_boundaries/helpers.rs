@@ -1,3 +1,4 @@
+use super::loop_requests::is_identifier_byte;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -583,4 +584,192 @@ fn module_path_attribute(raw: &[char], masked: &[char], begin: usize, end: usize
 /// marker, or it is loaded only by `#[cfg(test)]` module declarations.
 pub(super) fn is_test_code_file(relative: &str, source: &str, test_modules: &BTreeSet<String>) -> bool {
     is_test_only_file(source) || test_modules.contains(relative)
+}
+
+/// Blank comments while retaining strings, including raw strings and URL slashes.
+pub(super) fn blank_comments(source: &str) -> String {
+    let characters: Vec<char> = source.chars().collect();
+    let mut output = characters.clone();
+    let length = characters.len();
+    let blank = |output: &mut [char], from: usize, to: usize| {
+        let end = to.min(length);
+        if from >= end {
+            return;
+        }
+        for slot in &mut output[from..end] {
+            if *slot != '\n' {
+                *slot = ' ';
+            }
+        }
+    };
+    let mut index = 0usize;
+    while index < length {
+        let character = characters[index];
+        if character == '/' && index + 1 < length && characters[index + 1] == '/' {
+            let mut end = index;
+            while end < length && characters[end] != '\n' {
+                end += 1;
+            }
+            blank(&mut output, index, end);
+            index = end;
+            continue;
+        }
+        if character == '/' && index + 1 < length && characters[index + 1] == '*' {
+            let mut depth = 0usize;
+            let mut end = index;
+            while end < length {
+                if characters[end] == '/' && end + 1 < length && characters[end + 1] == '*' {
+                    depth += 1;
+                    end += 2;
+                    continue;
+                }
+                if characters[end] == '*' && end + 1 < length && characters[end + 1] == '/' {
+                    depth = depth.saturating_sub(1);
+                    end += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                end += 1;
+            }
+            blank(&mut output, index, end);
+            index = end;
+            continue;
+        }
+        if character == 'r' || character == 'b' || character == 'c' {
+            // Raw strings of every kind: `r"..."`, `r#"..."#`, `br"..."`,
+            // `br#"..."#`, `cr"..."`, `cr#"..."#`. The literal is raw when an
+            // `r` is in its prefix, whatever letter comes first, so a raw byte
+            // or C string ending in a backslash (`br"C:\"`) ends at its quote.
+            let mut cursor = index;
+            while cursor < length && cursor - index < 2 && matches!(characters[cursor], 'r' | 'b' | 'c') {
+                cursor += 1;
+            }
+            let mut hashes = 0usize;
+            while cursor + hashes < length && characters[cursor + hashes] == '#' {
+                hashes += 1;
+            }
+            let quote = cursor + hashes;
+            let prefix_is_raw = characters[index..cursor].contains(&'r');
+            let raw = cursor > index && quote < length && characters[quote] == '"' && prefix_is_raw;
+            let leading_ident = index > 0 && is_ident_char(characters[index - 1]);
+            if raw && !leading_ident {
+                let mut end = quote + 1;
+                loop {
+                    if end >= length {
+                        break;
+                    }
+                    if characters[end] == '"' {
+                        let mut closing = 0usize;
+                        while closing < hashes && end + 1 + closing < length && characters[end + 1 + closing] == '#' {
+                            closing += 1;
+                        }
+                        if closing == hashes {
+                            end += 1 + hashes;
+                            break;
+                        }
+                    }
+                    end += 1;
+                }
+                index = end;
+                continue;
+            }
+        }
+        if character == '"' {
+            let mut end = index + 1;
+            while end < length {
+                if characters[end] == '\\' {
+                    end += 2;
+                    continue;
+                }
+                if characters[end] == '"' {
+                    end += 1;
+                    break;
+                }
+                end += 1;
+            }
+            index = end;
+            continue;
+        }
+        if character == '\'' {
+            // A character literal, not a lifetime: `'a'`, `'\n'` or `'\''`.
+            let escaped = index + 1 < length && characters[index + 1] == '\\';
+            let mut end = index + 1;
+            if escaped {
+                // Skip the backslash and the escaped character itself (which
+                // may be a quote), then find the closing quote.
+                end += 2;
+                while end < length && characters[end] != '\'' && characters[end] != '\n' && end - index < 12 {
+                    end += 1;
+                }
+            } else {
+                end = index + 2;
+            }
+            if end < length && characters[end] == '\'' {
+                index = end + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    output.into_iter().collect()
+}
+
+/// Every argument of every `tracing` event macro in `production` as
+/// `(offset, field, value)`: `field` is the name of a `name = value` field
+/// (empty for a positional argument or the format string), and a shorthand
+/// field (`provider,`) has the identifier as both name and value.
+pub(super) fn log_macro_arguments(production: &str) -> Vec<(usize, String, String)> {
+    let bytes = production.as_bytes();
+    let mut arguments = Vec::new();
+    for level in ["trace!(", "debug!(", "info!(", "warn!(", "error!("] {
+        let mut search = 0usize;
+        while let Some(found) = production[search..].find(level) {
+            let start = search + found;
+            search = start + level.len();
+            if start > 0 && is_identifier_byte(bytes[start - 1]) {
+                continue;
+            }
+            let open = start + level.len() - 1;
+            let mut depth = 0i32;
+            let mut segment_start = open + 1;
+            for index in open..bytes.len() {
+                match bytes[index] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' | b',' if depth == 1 => {
+                        let segment = production[segment_start..index].trim();
+                        if !segment.is_empty() {
+                            let (field, value) = match segment.split_once('=') {
+                                Some((name, value))
+                                    if !value.starts_with('=')
+                                        && !name.trim().is_empty()
+                                        && name.trim().bytes().all(|byte| is_identifier_byte(byte) || byte == b'.') =>
+                                {
+                                    (name.trim().to_string(), value.trim().to_string())
+                                }
+                                _ => {
+                                    let bare = segment.trim_start_matches(['%', '?']);
+                                    if bare.bytes().all(is_identifier_byte) {
+                                        (bare.to_string(), bare.to_string())
+                                    } else {
+                                        (String::new(), segment.to_string())
+                                    }
+                                }
+                            };
+                            arguments.push((segment_start, field, value));
+                        }
+                        segment_start = index + 1;
+                        if bytes[index] != b',' {
+                            break;
+                        }
+                    }
+                    b')' | b']' | b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    arguments.sort_by_key(|(offset, _, _)| *offset);
+    arguments
 }

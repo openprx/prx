@@ -869,6 +869,11 @@ pub fn redact_url_value(value: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Format the complete CLI error chain with provider URL values redacted.
+pub fn redacted_error_report(error: &anyhow::Error) -> String {
+    redact_provider_text(&format!("{error:?}"))
+}
+
 /// Redact what a provider spelling, or a message that names one, may
 /// carry: the secrets this module recognises, then every URL's userinfo,
 /// query values, valueless parameters and fragment
@@ -973,6 +978,24 @@ where
 mod tests {
     /// RED before PMM-H (D-099 7c): a secret inside a URL path was shown as
     /// `[REDACTED]`, which `holds_redacted_url_part` did not recognise.
+
+    #[test]
+    fn secret_url_error_report_redacts_complete_chain() {
+        for key in ["key", "sig"] {
+            let error =
+                anyhow::anyhow!("request failed for url (https://example.com/private?{key}=PRX_URL_SECRET_MARKER)")
+                    .context("model discovery failed");
+            let shown = redacted_error_report(&error);
+            assert!(
+                !shown.contains("PRX_URL_SECRET_MARKER"),
+                "test: cause leaked query value: {shown}"
+            );
+            assert!(
+                shown.contains("model discovery failed"),
+                "test: outer diagnostic context was lost"
+            );
+        }
+    }
     #[test]
     fn a_secret_in_a_url_path_reads_as_the_url_mask() {
         let token = "sk-proj-abcdefghijklmnopqrstuvwxyz0123";
