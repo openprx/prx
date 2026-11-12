@@ -405,6 +405,29 @@ pub struct TelegramChannel {
     bot_username: Mutex<Option<String>>,
 }
 
+/// What replaces the bot token, and the path of a media URL, in diagnostics.
+const TELEGRAM_REDACTION_MARKER: &str = "[REDACTED]";
+/// Longest diagnostic text kept from a Bot API response body or error, in characters.
+const TELEGRAM_DIAGNOSTIC_MAX_CHARS: usize = 512;
+/// Appended to a diagnostic text that was cut at `TELEGRAM_DIAGNOSTIC_MAX_CHARS`.
+const TELEGRAM_DIAGNOSTIC_TRUNCATED: &str = "… [truncated]";
+
+/// The form of a media URL that may be logged: scheme and host only.
+///
+/// A Telegram file URL (`https://api.telegram.org/file/bot<TOKEN>/…`) carries
+/// the bot token in its path, and other hosts sign their URLs in the path or
+/// the query, so neither is ever written to a log.
+fn loggable_media_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => match parsed.host_str() {
+            Some(host) => format!("{}://{host}/{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
+            None => format!("{}:{TELEGRAM_REDACTION_MARKER}", parsed.scheme()),
+        },
+        // Not a URL (a Telegram file id, for example): nothing of it is safe to show.
+        Err(_) => TELEGRAM_REDACTION_MARKER.to_string(),
+    }
+}
+
 /// Telegram's Bot API origin.
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
@@ -586,19 +609,104 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    /// The one place text that came back from a Bot API call is made safe to
+    /// log or return: every occurrence of this channel's bot token is replaced
+    /// and the text is cut to a bounded length.
+    ///
+    /// The request URL carries the token in its path, so a response body or an
+    /// error from Telegram or from a proxy in between may echo it. The token
+    /// is replaced before the cut, so a cut can never leave part of it behind.
+    fn sanitize_diagnostic(&self, text: &str) -> String {
+        let redacted = if self.bot_token.is_empty() {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(text.replace(self.bot_token.as_str(), TELEGRAM_REDACTION_MARKER))
+        };
+        let mut chars = redacted.chars();
+        let mut kept: String = chars.by_ref().take(TELEGRAM_DIAGNOSTIC_MAX_CHARS).collect();
+        if chars.next().is_some() {
+            kept.push_str(TELEGRAM_DIAGNOSTIC_TRUNCATED);
+        }
+        kept
+    }
+
+    /// Turn a failed Bot API request or response read into an error that is
+    /// safe to log or return: the request URL is dropped, the causes are
+    /// kept as text, and the result goes through `sanitize_diagnostic`.
+    fn transport_error(&self, error: reqwest::Error) -> anyhow::Error {
+        let error = error.without_url();
+        let mut text = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(inner) = cause {
+            text.push_str(": ");
+            text.push_str(&inner.to_string());
+            cause = inner.source();
+        }
+        anyhow::anyhow!(self.sanitize_diagnostic(&text))
+    }
+
+    /// Read the body of a Bot API response for diagnostics only, through
+    /// `sanitize_diagnostic`.
+    async fn response_diagnostic(&self, response: reqwest::Response) -> String {
+        match response.text().await {
+            Ok(body) => self.sanitize_diagnostic(&body),
+            Err(error) => format!("<response body unreadable: {}>", self.transport_error(error)),
+        }
+    }
+
+    /// The `description` of a Bot API error object, safe to log.
+    fn api_error_description(&self, data: &serde_json::Value) -> String {
+        let description = data
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown Telegram API error");
+        self.sanitize_diagnostic(description)
+    }
+
+    /// One `getUpdates` long poll. Its errors are safe to log.
+    async fn fetch_updates(&self, offset: i64) -> anyhow::Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "offset": offset,
+            "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECS,
+            "allowed_updates": ["message"]
+        });
+        let resp = self
+            .http_client()
+            .post(self.api_url("getUpdates"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| self.transport_error(e).context("Telegram poll error"))?;
+        resp.json()
+            .await
+            .map_err(|e| self.transport_error(e).context("Telegram parse error"))
+    }
+
+    /// One `getMe` call: whether the Bot API answered with success. Its
+    /// errors are safe to log.
+    async fn probe_health(&self) -> anyhow::Result<bool> {
+        let resp = self
+            .http_client()
+            .get(self.api_url("getMe"))
+            .send()
+            .await
+            .map_err(|e| self.transport_error(e))?;
+        Ok(resp.status().is_success())
+    }
+
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
         let resp = self
             .http_client()
             .get(self.api_url("getMe"))
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch bot info: {}", resp.status());
         }
 
-        let data: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| self.transport_error(e))?;
         let username = data
             .get("result")
             .and_then(|r| r.get("username"))
@@ -1067,7 +1175,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .json(&markdown_body)
                 .send()
                 .await
-                .map_err(reqwest::Error::without_url)?;
+                .map_err(|e| self.transport_error(e))?;
 
             if markdown_resp.status().is_success() {
                 if index < chunks.len() - 1 {
@@ -1077,7 +1185,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
 
             let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
+            let markdown_err = self.response_diagnostic(markdown_resp).await;
             tracing::warn!(
                 status = ?markdown_status,
                 "Telegram sendMessage with Markdown failed; retrying without parse_mode"
@@ -1103,11 +1211,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .json(&plain_body)
                 .send()
                 .await
-                .map_err(reqwest::Error::without_url)?;
+                .map_err(|e| self.transport_error(e))?;
 
             if !plain_resp.status().is_success() {
                 let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
+                let plain_err = self.response_diagnostic(plain_resp).await;
                 anyhow::bail!(
                     "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
                     markdown_status,
@@ -1156,14 +1264,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram {method} by URL failed: {err}");
         }
 
-        tracing::info!("Telegram {method} sent to {chat_id}: {url}");
+        tracing::info!("Telegram {method} sent to {chat_id}: {}", loggable_media_url(url));
         Ok(())
     }
 
@@ -1264,10 +1372,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
@@ -1302,10 +1410,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
@@ -1342,10 +1450,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
@@ -1380,10 +1488,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
@@ -1420,10 +1528,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendVideo failed: {err}");
         }
 
@@ -1460,10 +1568,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendAudio failed: {err}");
         }
 
@@ -1500,10 +1608,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .multipart(form)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendVoice failed: {err}");
         }
 
@@ -1542,14 +1650,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendDocument by URL failed: {err}");
         }
 
-        tracing::info!("Telegram document (URL) sent to {chat_id}: {url}");
+        tracing::info!("Telegram document (URL) sent to {chat_id}: {}", loggable_media_url(url));
         Ok(())
     }
 
@@ -1584,14 +1692,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendPhoto by URL failed: {err}");
         }
 
-        tracing::info!("Telegram photo (URL) sent to {chat_id}: {url}");
+        tracing::info!("Telegram photo (URL) sent to {chat_id}: {}", loggable_media_url(url));
         Ok(())
     }
 
@@ -1696,14 +1804,14 @@ impl Channel for TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await.unwrap_or_default();
+            let err = self.response_diagnostic(resp).await;
             anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
         }
 
-        let resp_json: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
+        let resp_json: serde_json::Value = resp.json().await.map_err(|e| self.transport_error(e))?;
         let message_id = resp_json
             .get("result")
             .and_then(|r| r.get("message_id"))
@@ -1766,7 +1874,7 @@ impl Channel for TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if resp.status().is_success() {
             self.last_draft_edit
@@ -1774,7 +1882,7 @@ impl Channel for TelegramChannel {
                 .insert(chat_id.clone(), std::time::Instant::now());
         } else {
             let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
+            let err = self.response_diagnostic(resp).await;
             tracing::debug!("Telegram editMessageText failed ({status}): {err}");
         }
 
@@ -1835,7 +1943,7 @@ impl Channel for TelegramChannel {
             .json(&body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -1854,7 +1962,7 @@ impl Channel for TelegramChannel {
             .json(&plain_body)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -1886,11 +1994,11 @@ impl Channel for TelegramChannel {
             }))
             .send()
             .await
-            .map_err(reqwest::Error::without_url)?;
+            .map_err(|e| self.transport_error(e))?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = self.response_diagnostic(response).await;
             tracing::debug!("Telegram deleteMessage failed ({status}): {body}");
         }
 
@@ -1953,26 +2061,10 @@ impl Channel for TelegramChannel {
                 }
             }
 
-            let url = self.api_url("getUpdates");
-            let body = serde_json::json!({
-                "offset": offset,
-                "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECS,
-                "allowed_updates": ["message"]
-            });
-
-            let resp = match self.http_client().post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Telegram poll error: {}", e.without_url());
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let data: serde_json::Value = match resp.json().await {
+            let data = match self.fetch_updates(offset).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("Telegram parse error: {}", e.without_url());
+                    tracing::warn!("{e:#}");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -1988,10 +2080,7 @@ impl Channel for TelegramChannel {
                     .get("error_code")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or_default();
-                let description = data
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown Telegram API error");
+                let description = self.api_error_description(&data);
 
                 if error_code == 409 {
                     tracing::warn!(
@@ -2040,10 +2129,10 @@ Ensure only one `openprx` process is using this bot token."
     async fn health_check(&self) -> bool {
         let timeout_duration = Duration::from_secs(5);
 
-        match tokio::time::timeout(timeout_duration, self.http_client().get(self.api_url("getMe")).send()).await {
-            Ok(Ok(resp)) => resp.status().is_success(),
+        match tokio::time::timeout(timeout_duration, self.probe_health()).await {
+            Ok(Ok(healthy)) => healthy,
             Ok(Err(e)) => {
-                tracing::debug!("Telegram health check failed: {}", e.without_url());
+                tracing::debug!("Telegram health check failed: {e}");
                 false
             }
             Err(_) => {
@@ -2635,51 +2724,281 @@ mod tests {
     /// Upper bound for one refused loopback connection in the leak test.
     const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(10);
 
-    #[tokio::test]
-    async fn bot_api_errors_do_not_carry_the_bot_token() {
-        // The default test API base is a loopback port nothing listens on, so
-        // every call fails with a transport error built from the token URL.
-        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false);
-        let url = ch.api_url("getUpdates");
-        assert!(
-            url.contains(LEAK_TEST_TOKEN),
-            "test setup: the request URL is expected to embed the token"
-        );
+    /// Most connections one leak-test fixture serves before it stops.
+    const LEAK_FIXTURE_MAX_CONNECTIONS: usize = 4;
+    /// Most request bytes the leak-test fixture reads from one connection.
+    const LEAK_FIXTURE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
-        // The raw transport error, formatted the way the long-poll and
-        // health-check log sites format it.
+    /// A loopback origin this test owned a moment ago and nothing listens on now.
+    async fn closed_loopback_base() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("test: read the bound loopback address");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// Whether `request` holds a complete HTTP request head and declared body.
+    fn leak_fixture_request_is_complete(request: &[u8]) -> bool {
+        let Some(head_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(request.get(..head_end).unwrap_or_default()).to_ascii_lowercase();
+        let body_len = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= head_end.saturating_add(4).saturating_add(body_len)
+    }
+
+    /// Read one request from `stream`, bounded in size and time.
+    async fn leak_fixture_read_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt as _;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while request.len() < LEAK_FIXTURE_MAX_REQUEST_BYTES {
+            let Ok(Ok(read)) = tokio::time::timeout(LEAK_TEST_DEADLINE, stream.read(&mut chunk)).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(chunk.get(..read).unwrap_or_default());
+            if leak_fixture_request_is_complete(&request) {
+                return;
+            }
+        }
+    }
+
+    /// A loopback Bot API stand-in that answers every request with one canned
+    /// response. Returns its origin and the serving task.
+    async fn serve_canned_response(status_line: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test: bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("test: read the bound loopback address");
+        let response = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..LEAK_FIXTURE_MAX_CONNECTIONS {
+                let Ok(Ok((mut stream, _))) = tokio::time::timeout(LEAK_TEST_DEADLINE, listener.accept()).await else {
+                    return;
+                };
+                leak_fixture_read_request(&mut stream).await;
+                // A client that already went away is not this fixture's failure.
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// Assert that no rendering of `err` names the leak-test token.
+    fn assert_error_hides_the_token(site: &str, err: &anyhow::Error) {
+        for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(LEAK_TEST_TOKEN),
+                "{site} produced an error that still names the bot token: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_carry_the_bot_token() {
+        let base = closed_loopback_base().await;
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
+        let url = ch.api_url("getUpdates");
+
         let raw = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.http_client().post(&url).send())
             .await
             .expect("test: a refused loopback connection must fail within the deadline")
-            .expect_err("test: nothing listens on the test API base");
+            .expect_err("test: the fixture port was closed before the request");
         assert!(
             raw.to_string().contains(LEAK_TEST_TOKEN),
             "test premise: an unstripped reqwest error names its URL, token included; \
              if this fails the test no longer proves anything"
         );
-        let logged = format!("Telegram poll error: {}", raw.without_url());
-        assert!(
-            !logged.contains(LEAK_TEST_TOKEN),
-            "a log line built from a Bot API transport error leaked the token: {logged}"
-        );
+        assert_error_hides_the_token("transport_error", &ch.transport_error(raw));
 
-        // Errors returned to callers (and logged by them) are stripped at the source.
-        let fetch_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_bot_username())
+        // The production paths behind the bot-username, send, long-poll and
+        // health-check log lines and returned errors.
+        let username_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_bot_username())
             .await
             .expect("test: getMe against a closed port must fail within the deadline")
             .expect_err("test: getMe cannot succeed without a server");
+        assert_error_hides_the_token("fetch_bot_username", &username_err);
+
         let send_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.send_text_chunks("hello", "123456", None))
             .await
             .expect("test: sendMessage against a closed port must fail within the deadline")
             .expect_err("test: sendMessage cannot succeed without a server");
-        for (site, err) in [("fetch_bot_username", fetch_err), ("send_text_chunks", send_err)] {
-            for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
-                assert!(
-                    !rendered.contains(LEAK_TEST_TOKEN),
-                    "{site} returned an error that still names the bot token: {rendered}"
-                );
-            }
+        assert_error_hides_the_token("send_text_chunks", &send_err);
+
+        let poll_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_updates(0))
+            .await
+            .expect("test: getUpdates against a closed port must fail within the deadline")
+            .expect_err("test: getUpdates cannot succeed without a server");
+        assert_error_hides_the_token("fetch_updates", &poll_err);
+        assert!(
+            format!("{poll_err:#}").starts_with("Telegram poll error: "),
+            "the long-poll log line lost its label or its cause: {poll_err:#}"
+        );
+
+        let health_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.probe_health())
+            .await
+            .expect("test: the health probe against a closed port must fail within the deadline")
+            .expect_err("test: the health probe cannot succeed without a server");
+        assert_error_hides_the_token("probe_health", &health_err);
+    }
+
+    #[tokio::test]
+    async fn error_bodies_that_echo_the_request_path_do_not_leak_the_bot_token() {
+        let body = format!(
+            "{{\"ok\":false,\"error_code\":404,\"description\":\"Not Found: /bot{LEAK_TEST_TOKEN}/sendMessage\"}}"
+        );
+        let (base, server) = serve_canned_response("404 Not Found", &body).await;
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
+
+        let text_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.send_text_chunks("hello", "123456", None))
+            .await
+            .expect("test: sendMessage against the fixture must finish within the deadline")
+            .expect_err("test: the fixture answers 404 to every request");
+        let media_err = tokio::time::timeout(
+            LEAK_TEST_DEADLINE,
+            ch.send_media_by_url(
+                "sendDocument",
+                "document",
+                "123456",
+                None,
+                "https://example.com/a.pdf",
+                None,
+            ),
+        )
+        .await
+        .expect("test: sendDocument against the fixture must finish within the deadline")
+        .expect_err("test: the fixture answers 404 to every request");
+        server.abort();
+
+        for (site, err) in [("send_text_chunks", text_err), ("send_media_by_url", media_err)] {
+            assert!(
+                err.to_string().contains(TELEGRAM_REDACTION_MARKER),
+                "test premise: {site} must report the echoed response body, with the token replaced: {err}"
+            );
+            assert_error_hides_the_token(site, &err);
         }
+    }
+
+    #[tokio::test]
+    async fn getupdates_error_descriptions_and_parse_errors_do_not_leak_the_bot_token() {
+        let body = format!(
+            "{{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized: /bot{LEAK_TEST_TOKEN}/getUpdates\"}}"
+        );
+        let (base, server) = serve_canned_response("200 OK", &body).await;
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
+        let data = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_updates(0))
+            .await
+            .expect("test: getUpdates against the fixture must finish within the deadline")
+            .expect("test: the fixture answers with a JSON error object");
+        server.abort();
+        let description = ch.api_error_description(&data);
+        assert!(
+            description.contains(TELEGRAM_REDACTION_MARKER),
+            "test premise: the logged description must keep the echoed path, with the token replaced: {description}"
+        );
+        assert!(
+            !description.contains(LEAK_TEST_TOKEN),
+            "the getUpdates API error description handed to the log still names the bot token: {description}"
+        );
+
+        let not_json = format!("upstream proxy error for /bot{LEAK_TEST_TOKEN}/getUpdates");
+        let (base, server) = serve_canned_response("200 OK", &not_json).await;
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
+        let parse_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_updates(0))
+            .await
+            .expect("test: getUpdates against the fixture must finish within the deadline")
+            .expect_err("test: the fixture body is not JSON");
+        server.abort();
+        assert_error_hides_the_token("fetch_updates", &parse_err);
+        assert!(
+            format!("{parse_err:#}").starts_with("Telegram parse error: "),
+            "the parse-error log line lost its label or its cause: {parse_err:#}"
+        );
+    }
+
+    #[test]
+    fn sanitize_diagnostic_replaces_every_token_occurrence_and_bounds_the_length() {
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false);
+
+        let twice = format!("GET /bot{LEAK_TEST_TOKEN}/getMe failed; retried /bot{LEAK_TEST_TOKEN}/getMe");
+        let sanitized = ch.sanitize_diagnostic(&twice);
+        assert!(
+            !sanitized.contains(LEAK_TEST_TOKEN),
+            "a token occurrence survived sanitization: {sanitized}"
+        );
+        assert_eq!(
+            sanitized.matches(TELEGRAM_REDACTION_MARKER).count(),
+            2,
+            "each token occurrence must be replaced by one marker: {sanitized}"
+        );
+
+        // Multi-byte text with the token across the cut: the token is replaced
+        // first, so the cut cannot leave a part of it, and it falls on a
+        // character boundary.
+        let long = format!(
+            "{}{LEAK_TEST_TOKEN}{}",
+            "é".repeat(TELEGRAM_DIAGNOSTIC_MAX_CHARS - 3),
+            "é".repeat(64)
+        );
+        let cut = ch.sanitize_diagnostic(&long);
+        assert!(
+            !cut.contains("AAFakeTokenForLeakTest"),
+            "a cut diagnostic kept part of the token: {cut}"
+        );
+        assert!(
+            cut.ends_with(TELEGRAM_DIAGNOSTIC_TRUNCATED),
+            "an over-long diagnostic must say that it was cut: {cut}"
+        );
+        assert_eq!(
+            cut.chars().count(),
+            TELEGRAM_DIAGNOSTIC_MAX_CHARS + TELEGRAM_DIAGNOSTIC_TRUNCATED.chars().count(),
+            "an over-long diagnostic must be cut to the fixed length"
+        );
+
+        let short = "Bad Request: chat not found";
+        assert_eq!(
+            ch.sanitize_diagnostic(short),
+            short,
+            "text without the token and within the limit must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn media_urls_are_logged_as_scheme_and_host_only() {
+        let file_url = format!("https://api.telegram.org/file/bot{LEAK_TEST_TOKEN}/documents/file_1.pdf");
+        assert_eq!(
+            loggable_media_url(&file_url),
+            "https://api.telegram.org/[REDACTED]",
+            "a Telegram file URL must be logged without its token-bearing path"
+        );
+
+        let signed =
+            format!("https://user:{LEAK_TEST_TOKEN}@cdn.example.com/a.png?sig={LEAK_TEST_TOKEN}#{LEAK_TEST_TOKEN}");
+        let logged = loggable_media_url(&signed);
+        assert_eq!(
+            logged, "https://cdn.example.com/[REDACTED]",
+            "userinfo, path, query and fragment must all be dropped"
+        );
+
+        assert_eq!(
+            loggable_media_url(LEAK_TEST_TOKEN),
+            "[REDACTED]",
+            "a value that is not a URL must not be logged at all"
+        );
     }
 
     #[tokio::test]
