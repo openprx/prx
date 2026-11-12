@@ -30,6 +30,8 @@ p.add_argument('--git-sha', required=True)
 p.add_argument('--agent-timeout-multiplier', type=float, default=1)
 p.add_argument('--temperature', type=float, default=0)
 p.add_argument('--provider')
+# Host address the per-trial key proxy binds; default is the primary IPv4 address.
+p.add_argument('--proxy-bind')
 for key in ('input', 'output', 'cache_read', 'cache_write'):
     p.add_argument('--price-' + key.replace('_', '-'), type=float, required=True)
 p.add_argument('tasks', nargs='+')
@@ -85,6 +87,8 @@ for index, task_name in enumerate(a.tasks):
     options.update({'price_' + key: getattr(a, 'price_' + key) for key in ('input', 'output', 'cache_read', 'cache_write')})
     if a.provider:
         options['provider'] = a.provider
+    if a.proxy_bind:
+        options['proxy_bind'] = a.proxy_bind
     for key, value in options.items():
         command += ['--ak', f'{key}={value}']
     try:
