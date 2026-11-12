@@ -1,0 +1,28 @@
+# Fixed-model Terminal-Bench profile. Dynamic fields are appended by profile.py.
+[reliability]
+fallback_providers = []
+model_fallbacks = {}
+api_keys = []
+provider_retries = 1
+[decision_engine]
+enabled = false
+[agent.compaction]
+mode = "off"
+memory_flush = false
+[memory]
+backend = "none"
+auto_save = false
+embedding_provider = "none"
+[auth]
+codex_auth_json_auto_import = false
+[autonomy]
+level = "full"
+workspace_only = false
+forbidden_paths = []
+acknowledge_unrestricted_profile = true
+max_cost_per_day_cents = 100000
+[cost]
+daily_limit_usd = 1000
+monthly_limit_usd = 10000
+[tool_tiering]
+always_exclude = ["delegate", "sessions_spawn"]

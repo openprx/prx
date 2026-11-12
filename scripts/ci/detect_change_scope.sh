@@ -84,7 +84,8 @@ while IFS= read -r file; do
     || [[ "$file" == benches/* ]] \
     || [[ "$file" == ".github/workflows/ci-run.yml" ]] \
     || [[ "$file" == .config/* ]] \
-    || [[ "$file" == scripts/ci/* ]]; then
+    || [[ "$file" == scripts/ci/* ]] \
+    || [[ "$file" == scripts/bench/* ]]; then
     rust_changed=true
   fi
 done <<< "$CHANGED"

@@ -16,7 +16,7 @@ class ChangeScopeTests(unittest.TestCase):
             root = Path(directory)
 
             def git(*args):
-                return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+                return subprocess.check_output(["git", *args], cwd=root, text=True, timeout=30).strip()
 
             git("init", "--quiet")
             git("config", "user.email", "fixture@example.invalid")
@@ -32,7 +32,7 @@ class ChangeScopeTests(unittest.TestCase):
             git("commit", "--quiet", "-m", "change")
             output = root / "scope-output"
             subprocess.run(
-                ["bash", str(SCRIPT)], cwd=root, check=True,
+                ["bash", str(SCRIPT)], cwd=root, check=True, timeout=30,
                 env={**os.environ, "GITHUB_OUTPUT": str(output), "EVENT_NAME": "push", "BASE_SHA": base},
             )
             return output.read_text().splitlines()
@@ -44,6 +44,7 @@ class ChangeScopeTests(unittest.TestCase):
             ("scripts/ci/observe_test_gate.py", "false"),
             ("scripts/ci/detect_change_scope.sh", "false"),
             (".config/nextest.toml", "false"),
+            ("scripts/bench/harbor/profile.py", "false"),
         ):
             with self.subTest(path=path):
                 lines = self.classify(path)

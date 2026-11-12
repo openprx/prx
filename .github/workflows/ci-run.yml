@@ -36,6 +36,8 @@ jobs:
               run: ./scripts/ci/installer_contract_gate.sh
             - name: Verify CI gate contracts
               run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+            - name: Verify benchmark adapter contracts
+              run: python3 -m unittest discover -s scripts/bench/harbor -p 'test_*.py'
             - name: Verify source file size limit
               run: python3 scripts/ci/source_size_gate.py
             - name: Verify tracked markdown has no CJK
