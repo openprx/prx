@@ -171,7 +171,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record['timings']['agent_execution']['finished_at']['status'], 'unavailable')
 
     def test_partial_agent_metadata_finalizes_infra_error(self):
-        write(self.logs / 'prx-agent-side.json', {'exit_code': unavailable('missing'), 'costs_rows': []})
+        write(self.logs / 'prx-agent-side.json', {'exit_code': 0, 'costs_rows': []})
         self.assertEqual(finalize(self.root)['attempt_status'], 'infra_error')
 
     def test_missing_exit_with_harbor_timeout_marks_killed_usage(self):

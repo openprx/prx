@@ -167,6 +167,8 @@ def classify(agent, result, reward, stdout, stderr):
     provider, model = agent["settlement_provider"], agent["model_id"]
     if code == 124 and not agent["costs_rows"]:
         return "timeout", "agent_timeout"
+    if not isinstance(provider, str) or not isinstance(model, str):
+        return "infra_error", "missing_agent_metadata"
     if isinstance(agent["costs_rows"], dict):
         return "infra_error", "ledger_unreadable"
     if any(row.get("usage", {}).get("model") != f"{provider}/{model}" or
