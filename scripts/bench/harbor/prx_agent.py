@@ -138,16 +138,14 @@ class PrxAgent(BaseInstalledAgent):
                 user="root", timeout_sec=30)
             if locked.return_code != 0:
                 raise RuntimeError("cannot secure private config")
-            timeout_available = await environment.exec(command="command -v timeout", timeout_sec=10)
             seconds = self.agent_timeout_sec - 50
-            timeout_prefix = f"timeout -k 5s {seconds:g}s " if timeout_available.return_code == 0 else ""
             no_proxy = f"NO_PROXY={shlex.quote(endpoint(self.provider))} no_proxy={shlex.quote(endpoint(self.provider))} " if self.provider.startswith("custom:") else ""
-            command = (f"env -u PRX_BENCH_API_KEY {no_proxy}{timeout_prefix}prx --config-dir {CONFIG_DIR} "
+            command = (f"env -u PRX_BENCH_API_KEY {no_proxy}prx --config-dir {CONFIG_DIR} "
                        f"agent -t {self.temperature:g} -m {shlex.quote(instruction)} "
                        f">{LOG_DIR}/prx-stdout.txt 2>{LOG_DIR}/prx-stderr.txt; "
                        f"code=$?; printf '%s\\n' \"$code\" >{LOG_DIR}/prx-exit-code")
             try:
-                await environment.exec(command=command, user="root", timeout_sec=seconds + (15 if timeout_prefix else 0))
+                await environment.exec(command=command, user="root", timeout_sec=seconds)
             except (TimeoutError, asyncio.TimeoutError):
                 await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await environment.exec(command=f"printf '124\\n' >{LOG_DIR}/prx-exit-code", timeout_sec=5)

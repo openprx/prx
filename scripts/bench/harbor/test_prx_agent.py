@@ -40,8 +40,6 @@ class FakeEnvironment:
                 raise asyncio.TimeoutError()
             if self.mode == 'runtime_timeout':
                 raise RuntimeError('Command timed out after 30 seconds')
-        if command == 'command -v timeout' and self.mode == 'no_timeout':
-            return SimpleNamespace(return_code=1)
         return SimpleNamespace(return_code=0)
 
     async def download_file(self, remote, local):
@@ -55,7 +53,7 @@ class FakeEnvironment:
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_exec_calls_never_contain_secret_and_cleanup_always_runs(self):
         secret = 'prx-fixture-secret-not-exported'
-        for mode in ('normal', 'timeout', 'runtime_timeout', 'no_timeout', 'download_timeout', 'sqlite_error'):
+        for mode in ('normal', 'timeout', 'runtime_timeout', 'download_timeout', 'sqlite_error'):
             with self.subTest(mode=mode):
                 agent = object.__new__(adapter.PrxAgent)
                 agent.key_file = Path('/opt/ops/bench/secrets/fixture')
@@ -89,12 +87,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent._metadata['per_attempt_models']['status'], 'unavailable')
                 invocation = next(c for c in commands if 'agent -t' in c)
                 self.assertIn('NO_PROXY=host.containers.internal', invocation)
-                if mode == 'no_timeout':
-                    self.assertNotIn('timeout -k', invocation)
-                else:
-                    self.assertIn('timeout -k 5s 70s', invocation)
+                self.assertNotIn('timeout -k', invocation)
+                self.assertNotIn('command -v timeout', commands)
                 execution = next(c for c in environment.calls if 'agent -t' in c['command'])
-                self.assertEqual(execution['timeout_sec'], 70 if mode == 'no_timeout' else 85)
+                self.assertEqual(execution['timeout_sec'], 70)
                 self.assertEqual(agent._metadata['agent_exec_timeout_sec'], 70)
                 self.assertTrue(all(c['timeout_sec'] == 10 for c in environment.calls if c['command'] == adapter.KILL_PRX))
 
@@ -115,7 +111,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
 class DescendantCleanupTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux /proc and setsid')
-    def test_cleanup_kills_separate_session_descendants(self):
+    def test_deadline_cleanup_kills_separate_session_descendants(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root / 'prx-stand-in'
@@ -136,6 +132,10 @@ class DescendantCleanupTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertIsNotNone(child_pid, 'stand-in child did not start')
                 self.assertGreaterEqual(marker.stat().st_size, 4, 'marker must grow before cleanup')
+                # Model Harbor's host-side wait deadline without signaling PRX.
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    parent.wait(timeout=0.2)
+                self.assertIsNone(parent.poll(), 'PRX must remain alive at the exec deadline')
                 subprocess.run(['sh', '-c', adapter.KILL_PRX],
                     env={**os.environ, 'PRX_EXE': str(executable)}, timeout=10, check=True)
                 parent.wait(timeout=2)
