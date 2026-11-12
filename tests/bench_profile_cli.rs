@@ -154,7 +154,7 @@ impl Server {
                                 "usage":{"prompt_tokens":20,"completion_tokens":1,"total_tokens":21,
                                 "prompt_tokens_details":{"cached_tokens":0}}})
                         } else {
-                            serde_json::json!({"error":{"message":"PRX fixture HTTP 503"}})
+                            serde_json::json!({"error":{"message":"fixture overloaded"}})
                         }
                         .to_string();
                         let code = if chat { status } else { 404 };
@@ -329,6 +329,60 @@ fn exercise(status: u16, refusal: bool) {
         },
         "unexpected request count: {requests:?}; stdout={stdout}; stderr={stderr}"
     );
+    if refusal {
+        assert!(
+            stdout.lines().any(|l| l.starts_with("Reason:") && l.contains("price")),
+            "config refusal line missing: {stdout}"
+        );
+    }
+    if status == 503 {
+        let path = root.path().join("stderr.txt");
+        std::fs::write(&path, &stderr).expect("test: save real PRX stderr");
+        let (code, out, err) = run(Command::new("python3").args([
+            "-c", "import sys; sys.path.insert(0,'scripts/bench/harbor'); from record import TRANSPORT; sys.exit(0 if TRANSPORT.search(open(sys.argv[1]).read()) else 3)"
+        ]).arg(&path), Duration::from_secs(30));
+        assert_eq!(
+            code.code(),
+            Some(0),
+            "real 503 stderr not classified as transport: {stderr}; {out} {err}"
+        );
+    }
+    if !refusal {
+        let db = config_dir.join("workspace/memory/brain.db");
+        assert!(db.is_file(), "sqlite memory not under config dir");
+        let (code, out, err) = run(Command::new("python3").args([
+            "-c", "import json,sys; sys.path.insert(0,'scripts/bench/harbor'); from record import per_attempt_models; print(json.dumps(per_attempt_models(sys.argv[1],'test')))"
+        ]).arg(&db), Duration::from_secs(30));
+        assert!(code.success(), "real SQLite ledger reader failed: {out} {err}");
+        let evidence: Value = serde_json::from_str(&out).expect("test: real attempt evidence");
+        assert_eq!(
+            evidence.get("status").and_then(Value::as_str),
+            Some("available"),
+            "attempt evidence missing: {evidence}"
+        );
+        let attempts = evidence
+            .get("attempts")
+            .and_then(Value::as_array)
+            .expect("test: attempt array");
+        assert_eq!(attempts.len(), 1, "unexpected persisted attempts: {evidence}");
+        // FU-ATTEMPT-RECORD-RETRIES: wire retries are not all persisted or counted in cost output.
+        assert_eq!(
+            evidence.pointer("/attempt_count/status").and_then(Value::as_str),
+            Some("unavailable"),
+            "total attempts must not be invented: {evidence}"
+        );
+        assert_eq!(
+            evidence.get("persisted_models"),
+            Some(&serde_json::json!([MODEL])),
+            "persisted model set changed: {evidence}"
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.get("model").and_then(Value::as_str) == Some(MODEL)),
+            "attempt model changed: {evidence}"
+        );
+    }
     if !refusal && status == 200 {
         let ledger = bounded_file(&config_dir.join("workspace/state/costs.jsonl"));
         let rows: Vec<Value> = ledger

@@ -47,6 +47,8 @@ class Handler(socketserver.BaseRequestHandler):
                     'message': {'role': 'assistant', 'content': 'PRX unpaid smoke complete.'}}],
                     'usage': {'prompt_tokens': 20, 'completion_tokens': 5, 'total_tokens': 25,
                               'prompt_tokens_details': {'cached_tokens': 0}}}
+            print(json.dumps({"request": self.server.accepted, "method": method, "path": path,
+                              "model": request.get("model"), "status": code}), flush=True)
             response = json.dumps(response).encode()
             self.request.sendall((f'HTTP/1.1 {code} Fixture\r\nContent-Type: application/json\r\n'
                 f'Content-Length: {len(response)}\r\nConnection: close\r\n\r\n').encode() + response)

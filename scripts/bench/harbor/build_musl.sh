@@ -13,11 +13,11 @@ if [[ -n ${PRX_BENCH_MUSL_FAILURE_REASON:-} ]]; then
     resume_gnu=1
     printf 'Resuming GNU fallback after musl failure: %s\n' "$PRX_BENCH_MUSL_FAILURE_REASON"
 fi
-claim=$("$res" claim qa 1 prx bench-musl)
-trap '"$res" release "$claim"' EXIT
-ssh -o ConnectTimeout=10 qa "mkdir -p /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
-git archive HEAD | ssh -o ConnectTimeout=10 qa "tar -xf - -C /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
-ssh -o ConnectTimeout=10 qa bash -s -- "$sha" "$toolchain" "$resume_gnu" <<'REMOTE'
+claim=$(timeout 60 "$res" claim qa 1 prx bench-musl)
+trap 'timeout 60 "$res" release "$claim"' EXIT
+timeout 60 ssh -o ConnectTimeout=10 qa "mkdir -p /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
+git archive HEAD | timeout 600 ssh -o ConnectTimeout=10 qa "tar -xf - -C /opt/ops/prx-lanes/prx-bench/bench-source/$sha"
+timeout 4200 ssh -o ConnectTimeout=10 qa bash -s -- "$sha" "$toolchain" "$resume_gnu" <<'REMOTE'
 set -euo pipefail
 sha=$1 toolchain=$2 resume_gnu=$3
 [[ $(uname -m) == x86_64 ]] || { echo 'QA x86_64 host required' >&2; exit 2; }

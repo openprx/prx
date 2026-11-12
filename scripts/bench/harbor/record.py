@@ -9,11 +9,14 @@ import sys
 import sqlite3
 import time
 import tomllib
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from profile import read_bounded
 
 MAX_ARTIFACT = 16 * 1024 * 1024
-TRANSPORT = re.compile(r"HTTP[^\n]*(?:5\d\d|429)|status[^\n]*(?:5\d\d|429)|connect|TLS|DNS|certificate|name resolution|error sending request|request timed out", re.I)
+AGENT_KEYS = ("git_sha", "binary_sha256", "profile_sha256", "instruction_sha256", "version",
+              "model_id", "provider", "settlement_provider", "sampling", "profile_values",
+              "agent_timeout_sec", "per_attempt_models")
+TRANSPORT = re.compile(r"API error \((?:5\d\d|429)\b|\b(?:HTTP|status)[ /:=]*(?:5\d\d|429)\b|error sending request|error trying to connect|tcp connect error|connection (?:refused|reset|closed)|dns error|failed to lookup address|name resolution|invalid peer certificate|tls handshake|request timed out|operation timed out", re.I)
 
 
 def unavailable(reason):
@@ -48,15 +51,31 @@ def endpoint(provider):
 
 
 def serving_provider(provider):
-    if not provider.startswith("custom:"):
+    if not provider.startswith("custom:") or "@" not in provider:
         return provider
-    url = urlsplit(provider[7:])
-    host = url.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    if url.port:
-        host += f":{url.port}"
-    return "custom:" + urlunsplit((url.scheme, host, url.path, url.query, url.fragment))
+    return re.sub(r"(://)[^/?#]*@", r"\1[redacted]@", provider, count=1)
+
+
+def agent_metadata(values, provider, model, prices, temperature, git_sha,
+                   binary_sha256, profile_text, instruction, version, agent_timeout_sec):
+    safe_values = {k: v for k, v in values.items()
+                   if k not in ("api_key", "default_provider", "providers", "cost")}
+    safe_values["default_provider"] = endpoint(provider)
+    if provider.startswith("custom:"):
+        safe_values["providers"] = {"models": [{"provider": endpoint(provider),
+            "model": model, "operations": ["chat"], "native_tools": True}]}
+    safe_values["cost"] = {**{k: v for k, v in values["cost"].items() if k != "prices"},
+                           "prices": prices}
+    return {
+        "git_sha": git_sha, "binary_sha256": binary_sha256,
+        "profile_sha256": sha256(profile_text.encode()),
+        "instruction_sha256": sha256(instruction.encode()), "version": version,
+        "model_id": model, "provider": endpoint(provider),
+        "settlement_provider": serving_provider(provider),
+        "sampling": {"temperature": temperature}, "profile_values": safe_values,
+        "agent_timeout_sec": agent_timeout_sec,
+        "per_attempt_models": unavailable(f"no per-attempt ledger at {git_sha}"),
+    }
 
 
 def usage(rows, exit_code):
@@ -70,14 +89,22 @@ def usage(rows, exit_code):
         creation = row.get("cache_creation_input_tokens")
         if cache is None or creation is None:
             return unavailable("ledger cache accounting unavailable")
-        if cache > u["input_tokens"]:
+        if cache + creation > u["input_tokens"]:
             raise ValueError("cache tokens exceed input")
-        result["uncached_input"] += u["input_tokens"] - cache
+        result["uncached_input"] += u["input_tokens"] - cache - creation
         result["cache_read"] += cache
         result["cache_write"] += creation
         result["output"] += u["output_tokens"]
         result["cost_usd"] += u["cost_usd"]
     return result
+
+
+def attempt_evidence(attempts):
+    # FU-ATTEMPT-RECORD-RETRIES: persisted rows omit retries, and cost exports no retry counter.
+    return {"status": "available", "attempts": attempts,
+            "persisted_models": sorted({attempt["model"] for attempt in attempts}),
+            "persisted_attempt_count": len(attempts),
+            "attempt_count": unavailable("FU-ATTEMPT-RECORD-RETRIES: retry count not exported")}
 
 
 def per_attempt_models(database, git_sha):
@@ -107,20 +134,28 @@ def per_attempt_models(database, git_sha):
                 raise ValueError("too many provider attempts")
             attempts.append({"seq": attempt["seq"], "provider": serving_provider(attempt["provider"]),
                              "model": attempt["model"], "status": attempt["status"]})
-    return {"status": "available", "attempts": attempts} if attempts else unavailable(f"no per-attempt ledger at {git_sha}")
+    return attempt_evidence(attempts) if attempts else unavailable(f"no per-attempt ledger at {git_sha}")
 
 
 def build_agent(logs, metadata):
     logs = Path(logs)
     code_path = logs / "prx-exit-code"
-    exit_code = int(text(code_path).strip()) if code_path.is_file() else unavailable("exit code not collected")
+    exit_code = int(raw) if (raw := text(code_path).strip()).lstrip("-").isdigit() else unavailable("exit code not collected")
     ledger = logs / "costs.jsonl"
-    rows = [json.loads(line) for line in text(ledger).splitlines() if line.strip()]
+    rows = []
+    try:
+        for line in text(ledger).splitlines():
+            if line.strip():
+                rows.append(json.loads(line))
+        totals = usage(rows, exit_code)
+    except (ValueError, KeyError, TypeError):
+        rows = unavailable("ledger unreadable")
+        totals = unavailable("ledger unreadable")
     result = {**metadata, "exit_code": exit_code, "costs_rows": rows,
               "stdout_sha256": sha256(read_bounded(logs / "prx-stdout.txt", MAX_ARTIFACT)) if (logs / "prx-stdout.txt").is_file() else unavailable("stdout not collected"),
               "stderr_sha256": sha256(read_bounded(logs / "prx-stderr.txt", MAX_ARTIFACT)) if (logs / "prx-stderr.txt").is_file() else unavailable("stderr not collected"),
               "cost_report": optional(logs / "prx-cost.json")}
-    result["usage"] = usage(rows, exit_code)
+    result["usage"] = totals
     write(logs / "prx-agent-side.json", result)
     return result
 
@@ -132,6 +167,8 @@ def classify(agent, result, reward, stdout, stderr):
     provider, model = agent["settlement_provider"], agent["model_id"]
     if code == 124 and not agent["costs_rows"]:
         return "timeout", "agent_timeout"
+    if isinstance(agent["costs_rows"], dict):
+        return "infra_error", "ledger_unreadable"
     if any(row.get("usage", {}).get("model") != f"{provider}/{model}" or
            row.get("settlement_provider") != provider for row in agent["costs_rows"]):
         return "infra_error", "model_substitution"
@@ -184,15 +221,14 @@ def finalize(trial):
     result, config = load(trial / "result.json"), load(trial / "config.json")
     logs = trial / "agent"
     agent_path = logs / "prx-agent-side.json"
+    absent = unavailable("agent did not produce metadata")
     if agent_path.is_file():
-        agent = load(agent_path)
+        agent = {**{k: absent for k in (*AGENT_KEYS, "usage", "cost_report")}, **load(agent_path)}
     else:
         # Setup/Harbor failures can precede run() and log download.
-        absent = unavailable("agent did not produce metadata")
-        agent = build_agent(logs, {key: absent for key in (
-            "git_sha", "binary_sha256", "profile_sha256", "instruction_sha256", "version",
-            "model_id", "provider", "settlement_provider", "sampling", "profile_values",
-            "agent_timeout_sec", "per_attempt_models")})
+        agent = build_agent(logs, {key: absent for key in AGENT_KEYS})
+    if agent["per_attempt_models"].get("status") == "available":
+        agent["per_attempt_models"] = attempt_evidence(agent["per_attempt_models"]["attempts"])
     task_path = Path(config["task"]["path"])
     # Host launcher passes absolute local task paths; git task caches are not guessed.
     task_file = task_path / "task.toml"
@@ -201,6 +237,8 @@ def finalize(trial):
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     reward = rewards.get("reward", unavailable("verifier reward missing"))
     status, reason = classify(agent, result, reward, text(logs / "prx-stdout.txt"), text(logs / "prx-stderr.txt"))
+    if status == "timeout" and agent["usage"].get("status") == "unavailable":
+        agent["usage"] = unavailable("killed_before_settlement")
     artifacts = {}
     for name in ("agent/prx-stdout.txt", "agent/prx-stderr.txt", "agent/costs.jsonl", "agent/prx-cost.json",
                  "verifier/reward.txt", "verifier/ctrf.json", "verifier/test-stdout.txt", "trial.log"):
