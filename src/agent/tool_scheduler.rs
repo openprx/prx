@@ -451,7 +451,6 @@ impl Drop for DelegationExecutionTask {
     }
 }
 
-#[allow(clippy::indexing_slicing)]
 pub(super) async fn execute_tools_with_service(
     tool_calls: &[ParsedToolCall],
     native_tool_calls: &[ToolCall],
@@ -466,38 +465,49 @@ pub(super) async fn execute_tools_with_service(
 
     let mut ordered_indices = (0..tool_calls.len()).collect::<Vec<_>>();
     if schedule.priority_enabled {
-        ordered_indices.sort_by_key(
-            |index| match classify_tool_priority(&tool_calls[*index].name, &schedule) {
-                ToolPriority::High => 0_u8,
-                ToolPriority::Low => 1_u8,
-            },
-        );
+        ordered_indices.sort_by_key(|index| {
+            match tool_calls
+                .get(*index)
+                .map(|call| classify_tool_priority(&call.name, &schedule))
+            {
+                Some(ToolPriority::High) => 0_u8,
+                Some(ToolPriority::Low) | None => 1_u8,
+            }
+        });
     }
     let mut results =
         vec![ObservedToolResult::not_executed(String::new(), ToolExecutionStatus::Indeterminate); tool_calls.len()];
     let mut cursor = 0;
-    while cursor < ordered_indices.len() {
+    while let Some(&index) = ordered_indices.get(cursor) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(ToolLoopCancelled.into());
         }
-        let index = ordered_indices[cursor];
+        let call = tool_calls.get(index).ok_or_else(|| tool_index_out_of_range(index))?;
         // Read-only calls always take the parallel lane; there is no switch that
         // can force them back to serial. Neither lane can carry a deadline —
         // `execute_one_with_service` takes none — so a tool behaves identically
         // whichever lane it runs in.
-        if classify_tool_call(&tool_calls[index].name) == ToolSchedulingClass::ReadOnly {
+        if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly {
             let start = cursor;
             let mut end = cursor + 1;
-            while end < ordered_indices.len()
-                && classify_tool_call(&tool_calls[ordered_indices[end]].name) == ToolSchedulingClass::ReadOnly
+            while ordered_indices
+                .get(end)
+                .and_then(|next| tool_calls.get(*next))
+                .is_some_and(|next| classify_tool_call(&next.name) == ToolSchedulingClass::ReadOnly)
             {
                 end += 1;
             }
-            let mut pending = stream::iter(ordered_indices[start..end].iter().copied())
+            let batch_indices = ordered_indices
+                .get(start..end)
+                .ok_or_else(|| tool_index_out_of_range(end))?;
+            let mut pending = stream::iter(batch_indices.iter().copied())
                 .map(|batch_index| async move {
+                    let batch_call = tool_calls
+                        .get(batch_index)
+                        .ok_or_else(|| tool_index_out_of_range(batch_index))?;
                     let result = execute_one_with_service(
                         batch_index,
-                        &tool_calls[batch_index],
+                        batch_call,
                         native_tool_calls,
                         adapter,
                         cancellation,
@@ -532,14 +542,16 @@ pub(super) async fn execute_tools_with_service(
                 concurrency_window: schedule.concurrency_window,
             });
             for (batch_index, result) in batch {
-                results[batch_index] = result;
+                *results
+                    .get_mut(batch_index)
+                    .ok_or_else(|| tool_index_out_of_range(batch_index))? = result;
             }
             cursor = end;
             continue;
         }
-        results[index] = execute_one_with_service(
+        let result = execute_one_with_service(
             index,
-            &tool_calls[index],
+            call,
             native_tool_calls,
             adapter,
             cancellation,
@@ -547,9 +559,14 @@ pub(super) async fn execute_tools_with_service(
             recorder,
         )
         .await?;
+        *results.get_mut(index).ok_or_else(|| tool_index_out_of_range(index))? = result;
         cursor += 1;
     }
     Ok(results)
+}
+
+fn tool_index_out_of_range(index: usize) -> anyhow::Error {
+    anyhow::anyhow!("tool call index {index} is outside the scheduled batch")
 }
 
 pub(super) fn shared_unrecoverable_tool_error(text: &str) -> bool {

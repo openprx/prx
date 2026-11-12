@@ -470,9 +470,8 @@ impl LarkChannel {
                         let entry = frag_cache.entry(msg_id.clone())
                             .or_insert_with(|| (vec![None; sum], Instant::now()));
                         if entry.0.len() != sum { *entry = (vec![None; sum], Instant::now()); }
-                        // SAFETY: seq_num < sum is checked above, and entry.0.len() == sum
-                        #[allow(clippy::indexing_slicing)]
-                        { entry.0[seq_num] = frame.payload.clone(); }
+                        // seq_num < sum is checked above, and entry.0.len() == sum.
+                        if let Some(slot) = entry.0.get_mut(seq_num) { *slot = frame.payload.clone(); }
                         if entry.0.iter().all(|s| s.is_some()) {
                             let full: Vec<u8> = entry.0.iter()
                                 .flat_map(|s| s.as_deref().unwrap_or(&[]))

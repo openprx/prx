@@ -139,9 +139,10 @@ pub(super) async fn setup_provider(
         .default(0)
         .interact()?;
 
-    // SAFETY: dialoguer Select guarantees provider_idx < providers.len()
-    #[allow(clippy::indexing_slicing)]
-    let provider_name = providers[provider_idx].0;
+    let provider_name = providers
+        .get(provider_idx)
+        .ok_or_else(|| anyhow::anyhow!("provider selection {provider_idx} is out of range"))?
+        .0;
 
     if is_zai_alias(provider_name) {
         print_bullet(crate::auth::terms::GLM_CODING_PLAN_WARNING);
@@ -503,9 +504,11 @@ pub(super) async fn setup_provider(
         .default(0)
         .interact()?;
 
-    // SAFETY: dialoguer Select guarantees model_idx < model_options.len()
-    #[allow(clippy::indexing_slicing)]
-    let selected_model = model_options[model_idx].0.clone();
+    let selected_model = model_options
+        .get(model_idx)
+        .ok_or_else(|| anyhow::anyhow!("model selection {model_idx} is out of range"))?
+        .0
+        .clone();
     let model = if selected_model == CUSTOM_MODEL_SENTINEL {
         Input::new()
             .with_prompt("  Enter custom model ID")

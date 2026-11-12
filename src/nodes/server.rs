@@ -1030,14 +1030,11 @@ fn parse_command(command: &str) -> Result<ParsedCommand> {
     if !current.is_empty() {
         tokens.push(current);
     }
-    if tokens.is_empty() {
+    let mut tokens = tokens.into_iter();
+    let Some(program) = tokens.next() else {
         bail!("cmd cannot be empty");
-    }
-
-    // SAFETY: tokens is non-empty (checked above)
-    #[allow(clippy::indexing_slicing)]
-    let program = tokens[0].clone();
-    let args = tokens.into_iter().skip(1).collect::<Vec<_>>();
+    };
+    let args = tokens.collect::<Vec<_>>();
     Ok(ParsedCommand { program, args })
 }
 

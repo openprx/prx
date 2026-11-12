@@ -2214,10 +2214,8 @@ impl SchemaCleanr {
             .collect();
 
         // If only one variant remains after stripping nulls, return it
-        if non_null.len() == 1 {
-            // SAFETY: non_null.len() == 1 (checked above)
-            #[allow(clippy::indexing_slicing)]
-            return Some(Self::preserve_meta(obj, non_null[0].clone()));
+        if let [only] = non_null.as_slice() {
+            return Some(Self::preserve_meta(obj, only.clone()));
         }
 
         // Try to flatten to enum if all variants are literals
@@ -2237,9 +2235,7 @@ impl SchemaCleanr {
             }
             // { enum: [null] }
             if let Some(Value::Array(arr)) = obj.get("enum") {
-                // SAFETY: arr.len() == 1 is checked before arr[0]
-                #[allow(clippy::indexing_slicing)]
-                if arr.len() == 1 && matches!(arr[0], Value::Null) {
+                if matches!(arr.as_slice(), [Value::Null]) {
                     return true;
                 }
             }
@@ -2271,10 +2267,8 @@ impl SchemaCleanr {
             let literal_value = if let Some(const_val) = obj.get("const") {
                 const_val.clone()
             } else if let Some(Value::Array(arr)) = obj.get("enum") {
-                if arr.len() == 1 {
-                    // SAFETY: arr.len() == 1 (checked above)
-                    #[allow(clippy::indexing_slicing)]
-                    arr[0].clone()
+                if let [only] = arr.as_slice() {
+                    only.clone()
                 } else {
                     return None;
                 }

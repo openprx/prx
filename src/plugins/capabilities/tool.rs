@@ -142,10 +142,6 @@ fn parse_plugin_result(fields: &[(String, wasmtime::component::Val)]) -> ToolRes
     ToolResult { success, output, error }
 }
 
-// SAFETY: All results[N] accesses index a Vec that was just constructed with
-// the correct number of elements (e.g. `vec![Val::Bool(false); 1]`),
-// so the index is always valid.
-#[allow(clippy::indexing_slicing)]
 impl WasmToolAdapter {
     /// Create a new WasmToolAdapter by instantiating the WASM component.
     ///
@@ -421,7 +417,9 @@ impl WasmToolAdapter {
 
         // The return type is a record (tool-spec) with fields: name, description, parameters-schema
         // Component Model returns records as a single Record value
-        let spec_record = &results[0];
+        let spec_record = results
+            .first()
+            .ok_or_else(|| PluginError::Runtime("get-spec returned no value".to_string()))?;
         let (name, description, params_schema) = match spec_record {
             wasmtime::component::Val::Record(fields) => {
                 let name = fields

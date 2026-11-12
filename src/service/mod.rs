@@ -648,17 +648,7 @@ async fn check_openprx_user() -> Result<()> {
         Ok(output) if output.status.success() => {
             let passwd_entry = String::from_utf8_lossy(&output.stdout);
             let parts: Vec<&str> = passwd_entry.split(':').collect();
-            if parts.len() >= 7 {
-                // SAFETY: bounds checked above (len >= 7)
-                #[allow(clippy::indexing_slicing)]
-                let uid = parts[2];
-                #[allow(clippy::indexing_slicing)]
-                let gid = parts[3];
-                #[allow(clippy::indexing_slicing)]
-                let home = parts[5];
-                #[allow(clippy::indexing_slicing)]
-                let shell = parts[6];
-
+            if let &[_, _, uid, gid, _, home, shell, ..] = parts.as_slice() {
                 if uid.parse::<u32>().unwrap_or(999) >= 1000 {
                     bail!(
                         "User 'prx' exists but has unexpected UID {} (expected system UID < 1000).\n\
@@ -870,10 +860,8 @@ async fn resolve_invoking_user_config_dir() -> Option<PathBuf> {
             if output.status.success() {
                 let entry = String::from_utf8_lossy(&output.stdout);
                 let fields: Vec<&str> = entry.trim().split(':').collect();
-                if fields.len() >= 6 {
-                    // SAFETY: bounds checked above (len >= 6)
-                    #[allow(clippy::indexing_slicing)]
-                    return Some(preferred_user_config_dir(PathBuf::from(fields[5])));
+                if let Some(&home) = fields.get(5) {
+                    return Some(preferred_user_config_dir(PathBuf::from(home)));
                 }
             }
         }

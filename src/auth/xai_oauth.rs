@@ -355,9 +355,11 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .read(&mut buffer)
         .await
         .context("Failed to read the xAI callback request")?;
-    // SAFETY: bytes_read <= buffer.len() because it is the return of stream.read.
-    #[allow(clippy::indexing_slicing)]
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request = String::from_utf8_lossy(
+        buffer
+            .get(..bytes_read)
+            .ok_or_else(|| anyhow::anyhow!("xAI callback read exceeded its buffer"))?,
+    );
     let first_line = request
         .lines()
         .next()
@@ -577,26 +579,29 @@ fn url_encode(input: &str) -> String {
         .collect()
 }
 
-// SAFETY: every index is bounded by `bytes.len()` or by `i + 2 < bytes.len()`.
-#[allow(clippy::indexing_slicing)]
+/// The byte encoded by the `%XX` escape that starts at `at`, if it is one.
+fn percent_escape(bytes: &[u8], at: usize) -> Option<u8> {
+    let &[hi, lo] = bytes.get(at + 1..at + 3)? else {
+        return None;
+    };
+    let value = (hi as char).to_digit(16)? * 16 + (lo as char).to_digit(16)?;
+    u8::try_from(value).ok()
+}
+
 fn url_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hi = (bytes[index + 1] as char).to_digit(16);
-                let lo = (bytes[index + 2] as char).to_digit(16);
-                if let (Some(high), Some(low)) = (hi, lo)
-                    && let Ok(value) = u8::try_from(high * 16 + low)
-                {
+    while let Some(&current) = bytes.get(index) {
+        match current {
+            b'%' => {
+                if let Some(value) = percent_escape(bytes, index) {
                     out.push(value);
                     index += 3;
-                    continue;
+                } else {
+                    out.push(current);
+                    index += 1;
                 }
-                out.push(bytes[index]);
-                index += 1;
             }
             b'+' => {
                 out.push(b' ');

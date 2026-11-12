@@ -372,9 +372,6 @@ const fn is_mattermost_username_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
 }
 
-// SAFETY: `index + mention_len <= text_bytes.len()` is the loop guard,
-// so text_bytes[index] and text_bytes[index..index+mention_len] are always valid.
-#[allow(clippy::indexing_slicing)]
 fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)> {
     if bot_username.is_empty() {
         return Vec::new();
@@ -391,18 +388,18 @@ fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)>
     let mut spans = Vec::new();
     let mut index = 0;
 
-    while index + mention_len <= text_bytes.len() {
-        let is_match = text_bytes[index] == b'@'
-            && text_bytes[index..index + mention_len]
+    while let Some(window) = text_bytes.get(index..index + mention_len) {
+        let is_match = window.first() == Some(&b'@')
+            && window
                 .iter()
                 .zip(mention_bytes.iter())
                 .all(|(left, right)| left.eq_ignore_ascii_case(right));
 
         if is_match {
             let end = index + mention_len;
-            let at_boundary = text[end..]
-                .chars()
-                .next()
+            let at_boundary = text
+                .get(end..)
+                .and_then(|rest| rest.chars().next())
                 .is_none_or(|next| !is_mattermost_username_char(next));
             if at_boundary {
                 spans.push((index, end));
@@ -411,7 +408,10 @@ fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)>
             }
         }
 
-        let step = text[index..].chars().next().map_or(1, char::len_utf8);
+        let step = text
+            .get(index..)
+            .and_then(|rest| rest.chars().next())
+            .map_or(1, char::len_utf8);
         index += step;
     }
 

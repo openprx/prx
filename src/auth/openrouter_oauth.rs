@@ -60,8 +60,11 @@ pub async fn receive_loopback_code(listener: TcpListener, timeout: Duration) -> 
         .read(&mut buffer)
         .await
         .context("Failed to read the OpenRouter callback")?;
-    #[allow(clippy::indexing_slicing)]
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let request = String::from_utf8_lossy(
+        buffer
+            .get(..read)
+            .ok_or_else(|| anyhow::anyhow!("OpenRouter callback read exceeded its buffer"))?,
+    );
     let path = request
         .lines()
         .next()
@@ -135,24 +138,28 @@ fn url_encode(input: &str) -> String {
         .collect()
 }
 
-#[allow(clippy::indexing_slicing)]
+/// The byte encoded by the `%XX` escape that starts at `at`, if it is one.
+fn percent_escape(bytes: &[u8], at: usize) -> Option<u8> {
+    let &[hi, lo] = bytes.get(at + 1..at + 3)? else {
+        return None;
+    };
+    let value = (hi as char).to_digit(16)? * 16 + (lo as char).to_digit(16)?;
+    u8::try_from(value).ok()
+}
+
 fn url_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hi = (bytes[index + 1] as char).to_digit(16);
-            let lo = (bytes[index + 2] as char).to_digit(16);
-            if let (Some(high), Some(low)) = (hi, lo)
-                && let Ok(value) = u8::try_from(high * 16 + low)
-            {
-                out.push(value);
-                index += 3;
-                continue;
-            }
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%'
+            && let Some(value) = percent_escape(bytes, index)
+        {
+            out.push(value);
+            index += 3;
+            continue;
         }
-        out.push(bytes[index]);
+        out.push(byte);
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

@@ -274,10 +274,6 @@ impl StorageExport for HealthCheckCall {
     }
 }
 
-// SAFETY: All results[N] accesses index a Vec that was just constructed with
-// exactly the right number of elements (e.g. `vec![Val::Bool(false)]`),
-// so the index is always valid.
-#[allow(clippy::indexing_slicing)]
 impl WasmStorage {
     /// Create a new `WasmStorage` from a compiled WASM component.
     ///
@@ -370,8 +366,8 @@ impl WasmStorage {
             .await
             .map_err(|e| PluginError::Runtime(format!("name() call failed: {e}")))?;
 
-        match &results[0] {
-            wasmtime::component::Val::String(s) => Ok(s.to_string()),
+        match results.first() {
+            Some(wasmtime::component::Val::String(s)) => Ok(s.to_string()),
             _ => Err(PluginError::Runtime(
                 "name() returned unexpected value type".to_string(),
             )),

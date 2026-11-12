@@ -130,9 +130,12 @@ pub(super) fn setup_project_context() -> Result<ProjectContext> {
             .interact_text()?
     } else {
         // Extract the short label before the parenthetical
-        // SAFETY: dialoguer Select guarantees tz_idx < tz_options.len()
-        #[allow(clippy::indexing_slicing)]
-        tz_options[tz_idx].split('(').next().unwrap_or("UTC").trim().to_string()
+        tz_options
+            .get(tz_idx)
+            .and_then(|option| option.split('(').next())
+            .unwrap_or("UTC")
+            .trim()
+            .to_string()
     };
 
     let agent_name: String = Input::new()

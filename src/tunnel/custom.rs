@@ -43,15 +43,13 @@ impl Tunnel for CustomTunnel {
             .replace("{port}", &local_port.to_string())
             .replace("{host}", local_host);
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() {
+        let mut parts = cmd.split_whitespace();
+        let Some(program) = parts.next() else {
             bail!("Custom tunnel start_command is empty");
-        }
+        };
 
-        // SAFETY: parts is non-empty (checked above), so parts[0] and parts[1..] are valid
-        #[allow(clippy::indexing_slicing)]
-        let mut child = Command::new(parts[0])
-            .args(&parts[1..])
+        let mut child = Command::new(program)
+            .args(parts)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

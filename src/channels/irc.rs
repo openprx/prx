@@ -172,7 +172,7 @@ impl IrcMessage {
 fn encode_sasl_plain(nick: &str, password: &str) -> String {
     // Simple base64 encoder — avoids adding a base64 crate dependency.
     // The project's Discord channel uses a similar inline approach.
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let input = format!("\0{nick}\0{password}");
     let bytes = input.as_bytes();
@@ -184,22 +184,21 @@ fn encode_sasl_plain(nick: &str, password: &str) -> String {
         let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
         let triple = (b0 << 16) | (b1 << 8) | b2;
 
-        // SAFETY: (triple >> N & 0x3F) is always in 0..64, and CHARS has 64 elements
-        #[allow(clippy::indexing_slicing)]
-        out.push(CHARS[(triple >> 18 & 0x3F) as usize] as char);
-        #[allow(clippy::indexing_slicing)]
-        out.push(CHARS[(triple >> 12 & 0x3F) as usize] as char);
+        // The index is masked to six bits and CHARS has 64 entries, so the
+        // padding fallback is never taken.
+        let sextet = |shift: u32| CHARS.get((triple >> shift & 0x3F) as usize).copied().unwrap_or(b'=') as char;
+
+        out.push(sextet(18));
+        out.push(sextet(12));
 
         if chunk.len() > 1 {
-            #[allow(clippy::indexing_slicing)]
-            out.push(CHARS[(triple >> 6 & 0x3F) as usize] as char);
+            out.push(sextet(6));
         } else {
             out.push('=');
         }
 
         if chunk.len() > 2 {
-            #[allow(clippy::indexing_slicing)]
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
+            out.push(sextet(0));
         } else {
             out.push('=');
         }

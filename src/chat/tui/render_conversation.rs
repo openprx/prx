@@ -277,12 +277,13 @@ pub(super) fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
         ])
         .split(area);
 
-    #[allow(clippy::indexing_slicing)]
-    {
-        render_status_bar(frame, chunks[1], state);
-        render_input(frame, chunks[3], state);
-        render_fullscreen_footer(frame, chunks[4], state, show_new_output_below);
-    }
+    let (Some(&status_area), Some(&input_area), Some(&footer_area)) = (chunks.get(1), chunks.get(3), chunks.get(4))
+    else {
+        return;
+    };
+    render_status_bar(frame, status_area, state);
+    render_input(frame, input_area, state);
+    render_fullscreen_footer(frame, footer_area, state, show_new_output_below);
 }
 
 pub fn render_fullscreen_chat<V: BottomChromeView + ?Sized>(
@@ -309,14 +310,14 @@ pub fn render_fullscreen_chat_with_selection<V: BottomChromeView + ?Sized>(
         .constraints([Constraint::Length(content_height), Constraint::Length(chrome_height)])
         .split(frame_area);
 
-    #[allow(clippy::indexing_slicing)]
-    {
-        let (transcript_area, panel_area) = fullscreen_content_areas(chunks[0], state);
-        render_fullscreen_transcript(frame, transcript_area, state, scroll, selection);
-        render_fullscreen_panel(frame, panel_area, state);
-        render_fullscreen_bottom_chrome_at(frame, chunks[1], state, scroll.new_output_below);
-        render_fullscreen_overlays(frame, chunks[0], state);
-    }
+    let (Some(&content_area), Some(&chrome_area)) = (chunks.first(), chunks.get(1)) else {
+        return;
+    };
+    let (transcript_area, panel_area) = fullscreen_content_areas(content_area, state);
+    render_fullscreen_transcript(frame, transcript_area, state, scroll, selection);
+    render_fullscreen_panel(frame, panel_area, state);
+    render_fullscreen_bottom_chrome_at(frame, chrome_area, state, scroll.new_output_below);
+    render_fullscreen_overlays(frame, content_area, state);
 }
 
 pub(super) fn fullscreen_content_areas<V: BottomChromeView + ?Sized>(area: Rect, state: &V) -> (Rect, Option<Rect>) {
@@ -341,8 +342,10 @@ pub(super) fn fullscreen_content_areas<V: BottomChromeView + ?Sized>(area: Rect,
             Constraint::Length(panel_height),
         ])
         .split(area);
-    #[allow(clippy::indexing_slicing)]
-    (chunks[0], Some(chunks[1]))
+    match (chunks.first(), chunks.get(1)) {
+        (Some(&transcript_area), Some(&panel_area)) => (transcript_area, Some(panel_area)),
+        _ => (area, None),
+    }
 }
 
 pub(super) fn render_fullscreen_panel<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Option<Rect>, state: &V) {

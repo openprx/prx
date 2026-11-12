@@ -869,9 +869,6 @@ fn filter_reachable_entries(
         .collect()
 }
 
-// SAFETY: chosen_index and other_index are produced by .position()/.enumerate()
-// on the same `models` slice, so they are always valid indices.
-#[allow(clippy::indexing_slicing)]
 #[cfg(feature = "llm-router")]
 fn apply_outcome_update_locked(
     models: &mut [ModelCapabilityEntry],
@@ -887,7 +884,6 @@ fn apply_outcome_update_locked(
 }
 
 #[cfg(feature = "llm-router")]
-#[allow(clippy::indexing_slicing)]
 fn apply_outcome_at_index(
     models: &mut [ModelCapabilityEntry],
     chosen_index: usize,
@@ -895,10 +891,8 @@ fn apply_outcome_at_index(
     latency_ms: u64,
     recent_successes: &mut VecDeque<bool>,
 ) -> Option<OutcomePersistenceSnapshot> {
-    if chosen_index >= models.len() {
-        return None;
-    }
-    let baseline = models
+    // The best other model's rating, read before the chosen entry is borrowed.
+    let baseline_elo = models
         .iter()
         .enumerate()
         .filter(|(index, _)| *index != chosen_index)
@@ -907,7 +901,8 @@ fn apply_outcome_at_index(
                 .partial_cmp(&right.dynamic_elo)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|(index, _)| index);
+        .map(|(_, model)| model.dynamic_elo);
+    let chosen = models.get_mut(chosen_index)?;
 
     recent_successes.push_back(success);
     while recent_successes.len() > 100 {
@@ -915,27 +910,26 @@ fn apply_outcome_at_index(
     }
 
     let success_count = recent_successes.iter().filter(|value| **value).count() as f32;
-    models[chosen_index].success_rate = if recent_successes.is_empty() {
+    chosen.success_rate = if recent_successes.is_empty() {
         1.0
     } else {
         success_count / recent_successes.len() as f32
     };
 
-    let old_latency = models[chosen_index].recent_latency_ms as f32;
+    let old_latency = chosen.recent_latency_ms as f32;
     let new_latency = latency_ms.min(u64::from(u32::MAX)) as f32;
-    models[chosen_index].recent_latency_ms = (old_latency.mul_add(0.7, new_latency * 0.3)).round() as u32;
+    chosen.recent_latency_ms = (old_latency.mul_add(0.7, new_latency * 0.3)).round() as u32;
 
-    if let Some(other_index) = baseline {
-        let baseline_elo = models[other_index].dynamic_elo;
+    if let Some(baseline_elo) = baseline_elo {
         let updated_chosen_elo = if success {
-            update_elo(models[chosen_index].dynamic_elo, baseline_elo).0
+            update_elo(chosen.dynamic_elo, baseline_elo).0
         } else {
-            update_elo(baseline_elo, models[chosen_index].dynamic_elo).1
+            update_elo(baseline_elo, chosen.dynamic_elo).1
         };
-        models[chosen_index].dynamic_elo = updated_chosen_elo;
+        chosen.dynamic_elo = updated_chosen_elo;
     }
 
-    let metrics_entry = models[chosen_index].clone();
+    let metrics_entry = chosen.clone();
     Some(OutcomePersistenceSnapshot {
         model_id: metrics_entry.config.model_id.clone(),
         metrics_entry,

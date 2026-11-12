@@ -171,9 +171,11 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
         .await
         .context("Failed to read callback request")?;
 
-    // SAFETY: bytes_read <= buffer.len() because it is the return value of stream.read(&mut buffer)
-    #[allow(clippy::indexing_slicing)]
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let request = String::from_utf8_lossy(
+        buffer
+            .get(..bytes_read)
+            .ok_or_else(|| anyhow::anyhow!("Callback read exceeded its buffer"))?,
+    );
     let first_line = request
         .lines()
         .next()
@@ -383,29 +385,30 @@ fn url_encode(input: &str) -> String {
         .collect::<String>()
 }
 
-// SAFETY: All byte accesses in url_decode are guarded:
-// - bytes[i] is under `while i < bytes.len()`
-// - bytes[i+1] and bytes[i+2] are under `i + 2 < bytes.len()`
-#[allow(clippy::indexing_slicing)]
+/// The byte encoded by the `%XX` escape that starts at `at`, if it is one.
+fn percent_escape(bytes: &[u8], at: usize) -> Option<u8> {
+    let &[hi, lo] = bytes.get(at + 1..at + 3)? else {
+        return None;
+    };
+    let value = (hi as char).to_digit(16)? * 16 + (lo as char).to_digit(16)?;
+    u8::try_from(value).ok()
+}
+
 fn url_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hi = bytes[i + 1] as char;
-                let lo = bytes[i + 2] as char;
-                if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16)) {
-                    if let Ok(value) = u8::try_from(h * 16 + l) {
-                        out.push(value);
-                        i += 3;
-                        continue;
-                    }
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'%' => {
+                if let Some(value) = percent_escape(bytes, i) {
+                    out.push(value);
+                    i += 3;
+                } else {
+                    out.push(byte);
+                    i += 1;
                 }
-                out.push(bytes[i]);
-                i += 1;
             }
             b'+' => {
                 out.push(b' ');

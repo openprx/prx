@@ -148,21 +148,13 @@ impl JudgeHealthMonitor {
     }
 
     fn detect_drift(&self) -> Option<JudgeDriftAlert> {
-        if self.recent_round_means.len() < 4 {
-            return None;
-        }
         let values = self.recent_round_means.iter().copied().collect::<Vec<_>>();
-        // SAFETY: values.len() >= 4 (checked above), so values.len()-4 is valid,
-        // and tail has exactly 4 elements so tail[0..3] are always valid.
-        #[allow(clippy::indexing_slicing)]
-        let tail = &values[values.len() - 4..];
+        // Fewer than four rounds is not enough history to call a drift.
+        let tail @ &[first, second, third, fourth] = values.last_chunk::<4>()?;
 
-        #[allow(clippy::indexing_slicing)]
-        let a = relative_shift(tail[0], tail[1]);
-        #[allow(clippy::indexing_slicing)]
-        let b = relative_shift(tail[1], tail[2]);
-        #[allow(clippy::indexing_slicing)]
-        let c = relative_shift(tail[2], tail[3]);
+        let a = relative_shift(first, second);
+        let b = relative_shift(second, third);
+        let c = relative_shift(third, fourth);
         if a > 0.15 && b > 0.15 && c > 0.15 {
             return Some(JudgeDriftAlert {
                 message: "judge score drift exceeded 15% for 3 consecutive rounds".to_string(),

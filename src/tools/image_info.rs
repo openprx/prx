@@ -33,10 +33,12 @@ impl ImageInfoTool {
             "jpeg"
         } else if bytes.starts_with(b"GIF8") {
             "gif"
-        } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 {
-            // SAFETY: bounds checked above (len >= 12)
-            #[allow(clippy::indexing_slicing)]
-            if &bytes[8..12] == b"WEBP" { "webp" } else { "unknown" }
+        } else if bytes.starts_with(b"RIFF") {
+            if bytes.get(8..12).is_some_and(|tag| tag == b"WEBP") {
+                "webp"
+            } else {
+                "unknown"
+            }
         } else if bytes.starts_with(b"BM") {
             "bmp"
         } else {
@@ -44,42 +46,33 @@ impl ImageInfoTool {
         }
     }
 
+    /// The `N` bytes starting at `at`, or `None` when the input is shorter.
+    fn array_at<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+        bytes.get(at..at.checked_add(N)?)?.try_into().ok()
+    }
+
     /// Try to extract dimensions from image header bytes.
     /// Returns (width, height) if detectable.
-    // SAFETY: all array indexing below is guarded by the len checks in each branch
-    #[allow(clippy::indexing_slicing)]
     fn extract_dimensions(bytes: &[u8], format: &str) -> Option<(u32, u32)> {
         match format {
             "png" => {
                 // PNG IHDR chunk: bytes 16-19 = width, 20-23 = height (big-endian)
-                if bytes.len() >= 24 {
-                    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-                    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-                    Some((w, h))
-                } else {
-                    None
-                }
+                let w = u32::from_be_bytes(Self::array_at(bytes, 16)?);
+                let h = u32::from_be_bytes(Self::array_at(bytes, 20)?);
+                Some((w, h))
             }
             "gif" => {
                 // GIF: bytes 6-7 = width, 8-9 = height (little-endian)
-                if bytes.len() >= 10 {
-                    let w = u32::from(u16::from_le_bytes([bytes[6], bytes[7]]));
-                    let h = u32::from(u16::from_le_bytes([bytes[8], bytes[9]]));
-                    Some((w, h))
-                } else {
-                    None
-                }
+                let w = u32::from(u16::from_le_bytes(Self::array_at(bytes, 6)?));
+                let h = u32::from(u16::from_le_bytes(Self::array_at(bytes, 8)?));
+                Some((w, h))
             }
             "bmp" => {
                 // BMP: bytes 18-21 = width, 22-25 = height (little-endian, signed)
-                if bytes.len() >= 26 {
-                    let w = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
-                    let h_raw = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]);
-                    let h = h_raw.unsigned_abs();
-                    Some((w, h))
-                } else {
-                    None
-                }
+                let w = u32::from_le_bytes(Self::array_at(bytes, 18)?);
+                let h_raw = i32::from_le_bytes(Self::array_at(bytes, 22)?);
+                let h = h_raw.unsigned_abs();
+                Some((w, h))
             }
             "jpeg" => Self::jpeg_dimensions(bytes),
             _ => None,
@@ -87,37 +80,27 @@ impl ImageInfoTool {
     }
 
     /// Parse JPEG SOF markers to extract dimensions.
-    // SAFETY: all byte indexing is guarded by i+N < bytes.len() conditions
-    #[allow(clippy::indexing_slicing)]
     fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let mut i = 2; // skip SOI marker
-        while i + 1 < bytes.len() {
-            if bytes[i] != 0xFF {
+        while let Some([prefix, marker]) = Self::array_at::<2>(bytes, i) {
+            if prefix != 0xFF {
                 return None;
             }
-            let marker = bytes[i + 1];
             i += 2;
 
             // SOF0..SOF3 markers contain dimensions
             if (0xC0..=0xC3).contains(&marker) {
-                if i + 7 <= bytes.len() {
-                    let h = u32::from(u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]));
-                    let w = u32::from(u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]));
-                    return Some((w, h));
-                }
-                return None;
+                let h = u32::from(u16::from_be_bytes(Self::array_at(bytes, i + 3)?));
+                let w = u32::from(u16::from_be_bytes(Self::array_at(bytes, i + 5)?));
+                return Some((w, h));
             }
 
             // Skip this segment
-            if i + 1 < bytes.len() {
-                let seg_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
-                if seg_len < 2 {
-                    return None; // Malformed segment (valid segments have length >= 2)
-                }
-                i += seg_len;
-            } else {
-                return None;
+            let seg_len = usize::from(u16::from_be_bytes(Self::array_at(bytes, i)?));
+            if seg_len < 2 {
+                return None; // Malformed segment (valid segments have length >= 2)
             }
+            i += seg_len;
         }
         None
     }

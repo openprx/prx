@@ -158,9 +158,6 @@ fn chat_payload_bytes(messages: &[ChatMessage], model: &str) -> usize {
     })
 }
 
-// SAFETY: All results[N] accesses index a Vec that was just constructed with
-// the correct number of elements, so the index is always valid.
-#[allow(clippy::indexing_slicing)]
 impl WasmProvider {
     /// Create a new `WasmProvider` from a compiled WASM component.
     ///
@@ -249,8 +246,8 @@ impl WasmProvider {
             .await
             .map_err(|e| PluginError::Runtime(format!("name() call failed: {e}")))?;
 
-        match &results[0] {
-            wasmtime::component::Val::String(s) => Ok(s.to_string()),
+        match results.first() {
+            Some(wasmtime::component::Val::String(s)) => Ok(s.to_string()),
             _ => Err(PluginError::Runtime(
                 "name() returned unexpected value type".to_string(),
             )),

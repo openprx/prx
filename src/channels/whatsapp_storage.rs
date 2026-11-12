@@ -1317,29 +1317,44 @@ impl DeviceStoreTrait for RusqliteStore {
                 let identity_key_bytes: Vec<u8> = row.get("identity_key")?;
                 let signed_pre_key_bytes: Vec<u8> = row.get("signed_pre_key")?;
 
-                if noise_key_bytes.len() != 64 || identity_key_bytes.len() != 64 || signed_pre_key_bytes.len() != 64 {
-                    return Err(rusqlite::Error::InvalidParameterName("key_pair".into()));
+                // A stored key pair is the 32-byte private key followed by the
+                // 32-byte public key.
+                fn split_key_pair(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+                    if bytes.len() == 64 {
+                        bytes.split_at_checked(32)
+                    } else {
+                        None
+                    }
                 }
+
+                let (
+                    Some((noise_private, noise_public)),
+                    Some((identity_private, identity_public)),
+                    Some((signed_pre_private, signed_pre_public)),
+                ) = (
+                    split_key_pair(&noise_key_bytes),
+                    split_key_pair(&identity_key_bytes),
+                    split_key_pair(&signed_pre_key_bytes),
+                )
+                else {
+                    return Err(rusqlite::Error::InvalidParameterName("key_pair".into()));
+                };
 
                 use wa_rs_core::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 
-                // Length validated as 64 above; slicing is safe.
-                #[allow(clippy::indexing_slicing)]
                 let noise_key = KeyPair::new(
-                    PublicKey::from_djb_public_key_bytes(&noise_key_bytes[32..64]).map_err(to_rusqlite_err)?,
-                    PrivateKey::deserialize(&noise_key_bytes[0..32]).map_err(to_rusqlite_err)?,
+                    PublicKey::from_djb_public_key_bytes(noise_public).map_err(to_rusqlite_err)?,
+                    PrivateKey::deserialize(noise_private).map_err(to_rusqlite_err)?,
                 );
 
-                #[allow(clippy::indexing_slicing)]
                 let identity_key = KeyPair::new(
-                    PublicKey::from_djb_public_key_bytes(&identity_key_bytes[32..64]).map_err(to_rusqlite_err)?,
-                    PrivateKey::deserialize(&identity_key_bytes[0..32]).map_err(to_rusqlite_err)?,
+                    PublicKey::from_djb_public_key_bytes(identity_public).map_err(to_rusqlite_err)?,
+                    PrivateKey::deserialize(identity_private).map_err(to_rusqlite_err)?,
                 );
 
-                #[allow(clippy::indexing_slicing)]
                 let signed_pre_key = KeyPair::new(
-                    PublicKey::from_djb_public_key_bytes(&signed_pre_key_bytes[32..64]).map_err(to_rusqlite_err)?,
-                    PrivateKey::deserialize(&signed_pre_key_bytes[0..32]).map_err(to_rusqlite_err)?,
+                    PublicKey::from_djb_public_key_bytes(signed_pre_public).map_err(to_rusqlite_err)?,
+                    PrivateKey::deserialize(signed_pre_private).map_err(to_rusqlite_err)?,
                 );
 
                 let lid_str: Option<String> = row.get("lid")?;

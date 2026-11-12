@@ -757,7 +757,6 @@ pub(super) fn render_switcher(
     let end = (start + list_height).min(total);
 
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(list_height.saturating_add(1));
-    #[allow(clippy::indexing_slicing)]
     for (idx, entry) in switcher.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
         let abs = start + idx;
         let selected = abs == switcher.selected;

@@ -165,10 +165,16 @@ fn normalize_incoming_content(content: &str, mention_only: bool, bot_user_id: &s
 }
 
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
-// SAFETY: chunk.len() < 4 breaks the loop, so chunk[2]/[3] are always valid;
-// v is a fixed-size [0usize; 4] array so v[0..3] are always valid.
-#[allow(clippy::cast_possible_truncation, clippy::indexing_slicing)]
+#[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
+    fn sextet(byte: u8) -> Option<usize> {
+        if byte == b'=' {
+            Some(0)
+        } else {
+            BASE64_ALPHABET.iter().position(|&a| a == byte)
+        }
+    }
+
     let padded = match input.len() % 4 {
         2 => format!("{input}=="),
         3 => format!("{input}="),
@@ -178,26 +184,19 @@ fn base64_decode(input: &str) -> Option<String> {
     let mut bytes = Vec::new();
     let chars: Vec<u8> = padded.bytes().collect();
 
-    for chunk in chars.chunks(4) {
-        if chunk.len() < 4 {
+    // A trailing chunk shorter than four bytes is ignored.
+    for chunk in chars.chunks_exact(4) {
+        let &[c0, c1, c2, c3] = chunk else {
             break;
-        }
+        };
+        let (v0, v1, v2, v3) = (sextet(c0)?, sextet(c1)?, sextet(c2)?, sextet(c3)?);
 
-        let mut v = [0usize; 4];
-        for (i, &b) in chunk.iter().enumerate() {
-            if b == b'=' {
-                v[i] = 0;
-            } else {
-                v[i] = BASE64_ALPHABET.iter().position(|&a| a == b)?;
-            }
+        bytes.push(((v0 << 2) | (v1 >> 4)) as u8);
+        if c2 != b'=' {
+            bytes.push((((v1 & 0xF) << 4) | (v2 >> 2)) as u8);
         }
-
-        bytes.push(((v[0] << 2) | (v[1] >> 4)) as u8);
-        if chunk[2] != b'=' {
-            bytes.push((((v[1] & 0xF) << 4) | (v[2] >> 2)) as u8);
-        }
-        if chunk[3] != b'=' {
-            bytes.push((((v[2] & 0x3) << 6) | v[3]) as u8);
+        if c3 != b'=' {
+            bytes.push((((v2 & 0x3) << 6) | v3) as u8);
         }
     }
 
