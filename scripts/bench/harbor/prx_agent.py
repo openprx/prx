@@ -1,7 +1,16 @@
-"""Harbor 0.25.0 installed-agent adapter; all accounting lives in record.py."""
+"""Harbor 0.25.0 installed-agent adapter; all accounting lives in record.py.
+
+The provider key never enters the task container. For a `custom:https://`
+provider the adapter runs key_proxy.KeyProxy on the host for one trial and the
+container profile holds the proxy URL plus a per-trial token. A plain
+`custom:http://` provider is the unpaid smoke endpoint: it is reached directly
+and also receives a throwaway token, never the key file content.
+"""
 import asyncio
+import logging
 import math
 import os
+import secrets
 import sqlite3
 import stat
 from pathlib import Path
@@ -10,6 +19,7 @@ import tempfile
 
 from harbor.agents.installed.base import BaseInstalledAgent
 
+from key_proxy import CONTAINER_HOST, KeyProxy, holds_key, primary_ipv4
 from profile import PRICES, check, identity, read_bounded, render
 from record import AGENT_KEYS, agent_metadata, build_agent, endpoint, sha256, unavailable, per_attempt_models
 
@@ -76,9 +86,17 @@ def read_key_file(path):
     return key.decode().strip()
 
 
+def require_proxy_route(provider):
+    # Built-in providers have a fixed base URL in PRX, so the key would have
+    # to enter the container. Fail closed instead.
+    if not provider.startswith("custom:"):
+        raise ValueError("built-in providers cannot use the host key proxy; "
+                         "pass provider=custom:https://<provider base URL>")
+
+
 class PrxAgent(BaseInstalledAgent):
     def __init__(self, *args, binary_path, binary_sha256, git_sha,
-                 agent_timeout_sec, key_file, temperature=0.0, provider=None, **kwargs):
+                 agent_timeout_sec, key_file, temperature=0.0, provider=None, proxy_bind=None, **kwargs):
         self.key_file = Path(key_file)
         self.binary_path = Path(binary_path)
         self.binary_sha256 = str(binary_sha256)
@@ -91,8 +109,10 @@ class PrxAgent(BaseInstalledAgent):
             raise ValueError("temperature must be finite")
         self.prices = {key: float(kwargs.pop("price_" + key)) for key in PRICES}
         self.provider_override = provider
+        self.proxy_bind = proxy_bind
         super().__init__(*args, **kwargs)
         self.provider, self.model = identity(self.model_name or "", provider)
+        require_proxy_route(self.provider)
         self._metadata = {key: unavailable("agent did not produce metadata") for key in AGENT_KEYS}
 
     @staticmethod
@@ -118,13 +138,35 @@ class PrxAgent(BaseInstalledAgent):
         # Keep context empty: Harbor invokes populate_context_post_run after log download.
         del context
         key = read_key_file(self.key_file)
+        proxy = None
+        container_provider = self.provider
+        if self.provider.startswith("custom:https://"):
+            proxy = KeyProxy(self.provider[7:], key, self.proxy_bind or primary_ipv4())
+            container_provider = "custom:" + proxy.container_base_url()
+            proxy.start()
+        try:
+            await self._trial(instruction, environment, key, proxy, container_provider)
+        finally:
+            # Synchronous on purpose: cancellation cannot skip it.
+            if proxy is not None:
+                proxy.stop()
+
+    async def _trial(self, instruction, environment, key, proxy, container_provider):
+        credential = proxy.token if proxy is not None else secrets.token_urlsafe(32)
         with tempfile.TemporaryDirectory(prefix="prx-bench-profile-") as directory:
             path = Path(directory) / "config.toml"
-            profile_text = render(path, self.model_name, key, self.prices, self.provider_override)
+            profile_text = render(path, self.model_name, credential, self.prices, container_provider)
             values = check(path)
+        if holds_key(profile_text.encode(), key):
+            raise RuntimeError("refusing to upload a profile that contains the provider key")
+        # Hash a canonical profile: the token and proxy port change every trial.
+        canonical = profile_text.replace(credential, "<per-trial-credential>")
+        if proxy is not None:
+            canonical = canonical.replace(f"{CONTAINER_HOST}:{proxy.address[1]}", f"{CONTAINER_HOST}:<per-trial-port>")
         self._metadata = agent_metadata(values, self.provider, self.model, self.prices,
-            self.temperature, self.git_sha, self.binary_sha256, profile_text,
-            instruction, self.version(), self.agent_timeout_sec)
+            self.temperature, self.git_sha, self.binary_sha256, canonical,
+            instruction, self.version(), self.agent_timeout_sec, settlement=container_provider)
+        self._metadata["container_config_key_scan"] = unavailable("not run")
         setup = await environment.exec(
             command="test ! -e /opt/prx-bench && mkdir -p /opt/prx-bench /logs/agent && chown root:root /opt/prx-bench && chmod 0700 /opt/prx-bench",
             user="root", timeout_sec=30)
@@ -139,7 +181,8 @@ class PrxAgent(BaseInstalledAgent):
             if locked.return_code != 0:
                 raise RuntimeError("cannot secure private config")
             seconds = self.agent_timeout_sec - 50
-            no_proxy = f"NO_PROXY={shlex.quote(endpoint(self.provider))} no_proxy={shlex.quote(endpoint(self.provider))} " if self.provider.startswith("custom:") else ""
+            host = shlex.quote(endpoint(container_provider))
+            no_proxy = f"NO_PROXY={host} no_proxy={host} "
             command = (f"env -u PRX_BENCH_API_KEY {no_proxy}prx --config-dir {CONFIG_DIR} "
                        f"agent -t {self.temperature:g} -m {shlex.quote(instruction)} "
                        f">{LOG_DIR}/prx-stdout.txt 2>{LOG_DIR}/prx-stderr.txt; "
@@ -156,13 +199,31 @@ class PrxAgent(BaseInstalledAgent):
                 await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await environment.exec(command=f"printf '124\\n' >{LOG_DIR}/prx-exit-code", timeout_sec=5)
         finally:
+            if proxy is not None:
+                proxy.stop()
+            leaked = False
             try:
                 await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
+                try:
+                    leaked = await asyncio.wait_for(self._config_holds_key(environment, key), timeout=15)
+                    self._metadata["container_config_key_scan"] = "leak" if leaked else "clean"
+                except (ValueError, OSError, asyncio.TimeoutError, RuntimeError, sqlite3.Error) as error:
+                    self._metadata["container_config_key_scan"] = unavailable(f"config unreadable: {type(error).__name__}")
+                    logging.getLogger("prx_bench.adapter").warning("container config key scan did not run")
                 await asyncio.wait_for(self._collect(environment), timeout=15)
             except (sqlite3.Error, ValueError, KeyError, TypeError, OSError, asyncio.TimeoutError, RuntimeError) as error:
                 self._metadata["per_attempt_models"] = unavailable(f"per-attempt ledger unreadable: {type(error).__name__}")
             finally:
                 await asyncio.shield(environment.exec(command="rm -rf /opt/prx-bench", user="root", timeout_sec=5))
+            if leaked:
+                raise RuntimeError("credential leak in container config")
+
+    async def _config_holds_key(self, environment, key):
+        """Download the container-side config after the trial and scan it on the host."""
+        with tempfile.TemporaryDirectory(prefix="prx-bench-scan-") as directory:
+            local = Path(directory) / "config.toml"
+            await environment.download_file(CONFIG_DIR + "/config.toml", str(local))
+            return holds_key(read_bounded(local), key)
 
     async def _collect(self, environment):
         await environment.exec(

@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -60,6 +61,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 agent.model_name = 'prx/model'
                 agent.provider_override = 'custom:http://host.containers.internal:1234/v1'
                 agent.provider = agent.provider_override
+                agent.proxy_bind = None
                 agent.model = 'model'
                 agent.prices = dict.fromkeys(('input', 'output', 'cache_read', 'cache_write'), 0)
                 agent.temperature = 0
@@ -80,7 +82,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(secret, calls)
                 self.assertNotIn(secret[:8], calls)
                 self.assertNotIn('env', {k for call in environment.calls for k in call})
-                self.assertIn(secret, environment.uploads[0]['content'])
+                self.assertNotIn(secret, environment.uploads[0]['content'])
+                self.assertNotIn(secret[:8], environment.uploads[0]['content'])
                 self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
                 commands = [call['command'] for call in environment.calls]
                 self.assertIn(adapter.KILL_PRX, commands)
@@ -93,6 +96,87 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(execution['timeout_sec'], 70)
                 self.assertEqual(agent._metadata['agent_exec_timeout_sec'], 70)
                 self.assertTrue(all(c['timeout_sec'] == 10 for c in environment.calls if c['command'] == adapter.KILL_PRX))
+
+    def proxied_agent(self):
+        agent = object.__new__(adapter.PrxAgent)
+        agent.key_file = Path('/opt/ops/bench/secrets/fixture')
+        agent.model_name = 'prx/model'
+        agent.provider_override = 'custom:https://api.example.test/v1'
+        agent.provider = agent.provider_override
+        agent.proxy_bind = '127.0.0.1'
+        agent.model = 'model'
+        agent.prices = dict.fromkeys(('input', 'output', 'cache_read', 'cache_write'), 0)
+        agent.temperature = 0
+        agent.git_sha = 'sha'
+        agent.binary_sha256 = 'binary'
+        agent.agent_timeout_sec = 120
+        agent.version = lambda: 'prx fixture'
+        agent._metadata = {k: unavailable('not produced') for k in AGENT_KEYS}
+
+        async def upload(environment, **kwargs):
+            environment.uploads.append(kwargs)
+
+        agent._upload_config_text = upload
+        return agent
+
+    async def test_https_provider_runs_behind_per_trial_proxy_that_dies_with_the_trial(self):
+        secret = 'prx-fixture-secret-not-exported'
+        hashes = set()
+        for mode in ('normal', 'timeout', 'runtime_timeout', 'download_timeout'):
+            with self.subTest(mode=mode):
+                agent = self.proxied_agent()
+                environment = FakeEnvironment(mode)
+                reachable = []
+                plain_exec = environment.exec
+
+                async def exec_and_probe(plain_exec=plain_exec, environment=environment, reachable=reachable, **kwargs):
+                    if 'agent -t' in kwargs['command']:
+                        port = int(environment.uploads[0]['content'].split('host.containers.internal:')[1].split('/')[0])
+                        socket.create_connection(('127.0.0.1', port), timeout=2).close()
+                        reachable.append(port)
+                    return await plain_exec(**kwargs)
+
+                environment.exec = exec_and_probe
+                with patch.object(adapter, 'read_key_file', return_value=secret):
+                    await agent.run('fixture instruction', environment, None)
+                content = environment.uploads[0]['content']
+                self.assertNotIn(secret, content)
+                self.assertNotIn(secret[:8], content)
+                self.assertNotIn('api.example.test', content, 'container must only know the proxy')
+                (port,) = reachable
+                container_provider = f'custom:http://host.containers.internal:{port}/v1'
+                self.assertIn(json.dumps(container_provider), content)
+                with self.assertRaises(OSError, msg='proxy must be stopped after the trial'):
+                    socket.create_connection(('127.0.0.1', port), timeout=2).close()
+                self.assertEqual(agent._metadata['provider'], 'api.example.test')
+                self.assertEqual(agent._metadata['settlement_provider'], container_provider)
+                expected = unavailable('config unreadable: TimeoutError') if mode == 'download_timeout' else 'clean'
+                self.assertEqual(agent._metadata['container_config_key_scan'], expected)
+                self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
+                hashes.add(agent._metadata['profile_sha256'])
+        self.assertEqual(len(hashes), 1, 'profile hash must not depend on the per-trial token or port')
+
+    async def test_key_found_in_container_config_after_trial_fails_the_trial(self):
+        secret = 'prx-fixture-secret-not-exported'
+        for leaked in (secret, secret[:8]):
+            with self.subTest(leaked=leaked):
+                agent = self.proxied_agent()
+                environment = FakeEnvironment('normal')
+
+                async def download(remote, local, leaked=leaked):
+                    Path(local).write_text(f'api_key = "{leaked}"\n' if remote.endswith('config.toml') else 'x')
+
+                environment.download_file = download
+                with patch.object(adapter, 'read_key_file', return_value=secret):
+                    with self.assertRaisesRegex(RuntimeError, 'credential leak in container config'):
+                        await agent.run('fixture instruction', environment, None)
+                self.assertEqual(agent._metadata['container_config_key_scan'], 'leak')
+                self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
+
+    async def test_built_in_provider_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'host key proxy'):
+            adapter.require_proxy_route('kimi-code')
+        adapter.require_proxy_route('custom:https://api.example.test/v1')
 
     async def test_key_file_rejects_wrong_path_and_mode(self):
         with self.assertRaises(ValueError):

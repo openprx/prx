@@ -57,7 +57,10 @@ def serving_provider(provider):
 
 
 def agent_metadata(values, provider, model, prices, temperature, git_sha,
-                   binary_sha256, profile_text, instruction, version, agent_timeout_sec):
+                   binary_sha256, profile_text, instruction, version, agent_timeout_sec,
+                   settlement=None):
+    # `settlement` is the provider label PRX itself records when the adapter
+    # points the container at the host key proxy instead of `provider`.
     safe_values = {k: v for k, v in values.items()
                    if k not in ("api_key", "default_provider", "providers", "cost")}
     safe_values["default_provider"] = endpoint(provider)
@@ -71,7 +74,7 @@ def agent_metadata(values, provider, model, prices, temperature, git_sha,
         "profile_sha256": sha256(profile_text.encode()),
         "instruction_sha256": sha256(instruction.encode()), "version": version,
         "model_id": model, "provider": endpoint(provider),
-        "settlement_provider": serving_provider(provider),
+        "settlement_provider": serving_provider(settlement or provider),
         "sampling": {"temperature": temperature}, "profile_values": safe_values,
         "agent_timeout_sec": agent_timeout_sec,
         "agent_exec_timeout_sec": agent_timeout_sec - 50,
