@@ -358,7 +358,7 @@ impl ProxyConfigTool {
     /// `apply_env` and `clear_env` used to write and remove the proxy
     /// variables of the running process. They are refused with a typed
     /// error: nothing mutates the process environment after startup.
-    fn refuse_env_mutation(action: &'static str) -> ProxyEnvError {
+    const fn refuse_env_mutation(action: &'static str) -> ProxyEnvError {
         ProxyEnvError::RuntimeMutationUnsupported { action }
     }
 }
@@ -433,7 +433,7 @@ impl Tool for ProxyConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors, 'apply_env' applies the proxy to the process environment, and 'clear_env' removes it"
+        "Manage ZeroClaw proxy settings (scope: environment | prx | services): 'get' reads the effective settings, 'set' writes them, 'list_services' lists the routable service selectors; 'apply_env' and 'clear_env' are refused (PRX never modifies the process environment at runtime)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
