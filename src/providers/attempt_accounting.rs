@@ -114,21 +114,6 @@ pub(crate) async fn chat_traced(
     .await
     .map_err(|_| AccountingRefusal)?
 }
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
-pub(crate) async fn embed(
-    provider: &dyn crate::memory::embeddings::EmbeddingProvider,
-    texts: &[&str],
-    accounting: Arc<dyn AttemptAccounting>,
-) -> anyhow::Result<Vec<Vec<f32>>> {
-    if !provider.supports_attempt_accounting() {
-        return Err(AccountingRefusal.into());
-    }
-    let deadline = tokio::time::Instant::from_std(accounting.deadline());
-    tokio::time::timeout_at(deadline, ACCOUNTING.scope(accounting, provider.embed(texts)))
-        .await
-        .map_err(|_| AccountingRefusal)?
-}
 
 /// Live leaves the ordinary path's response ownership/allocation unchanged.
 pub(crate) enum Response {

@@ -1783,12 +1783,7 @@ impl TurnDecisionService {
         ) {
             return true;
         }
-        matches!(
-            crate::decision::factory::configured_selection(&config.causal_tree),
-            Some(selection)
-                if selection.locality == crate::decision::BackendLocality::Loopback
-                    || config.decision_engine.enabled
-        )
+        crate::decision::factory::configured_selection(&config.causal_tree).is_some()
     }
 
     /// Build the turn context, G6 slice and SendLimits without a prediction

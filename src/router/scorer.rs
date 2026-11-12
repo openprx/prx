@@ -117,25 +117,6 @@ pub fn rank_models(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn rank_models_scoped(
-    intent: &RouterIntent,
-    estimated_tokens: usize,
-    models: &[ModelCapabilityEntry],
-    config: &RouterConfig,
-    scores: &HashMap<(String, String), f32>,
-) -> RouterResult {
-    rank_models_by(intent, estimated_tokens, models, config, |model| {
-        scores
-            .iter()
-            .find(|((provider, id), _)| {
-                id == &model.config.model_id
-                    && provider == crate::providers::redact_endpoint_userinfo(&model.config.provider).as_ref()
-            })
-            .map_or(0.0, |(_, score)| *score)
-    })
-}
-
 fn rank_models_by(
     intent: &RouterIntent,
     estimated_tokens: usize,

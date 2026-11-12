@@ -187,7 +187,8 @@ async fn authenticated_resume_without_original_allowance_cannot_mint_a_child_slo
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.sessions_spawn.allow_recursive_delegation = true;
-    let admitted = AdmittedTurn::with_config(config, "project request", Arc::new(Vec::new())).await;
+    let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+    let admitted = AdmittedTurn::with_memory(config, "project request", Arc::new(Vec::new()), memory).await;
     let turn = admitted.decision();
     assert!(
         turn.proof.source_event_id().is_some(),

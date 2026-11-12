@@ -217,12 +217,6 @@ impl TrustedState {
         Self(parts, None)
     }
 
-    #[cfg(all(test, feature = "llm-router"))]
-    pub(crate) fn with_router_history(mut self, purpose: RouterHistoryReadBinding) -> Self {
-        self.1 = Some(Arc::new(purpose));
-        self
-    }
-
     pub(crate) fn router_history(&self) -> Option<&RouterHistoryReadBinding> {
         self.1.as_deref()
     }

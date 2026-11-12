@@ -128,7 +128,7 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
         runtime_ctx,
         traits::ChannelMessage {
             id: "engine-off-1".to_string(),
-            sender: "alice".to_string(),
+            sender: "prx_user".to_string(),
             reply_target: "chat-1".to_string(),
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
@@ -148,7 +148,7 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
     assert_eq!(calls.load(Ordering::SeqCst), 1, "test: channel provider called once");
     assert_eq!(
         response_messages(&channel_impl.sent_messages.lock().await).as_slice(),
-        ["ok"],
+        ["chat-1:ok"],
         "test: channel turn completed"
     );
 }

@@ -92,7 +92,7 @@ async fn discovered_spec_with_changed_schema_still_fails_bind() {
 
 #[tokio::test]
 async fn child_zero_budget_publishes_no_costed_direct_ref() -> anyhow::Result<()> {
-    let child = crate::agent::turn_tests::engine_switch::admit_bound_child_segment().await;
+    let child = crate::agent::turn_tests::engine_switch::admit_priced_bound_child_segment().await;
     let turn = child.turn.routing();
     let scope = turn.proof.child_scope().expect("test: authenticated child scope");
     let (incoming, original_parent) = scope.gate_inputs();

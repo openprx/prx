@@ -63,14 +63,6 @@ impl RouterHistory {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn query_deadline(&self, turn_deadline: std::time::Instant) -> Result<std::time::Instant> {
-        let local = crate::causal_tree::logical_clock::now()
-            .checked_add(self.query_timeout)
-            .ok_or_else(|| anyhow::anyhow!("Router history deadline overflow"))?;
-        Ok(local.min(turn_deadline))
-    }
-
     pub(crate) fn policy_descriptor(&self) -> Result<(&str, usize, usize, usize, u128)> {
         let embedder = self.admitted_embedder()?;
         Ok((
@@ -103,70 +95,6 @@ impl RouterHistory {
             "Router paid embedding descriptor exceeds capacity"
         );
         Ok(self.embedder.as_ref())
-    }
-
-    /// Rank a complete authorized history domain, keeping provider/model pairs
-    /// distinct. Failed records still count toward the original KNN threshold.
-    #[cfg(test)]
-    pub(crate) async fn scoped_similarity(
-        &self,
-        read: &crate::memory::RouterHistoryRead,
-        domain: &crate::memory::RouterHistoryDomain,
-        vector: &[f32],
-        deadline: std::time::Instant,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> Result<HashMap<(String, String), f32>> {
-        read.validate(domain)?;
-        anyhow::ensure!(
-            vector.len() == usize::from(domain.dimensions) && vector.iter().all(|value| value.is_finite()),
-            "invalid Router query embedding"
-        );
-        anyhow::ensure!(
-            !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
-            "Router history ranking cancelled or expired"
-        );
-        if read.rows.len() < self.knn_min_records {
-            return Ok(HashMap::new());
-        }
-        let mut neighbors = Vec::new();
-        for (index, row) in read.rows.iter().enumerate() {
-            // Bounded batches avoid one scheduler handoff per history row;
-            // the authority deadline and cancellation are still checked per row.
-            if index.is_multiple_of(16) {
-                tokio::task::yield_now().await;
-            }
-            anyhow::ensure!(
-                !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
-                "Router history ranking cancelled or expired"
-            );
-            if !row.success {
-                continue;
-            }
-            let similarity = crate::memory::vector::cosine_similarity(vector, &row.embedding);
-            anyhow::ensure!(similarity.is_finite(), "invalid Router history cosine");
-            if similarity > 0.0 {
-                neighbors.push((row, 1.0 - similarity));
-            }
-        }
-        neighbors.sort_by(|left, right| left.1.total_cmp(&right.1));
-        neighbors.truncate(self.knn_k);
-        let mut scores = HashMap::new();
-        let mut total = 0.0_f32;
-        for (row, distance) in neighbors {
-            let weight = 1.0 / distance.max(1.0e-6);
-            total += weight;
-            *scores.entry((row.provider.clone(), row.model.clone())).or_insert(0.0) += weight;
-        }
-        if total > 0.0 {
-            for value in scores.values_mut() {
-                *value = (*value / total).clamp(0.0, 1.0);
-            }
-        }
-        anyhow::ensure!(
-            !cancellation.is_cancelled() && crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
-            "Router history ranking cancelled or expired"
-        );
-        Ok(scores)
     }
 
     #[cfg(test)]

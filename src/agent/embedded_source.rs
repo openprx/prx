@@ -21,14 +21,6 @@ pub(crate) struct SelectedEmbeddedModel {
     provider: Arc<dyn crate::providers::Provider>,
 }
 
-impl SelectedEmbeddedModel {
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
-    pub(crate) const fn choice(&self) -> &super::entry::AgentModelChoice {
-        &self.choice
-    }
-}
-
 pub(super) struct EmbeddedAgentBinding {
     generation: Arc<ConfigGeneration>,
     provider: Arc<dyn crate::providers::Provider>,
@@ -486,8 +478,6 @@ impl Drop for EmbeddedAdmissionGuard {
 /// readback. No public constructor or caller-supplied raw metadata entrance exists.
 #[cfg(feature = "llm-router")]
 pub(crate) struct VerifiedEmbeddedInputMetadata {
-    #[cfg(test)]
-    sequence: i64,
     event_id: String,
     workspace: String,
     owner: String,
@@ -532,8 +522,6 @@ impl VerifiedEmbeddedInputMetadata {
         }
         anyhow::ensure!(event.id > 0, "embedded input sequence is not durable");
         Ok(Self {
-            #[cfg(test)]
-            sequence: event.id,
             event_id: event.event_id.clone(),
             workspace: event.workspace_id.clone(),
             owner: event.owner_id.clone().context("embedded input owner missing")?,
@@ -548,11 +536,6 @@ impl VerifiedEmbeddedInputMetadata {
                 .context("embedded input revision missing")?,
             raw: event.raw_payload_json.as_deref().map(Arc::from),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn sequence(&self) -> i64 {
-        self.sequence
     }
 
     pub(crate) fn verified_raw_for<'a>(&'a self, source: &dyn TurnSourceProof) -> anyhow::Result<Option<&'a str>> {
@@ -776,6 +759,7 @@ impl EmbeddedAgentSource {
             .as_ref()
             .map_or(&self.binding.choice, |selected| &selected.choice)
     }
+
     pub(super) fn provider(&self) -> &Arc<dyn crate::providers::Provider> {
         self.selected_choice
             .as_ref()

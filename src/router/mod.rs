@@ -208,28 +208,6 @@ impl RouterEngine {
             .ok_or_else(|| anyhow::anyhow!("Router history is absent"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn rank_scoped_history(
-        &self,
-        source: &dyn crate::runtime::turn_source::TurnSourceProof,
-        task: TaskIntent,
-        scores: &std::collections::HashMap<(String, String), f32>,
-    ) -> Result<RouterResult> {
-        self.bind_local_source(source)?;
-        let slot = self.local_slot.read();
-        let state = slot
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Router source scope missing"))?;
-        let models = self.reachable_models(&state.models);
-        Ok(scorer::rank_models_scoped(
-            &infer_router_intent(task, source.routing_input()),
-            estimate_tokens(source.routing_input()),
-            &models,
-            &self.config,
-            scores,
-        ))
-    }
-
     #[allow(clippy::indexing_slicing)]
     #[cfg(test)]
     fn new_with_history(

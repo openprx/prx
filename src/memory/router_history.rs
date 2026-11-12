@@ -53,54 +53,6 @@ impl RouterHistoryDomain {
     }
 }
 
-/// Authenticated source binding for a history read, independent of selection.
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
-pub(crate) struct RouterReadScope {
-    event_id: String,
-    run: String,
-    query_sha256: [u8; 32],
-    domain: RouterHistoryDomain,
-    deadline: Instant,
-}
-
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
-impl RouterReadScope {
-    #[cfg(test)]
-    pub(crate) fn from_source(
-        source: &dyn crate::runtime::turn_source::TurnSourceProof,
-        domain: RouterHistoryDomain,
-        deadline: Instant,
-    ) -> Result<Self> {
-        domain.validate()?;
-        ensure!(
-            domain.workspace == source.workspace_id()
-                && domain.owner == source.owner_id()
-                && domain.session == source.session_key(),
-            "Router scope differs from authenticated source"
-        );
-        let event_id = source
-            .source_event_id()
-            .ok_or_else(|| anyhow::anyhow!("Router source missing"))?;
-        ensure!(
-            !event_id.is_empty()
-                && event_id.len() <= 512
-                && !source.run_id().is_empty()
-                && source.run_id().len() <= 512
-                && source.routing_input().len() <= ROUTER_HISTORY_MAX_INPUT_BYTES,
-            "Router scope source exceeds bounds"
-        );
-        Ok(Self {
-            event_id: event_id.to_owned(),
-            run: source.run_id().to_owned(),
-            query_sha256: Sha256::digest(source.routing_input().as_bytes()).into(),
-            domain,
-            deadline,
-        })
-    }
-}
-
 #[cfg(feature = "llm-router")]
 pub(crate) struct RouterEmbedding {
     pub(crate) source_event_id: String,
@@ -137,50 +89,6 @@ pub struct RouterHistoryReadEvidence {
 }
 
 impl RouterHistoryReadEvidence {
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
-    pub(crate) fn from_scope(
-        scope: RouterReadScope,
-        source: &dyn crate::runtime::turn_source::TurnSourceProof,
-        witness: &crate::agent::embedded_source::VerifiedEmbeddedInputMetadata,
-        deadline: Instant,
-    ) -> Result<Self> {
-        ensure!(
-            scope.domain.workspace == source.workspace_id()
-                && scope.domain.owner == source.owner_id()
-                && scope.domain.session == source.session_key()
-                && scope.run == source.run_id()
-                && Some(scope.event_id.as_str()) == source.source_event_id()
-                && scope.query_sha256 == <[u8; 32]>::from(Sha256::digest(source.routing_input().as_bytes())),
-            "Router scope differs from original source"
-        );
-        let raw = witness.verified_raw_for(source)?;
-        // Bounds are checked before cloning any caller-visible source bytes.
-        ensure!(
-            source.routing_input().len() <= ROUTER_HISTORY_MAX_INPUT_BYTES
-                && raw.is_none_or(|raw| raw.len() <= ROUTER_HISTORY_MAX_METADATA_BYTES),
-            "Router selected source exceeds byte capacity"
-        );
-        let evidence = Self {
-            source: RouterHistorySource {
-                event_id: source
-                    .source_event_id()
-                    .ok_or_else(|| anyhow::anyhow!("Router source missing"))?
-                    .to_owned(),
-                run: source.run_id().to_owned(),
-                generation: i64::try_from(source.config_generation_id())?,
-                revision: source.config_source_revision().to_owned(),
-                input: source.routing_input().to_owned(),
-                raw_payload: raw.map(str::to_owned),
-            },
-            domain: scope.domain,
-            query_sha256: scope.query_sha256,
-            deadline: scope.deadline,
-        };
-        evidence.validate(deadline)?;
-        Ok(evidence)
-    }
-
     pub(super) fn validate(&self, deadline: Instant) -> Result<()> {
         self.domain.validate()?;
         ensure!(
@@ -387,6 +295,3 @@ fn hash_field(digest: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod codec_tests;
-
-#[cfg(test)]
-mod tests;

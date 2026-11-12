@@ -314,48 +314,6 @@ pub(crate) fn create_configured_embedder(config: &crate::config::Config) -> Conf
     }
 }
 
-/// A paid Router target produced from exactly the memory embedding resolver.
-/// Credential ownership stays in that resolver and the concrete provider.
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
-pub(crate) struct ConfiguredPaidEmbedding {
-    pub provider: String,
-    pub model: String,
-    pub dimensions: usize,
-    pub embedder: Arc<dyn embeddings::EmbeddingProvider>,
-}
-
-#[cfg(test)]
-#[cfg(feature = "llm-router")]
-pub(crate) fn configured_paid_embedder(
-    config: &crate::config::Config,
-    catalog: &crate::providers::catalog::CatalogView,
-) -> anyhow::Result<ConfiguredPaidEmbedding> {
-    let resolved = resolve_embedding_config(
-        &config.memory,
-        &config.embedding_routes_with_references(),
-        EmbeddingRootCredential::from_config(config),
-    );
-    anyhow::ensure!(
-        !crate::providers::selection::is_prx_embedder(&resolved.provider),
-        "Router paid embedding target is not paid"
-    );
-    crate::providers::selection::check_embedder(catalog, &resolved.provider, &resolved.model)?;
-    let embedder: Arc<dyn embeddings::EmbeddingProvider> = Arc::from(build_embedder(&resolved, catalog));
-    anyhow::ensure!(
-        embedder.supports_attempt_accounting()
-            && embedder.model() == resolved.model
-            && embedder.dimensions() == resolved.dimensions,
-        "Router configured embedding target is not instrumented"
-    );
-    Ok(ConfiguredPaidEmbedding {
-        provider: resolved.provider,
-        model: resolved.model,
-        dimensions: resolved.dimensions,
-        embedder,
-    })
-}
-
 pub fn create_embedder_from_config(config: &crate::config::Config) -> Arc<dyn embeddings::EmbeddingProvider> {
     match create_configured_embedder(config) {
         ConfiguredEmbedding::LocalHash(embedder) => embedder,

@@ -360,31 +360,6 @@ async fn disabled_entry_turn_has_finite_call_budget() {
     assert_eq!(decision.service.prediction_port_calls(), before);
 }
 
-struct CollectIgnoreProvider {
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-
-#[async_trait]
-impl Provider for CollectIgnoreProvider {
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calling: true,
-            vision: false,
-        }
-    }
-    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
-        anyhow::bail!("fixture requires a structured request")
-    }
-    async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(ChatResponse {
-            text: Some("done".into()),
-            tool_calls: Vec::new(),
-            reasoning_content: None,
-        })
-    }
-}
-
 struct SpawnFixtureChannel;
 
 #[async_trait]
@@ -634,6 +609,14 @@ impl AdmittedBoundChild {
 }
 
 pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
+    admit_bound_child_segment_with_pricing(false).await
+}
+
+pub(crate) async fn admit_priced_bound_child_segment() -> AdmittedBoundChild {
+    admit_bound_child_segment_with_pricing(true).await
+}
+
+async fn admit_bound_child_segment_with_pricing(priced: bool) -> AdmittedBoundChild {
     use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
     use crate::causal_tree::state::TurnSurfaceKind;
     use crate::memory::{MemoryVisibility, MessageEventScope};
@@ -649,6 +632,17 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
 
     let workspace = tempfile::tempdir().expect("test: segment-admit workspace");
     let mut config = crate::config::Config::default();
+    if priced {
+        config.cost.prices.insert(
+            "ollama/prx-local-model".into(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;
