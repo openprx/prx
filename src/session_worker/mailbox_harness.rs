@@ -1,3 +1,4 @@
+#![cfg(feature = "test-mock")]
 //! Test-mock-only C7 parent. Real model-source admission, worker ownership,
 //! manifests, pipes, mailbox transactions and scope leases; only the model is
 //! scripted. This constructor never participates in production registration.
@@ -259,33 +260,19 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
     std::fs::create_dir_all(workspace)?;
     let workspace = std::fs::canonicalize(workspace)?;
     let config_dir = crate::config::process_config_dir().context("mailbox process fixture requires --config-dir")?;
-    let mut config = crate::config::Config {
-        workspace_dir: workspace.clone(),
-        config_path: config_dir.join("config.toml"),
-        default_provider: Some("mock".into()),
-        default_model: Some("prx-mailbox-model".into()),
-        ..crate::config::Config::default()
-    };
-    config.secrets.encrypt = false;
-    config.causal_tree.enabled = false;
-    config.autonomy.level = crate::security::policy::AutonomyLevel::Full;
-    config.sessions_spawn.max_recursive_depth = 8;
-    config.sessions_spawn.cleanup_on_complete = false;
-    config.sessions_spawn.worker_workspace_root = Some(workspace.join("workers").to_string_lossy().into_owned());
-    config.tool_tiering.always_include.push("sessions_spawn".into());
-    config.providers.models.push(serde_json::from_value(
-        serde_json::json!({"provider":"mock","model":"prx-mailbox-model","operations":["chat"],"native_tools":true}),
-    )?);
-    config.cost.prices.insert(
-        "mock/prx-mailbox-model".into(),
-        crate::config::schema::ModelPricing {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 1.0,
-            cache_read: 1.0,
-        },
+    let config = crate::config::Config::load_existing_read_only_with_config_dir(Some(
+        config_dir.to_str().context("mailbox config path must be UTF-8")?,
+    ))
+    .await?;
+    ensure!(
+        config.workspace_dir == workspace,
+        "mailbox fixture workspace differs from loaded config"
     );
-    config.save().await?;
+    ensure!(
+        config.default_provider.as_deref() == Some("mock")
+            && config.default_model.as_deref() == Some("prx-mailbox-model"),
+        "mailbox fixture requires its scripted model"
+    );
     let memory = Arc::new(SqliteMemory::new(&workspace)?);
     let store = SqliteMailbox::new(
         memory.as_ref().clone(),
@@ -405,71 +392,25 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
         .await
 }
 
-/// Only the model is scripted in C7. This wrapper submits a typed outbound
-/// intent through the native stdout writer; it never fabricates pipe bytes,
-/// store receipts, source grants, worker processes or parent acceptance.
-pub(super) fn worker_model(
-    manifest: &WorkerManifest,
-    inner: Box<dyn crate::providers::Provider>,
-) -> Box<dyn crate::providers::Provider> {
+/// Only the model is scripted in C7. The deep authenticated provider binding
+/// remains the real factory object; its model stimulus calls the native stdout
+/// owner instead of fabricating pipe bytes or receipts.
+pub(super) fn install_worker_model(manifest: &WorkerManifest) -> Result<()> {
     if manifest.provider_name != "mock" || manifest.session_addr.is_none() {
-        return inner;
+        return Ok(());
     }
     let Some(path) = std::env::var_os("OPENPRX_TEST_MAILBOX_OUTBOUND") else {
-        return inner;
+        return Ok(());
     };
-    Box::new(WorkerModel {
-        inner,
-        path: path.into(),
-        sent: std::sync::atomic::AtomicBool::new(false),
-    })
-}
-struct WorkerModel {
-    inner: Box<dyn crate::providers::Provider>,
-    path: PathBuf,
-    sent: std::sync::atomic::AtomicBool,
-}
-#[async_trait]
-impl crate::providers::Provider for WorkerModel {
-    async fn chat_with_system(
-        &self,
-        system: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> Result<String> {
-        self.inner.chat_with_system(system, message, model, temperature).await
-    }
-    async fn chat_with_history(
-        &self,
-        messages: &[crate::providers::ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> Result<String> {
-        self.inner.chat_with_history(messages, model, temperature).await
-    }
-    fn supports_native_tools(&self) -> bool {
-        self.inner.supports_native_tools()
-    }
-    async fn chat(
-        &self,
-        request: crate::providers::ChatRequest<'_>,
-        model: &str,
-        temperature: f64,
-    ) -> Result<crate::providers::ChatResponse> {
-        let assessment = request.messages.first().is_some_and(|message| {
-            message.content.starts_with("Classify the execution requirement")
-                || message
-                    .content
-                    .starts_with("Review the proposed final reply against the CURRENT request")
-        });
-        let result = self.inner.chat(request, model, temperature).await?;
-        if !assessment && !self.sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let envelope: PrxMessage = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+    let path = PathBuf::from(path);
+    let sent = std::sync::atomic::AtomicBool::new(false);
+    crate::providers::router::install_mock_response_hook(Arc::new(move || {
+        if !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let envelope: PrxMessage = serde_json::from_slice(&std::fs::read(&path)?)?;
             super::stdout::frame(&WorkerOutputFrame::Message {
                 envelope: Box::new(envelope),
             })?;
         }
-        Ok(result)
-    }
+        Ok(())
+    }))
 }

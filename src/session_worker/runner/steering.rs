@@ -148,7 +148,7 @@ where
                     cancel.cancel();
                     let (mut advanced,cancelled)=segment.await;
                     if cancelled.as_ref().err().is_some_and(|error|error.is::<crate::runtime::turn_cleanup::CleanupIncomplete>()) {return (advanced,cancelled);}
-                    advanced.push(ChatMessage::user(steering_instruction(&message)));
+                    advanced.push(crate::agent::turn_contracts::inbound_user_message_owned(steering_instruction(&message)));
                     raw_steer=Some(message);history=advanced;continue;
                 }
                 segment.await
@@ -163,7 +163,7 @@ where
                 Ok(text) => text,
                 Err(error) => return (advanced, Err(error.into())),
             };
-            advanced.push(ChatMessage::user(text));
+            advanced.push(crate::agent::turn_contracts::inbound_user_message_owned(text));
             let ack = mailbox
                 .as_ref()
                 .ok_or(crate::messaging::mailbox::MailboxError::CorruptState)

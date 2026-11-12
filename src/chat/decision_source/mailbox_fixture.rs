@@ -50,11 +50,24 @@ pub(crate) async fn spawn(
         crate::tools::ToolExecutionContext::new(binding.envelope().clone(), binding.policy_chat_type());
     let (execution, execution_context) =
         service.bind_agent_execution(binding.as_ref(), context, &execution_context, &specs.specs)?;
-    let outcome = execution
-        .execute(
-            crate::tools::ToolExecutionCommand::new("sessions_spawn", arguments),
-            execution_context,
-            Some(cancellation),
+    // Match the real chat driver: lineage comes from the authenticated turn,
+    // while the first child retains depth zero. This seeds no execution grant.
+    let spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+        binding
+            .envelope()
+            .run_id
+            .clone()
+            .context("mailbox parent run missing")?,
+        binding.envelope().session_key.clone(),
+    );
+    let outcome = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+        .scope(
+            spawn_context,
+            execution.execute(
+                crate::tools::ToolExecutionCommand::new("sessions_spawn", arguments),
+                execution_context,
+                Some(cancellation),
+            ),
         )
         .await;
     match (outcome.result, outcome.error) {

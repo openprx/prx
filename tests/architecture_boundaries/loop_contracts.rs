@@ -426,8 +426,6 @@ const USER_MESSAGE_CONSTRUCTION_SITES: &[&str] = &[
     // `run_sub_agent_task`: the operator steering turn, which opens with `[Steering instruction from
     // operator]` and so can never open with a reserved marker.
     "src/tools/sessions_spawn/task_mode.rs::run_sub_agent_task",
-    // The session worker's steering turn, the same wrapper.
-    "src/session_worker/runner/steering.rs::run_segments_with_steering",
 ];
 
 /// The names the loop-note guards scan for cannot be hidden (R-LOOPD5 F-1).

@@ -367,9 +367,24 @@ impl Provider for RouterProvider {
 /// Intentionally bypasses prompt-guided tool injection by reporting
 /// `supports_native_tools() = true` — the chat tool loop then treats `Provider::chat`
 /// as native, and our impl just returns the canned text with no tool calls.
+/// A test-only model stimulus; installed before provider construction in an
+/// isolated fixture process. It changes no provider binding or source grant.
+#[cfg(feature = "test-mock")]
+type MockResponseHook = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+#[cfg(feature = "test-mock")]
+static MOCK_RESPONSE_HOOK: std::sync::OnceLock<MockResponseHook> = std::sync::OnceLock::new();
+#[cfg(feature = "test-mock")]
+pub(crate) fn install_mock_response_hook(hook: MockResponseHook) -> anyhow::Result<()> {
+    MOCK_RESPONSE_HOOK
+        .set(hook)
+        .map_err(|_| anyhow::anyhow!("mock response hook already installed"))
+}
+
 #[cfg(any(test, feature = "test-mock"))]
 pub(crate) struct MockEnvProvider {
     response: String,
+    #[cfg(feature = "test-mock")]
+    response_hook: Option<MockResponseHook>,
     /// Scripted verdict for the separate no-result assessment request. This is
     /// fixture data, not a semantic classifier; it exists only in test/mock builds.
     execution_assessment: Option<String>,
@@ -664,6 +679,8 @@ impl MockEnvProvider {
             .filter(|value| !value.is_empty());
         Self {
             response,
+            #[cfg(feature = "test-mock")]
+            response_hook: MOCK_RESPONSE_HOOK.get().cloned(),
             execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT").ok(),
             completion_assessment: std::env::var("OPENPRX_MOCK_COMPLETION_ASSESSMENT")
                 .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result","constraints":[]}"#.to_string()),
@@ -683,9 +700,22 @@ impl MockEnvProvider {
     ///
     /// Deliberately does **not** touch `call_counter`: that counter drives the
     /// streaming tool-call script and must keep counting stream calls only.
+    #[cfg(feature = "test-mock")]
+    fn response_effect(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "test-mock")]
+        if let Some(hook) = &self.response_hook {
+            hook()?;
+        }
+        Ok(())
+    }
+
     fn non_streaming_outcome(&self) -> anyhow::Result<String> {
         self.error.as_ref().map_or_else(
-            || Ok(self.response.clone()),
+            || {
+                #[cfg(feature = "test-mock")]
+                self.response_effect()?;
+                Ok(self.response.clone())
+            },
             |message| Err(anyhow::anyhow!("{message}")),
         )
     }
@@ -834,6 +864,10 @@ impl Provider for MockEnvProvider {
         use crate::providers::traits::ToolCallChunk;
         use futures::StreamExt as _;
 
+        #[cfg(feature = "test-mock")]
+        if let Err(error) = self.response_effect() {
+            return futures::stream::once(async move { Err(error) }).boxed();
+        }
         let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
         let response = self.response.clone();
         let initial_delay = mock_delay_ms_for_messages(&self.delay_ms_by_prompt, messages);

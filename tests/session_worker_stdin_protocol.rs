@@ -1837,7 +1837,35 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
 #[cfg(feature = "test-mock")]
 async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
     use anyhow::{Context as _, ensure};
-    let (_root, config_dir, workspace, home) = worker_dirs();
+    let (_root, config_dir, _unused_workspace, home) = worker_dirs();
+    let workspace = config_dir.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let mut config = openprx::config::Config {
+        workspace_dir: workspace.clone(),
+        config_path: config_dir.join("config.toml"),
+        default_provider: Some("mock".into()),
+        default_model: Some("prx-mailbox-model".into()),
+        ..openprx::config::Config::default()
+    };
+    config.secrets.encrypt = false;
+    config.autonomy.level = openprx::security::policy::AutonomyLevel::Full;
+    config.sessions_spawn.max_recursive_depth = 8;
+    config.sessions_spawn.cleanup_on_complete = false;
+    config.sessions_spawn.worker_workspace_root = Some(workspace.join("workers").to_string_lossy().into_owned());
+    config.tool_tiering.always_include.push("sessions_spawn".into());
+    config.providers.models.push(serde_json::from_value(
+        serde_json::json!({"provider":"mock","model":"prx-mailbox-model","operations":["chat"],"native_tools":true}),
+    )?);
+    config.cost.prices.insert(
+        "mock/prx-mailbox-model".into(),
+        openprx::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    config.save().await?;
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_prx"));
     command
         .arg("--config-dir")
@@ -1862,7 +1890,7 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
     let output = tokio::time::timeout(std::time::Duration::from_secs(120), command.output())
         .await
         .context("real mailbox worker harness hung")??;
-    ensure!(
+    assert!(
         output.status.success(),
         "real mailbox worker failed: {}",
         String::from_utf8_lossy(&output.stderr)

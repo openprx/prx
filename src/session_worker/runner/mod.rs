@@ -53,6 +53,8 @@ async fn run_manifest(
     let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
     scrub_capability_env();
     let transport = validation?;
+    #[cfg(feature = "test-mock")]
+    super::mailbox_harness::install_worker_model(&manifest)?;
     let (mailbox_tx, mailbox_rx) = if read_stdin_control_frames {
         if let Some(address) = manifest.session_addr.as_ref() {
             anyhow::ensure!(

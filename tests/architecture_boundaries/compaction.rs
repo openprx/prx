@@ -326,6 +326,8 @@ pub(super) fn sub_agent_tools_resolve_compaction_from_the_whole_configuration() 
             "src/chat/run/startup.rs::session_tools",
             "src/gateway/mod.rs::register_gateway_turn_tools",
             "src/session_worker/runner/provider.rs::worker_spawn_tool",
+            // Feature-gated real-process fixture; uses with_hint_config below.
+            "src/session_worker/mailbox_harness.rs::run",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions",
         ],
     );
