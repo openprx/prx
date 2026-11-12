@@ -4,6 +4,9 @@ use super::helpers::{
 };
 
 fn violations(source: &str) -> Vec<String> {
+    // Rust raw identifiers name the same methods and lints as ordinary identifiers.
+    let normalized = source.replace("r#", "");
+    let source = normalized.as_str();
     // Preserve punctuation as individual tokens, and identifiers as whole words.
     let mut lexed = Vec::new();
     for token in source.split_whitespace() {
@@ -67,9 +70,13 @@ fn violations(source: &str) -> Vec<String> {
                     .any(|lint| {
                         inner.match_indices(*lint).any(|(start, _)| {
                             !inner
-                                .get(start + lint.len()..)
-                                .and_then(|s| s.chars().next())
+                                .get(..start)
+                                .and_then(|s| s.chars().next_back())
                                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                                && !inner
+                                    .get(start + lint.len()..)
+                                    .and_then(|s| s.chars().next())
+                                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
                         })
                     })
             });
@@ -192,4 +199,35 @@ fn panic_literals_and_comments_are_ignored() {
         violations(&code).is_empty(),
         "documentation and literal decoys must not trigger policy"
     );
+}
+
+#[test]
+fn raw_identifiers_cannot_bypass_panic_policy() {
+    const PROBES: [&str; 4] = [
+        "fn probe() { value.r#unwrap(); }",
+        "fn probe() { value.r#expect(\"test\"); }",
+        "#[r#allow(clippy::r#expect_used)] fn probe() {}",
+        "#[cfg_attr(unix, r#allow(clippy::r#panic))] fn probe() {}",
+    ];
+    for source in PROBES {
+        assert!(
+            !violations(&blank_comments_and_literals(source)).is_empty(),
+            "raw identifiers must not bypass the panic policy: {source}"
+        );
+    }
+}
+
+#[test]
+fn lint_names_and_suppression_groups_are_exact() {
+    const PROBES: [&str; 3] = [
+        "#[allow(clippy::panic_in_result_fn)] fn probe() {}",
+        "#[allow(other_clippy::expect_used)] fn probe() {}",
+        "#[cfg_attr(unix, allow(dead_code), warn(clippy::expect_used))] fn probe() {}",
+    ];
+    for source in PROBES {
+        assert!(
+            violations(&blank_comments_and_literals(source)).is_empty(),
+            "unrelated lints and warning groups must remain allowed: {source}"
+        );
+    }
 }

@@ -294,22 +294,22 @@ macro_rules! planted_violation_probes {
 planted_violation_probes! {
     probe_panic_unwrap: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "value.unwrap();\n";
+        "pub fn probe(value: Option<u8>) { let _ = value.unwrap(); }\n";
     probe_panic_expect: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "value.expect(\"test\");\n";
+        "pub fn probe(value: Option<u8>) { let _ = value.expect(\"test\"); }\n";
     probe_panic_panic: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "panic!(\"test\");\n";
+        "pub fn probe() { panic!(\"test\"); }\n";
     probe_panic_unreachable: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "unreachable!();\n";
+        "pub fn probe() { unreachable!(); }\n";
     probe_panic_todo: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "todo!();\n";
+        "pub fn probe() { todo!(); }\n";
     probe_panic_unimplemented: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "unimplemented!();\n";
+        "pub fn probe() { unimplemented!(); }\n";
     probe_panic_allow: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
         "#[allow(clippy::expect_used)] fn a() {}\n";

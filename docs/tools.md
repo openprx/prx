@@ -1985,5 +1985,6 @@ This check prevents a model from invoking a withheld tool by guessing its name.
 ### Built-in pattern failures
 
 If a built-in HTML or search-result pattern cannot compile, web tools return an
-error instead of returning unprocessed page content. Memory privacy checks fail
-closed when a detector is unavailable and report `pii pattern unavailable`.
+error instead of returning unprocessed page content. The memory safety filter
+rejects writes when a PII detector is unavailable and reports
+`pii pattern unavailable`.
