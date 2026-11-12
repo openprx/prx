@@ -144,11 +144,16 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
     // is caught until the listener and real cleanup owner have been awaited.
     let outcome = std::panic::AssertUnwindSafe(async {
         let mut config = Config::default();
+        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500,
+            "test: production source decision and auxiliary budget stays 500 ms");
+        // Real sockets and SQLite cannot use paused Tokio time. Give this
+        // accounting fixture the largest valid configured latency budget.
+        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = !text_only;
         // Narrow the allowed hops: one genuine memory read, then the existing
-        // fresh-evidence terminal gate. No deadline or scoring threshold changes.
+        // fresh-evidence terminal gate. Scoring thresholds remain unchanged.
         config.causal_tree.policy.max_decision_hops = 1;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         config.default_provider = Some(PROVIDER.to_owned());
@@ -276,11 +281,11 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         ).await.expect("source-backed private fact");
         guard.finish_without_decision();
         let input = message.content.clone();
-        // This outer watchdog owns teardown only. It does not change the production
-        // 500 ms source decision/auxiliary deadline or manufacture a selected grant.
+        // This outer watchdog owns teardown; the configured fixture budget
+        // controls the real source decision and auxiliary call deadlines.
         let turn = cleanup.scope(channel_turn(ctx, message, CancellationToken::new()));
-        let completed = tokio::time::timeout(Duration::from_secs(5), turn).await;
-        completed.expect("channel fixture must finish within its teardown watchdog");
+        let completed = tokio::time::timeout(Duration::from_secs(15), turn).await;
+        completed.expect("test: channel fixture must finish within its teardown watchdog");
 
         {
             let captured = requests.lock();
