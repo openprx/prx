@@ -164,9 +164,10 @@ class PrxAgent(BaseInstalledAgent):
                 proxy.start()
             await self._trial(instruction, environment, key, proxy, container_provider, api_url)
         finally:
-            # Synchronous on purpose: cancellation cannot skip it.
+            # Synchronous on purpose: cancellation cannot skip it. A handler
+            # that outlives stop() could still spend, so the trial fails.
             if proxy is not None and not proxy.stop():
-                logging.getLogger("prx_bench.adapter").warning("key proxy handler outlived stop")
+                raise RuntimeError("key proxy did not stop cleanly")
 
     def _proxy(self, upstream, key):
         peers = [peer for peer in str(self.proxy_peers).split(",") if peer.strip()] if self.proxy_peers else None
@@ -223,8 +224,7 @@ class PrxAgent(BaseInstalledAgent):
                 await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await environment.exec(command=f"printf '124\\n' >{LOG_DIR}/prx-exit-code", timeout_sec=5)
         finally:
-            if proxy is not None:
-                proxy.stop()
+            proxy_stopped = proxy is None or proxy.stop()
             leaked = False
             try:
                 await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
@@ -239,6 +239,8 @@ class PrxAgent(BaseInstalledAgent):
                 self._metadata["per_attempt_models"] = unavailable(f"per-attempt ledger unreadable: {type(error).__name__}")
             finally:
                 await asyncio.shield(environment.exec(command="rm -rf /opt/prx-bench", user="root", timeout_sec=5))
+            if not proxy_stopped:
+                raise RuntimeError("key proxy did not stop cleanly")
             if leaked:
                 raise RuntimeError("credential leak in container config")
 

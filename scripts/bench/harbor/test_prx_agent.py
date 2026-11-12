@@ -17,6 +17,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import key_proxy
 from record import AGENT_KEYS, unavailable
 
 
@@ -130,6 +131,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             environment.uploads.append(kwargs)
 
         agent._upload_config_text = upload
+        # No DNS in unit tests: the upstream is never contacted.
+        resolved = patch.object(key_proxy, 'resolve', return_value=[(socket.AF_INET, ('127.0.0.1', 9))])
+        resolved.start()
+        self.addCleanup(resolved.stop)
         return agent
 
     @deadline(60)
@@ -187,6 +192,26 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                         await agent.run('fixture instruction', environment, None)
                 self.assertEqual(agent._metadata['container_config_key_scan'], 'leak')
                 self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
+
+    @deadline(60)
+    async def test_proxy_that_does_not_stop_cleanly_fails_the_trial(self):
+        secret = 'prx-fixture-secret-not-exported'
+        real_stop = key_proxy.KeyProxy.stop
+
+        def unclean(proxy, *args):
+            real_stop(proxy, *args)
+            return False  # as if a handler thread had outlived the join
+
+        for mode in ('normal', 'timeout'):
+            with self.subTest(mode=mode):
+                agent = self.proxied_agent()
+                environment = FakeEnvironment(mode)
+                with patch.object(adapter, 'read_key_file', return_value=secret), \
+                        patch.object(key_proxy.KeyProxy, 'stop', autospec=True, side_effect=unclean):
+                    with self.assertRaisesRegex(RuntimeError, 'key proxy did not stop cleanly'):
+                        await agent.run('fixture instruction', environment, None)
+                self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench',
+                                 'container cleanup must still run')
 
     @deadline(60)
     async def test_only_proxyable_providers_are_accepted(self):

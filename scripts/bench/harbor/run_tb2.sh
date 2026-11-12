@@ -22,7 +22,23 @@ from profile import read_bounded
 from prx_agent import read_key_file
 from record import finalize, scan_secrets, sha256, write, unavailable
 
-p = argparse.ArgumentParser()
+p = argparse.ArgumentParser(
+    description='Run pinned Terminal-Bench 2.0 tasks with PRX on the QA host.',
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""key proxy (operators):
+  The provider key stays on this host. For each trial a proxy listens on
+  --proxy-bind (default: this host's primary IPv4 address) and forwards only
+  POST <provider base>/chat/completions for the per-trial token it gave the
+  container. Anything that can reach that address can connect: without the
+  token nothing is forwarded, but such a client can hold the 16 connection
+  slots for up to 120 seconds each and so delay or fail a trial.
+  Run benchmarks on an isolated host network. Where that is not possible,
+  pass --proxy-peers with the source network that container traffic arrives
+  from (with rootless podman and pasta this is expected to be the host's own
+  address, e.g. --proxy-peers 192.0.2.10/32; confirm with one unpaid trial).
+  Other peers are then dropped at accept, before a slot is taken.
+  A trial fails if the proxy cannot stop cleanly or if the key is found in
+  the container-side config afterwards.""")
 p.add_argument('--model', required=True)
 p.add_argument('--key-file', required=True, type=Path)
 p.add_argument('--binary', required=True, type=Path)
