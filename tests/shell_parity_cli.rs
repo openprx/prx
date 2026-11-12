@@ -10,19 +10,41 @@ use tokio::io::AsyncReadExt;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
 
 async fn run(config: &std::path::Path, args: &[&str]) -> (std::process::ExitStatus, String) {
+    let mut arguments = vec!["agent"];
+    arguments.extend_from_slice(args);
+    run_program(config, &arguments, None).await
+}
+
+async fn run_program(
+    config: &std::path::Path,
+    args: &[&str],
+    input: Option<&str>,
+) -> (std::process::ExitStatus, String) {
+    use tokio::io::AsyncWriteExt;
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_prx"));
     command
         .arg("--config-dir")
         .arg(config)
-        .arg("agent")
         .args(args)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", config.parent().expect("test: home"))
+        .env("PRX_TUI", "0")
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "off")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn().expect("test: CLI spawn");
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("test: stdin");
+        tokio::time::timeout(Duration::from_secs(5), stdin.write_all(input.as_bytes()))
+            .await
+            .expect("test: stdin deadline")
+            .expect("test: stdin write");
+    }
+    drop(child.stdin.take());
     let stdout = child.stdout.take().expect("test: stdout");
     let stderr = child.stderr.take().expect("test: stderr");
     let (status, out, err) = tokio::time::timeout(Duration::from_secs(60), async {
