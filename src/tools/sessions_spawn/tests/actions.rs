@@ -818,8 +818,7 @@ async fn history_populated_after_no_tools_run() {
         .trim()
         .to_string();
 
-    // Wait for task to complete
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_run_finished(&tool, &run_id).await;
 
     // Check history
     let hist_result = tool
