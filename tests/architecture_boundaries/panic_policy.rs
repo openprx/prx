@@ -103,6 +103,7 @@ fn violations(source: &str) -> Vec<String> {
                     "clippy::unwrap_used",
                     "clippy::expect_used",
                     "clippy::panic",
+                    "clippy::indexing_slicing",
                     "clippy::restriction",
                 ]
                 .iter()
@@ -126,6 +127,48 @@ fn violations(source: &str) -> Vec<String> {
     found
 }
 
+/// The production text of a comment- and literal-blanked source.
+///
+/// `strip_cfg_test_items` blanks a test item from its `#[cfg(test)]` attribute
+/// onwards, so attributes written before that one would be left behind and
+/// read as attributes of production code. They belong to the test item, and
+/// are blanked with it here.
+fn production_text(masked: &str) -> String {
+    let stripped = strip_cfg_test_items(masked);
+    let before: Vec<char> = masked.chars().collect();
+    let mut after: Vec<char> = stripped.chars().collect();
+    // A test-only file strips to nothing.
+    if before.len() != after.len() {
+        return stripped;
+    }
+    let is_attribute = |text: &[char], at: usize| text.get(at) == Some(&'#') && text.get(at + 1) == Some(&'[');
+    let mut index = 0;
+    while index < after.len() {
+        if !is_attribute(&after, index) {
+            index += 1;
+            continue;
+        }
+        // Walk the run of outer attributes that starts here.
+        let mut cursor = index;
+        while is_attribute(&after, cursor) {
+            cursor = close_of_group(&after, cursor + 1);
+            while before.get(cursor).is_some_and(|c| c.is_whitespace()) {
+                cursor += 1;
+            }
+        }
+        // The run leads into an attribute that the strip removed.
+        if is_attribute(&before, cursor) && !is_attribute(&after, cursor) {
+            for slot in after.iter_mut().take(cursor).skip(index) {
+                if *slot != '\n' {
+                    *slot = ' ';
+                }
+            }
+        }
+        index = cursor.max(index + 1);
+    }
+    after.into_iter().collect()
+}
+
 #[test]
 pub(super) fn production_has_no_panic_shortcuts() {
     let modules = test_module_files();
@@ -136,7 +179,7 @@ pub(super) fn production_has_no_panic_shortcuts() {
         if is_test_code_file(&relative, &raw, &modules) {
             continue;
         }
-        let production = strip_cfg_test_items(&blank_comments_and_literals(&raw));
+        let production = production_text(&blank_comments_and_literals(&raw));
         actual.extend(
             violations(&production)
                 .into_iter()
@@ -267,6 +310,31 @@ fn lint_names_and_suppression_groups_are_exact() {
         assert!(
             violations(&blank_comments_and_literals(source)).is_empty(),
             "unrelated lints and warning groups must remain allowed: {source}"
+        );
+    }
+}
+
+#[test]
+fn indexing_allow_is_banned_outside_test_items() {
+    const PRODUCTION: [&str; 2] = [
+        "#[allow(clippy::indexing_slicing)] fn probe() {}",
+        "#[allow(clippy::indexing_slicing)]\n#[cfg(unix)]\nfn probe() {}",
+    ];
+    for source in PRODUCTION {
+        assert!(
+            !violations(&production_text(&blank_comments_and_literals(source))).is_empty(),
+            "an indexing allow on production code must be reported: {source}"
+        );
+    }
+    const TEST_ITEMS: [&str; 3] = [
+        "#[cfg(test)]\n#[allow(clippy::indexing_slicing)]\nmod tests {}",
+        "#[allow(clippy::indexing_slicing)]\n#[cfg(test)]\nmod tests {}",
+        "#[allow(clippy::indexing_slicing)]\n#[cfg(unix)]\n#[cfg(test)]\nfn probe() {}",
+    ];
+    for source in TEST_ITEMS {
+        assert!(
+            violations(&production_text(&blank_comments_and_literals(source))).is_empty(),
+            "attributes of a test item are not production code: {source}"
         );
     }
 }
