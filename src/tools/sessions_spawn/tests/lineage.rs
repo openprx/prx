@@ -2,6 +2,38 @@
 
 use super::*;
 
+async fn wait_for_announcement(sent: &Mutex<Vec<String>>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while sent.lock().await.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test: announcement must arrive within 10 seconds");
+}
+
+struct RecipientRecordingChannel {
+    sent: Arc<Mutex<Vec<String>>>,
+    recipients: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Channel for RecipientRecordingChannel {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.recipients.lock().await.push(message.recipient.clone());
+        self.sent.lock().await.push(message.content.clone());
+        Ok(())
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn no_recipient_skips_announcement() {
     let (ch, sent) = RecordingChannel::new();
@@ -15,18 +47,47 @@ async fn no_recipient_skips_announcement() {
 
     let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "Do something"})))
         .await
-        .unwrap();
-    assert!(result.success);
+        .expect("test: no-recipient spawn must be admitted");
+    assert!(result.success, "test: no-recipient spawn must succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let runs = tool.active_runs_snapshot().await;
+    let task = runs
+        .first()
+        .expect("test: spawned run must be registered")
+        .abort_handle
+        .as_ref()
+        .expect("test: spawned run must have a task handle");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !task.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test: no-recipient task must complete within 10 seconds");
 
+    let completed = tool.active_runs_snapshot().await;
+    assert!(
+        matches!(
+            completed.first().map(|run| &run.status),
+            Some(SubAgentStatus::Completed(_))
+        ),
+        "test: no-recipient run must complete successfully before checking silence"
+    );
     let messages = sent.lock().await;
-    assert!(messages.is_empty(), "Should not announce without recipient");
+    assert!(
+        messages.is_empty(),
+        "test: completed run must not announce without a recipient"
+    );
 }
 
 #[tokio::test]
 async fn explicit_recipient_overrides_default() {
-    let (ch, sent) = RecordingChannel::new();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let recipients = Arc::new(Mutex::new(Vec::new()));
+    let ch = RecipientRecordingChannel {
+        sent: Arc::clone(&sent),
+        recipients: Arc::clone(&recipients),
+    };
     let tool = make_tool(
         Arc::new(ch),
         Arc::new(EchoProvider {
@@ -43,14 +104,18 @@ async fn explicit_recipient_overrides_default() {
         })),
     )
     .await
-    .unwrap();
-    assert!(result.success);
+    .expect("test: explicit-recipient spawn must be admitted");
+    assert!(result.success, "test: explicit-recipient spawn must succeed");
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_announcement(&sent).await;
 
     let messages = sent.lock().await;
-    // Should have sent to explicit-recipient (check channel.sent has a message)
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 1, "test: exactly one announcement must arrive");
+    assert_eq!(
+        *recipients.lock().await,
+        ["explicit-recipient"],
+        "test: explicit recipient must override the default"
+    );
 }
 
 /// The runtime places no ceiling on how many sub-agents run at once, how
@@ -292,13 +357,17 @@ async fn failed_provider_announces_error() {
 
     let result = execute_admitted_spawn(&tool, with_spawn_grant(json!({"task": "This will fail"})))
         .await
-        .unwrap();
-    assert!(result.success); // spawn succeeds; failure is in the sub-agent
+        .expect("test: failing-provider spawn must be admitted");
+    assert!(result.success, "test: spawn succeeds before provider failure");
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_announcement(&sent).await;
 
     let messages = sent.lock().await;
-    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages.len(),
+        1,
+        "test: provider failure must produce exactly one announcement"
+    );
     assert!(
         messages[0].contains("error") || messages[0].contains("Error"),
         "Error message should be announced: {}",
