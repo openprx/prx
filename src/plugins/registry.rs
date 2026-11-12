@@ -135,12 +135,6 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Remove a plugin from the registry. Returns `true` if it existed.
-    pub async fn unregister(&self, name: &str) -> bool {
-        let mut plugins = self.plugins.write().await;
-        plugins.remove(name).is_some()
-    }
-
     /// Replace an existing plugin (for hot-reload).
     pub async fn replace(&self, plugin: LoadedPlugin) {
         let name = plugin.manifest.plugin.name.clone();
@@ -255,16 +249,6 @@ mod tests {
         let p2 = trusted_plugin(test_manifest("test"), "/tmp".into());
         registry.register(p1).await.unwrap();
         assert!(registry.register(p2).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn unregister() {
-        let registry = PluginRegistry::new();
-        let plugin = trusted_plugin(test_manifest("test"), "/tmp".into());
-        registry.register(plugin).await.unwrap();
-        assert!(registry.unregister("test").await);
-        assert!(!registry.unregister("test").await);
-        assert_eq!(registry.len().await, 0);
     }
 
     #[tokio::test]

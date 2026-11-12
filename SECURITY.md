@@ -26,7 +26,7 @@ in `deny.toml` with a documented reason. New unsuppressed advisories fail CI.
 
 | Advisory | Crate | Reason |
 |----------|-------|--------|
-| RUSTSEC-2025-0141 | bincode 2.0.1 | Transitive via probe-rs; upstream project considered complete |
+| RUSTSEC-2025-0141 | bincode 1.3.3 | Transitive via syntect; unmaintained advisory with no patched version, upstream considers 1.3.3 complete |
 | RUSTSEC-2026-0441 | pin-utils 0.1.0 | Transitive via async-imap; macro-only crate considered complete |
 
 CI enforcement: `.github/workflows/sec-audit.yml` job `deny / advisories` runs

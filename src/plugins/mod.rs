@@ -1197,16 +1197,32 @@ mod tests {
     async fn create_wasm_tool_adapters_empty_returns_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
-        let tools = manager.create_wasm_tool_adapters(None, None).await;
-        assert!(tools.value.is_empty());
+        let tools = tokio::time::timeout(Duration::from_secs(5), manager.create_wasm_tool_adapters(None, None))
+            .await
+            .expect("test: tool adapter build on an empty registry should finish within 5s");
+        assert!(
+            tools.value.is_empty(),
+            "an empty registry produced {} tool adapter(s); errors: {:?}",
+            tools.value.len(),
+            tools.errors
+        );
     }
 
     #[tokio::test]
     async fn create_middleware_chain_empty_returns_empty_chain() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
-        let chain = manager.create_middleware_chain_with_memory(None, None).await;
-        assert!(chain.value.is_empty());
+        let chain = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.create_middleware_chain_with_memory(None, None),
+        )
+        .await
+        .expect("test: middleware chain build on an empty registry should finish within 5s");
+        assert!(
+            chain.value.is_empty(),
+            "an empty registry produced a non-empty middleware chain; errors: {:?}",
+            chain.errors
+        );
     }
 
     #[tokio::test]
