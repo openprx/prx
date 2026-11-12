@@ -382,16 +382,6 @@ impl PluginManager {
             .store(cache.total_compile_ms(), Ordering::Relaxed);
     }
 
-    /// Unload a plugin by name.
-    pub async fn unload_plugin(&self, name: &str) -> PluginResult<()> {
-        if self.registry.unregister(name).await {
-            tracing::info!(plugin = %name, "plugin unloaded");
-            Ok(())
-        } else {
-            Err(PluginError::NotFound { name: name.to_string() })
-        }
-    }
-
     /// List all loaded plugins.
     pub async fn list_plugins(&self) -> Vec<PluginInfo> {
         self.registry.list().await
@@ -400,32 +390,6 @@ impl PluginManager {
     /// Get info about a specific plugin.
     pub async fn get_plugin(&self, name: &str) -> Option<PluginInfo> {
         self.registry.get_info(name).await
-    }
-
-    /// Create WasmToolAdapter instances for all plugins that declare tool capabilities.
-    ///
-    /// Returns a list of boxed `Tool` trait objects ready for registration
-    /// in the tools_registry.
-    pub async fn create_tool_adapters(&self) -> Vec<Box<dyn Tool>> {
-        self.create_tool_adapters_with_memory(None, None).await.value
-    }
-
-    /// Create tool adapters for all plugins with tool capabilities,
-    /// optionally injecting a memory backend and/or event bus into each adapter's host state.
-    pub async fn create_tool_adapters_with_memory(
-        &self,
-        memory: Option<Arc<dyn crate::memory::traits::Memory>>,
-        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> PluginAdapterBuild<Vec<Box<dyn Tool>>> {
-        let build = self.create_wasm_tool_adapters(memory, event_bus).await;
-        PluginAdapterBuild {
-            value: build
-                .value
-                .into_iter()
-                .map(|adapter| Box::new(adapter) as Box<dyn Tool>)
-                .collect(),
-            errors: build.errors,
-        }
     }
 
     /// Create the concrete tool adapters, so a runtime can read each one's
@@ -503,13 +467,6 @@ impl PluginManager {
     }
 
     /// Create middleware adapters for all plugins with middleware capabilities.
-    pub async fn create_middleware_chain(
-        &self,
-        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> PluginAdapterBuild<capabilities::middleware::MiddlewareChain> {
-        self.create_middleware_chain_with_memory(None, event_bus).await
-    }
-
     pub async fn create_middleware_chain_with_memory(
         &self,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
@@ -590,13 +547,6 @@ impl PluginManager {
     }
 
     /// Create hook adapters for all plugins with hook capabilities.
-    pub async fn create_hook_executor(
-        &self,
-        event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
-    ) -> PluginAdapterBuild<capabilities::hook::WasmHookExecutor> {
-        self.create_hook_executor_with_memory(None, event_bus).await
-    }
-
     pub async fn create_hook_executor_with_memory(
         &self,
         memory: Option<Arc<dyn crate::memory::traits::Memory>>,
@@ -1026,45 +976,6 @@ fn spawn_epoch_ticker(engine: &wasmtime::Engine) {
 #[cfg(not(target_has_atomic = "64"))]
 fn spawn_epoch_ticker(_engine: &wasmtime::Engine) {}
 
-/// Initialize the plugin manager under `policy`.
-///
-/// Called during gateway startup. Returns `None` if the plugins directory
-/// doesn't exist or no plugins are found (non-fatal).
-pub async fn init_plugin_manager(workspace_dir: &Path, policy: PluginPolicy) -> Option<Arc<PluginManager>> {
-    let plugins_dir = workspace_dir.join("plugins");
-
-    // Create the plugins directory if it doesn't exist
-    if !plugins_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&plugins_dir) {
-            tracing::warn!(error = %e, "failed to create plugins directory");
-            return None;
-        }
-    }
-
-    match PluginManager::new(plugins_dir, policy) {
-        Ok(manager) => {
-            let manager = Arc::new(manager);
-            match manager.load_all().await {
-                Ok(count) => {
-                    if count > 0 {
-                        tracing::info!(count, "WASM plugin system ready");
-                    } else {
-                        tracing::debug!("WASM plugin system ready (no plugins found)");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load plugins");
-                }
-            }
-            Some(manager)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to initialize WASM plugin manager");
-            None
-        }
-    }
-}
-
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
@@ -1238,14 +1149,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unload_nonexistent_returns_error() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
-        let result = manager.unload_plugin("nonexistent").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn reload_nonexistent_returns_error() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
@@ -1288,44 +1191,21 @@ mod tests {
         assert!(error.to_string().contains("stay within"));
     }
 
-    // ── init_plugin_manager ─────────────────────────────────────
+    // ── adapter builders on empty registry ──────────────────────
 
     #[tokio::test]
-    async fn init_plugin_manager_creates_plugins_dir() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let workspace = tmp.path();
-        let plugins_dir = workspace.join("plugins");
-        assert!(!plugins_dir.exists());
-
-        let manager = init_plugin_manager(workspace, policy_in(workspace)).await;
-        assert!(manager.is_some());
-        assert!(plugins_dir.exists());
-    }
-
-    #[tokio::test]
-    async fn init_plugin_manager_empty_workspace_succeeds() {
-        let tmp = tempfile::tempdir().expect("test: tempdir");
-        let manager = init_plugin_manager(tmp.path(), policy_in(tmp.path())).await;
-        assert!(manager.is_some());
-        let plugins = manager.as_ref().expect("test: manager").list_plugins().await;
-        assert!(plugins.is_empty());
-    }
-
-    // ── create_tool_adapters on empty registry ──────────────────
-
-    #[tokio::test]
-    async fn create_tool_adapters_empty_returns_empty() {
+    async fn create_wasm_tool_adapters_empty_returns_empty() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
-        let tools = manager.create_tool_adapters().await;
-        assert!(tools.is_empty());
+        let tools = manager.create_wasm_tool_adapters(None, None).await;
+        assert!(tools.value.is_empty());
     }
 
     #[tokio::test]
     async fn create_middleware_chain_empty_returns_empty_chain() {
         let tmp = tempfile::tempdir().expect("test: tempdir");
         let manager = PluginManager::new(tmp.path().to_path_buf(), policy_in(tmp.path())).expect("test: new");
-        let chain = manager.create_middleware_chain(None).await;
+        let chain = manager.create_middleware_chain_with_memory(None, None).await;
         assert!(chain.value.is_empty());
     }
 
