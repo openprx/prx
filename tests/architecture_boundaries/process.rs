@@ -67,8 +67,10 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // the lock is released when its holder dies needs a child that is SIGKILLed.
     "src/skills/lifecycle/tests/publish.rs::a_killed_lock_holder_releases_the_lock_and_publication_continues::.spawn()",
     "src/skills/lifecycle/tests/publish.rs::processes_racing_on_one_generation_have_exactly_one_winner::.spawn()",
+    "src/tunnel/cloudflare.rs::start::let mut child = command.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",
+    "src/tunnel/ngrok.rs::start::let mut child = command.spawn()?;",
     "src/tunnel/tailscale.rs::start::.spawn()?;",
 ];
 

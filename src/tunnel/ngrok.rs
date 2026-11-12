@@ -57,7 +57,8 @@ impl Tunnel for NgrokTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        let mut child = self.build_command(local_port).spawn()?;
+        let mut command = self.build_command(local_port);
+        let mut child = command.spawn()?;
 
         let stdout = child
             .stdout
