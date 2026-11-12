@@ -5,9 +5,10 @@ use serde_json::json;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-#[allow(clippy::expect_used)]
-static RE_STRIP_TAGS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("BUG: invalid hardcoded strip-tags regex"));
+static RE_STRIP_TAGS: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(r"<[^>]+>"));
+fn re_strip_tags() -> Result<&'static Regex, &'static regex::Error> {
+    RE_STRIP_TAGS.as_ref()
+}
 
 /// Web search tool for searching the internet.
 /// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
@@ -87,14 +88,14 @@ impl WebSearchTool {
 
         for (i, caps) in link_matches.iter().take(count).enumerate() {
             let url_str = decode_ddg_redirect_url(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
-            let title = strip_tags(caps.get(2).map(|m| m.as_str()).unwrap_or(""));
+            let title = strip_tags(caps.get(2).map(|m| m.as_str()).unwrap_or(""))?;
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
 
             // Add snippet if available
             if let Some(snippet_caps) = snippet_matches.get(i) {
-                let snippet = strip_tags(snippet_caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+                let snippet = strip_tags(snippet_caps.get(1).map(|m| m.as_str()).unwrap_or(""))?;
                 let snippet = snippet.trim();
                 if !snippet.is_empty() {
                     lines.push(format!("   {}", snippet));
@@ -177,8 +178,14 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
-fn strip_tags(content: &str) -> String {
-    RE_STRIP_TAGS.replace_all(content, "").to_string()
+fn strip_tags(content: &str) -> Result<String, &'static regex::Error> {
+    strip_tags_with_pattern(content, re_strip_tags())
+}
+fn strip_tags_with_pattern(
+    content: &str,
+    pattern: Result<&Regex, &'static regex::Error>,
+) -> Result<String, &'static regex::Error> {
+    Ok(pattern?.replace_all(content, "").to_string())
 }
 
 #[async_trait]
@@ -212,6 +219,14 @@ impl Tool for WebSearchTool {
 
         if query.trim().is_empty() {
             anyhow::bail!("Search query cannot be empty");
+        }
+
+        if let Err(error) = re_strip_tags() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("search result pattern unavailable: {error}")),
+            });
         }
 
         tracing::info!("Searching web for: {}", query);
@@ -269,7 +284,7 @@ mod tests {
     #[test]
     fn test_strip_tags() {
         let html = "<b>Hello</b> <i>World</i>";
-        assert_eq!(strip_tags(html), "Hello World");
+        assert_eq!(strip_tags(html).expect("test: strip tags"), "Hello World");
     }
 
     #[test]
@@ -416,5 +431,20 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[test]
+    fn web_search_tool_hardcoded_patterns_compile() {
+        assert!(re_strip_tags().is_ok(), "hardcoded re_strip_tags must compile");
+    }
+
+    #[test]
+    fn strip_tags_propagates_pattern_error() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        assert!(
+            strip_tags_with_pattern("<b>text</b>", Err(&ERROR)).is_err(),
+            "broken tag stripper must reject unprocessed output"
+        );
     }
 }

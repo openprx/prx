@@ -249,6 +249,7 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
     let body = "pub async fn handler() {\n    let _ = MiddlewareStage::Outbound;\n    cfg.save();\n    let _ = \
                 tool.execute(args).await;\n}\n";
     for marked in [
+        format!("#![cfg(all(test, feature = \"probe\"))]\n{body}"),
         format!("//! Tests of a production module.\n\n#![cfg(test)]\n#![allow(clippy::unwrap_used)]\n\n{body}"),
         format!("/* leading block comment */\n#![cfg(test)] // trailing comment\n{body}"),
     ] {
@@ -273,7 +274,6 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
         format!("#![allow(clippy::unwrap_used)]\n#![cfg(test)]\n{body}"),
         format!("#![cfg(any(test, feature = \"probe\"))]\n{body}"),
         format!("#![cfg(not(test))]\n{body}"),
-        format!("#![cfg(all(test, feature = \"probe\"))]\n{body}"),
         format!("/* a comment that mentions\n#![cfg(test)]\n*/\n{body}"),
         format!("{body}#[cfg(test)]\nmod tests {{}}\n"),
     ] {
@@ -288,5 +288,20 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
             1,
             "{unmarked}"
         );
+    }
+}
+
+#[test]
+fn all_cfg_requires_test_but_any_cfg_does_not() {
+    for predicate in ["test", "all(test, unix)", "all(unix, test)", "all(unix, all(test, feature = \"probe\"))"] {
+        let source = format!("#[cfg({predicate})] fn probe() {{ value.unwrap(); }}\nfn production() {{ keep(); }}");
+        let stripped = strip_cfg_test_items(&blank_comments_and_literals(&source));
+        assert!(!stripped.contains("unwrap"), "test-requiring predicate {predicate} must be stripped");
+        assert!(stripped.contains("keep"), "stripping {predicate} must preserve production after the item");
+    }
+    for predicate in ["any(test, unix)", "all(unix, any(test, feature = \"probe\"))", "not(test)"] {
+        let source = format!("#[cfg({predicate})] fn probe() {{ value.unwrap(); }}");
+        let stripped = strip_cfg_test_items(&blank_comments_and_literals(&source));
+        assert!(stripped.contains("unwrap"), "predicate {predicate} can compile outside tests and must remain production");
     }
 }

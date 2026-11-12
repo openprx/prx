@@ -2076,7 +2076,7 @@ impl Channel for SignalChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Parse any media markers embedded in the message content
-        let (clean_text, media_items) = extract_outgoing_media(&message.content);
+        let (clean_text, media_items) = extract_outgoing_media(&message.content)?;
         let text_content = &clean_text;
 
         // ── Native mode: JSON-RPC send ────────────────────────────────────────

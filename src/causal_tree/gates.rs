@@ -1420,11 +1420,18 @@ mod tests {
             report.outcomes.get(candidate.candidate_id()),
             Some(&GateOutcome::ApprovalDeferred)
         );
-        let original = state.material_fingerprint(&key);
+        let original = state
+            .material_fingerprint(&key)
+            .expect("test: canonical state serializes");
         let mut isolated = state.trusted.parts().clone();
         isolated.constraints.push(ConstraintCode::new("owner_isolated"));
         state.trusted = TrustedState::from_runtime(isolated);
-        assert_ne!(state.material_fingerprint(&key), original);
+        assert_ne!(
+            state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            original
+        );
         let calls = BTreeMap::from([(candidate.candidate_id().clone(), [1; 32])]);
         let mut approved = probe_inputs(&policy, &empty, &calls, &history);
         approved

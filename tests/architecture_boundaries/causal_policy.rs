@@ -2,7 +2,7 @@ use super::causal_domain::crate_rooted_paths;
 use super::helpers::{
     blank_comments_and_literals, is_ident_char, read_source, relative_path, rust_source_files, strip_cfg_test_items,
 };
-use super::loop_requests::{is_test_code_file, test_module_files};
+use super::helpers::{is_test_code_file, test_module_files};
 use super::tool_scanner::contains_identifier;
 /// The only production files that may write the decision-plane
 /// configuration (CDP-04, SP-CDP-A 5.4): its own module, for the legacy

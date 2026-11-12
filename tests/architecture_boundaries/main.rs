@@ -20,6 +20,7 @@ mod loop_contracts;
 mod loop_prompt;
 mod loop_requests;
 mod memory;
+mod panic_policy;
 mod process;
 mod providers;
 mod removed_modules;

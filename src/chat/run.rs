@@ -4761,7 +4761,7 @@ Retry with a compatible model: /provider {shown} <model>",
         }
 
         // ── Extract and display media markers (images, documents, etc.) ──
-        let (clean_response, media_items) = extract_outgoing_media(&response);
+        let (clean_response, media_items) = extract_outgoing_media(&response)?;
         for (media_type, path) in &media_items {
             if media_type == "IMAGE" && std::path::Path::new(path).exists() {
                 if let Err(e) = terminal_proto::display_image(path) {

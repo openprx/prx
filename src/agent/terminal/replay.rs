@@ -257,6 +257,7 @@ impl PreparedReplay {
                     .replay_record(&scope, &hop.decision_id)?
                     .context("decision replay row is missing")?
             };
+            let state_fingerprint = hop.state.material_fingerprint(&recorded.key)?;
             anyhow::ensure!(
                 row.decision.enabled_snapshot
                     && !row.decision.legacy_v1
@@ -272,7 +273,7 @@ impl PreparedReplay {
                     && row.source_event_id.as_deref() == Some(source_id)
                     && row.catalog_generation == hop.state.trusted.parts().catalog_generation.to_hex()
                     && row.decision.policy_version == hop.state.trusted.parts().policy_version.as_ref()
-                    && row.state_fingerprint == hop.state.material_fingerprint(&recorded.key),
+                    && row.state_fingerprint == state_fingerprint,
                 "persisted decision replay binding differs from the issued context"
             );
             let expected = expected_records

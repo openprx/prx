@@ -37,7 +37,7 @@ fn parse_tool_calls_extracts_single_call() {
 {"name": "shell", "arguments": {"command": "ls -la"}}
 </tool_call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(text, "Let me check that.");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -47,7 +47,7 @@ fn parse_tool_calls_extracts_single_call() {
 #[test]
 fn parse_tool_calls_returns_text_only_when_no_calls() {
     let response = "Just a normal response with no tools.";
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(text, "Just a normal response with no tools.");
     assert!(calls.is_empty());
 }
@@ -59,7 +59,7 @@ not valid json
 </tool_call>
 Some text after."#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(calls.is_empty());
     assert!(text.contains("Some text after."));
 }
@@ -72,7 +72,7 @@ fn parse_tool_calls_text_before_and_after() {
 </tool_call>
 After text."#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.contains("Before text."));
     assert!(text.contains("After text."));
     assert_eq!(calls.len(), 1);
@@ -83,7 +83,7 @@ fn parse_tool_calls_handles_openai_format() {
     // OpenAI-style response with tool_calls array
     let response = r#"{"content": "Let me check that for you.", "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls -la\"}"}}]}"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(text, "Let me check that for you.");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -96,7 +96,7 @@ fn parse_tool_calls_openai_format_without_content() {
     let response =
         r#"{"tool_calls": [{"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}}]}"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value"); // No content field
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "memory_recall");
@@ -110,7 +110,7 @@ fn parse_tool_calls_handles_markdown_json_inside_tool_call_tag() {
 ```
 </tool_call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "file_write");
@@ -124,7 +124,7 @@ I will now call the tool with this payload:
 {"name": "shell", "arguments": {"command": "pwd"}}
 </tool_call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -139,7 +139,7 @@ fn parse_tool_calls_handles_markdown_tool_call_fence() {
 ```
 Done."#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "pwd");
@@ -156,7 +156,7 @@ fn parse_tool_calls_handles_markdown_tool_call_hybrid_close_tag() {
 </tool_call>
 Tail"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
@@ -173,7 +173,7 @@ fn parse_tool_calls_handles_markdown_invoke_fence() {
 ```
 Done."#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "date");
@@ -187,7 +187,7 @@ fn parse_tool_calls_handles_toolcall_tag_alias() {
 {"name": "shell", "arguments": {"command": "date"}}
 </toolcall>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -200,7 +200,7 @@ fn parse_tool_calls_handles_tool_dash_call_tag_alias() {
 {"name": "shell", "arguments": {"command": "whoami"}}
 </tool-call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -213,7 +213,7 @@ fn parse_tool_calls_handles_tool_call_tag_with_attributes() {
 {"name": "shell", "arguments": {"command": "date"}}
 </tool_call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -226,7 +226,7 @@ fn parse_tool_calls_handles_invoke_tag_alias() {
 {"name": "shell", "arguments": {"command": "uptime"}}
 </invoke>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -239,7 +239,7 @@ fn parse_tool_calls_handles_codex_to_shell_code_format() {
 date
 "#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -254,7 +254,7 @@ pwd
 ```
 "#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -267,7 +267,7 @@ fn parse_tool_calls_handles_assistant_recipient_format_with_json_arguments() {
 {"path":"README.md"}
 </assistant>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "file_read");
@@ -280,7 +280,7 @@ fn parse_tool_calls_handles_assistant_recipient_format_with_shell_command_body()
 ls -la
 </assistant>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -293,7 +293,7 @@ fn parse_tool_calls_recovers_unclosed_tool_call_with_json() {
 <tool_call>
 {"name": "shell", "arguments": {"command": "uptime -p"}}"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.contains("I will call the tool now."));
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -309,7 +309,7 @@ fn parse_tool_calls_recovers_mismatched_close_tag() {
 {"name": "shell", "arguments": {"command": "uptime"}}
 </arg_value>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -322,7 +322,7 @@ fn parse_tool_calls_recovers_cross_alias_closing_tags() {
 {"name": "shell", "arguments": {"command": "date"}}
 </tool_call>"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.is_empty(), "expected an empty value");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
@@ -336,7 +336,7 @@ fn parse_tool_calls_rejects_raw_tool_json_without_tags() {
     let response = r#"Sure, creating the file now.
 {"name": "file_write", "arguments": {"path": "hello.py", "content": "print('hello')"}}"#;
 
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.contains("Sure, creating the file now."));
     assert_eq!(calls.len(), 0, "Raw JSON without wrappers should not be parsed");
 }
@@ -378,7 +378,7 @@ fn parse_tool_calls_handles_empty_tool_result() {
 
 </tool_result>
 Done."#;
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(text.contains("Done."));
     assert!(calls.is_empty());
 }
@@ -395,7 +395,7 @@ fn parse_arguments_value_handles_null() {
 fn parse_tool_calls_handles_empty_tool_calls_array() {
     // Recovery: Empty tool_calls array returns original response (no tool parsing)
     let response = r#"{"content": "Hello", "tool_calls": []}"#;
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     // When tool_calls is empty, the entire JSON is returned as text
     assert!(text.contains("Hello"));
     assert!(calls.is_empty());
@@ -592,7 +592,7 @@ browser_open/url>https://example.com"#;
 fn parse_glm_style_tool_call_integration() {
     // Integration test: GLM format should be parsed in parse_tool_calls
     let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert!(text.contains("Checking"));
@@ -609,7 +609,7 @@ fn parse_glm_style_rejects_non_http_url_param() {
 #[test]
 fn parse_tool_calls_handles_unclosed_tool_call_tag() {
     let response = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}\nDone";
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "shell");
     assert_eq!(calls[0].arguments["command"], "pwd");
@@ -618,14 +618,14 @@ fn parse_tool_calls_handles_unclosed_tool_call_tag() {
 
 #[test]
 fn parse_tool_calls_empty_input_returns_empty() {
-    let (text, calls) = parse_tool_calls("");
+    let (text, calls) = parse_tool_calls("").expect("test: parser patterns compile");
     assert!(calls.is_empty(), "empty input should produce no tool calls");
     assert!(text.is_empty(), "empty input should produce no text");
 }
 
 #[test]
 fn parse_tool_calls_whitespace_only_returns_empty_calls() {
-    let (text, calls) = parse_tool_calls("   \n\t  ");
+    let (text, calls) = parse_tool_calls("   \n\t  ").expect("test: parser patterns compile");
     assert!(calls.is_empty());
     assert!(text.is_empty() || text.trim().is_empty());
 }
@@ -634,7 +634,7 @@ fn parse_tool_calls_whitespace_only_returns_empty_calls() {
 fn parse_tool_calls_nested_xml_tags_handled() {
     // Double-wrapped tool call should still parse the inner call
     let response = r#"<tool_call><tool_call>{"name":"echo","arguments":{"msg":"hi"}}</tool_call></tool_call>"#;
-    let (_text, calls) = parse_tool_calls(response);
+    let (_text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     // Should find at least one tool call
     assert!(
         !calls.is_empty(),
@@ -646,38 +646,48 @@ fn parse_tool_calls_nested_xml_tags_handled() {
 fn parse_tool_calls_truncated_json_no_panic() {
     // Incomplete JSON inside tool_call tags
     let response = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"</tool_call>"#;
-    let (_text, _calls) = parse_tool_calls(response);
+    let (_text, _calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     // Should not panic — graceful handling of truncated JSON
 }
 
 #[test]
 fn looks_like_unparsed_tool_call_syntax_requires_complete_shapes() {
-    assert!(!looks_like_unparsed_tool_call_syntax(
-        "This text mentions <invoke in docs but has no closing tag."
-    ));
-    assert!(!looks_like_unparsed_tool_call_syntax(
-        "Quoted protocol only: assistant to=shell code"
-    ));
-    assert!(!looks_like_unparsed_tool_call_syntax(
-        "Discussion snippet: <assistant recipient=\"shell\"> without a closing tag."
-    ));
+    assert!(
+        !looks_like_unparsed_tool_call_syntax("This text mentions <invoke in docs but has no closing tag.")
+            .expect("test: parser patterns compile")
+    );
+    assert!(
+        !looks_like_unparsed_tool_call_syntax("Quoted protocol only: assistant to=shell code")
+            .expect("test: parser patterns compile")
+    );
+    assert!(
+        !looks_like_unparsed_tool_call_syntax(
+            "Discussion snippet: <assistant recipient=\"shell\"> without a closing tag."
+        )
+        .expect("test: parser patterns compile")
+    );
 
-    assert!(looks_like_unparsed_tool_call_syntax(
-        r#"<invoke>{"name":"shell","arguments":{"command":"pwd"}}</invoke>"#
-    ));
-    assert!(looks_like_unparsed_tool_call_syntax(
-        r#"assistant to=shell code
+    assert!(
+        looks_like_unparsed_tool_call_syntax(r#"<invoke>{"name":"shell","arguments":{"command":"pwd"}}</invoke>"#)
+            .expect("test: parser patterns compile")
+    );
+    assert!(
+        looks_like_unparsed_tool_call_syntax(
+            r#"assistant to=shell code
 {"command":"pwd"}"#
-    ));
-    assert!(looks_like_unparsed_tool_call_syntax(
-        r#"<assistant recipient="file_read">{"path":"README.md"}</assistant>"#
-    ));
+        )
+        .expect("test: parser patterns compile")
+    );
+    assert!(
+        looks_like_unparsed_tool_call_syntax(r#"<assistant recipient="file_read">{"path":"README.md"}</assistant>"#)
+            .expect("test: parser patterns compile")
+    );
 }
 
 #[test]
 fn parse_tool_calls_empty_json_object_in_tag() {
     let response = "<tool_call>{}</tool_call>";
-    let (_text, calls) = parse_tool_calls(response);
+    let (_text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     // Empty JSON object has no name field — should not produce valid tool call
     assert!(calls.is_empty(), "empty JSON object should not produce a tool call");
 }
@@ -685,7 +695,7 @@ fn parse_tool_calls_empty_json_object_in_tag() {
 #[test]
 fn parse_tool_calls_closing_tag_only_returns_text() {
     let response = "Some text </tool_call> more text";
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(calls.is_empty(), "closing tag only should not produce calls");
     assert!(!text.is_empty(), "text around orphaned closing tag should be preserved");
 }
@@ -697,7 +707,7 @@ fn parse_tool_calls_very_large_arguments_no_panic() {
         r#"<tool_call>{{"name":"echo","arguments":{{"message":"{}"}}}}</tool_call>"#,
         large_arg
     );
-    let (_text, calls) = parse_tool_calls(&response);
+    let (_text, calls) = parse_tool_calls(&response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1, "large arguments should still parse");
     assert_eq!(calls[0].name, "echo");
 }
@@ -705,7 +715,7 @@ fn parse_tool_calls_very_large_arguments_no_panic() {
 #[test]
 fn parse_tool_calls_special_characters_in_arguments() {
     let response = r#"<tool_call>{"name":"echo","arguments":{"message":"hello \"world\" <>&'\n\t"}}</tool_call>"#;
-    let (_text, calls) = parse_tool_calls(response);
+    let (_text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "echo");
 }
@@ -714,7 +724,7 @@ fn parse_tool_calls_special_characters_in_arguments() {
 fn parse_tool_calls_text_with_embedded_json_not_extracted() {
     // Raw JSON without any tags should NOT be extracted as a tool call
     let response = r#"Here is some data: {"name":"echo","arguments":{"message":"hi"}} end."#;
-    let (_text, calls) = parse_tool_calls(response);
+    let (_text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert!(
         calls.is_empty(),
         "raw JSON in text without tags should not be extracted"
@@ -731,7 +741,7 @@ fn parse_tool_calls_multiple_formats_mixed() {
 </tool_call>
 
 Let me check the result."#;
-    let (text, calls) = parse_tool_calls(response);
+    let (text, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 1, "should extract one tool call from mixed content");
     assert_eq!(calls[0].name, "shell");
     assert!(text.contains("help you"), "text before tool call should be preserved");
@@ -777,7 +787,7 @@ fn unparsed_syntax_prefilter_matches_original_casefold_and_unicode_patterns() {
     ];
     for text in cases {
         assert_eq!(
-            super::looks_like_unparsed_tool_call_syntax(text),
+            super::looks_like_unparsed_tool_call_syntax(text).expect("test: parser patterns compile"),
             original.is_match(text),
             "input={text:?}"
         );

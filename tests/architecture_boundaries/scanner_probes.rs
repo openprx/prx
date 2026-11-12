@@ -55,6 +55,7 @@ use super::memory::{
     every_memory_read_principal_built_from_a_context_carries_the_owner_scope,
     the_owner_isolation_bit_is_never_asserted_by_memory_production_code,
 };
+use super::panic_policy::production_has_no_panic_shortcuts;
 use super::process::{
     every_production_process_command_is_inventoried, git_is_named_only_in_the_reviewed_places,
     git_runs_only_through_the_hardened_launch, process_command_types_are_never_aliased,
@@ -78,6 +79,10 @@ use std::fs;
 /// reason. Every other function that walks the source tree must separate
 /// production from tests through a marker-aware helper.
 pub(super) const TEST_INCLUSIVE_TREE_SCANNERS: &[(&str, &str)] = &[
+    (
+        "catch_unwind_file_inventory_only_shrinks",
+        "part B ratchet includes tests and production; only removal of existing files is permitted",
+    ),
     (
         "removed_reply_feature_has_only_explicit_compatibility_references",
         "feature retirement covers test code and fixtures too; its planted executable-reference regression verifies rejection",
@@ -287,6 +292,33 @@ macro_rules! planted_violation_probes {
 }
 
 planted_violation_probes! {
+    probe_panic_unwrap: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "value.unwrap();\n";
+    probe_panic_expect: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "value.expect(\"test\");\n";
+    probe_panic_panic: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "panic!(\"test\");\n";
+    probe_panic_unreachable: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "unreachable!();\n";
+    probe_panic_todo: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "todo!();\n";
+    probe_panic_unimplemented: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "unimplemented!();\n";
+    probe_panic_allow: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[allow(clippy::expect_used)] fn a() {}\n";
+    probe_panic_expect_attribute: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[expect(clippy::unwrap_used)] fn a() {}\n";
+    probe_panic_conditional_allow: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[cfg_attr(unix, allow(clippy::panic))] fn a() {}\n";
     probe_config_writes: config_writes_route_through_the_transaction_layer,
         "src/providers/mod.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub async fn d0_planted_save(cfg: Config) {\n    cfg.save().await;\n}\n";
@@ -929,4 +961,42 @@ fn mutation_proof_confidence_terminal() {
         "if fallback_answer || !gates.model_can_call_tools",
         "if !gates.model_can_call_tools",
     );
+}
+
+#[test]
+fn panic_guard_exempts_all_test_items_and_module_loaders() {
+    assert!(
+        !scanner_fails_with(
+            production_has_no_panic_shortcuts,
+            vec![
+                (
+                    "src/panic_policy_probe.rs".to_string(),
+                    "#[cfg(all(test, unix))] fn probe() { value.unwrap(); }".to_string()
+                ),
+                (
+                    "src/panic_loader.rs".to_string(),
+                    "#[cfg(all(test, unix))] mod probe;".to_string()
+                ),
+                (
+                    "src/panic_loader/probe.rs".to_string(),
+                    "fn probe() { value.expect(\"test\"); }".to_string()
+                ),
+                (
+                    "src/panic_literals.rs".to_string(),
+                    "/// .unwrap()\nconst S: &str = \".unwrap()\";".to_string()
+                ),
+            ]
+        ),
+        "test-gated items, test module files, docs and literals must be exempt"
+    );
+}
+
+#[test]
+fn panic_ratchet_rejects_new_production_and_test_files() {
+    for code in [
+        "fn probe() { std::panic::catch_unwind(|| ()); }",
+        "#![cfg(test)]\nfn probe() { std::panic::catch_unwind(|| ()); }",
+    ] {
+        assert!(scanner_fails_with(super::panic_policy::catch_unwind_file_inventory_only_shrinks, vec![("src/panic_catch_probe.rs".to_string(), code.to_string())]), "a new catch_unwind file must fail even when it is test-only");
+    }
 }

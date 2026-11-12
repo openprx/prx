@@ -3,6 +3,55 @@ use crate::providers::ToolCall;
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
 
+static CODEX_TO_HEADER_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#));
+fn codex_to_header_re() -> Result<&'static Regex, &'static regex::Error> {
+    CODEX_TO_HEADER_RE.as_ref()
+}
+
+static ASSISTANT_RECIPIENT_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#));
+fn assistant_recipient_re() -> Result<&'static Regex, &'static regex::Error> {
+    ASSISTANT_RECIPIENT_RE.as_ref()
+}
+
+static RECIPIENT_ATTR_RE: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#));
+fn recipient_attr_re() -> Result<&'static Regex, &'static regex::Error> {
+    RECIPIENT_ATTR_RE.as_ref()
+}
+
+static COMPLETE_TOOL_SYNTAX: LazyLock<Result<RegexSet, regex::Error>> = LazyLock::new(|| {
+    RegexSet::new([
+        r"(?is)<tool[_-]?call\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</tool[_-]?call>",
+        r"(?is)<toolcall\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</toolcall>",
+        r"(?is)<tool_use\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</tool_use>",
+        r"(?is)<invoke\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</invoke>",
+        r#"(?is)<assistant\b[^>]*\brecipient\s*=\s*["']?[a-zA-Z0-9_.-]+["']?[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\]|```[\s\S]*?```)\s*</assistant>"#,
+        r"(?is)(?:^|\n)\s*(?:assistant\s+)?to=[a-zA-Z0-9_.-]+\s+code\s*(?:\r?\n)+\s*(?:```(?:json|tool[_-]?call|toolcall|invoke)?\s*(?:\r?\n)+)?\s*(?:\{|\[)",
+    ])
+});
+fn complete_tool_syntax() -> Result<&'static RegexSet, &'static regex::Error> {
+    COMPLETE_TOOL_SYNTAX.as_ref()
+}
+
+static MD_TOOL_CALL_RE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
+    Regex::new(r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</tool_use>|</invoke>)")
+});
+fn md_tool_call_re() -> Result<&'static Regex, &'static regex::Error> {
+    MD_TOOL_CALL_RE.as_ref()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ToolCallParseError {
+    #[error("tool-call pattern unavailable: {0}")]
+    Pattern(#[from] &'static regex::Error),
+}
+
+fn parser_pattern<T>(pattern: Result<T, &'static regex::Error>) -> Result<T, ToolCallParseError> {
+    pattern.map_err(ToolCallParseError::Pattern)
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
@@ -392,13 +441,7 @@ fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall
     calls
 }
 
-fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
-    #[allow(clippy::expect_used)]
-    static CODEX_TO_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)^\s*(?:assistant\s+)?to=([a-zA-Z0-9_.-]+)\s+code\s*$"#)
-            .expect("compile regex: codex to=recipient header")
-    });
-
+fn parse_codex_to_style_tool_calls(text: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut plain_text = String::new();
@@ -412,8 +455,9 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
         }
     };
 
+    let header = parser_pattern(codex_to_header_re())?;
     for line in text.lines() {
-        if let Some(cap) = CODEX_TO_HEADER_RE.captures(line) {
+        if let Some(cap) = header.captures(line) {
             flush_current(&mut current_recipient, &mut current_body, &mut calls);
             current_recipient = cap.get(1).map(|m| m.as_str().to_string());
             continue;
@@ -441,25 +485,17 @@ fn parse_codex_to_style_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) 
         text_parts.push(text.trim().to_string());
     }
 
-    (text_parts.join("\n"), calls)
+    Ok((text_parts.join("\n"), calls))
 }
 
-fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
-    #[allow(clippy::expect_used)]
-    static ASSISTANT_RECIPIENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)<assistant\b([^>]*)>(.*?)</assistant>"#).expect("compile regex: assistant XML tag pattern")
-    });
-    #[allow(clippy::expect_used)]
-    static RECIPIENT_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\brecipient\s*=\s*["']?([a-zA-Z0-9_.-]+)["']?"#)
-            .expect("compile regex: recipient attribute pattern")
-    });
-
+fn parse_assistant_recipient_tool_calls(text: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut last_end = 0usize;
 
-    for cap in ASSISTANT_RECIPIENT_RE.captures_iter(text) {
+    let assistant = parser_pattern(assistant_recipient_re())?;
+    let recipient_pattern = parser_pattern(recipient_attr_re())?;
+    for cap in assistant.captures_iter(text) {
         let Some(full_match) = cap.get(0) else {
             continue;
         };
@@ -470,7 +506,7 @@ fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCa
 
         let attrs = cap.get(1).map_or("", |m| m.as_str());
         let body = cap.get(2).map_or("", |m| m.as_str());
-        if let Some(recipient_match) = RECIPIENT_ATTR_RE.captures(attrs) {
+        if let Some(recipient_match) = recipient_pattern.captures(attrs) {
             if let Some(recipient) = recipient_match.get(1).map(|m| m.as_str()) {
                 calls.extend(parse_recipient_tool_calls(recipient, body));
             }
@@ -488,30 +524,19 @@ fn parse_assistant_recipient_tool_calls(text: &str) -> (String, Vec<ParsedToolCa
         text_parts.push(text.trim().to_string());
     }
 
-    (text_parts.join("\n"), calls)
+    Ok((text_parts.join("\n"), calls))
 }
 
-pub(super) fn looks_like_unparsed_tool_call_syntax(text: &str) -> bool {
+pub(super) fn looks_like_unparsed_tool_call_syntax(text: &str) -> Result<bool, ToolCallParseError> {
     // Every XML alternative requires '<'; the Codex alternative requires '='.
     // These punctuation literals are unchanged by Unicode case folding.
     // Keep the original matcher for every possible match, including malformed
     // marker-bearing input, without initializing its regexes for plain prose.
     if !text.bytes().any(|byte| matches!(byte, b'<' | b'=')) {
-        return false;
+        return Ok(false);
     }
-    #[allow(clippy::expect_used)]
-    static COMPLETE_TOOL_SYNTAX: LazyLock<RegexSet> = LazyLock::new(|| {
-        RegexSet::new([
-            r"(?is)<tool[_-]?call\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</tool[_-]?call>",
-            r"(?is)<toolcall\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</toolcall>",
-            r"(?is)<tool_use\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</tool_use>",
-            r"(?is)<invoke\b[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\])\s*</invoke>",
-            r#"(?is)<assistant\b[^>]*\brecipient\s*=\s*["']?[a-zA-Z0-9_.-]+["']?[^>]*>\s*(?:\{[\s\S]*?\}|\[[\s\S]*?\]|```[\s\S]*?```)\s*</assistant>"#,
-            r"(?is)(?:^|\n)\s*(?:assistant\s+)?to=[a-zA-Z0-9_.-]+\s+code\s*(?:\r?\n)+\s*(?:```(?:json|tool[_-]?call|toolcall|invoke)?\s*(?:\r?\n)+)?\s*(?:\{|\[)",
-        ])
-        .expect("compile regex set: complete tool syntax patterns")
-    });
-    COMPLETE_TOOL_SYNTAX.is_match(text)
+
+    Ok(parser_pattern(complete_tool_syntax())?.is_match(text))
 }
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
@@ -538,7 +563,7 @@ pub(super) fn looks_like_unparsed_tool_call_syntax(text: &str) -> bool {
 /// compatibility.
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
-pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+pub(super) fn parse_tool_calls(response: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -554,7 +579,7 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
                     text_parts.push(content.trim().to_string());
                 }
             }
-            return (text_parts.join("\n"), calls);
+            return Ok((text_parts.join("\n"), calls));
         }
     }
 
@@ -618,17 +643,10 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
     // Models behind OpenRouter sometimes output ```tool_call ... ``` or hybrid
     // ```tool_call ... </tool_call> instead of structured API calls or XML tags.
     if calls.is_empty() {
-        #[allow(clippy::expect_used)]
-        static MD_TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(
-                r"(?s)```(?:tool[_-]?call|invoke)\s*\n(.*?)(?:```|</tool[_-]?call>|</toolcall>|</tool_use>|</invoke>)",
-            )
-            .expect("compile regex: markdown tool_call block pattern")
-        });
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
-        for cap in MD_TOOL_CALL_RE.captures_iter(response) {
+        for cap in parser_pattern(md_tool_call_re())?.captures_iter(response) {
             // cap.get(0) is the full match, always present for captures_iter results
             if let Some(full_match) = cap.get(0) {
                 let before = &response[last_end..full_match.start()];
@@ -657,7 +675,7 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
 
     // OpenAI Codex text protocol: `assistant to=<tool> code ...`
     if calls.is_empty() {
-        let (parsed_text, parsed_calls) = parse_codex_to_style_tool_calls(response);
+        let (parsed_text, parsed_calls) = parse_codex_to_style_tool_calls(response)?;
         if !parsed_calls.is_empty() {
             calls = parsed_calls;
             if !parsed_text.is_empty() {
@@ -671,7 +689,7 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
 
     // Assistant-recipient XML protocol: <assistant recipient="tool">...</assistant>
     if calls.is_empty() {
-        let (parsed_text, parsed_calls) = parse_assistant_recipient_tool_calls(response);
+        let (parsed_text, parsed_calls) = parse_assistant_recipient_tool_calls(response)?;
         if !parsed_calls.is_empty() {
             calls = parsed_calls;
             if !parsed_text.is_empty() {
@@ -719,7 +737,7 @@ pub(super) fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) 
         text_parts.push(remaining.trim().to_string());
     }
 
-    (text_parts.join("\n"), calls)
+    Ok((text_parts.join("\n"), calls))
 }
 
 /// Unparseable arguments become `{}` here only so the call keeps its slot and
@@ -771,3 +789,39 @@ pub(super) struct ParsedToolCall {
 
 #[path = "turn_tests/tool_call_parser.rs"]
 mod tests;
+
+#[cfg(test)]
+mod panic_policy_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_parser_hardcoded_patterns_compile() {
+        assert!(
+            codex_to_header_re().is_ok(),
+            "hardcoded codex_to_header_re must compile"
+        );
+        assert!(
+            assistant_recipient_re().is_ok(),
+            "hardcoded assistant_recipient_re must compile"
+        );
+        assert!(recipient_attr_re().is_ok(), "hardcoded recipient_attr_re must compile");
+        assert!(
+            complete_tool_syntax().is_ok(),
+            "hardcoded complete_tool_syntax must compile"
+        );
+        assert!(md_tool_call_re().is_ok(), "hardcoded md_tool_call_re must compile");
+    }
+
+    #[test]
+    fn parser_pattern_error_is_typed() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        assert!(
+            matches!(
+                parser_pattern::<&Regex>(Err(&ERROR)),
+                Err(ToolCallParseError::Pattern(_))
+            ),
+            "broken parser pattern must propagate a typed error"
+        );
+    }
+}

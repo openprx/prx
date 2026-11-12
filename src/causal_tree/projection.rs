@@ -684,7 +684,9 @@ mod tests {
             },
         );
         turn.derived = derived(vec![item.clone()]);
-        let unknown_fingerprint = turn.material_fingerprint(&key);
+        let unknown_fingerprint = turn
+            .material_fingerprint(&key)
+            .expect("test: canonical state serializes");
         for (effective, expected) in [(None, "required"), (Some(true), "required"), (Some(false), "none")] {
             item.effective_approval_required = effective;
             turn.derived = derived(vec![item.clone()]);
@@ -696,7 +698,11 @@ mod tests {
                 ApprovalRequirement::Required { .. }
             ));
             if effective.is_some() {
-                assert_ne!(turn.material_fingerprint(&key), unknown_fingerprint);
+                assert_ne!(
+                    turn.material_fingerprint(&key)
+                        .expect("test: canonical state serializes"),
+                    unknown_fingerprint
+                );
             }
         }
     }

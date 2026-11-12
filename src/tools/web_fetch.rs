@@ -5,23 +5,32 @@ use serde_json::json;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-#[allow(clippy::expect_used)]
-static RE_SCRIPT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?si)<script[^>]*>.*?</script>").expect("BUG: invalid hardcoded script tag regex"));
-#[allow(clippy::expect_used)]
-static RE_STYLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?si)<style[^>]*>.*?</style>").expect("BUG: invalid hardcoded style tag regex"));
-#[allow(clippy::expect_used)]
-static RE_HEAD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?si)<head[^>]*>.*?</head>").expect("BUG: invalid hardcoded head tag regex"));
-#[allow(clippy::expect_used)]
-static RE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>")
-        .expect("BUG: invalid hardcoded block element regex")
-});
-#[allow(clippy::expect_used)]
-static RE_TAGS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("BUG: invalid hardcoded strip-tags regex"));
+static RE_SCRIPT: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"(?si)<script[^>]*>.*?</script>"));
+fn re_script() -> Result<&'static Regex, &'static regex::Error> {
+    RE_SCRIPT.as_ref()
+}
+
+static RE_STYLE: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(r"(?si)<style[^>]*>.*?</style>"));
+fn re_style() -> Result<&'static Regex, &'static regex::Error> {
+    RE_STYLE.as_ref()
+}
+
+static RE_HEAD: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(r"(?si)<head[^>]*>.*?</head>"));
+fn re_head() -> Result<&'static Regex, &'static regex::Error> {
+    RE_HEAD.as_ref()
+}
+
+static RE_BLOCK: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"(?i)<(br\s*/?|p|div|h[1-6]|li|tr|article|section|header|footer)[^>]*>"));
+fn re_block() -> Result<&'static Regex, &'static regex::Error> {
+    RE_BLOCK.as_ref()
+}
+
+static RE_TAGS: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| Regex::new(r"<[^>]+>"));
+fn re_tags() -> Result<&'static Regex, &'static regex::Error> {
+    RE_TAGS.as_ref()
+}
 
 /// Web fetch tool — fetches a URL and returns clean readable text.
 pub struct WebFetchTool {
@@ -40,19 +49,28 @@ impl WebFetchTool {
     }
 
     /// Convert HTML to plain readable text by stripping tags and decoding entities.
-    fn html_to_text(html: &str) -> String {
+    fn html_to_text(html: &str) -> Result<String, &'static regex::Error> {
+        Self::html_to_text_with_patterns(html, [re_script(), re_style(), re_head(), re_block(), re_tags()])
+    }
+
+    fn html_to_text_with_patterns(
+        html: &str,
+        patterns: [Result<&Regex, &'static regex::Error>; 5],
+    ) -> Result<String, &'static regex::Error> {
+        let [script, style, head, block, tags] = patterns;
+
         // Remove script/style/head blocks (case-insensitive, multiline).
         // Rust's regex crate does not support backreferences, so use three
         // separate patterns instead of the combined `(?si)<(script|style|head)[^>]*>.*?</\1>`.
-        let text = RE_SCRIPT.replace_all(html, "");
-        let text = RE_STYLE.replace_all(&text, "");
-        let text = RE_HEAD.replace_all(&text, "");
+        let text = script?.replace_all(html, "");
+        let text = style?.replace_all(&text, "");
+        let text = head?.replace_all(&text, "");
 
         // Replace block-level elements with newlines so paragraphs separate cleanly
-        let text = RE_BLOCK.replace_all(&text, "\n");
+        let text = block?.replace_all(&text, "\n");
 
         // Strip all remaining tags
-        let text = RE_TAGS.replace_all(&text, "");
+        let text = tags?.replace_all(&text, "");
 
         // Decode common HTML entities
         let text = text
@@ -73,11 +91,12 @@ impl WebFetchTool {
             .replace("&rsquo;", "\u{2019}");
 
         // Collapse whitespace: trim each line and drop blank lines
-        text.lines()
+        Ok(text
+            .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"))
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -238,7 +257,16 @@ impl Tool for WebFetchTool {
             .map_err(|e| anyhow::anyhow!("Failed to read response body from {}: {}", url, e))?;
 
         let output = if is_html || body.trim_start().starts_with('<') {
-            Self::html_to_text(&body)
+            match Self::html_to_text(&body) {
+                Ok(text) => text,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("HTML pattern unavailable: {error}")),
+                    });
+                }
+            }
         } else {
             // Plain text / JSON / XML — return as-is
             body
@@ -429,7 +457,7 @@ mod tests {
     #[test]
     fn test_html_to_text_basic() {
         let html = "<html><body><h1>Hello</h1><p>World</p></body></html>";
-        let text = WebFetchTool::html_to_text(html);
+        let text = WebFetchTool::html_to_text(html).expect("test: HTML patterns compile");
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
         assert!(!text.contains('<'));
@@ -439,7 +467,7 @@ mod tests {
     #[test]
     fn test_html_to_text_strips_scripts() {
         let html = "<html><head><script>var x = 1;</script></head><body>Content</body></html>";
-        let text = WebFetchTool::html_to_text(html);
+        let text = WebFetchTool::html_to_text(html).expect("test: HTML patterns compile");
         assert!(!text.contains("var x"));
         assert!(text.contains("Content"));
     }
@@ -447,7 +475,7 @@ mod tests {
     #[test]
     fn test_html_to_text_strips_styles() {
         let html = "<html><head><style>body { color: red; }</style></head><body>Text</body></html>";
-        let text = WebFetchTool::html_to_text(html);
+        let text = WebFetchTool::html_to_text(html).expect("test: HTML patterns compile");
         assert!(!text.contains("color"));
         assert!(text.contains("Text"));
     }
@@ -455,14 +483,14 @@ mod tests {
     #[test]
     fn test_html_to_text_decodes_entities() {
         let html = "<p>1 &lt; 2 &amp; 3 &gt; 0 &quot;quoted&quot; it&#39;s</p>";
-        let text = WebFetchTool::html_to_text(html);
+        let text = WebFetchTool::html_to_text(html).expect("test: HTML patterns compile");
         assert!(text.contains("1 < 2 & 3 > 0 \"quoted\" it's"), "got: {text}");
     }
 
     #[test]
     fn test_html_to_text_collapses_whitespace() {
         let html = "<p>   lots   of   space   </p>";
-        let text = WebFetchTool::html_to_text(html);
+        let text = WebFetchTool::html_to_text(html).expect("test: HTML patterns compile");
         // After trim, no leading/trailing whitespace per line
         for line in text.lines() {
             assert_eq!(line, line.trim());
@@ -560,5 +588,29 @@ mod tests {
     fn hostname_checks_use_the_test_resolver_and_never_the_network() {
         assert!(is_private_or_local_host("rebind.test"));
         assert!(!is_private_or_local_host("example.com"));
+    }
+
+    #[test]
+    fn web_fetch_hardcoded_patterns_compile() {
+        assert!(re_script().is_ok(), "hardcoded re_script must compile");
+        assert!(re_style().is_ok(), "hardcoded re_style must compile");
+        assert!(re_head().is_ok(), "hardcoded re_head must compile");
+        assert!(re_block().is_ok(), "hardcoded re_block must compile");
+        assert!(re_tags().is_ok(), "hardcoded re_tags must compile");
+    }
+
+    #[test]
+    fn html_conversion_propagates_each_pattern_error() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        const PATTERNS: usize = 5;
+        for index in 0..PATTERNS {
+            let mut patterns = [re_script(), re_style(), re_head(), re_block(), re_tags()];
+            *patterns.get_mut(index).expect("test: bounded pattern index") = Err(&ERROR);
+            assert!(
+                WebFetchTool::html_to_text_with_patterns("<script>private</script>", patterns).is_err(),
+                "broken HTML pattern must reject unprocessed output"
+            );
+        }
     }
 }

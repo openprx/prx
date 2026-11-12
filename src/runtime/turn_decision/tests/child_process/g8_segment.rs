@@ -685,12 +685,14 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
                 .context
                 .engine
                 .state
-                .material_fingerprint(&child_service.state_key),
+                .material_fingerprint(&child_service.state_key)
+                .expect("test: canonical state serializes"),
             routing
                 .context
                 .engine
                 .state
-                .record_fingerprint(&child_service.state_key),
+                .record_fingerprint(&child_service.state_key)
+                .expect("test: canonical state serializes"),
         ];
         assert!(
             routing
@@ -706,8 +708,12 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         assert_eq!(
             original,
             [
-                no_facts.material_fingerprint(&child_service.state_key),
-                no_facts.record_fingerprint(&child_service.state_key)
+                no_facts
+                    .material_fingerprint(&child_service.state_key)
+                    .expect("test: canonical state serializes"),
+                no_facts
+                    .record_fingerprint(&child_service.state_key)
+                    .expect("test: canonical state serializes")
             ]
         );
         let legacy =

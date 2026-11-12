@@ -7,10 +7,12 @@
 // inner attributes or module docs.
 //
 // The rule, in one place:
-// - a file whose first line of code is exactly `#![cfg(test)]` is test code
+// - a file whose first attribute requires `test` (`#![cfg(test)]` or
+//   `#![cfg(all(test, ...))]`) is test code
 //   (`is_test_only_file`);
 // - otherwise every item, field, parameter, argument, match arm or statement
-//   that carries `#[cfg(test)]` is test code, and its extent is computed on
+//   that carries a cfg requiring `test` is test code (not `any(test, ...)`),
+//   and its extent is computed on
 //   text whose comments and literals are blanked, so no bracket inside a
 //   string, char literal or comment can move it (`cfg_test_ranges`);
 // - the stripped text keeps every character position and line of the input:
@@ -161,21 +163,42 @@ fn blank_comments_and_literals_uncached(source: &str) -> String {
     }
     output.into_iter().collect()
 }
-/// Is this whole file test code?
-///
-/// True when the file's first line of code (blank lines and comments,
-/// including `//!` module docs and nested block comments, skipped) is exactly
-/// `#![cfg(test)]`. That inner attribute is enforced by the compiler: outside
-/// `cfg(test)` the module the file defines is empty. It is a marker the file
-/// carries, not a path or directory exemption. Any other first line, a marker
-/// after the first item, or a composite predicate such as
-/// `#![cfg(any(test, feature = "x"))]` leaves the file production code.
+/// Whether a predicate requires the test configuration in every case.
+fn requires_test(predicate: &str) -> bool {
+    if predicate == "test" { return true; }
+    let Some(inner) = predicate.strip_prefix("all(").and_then(|s| s.strip_suffix(')')) else { return false; };
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                if requires_test(&inner[start..index]) { return true; }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    requires_test(&inner[start..])
+}
+
+fn test_cfg_attribute(masked: &[char], index: usize, inner: bool) -> Option<usize> {
+    let bracket = index + if inner { 2 } else { 1 };
+    if masked.get(index) != Some(&'#') || (inner && masked.get(index + 1) != Some(&'!')) || masked.get(bracket) != Some(&'[') { return None; }
+    let end = close_of_group(masked, bracket);
+    let compact: String = masked.get(bracket + 1..end.checked_sub(1)?)?.iter().filter(|c| !c.is_whitespace()).collect();
+    let predicate = compact.strip_prefix("cfg(")?.strip_suffix(')')?;
+    requires_test(predicate).then_some(end)
+}
+
+/// Whether the file's first attribute requires `test`: `cfg(test)` or an
+/// `all(...)` with a test-requiring member. Comments and module docs are
+/// ignored. A late marker or `any(test, ...)` leaves the file production code.
 pub(crate) fn is_test_only_file(source: &str) -> bool {
-    blank_comments_and_literals(source)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        == Some("#![cfg(test)]")
+    let masked: Vec<char> = blank_comments_and_literals(source).chars().collect();
+    let start = masked.iter().position(|c| !c.is_whitespace()).unwrap_or(masked.len());
+    test_cfg_attribute(&masked, start, true).is_some()
 }
 
 /// One `#[cfg(test)]`-attributed piece of source: character range
@@ -320,17 +343,15 @@ fn cfg_test_item_end(masked: &[char], from: usize, shape: CfgTestShape) -> usize
 /// comment or string is not one, and no bracket inside a literal or comment
 /// can stretch or cut an extent.
 pub(crate) fn cfg_test_ranges(source: &str) -> Vec<CfgTestRange> {
-    const ATTRIBUTE: [char; 12] = ['#', '[', 'c', 'f', 'g', '(', 't', 'e', 's', 't', ')', ']'];
     let masked: Vec<char> = blank_comments_and_literals(source).chars().collect();
     let mut ranges = Vec::new();
     let mut index = 0usize;
-    while index + ATTRIBUTE.len() <= masked.len() {
-        if masked[index..index + ATTRIBUTE.len()] != ATTRIBUTE {
+    while index < masked.len() {
+        let Some(mut cursor) = test_cfg_attribute(&masked, index, false) else {
             index += 1;
             continue;
-        }
+        };
         let start = index;
-        let mut cursor = index + ATTRIBUTE.len();
         loop {
             while cursor < masked.len() && masked[cursor].is_whitespace() {
                 cursor += 1;

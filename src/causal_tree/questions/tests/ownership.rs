@@ -219,7 +219,9 @@ fn original_compile(
         state: projection.clone(),
         questions,
         model: policy.model.map(str::to_string),
-        state_fingerprint: state.material_fingerprint(policy.key),
+        state_fingerprint: state
+            .material_fingerprint(policy.key)
+            .expect("test: canonical state serializes"),
         candidate_set_hash,
         policy_version: Arc::clone(&trusted.policy_version),
         catalog_generation: trusted.catalog_generation.to_hex(),

@@ -301,7 +301,9 @@ fn component_request(
     assert_eq!(request.manifest().state_fingerprint(), trace.state_fingerprint);
     assert_eq!(
         trace.state_fingerprint,
-        hop.state.material_fingerprint(&service.state_key)
+        hop.state
+            .material_fingerprint(&service.state_key)
+            .expect("test: canonical state serializes")
     );
     assert_eq!(request.manifest().policy_version().as_ref(), trace.policy_version);
     assert_eq!(request.manifest().catalog_generation(), trace.catalog_generation);
@@ -744,7 +746,7 @@ fn capture_expected(
             }
         }
         raw_bindings.push(json!({"index":index,"decision_id":hop.decision_id.to_string(),
-            "catalog_generation":catalog.generation().to_hex(),"state_fingerprint":hop.state.material_fingerprint(&service.state_key),
+            "catalog_generation":catalog.generation().to_hex(),"state_fingerprint":hop.state.material_fingerprint(&service.state_key).expect("test: canonical state serializes"),
             "policy_version":service.policy_version.as_ref(),
             "refs":admitted.iter().map(|c|json!({"candidate_id":c.candidate_id().as_str(),
                 "refs":c.required_capabilities().iter().map(|r|json!({"id":r.id.as_str(),"generation":r.generation.to_hex(),
@@ -918,7 +920,12 @@ fn capture_expected(
             proof.owner_id(),
             &hop.decision_id.to_string(),
         );
-        assert_eq!(stored.0, hop.state.material_fingerprint(&service.state_key));
+        assert_eq!(
+            stored.0,
+            hop.state
+                .material_fingerprint(&service.state_key)
+                .expect("test: canonical state serializes")
+        );
         assert_eq!(stored.1, catalog.generation().to_hex());
         assert_eq!(
             stored.2,

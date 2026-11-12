@@ -1948,7 +1948,7 @@ impl Channel for WacliChannel {
         // without markers keeps the plain `wacli send text` path, and anything
         // that cannot be attached falls back to the literal marker text so no
         // information is lost.
-        let (clean_text, media) = extract_outgoing_media(&message.content);
+        let (clean_text, media) = extract_outgoing_media(&message.content)?;
         if media.is_empty() {
             return self.send_text(&message.recipient, &message.content).await;
         }

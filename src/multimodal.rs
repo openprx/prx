@@ -731,7 +731,10 @@ mod tests {
         }
         assert!(out.contains("/tmp/a.png") && out.contains("/tmp/e.ogg"));
         assert!(
-            crate::channels::traits::extract_outgoing_media(&out).1.is_empty(),
+            crate::channels::traits::extract_outgoing_media(&out)
+                .expect("test: media extraction")
+                .1
+                .is_empty(),
             "expected an empty value"
         );
         assert!(parse_image_markers(&out).1.is_empty(), "expected an empty value");

@@ -295,3 +295,8 @@ an empty list admits nobody, and `*` is an explicit wildcard. The host supplies
 channel identity and timestamps. Standard inbound processing and outbound policy
 still apply. Existing channel proxies follow atomic plugin reloads; adding a
 new channel name requires restarting the channel supervisor.
+
+### Outgoing media pattern failures
+
+Outgoing media extraction returns an error if its built-in pattern cannot compile.
+Channel delivery stops on that error so raw media markers are never sent as a fallback.

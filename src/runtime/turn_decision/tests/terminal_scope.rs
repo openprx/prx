@@ -435,7 +435,10 @@ async fn linked_finalizer_rejects_changed_or_double_encoded_persisted_fingerprin
             let hop = fixture.context.audit_hops().next().expect("actual issued hop");
             let decision_id = hop.decision_id.to_string();
             let owner = fixture.proof.owner_id().to_owned();
-            let expected = hop.state.material_fingerprint(&fixture.service.state_key);
+            let expected = hop
+                .state
+                .material_fingerprint(&fixture.service.state_key)
+                .expect("test: canonical state serializes");
             let connection = rusqlite::Connection::open(fixture.workspace.path().join("self/causal_tree/decisions.db"))
                 .expect("actual decision store");
             let stored: String = connection

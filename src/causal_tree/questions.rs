@@ -103,6 +103,8 @@ impl CompiledQuestionRequest {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompileError {
+    #[error("state fingerprint serialization failed")]
+    Fingerprint(#[from] serde_json::Error),
     #[error("a NoLegalPath has no decision request")]
     NoLegalPath,
     #[error("state candidates differ from the admitted candidate set")]
@@ -331,7 +333,7 @@ impl QuestionCompiler {
             state: projection,
             questions,
             model: policy.model.map(str::to_string),
-            state_fingerprint: state.material_fingerprint(policy.key),
+            state_fingerprint: state.material_fingerprint(policy.key)?,
             candidate_set_hash,
             policy_version: Arc::clone(&trusted.policy_version),
             catalog_generation: trusted.catalog_generation.to_hex(),

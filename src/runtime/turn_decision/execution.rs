@@ -893,9 +893,10 @@ impl TurnDecisionService {
             matches!(&context.directive, TurnExecutionDirective::CollectApprovalArguments(issued) if issued == collection),
             "collection directive differs from its selected proof"
         );
+        let state_fingerprint = context.engine.state.material_fingerprint(&self.state_key)?;
         anyhow::ensure!(
             proof.approval_review_adapter() == Some(collection.adapter())
-                && collection.state_fingerprint() == context.engine.state.material_fingerprint(&self.state_key)
+                && collection.state_fingerprint() == state_fingerprint
                 && collection.capability().generation == catalog.generation()
                 && !context.execution_closed.load(std::sync::atomic::Ordering::Acquire)
                 && context.execution_refs.is_empty(),

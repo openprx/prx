@@ -47,14 +47,13 @@ use crate::tools::Tool;
 ///
 /// The regex matches bytes (not chars) because all three sentinel
 /// characters are pure ASCII and a byte scan is the fastest possible test.
-#[allow(clippy::expect_used)]
-static PREFILTER: LazyLock<Regex> = LazyLock::new(|| {
-    // The pattern is a compile-time constant character class. A failure
-    // here is a programming error and would surface at first use, not in
-    // production — `expect` is the documented convention in this crate
-    // (see `tools/web_fetch.rs`, `memory/principal.rs`, …).
-    Regex::new(r"[<\{\[]").expect("BUG: invalid hardcoded sanitize prefilter regex")
+static PREFILTER: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
+    // A broken prefilter disables only the fast path; full scrubbers still run.
+    Regex::new(r"[<\{\[]")
 });
+fn prefilter() -> Result<&'static Regex, &'static regex::Error> {
+    PREFILTER.as_ref()
+}
 
 /// Lower-case names of every registered tool. Used by the scrubbers to
 /// decide whether a JSON object that mentions a `name` / `function.name`
@@ -76,13 +75,21 @@ pub(crate) fn known_tool_names(tools: &[Box<dyn Tool>]) -> HashSet<String> {
 /// [`crate::channels::sanitize_channel_response`]: callers should invoke
 /// it on every flushed chunk before forwarding it to the channel sender.
 pub(crate) fn sanitize_stream_chunk<'a>(input: &'a str, known_tool_names: &HashSet<String>) -> Cow<'a, str> {
+    sanitize_stream_chunk_with_pattern(input, known_tool_names, prefilter())
+}
+
+fn sanitize_stream_chunk_with_pattern<'a>(
+    input: &'a str,
+    known_tool_names: &HashSet<String>,
+    pattern: Result<&Regex, &regex::Error>,
+) -> Cow<'a, str> {
     // Fast path 1: empty input — nothing to do.
     if input.is_empty() {
         return Cow::Borrowed(input);
     }
 
     // Fast path 2: no `<`, `{`, or `[` in the chunk — no artifact possible.
-    if !PREFILTER.is_match(input.as_bytes()) {
+    if prefilter_is_clean(input, pattern) {
         return Cow::Borrowed(input);
     }
 
@@ -112,6 +119,19 @@ pub(crate) fn sanitize_stream_chunk<'a>(input: &'a str, known_tool_names: &HashS
         Cow::Borrowed(input)
     } else {
         Cow::Owned(cleaned)
+    }
+}
+
+fn prefilter_is_clean(input: &str, pattern: Result<&Regex, &regex::Error>) -> bool {
+    match pattern {
+        Ok(pattern) => !pattern.is_match(input.as_bytes()),
+        Err(_) => {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::error!("sanitize prefilter unavailable");
+            }
+            false
+        }
     }
 }
 
@@ -316,6 +336,32 @@ mod tests {
         assert!(
             matches!(result, Cow::Borrowed(_)),
             "a CRLF chunk must short-circuit to Borrowed"
+        );
+    }
+
+    #[test]
+    fn sanitize_hardcoded_patterns_compile() {
+        assert!(prefilter().is_ok(), "hardcoded prefilter must compile");
+    }
+
+    #[test]
+    fn unavailable_prefilter_runs_scrubbers() {
+        let error = regex::Error::Syntax("test: injected pattern failure".to_string());
+        let tools = names(&["shell"]);
+        let input = "<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>";
+        assert!(
+            !prefilter_is_clean(input, Err(&error)),
+            "broken prefilter must disable the fast path"
+        );
+        assert_eq!(
+            sanitize_stream_chunk_with_pattern(input, &tools, Err(&error)),
+            sanitize_stream_chunk(input, &tools),
+            "broken prefilter must still scrub artifacts"
+        );
+        assert_ne!(
+            sanitize_stream_chunk_with_pattern(input, &tools, Err(&error)).as_ref(),
+            input,
+            "test input must exercise actual removal"
         );
     }
 }

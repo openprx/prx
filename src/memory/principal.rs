@@ -812,13 +812,8 @@ pub fn principal_from_policy(
 }
 
 pub fn classify_memory(ctx: &MemoryWriteContext, content: &str, principal: &Principal) -> MemoryClassification {
-    let mut risk_signals = Vec::new();
-    if matches_sensitive_patterns(content) {
-        risk_signals.push("sensitive_keyword_match".to_string());
-    }
-    if contains_pii(content) {
-        risk_signals.push("pii_detected".to_string());
-    }
+    let risk_signals =
+        classification_risk_signals(content, sensitive_patterns().map(Vec::as_slice), email_re(), ipv4_re());
 
     let chat_type = ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm);
 
@@ -850,17 +845,71 @@ pub fn classify_memory(ctx: &MemoryWriteContext, content: &str, principal: &Prin
     }
 }
 
-pub fn matches_sensitive_patterns(content: &str) -> bool {
-    let normalized = content.nfkc().collect::<String>().to_lowercase();
-    let no_space = normalized.replace(' ', "");
-
-    SENSITIVE_PATTERNS
-        .iter()
-        .any(|re| re.is_match(&normalized) || re.is_match(&no_space))
+fn classification_risk_signals(
+    content: &str,
+    patterns: std::result::Result<&[Regex], &regex::Error>,
+    email: std::result::Result<&Regex, &regex::Error>,
+    ip: std::result::Result<&Regex, &regex::Error>,
+) -> Vec<String> {
+    if patterns.is_err() || email.is_err() || ip.is_err() {
+        return vec!["pattern_unavailable".to_string()];
+    }
+    let mut signals = Vec::new();
+    if sensitive_patterns_or_closed(content, patterns) {
+        signals.push("sensitive_keyword_match".to_string());
+    }
+    if contains_pii(content, email, ip) {
+        signals.push("pii_detected".to_string());
+    }
+    signals
 }
 
-fn contains_pii(content: &str) -> bool {
-    EMAIL_RE.is_match(content) || IPV4_RE.is_match(content)
+pub fn matches_sensitive_patterns(content: &str) -> bool {
+    sensitive_patterns_or_closed(content, sensitive_patterns().map(Vec::as_slice))
+}
+
+fn sensitive_patterns_or_closed(content: &str, patterns: std::result::Result<&[Regex], &regex::Error>) -> bool {
+    sensitive_match(content, patterns).unwrap_or(true)
+}
+
+fn sensitive_match<'a>(
+    content: &str,
+    patterns: std::result::Result<&[Regex], &'a regex::Error>,
+) -> std::result::Result<bool, &'a regex::Error> {
+    let patterns = patterns?;
+    let normalized = content.nfkc().collect::<String>().to_lowercase();
+    let no_space = normalized.replace(' ', "");
+    Ok(patterns
+        .iter()
+        .any(|re| re.is_match(&normalized) || re.is_match(&no_space)))
+}
+
+fn contains_pii(
+    content: &str,
+    email: std::result::Result<&Regex, &regex::Error>,
+    ip: std::result::Result<&Regex, &regex::Error>,
+) -> bool {
+    pii_match(content, email, ip).unwrap_or(true)
+}
+
+fn pii_match<'a>(
+    content: &str,
+    email: std::result::Result<&Regex, &'a regex::Error>,
+    ip: std::result::Result<&Regex, &'a regex::Error>,
+) -> std::result::Result<bool, &'a regex::Error> {
+    let email = email?;
+    let ip = ip?;
+    Ok(email.is_match(content) || ip.is_match(content))
+}
+
+fn principal_pattern<'a, T>(
+    pattern: &'a std::result::Result<T, regex::Error>,
+    logged: &std::sync::atomic::AtomicBool,
+) -> std::result::Result<&'a T, &'a regex::Error> {
+    if pattern.is_err() && !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("principal pattern unavailable");
+    }
+    pattern.as_ref()
 }
 
 fn parse_json_array(raw: &str) -> Vec<String> {
@@ -910,29 +959,37 @@ const fn is_acl_enforced_for_role(role: &Role) -> bool {
     }
 }
 
-#[allow(clippy::expect_used)]
-static SENSITIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"\bssh\b").expect("compile regex: ssh keyword"),
-        Regex::new(r"\bapi[_-]?key\b").expect("compile regex: api key keyword"),
-        Regex::new(r"\bcredential(s)?\b").expect("compile regex: credential keyword"),
-        Regex::new(r"\bpassw(or)?d\b").expect("compile regex: password keyword"),
-        Regex::new(r"\btok(en)?\b").expect("compile regex: token keyword"),
-        Regex::new(r"\bsecret\b").expect("compile regex: secret keyword"),
-        Regex::new(r"im-ops|\bserver\s+address\b|\bhost(name)?\s+address\b")
-            .expect("compile regex: server address keywords"),
-        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"),
-        Regex::new(r"\bprivate[_\s]?key\b").expect("compile regex: private key keyword"),
-    ]
+static SENSITIVE_PATTERNS: LazyLock<std::result::Result<Vec<Regex>, regex::Error>> = LazyLock::new(|| {
+    Ok(vec![
+        Regex::new(r"\bssh\b")?,
+        Regex::new(r"\bapi[_-]?key\b")?,
+        Regex::new(r"\bcredential(s)?\b")?,
+        Regex::new(r"\bpassw(or)?d\b")?,
+        Regex::new(r"\btok(en)?\b")?,
+        Regex::new(r"\bsecret\b")?,
+        Regex::new(r"im-ops|\bserver\s+address\b|\bhost(name)?\s+address\b")?,
+        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")?,
+        Regex::new(r"\bprivate[_\s]?key\b")?,
+    ])
 });
 
-#[allow(clippy::expect_used)]
-static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("compile regex: email address pattern")
-});
-#[allow(clippy::expect_used)]
-static IPV4_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").expect("compile regex: IPv4 address pattern"));
+static EMAIL_RE: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"));
+static IPV4_RE: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"));
+
+fn sensitive_patterns() -> std::result::Result<&'static Vec<Regex>, &'static regex::Error> {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    principal_pattern(&SENSITIVE_PATTERNS, &LOGGED)
+}
+fn email_re() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    principal_pattern(&EMAIL_RE, &LOGGED)
+}
+fn ipv4_re() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    principal_pattern(&IPV4_RE, &LOGGED)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1957,6 +2014,49 @@ AND tp.user_id = $11\
         assert_eq!(SYSTEM_PRINCIPAL_IDS.len(), 4);
         for name in ["owner:alice", "anonymous:signal:bob", "user", "", "System", "ROUTER"] {
             assert!(!is_system_principal(name), "{name} must not be a system principal");
+        }
+    }
+
+    #[test]
+    fn principal_hardcoded_patterns_compile() {
+        assert!(
+            sensitive_patterns().is_ok(),
+            "hardcoded sensitive_patterns must compile"
+        );
+        assert!(email_re().is_ok(), "hardcoded email_re must compile");
+        assert!(ipv4_re().is_ok(), "hardcoded ipv4_re must compile");
+    }
+
+    #[test]
+    fn sensitive_pattern_error_fails_closed() {
+        let error = regex::Error::Syntax("test: injected pattern failure".to_string());
+        assert!(
+            sensitive_patterns_or_closed("ordinary prose", Err(&error)),
+            "missing sensitive patterns must classify all content as sensitive"
+        );
+        assert!(
+            contains_pii("ordinary prose", Err(&error), ipv4_re()),
+            "missing email pattern must classify all content as PII"
+        );
+        assert!(
+            contains_pii("ordinary prose", email_re(), Err(&error)),
+            "missing IP pattern must classify all content as PII"
+        );
+    }
+    #[test]
+    fn classification_pattern_errors_have_a_distinct_reason() {
+        let error = regex::Error::Syntax("test: injected failure".to_string());
+        let patterns = sensitive_patterns().map(Vec::as_slice);
+        for signals in [
+            classification_risk_signals("ordinary prose", Err(&error), email_re(), ipv4_re()),
+            classification_risk_signals("ordinary prose", patterns, Err(&error), ipv4_re()),
+            classification_risk_signals("ordinary prose", patterns, email_re(), Err(&error)),
+        ] {
+            assert_eq!(
+                signals,
+                ["pattern_unavailable"],
+                "pattern failures must not invent sensitive-keyword or PII matches"
+            );
         }
     }
 }

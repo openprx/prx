@@ -146,9 +146,18 @@ mod tests {
     fn absent_observations_keep_legacy_canonical_and_present_facts_bind_both_fingerprints() {
         let key = super::super::fixtures::key();
         let mut state = super::super::fixtures::state(&key, "prx observation");
-        let original = [state.canonical(false), state.canonical(true)];
+        let original = [
+            state.canonical(false).expect("test: canonical state serializes"),
+            state.canonical(true).expect("test: canonical state serializes"),
+        ];
         state.observed = state.observed.clone().with_exact_call_observations(None);
-        assert_eq!([state.canonical(false), state.canonical(true)], original);
+        assert_eq!(
+            [
+                state.canonical(false).expect("test: canonical state serializes"),
+                state.canonical(true).expect("test: canonical state serializes")
+            ],
+            original
+        );
         for value in &original {
             assert!(!value.contains("exact_call_observations"));
         }
@@ -168,8 +177,12 @@ mod tests {
             .clone()
             .with_exact_call_observations(Some(Arc::new(facts.clone())));
         let before = [
-            state.material_fingerprint(&key),
-            state.record_fingerprint(&key),
+            state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            state
+                .record_fingerprint(&key)
+                .expect("test: canonical state serializes"),
             state.evidence_fingerprint(&key),
         ];
         let mut changed = facts;
@@ -179,10 +192,17 @@ mod tests {
             .clone()
             .with_exact_call_observations(Some(Arc::new(changed)));
         assert_ne!(
-            state.material_fingerprint(&key),
+            state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
             before.first().expect("material").as_str()
         );
-        assert_ne!(state.record_fingerprint(&key), before.get(1).expect("record").as_str());
+        assert_ne!(
+            state
+                .record_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            before.get(1).expect("record").as_str()
+        );
         assert_ne!(
             state.evidence_fingerprint(&key),
             before.get(2).expect("evidence").as_str()

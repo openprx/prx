@@ -1,13 +1,15 @@
 use crate::channels::activity::LivenessModel;
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-#[allow(clippy::expect_used)]
-static RE_OUTGOING_MEDIA: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]")
-        .expect("BUG: invalid hardcoded outgoing media tag regex")
-});
+static RE_OUTGOING_MEDIA: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]"));
+
+fn re_outgoing_media() -> Result<&'static Regex, &'static regex::Error> {
+    RE_OUTGOING_MEDIA.as_ref()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -315,23 +317,33 @@ pub struct ChannelCapabilities {
 /// strips them out and returns both the cleaned text and the list of
 /// `(marker_type, file_path)` pairs so each channel can attach the files.
 ///
+/// # Errors
+/// Returns the pattern error if the built-in media matcher cannot compile.
+/// Callers must stop delivery rather than send unprocessed media markers.
+///
 /// # Example
 /// ```
 /// use openprx::channels::traits::extract_outgoing_media;
-/// let (text, media) = extract_outgoing_media("Here you go [IMAGE:/tmp/cat.png] enjoy!");
+/// let (text, media) = extract_outgoing_media("Here you go [IMAGE:/tmp/cat.png] enjoy!").expect("test: media pattern compiles");
 /// assert_eq!(text, "Here you go  enjoy!");
 /// assert_eq!(media, vec![("IMAGE".to_string(), "/tmp/cat.png".to_string())]);
 /// ```
-pub fn extract_outgoing_media(text: &str) -> (String, Vec<(String, String)>) {
+pub fn extract_outgoing_media(text: &str) -> Result<(String, Vec<(String, String)>), &'static regex::Error> {
+    extract_outgoing_media_with_pattern(text, re_outgoing_media())
+}
+fn extract_outgoing_media_with_pattern(
+    text: &str,
+    pattern: Result<&Regex, &'static regex::Error>,
+) -> Result<(String, Vec<(String, String)>), &'static regex::Error> {
     let mut media = Vec::new();
-    let clean = RE_OUTGOING_MEDIA
+    let clean = pattern?
         .replace_all(text, |caps: &regex::Captures| {
             media.push((caps[1].to_string(), caps[2].to_string()));
             String::new()
         })
         .trim()
         .to_string();
-    (clean, media)
+    Ok((clean, media))
 }
 
 /// Coarse media class an outgoing `[KIND:path]` marker claims.
@@ -568,5 +580,20 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[test]
+    fn traits_hardcoded_patterns_compile() {
+        assert!(re_outgoing_media().is_ok(), "hardcoded re_outgoing_media must compile");
+    }
+
+    #[test]
+    fn outgoing_media_propagates_pattern_error() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        assert!(
+            extract_outgoing_media_with_pattern("[IMAGE:example.png]", Err(&ERROR)).is_err(),
+            "broken media pattern must reject unprocessed output"
+        );
     }
 }

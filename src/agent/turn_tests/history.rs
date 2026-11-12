@@ -25,7 +25,7 @@ fn parse_tool_calls_extracts_multiple_calls() {
 {"name": "file_read", "arguments": {"path": "b.txt"}}
 </tool_call>"#;
 
-    let (_, calls) = parse_tool_calls(response);
+    let (_, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].name, "file_read");
     assert_eq!(calls[1].name, "file_read");
@@ -35,7 +35,7 @@ fn parse_tool_calls_extracts_multiple_calls() {
 fn parse_tool_calls_handles_openai_format_multiple_calls() {
     let response = r#"{"tool_calls": [{"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"a.txt\"}"}}, {"type": "function", "function": {"name": "file_read", "arguments": "{\"path\": \"b.txt\"}"}}]}"#;
 
-    let (_, calls) = parse_tool_calls(response);
+    let (_, calls) = parse_tool_calls(response).expect("test: parser patterns compile");
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].name, "file_read");
     assert_eq!(calls[1].name, "file_read");

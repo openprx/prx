@@ -503,8 +503,7 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
         scanned += 1;
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
         for (root, named) in crate_rooted_paths(&production, relative == "src/causal_tree/mod.rs") {
-            // From a module nested inside a causal file (a test module under
-            // `cfg(all(test, ..))`, which the scan keeps), `super::super::`
+            // From a module nested inside a causal file (an ordinary nested module), `super::super::`
             // is the causal domain itself, not the crate root. Only such a
             // relative path is read that way; `crate::<name>` never is
             // (D-066 N-5).

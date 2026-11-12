@@ -1981,3 +1981,9 @@ backend binding or schema, or availability below Configured, returns
 reject a different execution provider/model. Models without verified native tool
 support, and sources with tool calls disabled, receive an empty tool surface.
 This check prevents a model from invoking a withheld tool by guessing its name.
+
+### Built-in pattern failures
+
+If a built-in HTML or search-result pattern cannot compile, web tools return an
+error instead of returning unprocessed page content. Memory privacy checks fail
+closed when a detector is unavailable and report `pii pattern unavailable`.

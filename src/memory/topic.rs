@@ -370,7 +370,7 @@ pub fn resolve_topic(
     }
 
     let project = infer_project(content);
-    let external_id = extract_external_ref(content);
+    let external_id = extract_external_ref(content)?;
 
     if let Some(external_id) = external_id.as_deref() {
         let maybe_topic = find_topic_by_project_and_external(conn, project.as_deref(), external_id)?;
@@ -457,15 +457,24 @@ pub fn infer_project(content: &str) -> Option<String> {
     None
 }
 
-fn extract_external_ref(content: &str) -> Option<String> {
-    EXTERNAL_URL_RE
+fn extract_external_ref(content: &str) -> Result<Option<String>> {
+    Ok(extract_external_ref_with_patterns(
+        content,
+        external_url_re(),
+        external_ticket_re(),
+    )?)
+}
+fn extract_external_ref_with_patterns(
+    content: &str,
+    url: std::result::Result<&Regex, &'static regex::Error>,
+    ticket: std::result::Result<&Regex, &'static regex::Error>,
+) -> std::result::Result<Option<String>, &'static regex::Error> {
+    let url = url?;
+    let ticket = ticket?;
+    Ok(url
         .find(content)
-        .map(|m| m.as_str().trim().to_lowercase())
-        .or_else(|| {
-            EXTERNAL_TICKET_RE
-                .find(content)
-                .map(|m| m.as_str().trim().to_lowercase())
-        })
+        .or_else(|| ticket.find(content))
+        .map(|m| m.as_str().trim().to_lowercase()))
 }
 
 pub(crate) fn build_safe_fts_query(query: &str) -> String {
@@ -536,13 +545,17 @@ fn map_topic(row: &rusqlite::Row<'_>) -> rusqlite::Result<Topic> {
     })
 }
 
-#[allow(clippy::expect_used)]
-static EXTERNAL_URL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"https?://[^\s]+/(pull|issues)/\d+").expect("external url regex must compile"));
-#[allow(clippy::expect_used)]
-static EXTERNAL_TICKET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b").expect("external id regex must compile")
-});
+static EXTERNAL_URL_RE: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s]+/(pull|issues)/\d+"));
+fn external_url_re() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    EXTERNAL_URL_RE.as_ref()
+}
+
+static EXTERNAL_TICKET_RE: LazyLock<std::result::Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(openpr|pr|issue|mr|ticket)[#:\-\s]*\d+\b"));
+fn external_ticket_re() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    EXTERNAL_TICKET_RE.as_ref()
+}
 static TASK_WORDS: [&str; 12] = [
     "bug",
     "fix",
@@ -916,5 +929,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp.as_deref(), Some(S), "participant inherits the topic stamp");
+    }
+
+    #[test]
+    fn topic_hardcoded_patterns_compile() {
+        assert!(external_url_re().is_ok(), "hardcoded external_url_re must compile");
+        assert!(
+            external_ticket_re().is_ok(),
+            "hardcoded external_ticket_re must compile"
+        );
+    }
+
+    #[test]
+    fn external_ref_propagates_each_pattern_error() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        assert!(
+            extract_external_ref_with_patterns("issue#42", Err(&ERROR), external_ticket_re()).is_err(),
+            "broken URL pattern must stop topic resolution"
+        );
+        assert!(
+            extract_external_ref_with_patterns("issue#42", external_url_re(), Err(&ERROR)).is_err(),
+            "broken ticket pattern must stop topic resolution"
+        );
     }
 }

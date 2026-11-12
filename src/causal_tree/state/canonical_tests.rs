@@ -83,14 +83,20 @@ fn canonical_fixture(key: &DecisionKey, size: u8) -> CausalState {
 fn assert_oracle(state: &CausalState, key: &DecisionKey) {
     for record in [false, true] {
         let expected = legacy_canonical(state, record);
-        assert_eq!(state.canonical(record), expected, "exact canonical bytes");
+        assert_eq!(
+            state.canonical(record).expect("test: canonical state serializes"),
+            expected,
+            "exact canonical bytes"
+        );
         let domain: &[u8] = if record { b"record" } else { b"material" };
         let digest = hex::encode(key.hmac(KeyDomain::StateFingerprint, &[domain, expected.as_bytes()]));
         assert_eq!(
             if record {
-                state.record_fingerprint(key)
+                state.record_fingerprint(key).expect("test: canonical state serializes")
             } else {
-                state.material_fingerprint(key)
+                state
+                    .material_fingerprint(key)
+                    .expect("test: canonical state serializes")
             },
             digest
         );
@@ -104,8 +110,22 @@ fn canonical_bytes_and_keyed_digests_match_independent_owned_oracle() {
     for size in [0, 1, 13] {
         let state = canonical_fixture(&key, size);
         assert_oracle(&state, &other_key);
-        assert_ne!(state.material_fingerprint(&key), state.material_fingerprint(&other_key));
-        assert_ne!(state.material_fingerprint(&key), state.record_fingerprint(&key));
+        assert_ne!(
+            state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            state
+                .material_fingerprint(&other_key)
+                .expect("test: canonical state serializes")
+        );
+        assert_ne!(
+            state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            state
+                .record_fingerprint(&key)
+                .expect("test: canonical state serializes")
+        );
         assert_oracle(&state, &key);
         let mut empty = state.clone();
         let mut trusted = empty.trusted.parts().clone();
@@ -189,8 +209,14 @@ fn canonical_bytes_and_keyed_digests_match_independent_owned_oracle() {
             candidates.reverse();
             reordered.derived = DerivedState::new(candidates).expect("same distinct candidates");
             assert_oracle(&reordered, &key);
-            assert_eq!(reordered.canonical(false), changed.canonical(false));
-            assert_eq!(reordered.canonical(true), changed.canonical(true));
+            assert_eq!(
+                reordered.canonical(false).expect("test: canonical state serializes"),
+                changed.canonical(false).expect("test: canonical state serializes")
+            );
+            assert_eq!(
+                reordered.canonical(true).expect("test: canonical state serializes"),
+                changed.canonical(true).expect("test: canonical state serializes")
+            );
         }
     }
 }
@@ -205,11 +231,13 @@ fn canonical_allocations_are_less_than_half_of_owned_oracle() {
         for record in [false, true] {
             for warm in [false, true] {
                 if warm {
-                    drop(state.canonical(record));
+                    drop(state.canonical(record).expect("test: canonical state serializes"));
                 }
                 let (expected, original) =
                     crate::decision::builtin::allocation_counter::count(|| legacy_canonical(&state, record));
-                let (actual, current) = crate::decision::builtin::allocation_counter::count(|| state.canonical(record));
+                let (actual, current) = crate::decision::builtin::allocation_counter::count(|| {
+                    state.canonical(record).expect("test: canonical state serializes")
+                });
                 assert_eq!(actual, expected);
                 println!(
                     "PRX_CANONICAL_ALLOCATION size={size} record={record} warm={warm} original={original} current={current}"
@@ -266,8 +294,11 @@ fn canonical_empty_state_matches_independent_lexical_golden() {
         ),
         1,
     );
-    assert_eq!(state.canonical(false), material);
-    assert_eq!(state.canonical(true), record);
+    assert_eq!(
+        state.canonical(false).expect("test: canonical state serializes"),
+        material
+    );
+    assert_eq!(state.canonical(true).expect("test: canonical state serializes"), record);
     assert_oracle(&state, &key);
 }
 
@@ -322,11 +353,21 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
     let mut reversed_steps = state.clone();
     reversed_steps.observed.completed_steps.reverse();
     assert_oracle(&reversed_steps, &key);
-    assert_ne!(state.canonical(false), reversed_steps.canonical(false));
+    assert_ne!(
+        state.canonical(false).expect("test: canonical state serializes"),
+        reversed_steps
+            .canonical(false)
+            .expect("test: canonical state serializes")
+    );
     let mut reversed_artifacts = state.clone();
     reversed_artifacts.observed.artifacts.reverse();
     assert_oracle(&reversed_artifacts, &key);
-    assert_ne!(state.canonical(false), reversed_artifacts.canonical(false));
+    assert_ne!(
+        state.canonical(false).expect("test: canonical state serializes"),
+        reversed_artifacts
+            .canonical(false)
+            .expect("test: canonical state serializes")
+    );
     let mut reversed_caps = state.clone();
     let changed = state
         .derived
@@ -355,7 +396,12 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
         .collect();
     reversed_caps.derived = DerivedState::new(changed).expect("same distinct candidate ids");
     assert_oracle(&reversed_caps, &key);
-    assert_ne!(state.canonical(false), reversed_caps.canonical(false));
+    assert_ne!(
+        state.canonical(false).expect("test: canonical state serializes"),
+        reversed_caps
+            .canonical(false)
+            .expect("test: canonical state serializes")
+    );
     let mut record_only = state.clone();
     record_only.built_at_ms += 1;
     record_only
@@ -369,8 +415,14 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
         .iter_mut()
         .for_each(|artifact| artifact.source_event_id = None);
     assert_oracle(&record_only, &key);
-    assert_eq!(state.canonical(false), record_only.canonical(false));
-    assert_ne!(state.canonical(true), record_only.canonical(true));
+    assert_eq!(
+        state.canonical(false).expect("test: canonical state serializes"),
+        record_only.canonical(false).expect("test: canonical state serializes")
+    );
+    assert_ne!(
+        state.canonical(true).expect("test: canonical state serializes"),
+        record_only.canonical(true).expect("test: canonical state serializes")
+    );
 }
 
 fn legacy_canonical(state: &CausalState, record: bool) -> String {
@@ -497,7 +549,10 @@ fn canonical_distinguishes_mixed_delivery_empty_optionals_and_maximum_hop() {
         trusted.owner_id = None;
         absent.trusted = TrustedState::from_runtime(trusted);
         assert_oracle(&absent, &key);
-        assert_ne!(changed.canonical(false), absent.canonical(false));
+        assert_ne!(
+            changed.canonical(false).expect("test: canonical state serializes"),
+            absent.canonical(false).expect("test: canonical state serializes")
+        );
     }
 }
 
@@ -528,7 +583,7 @@ fn model_admission_canonical_commits_only_digest_and_none_keeps_legacy_bytes() {
                 serde_json::to_value(policy.digest()).expect("fixed digest"),
             );
         assert_eq!(
-            state.canonical(record),
+            state.canonical(record).expect("test: canonical state serializes"),
             serde_json::to_string(&expected).expect("oracle canonical JSON")
         );
     }

@@ -103,39 +103,16 @@ impl MemorySafetyFilter {
 
     /// Run the complete safety pipeline before memory write.
     pub async fn check(&self, content: &str, source: &SourceMetadata) -> SafetyCheckResult {
-        let mut issues = Vec::new();
-        // Session snapshots contain system-generated UUIDs. Depending on their
-        // random digits, the phone detector could interpret a substring across
-        // UUID hyphens as a telephone number and reject an otherwise identical
-        // conversation nondeterministically. UUIDs are opaque internal
-        // identifiers, so exclude only their canonical shape from numeric PII
-        // detectors while continuing to inspect every user-authored field.
-        let numeric_pii_content = canonical_uuid_regex().replace_all(content, "<uuid>");
-
-        if pii_phone_regex().is_match(&numeric_pii_content) {
-            issues.push(SafetyIssue {
-                kind: SafetyIssueKind::Pii,
-                detail: "detected phone-like identifier".to_string(),
-            });
-        }
-        if pii_email_regex().is_match(content) {
-            issues.push(SafetyIssue {
-                kind: SafetyIssueKind::Pii,
-                detail: "detected email address".to_string(),
-            });
-        }
-        if pii_id_regex().is_match(&numeric_pii_content) {
-            issues.push(SafetyIssue {
-                kind: SafetyIssueKind::Pii,
-                detail: "detected identity-number-like token".to_string(),
-            });
-        }
-        if contains_credit_card_number(&numeric_pii_content) {
-            issues.push(SafetyIssue {
-                kind: SafetyIssueKind::Pii,
-                detail: "detected payment-card-like number".to_string(),
-            });
-        }
+        let mut issues = pii_issues(
+            content,
+            [
+                canonical_uuid_regex(),
+                pii_phone_regex(),
+                pii_email_regex(),
+                pii_id_regex(),
+                credit_card_candidate_regex(),
+            ],
+        );
 
         let lower = content.to_ascii_lowercase();
         let matched_injection = injection_markers().iter().find(|marker| lower.contains(*marker));
@@ -202,9 +179,63 @@ pub fn safety_rejection_message(issues: &[SafetyIssue]) -> String {
     }
 }
 
-fn pii_phone_regex() -> &'static Regex {
-    #[allow(clippy::expect_used)]
-    static PHONE: LazyLock<Regex> = LazyLock::new(|| {
+fn pii_issues(content: &str, patterns: [std::result::Result<&Regex, &regex::Error>; 5]) -> Vec<SafetyIssue> {
+    let [uuid, phone, email, id, card] = patterns;
+    let mut issues = Vec::new();
+    // Session snapshots contain system-generated UUIDs. Depending on their
+    // random digits, the phone detector could interpret a substring across
+    // UUID hyphens as a telephone number and reject an otherwise identical
+    // conversation nondeterministically. UUIDs are opaque internal
+    // identifiers, so exclude only their canonical shape from numeric PII
+    // detectors while continuing to inspect every user-authored field.
+    let numeric_pii_content = mask_uuids(content, uuid);
+
+    push_pii_issue(
+        &mut issues,
+        pii_pattern_match(&numeric_pii_content, phone),
+        "detected phone-like identifier",
+    );
+    push_pii_issue(&mut issues, pii_pattern_match(content, email), "detected email address");
+    push_pii_issue(
+        &mut issues,
+        pii_pattern_match(&numeric_pii_content, id),
+        "detected identity-number-like token",
+    );
+    push_pii_issue(
+        &mut issues,
+        contains_credit_card_with_pattern(&numeric_pii_content, card),
+        "detected payment-card-like number",
+    );
+
+    issues
+}
+
+fn mask_uuids<'a>(content: &'a str, pattern: std::result::Result<&Regex, &regex::Error>) -> std::borrow::Cow<'a, str> {
+    match pattern {
+        Ok(pattern) => pattern.replace_all(content, "<uuid>"),
+        Err(_) => std::borrow::Cow::Borrowed(content),
+    }
+}
+fn pii_pattern_match<'a>(
+    content: &str,
+    pattern: std::result::Result<&Regex, &'a regex::Error>,
+) -> std::result::Result<bool, &'a regex::Error> {
+    Ok(pattern?.is_match(content))
+}
+fn push_pii_issue(issues: &mut Vec<SafetyIssue>, result: std::result::Result<bool, &regex::Error>, detected: &str) {
+    let detail = match result {
+        Ok(false) => return,
+        Ok(true) => detected,
+        Err(_) => "pii pattern unavailable",
+    };
+    issues.push(SafetyIssue {
+        kind: SafetyIssueKind::Pii,
+        detail: detail.to_string(),
+    });
+}
+
+fn pii_phone_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static PHONE: LazyLock<std::result::Result<Regex, regex::Error>> = LazyLock::new(|| {
         // Require either explicit E.164 notation or a conventional separated
         // phone shape. Treating every bare 7-15 digit run as a phone number
         // rejects ordinary technical transcripts containing PIDs, counters,
@@ -218,45 +249,64 @@ fn pii_phone_regex() -> &'static Regex {
                 \b(?:phone|telephone|tel|mobile|cell|call\s+me\s+at|reach\s+me\s+at)\s*:?\s*\d{7,15}\b
             )",
         )
-        .expect("BUG: invalid hardcoded phone regex")
     });
-    &PHONE
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = PHONE.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
 }
 
-fn canonical_uuid_regex() -> &'static Regex {
-    #[allow(clippy::expect_used)]
-    static UUID: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
-            .expect("BUG: invalid hardcoded UUID regex")
-    });
-    &UUID
+fn canonical_uuid_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static UUID: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"));
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = UUID.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
 }
 
-fn pii_email_regex() -> &'static Regex {
-    #[allow(clippy::expect_used)]
-    static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("BUG: invalid hardcoded email regex")
-    });
-    &EMAIL
+fn pii_email_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static EMAIL: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"));
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = EMAIL.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
 }
 
-fn pii_id_regex() -> &'static Regex {
-    #[allow(clippy::expect_used)]
-    static ID: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b").expect("BUG: invalid hardcoded ID regex")
-    });
-    &ID
+fn pii_id_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static ID: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\b\d{17}[\dXx]\b|\b\d{15}\b|\b\d{3}-\d{2}-\d{4}\b"));
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = ID.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
 }
 
-fn credit_card_candidate_regex() -> &'static Regex {
-    #[allow(clippy::expect_used)]
-    static CARD: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("BUG: invalid hardcoded credit card regex"));
-    &CARD
+fn credit_card_candidate_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static CARD: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"\b(?:\d[ -]?){13,19}\b"));
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = CARD.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
 }
 
-fn contains_credit_card_number(content: &str) -> bool {
-    for candidate in credit_card_candidate_regex().find_iter(content) {
+fn contains_credit_card_with_pattern<'a>(
+    content: &str,
+    pattern: std::result::Result<&Regex, &'a regex::Error>,
+) -> std::result::Result<bool, &'a regex::Error> {
+    for candidate in pattern?.find_iter(content) {
         // Long floating-point telemetry values (for example a fitness ratio
         // such as `0.4111111111111111`) can satisfy Luhn by chance. A payment
         // card candidate is an integer-like token, never the fractional part
@@ -273,10 +323,10 @@ fn contains_credit_card_number(content: &str) -> bool {
         }
         let digits: String = candidate.as_str().chars().filter(|ch| ch.is_ascii_digit()).collect();
         if (13..=19).contains(&digits.len()) && passes_luhn(&digits) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn passes_luhn(digits: &str) -> bool {
@@ -403,10 +453,119 @@ mod tests {
 
     #[test]
     fn credit_card_luhn_detection() {
-        assert!(contains_credit_card_number("card 4111 1111 1111 1111"));
-        assert!(!contains_credit_card_number("card 4111 1111 1111 1112"));
-        assert!(contains_credit_card_number("card=4111111111111111"));
-        assert!(!contains_credit_card_number("ratio=0.4111111111111111"));
-        assert!(!contains_credit_card_number("telemetry=4111111111111111.0"));
+        assert!(
+            contains_credit_card_with_pattern("card 4111 1111 1111 1111", credit_card_candidate_regex())
+                .expect("test: card pattern compiles")
+        );
+        assert!(
+            !contains_credit_card_with_pattern("card 4111 1111 1111 1112", credit_card_candidate_regex())
+                .expect("test: card pattern compiles")
+        );
+        assert!(
+            contains_credit_card_with_pattern("card=4111111111111111", credit_card_candidate_regex())
+                .expect("test: card pattern compiles")
+        );
+        assert!(
+            !contains_credit_card_with_pattern("ratio=0.4111111111111111", credit_card_candidate_regex())
+                .expect("test: card pattern compiles")
+        );
+        assert!(
+            !contains_credit_card_with_pattern("telemetry=4111111111111111.0", credit_card_candidate_regex())
+                .expect("test: card pattern compiles")
+        );
+    }
+
+    #[test]
+    fn filter_hardcoded_patterns_compile() {
+        assert!(pii_phone_regex().is_ok(), "hardcoded pii_phone_regex must compile");
+        assert!(
+            canonical_uuid_regex().is_ok(),
+            "hardcoded canonical_uuid_regex must compile"
+        );
+        assert!(pii_email_regex().is_ok(), "hardcoded pii_email_regex must compile");
+        assert!(pii_id_regex().is_ok(), "hardcoded pii_id_regex must compile");
+        assert!(
+            credit_card_candidate_regex().is_ok(),
+            "hardcoded credit_card_candidate_regex must compile"
+        );
+    }
+
+    #[test]
+    fn unavailable_pii_patterns_reject_with_honest_reason() {
+        let error = regex::Error::Syntax("test: injected pattern failure".to_string());
+        let mut issues = Vec::new();
+        push_pii_issue(
+            &mut issues,
+            pii_pattern_match("ordinary prose", Err(&error)),
+            "detected email address",
+        );
+        push_pii_issue(
+            &mut issues,
+            contains_credit_card_with_pattern("ordinary prose", Err(&error)),
+            "detected payment-card-like number",
+        );
+        assert_eq!(issues.len(), 2, "each missing PII pattern must reject a write");
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail == "pii pattern unavailable"),
+            "a pattern failure must not be reported as detected PII"
+        );
+        let content = "00000000-0000-4000-8000-000000000001";
+        assert_eq!(
+            mask_uuids(content, Err(&error)),
+            content,
+            "broken UUID mask must scan the original content"
+        );
+    }
+    #[test]
+    fn each_unavailable_detector_rejects_writes() {
+        let error = regex::Error::Syntax("test: injected failure".to_string());
+        const DETECTOR_INDEXES: [usize; 4] = [1, 2, 3, 4];
+        for index in DETECTOR_INDEXES {
+            let mut patterns = [
+                canonical_uuid_regex(),
+                pii_phone_regex(),
+                pii_email_regex(),
+                pii_id_regex(),
+                credit_card_candidate_regex(),
+            ];
+            *patterns.get_mut(index).expect("test: bounded detector index") = Err(&error);
+            let issues = pii_issues("ordinary prose", patterns);
+            assert_eq!(issues.len(), 1, "missing detector {index} must reject even clean prose");
+            assert_eq!(
+                issues.first().expect("test: rejection exists").detail,
+                "pii pattern unavailable",
+                "missing detector {index} must report the unavailable pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_uuid_mask_scans_unmasked_content() {
+        let error = regex::Error::Syntax("test: injected failure".to_string());
+        let content = "12345678-1234-1234-1234-123456789012";
+        let patterns = [
+            canonical_uuid_regex(),
+            pii_phone_regex(),
+            pii_email_regex(),
+            pii_id_regex(),
+            credit_card_candidate_regex(),
+        ];
+        assert!(
+            pii_issues(content, patterns).is_empty(),
+            "valid mask must exclude system UUIDs"
+        );
+        let strict = [
+            Err(&error),
+            pii_phone_regex(),
+            pii_email_regex(),
+            pii_id_regex(),
+            credit_card_candidate_regex(),
+        ];
+        assert!(
+            !pii_issues(content, strict).is_empty(),
+            "failed UUID mask must retain numeric PII detection"
+        );
     }
 }

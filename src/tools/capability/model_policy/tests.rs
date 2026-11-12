@@ -162,7 +162,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
         let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
         let view = catalog.view(&CatalogScope::default());
         let mut state = crate::causal_tree::state::fixtures::state(&key, "prx input");
-        let before = state.material_fingerprint(&key);
+        let before = state.material_fingerprint(&key)?;
         let mut trusted = state.trusted.parts().clone();
         trusted.model_admission = Some(ModelAdmission::fresh(
             &registry,
@@ -173,7 +173,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
             &key,
         ));
         state.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
-        assert_ne!(state.material_fingerprint(&key), before);
+        assert_ne!(state.material_fingerprint(&key)?, before);
         let policy = state
             .trusted
             .parts()
@@ -193,7 +193,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
         let mut trusted = state.trusted.parts().clone();
         trusted.model_admission = None;
         state.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
-        assert_eq!(state.material_fingerprint(&key), before);
+        assert_eq!(state.material_fingerprint(&key)?, before);
     }
     assert_eq!(lengths, [32, 32, 32]);
     Ok(())

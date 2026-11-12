@@ -2,7 +2,7 @@ use super::helpers::{
     blank_comments_and_literals, enclosing_function, is_ident_char, normalize_line, read_source, relative_path,
     rust_source_files, strip_cfg_test_items,
 };
-use super::loop_requests::{is_test_code_file, test_module_files};
+use super::helpers::{is_test_code_file, test_module_files};
 use super::tool_tables::{
     NON_TOOL_CLOSURE_PROVIDERS, NON_TOOL_RECEIVER_PRODUCERS, NON_TOOL_RECEIVER_TYPES, NonToolCallSite,
     PRODUCER_INERT_TAIL_METHODS, TOOL_EXECUTION_METHODS,

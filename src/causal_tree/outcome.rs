@@ -27,8 +27,10 @@ use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, KeyDomain, PR
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::runtime::turn_decision::TurnDecisionContext;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum RecordBuildError {
+    #[error("state fingerprint serialization failed")]
+    Fingerprint(#[from] serde_json::Error),
     #[error("decision hop chain does not match its runtime lineage")]
     Chain,
     #[error("decision record facts disagree with the sealed request")]
@@ -178,7 +180,7 @@ impl DecisionRecordBuilder {
         record_redacted_projection: bool,
     ) -> Result<DecisionRecord, RecordBuildError> {
         let trusted = hop.state.trusted.parts();
-        let state_fingerprint = hop.state.material_fingerprint(key);
+        let state_fingerprint = hop.state.material_fingerprint(key)?;
         let catalog_generation = trusted.catalog_generation.to_hex();
         let projection = match (&hop.audit_trace, record_redacted_projection) {
             (Some(trace), enabled) => {
@@ -1624,7 +1626,9 @@ mod tests {
             gate_set_hash: [0; 32],
         };
         let trace = PredictionAuditTrace {
-            state_fingerprint: state.material_fingerprint(&key),
+            state_fingerprint: state
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
             policy_version: state.trusted.parts().policy_version.to_string(),
             catalog_generation: state.trusted.parts().catalog_generation.to_hex(),
             answers: BTreeMap::new(),

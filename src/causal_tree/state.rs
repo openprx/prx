@@ -668,6 +668,17 @@ pub(crate) struct CausalState {
     pub(crate) built_at_ms: u64,
 }
 
+fn fingerprint_from_canonical(
+    key: &DecisionKey,
+    domain: &[u8],
+    canonical: Result<String, serde_json::Error>,
+) -> Result<String, serde_json::Error> {
+    let canonical = canonical?;
+    Ok(hex::encode(
+        key.hmac(KeyDomain::StateFingerprint, &[domain, canonical.as_bytes()]),
+    ))
+}
+
 impl CausalState {
     /// The keyed fingerprint of everything that decides the turn: trusted,
     /// observed and derived inputs and the raw texts. Lineage and time are
@@ -680,11 +691,8 @@ impl CausalState {
     /// uses [`CausalState::evidence_fingerprint`] for that (D-066 N-1).
     /// Lowercase hex of
     /// `HMAC(DecisionKey, StateFingerprint, "material" ‖ canonical JSON)`.
-    pub(crate) fn material_fingerprint(&self, key: &DecisionKey) -> String {
-        hex::encode(key.hmac(
-            KeyDomain::StateFingerprint,
-            &[b"material", self.canonical(false).as_bytes()],
-        ))
+    pub(crate) fn material_fingerprint(&self, key: &DecisionKey) -> Result<String, serde_json::Error> {
+        fingerprint_from_canonical(key, b"material", self.canonical(false))
     }
 
     /// The keyed fingerprint of the evidence the turn has observed (D-066
@@ -744,11 +752,8 @@ impl CausalState {
     /// The keyed fingerprint of the full record: the material inputs plus
     /// the lineage, the event ids and the times.
     #[cfg(test)]
-    pub(crate) fn record_fingerprint(&self, key: &DecisionKey) -> String {
-        hex::encode(key.hmac(
-            KeyDomain::StateFingerprint,
-            &[b"record", self.canonical(true).as_bytes()],
-        ))
+    pub(crate) fn record_fingerprint(&self, key: &DecisionKey) -> Result<String, serde_json::Error> {
+        fingerprint_from_canonical(key, b"record", self.canonical(true))
     }
 
     /// Canonical JSON of the fingerprinted inputs: object keys in a fixed
@@ -756,9 +761,8 @@ impl CausalState {
     /// candidates) deduplicated and sorted so neither their listing order
     /// nor a repeat matters, sequences (steps, artifacts) in order, no
     /// floats.
-    #[allow(clippy::expect_used)] // Fixed primitive fields serialize infallibly into an in-memory String.
-    fn canonical(&self, record: bool) -> String {
-        canonical::serialize(self, record).expect("canonical primitive serialization invariant")
+    fn canonical(&self, record: bool) -> Result<String, serde_json::Error> {
+        canonical::serialize(self, record)
     }
 
     /// The derived candidates ordered by candidate id (ids are distinct).
@@ -949,8 +953,10 @@ mod turn_state_tests {
     fn lineage_and_time_are_not_material() {
         let key = key();
         let base = state(&key, "hello");
-        let material = base.material_fingerprint(&key);
-        let record = base.record_fingerprint(&key);
+        let material = base
+            .material_fingerprint(&key)
+            .expect("test: canonical state serializes");
+        let record = base.record_fingerprint(&key).expect("test: canonical state serializes");
         assert_eq!(material.len(), 64);
         assert_ne!(material, record);
 
@@ -971,8 +977,20 @@ mod turn_state_tests {
             Some(Arc::from("event-step-9")),
         );
         later.observed = ObservedState::from_runtime_records(vec![renamed], vec![aged], 0);
-        assert_eq!(later.material_fingerprint(&key), material, "not material");
-        assert_ne!(later.record_fingerprint(&key), record, "but recorded");
+        assert_eq!(
+            later
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            material,
+            "not material"
+        );
+        assert_ne!(
+            later
+                .record_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            record,
+            "but recorded"
+        );
     }
 
     /// D-066 N-1, the hop loop simulated: decide Retrieve, execute it, then
@@ -1030,8 +1048,12 @@ mod turn_state_tests {
         let empty = hop(ObservedStepStatus::Ok, None, ObservedStepKind::Retrieve);
         assert_eq!(empty.evidence_fingerprint(&key), evidence, "no new evidence: stop");
         assert_ne!(
-            empty.material_fingerprint(&key),
-            before.material_fingerprint(&key),
+            empty
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            before
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
             "the step itself is material, which is why the loop does not use it"
         );
 
@@ -1067,7 +1089,9 @@ mod turn_state_tests {
     fn new_inputs_are_material() {
         let key = key();
         let base = state(&key, "hello");
-        let material = base.material_fingerprint(&key);
+        let material = base
+            .material_fingerprint(&key)
+            .expect("test: canonical state serializes");
         let github = candidates(&key)[2].candidate.candidate_id().clone();
         let failed = executed(ObservedStepStatus::Failed, &github);
         let changes: Vec<CausalState> = vec![
@@ -1123,10 +1147,21 @@ mod turn_state_tests {
             },
         ];
         for (index, changed) in changes.iter().enumerate() {
-            assert_ne!(changed.material_fingerprint(&key), material, "change {index}");
+            assert_ne!(
+                changed
+                    .material_fingerprint(&key)
+                    .expect("test: canonical state serializes"),
+                material,
+                "change {index}"
+            );
         }
         let other_key = super::fixtures::key();
-        assert_ne!(base.material_fingerprint(&other_key), material, "keyed per workspace");
+        assert_ne!(
+            base.material_fingerprint(&other_key)
+                .expect("test: canonical state serializes"),
+            material,
+            "keyed per workspace"
+        );
     }
 
     /// I-01.4 and R-CDP16 L-4: neither the listing order of a set nor a
@@ -1144,8 +1179,19 @@ mod turn_state_tests {
             parts.constraints.push(ConstraintCode::new("no_destructive_filesystem"));
         });
         shuffled.derived = derived(reversed);
-        assert_eq!(shuffled.material_fingerprint(&key), base.material_fingerprint(&key));
-        assert_eq!(shuffled.record_fingerprint(&key), base.record_fingerprint(&key));
+        assert_eq!(
+            shuffled
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            base.material_fingerprint(&key)
+                .expect("test: canonical state serializes")
+        );
+        assert_eq!(
+            shuffled
+                .record_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            base.record_fingerprint(&key).expect("test: canonical state serializes")
+        );
     }
 
     /// R-CDP16 L-2: a failure comes only from a completed step with status
@@ -1174,7 +1220,13 @@ mod turn_state_tests {
         assert_eq!(observed.failed_candidates().into_iter().collect::<Vec<_>>(), [&github]);
         let mut failed = base.clone();
         failed.observed = observed;
-        assert_ne!(failed.material_fingerprint(&key), base.material_fingerprint(&key));
+        assert_ne!(
+            failed
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            base.material_fingerprint(&key)
+                .expect("test: canonical state serializes")
+        );
         // Which candidate failed is material, not only that a step failed.
         let failed_on = |candidate: &CandidateId| {
             let mut changed = base.clone();
@@ -1183,7 +1235,9 @@ mod turn_state_tests {
                 Vec::new(),
                 0,
             );
-            changed.material_fingerprint(&key)
+            changed
+                .material_fingerprint(&key)
+                .expect("test: canonical state serializes")
         };
         assert_ne!(failed_on(&github), failed_on(&answer));
     }
@@ -1291,8 +1345,10 @@ mod turn_state_tests {
         let key = key();
         let mut turn = state(&key, "hello");
         let trusted_before = turn.trusted.clone();
-        let material_before = turn.material_fingerprint(&key);
-        let record_before = turn.record_fingerprint(&key);
+        let material_before = turn
+            .material_fingerprint(&key)
+            .expect("test: canonical state serializes");
+        let record_before = turn.record_fingerprint(&key).expect("test: canonical state serializes");
 
         let (request, id, answer) = sealed(&key, &material_before);
         let decision = validated(&request, &id, &answer);
@@ -1301,8 +1357,15 @@ mod turn_state_tests {
         assert_eq!(predicted.answer(&id), Some(&answer));
         assert_eq!(predicted.request_id(), request.request_id());
         assert_eq!(turn.trusted, trusted_before);
-        assert_eq!(turn.material_fingerprint(&key), material_before);
-        assert_eq!(turn.record_fingerprint(&key), record_before);
+        assert_eq!(
+            turn.material_fingerprint(&key)
+                .expect("test: canonical state serializes"),
+            material_before
+        );
+        assert_eq!(
+            turn.record_fingerprint(&key).expect("test: canonical state serializes"),
+            record_before
+        );
 
         let (other, _, _) = sealed(&key, &material_before);
         assert_ne!(other.request_id(), request.request_id());
@@ -1348,5 +1411,19 @@ mod turn_state_tests {
         ] {
             assert!(!printed.contains(sentinel), "{sentinel} printed: {printed}");
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_error_tests {
+    use super::*;
+    #[test]
+    fn fingerprint_error_never_becomes_a_match() {
+        let error = serde_json::from_str::<serde_json::Value>("{").expect_err("test: invalid JSON");
+        let key = fixtures::key();
+        assert!(
+            fingerprint_from_canonical(&key, b"material", Err(error)).is_err(),
+            "serialization error must not mint a usable material fingerprint"
+        );
     }
 }

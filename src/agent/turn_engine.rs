@@ -1461,12 +1461,12 @@ async fn run_turn_unguarded(
                 let mut parsed_text = String::new();
 
                 if calls.is_empty() {
-                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text)?;
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
                     }
                     calls = fallback_calls;
-                    if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text) {
+                    if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text)? {
                         let sanitized_preview = sanitize_tool_parse_log_preview(&response_text);
                         tracing::error!(
                             raw_response = sanitized_preview.as_str(),

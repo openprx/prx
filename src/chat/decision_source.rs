@@ -2099,8 +2099,12 @@ pub(crate) mod admission_failure_tests {
             without_plan.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
             let key = crate::causal_tree::state::fixtures::key();
             assert_ne!(
-                actual.material_fingerprint(&key),
-                without_plan.material_fingerprint(&key)
+                actual
+                    .material_fingerprint(&key)
+                    .expect("test: canonical state serializes"),
+                without_plan
+                    .material_fingerprint(&key)
+                    .expect("test: canonical state serializes")
             );
             let source = ChatSourceReceipt {
                 envelope: binding.envelope.clone(),

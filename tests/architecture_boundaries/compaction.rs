@@ -3,9 +3,10 @@ use super::helpers::{
     assert_inventory, blank_comments_and_literals, enclosing_function, function_body, read_source, relative_path,
     repository_root, rust_source_files, strip_cfg_test_items,
 };
+use super::helpers::{is_test_code_file, test_module_files};
 use super::loop_requests::{
-    compact_rust_tokens, compaction_argument_is_none, engine_turn_requests, is_identifier_byte, is_test_code_file,
-    leading_identifier, nearest_let_initializer, request_field, test_module_files,
+    compact_rust_tokens, compaction_argument_is_none, engine_turn_requests, is_identifier_byte, leading_identifier,
+    nearest_let_initializer, request_field,
 };
 /// Where a loop-engine call's compaction config comes from, as far as the
 /// source text shows.
