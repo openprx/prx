@@ -52,6 +52,34 @@ impl WorkerMailboxParent {
             _execution: execution,
         })
     }
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_pending(self) -> HashMap<Uuid, MailboxDelivery> {
+        self.pending
+    }
+
+    pub(crate) fn finish_adopt(
+        &mut self,
+        message_id: Uuid,
+        result: MailboxResult<MailboxReceipt>,
+    ) -> MailboxResult<Option<MailboxReceipt>> {
+        if !matches!(
+            &result,
+            Err(MailboxError::SeqConflict | MailboxError::Storage | MailboxError::CorruptState)
+        ) {
+            self.pending.remove(&message_id);
+        }
+        match result {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(MailboxError::StaleRun) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Hold the delivery lease through the actual queue and wire handoff.
     pub fn next_delivery(&mut self) -> MailboxResult<Option<WorkerControlFrame>> {
         let Some(delivery) = self.store.deliver(&self.worker_scope, &self.worker)? else {
@@ -101,11 +129,14 @@ impl WorkerMailboxParent {
             }
             WorkerOutputFrame::Ack { message_id, state } => {
                 let Some(delivery) = self.pending.get(&message_id) else {
-                    // Already-consumed acknowledgments have no in-flight lease.
+                    tracing::debug!(%message_id, "worker acknowledgment has no pending delivery");
                     return Ok(None);
                 };
                 if state == DeliveryState::Consumed {
-                    let adopted = self.store.adopt(delivery)?;
+                    let result = self.store.adopt(delivery);
+                    let Some(adopted) = self.finish_adopt(message_id, result)? else {
+                        return Ok(None);
+                    };
                     self.inherited = adopted.remote.clone().map(|remote| InheritedProvenance {
                         remote,
                         chain: adopted.chain.clone(),
@@ -120,7 +151,6 @@ impl WorkerMailboxParent {
                     }
                     self.store
                         .acknowledge(&self.parent_scope, &self.worker, message_id, adopted.state)?;
-                    self.pending.remove(&message_id);
                 } else {
                     self.store
                         .acknowledge(&self.parent_scope, &self.worker, message_id, state)?;

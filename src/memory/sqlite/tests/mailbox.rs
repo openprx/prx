@@ -1685,29 +1685,28 @@ fn send_reply_resolves_parent_from_outbox_without_transcript() {
 }
 
 #[test]
-fn idempotent_retry_after_parent_erase_returns_same_ack() {
+fn idempotent_retry_after_parent_erase_reports_scope_erasing() {
     let f = Fixture::new();
     f.receive(1, 1);
     let mut reply = f.message(2, 2);
     reply.in_reply_to = Some(Uuid::from_u128(1001));
-    let accepted = f
-        .store
+    f.store
         .accept(&f.authority, reply.clone())
-        .expect("test: idempotent_retry_after_parent_erase_returns_same_ack: accept succeeds");
+        .expect("test: idempotent_retry_after_parent_erase_reports_scope_erasing: accept succeeds");
     f.store
         .erase_scope(&f.recipient, Duration::from_secs(5), &|| Ok(()))
-        .expect("test: idempotent_retry_after_parent_erase_returns_same_ack: erase_scope succeeds");
+        .expect("test: idempotent_retry_after_parent_erase_reports_scope_erasing: erase_scope succeeds");
     assert_eq!(
         f.store
             .accept(&f.authority, reply)
-            .expect("test: idempotent_retry_after_parent_erase_returns_same_ack: accept succeeds"),
-        accepted,
-        "idempotent retry after parent erase returns same ack: payload retention and erasure boundary changed"
+            .expect_err("test: erased nonconsumed replay is terminal"),
+        MailboxError::ScopeErasing,
+        "erased nonconsumed replay must report scope erasure"
     );
     assert_eq!(
         f.scalar("SELECT count(*) FROM prx_mailbox_outbox"),
         0,
-        "idempotent retry after parent erase returns same ack: payload retention and erasure boundary changed"
+        "erased nonconsumed replay must report scope erasure"
     );
 }
 
@@ -3272,7 +3271,243 @@ async fn pending_send_resolver_keeps_payload_in_scope_until_cancel_join() {
     );
 }
 
+fn mailbox_parent(f: &Fixture) -> crate::session_worker::mailbox_parent::WorkerMailboxParent {
+    crate::session_worker::mailbox_parent::WorkerMailboxParent::new(
+        f.store.clone(),
+        f.target.clone(),
+        f.recipient.clone(),
+        f.source.clone(),
+        f.sender.clone(),
+        "run-target".into(),
+        None,
+    )
+    .expect("test: construct persistent parent")
+}
+
+fn stale_parent_releases_delivery_before_erase() {
+    use crate::session_worker::protocol::{WorkerControlFrame, WorkerOutputFrame};
+    let f = Fixture::new();
+    let mut parent = mailbox_parent(&f);
+    let mut message = f.message(1, 1);
+    message.exec = Some(ExecRef {
+        run: Some("run-target".into()),
+    });
+    f.store
+        .accept(&f.authority, message)
+        .expect("test: accept pinned parent input");
+    let Some(WorkerControlFrame::Message { envelope }) = parent.next_delivery().expect("test: parent delivery") else {
+        panic!("test: parent must hold the delivered input");
+    };
+    let ack = WorkerOutputFrame::Ack {
+        message_id: envelope.id,
+        state: DeliveryState::Consumed,
+    };
+    drop(envelope);
+    f.store
+        .set_execution(&f.recipient, &f.target, Some("run-next".into()))
+        .expect("test: change parent run");
+    let result = parent.receive(ack.clone());
+    let repeated = parent.receive(ack);
+    // Quiesce the parent's execution cache but retain any leaked deliveries.
+    // The old early ? must still fail at the erase deadline, not a cache lease.
+    let pending = parent.into_pending();
+    let erased = f
+        .store
+        .erase_scope(&f.recipient, Duration::from_millis(20), &|| Ok(()))
+        .expect("test: terminal parent adoption must release its lease before erase deadline");
+    assert_eq!(erased.remaining, 0, "terminal parent input must be fully erased");
+    assert!(
+        result.expect("test: stale parent Ack is harmless").is_none(),
+        "stale Ack must return no receipt"
+    );
+    assert_eq!(pending.len(), 0, "terminal adoption retained a pending delivery");
+    assert!(
+        repeated.expect("test: repeat stale Ack").is_none(),
+        "repeated Ack must be harmless"
+    );
+}
+
+#[test]
+fn parent_terminal_adopt_errors_release_pending_and_retryable_errors_retain_it() {
+    for error in [
+        MailboxError::ReceiptExpired,
+        MailboxError::Unauthorized,
+        MailboxError::Fenced,
+        MailboxError::IdentityImmutable,
+        MailboxError::ScopeErasing,
+        MailboxError::SeqConflict,
+        MailboxError::Storage,
+        MailboxError::CorruptState,
+    ] {
+        let f = Fixture::new();
+        let mut parent = mailbox_parent(&f);
+        let message = f.message(1, 1);
+        let id = message.id;
+        f.store
+            .accept(&f.authority, message)
+            .expect("test: accept matrix input");
+        parent
+            .next_delivery()
+            .expect("test: hold matrix input")
+            .expect("test: pending matrix frame");
+        assert_eq!(
+            parent.pending_count(),
+            1,
+            "matrix must start with a real delivery lease"
+        );
+        let sql = match error {
+            MailboxError::ReceiptExpired => Some("DELETE FROM prx_mailbox_receipts"),
+            MailboxError::Unauthorized => Some(
+                "UPDATE prx_mailbox_receipts SET ma_scope_id='00000000-0000-0000-0000-00000000000a',receipt_meta=json_set(receipt_meta,'$.canonical_session_key','canonical-source')",
+            ),
+            MailboxError::IdentityImmutable => Some("UPDATE prx_mailbox_messages SET body_bytes=x'6368616e676564'"),
+            MailboxError::ScopeErasing => Some(
+                "INSERT INTO agent_erase_fences VALUES ('00000000-0000-0000-0000-000000000014','00000000-0000-0000-0000-000000000063','draining',2)",
+            ),
+            _ => None,
+        };
+        let result = if let Some(sql) = sql {
+            f.memory
+                .pool
+                .write()
+                .execute(sql, [])
+                .expect("test: set terminal store condition");
+            parent.receive(crate::session_worker::protocol::WorkerOutputFrame::Ack {
+                message_id: id,
+                state: DeliveryState::Consumed,
+            })
+        } else {
+            // Fenced is no longer emitted by adopt after L7. Keep its parent
+            // policy covered, along with injected retryable storage outcomes.
+            parent.finish_adopt(id, Err(error.clone()))
+        };
+        assert_eq!(
+            result.expect_err("test: propagate typed adopt error"),
+            error,
+            "parent changed the terminal error"
+        );
+        let retryable = matches!(
+            error,
+            MailboxError::SeqConflict | MailboxError::Storage | MailboxError::CorruptState
+        );
+        assert_eq!(
+            parent.pending_count(),
+            usize::from(retryable),
+            "wrong lease policy for {error:?}"
+        );
+        assert_eq!(
+            f.memory.mailbox_runtime.has_leases(f.recipient.scope_id),
+            retryable,
+            "wrong runtime lease policy for {error:?}"
+        );
+    }
+}
+
+#[test]
+fn parent_acknowledge_error_after_adopt_releases_pending() {
+    let f = Fixture::new();
+    let mut parent = mailbox_parent(&f);
+    let message = f.message(1, 1);
+    let id = message.id;
+    f.store
+        .accept(&f.authority, message)
+        .expect("test: accept without local outbox");
+    parent
+        .next_delivery()
+        .expect("test: deliver without outbox")
+        .expect("test: pending delivery");
+    let error = parent
+        .receive(crate::session_worker::protocol::WorkerOutputFrame::Ack {
+            message_id: id,
+            state: DeliveryState::Consumed,
+        })
+        .expect_err("test: acknowledge requires a sender outbox");
+    assert_eq!(
+        error,
+        MailboxError::InvalidMetadata,
+        "adoption must finish before missing-outbox Ack fails"
+    );
+    assert_eq!(
+        parent.pending_count(),
+        0,
+        "committed adoption retained a pending lease after Ack error"
+    );
+    assert!(
+        !f.memory.mailbox_runtime.has_leases(f.recipient.scope_id),
+        "Ack error retained the consumed body"
+    );
+    assert_eq!(
+        f.scalar("SELECT count(*) FROM prx_mailbox_receipts WHERE state=2"),
+        1,
+        "Ack failure must follow committed adoption"
+    );
+}
+
+#[test]
+fn consumed_then_erased_adopt_replays_saved_result() {
+    let f = Fixture::new();
+    f.receive(1, 1);
+    let held = f.deliver();
+    let saved = f.store.adopt(&held).expect("test: consume receipt before erasure");
+    // Erasure normally joins the holder. Preserve this delivery solely to exercise replay.
+    f.memory
+        .pool
+        .write()
+        .execute(
+            "UPDATE prx_mailbox_receipts SET receipt_meta=json_set(receipt_meta,'$.body_erased_at',1000) WHERE id=?1",
+            [saved.row_id],
+        )
+        .expect("test: mark consumed receipt erased");
+    f.memory
+        .pool
+        .write()
+        .execute("DELETE FROM prx_mailbox_messages WHERE id=?1", [saved.row_id])
+        .expect("test: remove consumed receipt body");
+    let replay = f.store.adopt(&held).expect("test: replay erased consumed receipt");
+    assert_eq!(replay, saved, "erasure must preserve the saved adoption checkpoint");
+}
+
+#[test]
+fn erased_nonconsumed_replays_report_scope_erasing_when_fenced() {
+    let f = Fixture::new();
+    let message = f.message(1, 1);
+    f.store
+        .accept(&f.authority, message.clone())
+        .expect("test: accept fenced replay input");
+    let held = f.deliver();
+    {
+        let writer = f.memory.pool.write();
+        writer
+            .execute(
+                "UPDATE prx_mailbox_receipts SET receipt_meta=json_set(receipt_meta,'$.body_erased_at',1000)",
+                [],
+            )
+            .expect("test: erase replay body metadata");
+        writer
+            .execute(
+                "INSERT INTO agent_erase_fences VALUES (?1,?2,'draining',2)",
+                params![f.recipient.scope_id.to_string(), Uuid::new_v4().to_string()],
+            )
+            .expect("test: fence erased receipt scope");
+    }
+    assert_eq!(
+        f.store
+            .accept(&f.authority, message)
+            .expect_err("test: replay fenced accept"),
+        MailboxError::ScopeErasing,
+        "fenced replay must report erasure instead of stale run"
+    );
+    assert_eq!(
+        f.store.adopt(&held).expect_err("test: replay fenced adopt"),
+        MailboxError::ScopeErasing,
+        "fenced adoption must report erasure instead of stale run"
+    );
+}
+
 fn stale_slot_case(adopt_race: bool) {
+    if adopt_race {
+        stale_parent_releases_delivery_before_erase();
+    }
     let f = Fixture::new();
     let mut first = f.message(1, 0);
     first.exec = Some(ExecRef {
@@ -3298,6 +3533,7 @@ fn stale_slot_case(adopt_race: bool) {
             .acknowledge(&f.sender, &f.target, slot.message().id, accepted.state)
             .expect("test: acknowledge accepted work before the run changes");
     }
+    let replay = outgoing.first().expect("test: first published slot").message().clone();
     drop(outgoing);
     let held = if adopt_race {
         let held = f.deliver();
@@ -3317,9 +3553,21 @@ fn stale_slot_case(adopt_race: bool) {
             MailboxError::StaleRun,
             "run change must terminalize only the held slot"
         );
+        assert_eq!(
+            f.store.adopt(&held).expect_err("test: replay stale adoption"),
+            MailboxError::StaleRun,
+            "an erased stale receipt must replay its terminal outcome"
+        );
         drop(held);
     }
     let next = f.deliver();
+    assert_eq!(
+        f.store
+            .accept(&f.authority, replay)
+            .expect_err("test: replay stale accept"),
+        MailboxError::StaleRun,
+        "re-accept must report the stale slot instead of its old delivery state"
+    );
     assert_eq!(next.message().seq, 2, "later accepted work must survive a stale run");
     assert_eq!(
         f.store.adopt(&next).expect("test: adopt surviving slot").state,

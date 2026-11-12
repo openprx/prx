@@ -13,7 +13,7 @@ use crate::messaging::mailbox::{
     MAX_BYTES, MAX_HOLES, MAX_QUEUE, MAX_RECEIPTS, MAX_ROWS, MailboxAuthority, MailboxError, MailboxReceipt,
     MailboxResult, MailboxScope, REPLAY_SECONDS, ledger_key, validate_address, validate_body,
 };
-use crate::messaging::{MessageKind, MessageOrigin, PrxMessage, RemotePeerAttr};
+use crate::messaging::{DeliveryState, MessageKind, MessageOrigin, PrxMessage, RemotePeerAttr};
 
 impl SqliteMailbox {
     pub fn accept(&self, authority: &MailboxAuthority, mut message: PrxMessage) -> MailboxResult<MailboxReceipt> {
@@ -36,6 +36,20 @@ impl SqliteMailbox {
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
         if let Some(saved) = receipt::by_key(&tx, &key)? {
             saved.matches(&tx, &authority.workspace_id, &message)?;
+            if saved.state != DeliveryState::Consumed && saved.meta.body_erased_at.is_some() {
+                let fenced: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agent_erase_fences WHERE scope_id=?1)",
+                        [saved.scope.scope_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)?;
+                return Err(if fenced {
+                    MailboxError::ScopeErasing
+                } else {
+                    MailboxError::StaleRun
+                });
+            }
             return saved.result(&tx);
         }
         // Non-Data frames update sender status elsewhere, never become inbox

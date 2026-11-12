@@ -33,14 +33,25 @@ impl SqliteMailbox {
             return Err(MailboxError::Unauthorized);
         }
         saved.matches(&tx, &scope.workspace_id, delivery.message())?;
-        if saved.meta.body_erased_at.is_some() {
-            return Err(MailboxError::Fenced);
-        }
-        let mut stream = stream::load(&tx, saved.stream_id)?;
-        check_scope(&tx, scope, &stream.to, Some(&saved.meta.canonical_session_key), true)?;
         if saved.state == DeliveryState::Consumed {
             return saved.result(&tx);
         }
+        if saved.meta.body_erased_at.is_some() {
+            let fenced: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_erase_fences WHERE scope_id=?1)",
+                    [saved.scope.scope_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(storage_error)?;
+            return Err(if fenced {
+                MailboxError::ScopeErasing
+            } else {
+                MailboxError::StaleRun
+            });
+        }
+        let mut stream = stream::load(&tx, saved.stream_id)?;
+        check_scope(&tx, scope, &stream.to, Some(&saved.meta.canonical_session_key), true)?;
         let live_run = self.memory.mailbox_runtime.execution(&stream.to, scope);
         if saved
             .meta
