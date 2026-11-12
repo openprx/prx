@@ -67,10 +67,8 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // the lock is released when its holder dies needs a child that is SIGKILLed.
     "src/skills/lifecycle/tests/publish.rs::a_killed_lock_holder_releases_the_lock_and_publication_continues::.spawn()",
     "src/skills/lifecycle/tests/publish.rs::processes_racing_on_one_generation_have_exactly_one_winner::.spawn()",
-    "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",
-    "src/tunnel/ngrok.rs::start::.spawn()?;",
     "src/tunnel/tailscale.rs::start::.spawn()?;",
 ];
 
@@ -324,10 +322,9 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/tools/message_send.rs::auto_generate_voice::let mut node_cmd = tokio::process::Command::new(\"node\");",
     "src/tools/message_send.rs::auto_generate_voice::let mut npm_cmd = tokio::process::Command::new(\"npm\");",
     "src/tools/sessions_spawn/process_mode.rs::run_sub_agent_process::let mut command = tokio::process::Command::new(executable);",
-    "src/tunnel/cloudflare.rs::start::let mut child = Command::new(\"cloudflared\")",
+    "src/tunnel/cloudflare.rs::build_command::let mut command = Command::new(\"cloudflared\");",
     "src/tunnel/custom.rs::start::let mut child = Command::new(program)",
-    "src/tunnel/ngrok.rs::start::Command::new(\"ngrok\")",
-    "src/tunnel/ngrok.rs::start::let mut child = Command::new(\"ngrok\")",
+    "src/tunnel/ngrok.rs::build_command::let mut command = Command::new(\"ngrok\");",
     "src/tunnel/tailscale.rs::start::let child = Command::new(\"tailscale\")",
     "src/tunnel/tailscale.rs::start::let output = Command::new(\"tailscale\")",
     "src/tunnel/tailscale.rs::stop::Command::new(\"tailscale\")",
