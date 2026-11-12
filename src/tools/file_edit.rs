@@ -117,7 +117,7 @@ impl FileEditTool {
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         // Security check: validate path is within workspace (same policy as file_write).
-        if !full && !self.security.is_path_allowed(path) {
+        if !full && !self.security.is_path_allowed_at(self.working_root(), path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

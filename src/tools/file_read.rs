@@ -137,7 +137,7 @@ impl FileReadTool {
 
         let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         // Security check: validate path is within workspace
-        if !full && !self.security.is_path_allowed(path) {
+        if !full && !self.security.is_path_allowed_at(self.working_root(), path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -158,7 +158,7 @@ impl FileReadTool {
                 }
             }
         } else {
-            self.working_root().join(path)
+            crate::security::path_policy::resolve_request_path(self.working_root(), path)?
         };
 
         // Resolve path before reading to block symlink escapes.

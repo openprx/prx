@@ -1360,6 +1360,8 @@ impl crate::runtime::turn_decision::CloseTurnPorts for ChatDecisionClose<'_> {
 pub(crate) mod admission_failure_tests {
     mod operator_accounting;
     #[cfg(unix)]
+    mod shell_parity_working_root;
+    #[cfg(unix)]
     mod worker_stdin_protocol;
     use super::*;
     use crate::agent::terminal::TurnTerminalStatus;

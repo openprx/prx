@@ -260,8 +260,10 @@ jobs:
             fail-fast: false
             matrix:
                 include:
+                    # The signed-carry library test launches the real prx executable;
+                    # this existing integration target makes nextest archive that binary.
                     - name: lib
-                      targets: --lib
+                      targets: "--lib --test shell_parity_cli"
                     - name: rest
                       targets: "--bins --test '*'"
         env:
@@ -346,9 +348,9 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - { name: lib-1, archive: lib, targets: --lib, part: "1/3" }
-                    - { name: lib-2, archive: lib, targets: --lib, part: "2/3" }
-                    - { name: lib-3, archive: lib, targets: --lib, part: "3/3" }
+                    - { name: lib-1, archive: lib, targets: "--lib --test shell_parity_cli", part: "1/3" }
+                    - { name: lib-2, archive: lib, targets: "--lib --test shell_parity_cli", part: "2/3" }
+                    - { name: lib-3, archive: lib, targets: "--lib --test shell_parity_cli", part: "3/3" }
                     - { name: rest-1, archive: rest, targets: "--bins --test '*'", part: "1/3" }
                     - { name: rest-2, archive: rest, targets: "--bins --test '*'", part: "2/3" }
                     - { name: rest-3, archive: rest, targets: "--bins --test '*'", part: "3/3" }

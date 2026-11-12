@@ -96,7 +96,19 @@ impl TurnDecisionService {
     ) -> anyhow::Result<(String, RiskLevel)> {
         anyhow::ensure!(matches!(tool, "file_write" | "file_edit"), "unsupported file mutation");
         anyhow::ensure!(
-            self.security.is_path_allowed(path),
+            self.security.is_path_allowed_at(
+                if filesystem.is_some() {
+                    &self.security.workspace_dir
+                } else {
+                    self.generation
+                        .effective
+                        .runtime
+                        .workdir
+                        .as_deref()
+                        .unwrap_or(&self.security.workspace_dir)
+                },
+                path
+            ),
             "file approval path is outside allowed workspace"
         );
         let (operation, risk) = if let Some(filesystem) = filesystem {
@@ -186,4 +198,47 @@ async fn owned_filesystem_read<T: Send + 'static>(
 ) -> anyhow::Result<T> {
     let owner = crate::runtime::turn_cleanup::current_tracker().context("Console filesystem cleanup owner missing")?;
     crate::runtime::ingress_recovery::owned_store_read(&owner, work).await
+}
+
+#[cfg(test)]
+mod working_root_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn approval_path_checks_the_execution_root() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let workspace = tempfile::tempdir().expect("test: workspace");
+            let root = tempfile::tempdir().expect("test: execution root");
+            for level in [
+                crate::security::AutonomyLevel::Supervised,
+                crate::security::AutonomyLevel::ReadOnly,
+            ] {
+                let mut config = crate::config::Config::default();
+                config.workspace_dir = workspace.path().into();
+                config.runtime.workdir = Some(root.path().into());
+                config.autonomy.level = level;
+                config.autonomy.workspace_only = false;
+                config.autonomy.forbidden_paths = vec![root.path().join("blocked").to_string_lossy().into_owned()];
+                config.causal_tree.enabled = false;
+                let generation = crate::config::new_shared(config.clone()).pin();
+                let catalog = crate::providers::catalog::CatalogView::from_config(&config);
+                let service = super::super::tests::disabled_agent_service(&generation, &catalog).await;
+                let denied = service
+                    .scoped_file_operation(None, "file_write", "blocked/target")
+                    .await;
+                assert_eq!(
+                    denied.expect_err("test: forbidden approval must fail").to_string(),
+                    "file approval path is outside allowed workspace",
+                    "test: approval must use selected root"
+                );
+                let allowed = service.scoped_file_operation(None, "file_write", "allowed").await;
+                assert!(
+                    allowed.is_ok(),
+                    "test: path resolution permits allowed target; autonomy is checked separately: {allowed:?}"
+                );
+            }
+        })
+        .await
+        .expect("test: approval path deadline");
+    }
 }

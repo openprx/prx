@@ -26,6 +26,60 @@ async fn direct(tool: &dyn Tool, level: AutonomyLevel, args: Value) -> ToolResul
     .expect("test: tool result")
 }
 
+async fn run_exact_environment_probe(mut command: tokio::process::Command) {
+    use tokio::io::AsyncReadExt;
+    const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("test: isolated environment probe");
+    let stdout = child.stdout.take().expect("test: probe stdout");
+    let stderr = child.stderr.take().expect("test: probe stderr");
+    let (status, out, err) = tokio::time::timeout(Duration::from_secs(25), async {
+        tokio::join!(
+            child.wait(),
+            async {
+                let mut bytes = Vec::new();
+                stdout
+                    .take(MAX_PROBE_OUTPUT + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .expect("test: bounded probe stdout");
+                assert!(bytes.len() as u64 <= MAX_PROBE_OUTPUT, "test: probe stdout cap");
+                bytes
+            },
+            async {
+                let mut bytes = Vec::new();
+                stderr
+                    .take(MAX_PROBE_OUTPUT + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .expect("test: bounded probe stderr");
+                assert!(bytes.len() as u64 <= MAX_PROBE_OUTPUT, "test: probe stderr cap");
+                bytes
+            }
+        )
+    })
+    .await
+    .expect("test: probe deadline");
+    let out = String::from_utf8_lossy(&out);
+    let err = String::from_utf8_lossy(&err);
+    assert!(
+        status.expect("test: probe status").success(),
+        "test: environment probe failed: {out} {err}"
+    );
+    assert!(
+        out.lines().any(|line| line == "running 1 test"),
+        "test: exact probe must execute one test: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+        "test: exact probe must pass one test: {out}"
+    );
+}
+
 #[tokio::test]
 async fn full_shell_runs_git_and_repository_hook() {
     use std::os::unix::fs::PermissionsExt;
@@ -147,11 +201,7 @@ async fn full_shell_environment_keeps_proxy_and_strips_credentials() {
             .env("OPENPRX_TEST_SECRET", "synthetic")
             .env("http_proxy", "x")
             .kill_on_drop(true);
-        let status = tokio::time::timeout(Duration::from_secs(25), command.status())
-            .await
-            .expect("test: probe deadline")
-            .expect("test: probe exit");
-        assert!(status.success(), "test: isolated environment probe");
+        run_exact_environment_probe(command).await;
         return;
     }
     let root = tempfile::tempdir().expect("test: workspace");
@@ -457,11 +507,7 @@ async fn full_dispatcher_widens_native_files_and_environment() {
             .env("http_proxy", "prx-proxy")
             .env("ANTHROPIC_API_KEY", "prx-secret")
             .kill_on_drop(true);
-        let status = tokio::time::timeout(Duration::from_secs(25), command.status())
-            .await
-            .expect("test: dispatcher env deadline")
-            .expect("test: probe status");
-        assert!(status.success(), "test: isolated dispatcher env");
+        run_exact_environment_probe(command).await;
         return;
     }
     let result = dispatch(
@@ -477,4 +523,118 @@ async fn full_dispatcher_widens_native_files_and_environment() {
         result.success && result.output.contains("prx-proxy|unset"),
         "test: dispatcher grants environment inheritance with secret hygiene: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn working_root_forbidden_file_matrix() {
+    let workspace = tempfile::tempdir().expect("test: policy workspace");
+    let root = tempfile::tempdir().expect("test: execution root");
+    let forbidden = root.path().join("blocked");
+    std::fs::create_dir(&forbidden).expect("test: forbidden directory");
+    for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
+        let policy = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().into(),
+            autonomy: level,
+            workspace_only: false,
+            forbidden_paths: vec![forbidden.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileReadTool::new(policy.clone(), false).with_workdir(Some(root.path().into()))),
+            Box::new(FileWriteTool::new(policy.clone()).with_workdir(Some(root.path().into()))),
+            Box::new(FileEditTool::new(policy).with_workdir(Some(root.path().into()))),
+        ];
+        for tool in tools {
+            for (path, blocked) in [("blocked/target", true), ("allowed", false)] {
+                let target = root.path().join(path);
+                std::fs::write(&target, "original").expect("test: target fixture");
+                let result = direct(
+                    tool.as_ref(),
+                    level,
+                    json!({"path":path,"content":"changed","old_string":"original","new_string":"changed"}),
+                )
+                .await;
+                let readonly_mutation = level == AutonomyLevel::ReadOnly && tool.name() != "file_read";
+                if blocked || readonly_mutation {
+                    assert!(
+                        !result.success,
+                        "test: {} {level:?} must refuse {path}: {result:?}",
+                        tool.name()
+                    );
+                    let expected = if readonly_mutation {
+                        "Action blocked: autonomy is read-only".to_owned()
+                    } else {
+                        format!("Path not allowed by security policy: {path}")
+                    };
+                    assert_eq!(
+                        result.error.as_deref(),
+                        Some(expected.as_str()),
+                        "test: native typed refusal for {} {level:?}",
+                        tool.name()
+                    );
+                    assert_eq!(
+                        std::fs::read(&target).expect("test: unchanged fixture"),
+                        b"original",
+                        "test: refused {} leaves target unchanged",
+                        tool.name()
+                    );
+                } else {
+                    assert!(result.success, "test: allowed {} {level:?}: {result:?}", tool.name());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn working_root_forbidden_shell_argument_is_refused() {
+    let workspace = tempfile::tempdir().expect("test: workspace");
+    let root = tempfile::tempdir().expect("test: root");
+    let policy = Arc::new(SecurityPolicy {
+        workspace_dir: workspace.path().into(),
+        workspace_only: false,
+        forbidden_paths: vec![root.path().join("blocked").to_string_lossy().into_owned()],
+        ..SecurityPolicy::default()
+    });
+    let tool = shell(root.path()).with_path_policy(policy);
+    for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
+        let denied = direct(&tool, level, json!({"command":"cat blocked/target"})).await;
+        assert_eq!(
+            denied.error.as_deref(),
+            Some("forbidden path argument: blocked/target"),
+            "test: shell checks actual cwd"
+        );
+        let allowed = direct(&tool, level, json!({"command":"printf allowed"})).await;
+        assert!(
+            allowed.success,
+            "test: allowed shell argument remains executable: {allowed:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn working_root_symlink_retains_existing_policy() {
+    let workspace = tempfile::tempdir().expect("test: workspace");
+    let root = tempfile::tempdir().expect("test: root");
+    let target = root.path().join("forbidden");
+    std::fs::write(&target, "fixture").expect("test: target");
+    std::os::unix::fs::symlink(&target, workspace.path().join("link")).expect("test: symlink");
+    for workspace_only in [true, false] {
+        let policy = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().into(),
+            workspace_only,
+            forbidden_paths: vec![target.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        for explicit_root in [false, true] {
+            let tool =
+                FileReadTool::new(policy.clone(), false).with_workdir(explicit_root.then(|| workspace.path().into()));
+            let result = direct(&tool, AutonomyLevel::ReadOnly, json!({"path":"link"})).await;
+            assert_eq!(
+                result.success, !workspace_only,
+                "test: explicit root retains main's canonical containment behavior: {result:?}"
+            );
+        }
+    }
 }

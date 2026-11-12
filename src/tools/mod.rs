@@ -374,7 +374,7 @@ pub fn default_tools_with_runtime(
     let workspace_dir = security.workspace_dir.clone();
     vec![
         Box::new(capability::search_tool::CapabilitySearchTool),
-        Box::new(ShellTool::new(runtime, workspace_dir)),
+        Box::new(ShellTool::new(runtime, workspace_dir).with_path_policy(security.clone())),
         Box::new(FileReadTool::new(security.clone(), false)),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security)),
@@ -522,7 +522,8 @@ pub fn all_tools_with_runtime_ext_and_extensions(
                 runtime.clone(),
                 config.runtime.workdir.as_deref().unwrap_or(workspace_dir).to_path_buf(),
             )
-            .with_env_allowlist(config.runtime.shell_env_allowlist.clone()),
+            .with_env_allowlist(config.runtime.shell_env_allowlist.clone())
+            .with_path_policy(security.clone()),
         ),
         Arc::new(
             FileReadTool::new(security.clone(), config.memory.acl_enabled).with_workdir(config.runtime.workdir.clone()),

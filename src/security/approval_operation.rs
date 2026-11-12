@@ -330,15 +330,7 @@ pub(crate) async fn resolve_file_target(
     allow_missing_parent: bool,
 ) -> std::io::Result<std::path::PathBuf> {
     use std::io::{Error, ErrorKind};
-    use std::path::Component;
-    if path.contains('\0')
-        || std::path::Path::new(path)
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-    {
-        return Err(Error::new(ErrorKind::InvalidInput, "invalid file path"));
-    }
-    let full = workspace.join(path);
+    let full = super::path_policy::resolve_request_path(workspace, path)?;
     let name = full
         .file_name()
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "file name missing"))?;
