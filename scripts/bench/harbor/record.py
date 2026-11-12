@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 from profile import read_bounded
 
 MAX_ARTIFACT = 16 * 1024 * 1024
-TRANSPORT = re.compile(r"HTTP[^\n]*(?:5\d\d|429)|status[^\n]*(?:5\d\d|429)|connect|TLS|DNS|certificate|name resolution", re.I)
+TRANSPORT = re.compile(r"HTTP[^\n]*(?:5\d\d|429)|status[^\n]*(?:5\d\d|429)|connect|TLS|DNS|certificate|name resolution|error sending request|request timed out", re.I)
 
 
 def unavailable(reason):

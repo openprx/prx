@@ -121,7 +121,7 @@ class PrxAgent(BaseInstalledAgent):
                     database = Path(directory) / "brain.db"
                     for suffix in ("", "-wal"):
                         remote = CONFIG_DIR + "/workspace/memory/brain.db" + suffix
-                        exists = await environment.exec(command=f"test -f {remote} && test $(wc -c < {remote}) -le 67108864", timeout_sec=5)
+                        exists = await environment.exec(command=f"test -f {remote} && test $(wc -c < {remote}) -le 67108864", user="root", timeout_sec=5)
                         if exists.return_code == 0:
                             await asyncio.wait_for(environment.download_file(remote, str(database) + suffix), timeout=10)
                     self._metadata["per_attempt_models"] = per_attempt_models(database, self.git_sha)

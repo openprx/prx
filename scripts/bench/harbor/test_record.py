@@ -78,6 +78,7 @@ class RecordTests(unittest.TestCase):
                  (2, None, 'policy', '', 1, 'refusal', 'harness_policy'),
                  (1, None, '', 'HTTP 503', 1, 'infra_error', 'provider_transport'),
                  (1, None, '', 'HTTP 429', 1, 'infra_error', 'provider_transport'),
+                 (1, None, '', 'error sending request for url (http://127.0.0.1/v1/chat/completions)', 0, 'infra_error', 'provider_transport'),
                  (1, None, '', 'DNS connection TLS failed', 1, 'infra_error', 'provider_transport'),
                  (1, None, '', 'agent failure', 1, 'fail', 'agent_error'),
                  (0, None, '', '', 0, 'fail', 'verifier_reward'),
