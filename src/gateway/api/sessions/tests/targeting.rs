@@ -1951,6 +1951,9 @@ async fn none_targeted_scope_rejected() {
         .expect_err("test: named events");
     assert!(events.downcast_ref::<AgentScopeUnsupported>().is_some(), "{events:#}");
 
+    // Job snapshots span all fixtures in this process. Identify only this
+    // rejected request rather than another test's legitimately submitted job.
+    let session_key = format!("prx-rejected-scope-{}", uuid::Uuid::new_v4());
     let temp = tempfile::tempdir().expect("test: tempdir");
     let mut config = Config::default();
     config.workspace_dir = temp.path().to_owned();
@@ -1961,7 +1964,7 @@ async fn none_targeted_scope_rejected() {
     state.mem = Arc::new(NoneMemory::new());
     let response = post_session_message(
         State(state.clone()),
-        Path(SESSION.to_owned()),
+        Path(session_key.clone()),
         http_request(serde_json::json!({"message": "hi", "agent": "x"})),
     )
     .await
@@ -1977,11 +1980,11 @@ async fn none_targeted_scope_rejected() {
     assert!(state.mem.agent_registry().is_none(), "no registry row");
     let session = state
         .mem
-        .get_conversation_session(SESSION)
+        .get_conversation_session(&session_key)
         .await
         .expect("test: read session");
     assert!(session.is_none(), "no input event");
-    let job_label = format!("gateway:session_message:{SESSION}");
+    let job_label = format!("gateway:session_message:{session_key}");
     assert!(
         crate::gateway::jobs::snapshot_all()
             .iter()
