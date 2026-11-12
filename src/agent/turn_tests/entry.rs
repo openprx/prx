@@ -117,7 +117,7 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
         .map(|tool| tool.spec())
         .collect::<Vec<_>>();
     assert_eq!(expected_specs.len(), 1);
-    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+    let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_memory(
         config,
         raw_turn_text,
         Arc::clone(&tools_registry),

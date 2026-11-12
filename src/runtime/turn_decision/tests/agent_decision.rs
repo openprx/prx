@@ -641,7 +641,7 @@ async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
 }
 
 #[tokio::test]
-async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
+async fn enabled_engine_without_recording_runs_generator_gates_and_builtin() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
@@ -662,9 +662,17 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         .await
         .expect("source-bound builtin decision");
     assert!(matches!(result.directive(), TurnExecutionDirective::AnswerDirectly));
-    service
+    let error = service
         .agent_execution_specs(&proof, &result)
-        .expect("confidence Answer uses ordinary model publication");
+        .err()
+        .expect("test: abstained Answer does not publish executable specs");
+    assert!(
+        matches!(
+            error.downcast_ref::<DirectiveError>(),
+            Some(DirectiveError::NonExecutableSelection { kind: "answer" })
+        ),
+        "test: confidence fallback retains its typed selection: {error:#}"
+    );
     assert!(matches!(
         &result.engine().candidates,
         crate::causal_tree::candidate_generator::CandidateSet::Legal { .. }
@@ -870,12 +878,16 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
         ));
         assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
         assert!(context.execution_refs().is_empty());
+        let error = service
+            .agent_execution_specs(&proof, &context)
+            .err()
+            .expect("test: fallback Answer cannot publish executable specs");
         assert!(
-            service
-                .agent_execution_specs(&proof, &context)
-                .unwrap()
-                .specs
-                .is_empty()
+            matches!(
+                error.downcast_ref::<DirectiveError>(),
+                Some(DirectiveError::NonExecutableSelection { kind: "answer" })
+            ),
+            "test: fallback preserves typed Answer refusal: {error:#}"
         );
         context.terminal_execution_trace();
     }

@@ -96,6 +96,28 @@ impl AdmittedTurn {
         .await
     }
 
+    pub(crate) async fn with_prediction_tools(
+        workspace: &Path,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    ) -> Self {
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace.to_path_buf();
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: prediction fixture memory"));
+        Self::with_prediction_memory(config, input, registry, memory).await
+    }
+
+    pub(crate) async fn with_prediction_memory(
+        mut config: crate::config::Config,
+        input: &str,
+        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+        memory: Arc<dyn crate::memory::Memory>,
+    ) -> Self {
+        config.causal_tree.enabled = true;
+        Self::with_enabled_builtin_model(config, input, registry, memory, ("ollama", "prx-local-model")).await
+    }
+
     pub(crate) async fn with_memory(
         config: crate::config::Config,
         input: &str,
@@ -652,6 +674,11 @@ impl AdmittedTurn {
             );
         }
         let ordinary_controlled = matches!(&origin, FixtureOrigin::OrdinaryControlledChannel(_));
+        if ordinary_controlled {
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        }
         let channel_surface = matches!(
             &origin,
             FixtureOrigin::Channel(_) | FixtureOrigin::OrdinaryControlledChannel(_)

@@ -845,9 +845,12 @@ async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_
     crate::runtime::turn_decision::with_scored_prediction(async {
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "gpio_read" })];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        // This structural request retains the separately gated search control on
-        // its terminal provider hop, so the budget must include that exact schema.
-        let tool_specs = tool_specs_of(&tools_registry);
+        // The only business capability is direct; no deferred entry remains for
+        // capability_search. Measure precisely the schema actually offered.
+        let tool_specs = tool_specs_of(&tools_registry)
+            .into_iter()
+            .filter(|spec| spec.name != "capability_search")
+            .collect::<Vec<_>>();
         let appended_tokens = compiled_instruction_tokens(&tool_specs);
         let payload_tokens =
             budgeted_tokens(crate::agent::turn_context::measure_native_tool_payload(&tool_specs).measurement);
@@ -883,6 +886,10 @@ async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_
         let mut admission_config = crate::config::Config::default();
         admission_config.workspace_dir = workspace.path().to_path_buf();
         admission_config.agent.compaction = config.clone();
+        admission_config
+            .tool_tiering
+            .always_include
+            .push("gpio_read".to_owned());
         let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_config(
             admission_config,
             &history.last().expect("current fixture input").content,

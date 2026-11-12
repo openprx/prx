@@ -1149,14 +1149,10 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         );
     } else {
         let answer = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly);
-        if answer {
-            service.agent_execution_specs(&proof, &context)?;
-        } else {
-            assert!(
-                service.agent_execution_specs(&proof, &context).is_err(),
-                "test: no selected executable delegation"
-            );
-        }
+        assert!(
+            service.agent_execution_specs(&proof, &context).is_err(),
+            "test: policy refusal exposes no selected executable delegation"
+        );
         assert!(service.issue_child_grant(&proof, &context).is_err());
         assert_eq!(
             match service.verified_delegation_scope(&context) {

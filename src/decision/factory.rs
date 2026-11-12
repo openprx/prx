@@ -2297,6 +2297,7 @@ mod tests {
     fn a_disabled_plane_never_opens_the_credential_store() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
+        disabled.decision_engine.enabled = false;
         disabled.causal_tree.enabled = false;
         disabled.causal_tree.backend.credential_ref = CredentialRefSetting::Profile("cred-decision-held".to_string());
         // Declared in the configuration, which the configuration check reads.

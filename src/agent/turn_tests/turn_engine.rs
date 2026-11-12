@@ -750,7 +750,7 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         let mut config = crate::config::Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_memory(
             config,
             input,
             Arc::clone(&tools_registry),
@@ -1310,6 +1310,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
             let mut config = crate::config::Config::default();
             config.workspace_dir = tmp.path().to_path_buf();
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
             let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
                 config,
                 &history.last().expect("source input").content,

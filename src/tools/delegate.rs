@@ -1519,7 +1519,7 @@ impl DelegateLoopResources {
             turn.enrich_input(&mut history)?;
         }
         let result = loop_cleanup
-            .run(crate::agent::turn_engine::run_turn(
+            .run(Box::pin(crate::agent::turn_engine::run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
                     advice: None,
@@ -1564,7 +1564,7 @@ impl DelegateLoopResources {
                     on_delta: None,
                     on_tool_call: None,
                 },
-            ))
+            )))
             .await;
         let result = match result {
             Ok((outcome, trace)) => {
@@ -2841,7 +2841,18 @@ pub(crate) mod tests {
             ),
         )
         .await;
-        assert!(result.success, "{:?}", result.error);
+        assert!(
+            !result.success,
+            "test: expired Clarify selection must refuse child execution"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("decision selection clarify is not executable")),
+            "test: refused child preserves its Clarify reason: {:?}",
+            result.error
+        );
         assert!(
             requests.is_empty(),
             "expired child admission must not reach the provider"

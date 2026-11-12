@@ -519,7 +519,7 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
             "selected fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
             workspace.path(),
             routing_input,
             Arc::clone(&tools_registry),
@@ -605,7 +605,7 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
             "selected fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
             workspace.path(),
             routing_input,
             Arc::clone(&tools_registry),
@@ -698,7 +698,7 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
             "selected fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
             workspace.path(),
             routing_input,
             Arc::clone(&tools_registry),
@@ -799,7 +799,7 @@ async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
             "selected fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
             workspace.path(),
             routing_input,
             Arc::clone(&tools_registry),
@@ -884,7 +884,7 @@ async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
             "selected fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
             workspace.path(),
             routing_input,
             Arc::clone(&tools_registry),
@@ -1805,8 +1805,8 @@ impl Tool for ChildSurfaceProbe {
             )
             .await?;
             anyhow::ensure!(
-                child.routing().context.engine().prediction.is_none(),
-                "ungated child has no engine prediction"
+                child.routing().context.engine().prediction.is_some(),
+                "test: child inherits the explicitly enabled prediction engine"
             );
             let child_routing = child.routing();
             let child_selection = child_routing

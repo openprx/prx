@@ -586,6 +586,7 @@ impl Driver {
 }
 
 pub fn configure(config: &mut openprx::config::Config, endpoint: &str) -> Result<()> {
+    config.decision_engine.enabled = true;
     config.causal_tree.enabled = true;
     config.causal_tree.backend.kind = serde_json::from_value(json!("compatible_http"))?;
     endpoint.clone_into(&mut config.causal_tree.backend.endpoint);

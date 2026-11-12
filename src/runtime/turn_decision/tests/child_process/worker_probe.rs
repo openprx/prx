@@ -32,6 +32,10 @@ where
     let outcome = cleanup
         .run(boxed_parent_issuance(|| async {
             Ok(std::panic::AssertUnwindSafe(boxed_parent_issuance(|| async {
+                let mut config = config.clone();
+                config.decision_engine.enabled = true;
+                config.causal_tree.backend.kind =
+                    crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
                 let generation = crate::config::new_shared(config.clone()).pin();
                 let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));
                 let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
@@ -113,7 +117,11 @@ where
                 let context = service
                     .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
                     .await?;
-                assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
+                assert!(
+                    matches!(context.directive(), TurnExecutionDirective::Delegate { .. }),
+                    "test: parent manifest requires admitted delegation: {:?}",
+                    context.engine.selection
+                );
                 assert!(context.record_admitted.load(Ordering::Acquire));
                 let selected = service.agent_execution_specs(&proof, &context)?;
                 assert_eq!(selected.specs.len(), 1);

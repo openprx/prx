@@ -1293,7 +1293,10 @@ mod tests {
                 .await
                 .expect_err("test: explicit prediction abstention has no executable selection");
             assert!(
-                error.to_string().contains("decision has no executable selection"),
+                matches!(
+                    error.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
+                    Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind: "clarify" })
+                ),
                 "test: explicit prediction failure: {error}"
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
