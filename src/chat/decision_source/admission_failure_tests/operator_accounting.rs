@@ -42,7 +42,7 @@ async fn decision_reply(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<
     );
     calls.fetch_add(1, Ordering::SeqCst);
     // A decoded response with real usage but missing answers must settle its
-    // physical request before semantic rejection and truthful builtin fallback.
+    // physical request before semantic rejection and the bounded failure close.
     // No private wire question IDs are guessed or forged here.
     Json(json!({"model":"prx-operator-decision", "answers":{},
         "usage":{"input_tokens":20,"output_tokens":10}}))
@@ -301,11 +301,26 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
                     usize::from(prediction),
                     "only explicit prediction sends to the decision backend"
                 );
-                assert!(
-                    !turn.is_close()?,
-                    "ungated child is Direct-surface Run: {:?}",
-                    turn.routing().context.directive()
-                );
+                if prediction {
+                    assert!(
+                        turn.is_close()?,
+                        "test: missing prediction answers must not produce executable admission"
+                    );
+                    assert!(
+                        matches!(
+                            turn.routing().context.directive(),
+                            crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code }
+                                if reason_code == "decision_failed"
+                        ),
+                        "test: semantic prediction failure keeps its bounded close"
+                    );
+                } else {
+                    assert!(
+                        !turn.is_close()?,
+                        "test: Auto without a backend stays Direct-surface Run: {:?}",
+                        turn.routing().context.directive()
+                    );
+                }
                 drop(turn);
                 Ok::<_, anyhow::Error>(())
             })
