@@ -494,7 +494,8 @@ addition to file, fixed-operation MCP and lifecycle mutations. Approval binds
 all normalized arguments; explicit resume executes the stored call once and
 retains tool-specific policy. A Console owner's existing isolation restrictions
 still apply, so this does not grant Console access to host Shell. The plain
-agent CLI has no review adapter; use Chat or Console for this workflow.
+agent CLI has no review adapter. Ordinary Chat uses its interactive execution
+approval prompt and does not require this explicit Console resume workflow.
 
 An operator can call the authenticated plugin reload route through
 `prx plugin reload NAME --gateway-url URL --token-from-stdin --yes`. The command

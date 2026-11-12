@@ -84,7 +84,7 @@ impl Eq for CallTokenBudget {}
 pub(crate) struct TurnSurface {
     registry_generation: Option<[u8; 32]>,
     published: BTreeSet<String>,
-    capability_ids: BTreeMap<String, String>,
+    capability_ids: Arc<BTreeMap<String, String>>,
     exclusions: BTreeSet<String>,
     model_allowlist: Option<BTreeSet<String>>,
 }
@@ -114,7 +114,7 @@ impl TurnSurface {
         let mut surface = Self {
             registry_generation: live_generation(service),
             published: BTreeSet::new(),
-            capability_ids: BTreeMap::new(),
+            capability_ids: Arc::new(BTreeMap::new()),
             exclusions,
             model_allowlist,
         };
@@ -158,14 +158,16 @@ impl TurnSurface {
         mut self,
         catalog: &crate::tools::capability::catalog::CapabilityCatalog,
     ) -> Self {
-        self.capability_ids = catalog
-            .public_names()
-            .filter_map(|name| {
-                catalog
-                    .entry_for_public_name(name)
-                    .map(|entry| (name.to_owned(), entry.id.as_str().to_owned()))
-            })
-            .collect();
+        self.capability_ids = Arc::new(
+            catalog
+                .public_names()
+                .filter_map(|name| {
+                    catalog
+                        .entry_for_public_name(name)
+                        .map(|entry| (name.to_owned(), entry.id.as_str().to_owned()))
+                })
+                .collect(),
+        );
         self
     }
 
