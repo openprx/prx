@@ -107,6 +107,7 @@ enum LegacyEvents {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CollectionBudget {
     Standard,
+    WorkingRoot,
     /// The default fixture with the live G6 tokens narrowed after the decision.
     Narrowed,
     /// A money ceiling between a request carrying the raw and the Gemini-cleaned schema.
@@ -224,25 +225,33 @@ async fn exact_file_collection_with_legacy_events(
 ) {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
+    let working_root = workspace.path().join("working-root");
+    std::fs::create_dir(&working_root).expect("test: working root");
+    let file_root = if matches!(budget, CollectionBudget::WorkingRoot) {
+        working_root.as_path()
+    } else {
+        workspace.path()
+    };
     let tool_name = if edit { "file_edit" } else { "file_write" };
     let original = "prefix\noriginal contents\nsuffix\n";
     if edit {
-        std::fs::write(workspace.path().join("prx-approved.txt"), original).unwrap();
+        std::fs::write(file_root.join("prx-approved.txt"), original).unwrap();
     }
-    std::fs::write(workspace.path().join("prx-unrelated.txt"), "unrelated contents").unwrap();
+    std::fs::write(file_root.join("prx-unrelated.txt"), "unrelated contents").unwrap();
     let assert_unmodified = || {
         if edit {
             assert_eq!(
-                std::fs::read_to_string(workspace.path().join("prx-approved.txt")).unwrap(),
+                std::fs::read_to_string(file_root.join("prx-approved.txt")).unwrap(),
                 original
             );
         } else {
-            assert!(!workspace.path().join("prx-approved.txt").exists());
+            assert!(!file_root.join("prx-approved.txt").exists());
         }
     };
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
+    config.runtime.workdir = matches!(budget, CollectionBudget::WorkingRoot).then(|| working_root.clone());
     config.causal_tree.enabled = true;
     config.sessions_spawn.allow_recursive_delegation = recursive_budget != RecursiveBudgetCase::Disabled;
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
@@ -263,7 +272,7 @@ async fn exact_file_collection_with_legacy_events(
         .unwrap(),
     );
     match budget {
-        CollectionBudget::Standard => {}
+        CollectionBudget::Standard | CollectionBudget::WorkingRoot => {}
         CollectionBudget::Narrowed => {}
         CollectionBudget::Dialect { .. } => {}
     }
@@ -277,7 +286,7 @@ async fn exact_file_collection_with_legacy_events(
         } else if matches!(budget, CollectionBudget::Dialect { .. }) {
             Box::new(HugeExamplesSchema(Box::new(FileWriteTool::new(Arc::clone(&security)))))
         } else {
-            Box::new(FileWriteTool::new(Arc::clone(&security)))
+            Box::new(FileWriteTool::new(Arc::clone(&security)).with_workdir(config.runtime.workdir.clone()))
         },
         calls: Arc::clone(&dispatches),
     })]);
@@ -446,7 +455,7 @@ async fn exact_file_collection_with_legacy_events(
             cleanup_confirmed: &owned_cleanup_confirmed,
             store_stalled: false,
         })).await;
-        if budget != CollectionBudget::Standard {
+        if !matches!(budget, CollectionBudget::Standard | CollectionBudget::WorkingRoot) {
             assert_eq!(dispatches.load(Ordering::SeqCst), 0);
             return;
         }
@@ -552,7 +561,7 @@ async fn exact_file_collection_with_legacy_events(
             assert_eq!(dispatches.load(Ordering::SeqCst), 0);
             assert_unmodified();
             assert_eq!(
-                std::fs::read_to_string(workspace.path().join("prx-unrelated.txt")).unwrap(),
+                std::fs::read_to_string(file_root.join("prx-unrelated.txt")).unwrap(),
                 "unrelated contents"
             );
             assert_eq!(transports.0.load(Ordering::SeqCst), 0);
@@ -752,7 +761,7 @@ async fn exact_file_collection_with_legacy_events(
         assert_eq!(executed.status, ToolExecutionStatus::Succeeded, "{:?}", executed.error);
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(
-            std::fs::read_to_string(workspace.path().join("prx-approved.txt")).unwrap(),
+            std::fs::read_to_string(file_root.join("prx-approved.txt")).unwrap(),
             if edit {
                 "prefix\napproved exact contents\nsuffix\n"
             } else {
@@ -760,7 +769,7 @@ async fn exact_file_collection_with_legacy_events(
             }
         );
         assert_eq!(
-            std::fs::read_to_string(workspace.path().join("prx-unrelated.txt")).unwrap(),
+            std::fs::read_to_string(file_root.join("prx-unrelated.txt")).unwrap(),
             "unrelated contents"
         );
         assert!(
@@ -1287,4 +1296,22 @@ async fn install_legacy_approval_events(
         .await
         .unwrap();
     assert_eq!(loaded.grants(), approval.grants());
+}
+
+#[tokio::test]
+async fn supervised_working_root_approval_executes_once_and_denial_never_executes() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        for approved in [true, false] {
+            Box::pin(exact_file_collection_with_legacy_events(
+                false,
+                approved,
+                RecursiveBudgetCase::Disabled,
+                LegacyEvents::None,
+                CollectionBudget::WorkingRoot,
+            ))
+            .await;
+        }
+    })
+    .await
+    .expect("test: working-root approval deadline");
 }

@@ -507,6 +507,27 @@ fn shell_sites_refuse_or_harden_git() {
         body("src/tools/shell.rs", "execute_inner").contains("git: shell_git_policy("),
         "shell must select git policy at invocation"
     );
+    for relative in [
+        "src/tools/shell.rs",
+        "src/tools/file_read.rs",
+        "src/tools/file_write.rs",
+        "src/tools/file_edit.rs",
+        "src/runtime/shell_process.rs",
+    ] {
+        let source = fs::read_to_string(repository_root().join(relative)).expect("test: effective-level source");
+        let source = production_part(&source);
+        assert!(
+            source.contains("effective_autonomy::current()"),
+            "test: {relative} must read the per-call level"
+        );
+        assert!(
+            !source.contains("self.security.autonomy") && !source.contains("config.autonomy.level"),
+            "test: {relative} must not widen from global autonomy"
+        );
+    }
+    let shell = body("src/tools/shell.rs", "execute_inner");
+    let compact: String = shell.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("git:shell_git_policy(super::effective_autonomy::current().unwrap_or(crate::security::AutonomyLevel::Supervised),)"), "test: shell selector must use the fail-closed per-call level");
     // D-107 amendment: cron and Xin decide by the recorded creator.
     assert!(
         body("src/cron/scheduler.rs", "run_job_command_with_adapter").contains("git: shell_git_policy(config, job)")

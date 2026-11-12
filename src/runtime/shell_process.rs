@@ -33,8 +33,8 @@ const SHELL_SECRET_ENV: &[&str] = &[
     "ANTHROPIC_OAUTH_TOKEN",
     "GITHUB_TOKEN",
     "SESSION_WORKER_SECRET",
-    "SESSION_WORKER_CAP_ENV",
-    "SESSION_WORKER_CAP_EXPIRY_ENV",
+    crate::tools::sessions_spawn::SESSION_WORKER_CAP_ENV,
+    crate::tools::sessions_spawn::SESSION_WORKER_CAP_EXPIRY_ENV,
 ];
 
 fn shell_secret_environment(name: &std::ffi::OsStr) -> bool {
@@ -43,7 +43,9 @@ fn shell_secret_environment(name: &std::ffi::OsStr) -> bool {
         || bytes.starts_with(b"OPENPRX_")
         || name.to_str().is_some_and(|name| {
             SHELL_SECRET_ENV.contains(&name)
-                || crate::providers::model_discovery::PROVIDER_CREDENTIAL_ENV.contains(&name)
+                || crate::providers::model_discovery::PROVIDER_CREDENTIAL_ENV
+                    .iter()
+                    .any(|(_, variable)| *variable == name)
         })
 }
 
@@ -1571,5 +1573,21 @@ mod tests {
         assert!(output.complete);
         assert!(!output.stdout_truncated);
         assert!(!output.stderr_truncated);
+    }
+}
+
+#[cfg(test)]
+mod secret_name_tests {
+    #[test]
+    fn worker_capability_names_are_denied_by_exact_entry() {
+        for name in [
+            "OPENPRX_SESSION_WORKER_CAPABILITY",
+            "OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY",
+        ] {
+            assert!(
+                super::SHELL_SECRET_ENV.contains(&name),
+                "test: capability must have an exact denylist entry: {name}"
+            );
+        }
     }
 }

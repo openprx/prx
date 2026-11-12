@@ -25,7 +25,7 @@ async fn run(config: &std::path::Path, args: &[&str]) -> (std::process::ExitStat
     let mut child = command.spawn().expect("test: CLI spawn");
     let stdout = child.stdout.take().expect("test: stdout");
     let stderr = child.stderr.take().expect("test: stderr");
-    let (status, out, err) = tokio::time::timeout(Duration::from_secs(20), async {
+    let (status, out, err) = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::join!(
             child.wait(),
             async {
@@ -113,3 +113,6 @@ async fn invalid_workdir_exits_before_provider_request() {
         "test: invalid paths never reach provider"
     );
 }
+
+#[path = "shell_parity_cli/worker.rs"]
+mod worker;

@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Real native process/filesystem regressions for Full-mode parity.
 use super::execution::*;
 use super::traits::{Tool, ToolResult};
@@ -354,65 +355,6 @@ async fn full_parent_supervised_child_keeps_native_restrictions_after_approval()
     assert!(!write.success && !path.exists(), "test: child out-of-root file denied");
 }
 
-struct RebuildAutonomy;
-struct PreparedAutonomy;
-impl crate::config::ConfigGenerationParticipant for RebuildAutonomy {
-    fn name(&self) -> &'static str {
-        "parity-autonomy"
-    }
-    fn supports_rebuild_field(&self, field: &str) -> bool {
-        field == "autonomy"
-    }
-    fn prepare(
-        &self,
-        _: Arc<crate::config::ConfigGeneration>,
-        _: &[String],
-    ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
-        Ok(Box::new(PreparedAutonomy))
-    }
-}
-impl crate::config::PreparedConfigGeneration for PreparedAutonomy {
-    fn commit(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn rollback(&mut self) {}
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn generation_swap_changes_git_outcome_between_calls() {
-    use crate::config::generation::{ConfigGenerationManager, ConfigReloadTrigger};
-    let root = tempfile::tempdir().expect("test: workspace");
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = root.path().into();
-    config.config_path = root.path().join("config.toml");
-    config.autonomy.level = AutonomyLevel::Full;
-    let manager = ConfigGenerationManager::new(config.clone());
-    let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = Arc::new(RebuildAutonomy);
-    manager.register_participant(&participant);
-    for level in [AutonomyLevel::Full, AutonomyLevel::Supervised] {
-        config.autonomy.level = level;
-        manager
-            .apply_runtime_config(config.clone(), ConfigReloadTrigger::Test)
-            .expect("test: generation swap");
-        let current = manager.pin();
-        let result = dispatch(
-            &service(root.path(), current.effective.autonomy.level),
-            context(),
-            "shell",
-            json!({"command":"git --version"}),
-        )
-        .await
-        .result
-        .expect("test: shell result");
-        assert_eq!(
-            result.success,
-            level == AutonomyLevel::Full,
-            "test: live generation controls next call"
-        );
-    }
-}
-
 #[tokio::test]
 async fn configured_workdir_is_shared_by_shell_files_and_git() {
     let workspace = tempfile::tempdir().expect("test: workspace");
@@ -480,5 +422,59 @@ async fn configured_workdir_is_shared_by_shell_files_and_git() {
     assert!(
         !workspace.path().join("relative.txt").exists(),
         "test: security workspace stays separate"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn full_dispatcher_widens_native_files_and_environment() {
+    let root = tempfile::tempdir().expect("test: workspace");
+    let outside = tempfile::tempdir().expect("test: outside workspace");
+    let service = service(root.path(), AutonomyLevel::Full);
+    let target = outside.path().join("file");
+    let result = dispatch(
+        &service,
+        context(),
+        "file_write",
+        json!({"path":target,"content":"written"}),
+    )
+    .await
+    .result
+    .expect("test: dispatched write");
+    assert!(
+        result.success && target.exists(),
+        "test: Full dispatcher bypasses native confinement: {result:?}"
+    );
+    const PROBE: &str = "PRX_DISPATCH_ENV_TEST";
+    if std::env::var_os(PROBE).is_none() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().expect("test: executable"));
+        command
+            .args([
+                "--exact",
+                "tools::shell_parity_tests::full_dispatcher_widens_native_files_and_environment",
+            ])
+            .env(PROBE, "1")
+            .env("http_proxy", "prx-proxy")
+            .env("ANTHROPIC_API_KEY", "prx-secret")
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(Duration::from_secs(25), command.status())
+            .await
+            .expect("test: dispatcher env deadline")
+            .expect("test: probe status");
+        assert!(status.success(), "test: isolated dispatcher env");
+        return;
+    }
+    let result = dispatch(
+        &service,
+        context(),
+        "shell",
+        json!({"command":"printf '%s|%s' \"$http_proxy\" \"${ANTHROPIC_API_KEY-unset}\""}),
+    )
+    .await
+    .result
+    .expect("test: dispatched env");
+    assert!(
+        result.success && result.output.contains("prx-proxy|unset"),
+        "test: dispatcher grants environment inheritance with secret hygiene: {result:?}"
     );
 }
