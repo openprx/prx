@@ -93,13 +93,14 @@ impl WorkerMailboxSender {
                     state: saved.state,
                 });
             }
-            if i64::try_from(seen.len()).map_err(|_| MailboxError::CorruptState)? >= crate::messaging::mailbox::MAX_ROWS
+            if i64::try_from(seen.len()).map_err(|_| MailboxError::CorruptState)?
+                >= crate::messaging::mailbox::MAX_QUEUE
             {
                 return Err(MailboxError::Quota("rows"));
             }
         }
-        // Reserve before enqueue: a fast async consumer can mark Consumed
-        // before blocking_send returns. Never overwrite that state afterwards.
+        // Reserve before enqueue: a fast async consumer can remove the entry
+        // before blocking_send returns. Never recreate that entry afterwards.
         self.seen.lock().insert(
             identity.clone(),
             InboxReceipt {
@@ -132,7 +133,7 @@ impl WorkerMailboxInbox {
         if entry.id != message.id || entry.digest != crate::messaging::request_digest(message) {
             return Err(MailboxError::IdempotencyConflict);
         }
-        entry.state = DeliveryState::Consumed;
+        seen.remove(&(message.from.instance.clone(), message.idempotency.as_str().to_owned()));
         Ok(WorkerOutputFrame::Ack {
             message_id: message.id,
             state: DeliveryState::Consumed,

@@ -63,10 +63,13 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let (_root, config_dir, workspace_dir, home) = worker_dirs();
     let parent_workspace = config_dir.join("workspace");
     let worker_workspace_root = workspace_dir.join("workers");
-    std::fs::create_dir_all(&worker_workspace_root).expect("worker workspace root");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
-    listener.set_nonblocking(true).expect("nonblocking loopback");
-    let destination = format!("custom:http://{}/v1", listener.local_addr().expect("loopback address"));
+    std::fs::create_dir_all(&worker_workspace_root).expect("test: worker workspace root");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test: loopback bind");
+    listener.set_nonblocking(true).expect("test: nonblocking loopback");
+    let destination = format!(
+        "custom:http://{}/v1",
+        listener.local_addr().expect("test: loopback address")
+    );
     let seen = Arc::new(Mutex::new(Vec::<ProviderRequest>::new()));
     let captured = Arc::new(Mutex::new(BTreeMap::<String, WorkerManifest>::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -80,7 +83,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                 Ok((mut stream, _)) => {
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                        .expect("loopback read timeout");
+                        .expect("test: loopback read timeout");
                     let mut buffer = Vec::new();
                     let mut chunk = [0_u8; 4096];
                     let head_end = loop {
@@ -163,10 +166,15 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                     let assistant = if request_body
                         .contains("Review the proposed final reply against the CURRENT request")
                     {
-                        let request: serde_json::Value = serde_json::from_str(&request_body).expect("review request");
-                        assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
+                        let request: serde_json::Value =
+                            serde_json::from_str(&request_body).expect("test: review request");
                         assert!(
-                            request_body.contains("observed_tools") && request_body.contains("proposed_final_reply")
+                            request["tools"].as_array().is_none_or(Vec::is_empty),
+                            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+                        );
+                        assert!(
+                            request_body.contains("observed_tools") && request_body.contains("proposed_final_reply"),
+                            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
                         );
                         serde_json::json!({"role":"assistant", "content": r#"{"decision":"accept","reason":"fixture evidence accepted","constraints":[]}"#})
                     } else if request_body.contains("Classify the execution requirement of current_request") {
@@ -242,7 +250,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         let (delta, finish_reason) = assistant.get("tool_calls").map_or_else(
                             || (serde_json::json!({"content": assistant["content"]}), "stop"),
                             |calls| {
-                                let mut calls = calls.as_array().expect("tool calls array").clone();
+                                let mut calls = calls.as_array().expect("test: tool calls array").clone();
                                 for (index, call) in calls.iter_mut().enumerate() {
                                     call["index"] = serde_json::json!(index);
                                 }
@@ -266,7 +274,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    stream.write_all(response.as_bytes()).expect("loopback reply");
+                    stream.write_all(response.as_bytes()).expect("test: loopback reply");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -310,13 +318,16 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         "route parent stderr: {}",
         String::from_utf8_lossy(&route_output.stderr)
     );
-    assert!(String::from_utf8_lossy(&route_output.stdout).contains("PRX-WORKER-OK"));
+    assert!(
+        String::from_utf8_lossy(&route_output.stdout).contains("PRX-WORKER-OK"),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert_parent_join(&seen.lock(), "PRX-ROUTE-PARENT", 1);
     let mut manifest = captured
         .lock()
         .get("PRX-ROUTE-CHILD")
         .cloned()
-        .expect("production route manifest");
+        .expect("test: production route manifest");
     assert_authenticated_source(&manifest);
     assert_sealed_child(&manifest, &seen.lock(), "PRX-ROUTE-CHILD");
     assert_completion_journal(&parent_workspace, &manifest);
@@ -325,16 +336,22 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         seen.lock()
             .iter()
             .filter(|request| request.marker == "PRX-ROUTE-CHILD")
-            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY"))
+            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY")),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
 
     // Replay the genuine production-issued source with only the selected
     // credential changed. A fresh outer HMAC cannot make that mutation match
     // the authenticated model selection carried by the inner source.
-    assert_eq!(manifest.route_hint.as_deref(), Some("fast"));
+    assert_eq!(
+        manifest.route_hint.as_deref(),
+        Some("fast"),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert_eq!(
         manifest.route_credential,
-        Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string())))
+        Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string()))),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
     manifest.api_key = Some("PRX-WORKER-ROOT-KEY".to_string());
     manifest.parent_capability = None;
@@ -346,7 +363,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let mut bad_stdin = take_stdin(&mut bad_child);
     write_production_manifest_line(
         &mut bad_stdin,
-        &serde_json::to_string(&manifest).expect("tampered manifest JSON"),
+        &serde_json::to_string(&manifest).expect("test: tampered manifest JSON"),
     );
     drop(bad_stdin);
     let bad_run = finish(bad_child, None);
@@ -359,15 +376,19 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         bad_result_error.ends_with("worker provider or credential provenance differs from issued selection"),
         "unexpected refusal: {bad_result_error}"
     );
-    assert_eq!(seen.lock().len(), served_requests);
+    assert_eq!(
+        seen.lock().len(),
+        served_requests,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
 
     // A second worker inherits a named agent's profile on a same-provider
     // route with no route key. Its execution identity stays unset: the sealed
     // credential reference, not `agent_id`, is the source of authority.
     let profile = openprx::config::manage::credentials::CredentialReferences::for_config(&config)
-        .expect("isolated credential store")
+        .expect("test: isolated credential store")
         .set(&destination, "prx-agent-route", "PRX-WORKER-AGENT-KEY")
-        .expect("store isolated agent credential");
+        .expect("test: store isolated agent credential");
     config.model_routes.push(openprx::config::ModelRouteConfig {
         settings: openprx::config::model_settings::ModelSettings::default(),
         hint: "agent".to_string(),
@@ -383,7 +404,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
             "provider = \"{destination}\"\nmodel = \"hint:agent\"\ncredential_ref = \"{}\"\n",
             profile.id
         ))
-        .expect("agent config"),
+        .expect("test: agent config"),
     );
     write_worker_config(&config);
     let agent_output = run_model_parent(&config_dir, &home, "PRX-AGENT-PARENT");
@@ -397,12 +418,13 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         .lock()
         .get("PRX-AGENT-CHILD")
         .cloned()
-        .expect("production agent manifest");
+        .expect("test: production agent manifest");
     assert_authenticated_source(&agent_manifest);
     assert_sealed_child(&agent_manifest, &seen.lock(), "PRX-AGENT-CHILD");
     assert_eq!(
         agent_manifest.route_credential,
-        Some(CredentialRef::Profile { id: profile.id })
+        Some(CredentialRef::Profile { id: profile.id }),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
     assert_completion_journal(&parent_workspace, &agent_manifest);
 
@@ -421,7 +443,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         .body
                         .contains("Review the proposed final reply against the CURRENT request"))
                 .count(),
-            2
+            2,
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
         assert_eq!(
             requests
@@ -431,22 +454,32 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                         .body
                         .contains("Review the proposed final reply against the CURRENT request"))
                 .count(),
-            1
+            1,
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
-        assert!(requests.iter().any(|request| {
-            request.marker == "PRX-DENIED-PARENT"
-                && request
-                    .body
-                    .contains("recursive child delegation is disabled by operator configuration")
-        }));
-        assert!(requests.iter().all(|request| request.marker != "PRX-DENIED-CHILD"));
+        assert!(
+            requests.iter().any(|request| {
+                request.marker == "PRX-DENIED-PARENT"
+                    && request
+                        .body
+                        .contains("recursive child delegation is disabled by operator configuration")
+            }),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+        );
+        assert!(
+            requests.iter().all(|request| request.marker != "PRX-DENIED-CHILD"),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+        );
     }
 
     // Q88's positive phase now requires actual opt-in and real admitted workers.
     let mut recursive_config = config.clone();
     recursive_config.agents.clear();
     recursive_config.sessions_spawn.allow_recursive_delegation = true;
-    assert_eq!(recursive_config.sessions_spawn.max_recursive_depth, 1);
+    assert_eq!(
+        recursive_config.sessions_spawn.max_recursive_depth, 1,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     write_worker_config(&recursive_config);
     let nested_output = run_model_parent(&config_dir, &home, "PRX-NESTED-PARENT");
     assert!(
@@ -468,31 +501,39 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         .lock()
         .get("PRX-NESTED-CHILD")
         .cloned()
-        .expect("actual nested worker manifest");
+        .expect("test: actual nested worker manifest");
     let leaf = captured
         .lock()
         .get("PRX-NESTED-LEAF")
         .cloned()
-        .expect("actual grandchild manifest");
+        .expect("test: actual grandchild manifest");
     assert_authenticated_source(&nested);
     assert_authenticated_source(&leaf);
     let scope = nested
         .capability_manifest
         .as_ref()
-        .expect("sealed recursive child scope");
+        .expect("test: sealed recursive child scope");
     let parent = &nested
         .child_source
         .as_ref()
-        .expect("admitted recursive source")
+        .expect("test: admitted recursive source")
         .parent_constraints;
-    assert_eq!(scope.allowed.len(), 1);
+    assert_eq!(
+        scope.allowed.len(),
+        1,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert!(
         scope
             .allowed
             .iter()
-            .all(|reference| reference.id.ends_with(":sessions_spawn"))
+            .all(|reference| reference.id.ends_with(":sessions_spawn")),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
-    assert!(scope.allowed.len() < parent.allowed.len());
+    assert!(
+        scope.allowed.len() < parent.allowed.len(),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert!(
         scope
             .allowed
@@ -501,33 +542,72 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                 allowed.id == reference.id
                     && allowed.fingerprint == reference.fingerprint
                     && allowed.generation == reference.generation
-            }))
+            })),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
-    assert_eq!(scope.remaining_depth, 1);
-    assert!(scope.max_cost_cents <= parent.max_cost_cents);
+    assert_eq!(
+        scope.remaining_depth, 1,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert!(
+        scope.max_cost_cents <= parent.max_cost_cents,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     let pins = scope
         .delegation
         .as_ref()
-        .expect("explicit delegation recorded under seal");
-    assert!(pins.requested);
+        .expect("test: explicit delegation recorded under seal");
+    assert!(
+        pins.requested,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert_eq!(
         openprx::providers::ProviderId::of(&pins.provider),
-        openprx::providers::ProviderId::of(&destination)
+        openprx::providers::ProviderId::of(&destination),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
-    assert_eq!(pins.model, "probe-model");
-    assert_eq!(leaf.parent_run_id.as_deref(), Some(nested.run_id.as_str()));
-    assert_eq!(leaf.owner_id, nested.owner_id);
-    let leaf_scope = leaf.capability_manifest.as_ref().expect("sealed leaf scope");
-    assert!(leaf_scope.allowed.is_empty());
-    assert_eq!(leaf_scope.remaining_depth, 0);
+    assert_eq!(
+        pins.model, "probe-model",
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert_eq!(
+        leaf.parent_run_id.as_deref(),
+        Some(nested.run_id.as_str()),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert_eq!(
+        leaf.owner_id, nested.owner_id,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    let leaf_scope = leaf.capability_manifest.as_ref().expect("test: sealed leaf scope");
+    assert!(
+        leaf_scope.allowed.is_empty(),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert_eq!(
+        leaf_scope.remaining_depth, 0,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     let leaf_pins = leaf_scope
         .delegation
         .as_ref()
-        .expect("leaf retains inherited model pins");
-    assert!(!leaf_pins.requested);
-    assert_eq!(leaf_pins.provider, pins.provider);
-    assert_eq!(leaf_pins.model, pins.model);
-    assert!(leaf_scope.max_cost_cents <= scope.max_cost_cents);
+        .expect("test: leaf retains inherited model pins");
+    assert!(
+        !leaf_pins.requested,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert_eq!(
+        leaf_pins.provider, pins.provider,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert_eq!(
+        leaf_pins.model, pins.model,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert!(
+        leaf_scope.max_cost_cents <= scope.max_cost_cents,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     {
         let requests = seen.lock();
         assert_eq!(
@@ -535,7 +615,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                 .iter()
                 .filter(|request| request.marker == "PRX-NESTED-LEAF")
                 .count(),
-            1
+            1,
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
         assert!(
             requests
@@ -543,7 +624,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                 .filter(|request| request.marker == "PRX-NESTED-CHILD")
                 .all(|request| {
                     request.head.contains("PRX-WORKER-ROUTE-KEY") && request.body.contains("probe-model")
-                })
+                }),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
         assert!(
             requests
@@ -551,7 +633,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
                 .filter(|request| request.marker == "PRX-NESTED-LEAF")
                 .all(|request| {
                     request.head.contains("PRX-WORKER-ROUTE-KEY") && request.body.contains("probe-model")
-                })
+                }),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
         assert_sealed_child(&leaf, &requests, "PRX-NESTED-LEAF");
     }
@@ -573,13 +656,19 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let mut wrong_parent_stdin = take_stdin(&mut wrong_parent_child);
     write_production_manifest_line(
         &mut wrong_parent_stdin,
-        &serde_json::to_string(&wrong_parent).expect("wrong-parent manifest JSON"),
+        &serde_json::to_string(&wrong_parent).expect("test: wrong-parent manifest JSON"),
     );
     drop(wrong_parent_stdin);
     let wrong_parent_run = finish(wrong_parent_child, None);
     let wrong_parent_result = assert_single_json_line(&wrong_parent_run.stdout);
-    assert!(wrong_parent_run.status.success());
-    assert!(!wrong_parent_result.success);
+    assert!(
+        wrong_parent_run.status.success(),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
+    assert!(
+        !wrong_parent_result.success,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     // The worker reports the full error chain (path context first); the
     // refusal reason must stay the innermost cause.
     let wrong_parent_result_error = wrong_parent_result.error.as_deref().unwrap_or_default();
@@ -587,16 +676,20 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         wrong_parent_result_error.ends_with("session-worker parent decision differs from issued authority"),
         "unexpected refusal: {wrong_parent_result_error}"
     );
-    assert_eq!(seen.lock().len(), requests_before_wrong_parent);
+    assert_eq!(
+        seen.lock().len(),
+        requests_before_wrong_parent,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     // Finding94: retain every original phase above, then exercise a new real
     // recursive worker's fanout and reissue attempts. A refused two-leaf batch
     // consumes no slot; one valid leaf can run, and another turn cannot mint
     // a second copy of that same subtree allowance.
     let fanout_config_dir = config_dir
         .parent()
-        .expect("fixture config parent")
+        .expect("test: fixture config parent")
         .join("fanout-config");
-    std::fs::create_dir_all(&fanout_config_dir).expect("isolated fanout config");
+    std::fs::create_dir_all(&fanout_config_dir).expect("test: isolated fanout config");
     let fanout_workspace = fanout_config_dir.join("workspace");
     let mut fanout_config = recursive_config.clone();
     fanout_config.config_path = fanout_config_dir.join("config.toml");
@@ -617,7 +710,10 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         "fanout parent stderr: {}",
         String::from_utf8_lossy(&fanout_output.stderr)
     );
-    assert!(String::from_utf8_lossy(&fanout_output.stdout).contains("PRX-WORKER-OK"));
+    assert!(
+        String::from_utf8_lossy(&fanout_output.stdout).contains("PRX-WORKER-OK"),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     {
         let requests = seen.lock();
         assert_parent_join(&requests, "PRX-FANOUT-PARENT", 1);
@@ -631,14 +727,21 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
             "all refusal, successful leaf and reissue phases must reach the model"
         );
         assert_join_summary(child[3], 1);
-        assert!(child[1].body.contains("at most one child"));
-        assert!(child[4].body.contains("already allocated its one child allowance"));
+        assert!(
+            child[1].body.contains("at most one child"),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+        );
+        assert!(
+            child[4].body.contains("already allocated its one child allowance"),
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+        );
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.marker == "PRX-FANOUT-LEAF")
                 .count(),
-            1
+            1,
+            "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
         );
         assert!(
             requests.iter().all(|request| !matches!(
@@ -649,25 +752,30 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         );
     }
     let manifests = captured.lock();
-    let fanout = manifests.get("PRX-FANOUT-CHILD").expect("real recursive worker");
-    let only_leaf = manifests.get("PRX-FANOUT-LEAF").expect("one real leaf worker");
+    let fanout = manifests.get("PRX-FANOUT-CHILD").expect("test: real recursive worker");
+    let only_leaf = manifests.get("PRX-FANOUT-LEAF").expect("test: one real leaf worker");
     assert_authenticated_source(fanout);
     assert_authenticated_source(only_leaf);
     let allowance = fanout
         .capability_manifest
         .as_ref()
-        .expect("recursive allowance")
+        .expect("test: recursive allowance")
         .max_cost_cents;
     assert!(allowance > 0, "the fanout limit must protect a nonzero allowance");
     assert!(
         only_leaf
             .capability_manifest
             .as_ref()
-            .expect("leaf allowance")
+            .expect("test: leaf allowance")
             .max_cost_cents
-            <= allowance
+            <= allowance,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
-    assert_eq!(only_leaf.parent_run_id.as_deref(), Some(fanout.run_id.as_str()));
+    assert_eq!(
+        only_leaf.parent_run_id.as_deref(),
+        Some(fanout.run_id.as_str()),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
     assert_completion_journal(&fanout_workspace, fanout);
     assert_completion_journal(&fanout_workspace, only_leaf);
     drop(manifests);
@@ -691,7 +799,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let mut missing_source_stdin = take_stdin(&mut missing_source_child);
     write_production_manifest_line(
         &mut missing_source_stdin,
-        &serde_json::to_string(&missing_source_manifest).expect("missing-source manifest JSON"),
+        &serde_json::to_string(&missing_source_manifest).expect("test: missing-source manifest JSON"),
     );
     drop(missing_source_stdin);
     let missing_source_run = finish(missing_source_child, None);
@@ -726,7 +834,8 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         requests
             .iter()
             .filter(|request| request.marker == "PRX-ROUTE-CHILD")
-            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY"))
+            .all(|request| request.head.contains("PRX-WORKER-ROUTE-KEY")),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
     assert!(
         requests
@@ -738,13 +847,15 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     assert!(
         requests
             .iter()
-            .all(|request| !request.head.contains("PRX-WORKER-ROOT-KEY"))
+            .all(|request| !request.head.contains("PRX-WORKER-ROOT-KEY")),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
     assert!(
         requests
             .iter()
             .filter(|request| request.marker == "PRX-AGENT-CHILD")
-            .all(|request| request.head.contains("PRX-WORKER-AGENT-KEY"))
+            .all(|request| request.head.contains("PRX-WORKER-AGENT-KEY")),
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
     );
     assert!(
         requests
@@ -753,7 +864,10 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
             .all(|request| request.body.contains("agent-model")),
         "named-agent child request used the wrong model"
     );
-    assert!(agent_requests > served_requests);
+    assert!(
+        agent_requests > served_requests,
+        "sealed route worker sends only its route key on wire: IPC identity or delivery state changed"
+    );
 }
 
 struct ProviderRequest {
@@ -771,7 +885,7 @@ impl OwnedProviderServer {
     fn finish(mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("loopback server joins");
+            thread.join().expect("test: loopback server joins");
         }
     }
 }
@@ -787,31 +901,50 @@ impl Drop for OwnedProviderServer {
 }
 
 fn assert_delegation_input_record(workspace: &Path, manifest: &WorkerManifest) {
-    let source = manifest.child_source.as_ref().expect("admitted child source");
-    let scope = manifest.capability_manifest.as_ref().expect("sealed child scope");
-    let pins = scope.delegation.as_ref().expect("sealed model pins");
-    let memory = openprx::memory::SqliteMemory::new(workspace).expect("parent admission memory");
+    let source = manifest.child_source.as_ref().expect("test: admitted child source");
+    let scope = manifest.capability_manifest.as_ref().expect("test: sealed child scope");
+    let pins = scope.delegation.as_ref().expect("test: sealed model pins");
+    let memory = openprx::memory::SqliteMemory::new(workspace).expect("test: parent admission memory");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .expect("test: assert_delegation_input_record: build succeeds");
     let event = runtime
         .block_on(memory.find_owned_message_event(
             &source.parent_constraints.workspace,
-            manifest.owner_id.as_deref().expect("child owner"),
+            manifest.owner_id.as_deref().expect("test: child owner"),
             &source.input_event_id,
         ))
-        .unwrap()
-        .expect("durable child admission record");
-    let payload: serde_json::Value = serde_json::from_str(event.raw_payload_json.as_deref().unwrap()).unwrap();
+        .expect("test: assert_delegation_input_record: block_on succeeds")
+        .expect("test: durable child admission record");
+    let payload: serde_json::Value = serde_json::from_str(
+        event
+            .raw_payload_json
+            .as_deref()
+            .expect("test: assert_delegation_input_record: as_deref succeeds"),
+    )
+    .expect("test: assert_delegation_input_record: serde_json::from_str succeeds");
     let delegation = &payload["delegation"];
-    assert_eq!(delegation["requested"], pins.requested);
-    assert_eq!(delegation["remaining_depth"], scope.remaining_depth);
-    assert_eq!(delegation["max_cost_cents"], scope.max_cost_cents);
-    assert_eq!(delegation["model"], pins.model);
+    assert_eq!(
+        delegation["requested"], pins.requested,
+        "assert delegation input record: expected messaging contract changed"
+    );
+    assert_eq!(
+        delegation["remaining_depth"], scope.remaining_depth,
+        "assert delegation input record: expected messaging contract changed"
+    );
+    assert_eq!(
+        delegation["max_cost_cents"], scope.max_cost_cents,
+        "assert delegation input record: expected messaging contract changed"
+    );
+    assert_eq!(
+        delegation["model"], pins.model,
+        "assert delegation input record: expected messaging contract changed"
+    );
     assert_eq!(
         delegation["allowed_tools"].as_array().map(Vec::len),
-        Some(scope.allowed.len())
+        Some(scope.allowed.len()),
+        "assert delegation input record: expected messaging contract changed"
     );
 }
 
@@ -888,9 +1021,9 @@ fn add_provider_fixture_model(config: &mut openprx::config::Config, provider: &s
 fn write_worker_config(config: &openprx::config::Config) {
     std::fs::write(
         &config.config_path,
-        toml::to_string_pretty(config).expect("serialize worker config"),
+        toml::to_string_pretty(config).expect("test: serialize worker config"),
     )
-    .expect("write worker config");
+    .expect("test: write worker config");
 }
 
 fn run_model_parent(config_dir: &Path, home: &Path, message: &str) -> Output {
@@ -899,7 +1032,7 @@ fn run_model_parent(config_dir: &Path, home: &Path, message: &str) -> Output {
     let xdg_state = home.join("xdg-state");
     let xdg_config = home.join("xdg-config");
     for path in [&xdg_data, &xdg_cache, &xdg_state, &xdg_config] {
-        std::fs::create_dir_all(path).expect("isolated parent directory");
+        std::fs::create_dir_all(path).expect("test: isolated parent directory");
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
     command
@@ -925,14 +1058,14 @@ fn run_model_parent(config_dir: &Path, home: &Path, message: &str) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("model parent binary");
+    let mut child = command.spawn().expect("test: model parent binary");
     child
         .stdin
         .take()
-        .expect("model parent stdin")
+        .expect("test: model parent stdin")
         .write_all(format!("Use sessions_spawn in process mode for {message}.\n/exit\n").as_bytes())
-        .expect("model parent script");
-    child.wait_with_output().expect("model parent output")
+        .expect("test: model parent script");
+    child.wait_with_output().expect("test: model parent output")
 }
 
 fn assert_authenticated_source(manifest: &WorkerManifest) {
@@ -953,8 +1086,8 @@ fn assert_sealed_child(manifest: &WorkerManifest, requests: &[ProviderRequest], 
     let request = requests
         .iter()
         .find(|request| request.marker == marker)
-        .expect("sealed child provider request");
-    let body: serde_json::Value = serde_json::from_str(&request.body).expect("sealed child request JSON");
+        .expect("test: sealed child provider request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("test: sealed child request JSON");
     assert!(
         body["tools"].as_array().is_none_or(|tools| tools
             .iter()
@@ -964,7 +1097,7 @@ fn assert_sealed_child(manifest: &WorkerManifest, requests: &[ProviderRequest], 
 }
 
 fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
-    let owner = manifest.owner_id.as_deref().expect("worker owner");
+    let owner = manifest.owner_id.as_deref().expect("test: worker owner");
     let (workspace_id, key, event_type, evidence) = match (
         &manifest.child_source,
         &manifest.ordinary_source,
@@ -991,19 +1124,27 @@ fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
         _ => panic!("completion journal requires exactly one authenticated source"),
     };
     assert_eq!(Path::new(workspace_id), workspace, "journal workspace lineage");
-    let memory = openprx::memory::SqliteMemory::new(workspace).expect("open parent completion memory");
+    let memory = openprx::memory::SqliteMemory::new(workspace).expect("test: open parent completion memory");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("completion journal runtime");
+        .expect("test: completion journal runtime");
     let event = runtime
         .block_on(memory.find_owned_message_event_by_idempotency_key(workspace_id, owner, &key))
-        .expect("completion journal lookup")
-        .expect("completion journal");
-    assert_eq!(event.event_type, event_type);
-    assert_eq!(event.run_id.as_deref(), Some(manifest.run_id.as_str()));
-    let result: WorkerResult = serde_json::from_str(event.raw_payload_json.as_deref().expect("completion payload"))
-        .expect("completion result");
+        .expect("test: completion journal lookup")
+        .expect("test: completion journal");
+    assert_eq!(
+        event.event_type, event_type,
+        "assert completion journal: expected messaging contract changed"
+    );
+    assert_eq!(
+        event.run_id.as_deref(),
+        Some(manifest.run_id.as_str()),
+        "assert completion journal: expected messaging contract changed"
+    );
+    let result: WorkerResult =
+        serde_json::from_str(event.raw_payload_json.as_deref().expect("test: completion payload"))
+            .expect("test: completion result");
     assert!(result.success, "{evidence} completion result: {:?}", result.error);
     let evidence_run_id = result
         .completion_evidence
@@ -1011,7 +1152,11 @@ fn assert_completion_journal(workspace: &Path, manifest: &WorkerManifest) {
         .map(|value| value.run_id.as_str())
         .or_else(|| result.ordinary_completion.as_ref().map(|value| value.run_id.as_str()))
         .or_else(|| result.operator_completion.as_ref().map(|value| value.run_id.as_str()));
-    assert_eq!(evidence_run_id, Some(manifest.run_id.as_str()));
+    assert_eq!(
+        evidence_run_id,
+        Some(manifest.run_id.as_str()),
+        "assert completion journal: expected messaging contract changed"
+    );
 }
 
 /// Markers in classification priority order.
@@ -1061,10 +1206,10 @@ fn strip_recall_preambles(text: &str) -> &str {
 /// body, which also carries recalled events quoting other sessions' markers,
 /// and never assistant/tool messages, which echo other tasks' text.
 fn request_own_input(request_body: &str) -> String {
-    let request: serde_json::Value = serde_json::from_str(request_body).expect("provider request JSON");
+    let request: serde_json::Value = serde_json::from_str(request_body).expect("test: provider request JSON");
     request["messages"]
         .as_array()
-        .expect("request messages")
+        .expect("test: request messages")
         .iter()
         .filter(|message| message["role"] == "user")
         .filter_map(|message| message["content"].as_str())
@@ -1093,7 +1238,7 @@ fn assert_parent_join(requests: &[ProviderRequest], marker: &str, expected_total
         .iter()
         .filter(|request| request.marker == marker && !is_assessment_request(request))
         .find(|request| last_tool_summary(request).is_some_and(|summary| summary.get("total").is_some()))
-        .expect("parent post-join request carrying a join summary");
+        .expect("test: parent post-join request carrying a join summary");
     assert_join_summary(post_join, expected_total);
 }
 
@@ -1109,25 +1254,40 @@ fn last_tool_summary(request: &ProviderRequest) -> Option<serde_json::Value> {
 }
 
 fn assert_join_summary(post_join: &ProviderRequest, expected_total: usize) {
-    let request: serde_json::Value = serde_json::from_str(&post_join.body).expect("parent post-join JSON");
+    let request: serde_json::Value = serde_json::from_str(&post_join.body).expect("test: parent post-join JSON");
     let summary = request["messages"]
         .as_array()
-        .expect("parent messages")
+        .expect("test: parent messages")
         .iter()
         .rev()
         .find(|message| message["role"] == "tool")
         .and_then(|message| message["content"].as_str())
         .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
-        .expect("parent join summary");
-    assert_eq!(summary["total"], expected_total);
+        .expect("test: parent join summary");
+    assert_eq!(
+        summary["total"], expected_total,
+        "assert join summary: expected messaging contract changed"
+    );
     assert_eq!(
         summary["completed"].as_array().map(Vec::len),
         Some(expected_total),
         "{summary}"
     );
-    assert_eq!(summary["failed"], serde_json::json!([]));
-    assert_eq!(summary["killed"], serde_json::json!([]));
-    assert_eq!(summary["no_result"], serde_json::json!([]));
+    assert_eq!(
+        summary["failed"],
+        serde_json::json!([]),
+        "assert join summary: expected messaging contract changed"
+    );
+    assert_eq!(
+        summary["killed"],
+        serde_json::json!([]),
+        "assert join summary: expected messaging contract changed"
+    );
+    assert_eq!(
+        summary["no_result"],
+        serde_json::json!([]),
+        "assert join summary: expected messaging contract changed"
+    );
 }
 
 fn scripted_spawn_call(arguments: &serde_json::Value) -> serde_json::Value {
@@ -1146,10 +1306,10 @@ fn scripted_spawn_call(arguments: &serde_json::Value) -> serde_json::Value {
 }
 
 fn scripted_join_call(request_body: &str) -> serde_json::Value {
-    let request: serde_json::Value = serde_json::from_str(request_body).expect("provider request JSON");
+    let request: serde_json::Value = serde_json::from_str(request_body).expect("test: provider request JSON");
     let batch = request["messages"]
         .as_array()
-        .expect("provider request messages")
+        .expect("test: provider request messages")
         .iter()
         .rev()
         .filter(|message| message["role"] == "tool")
@@ -1159,7 +1319,7 @@ fn scripted_join_call(request_body: &str) -> serde_json::Value {
         .unwrap_or_else(|| {
             let results: Vec<_> = request["messages"]
                 .as_array()
-                .expect("provider messages")
+                .expect("test: provider messages")
                 .iter()
                 .rev()
                 .filter(|message| message["role"] == "tool")
@@ -1168,7 +1328,7 @@ fn scripted_join_call(request_body: &str) -> serde_json::Value {
                 .collect();
             panic!("spawn batch tool result in parent request; actual tool results={results:?}")
         });
-    let batch_id = batch["batch_id"].as_str().expect("actual production batch id");
+    let batch_id = batch["batch_id"].as_str().expect("test: actual production batch id");
     scripted_spawn_call(&serde_json::json!({"action": "join", "batch_id": batch_id}))
 }
 
@@ -1250,14 +1410,14 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
 /// blanked. Written out here rather than reused from the crate on purpose — the
 /// test re-derives the wire contract independently of the code under test.
 fn worker_capability(manifest: &WorkerManifest, expiry_unix: u64) -> String {
-    let mut value = serde_json::to_value(manifest).expect("manifest serializes");
+    let mut value = serde_json::to_value(manifest).expect("test: manifest serializes");
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "parent_capability".to_string(),
             serde_json::Value::String(String::new()),
         );
     }
-    let payload = serde_json::to_string(&value).expect("manifest reserializes");
+    let payload = serde_json::to_string(&value).expect("test: manifest reserializes");
 
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
@@ -1307,40 +1467,45 @@ fn spawn_worker(config_dir: &Path, home: &Path, capability_env: Option<(&str, u6
             .env("OPENPRX_SESSION_WORKER_CAPABILITY", capability)
             .env("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY", expiry.to_string());
     }
-    let capture = tempfile::NamedTempFile::new_in(home).expect("private worker stdout capture");
-    command.stdout(Stdio::from(capture.as_file().try_clone().expect("capture writer")));
-    OwnedWorker::new(command.spawn().expect("session-worker binary spawns"), Some(capture))
+    let capture = tempfile::NamedTempFile::new_in(home).expect("test: private worker stdout capture");
+    command.stdout(Stdio::from(
+        capture.as_file().try_clone().expect("test: capture writer"),
+    ));
+    OwnedWorker::new(
+        command.spawn().expect("test: session-worker binary spawns"),
+        Some(capture),
+    )
 }
 
 /// Take the child's stdin so `Child::wait()` cannot close it behind our back —
 /// `wait` drops `self.stdin` before waiting, which would silently turn every
 /// "write end stays open" test into a "write end was closed" test.
 const fn take_stdin(child: &mut OwnedWorker) -> ChildStdin {
-    child.child.stdin.take().expect("worker stdin is piped")
+    child.child.stdin.take().expect("test: worker stdin is piped")
 }
 
 fn write_line(stdin: &mut ChildStdin, line: &str) {
     // Fixed local cases send at most one manifest plus three <=256-byte
     // steer frames: <=3840 bytes in the initially empty macOS stdin pipe.
     assert!(line.len() < 3072, "fixture manifest line exceeds stdin precondition");
-    stdin.write_all(line.as_bytes()).expect("write worker stdin line");
-    stdin.write_all(b"\n").expect("write worker stdin newline");
-    stdin.flush().expect("flush worker stdin");
+    stdin.write_all(line.as_bytes()).expect("test: write worker stdin line");
+    stdin.write_all(b"\n").expect("test: write worker stdin newline");
+    stdin.flush().expect("test: flush worker stdin");
 }
 
 fn write_production_manifest_line(stdin: &mut ChildStdin, line: &str) {
     stdin
         .write_all(line.as_bytes())
-        .expect("write production manifest line");
-    stdin.write_all(b"\n").expect("write production manifest newline");
-    stdin.flush().expect("flush production manifest");
+        .expect("test: write production manifest line");
+    stdin.write_all(b"\n").expect("test: write production manifest newline");
+    stdin.flush().expect("test: flush production manifest");
 }
 
 fn steer_frame(message: &str) -> String {
     let frame = serde_json::to_string(&WorkerControlFrame::Steer {
         message: message.to_string(),
     })
-    .expect("steer frame serializes");
+    .expect("test: steer frame serializes");
     assert!(frame.len() < 256, "fixture steer line exceeds stdin precondition");
     frame
 }
@@ -1381,7 +1546,7 @@ impl OwnedWorker {
         use std::io::{Seek as _, SeekFrom};
         let deadline = std::time::Instant::now() + WORKER_WATCHDOG;
         let status = loop {
-            if let Some(status) = self.try_wait().expect("worker exit status") {
+            if let Some(status) = self.try_wait().expect("test: worker exit status") {
                 break status;
             }
             assert!(std::time::Instant::now() < deadline, "worker fixture watchdog expired");
@@ -1393,16 +1558,16 @@ impl OwnedWorker {
         if let Some(capture) = &mut self.capture {
             const LIMIT: u64 = 1024 * 1024;
             let file = capture.as_file_mut();
-            let before = file.metadata().expect("capture metadata");
+            let before = file.metadata().expect("test: capture metadata");
             assert!(
                 before.is_file() && before.len() <= LIMIT,
                 "worker stdout exceeded fixture limit"
             );
-            file.seek(SeekFrom::Start(0)).expect("rewind capture");
+            file.seek(SeekFrom::Start(0)).expect("test: rewind capture");
             file.take(LIMIT + 1)
                 .read_to_string(&mut stdout)
-                .expect("complete UTF-8 worker stdout");
-            let after = capture.as_file().metadata().expect("capture metadata after read");
+                .expect("test: complete UTF-8 worker stdout");
+            let after = capture.as_file().metadata().expect("test: capture metadata after read");
             assert!(stdout.len() as u64 <= LIMIT, "worker stdout exceeded fixture limit");
             assert_eq!(before.len(), after.len(), "capture changed after direct-child reap");
             assert_eq!(after.len(), stdout.len() as u64, "capture was not read completely");
@@ -1471,7 +1636,7 @@ fn assert_single_json_line(stdout: &str) -> WorkerResult {
         "session-worker stdout must be exactly one JSON line, got {stdout:?}"
     );
     serde_json::from_str::<WorkerResult>(lines.first().copied().unwrap_or_default())
-        .expect("session-worker stdout line parses as a WorkerResult")
+        .expect("test: session-worker stdout line parses as a WorkerResult")
 }
 
 fn worker_dirs() -> (
@@ -1480,12 +1645,12 @@ fn worker_dirs() -> (
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let root = tempfile::tempdir().expect("temp dir");
+    let root = tempfile::tempdir().expect("test: temp dir");
     let config_dir = root.path().join("config");
     let workspace_dir = root.path().join("workspace");
     let home = root.path().join("home");
     for dir in [&config_dir, &workspace_dir, &home] {
-        std::fs::create_dir_all(dir).expect("create worker dir");
+        std::fs::create_dir_all(dir).expect("test: create worker dir");
     }
     (WorkerScratch(Some(root)), config_dir, workspace_dir, home)
 }
@@ -1519,7 +1684,7 @@ fn worker_refuses_to_run_without_the_parent_capability_env() {
     let mut stdin = take_stdin(&mut child);
     write_line(
         &mut stdin,
-        &serde_json::to_string(&manifest).expect("manifest serializes"),
+        &serde_json::to_string(&manifest).expect("test: manifest serializes"),
     );
     write_line(&mut stdin, &steer_frame("steering must not be reachable"));
 
@@ -1527,7 +1692,10 @@ fn worker_refuses_to_run_without_the_parent_capability_env() {
 
     assert!(run.status.success(), "an unauthenticated run still reports on stdout");
     let result = assert_single_json_line(&run.stdout);
-    assert!(!result.success);
+    assert!(
+        !result.success,
+        "worker refuses to run without the parent capability env: capacity enforcement or bounded delivery changed"
+    );
     assert_eq!(
         result.error.as_deref(),
         Some("session-worker parent capability env is missing"),
@@ -1559,7 +1727,7 @@ async fn relaunch_real_worker_keeps_session_addr() {
         },
     };
     let registry = ChildSessionRegistry::new(Arc::new(
-        openprx::memory::SqliteMemory::new(&workspace_dir.join("registry")).expect("durable registry"),
+        openprx::memory::SqliteMemory::new(&workspace_dir.join("registry")).expect("test: durable registry"),
     ))
     .with_workspace("prx_workspace".to_owned());
     registry
@@ -1573,21 +1741,37 @@ async fn relaunch_real_worker_keeps_session_addr() {
             }),
         ))
         .await
-        .expect("persist relaunch recipe");
+        .expect("test: persist relaunch recipe");
     let expiry = far_future_expiry();
     let mut previous_run = None;
     for _ in 0..2 {
         let mut base = manifest_for(&config_dir, &workspace_dir);
         base.owner_id = Some(addr.owner.clone());
-        let mut manifest = registry.relaunch_worker(&addr, base).await.expect("relaunch manifest");
-        assert_eq!(manifest.session_addr.as_ref(), Some(&addr));
-        assert_eq!(manifest.inherited_provenance.as_ref(), Some(&provenance));
-        assert_ne!(previous_run.as_deref(), Some(manifest.run_id.as_str()));
+        let mut manifest = registry
+            .relaunch_worker(&addr, base)
+            .await
+            .expect("test: relaunch manifest");
+        assert_eq!(
+            manifest.session_addr.as_ref(),
+            Some(&addr),
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
+        );
+        assert_eq!(
+            manifest.inherited_provenance.as_ref(),
+            Some(&provenance),
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
+        );
+        assert_ne!(
+            previous_run.as_deref(),
+            Some(manifest.run_id.as_str()),
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
+        );
         previous_run = Some(manifest.run_id.clone());
-        let restored = registry.reconstruct(&addr).await.expect("durable recipe");
+        let restored = registry.reconstruct(&addr).await.expect("test: durable recipe");
         assert_eq!(
             restored.recipe().and_then(|r| r.last_run.as_deref()),
-            Some(manifest.run_id.as_str())
+            Some(manifest.run_id.as_str()),
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
         );
         let capability = worker_capability(&manifest, expiry);
         manifest.parent_capability = Some(capability.clone());
@@ -1595,13 +1779,19 @@ async fn relaunch_real_worker_keeps_session_addr() {
         let mut stdin = take_stdin(&mut child);
         write_line(
             &mut stdin,
-            &serde_json::to_string(&manifest).expect("manifest wire bytes"),
+            &serde_json::to_string(&manifest).expect("test: manifest wire bytes"),
         );
         let run = finish(child, Some(stdin));
-        assert!(run.status.success());
+        assert!(
+            run.status.success(),
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
+        );
         let result = assert_single_json_line(&run.stdout);
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(!result.success);
+        assert!(
+            !result.success,
+            "relaunch real worker keeps session addr: IPC identity or delivery state changed"
+        );
         assert!(
             error.ends_with("worker requires an authenticated decision source"),
             "worker must verify the complete manifest before the decision-source guard: {error}"
@@ -1619,7 +1809,7 @@ async fn relaunch_real_worker_keeps_session_addr() {
             let mut stdin = take_stdin(&mut child);
             write_line(
                 &mut stdin,
-                &serde_json::to_string(&tampered).expect("tampered wire bytes"),
+                &serde_json::to_string(&tampered).expect("test: tampered wire bytes"),
             );
             let run = finish(child, Some(stdin));
             let result = assert_single_json_line(&run.stdout);
@@ -1640,14 +1830,14 @@ async fn relaunch_refuses_manifest_identity_mismatch_before_record_update() {
     use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchIdentityError};
     let (_root, config, workspace, _home) = worker_dirs();
     let registry = ChildSessionRegistry::new(std::sync::Arc::new(
-        openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"),
+        openprx::memory::SqliteMemory::new(&workspace).expect("test: sqlite"),
     ))
     .with_workspace("prx_workspace".to_owned());
     let addr = openprx::messaging::SessionAddr::new("prx-default", "prx-owner", "prx-session", None);
     registry
         .insert(&ChildSession::new(addr.clone(), None, None))
         .await
-        .expect("insert");
+        .expect("test: insert");
     for (owner, agent, expected) in [
         (None, None, RelaunchIdentityError::Owner),
         (Some("prx-other-owner"), None, RelaunchIdentityError::Owner),
@@ -1659,17 +1849,22 @@ async fn relaunch_refuses_manifest_identity_mismatch_before_record_update() {
         let error = registry
             .relaunch_worker(&addr, base)
             .await
-            .expect_err("identity refusal");
-        assert_eq!(error.downcast_ref::<RelaunchIdentityError>(), Some(&expected));
+            .expect_err("test: relaunch refuses a mismatched identity");
+        assert_eq!(
+            error.downcast_ref::<RelaunchIdentityError>(),
+            Some(&expected),
+            "relaunch refuses manifest identity mismatch before record update: replay identity or receipt stability changed"
+        );
         assert!(
             registry
                 .reconstruct(&addr)
                 .await
-                .expect("unchanged child")
+                .expect("test: unchanged child")
                 .recipe()
-                .expect("recipe")
+                .expect("test: recipe")
                 .last_run
-                .is_none()
+                .is_none(),
+            "relaunch refuses manifest identity mismatch before record update: replay identity or receipt stability changed"
         );
     }
 }
@@ -1679,13 +1874,13 @@ async fn relaunch_scope_key_separates_session_and_agent_and_is_stable() {
     use openprx::chat::sessions::child::{ChildSession, ChildSessionRegistry};
     let (_root, config, workspace, _home) = worker_dirs();
     let memory: std::sync::Arc<dyn openprx::memory::Memory> =
-        std::sync::Arc::new(openprx::memory::SqliteMemory::new(&workspace).expect("sqlite"));
+        std::sync::Arc::new(openprx::memory::SqliteMemory::new(&workspace).expect("test: sqlite"));
     memory
         .agent_registry()
-        .expect("registry")
+        .expect("test: registry")
         .resolve_incarnation("prx_workspace", "prx-owner", "n:prx_agent", &"1".repeat(64), &|| Ok(()))
-        .expect("resolve")
-        .expect("configured named agent");
+        .expect("test: resolve")
+        .expect("test: configured named agent");
     let registry = ChildSessionRegistry::new(memory).with_workspace("prx_workspace".to_owned());
     let mut keys = std::collections::HashSet::new();
     for (session, agent) in [
@@ -1697,21 +1892,31 @@ async fn relaunch_scope_key_separates_session_and_agent_and_is_stable() {
         registry
             .insert(&ChildSession::new(addr.clone(), None, None))
             .await
-            .expect("insert");
+            .expect("test: insert");
         let mut previous = None;
         for _ in 0..2 {
             let mut base = manifest_for(&config, &workspace);
             base.owner_id = Some(addr.owner.clone());
             base.agent_id = agent.map(str::to_owned);
-            let manifest = registry.relaunch_worker(&addr, base).await.expect("matching identity");
-            assert_eq!(manifest.session_addr.as_ref(), Some(&addr));
+            let manifest = registry
+                .relaunch_worker(&addr, base)
+                .await
+                .expect("test: matching identity");
+            assert_eq!(
+                manifest.session_addr.as_ref(),
+                Some(&addr),
+                "relaunch scope key separates session and agent and is stable: recipient authority or scope isolation changed"
+            );
             if let Some(previous) = previous {
-                assert_eq!(manifest.session_scope_key, previous);
+                assert_eq!(
+                    manifest.session_scope_key, previous,
+                    "relaunch scope key separates session and agent and is stable: recipient authority or scope isolation changed"
+                );
             }
             previous = Some(manifest.session_scope_key);
         }
         assert!(
-            keys.insert(previous.expect("scope key")),
+            keys.insert(previous.expect("test: scope key")),
             "session and agent must both distinguish scopes"
         );
     }
@@ -1733,7 +1938,10 @@ fn invalid_manifest_followed_by_a_steer_frame_still_writes_exactly_one_line() {
 
     assert!(run.status.success(), "a malformed manifest is reported, not crashed on");
     let result = assert_single_json_line(&run.stdout);
-    assert!(!result.success);
+    assert!(
+        !result.success,
+        "invalid manifest followed by a steer frame still writes exactly one line: IPC identity or delivery state changed"
+    );
     assert!(
         result
             .error
@@ -1765,13 +1973,16 @@ fn holding_the_stdin_write_end_keeps_an_eof_waiting_child_alive() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("stand-in EOF-waiting child spawns");
+        .expect("test: stand-in EOF-waiting child spawns");
     let mut child = OwnedWorker::new(child, None);
     let mut stdin = take_stdin(&mut child);
     write_line(&mut stdin, &steer_frame("this child never stops reading"));
 
     assert!(
-        child.try_wait().expect("try_wait on the stand-in child").is_none(),
+        child
+            .try_wait()
+            .expect("test: try_wait on the stand-in child")
+            .is_none(),
         "a child waiting for stdin EOF must still be running while the parent holds the write end"
     );
 
@@ -1800,7 +2011,7 @@ fn the_stdin_control_reader_stays_a_detached_os_thread() {
             .join("runner")
             .join("steering.rs"),
     )
-    .expect("read src/session_worker/runner/steering.rs");
+    .expect("test: read src/session_worker/runner/steering.rs");
     let body = function_body(&source, "spawn_stdin_control_reader");
 
     assert!(
@@ -1837,6 +2048,8 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
 #[cfg(feature = "test-mock")]
 async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
     use anyhow::{Context as _, ensure};
+    use tokio::io::AsyncReadExt as _;
+    const MAX_MAILBOX_OUTPUT: u64 = 1024 * 1024;
     let (_root, config_dir, _unused_workspace, home) = worker_dirs();
     let workspace = config_dir.join("workspace");
     std::fs::create_dir_all(&workspace)?;
@@ -1887,13 +2100,33 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
         .env_remove("OPENPRX_MOCK_ERROR")
         .env_remove("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
         .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(120), command.output())
-        .await
-        .context("real mailbox worker harness hung")??;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().context("test: mailbox stdout pipe")?;
+    let stderr = child.stderr.take().context("test: mailbox stderr pipe")?;
+    let (status, stdout, stderr) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let out = async {
+            let mut bytes = Vec::new();
+            stdout.take(MAX_MAILBOX_OUTPUT + 1).read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        let err = async {
+            let mut bytes = Vec::new();
+            stderr.take(MAX_MAILBOX_OUTPUT + 1).read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        };
+        tokio::try_join!(child.wait(), out, err)
+    })
+    .await
+    .context("test: real mailbox worker harness hung")??;
+    ensure!(
+        stdout.len() as u64 <= MAX_MAILBOX_OUTPUT && stderr.len() as u64 <= MAX_MAILBOX_OUTPUT,
+        "test: mailbox worker output overflow"
+    );
     assert!(
-        output.status.success(),
+        status.success(),
         "real mailbox worker failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr)
     );
     // The inspector opens the file independently after every receiving process
     // and real worker have joined; it does not share the parent's store handle.

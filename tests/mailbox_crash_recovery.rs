@@ -19,7 +19,7 @@ fn crash_recovery(stage: &str, transcript_before: i64, state_before: i64) -> Res
             .arg(dir.path())
             .env("OPENPRX_TEST_MAILBOX_BARRIER", format!("{stage}={}", barrier.display()))
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?,
     );
     let started = dir.path().join("barrier.started");
@@ -64,6 +64,7 @@ impl Drop for Receiver {
     }
 }
 fn restart(workspace: &Path) -> Result<()> {
+    const MAX_STDERR: u64 = 64 * 1024;
     let mut receiver = Receiver(
         Command::new(env!("CARGO_BIN_EXE_prx"))
             .arg("--config-dir")
@@ -75,13 +76,18 @@ fn restart(workspace: &Path) -> Result<()> {
             .stderr(Stdio::piped())
             .spawn()?,
     );
+    let pipe = receiver.stderr.take().context("test: restart stderr pipe")?;
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stderr = String::new();
+        let result = pipe.take(MAX_STDERR + 1).read_to_string(&mut stderr).map(|_| stderr);
+        let _ = output_tx.send(result);
+    });
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = receiver.try_wait()? {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = receiver.stderr.take() {
-                pipe.read_to_string(&mut stderr)?;
-            }
+            let stderr = output_rx.recv_timeout(Duration::from_secs(2))??;
+            ensure!(stderr.len() as u64 <= MAX_STDERR, "test: restart stderr overflow");
             ensure!(status.success(), "restart failed: {stderr}");
             return Ok(());
         }

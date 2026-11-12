@@ -3,7 +3,7 @@ use crate::session_worker::protocol::WorkerControlFrame;
 use crate::tools::sessions_spawn::steering_instruction;
 use anyhow::Result;
 use std::future::Future;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use tokio_util::sync::CancellationToken;
 
 /// Start the stdin control-frame reader for a running worker.
@@ -47,15 +47,20 @@ pub(super) fn spawn_stdin_control_reader(
     steer_tx: tokio::sync::mpsc::Sender<String>,
     mut mailbox: Option<super::super::mailbox::WorkerMailboxSender>,
 ) {
+    const MAX_CONTROL_LINE: u64 = 2 * 1024 * 1024;
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
         loop {
             let mut line = String::new();
-            match reader.read_line(&mut line) {
+            match (&mut reader).take(MAX_CONTROL_LINE + 1).read_line(&mut line) {
                 // Parent closed the pipe: no further steering is possible.
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
+            }
+            if line.len() as u64 > MAX_CONTROL_LINE {
+                tracing::warn!("session-worker control frame exceeded line limit");
+                break;
             }
             let line = line.trim();
             if line.is_empty() {

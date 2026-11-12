@@ -22,7 +22,11 @@ pub(super) struct AbortOnDrop(pub(super) tokio::task::JoinHandle<()>);
 impl AbortOnDrop {
     async fn shutdown(mut self) {
         self.0.abort();
-        let _ = (&mut self.0).await;
+        if let Err(error) = (&mut self.0).await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "worker control pump join failed");
+        }
     }
 }
 

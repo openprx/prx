@@ -142,7 +142,10 @@ impl SqliteMailbox {
             });
         }
         check_scope(&tx, sender, &message.from, None, true)?;
-        if pin_expires_at <= now || message.to_pin.token.is_empty() {
+        if message.to_pin.token.is_empty() {
+            return Err(MailboxError::PinRequired);
+        }
+        if pin_expires_at <= now {
             return Err(MailboxError::PinExpired);
         }
         if message.to.instance == self.local_instance {

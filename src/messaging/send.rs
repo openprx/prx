@@ -60,7 +60,7 @@ pub fn send_result(result: MailboxResult<MailboxPublished>) -> Value {
     match result {
         Ok(sent) => {
             json!({"status":match sent.state {MailboxSendState::Failed=>"failed",MailboxSendState::Acked=>"accepted",_=>"queued"},
-            "message_id":sent.message_id,"state":sent.ack_state.unwrap_or(super::DeliveryState::Accepted),"error":sent.error})
+            "message_id":sent.message_id,"state":sent.ack_state,"error":sent.error})
         }
         Err(error) => json!({"status":"failed","message_id":null,"state":null,"error":error.to_string()}),
     }

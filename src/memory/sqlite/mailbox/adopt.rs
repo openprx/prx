@@ -49,6 +49,8 @@ impl SqliteMailbox {
             .as_deref()
             .is_some_and(|run| Some(run) != live_run.as_deref())
         {
+            receipt::terminal_stale_slot(&tx, &mut stream, &mut saved, now)?;
+            tx.commit().map_err(storage_error)?;
             return Err(MailboxError::StaleRun);
         }
         if stream.retired {

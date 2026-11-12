@@ -22,6 +22,7 @@ impl SqliteMailbox {
     pub fn erase_scope(
         &self,
         scope: &MailboxScope,
+        deadline: std::time::Duration,
         drain: &dyn Fn() -> MailboxResult<()>,
     ) -> MailboxResult<MailboxErasure> {
         let now = self.clock.now();
@@ -52,7 +53,9 @@ impl SqliteMailbox {
             id
         };
         drain()?;
-        self.memory.mailbox_runtime.drain_and_join(scope.scope_id);
+        if !self.memory.mailbox_runtime.drain_and_join(scope.scope_id, deadline) {
+            return Err(MailboxError::Fenced);
+        }
         let writer = self.memory.pool.write();
         let tx = Transaction::new_unchecked(&writer, TransactionBehavior::Immediate).map_err(storage_error)?;
         let mut query=tx.prepare("SELECT stream_id FROM prx_mailbox_seq WHERE recipient_ma_scope_id=?1 UNION SELECT stream_id FROM prx_mailbox_receipts WHERE ma_scope_id=?1 AND state<>2").map_err(storage_error)?;

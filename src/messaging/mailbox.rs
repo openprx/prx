@@ -43,10 +43,14 @@ pub enum MailboxError {
     SeqStreamRetired,
     #[error("stale_incarnation")]
     StaleIncarnation,
-    #[error("recipient_pin_expired")]
+    #[error("pin_invalid")]
     PinExpired,
-    #[error("recipient_pin_invalid")]
+    #[error("pin_invalid")]
     InvalidPin,
+    #[error("recipient_pin_required")]
+    PinRequired,
+    #[error("scope_erasing")]
+    ScopeErasing,
     #[error("history_pending")]
     Fenced,
     #[error("stale_run")]

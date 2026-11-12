@@ -71,6 +71,9 @@ impl SqliteMailbox {
     }
 
     pub(super) fn verify_pin(&self, authority: &MailboxAuthority, message: &PrxMessage) -> MailboxResult<PinClaims> {
+        if message.to_pin.token.is_empty() {
+            return Err(MailboxError::PinRequired);
+        }
         let (payload, signature) = message.to_pin.token.split_once('.').ok_or(MailboxError::InvalidPin)?;
         let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| MailboxError::InvalidPin)?;
         let signature = hex::decode(signature).map_err(|_| MailboxError::InvalidPin)?;
@@ -131,7 +134,7 @@ pub(in crate::memory::sqlite) fn check_scope(
             return Err(MailboxError::StaleIncarnation);
         }
         if row.3.is_some() {
-            return Err(MailboxError::Fenced);
+            return Err(MailboxError::ScopeErasing);
         }
     }
     Ok(())

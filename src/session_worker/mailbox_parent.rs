@@ -7,7 +7,7 @@ use crate::messaging::mailbox::{
     MailboxAuthority, MailboxError, MailboxReceipt, MailboxResult, MailboxScope, MailboxSendState,
 };
 use crate::messaging::{DeliveryState, InheritedProvenance, SessionAddr};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub struct WorkerMailboxParent {
@@ -19,7 +19,6 @@ pub struct WorkerMailboxParent {
     incoming: MailboxAuthority,
     inherited: Option<InheritedProvenance>,
     pending: HashMap<Uuid, MailboxDelivery>,
-    completed: HashSet<Uuid>,
     _execution: MailboxExecution,
 }
 impl WorkerMailboxParent {
@@ -50,7 +49,6 @@ impl WorkerMailboxParent {
             incoming,
             inherited,
             pending: HashMap::new(),
-            completed: HashSet::new(),
             _execution: execution,
         })
     }
@@ -75,8 +73,13 @@ impl WorkerMailboxParent {
         match frame {
             WorkerOutputFrame::Message { envelope } => {
                 let mut message = *envelope;
-                // For this local pipe the store verifies the original pin and
-                // persists its authenticated expiry. It never fills a pin.
+                // The authenticated parent is the worker sender's proxy.
+                message.to_pin = self.store.recipient_pin(
+                    &self.incoming,
+                    &self.parent_scope,
+                    &crate::chat::sessions::child::ChildSessionRegistry::canonical_session_key(&self.parent)
+                        .map_err(|_| MailboxError::InvalidAddress)?,
+                )?;
                 let published = self.store.publish(
                     &self.incoming,
                     message.clone(),
@@ -97,10 +100,10 @@ impl WorkerMailboxParent {
                 Ok(Some(accepted))
             }
             WorkerOutputFrame::Ack { message_id, state } => {
-                if self.completed.contains(&message_id) {
+                let Some(delivery) = self.pending.get(&message_id) else {
+                    // Already-consumed acknowledgments have no in-flight lease.
                     return Ok(None);
-                }
-                let delivery = self.pending.get(&message_id).ok_or(MailboxError::InvalidMetadata)?;
+                };
                 if state == DeliveryState::Consumed {
                     let adopted = self.store.adopt(delivery)?;
                     self.inherited = adopted.remote.clone().map(|remote| InheritedProvenance {
@@ -118,12 +121,6 @@ impl WorkerMailboxParent {
                     self.store
                         .acknowledge(&self.parent_scope, &self.worker, message_id, adopted.state)?;
                     self.pending.remove(&message_id);
-                    self.completed.insert(message_id);
-                    if i64::try_from(self.completed.len()).map_err(|_| MailboxError::CorruptState)?
-                        > crate::messaging::mailbox::MAX_ROWS
-                    {
-                        return Err(MailboxError::Quota("rows"));
-                    }
                 } else {
                     self.store
                         .acknowledge(&self.parent_scope, &self.worker, message_id, state)?;

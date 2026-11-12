@@ -505,19 +505,34 @@ mod tests {
         let a = ChildSession::new(addr("child-a"), None, None);
         let b = ChildSession::new(addr("child-b"), None, None);
         a.approvals().test_register("run-a");
-        assert!(a.approvals().is_pending("run-a"));
-        assert!(!b.approvals().is_pending("run-a"));
-        assert!(!a.approvals().is_pending("run-b"));
+        assert!(
+            a.approvals().is_pending("run-a"),
+            "two child sessions hold independent approvals: expected messaging contract changed"
+        );
+        assert!(
+            !b.approvals().is_pending("run-a"),
+            "two child sessions hold independent approvals: expected messaging contract changed"
+        );
+        assert!(
+            !a.approvals().is_pending("run-b"),
+            "two child sessions hold independent approvals: expected messaging contract changed"
+        );
         b.approvals().test_register("run-b");
-        assert!(b.approvals().is_pending("run-b"));
-        assert!(!a.approvals().is_pending("run-b"));
+        assert!(
+            b.approvals().is_pending("run-b"),
+            "two child sessions hold independent approvals: expected messaging contract changed"
+        );
+        assert!(
+            !a.approvals().is_pending("run-b"),
+            "two child sessions hold independent approvals: expected messaging contract changed"
+        );
     }
 
     #[tokio::test]
     async fn child_session_reconstructs_from_registry() {
-        let dir = tempfile::TempDir::new().expect("registry directory");
+        let dir = tempfile::TempDir::new().expect("test: registry directory");
         let registry = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("registry backend"),
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: registry backend"),
         ))
         .with_workspace("prx_workspace".to_owned());
         let mut live = ChildSession::new(
@@ -534,112 +549,158 @@ mod tests {
             timestamp: chrono::Utc::now(),
         });
         live.approvals().test_register("ask-1");
-        registry.insert(&live).await.expect("persist child");
+        registry.insert(&live).await.expect("test: persist child");
         drop(live);
         drop(registry);
         let registry = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("reopened registry backend"),
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: reopened registry backend"),
         ))
         .with_workspace("prx_workspace".to_owned());
         let restored = registry.reconstruct(&addr("child-a")).await.expect("test: reconstruct");
-        assert_eq!(restored.addr(), &addr("child-a"));
-        assert_eq!(restored.history().len(), 1);
-        assert_eq!(restored.provider().map(|p| p.provider.as_str()), Some("openrouter"));
+        assert_eq!(
+            restored.addr(),
+            &addr("child-a"),
+            "child session reconstructs from registry: expected messaging contract changed"
+        );
+        assert_eq!(
+            restored.history().len(),
+            1,
+            "child session reconstructs from registry: expected messaging contract changed"
+        );
+        assert_eq!(
+            restored.provider().map(|p| p.provider.as_str()),
+            Some("openrouter"),
+            "child session reconstructs from registry: expected messaging contract changed"
+        );
         assert!(!restored.approvals().is_pending("ask-1"), "in-memory Ask dies");
-        assert_eq!(restored.mailbox_cursor(), &MailboxCursor::default());
+        assert_eq!(
+            restored.mailbox_cursor(),
+            &MailboxCursor::default(),
+            "child session reconstructs from registry: expected messaging contract changed"
+        );
     }
 
     #[tokio::test]
     async fn relaunch_keeps_session_addr_and_mints_new_run() {
-        let dir = tempfile::TempDir::new().expect("registry directory");
+        let dir = tempfile::TempDir::new().expect("test: registry directory");
         let registry = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("registry backend"),
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: registry backend"),
         ))
         .with_workspace("prx_workspace".to_owned());
         let session = ChildSession::new(addr("child-a"), None, None);
-        registry.insert(&session).await.expect("persist child");
+        registry.insert(&session).await.expect("test: persist child");
         let first = registry.relaunch(&addr("child-a")).await.expect("test: first");
         let second = registry.relaunch(&addr("child-a")).await.expect("test: second");
-        assert_ne!(first.run, second.run);
-        assert!(first.run.is_some());
+        assert_ne!(
+            first.run, second.run,
+            "relaunch keeps session addr and mints new run: expected messaging contract changed"
+        );
+        assert!(
+            first.run.is_some(),
+            "relaunch keeps session addr and mints new run: expected messaging contract changed"
+        );
         let restored = registry.reconstruct(&addr("child-a")).await.expect("test: reconstruct");
-        assert_eq!(restored.addr(), &addr("child-a"));
-        assert_eq!(restored.recipe().and_then(|r| r.last_run.clone()), second.run);
+        assert_eq!(
+            restored.addr(),
+            &addr("child-a"),
+            "relaunch keeps session addr and mints new run: expected messaging contract changed"
+        );
+        assert_eq!(
+            restored.recipe().and_then(|r| r.last_run.clone()),
+            second.run,
+            "relaunch keeps session addr and mints new run: expected messaging contract changed"
+        );
     }
 
     #[tokio::test]
     async fn child_registry_is_excluded_from_picker_resume_and_latest() {
-        let dir = tempfile::tempdir().expect("session database");
+        let dir = tempfile::tempdir().expect("test: session database");
         let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("sqlite"));
+            Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite"));
         let registry = ChildSessionRegistry::new(Arc::clone(&memory)).with_workspace("prx_workspace".to_owned());
         let child = ChildSession::new(addr("child-a"), None, None);
-        registry.insert(&child).await.expect("insert child");
-        registry.relaunch(child.addr()).await.expect("relaunch child");
+        registry.insert(&child).await.expect("test: insert child");
+        registry.relaunch(child.addr()).await.expect("test: relaunch child");
         assert!(
             memory
                 .list(Some(&crate::memory::MemoryCategory::Conversation), None)
                 .await
-                .expect("operator namespace")
+                .expect("test: operator namespace")
                 .is_empty(),
             "child records must never be written into operator memories"
         );
         assert!(
             crate::chat::session_store::saved_chat_sessions(memory.as_ref())
                 .await
-                .expect("picker")
-                .is_empty()
+                .expect("test: picker")
+                .is_empty(),
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
         );
         assert!(
             crate::chat::session_store::load_latest_session(memory.as_ref())
                 .await
-                .expect("latest")
-                .is_none()
+                .expect("test: latest")
+                .is_none(),
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
         );
         assert!(
             crate::chat::session_store::load_session_by_id(
                 memory.as_ref(),
-                &ChildSessionRegistry::record_id(child.addr()).expect("id")
+                &ChildSessionRegistry::record_id(child.addr()).expect("test: id")
             )
             .await
-            .expect("resume")
-            .is_none()
+            .expect("test: resume")
+            .is_none(),
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
         );
         let mut operator = crate::chat::session::ChatSession::new("prx_provider", "prx_model");
-        operator.updated_at = chrono::DateTime::from_timestamp(1, 0).expect("old time");
+        operator.updated_at = chrono::DateTime::from_timestamp(1, 0).expect("test: old time");
         crate::chat::session_store::save_session(memory.as_ref(), &operator)
             .await
-            .expect("save operator");
+            .expect("test: save operator");
         // Also hide marked blobs written by the earlier, never-activated API.
-        let mut legacy = registry.load_record(child.addr()).await.expect("child record");
+        let mut legacy = registry.load_record(child.addr()).await.expect("test: child record");
         legacy.id = "prx-legacy-child".into();
         crate::chat::session_store::save_session(memory.as_ref(), &legacy)
             .await
-            .expect("legacy blob");
-        registry.relaunch(child.addr()).await.expect("newest child activity");
+            .expect("test: legacy blob");
+        registry
+            .relaunch(child.addr())
+            .await
+            .expect("test: newest child activity");
         let picker = crate::chat::session_store::saved_chat_sessions(memory.as_ref())
             .await
-            .expect("picker");
-        assert_eq!(picker.len(), 1);
-        assert_eq!(picker.first().expect("operator row").id, operator.id);
+            .expect("test: picker");
+        assert_eq!(
+            picker.len(),
+            1,
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
+        );
+        assert_eq!(
+            picker.first().expect("test: operator row").id,
+            operator.id,
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
+        );
         assert_eq!(
             crate::chat::session_store::load_latest_session(memory.as_ref())
                 .await
-                .expect("latest")
-                .expect("operator")
+                .expect("test: latest")
+                .expect("test: operator")
                 .id,
-            operator.id
+            operator.id,
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
         );
         assert!(
             crate::chat::session_store::load_session_by_id(memory.as_ref(), &legacy.id)
                 .await
-                .expect("legacy direct resume")
-                .is_none()
+                .expect("test: legacy direct resume")
+                .is_none(),
+            "child registry is excluded from picker resume and latest: expected messaging contract changed"
         );
         registry
             .reconstruct(child.addr())
             .await
-            .expect("child still reconstructs");
+            .expect("test: child still reconstructs");
     }
 
     async fn rich_child(registry: &ChildSessionRegistry) -> ChildSession {
@@ -649,12 +710,12 @@ mod tests {
             content: "prx result".into(),
             timestamp: chrono::Utc::now(),
         });
-        registry.insert(&child).await.expect("insert child");
+        registry.insert(&child).await.expect("test: insert child");
         registry
             .update_record(child.addr(), |old| {
-                let mut record = old.expect("stored child");
+                let mut record = old.expect("test: stored child");
                 record.title = "prx preserved title".into();
-                record.created_at = chrono::DateTime::from_timestamp(1, 0).expect("creation time");
+                record.created_at = chrono::DateTime::from_timestamp(1, 0).expect("test: creation time");
                 record
                     .token_usage_records
                     .push(crate::llm::route_decision::MeteredTokenUsageRecord {
@@ -685,7 +746,7 @@ mod tests {
                 record
                     .turns
                     .first_mut()
-                    .expect("turn")
+                    .expect("test: turn")
                     .tool_calls
                     .push(crate::chat::session::ToolCallSummary {
                         name: "prx_probe".into(),
@@ -697,39 +758,41 @@ mod tests {
                 Ok(record)
             })
             .await
-            .expect("rich record");
-        registry.reconstruct(child.addr()).await.expect("rich child")
+            .expect("test: rich record");
+        registry.reconstruct(child.addr()).await.expect("test: rich child")
     }
 
     #[tokio::test]
     async fn relaunch_and_insert_preserve_complete_child_record() {
-        let dir = tempfile::tempdir().expect("session database");
-        let registry =
-            ChildSessionRegistry::new(Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("sqlite")))
-                .with_workspace("prx_workspace".to_owned());
+        let dir = tempfile::tempdir().expect("test: session database");
+        let registry = ChildSessionRegistry::new(Arc::new(
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite"),
+        ))
+        .with_workspace("prx_workspace".to_owned());
         let stale = rich_child(&registry).await;
-        let before = registry.load_record(stale.addr()).await.expect("before");
-        let run = registry.relaunch(stale.addr()).await.expect("relaunch").run;
+        let before = registry.load_record(stale.addr()).await.expect("test: before");
+        let run = registry.relaunch(stale.addr()).await.expect("test: relaunch").run;
         // A history snapshot predating relaunch must not overwrite its new run.
-        registry.insert(&stale).await.expect("insert old snapshot");
-        let after = registry.load_record(stale.addr()).await.expect("after");
+        registry.insert(&stale).await.expect("test: insert old snapshot");
+        let after = registry.load_record(stale.addr()).await.expect("test: after");
         assert_eq!(
             after
                 .child_session
                 .as_ref()
                 .and_then(|metadata| metadata.recipe.as_ref())
                 .and_then(|recipe| recipe.last_run.clone()),
-            run
+            run,
+            "relaunch and insert preserve complete child record: expected messaging contract changed"
         );
-        let mut before = serde_json::to_value(before).expect("before JSON");
-        let mut after = serde_json::to_value(after).expect("after JSON");
+        let mut before = serde_json::to_value(before).expect("test: before JSON");
+        let mut after = serde_json::to_value(after).expect("test: after JSON");
         for record in [&mut before, &mut after] {
-            record.as_object_mut().expect("record").remove("updated_at");
+            record.as_object_mut().expect("test: record").remove("updated_at");
             let last_run = record
                 .get_mut("child_session")
                 .and_then(|metadata| metadata.get_mut("recipe"))
                 .and_then(|recipe| recipe.get_mut("last_run"))
-                .expect("stored recipe last_run field");
+                .expect("test: stored recipe last_run field");
             *last_run = serde_json::Value::Null;
         }
         assert_eq!(
@@ -740,13 +803,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_history_insert_and_relaunch_keep_both_updates() {
-        let dir = tempfile::tempdir().expect("session database");
+        let dir = tempfile::tempdir().expect("test: session database");
         let first = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("first pool"),
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: first pool"),
         ))
         .with_workspace("prx_workspace".to_owned());
         let second = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("independent pool"),
+            crate::memory::SqliteMemory::new(dir.path()).expect("test: independent pool"),
         ))
         .with_workspace("prx_workspace".to_owned());
         let mut child = rich_child(&first).await;
@@ -763,20 +826,40 @@ mod tests {
             first.insert(&child).await
         });
         barrier.wait().await;
-        let run = second.relaunch(&address).await.expect("concurrent relaunch").run;
-        insert.await.expect("insert task").expect("concurrent insert");
-        let record = second.load_record(&address).await.expect("merged record");
-        assert_eq!(record.turns.len(), 2);
-        assert_eq!(record.turns.first().expect("original turn").tool_calls.len(), 1);
-        assert_eq!(record.token_usage_records.len(), 1);
-        assert_eq!(record.background_sessions.len(), 1);
+        let run = second.relaunch(&address).await.expect("test: concurrent relaunch").run;
+        insert
+            .await
+            .expect("test: insert task")
+            .expect("test: concurrent insert");
+        let record = second.load_record(&address).await.expect("test: merged record");
+        assert_eq!(
+            record.turns.len(),
+            2,
+            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
+        );
+        assert_eq!(
+            record.turns.first().expect("test: original turn").tool_calls.len(),
+            1,
+            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
+        );
+        assert_eq!(
+            record.token_usage_records.len(),
+            1,
+            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
+        );
+        assert_eq!(
+            record.background_sessions.len(),
+            1,
+            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
+        );
         assert_eq!(
             record
                 .child_session
                 .as_ref()
                 .and_then(|metadata| metadata.recipe.as_ref())
                 .and_then(|recipe| recipe.last_run.clone()),
-            run
+            run,
+            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
         );
     }
 }

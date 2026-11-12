@@ -139,7 +139,11 @@ mod tests {
         worker.write_all(&serde_json::to_vec(&ack)?).await?;
         worker.write_all(b"\n").await?;
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), frames_rx.recv()).await?;
-        assert_eq!(received, Some(ack));
+        assert_eq!(
+            received,
+            Some(ack),
+            "stdout frames arrive before eof and terminal proof bytes are preserved: IPC identity or delivery state changed"
+        );
         assert!(
             !reader.is_finished(),
             "frames must arrive while the worker still owns stdout"
@@ -155,7 +159,11 @@ mod tests {
             .await?;
         worker.write_all(b"\n").await?;
         drop(worker);
-        assert_eq!(reader.await??, bytes);
+        assert_eq!(
+            reader.await??,
+            bytes,
+            "stdout frames arrive before eof and terminal proof bytes are preserved: IPC identity or delivery state changed"
+        );
         Ok(())
     }
 
@@ -176,9 +184,20 @@ mod tests {
         let mut lines = BufReader::new(worker).lines();
         let first_line = lines.next_line().await?.context("first frame missing")?;
         let second_line = lines.next_line().await?.context("second frame missing")?;
-        assert_eq!(serde_json::from_str::<WorkerControlFrame>(&first_line)?, first);
-        assert_eq!(serde_json::from_str::<WorkerControlFrame>(&second_line)?, second);
-        assert!(lines.next_line().await?.is_none());
+        assert_eq!(
+            serde_json::from_str::<WorkerControlFrame>(&first_line)?,
+            first,
+            "multiplexed control writer preserves each frame: IPC identity or delivery state changed"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerControlFrame>(&second_line)?,
+            second,
+            "multiplexed control writer preserves each frame: IPC identity or delivery state changed"
+        );
+        assert!(
+            lines.next_line().await?.is_none(),
+            "multiplexed control writer preserves each frame: IPC identity or delivery state changed"
+        );
         pump.await??;
         Ok(())
     }
@@ -186,7 +205,11 @@ mod tests {
     #[tokio::test]
     async fn empty_stdout_remains_available_to_exit_signal_classifier() -> Result<()> {
         let bytes = read_worker_frames(tokio::io::empty(), None, None, 4096).await?;
-        assert_eq!(bytes, Vec::<u8>::new());
+        assert_eq!(
+            bytes,
+            Vec::<u8>::new(),
+            "empty stdout remains available to exit signal classifier: expected messaging contract changed"
+        );
         Ok(())
     }
 
@@ -201,20 +224,33 @@ mod tests {
         };
         let mut wire = serde_json::to_vec(&frame)?;
         wire.push(b'\n');
-        assert!(wire.len() < 256);
+        assert!(
+            wire.len() < 256,
+            "live frames have a per line limit instead of a cumulative budget: IPC identity or delivery state changed"
+        );
         for _ in 0..16 {
             worker.write_all(&wire).await?;
         }
         let terminal = b"{\"success\":true,\"output\":\"done\",\"error\":null,\"tokens_used\":null}\n";
         worker.write_all(terminal).await?;
         drop(worker);
-        assert_eq!(reader.await??, terminal);
+        assert_eq!(
+            reader.await??,
+            terminal,
+            "live frames have a per line limit instead of a cumulative budget: IPC identity or delivery state changed"
+        );
         let mut received = 0;
         while let Some(actual) = receiver.recv().await {
-            assert_eq!(actual, frame);
+            assert_eq!(
+                actual, frame,
+                "live frames have a per line limit instead of a cumulative budget: IPC identity or delivery state changed"
+            );
             received += 1;
         }
-        assert_eq!(received, 16);
+        assert_eq!(
+            received, 16,
+            "live frames have a per line limit instead of a cumulative budget: IPC identity or delivery state changed"
+        );
         Ok(())
     }
 }

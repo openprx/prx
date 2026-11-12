@@ -108,12 +108,18 @@ impl Runtime {
     pub fn has_scope_leases(&self, scope: Uuid) -> bool {
         self.state.lock().leases.contains_key(&scope)
     }
-    pub fn drain_and_join(&self, scope: Uuid) {
+    pub fn drain_and_join(&self, scope: Uuid, deadline: std::time::Duration) -> bool {
+        let Some(until) = std::time::Instant::now().checked_add(deadline) else {
+            return false;
+        };
         let mut state = self.state.lock();
         state.executions.retain(|_, (bound, _)| bound.scope_id != scope);
         while state.leases.contains_key(&scope) {
-            self.changed.wait(&mut state);
+            if self.changed.wait_until(&mut state, until).timed_out() && state.leases.contains_key(&scope) {
+                return false;
+            }
         }
+        true
     }
     pub fn check_rate(&self, authority: &MailboxAuthority, now: i64) -> MailboxResult<()> {
         let mut state = self.state.lock();

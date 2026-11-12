@@ -53,21 +53,21 @@ async fn read_plan(worker: &WorkerManifest, version: u8, batch: &str) -> Result<
     Ok(roster.members.len())
 }
 
-/// A real child that completed through the worker port. Its parent authority is
-/// sealed as a version-4 batch row before the child runs, so the batch reader
-/// verifies the same run that settles below. Returns plain data only.
-// Keep the real worker setup future out of each replay scenario's poll frame.
+// Keep worker setup and journal replay futures out of each scenario's poll frame.
 #[inline(never)]
-fn boxed_completed_child_fixture<F, Fut>(make_fixture: F) -> std::pin::Pin<Box<Fut>>
+fn boxed_child_fixture<F, Fut>(make_fixture: F) -> std::pin::Pin<Box<Fut>>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<(WorkerManifest, WorkerResult)>>,
+    Fut: std::future::Future,
 {
     Box::pin(make_fixture())
 }
 
+/// A real child that completed through the worker port. Its parent authority is
+/// sealed as a version-4 batch row before the child runs, so the batch reader
+/// verifies the same run that settles below. Returns plain data only.
 async fn completed_child_fixture(tmp: &tempfile::TempDir) -> Result<(WorkerManifest, WorkerResult)> {
-    boxed_completed_child_fixture(|| async {
+    boxed_child_fixture(|| async {
         let outcome = {
             let probe = crate::providers::credential_probe::CredentialProbe::start_replying("r8 child completed").await;
             with_worker_probe_manifest(tmp, probe.custom_provider(), false, |manifest| async move {
@@ -397,7 +397,7 @@ async fn reopened_child_evidence(manifest: &WorkerManifest, result: &WorkerResul
 async fn batch_child_completion_settles_after_restart_through_completion_port() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let (manifest, result) = completed_child_fixture(&tmp).await?;
-    let child = reopened_child_evidence(&manifest, &result).await?;
+    let child = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
 
     // The completion port settled the row during the run. The normal reader
     // confirms it and must not repair it, so the raw rows stay identical.
@@ -470,7 +470,7 @@ struct SealedEntry {
 async fn child_outcome_seal_tamper_is_refused_after_restart() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let (manifest, result) = completed_child_fixture(&tmp).await?;
-    let child = reopened_child_evidence(&manifest, &result).await?;
+    let child = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     let (run, settlement) = (child.expected.run.clone(), child.expected.settlement.clone());
 
     // Positive control: the matching row reads through the normal reader.
@@ -501,7 +501,7 @@ async fn child_outcome_seal_tamper_is_refused_after_restart() -> Result<()> {
     drop(db);
 
     // Independent replay still succeeds after reopen. Only the journal read refuses.
-    let reopened = reopened_child_evidence(&manifest, &result).await?;
+    let reopened = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     let error = authority_journal::verify_child_outcome(
         &reopened.workspace,
         &reopened.key,
@@ -521,7 +521,7 @@ async fn child_outcome_seal_tamper_is_refused_after_restart() -> Result<()> {
 async fn child_outcome_missing_row_is_refused_for_v3() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let (manifest, result) = completed_child_fixture(&tmp).await?;
-    let child = reopened_child_evidence(&manifest, &result).await?;
+    let child = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     let (run, settlement) = (child.expected.run.clone(), child.expected.settlement.clone());
 
     // Positive control: the matching row reads through the normal reader.
@@ -545,7 +545,7 @@ async fn child_outcome_missing_row_is_refused_for_v3() -> Result<()> {
     drop(db);
 
     // The replay still verifies after reopen, so only the journal row is missing.
-    let reopened = reopened_child_evidence(&manifest, &result).await?;
+    let reopened = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     let error = authority_journal::verify_child_outcome(
         &reopened.workspace,
         &reopened.key,
@@ -850,7 +850,7 @@ async fn process_terminal_repair_uses_child_journal() -> Result<()> {
         key,
         expected,
         launch_version,
-    } = reopened_child_evidence(&manifest, &result).await?;
+    } = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     anyhow::ensure!(launch_version == 3, "test: the launch authority must be version 3");
     let source = manifest.child_source.as_ref().context("test: child source")?;
     let store_workspace = source.parent_store_workspace.clone();
@@ -906,7 +906,7 @@ async fn process_terminal_repair_uses_child_journal() -> Result<()> {
             &terminal,
         )
     };
-    let replay = replay_from_journal().await?;
+    let replay = boxed_child_fixture(replay_from_journal).await?;
     anyhow::ensure!(
         replay.parent_decision_id().map(|id| id.to_string()) == expected.parent_decision
             && replay.parent_digest().map(str::to_owned) == expected.parent_digest
@@ -935,7 +935,7 @@ async fn process_terminal_repair_uses_child_journal() -> Result<()> {
     );
 
     // Idempotent: the same adapter and hook leave identical bytes.
-    let replay = replay_from_journal().await?;
+    let replay = boxed_child_fixture(replay_from_journal).await?;
     hook.persist(&replay, &terminal, None, None).await?;
     anyhow::ensure!(
         child_outcome_rows(&workspace)? == repaired,
@@ -952,7 +952,7 @@ async fn process_terminal_repair_uses_child_journal() -> Result<()> {
         (&tampered, &expected.run, &expected.settlement),
     )?;
     drop(db);
-    let replay = replay_from_journal().await?;
+    let replay = boxed_child_fixture(replay_from_journal).await?;
     anyhow::ensure!(
         hook.persist(&replay, &terminal, None, None).await.is_err(),
         "test: the hook must refuse to overwrite a corrupt child outcome row"
@@ -1080,7 +1080,7 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
         key,
         expected,
         ..
-    } = reopened_child_evidence(&manifest, &result).await?;
+    } = boxed_child_fixture(|| reopened_child_evidence(&manifest, &result)).await?;
     let store_workspace = manifest
         .child_source
         .as_ref()

@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use super::{
-    model::{ReceiptMeta, decode, sequence, uuid},
+    model::{ReceiptMeta, decode, encode, sequence, uuid},
     pin::{check_scope, scope_from_row},
     storage_error, stream,
 };
@@ -249,4 +249,43 @@ pub(super) fn derive_chain(
     message.hop_count = depth.checked_add(1).ok_or(MailboxError::ChainDepth)?;
     message.ancestry = ancestry;
     Ok(())
+}
+
+/// Nack one accepted slot without retiring its stream or skipping later work.
+pub(super) fn terminal_stale_slot(
+    conn: &Connection,
+    stream: &mut stream::Stream,
+    saved: &mut Receipt,
+    now: i64,
+) -> MailboxResult<()> {
+    if !stream.progress.seq_skipped.iter().any(|hole| hole.seq == saved.seq) {
+        if stream.progress.seq_skipped.len() >= crate::messaging::mailbox::MAX_HOLES {
+            return Err(MailboxError::Quota("seq"));
+        }
+        stream.progress.seq_skipped.push(super::model::Hole {
+            seq: saved.seq,
+            skipped_at: now,
+        });
+        stream.progress.seq_skipped.sort_by_key(|hole| hole.seq);
+    }
+    saved.meta.body_erased_at = Some(now);
+    saved.meta.updated_at = now;
+    conn.execute("DELETE FROM prx_mailbox_messages WHERE id=?1", [saved.id])
+        .map_err(storage_error)?;
+    conn.execute(
+        "UPDATE prx_mailbox_receipts SET receipt_meta=?1 WHERE id=?2",
+        params![encode(&saved.meta)?, saved.id],
+    )
+    .map_err(storage_error)?;
+    stream.progress.deliver_cursor = stream.progress.deliver_cursor.max(saved.seq);
+    while let Some(next) = stream.progress.consume_cursor.checked_add(1) {
+        if !stream.progress.seq_skipped.iter().any(|hole| hole.seq == next) {
+            break;
+        }
+        stream.progress.consume_cursor = next;
+    }
+    stream.progress.gap_seq = None;
+    stream.progress.gap_started_at = None;
+    super::outbox::nack_slot(conn, stream, saved.seq, MailboxError::StaleRun, now)?;
+    stream::save_progress(conn, stream, now)
 }

@@ -130,15 +130,13 @@ impl WorkerMailboxFactory for Factory {
         drop(outgoing);
         // The scripted model gets a typed send intent. Wire bytes are still
         // emitted by the actual worker stdout owner and read by its real parent.
-        let reverse = MailboxAuthority::local(self.workspace.clone(), worker.clone(), parent.clone())?;
-        let parent_key = crate::chat::sessions::child::ChildSessionRegistry::canonical_session_key(&parent)?;
         let mut reply = message;
         reply.id = Uuid::new_v4();
         reply.idempotency = IdempotencyKey::parse(&reply.id.to_string())?;
         reply.stream_id = Some(Uuid::new_v4());
         reply.from = worker.clone();
         reply.to = parent.clone();
-        reply.to_pin = self.store.recipient_pin(&reverse, &parent_scope, &parent_key)?;
+        reply.to_pin.token.clear();
         reply.body.bytes = b"ordinary worker-originated Data".to_vec();
         std::fs::write(
             self.hold.with_file_name("worker-send-intent"),
