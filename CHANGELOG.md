@@ -70,6 +70,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- BREAKING (operators behind a mandatory proxy): the `web_fetch` and
+  `http_request` tools resolve a host once, refuse it when any address is
+  private or local, and connect to exactly the checked address (DNS
+  rebinding); `web_fetch` does so for every redirect hop. Both now connect
+  directly: a general proxy (`proxy.scope = "zeroclaw"`) and inherited
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are no longer used by them, because
+  a proxy resolves the name itself. `http_request` uses the proxy only with
+  `proxy.scope = "services"` and `tool.http_request` (or `tool.*`) in
+  `proxy.services`; the proxy must then enforce its own egress rules.
+  `web_fetch` never uses a proxy.
+
+- BREAKING (operators): PRX no longer writes the process environment.
+  `proxy.scope = "environment"` is inactive: a saved configuration that has
+  it still loads, with one warning, and its proxy URLs route no traffic.
+  Migrate to `proxy.scope = "zeroclaw"` (all PRX traffic) or to
+  `proxy.scope = "services"` with `proxy.services`; to rely on inherited
+  variables, start PRX with them set. The agent `proxy_config` tool refuses
+  `set` with scope `environment`, `apply_env` and `clear_env`, and changes
+  nothing when it refuses.
+
 - Console third-party skill installs require explicit confirmation and publish
   quarantined, inactive skills for owner review before activation.
 

@@ -100,3 +100,88 @@ async fn a_retired_matrix_proxy_selector_loads_ignored_and_a_typo_is_refused() {
         "the misspelled selector must be named, got: {error}"
     );
 }
+
+fn proxy_with_scope(scope: ProxyScope, services: &[&str]) -> ProxyConfig {
+    ProxyConfig {
+        http_proxy: Some("http://127.0.0.1:7890".into()),
+        https_proxy: None,
+        all_proxy: None,
+        no_proxy: Vec::new(),
+        scope,
+        services: services.iter().map(|service| (*service).to_string()).collect(),
+    }
+}
+
+/// Review r1 finding 1: only `scope = "services"` with a matching selector is
+/// an explicit selection; a general or environment proxy is not.
+#[test]
+async fn only_a_services_selector_explicitly_selects_a_service() {
+    let general = proxy_with_scope(ProxyScope::Zeroclaw, &[]);
+    assert!(
+        general.should_apply_to_service("tool.http_request"),
+        "a general proxy still applies to ordinary clients"
+    );
+    assert!(
+        !general.explicitly_selects_service("tool.http_request"),
+        "a general proxy is not an explicit selection"
+    );
+    assert!(
+        !proxy_with_scope(ProxyScope::Environment, &["tool.http_request"])
+            .explicitly_selects_service("tool.http_request"),
+        "the environment scope selects nothing"
+    );
+    for selector in ["tool.http_request", "tool.*"] {
+        assert!(
+            proxy_with_scope(ProxyScope::Services, &[selector]).explicitly_selects_service("tool.http_request"),
+            "services selector `{selector}` must select tool.http_request"
+        );
+    }
+    assert!(
+        !proxy_with_scope(ProxyScope::Services, &["provider.openai"]).explicitly_selects_service("tool.http_request"),
+        "a selector for another service must not select tool.http_request"
+    );
+}
+
+/// Review r1 finding 2: a saved configuration with the environment scope
+/// still loads and validates (startup must not fail); it carries the
+/// migration notice, and no other scope does.
+#[test]
+async fn a_saved_environment_scope_loads_with_a_migration_notice() {
+    let loaded: ProxyConfig = toml::from_str("scope = \"environment\"\nhttp_proxy = \"http://127.0.0.1:7890\"\n")
+        .expect("test: an old environment-scope [proxy] table still parses");
+    assert_eq!(
+        loaded.scope,
+        ProxyScope::Environment,
+        "the saved scope is kept as written"
+    );
+    loaded
+        .validate()
+        .expect("test: the environment scope must not fail validation at load");
+    assert!(
+        !loaded.should_apply_to_service("tool.http_request"),
+        "the inactive scope routes no traffic"
+    );
+
+    let notice = loaded
+        .environment_scope_notice()
+        .expect("test: the environment scope has a notice");
+    assert_eq!(
+        notice,
+        ProxyConfig::ENVIRONMENT_SCOPE_INACTIVE,
+        "the notice is the published migration text"
+    );
+    for needed in ["inactive", "zeroclaw", "services", "HTTP_PROXY"] {
+        assert!(
+            notice.contains(needed),
+            "the migration notice must mention `{needed}`: {notice}"
+        );
+    }
+    for scope in [ProxyScope::Zeroclaw, ProxyScope::Services] {
+        assert!(
+            proxy_with_scope(scope, &["tool.*"])
+                .environment_scope_notice()
+                .is_none(),
+            "{scope:?} is active and has no notice"
+        );
+    }
+}

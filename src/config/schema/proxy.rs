@@ -51,10 +51,12 @@ pub(super) static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, re
 // `setenv` next to a concurrent `getenv` in another thread is undefined
 // behaviour, and no single-threaded startup path ever needed it. Runtime
 // proxy changes go to the in-process state (`set_runtime_proxy_config`) that
-// client builders read explicitly. With `scope = "environment"` PRX adds no
-// explicit proxy; `reqwest` then honours the variables the process was
-// started with. (Plain comments: the doc comments below are published in the
-// config JSON schema.)
+// client builders read explicitly. `scope = "environment"` is therefore
+// inactive: a saved configuration that has it still loads, with one warning
+// (`ProxyConfig::ENVIRONMENT_SCOPE_INACTIVE`), and its URLs route no traffic. (Plain
+// comments: the doc comments below are published in the config JSON schema.)
+
+static ENVIRONMENT_SCOPE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
@@ -158,7 +160,62 @@ impl ProxyConfig {
             anyhow::bail!("proxy.scope='services' requires a non-empty proxy.services list");
         }
 
+        // An old configuration with the environment scope must still load:
+        // it is reported once per process, never refused.
+        if let Some(notice) = self.environment_scope_notice()
+            && !ENVIRONMENT_SCOPE_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!("{notice}");
+        }
+
         Ok(())
+    }
+
+    /// What an operator is told when a loaded configuration still has
+    /// `proxy.scope = "environment"`, and what the `proxy_config` tool
+    /// answers when asked to set it.
+    pub const ENVIRONMENT_SCOPE_INACTIVE: &str = "proxy.scope = \"environment\" is inactive: PRX never writes the \
+         process environment, so the configured proxy URLs route no traffic. Migrate to proxy.scope = \"zeroclaw\" \
+         (all PRX traffic; tool `proxy_config` scope 'prx') or to proxy.scope = \"services\" with a proxy.services \
+         list; to keep using inherited variables, start PRX with HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY already set";
+
+    /// The migration notice of a configuration whose scope is `environment`
+    /// (inactive since PRX stopped writing the process environment), and
+    /// `None` for every other scope.
+    pub const fn environment_scope_notice(&self) -> Option<&'static str> {
+        match self.scope {
+            ProxyScope::Environment => Some(Self::ENVIRONMENT_SCOPE_INACTIVE),
+            ProxyScope::Zeroclaw | ProxyScope::Services => None,
+        }
+    }
+
+    /// Whether the operator selected `service_key` for proxying by name:
+    /// the scope is `services` and a `proxy.services` selector matches the
+    /// key. A proxy that merely applies to everything (scope `zeroclaw`) or
+    /// that is inherited from the environment is not an explicit selection.
+    pub fn explicitly_selects_service(&self, service_key: &str) -> bool {
+        self.scope == ProxyScope::Services && self.should_apply_to_service(service_key)
+    }
+
+    /// The proxy settings of a client that connects to an address PRX has
+    /// checked and pinned (`http_request`, `web_fetch`). Through a proxy the
+    /// proxy resolves the target name, so the pin would not bind the address
+    /// that is finally connected to. Such a client therefore connects
+    /// directly: inherited environment proxies and a general proxy are
+    /// switched off. Only an explicit selection of `service_key`
+    /// ([`Self::explicitly_selects_service`]) routes it through the proxy;
+    /// the proxy must then enforce its own egress rules.
+    pub fn apply_explicit_selection_to_reqwest_builder(
+        &self,
+        builder: reqwest::ClientBuilder,
+        service_key: &str,
+    ) -> reqwest::ClientBuilder {
+        let direct = builder.no_proxy();
+        if self.explicitly_selects_service(service_key) {
+            self.apply_to_reqwest_builder(direct, service_key)
+        } else {
+            direct
+        }
     }
 
     pub fn should_apply_to_service(&self, service_key: &str) -> bool {
