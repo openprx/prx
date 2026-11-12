@@ -1412,11 +1412,6 @@ mod turn_state_tests {
             assert!(!printed.contains(sentinel), "{sentinel} printed: {printed}");
         }
     }
-}
-
-#[cfg(test)]
-mod fingerprint_error_tests {
-    use super::*;
     #[test]
     fn fingerprint_error_never_becomes_a_match() {
         let error = serde_json::from_str::<serde_json::Value>("{").expect_err("test: invalid JSON");

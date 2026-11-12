@@ -31,6 +31,13 @@ fn violations(source: &str) -> Vec<String> {
         }
     }
     for window in lexed.windows(4) {
+        if matches!(window[0], "Option" | "Result")
+            && window[1] == ":"
+            && window[2] == ":"
+            && matches!(window[3], "unwrap" | "expect")
+        {
+            found.push(format!("{}::{}", window[0], window[3]));
+        }
         if window[0] == "." && window[1] == "unwrap" && window[2] == "(" && window[3] == ")" {
             found.push(".unwrap()".to_string());
         }
@@ -65,20 +72,25 @@ fn violations(source: &str) -> Vec<String> {
                 let group: Vec<char> = attribute[offset + name.len() - 1..].chars().collect();
                 let close = close_of_group(&group, 0);
                 let inner: String = group[..close].iter().collect();
-                ["clippy::unwrap_used", "clippy::expect_used", "clippy::panic"]
-                    .iter()
-                    .any(|lint| {
-                        inner.match_indices(*lint).any(|(start, _)| {
-                            !inner
-                                .get(..start)
-                                .and_then(|s| s.chars().next_back())
+                [
+                    "clippy::unwrap_used",
+                    "clippy::expect_used",
+                    "clippy::panic",
+                    "clippy::restriction",
+                ]
+                .iter()
+                .any(|lint| {
+                    inner.match_indices(*lint).any(|(start, _)| {
+                        !inner
+                            .get(..start)
+                            .and_then(|s| s.chars().next_back())
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !inner
+                                .get(start + lint.len()..)
+                                .and_then(|s| s.chars().next())
                                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                                && !inner
-                                    .get(start + lint.len()..)
-                                    .and_then(|s| s.chars().next())
-                                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                        })
                     })
+                })
             });
         if suppressed {
             found.push(attribute);

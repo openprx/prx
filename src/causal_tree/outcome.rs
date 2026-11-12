@@ -30,7 +30,7 @@ use crate::runtime::turn_decision::TurnDecisionContext;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecordBuildError {
     #[error("state fingerprint serialization failed")]
-    Fingerprint(#[from] serde_json::Error),
+    Fingerprint(#[source] serde_json::Error),
     #[error("decision hop chain does not match its runtime lineage")]
     Chain,
     #[error("decision record facts disagree with the sealed request")]
@@ -180,7 +180,10 @@ impl DecisionRecordBuilder {
         record_redacted_projection: bool,
     ) -> Result<DecisionRecord, RecordBuildError> {
         let trusted = hop.state.trusted.parts();
-        let state_fingerprint = hop.state.material_fingerprint(key)?;
+        let state_fingerprint = hop
+            .state
+            .material_fingerprint(key)
+            .map_err(RecordBuildError::Fingerprint)?;
         let catalog_generation = trusted.catalog_generation.to_hex();
         let projection = match (&hop.audit_trace, record_redacted_projection) {
             (Some(trace), enabled) => {

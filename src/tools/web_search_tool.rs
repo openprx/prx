@@ -188,6 +188,19 @@ fn strip_tags_with_pattern(
     Ok(pattern?.replace_all(content, "").to_string())
 }
 
+fn search_pattern_gate(provider: &str, pattern: Result<&Regex, &'static regex::Error>) -> Option<ToolResult> {
+    if matches!(provider, "duckduckgo" | "ddg")
+        && let Err(error) = pattern
+    {
+        return Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("search result pattern unavailable: {error}")),
+        });
+    }
+    None
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -221,14 +234,8 @@ impl Tool for WebSearchTool {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        if matches!(self.provider.as_str(), "duckduckgo" | "ddg")
-            && let Err(error) = re_strip_tags()
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("search result pattern unavailable: {error}")),
-            });
+        if let Some(result) = search_pattern_gate(&self.provider, re_strip_tags()) {
+            return Ok(result);
         }
 
         tracing::info!("Searching web for: {}", query);
@@ -262,6 +269,29 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_pattern_gate_rejects_ddg_pattern_error() {
+        static ERROR: LazyLock<regex::Error> =
+            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+        for provider in ["ddg", "duckduckgo"] {
+            let result =
+                search_pattern_gate(provider, Err(&ERROR)).expect("test: broken search pattern refuses execution");
+            assert!(
+                !result.success,
+                "broken search pattern must produce a failed ToolResult"
+            );
+            assert!(result.error.is_some(), "pattern refusal must explain the failure");
+        }
+        assert!(
+            search_pattern_gate("brave", Err(&ERROR)).is_none(),
+            "Brave does not use the HTML pattern"
+        );
+        assert!(
+            search_pattern_gate("ddg", re_strip_tags()).is_none(),
+            "valid pattern must permit search"
+        );
+    }
 
     #[test]
     fn test_tool_name() {

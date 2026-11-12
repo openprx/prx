@@ -292,6 +292,24 @@ macro_rules! planted_violation_probes {
 }
 
 planted_violation_probes! {
+    probe_panic_restriction_group: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[allow(clippy::restriction)] fn a() {}\n";
+    probe_panic_restriction_expect: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[expect(clippy::restriction)] fn a() {}\n";
+    probe_panic_restriction_conditional: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "#[cfg_attr(unix, allow(clippy::restriction))] fn a() {}\n";
+    probe_panic_option_unwrap_call: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn p(v: Option<u8>) { let _ = Option::unwrap(v); }\n";
+    probe_panic_option_unwrap_path: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn p(v: Option<u8>) { let _ = v.map(Some).map(Option::unwrap); }\n";
+    probe_panic_result_expect_call: production_has_no_panic_shortcuts,
+        "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn p(r: Result<u8, ()>) { let _ = Result::expect(r, \"x\"); }\n";
     probe_panic_unwrap: production_has_no_panic_shortcuts,
         "src/panic_policy_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn probe(value: Option<u8>) { let _ = value.unwrap(); }\n";

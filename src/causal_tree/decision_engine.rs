@@ -620,7 +620,7 @@ pub(crate) enum FallbackCause {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EngineError {
     #[error("state fingerprint serialization failed")]
-    Fingerprint(#[from] serde_json::Error),
+    Fingerprint(#[source] serde_json::Error),
     #[error(transparent)]
     Gates(#[from] GateError),
     #[error(transparent)]
@@ -969,7 +969,10 @@ impl CausalDecisionEngine {
         let proof = super::approval_collection::DeferredArgumentProof::issue(
             reference.clone(),
             adapter,
-            prepared.state.material_fingerprint(inputs.key)?,
+            prepared
+                .state
+                .material_fingerprint(inputs.key)
+                .map_err(EngineError::Fingerprint)?,
         );
         Ok(Some(CollectionReadyRecord {
             proof,

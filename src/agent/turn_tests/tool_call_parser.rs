@@ -793,3 +793,67 @@ fn unparsed_syntax_prefilter_matches_original_casefold_and_unicode_patterns() {
         );
     }
 }
+
+#[test]
+fn tool_call_parser_hardcoded_patterns_compile() {
+    assert!(
+        codex_to_header_re().is_ok(),
+        "hardcoded codex_to_header_re must compile"
+    );
+    assert!(
+        assistant_recipient_re().is_ok(),
+        "hardcoded assistant_recipient_re must compile"
+    );
+    assert!(recipient_attr_re().is_ok(), "hardcoded recipient_attr_re must compile");
+    assert!(
+        complete_tool_syntax().is_ok(),
+        "hardcoded complete_tool_syntax must compile"
+    );
+    assert!(md_tool_call_re().is_ok(), "hardcoded md_tool_call_re must compile");
+}
+
+#[test]
+fn parser_pattern_error_is_typed() {
+    static ERROR: LazyLock<regex::Error> =
+        LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+    assert!(
+        matches!(
+            parser_pattern::<&Regex>(Err(&ERROR)),
+            Err(ToolCallParseError::Pattern(_))
+        ),
+        "broken parser pattern must propagate a typed error"
+    );
+}
+
+#[test]
+fn parse_tool_calls_propagates_each_pattern_error() {
+    static ERROR: LazyLock<regex::Error> =
+        LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+    const PATTERN_COUNT: usize = 4;
+    for index in 0..PATTERN_COUNT {
+        let mut patterns = [
+            md_tool_call_re(),
+            codex_to_header_re(),
+            assistant_recipient_re(),
+            recipient_attr_re(),
+        ];
+        *patterns.get_mut(index).expect("test: pattern index is bounded") = Err(&ERROR);
+        assert!(
+            matches!(parse_tool_calls_with_patterns("plain response", patterns), Err(ToolCallParseError::Pattern(error)) if std::ptr::eq(error, &*ERROR)),
+            "parser must propagate injected pattern error at index {index}"
+        );
+    }
+}
+
+#[test]
+fn unparsed_syntax_propagates_pattern_error() {
+    static ERROR: LazyLock<regex::Error> =
+        LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
+    assert!(
+        matches!(
+            looks_like_unparsed_tool_call_syntax_with_patterns("<tool_call>", [Err(&ERROR)]),
+            Err(ToolCallParseError::Pattern(_))
+        ),
+        "syntax decision must propagate pattern error instead of returning false"
+    );
+}

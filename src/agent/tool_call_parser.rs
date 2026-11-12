@@ -441,7 +441,10 @@ fn parse_recipient_tool_calls(recipient: &str, body: &str) -> Vec<ParsedToolCall
     calls
 }
 
-fn parse_codex_to_style_tool_calls(text: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
+fn parse_codex_to_style_tool_calls_with_patterns(
+    text: &str,
+    [header]: [Result<&Regex, &'static regex::Error>; 1],
+) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut plain_text = String::new();
@@ -455,7 +458,7 @@ fn parse_codex_to_style_tool_calls(text: &str) -> Result<(String, Vec<ParsedTool
         }
     };
 
-    let header = parser_pattern(codex_to_header_re())?;
+    let header = parser_pattern(header)?;
     for line in text.lines() {
         if let Some(cap) = header.captures(line) {
             flush_current(&mut current_recipient, &mut current_body, &mut calls);
@@ -488,13 +491,16 @@ fn parse_codex_to_style_tool_calls(text: &str) -> Result<(String, Vec<ParsedTool
     Ok((text_parts.join("\n"), calls))
 }
 
-fn parse_assistant_recipient_tool_calls(text: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
+fn parse_assistant_recipient_tool_calls_with_patterns(
+    text: &str,
+    [assistant, recipient]: [Result<&Regex, &'static regex::Error>; 2],
+) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut calls = Vec::new();
     let mut text_parts = Vec::new();
     let mut last_end = 0usize;
 
-    let assistant = parser_pattern(assistant_recipient_re())?;
-    let recipient_pattern = parser_pattern(recipient_attr_re())?;
+    let assistant = parser_pattern(assistant)?;
+    let recipient_pattern = parser_pattern(recipient)?;
     for cap in assistant.captures_iter(text) {
         let Some(full_match) = cap.get(0) else {
             continue;
@@ -528,15 +534,22 @@ fn parse_assistant_recipient_tool_calls(text: &str) -> Result<(String, Vec<Parse
 }
 
 pub(super) fn looks_like_unparsed_tool_call_syntax(text: &str) -> Result<bool, ToolCallParseError> {
+    looks_like_unparsed_tool_call_syntax_with_patterns(text, [complete_tool_syntax()])
+}
+
+fn looks_like_unparsed_tool_call_syntax_with_patterns(
+    text: &str,
+    [complete]: [Result<&RegexSet, &'static regex::Error>; 1],
+) -> Result<bool, ToolCallParseError> {
     // Every XML alternative requires '<'; the Codex alternative requires '='.
     // These punctuation literals are unchanged by Unicode case folding.
     // Keep the original matcher for every possible match, including malformed
-    // marker-bearing input, without initializing its regexes for plain prose.
+    // marker-bearing input, while skipping regex matching for plain prose.
     if !text.bytes().any(|byte| matches!(byte, b'<' | b'=')) {
         return Ok(false);
     }
 
-    Ok(parser_pattern(complete_tool_syntax())?.is_match(text))
+    Ok(parser_pattern(complete)?.is_match(text))
 }
 
 // ── Tool-Call Parsing ─────────────────────────────────────────────────────
@@ -564,6 +577,21 @@ pub(super) fn looks_like_unparsed_tool_call_syntax(text: &str) -> Result<bool, T
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
 pub(super) fn parse_tool_calls(response: &str) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
+    parse_tool_calls_with_patterns(
+        response,
+        [
+            md_tool_call_re(),
+            codex_to_header_re(),
+            assistant_recipient_re(),
+            recipient_attr_re(),
+        ],
+    )
+}
+
+fn parse_tool_calls_with_patterns(
+    response: &str,
+    [md, header, assistant, recipient]: [Result<&Regex, &'static regex::Error>; 4],
+) -> Result<(String, Vec<ParsedToolCall>), ToolCallParseError> {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -646,7 +674,7 @@ pub(super) fn parse_tool_calls(response: &str) -> Result<(String, Vec<ParsedTool
         let mut md_text_parts: Vec<String> = Vec::new();
         let mut last_end = 0;
 
-        for cap in parser_pattern(md_tool_call_re())?.captures_iter(response) {
+        for cap in parser_pattern(md)?.captures_iter(response) {
             // cap.get(0) is the full match, always present for captures_iter results
             if let Some(full_match) = cap.get(0) {
                 let before = &response[last_end..full_match.start()];
@@ -675,7 +703,7 @@ pub(super) fn parse_tool_calls(response: &str) -> Result<(String, Vec<ParsedTool
 
     // OpenAI Codex text protocol: `assistant to=<tool> code ...`
     if calls.is_empty() {
-        let (parsed_text, parsed_calls) = parse_codex_to_style_tool_calls(response)?;
+        let (parsed_text, parsed_calls) = parse_codex_to_style_tool_calls_with_patterns(response, [header])?;
         if !parsed_calls.is_empty() {
             calls = parsed_calls;
             if !parsed_text.is_empty() {
@@ -689,7 +717,8 @@ pub(super) fn parse_tool_calls(response: &str) -> Result<(String, Vec<ParsedTool
 
     // Assistant-recipient XML protocol: <assistant recipient="tool">...</assistant>
     if calls.is_empty() {
-        let (parsed_text, parsed_calls) = parse_assistant_recipient_tool_calls(response)?;
+        let (parsed_text, parsed_calls) =
+            parse_assistant_recipient_tool_calls_with_patterns(response, [assistant, recipient])?;
         if !parsed_calls.is_empty() {
             calls = parsed_calls;
             if !parsed_text.is_empty() {
@@ -789,39 +818,3 @@ pub(super) struct ParsedToolCall {
 
 #[path = "turn_tests/tool_call_parser.rs"]
 mod tests;
-
-#[cfg(test)]
-mod panic_policy_tests {
-    use super::*;
-
-    #[test]
-    fn tool_call_parser_hardcoded_patterns_compile() {
-        assert!(
-            codex_to_header_re().is_ok(),
-            "hardcoded codex_to_header_re must compile"
-        );
-        assert!(
-            assistant_recipient_re().is_ok(),
-            "hardcoded assistant_recipient_re must compile"
-        );
-        assert!(recipient_attr_re().is_ok(), "hardcoded recipient_attr_re must compile");
-        assert!(
-            complete_tool_syntax().is_ok(),
-            "hardcoded complete_tool_syntax must compile"
-        );
-        assert!(md_tool_call_re().is_ok(), "hardcoded md_tool_call_re must compile");
-    }
-
-    #[test]
-    fn parser_pattern_error_is_typed() {
-        static ERROR: LazyLock<regex::Error> =
-            LazyLock::new(|| regex::Error::Syntax("test: injected pattern failure".to_string()));
-        assert!(
-            matches!(
-                parser_pattern::<&Regex>(Err(&ERROR)),
-                Err(ToolCallParseError::Pattern(_))
-            ),
-            "broken parser pattern must propagate a typed error"
-        );
-    }
-}
