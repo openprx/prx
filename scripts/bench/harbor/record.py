@@ -15,7 +15,7 @@ from profile import read_bounded
 MAX_ARTIFACT = 16 * 1024 * 1024
 AGENT_KEYS = ("git_sha", "binary_sha256", "profile_sha256", "instruction_sha256", "version",
               "model_id", "provider", "settlement_provider", "sampling", "profile_values",
-              "agent_timeout_sec", "per_attempt_models")
+              "agent_timeout_sec", "agent_exec_timeout_sec", "per_attempt_models")
 TRANSPORT = re.compile(r"API error \((?:5\d\d|429)\b|\b(?:HTTP|status)[ /:=]*(?:5\d\d|429)\b|error sending request|error trying to connect|tcp connect error|connection (?:refused|reset|closed)|dns error|failed to lookup address|name resolution|invalid peer certificate|tls handshake|request timed out|operation timed out", re.I)
 
 
@@ -74,6 +74,7 @@ def agent_metadata(values, provider, model, prices, temperature, git_sha,
         "settlement_provider": serving_provider(provider),
         "sampling": {"temperature": temperature}, "profile_values": safe_values,
         "agent_timeout_sec": agent_timeout_sec,
+        "agent_exec_timeout_sec": agent_timeout_sec - 50,
         "per_attempt_models": unavailable(f"no per-attempt ledger at {git_sha}"),
     }
 
@@ -137,10 +138,22 @@ def per_attempt_models(database, git_sha):
     return attempt_evidence(attempts) if attempts else unavailable(f"no per-attempt ledger at {git_sha}")
 
 
+def collected(name, reader):
+    try:
+        return reader()
+    except (ValueError, OSError):
+        return unavailable(f"{name} unreadable")
+
+
+def cost_report(path):
+    report = optional(path)
+    return report if isinstance(report, dict) else unavailable("cost report unreadable")
+
+
 def build_agent(logs, metadata):
     logs = Path(logs)
     code_path = logs / "prx-exit-code"
-    exit_code = int(raw) if (raw := text(code_path).strip()).lstrip("-").isdigit() else unavailable("exit code not collected")
+    exit_code = collected("exit code", lambda: int(raw) if re.fullmatch(r"-?\d{1,5}", raw := text(code_path).strip()) else unavailable("exit code not collected"))
     ledger = logs / "costs.jsonl"
     rows = []
     try:
@@ -152,9 +165,9 @@ def build_agent(logs, metadata):
         rows = unavailable("ledger unreadable")
         totals = unavailable("ledger unreadable")
     result = {**metadata, "exit_code": exit_code, "costs_rows": rows,
-              "stdout_sha256": sha256(read_bounded(logs / "prx-stdout.txt", MAX_ARTIFACT)) if (logs / "prx-stdout.txt").is_file() else unavailable("stdout not collected"),
-              "stderr_sha256": sha256(read_bounded(logs / "prx-stderr.txt", MAX_ARTIFACT)) if (logs / "prx-stderr.txt").is_file() else unavailable("stderr not collected"),
-              "cost_report": optional(logs / "prx-cost.json")}
+              "stdout_sha256": collected("stdout", lambda: sha256(read_bounded(logs / "prx-stdout.txt", MAX_ARTIFACT))),
+              "stderr_sha256": collected("stderr", lambda: sha256(read_bounded(logs / "prx-stderr.txt", MAX_ARTIFACT))),
+              "cost_report": collected("cost report", lambda: cost_report(logs / "prx-cost.json"))}
     result["usage"] = totals
     write(logs / "prx-agent-side.json", result)
     return result
@@ -168,7 +181,7 @@ def classify(agent, result, reward, stdout, stderr):
     if code == 124 and not agent["costs_rows"]:
         return "timeout", "agent_timeout"
     if not isinstance(provider, str) or not isinstance(model, str):
-        return "infra_error", "missing_agent_metadata"
+        return "infra_error", "harbor_exception" if exception else "missing_agent_metadata"
     if isinstance(agent["costs_rows"], dict):
         return "infra_error", "ledger_unreadable"
     if any(row.get("usage", {}).get("model") != f"{provider}/{model}" or
@@ -268,6 +281,7 @@ def finalize(trial):
                             "storage_mb": resource_mb(env, "storage"),
                             "gpu": unavailable("v1 GPU inspection unavailable"),
                             "agent_timeout_sec": agent["agent_timeout_sec"],
+                            "agent_exec_timeout_sec": agent["agent_exec_timeout_sec"],
                             "network_mode": task.get("agent", {}).get("network_mode") or env.get("network_mode", "public")},
         "score": reward, "verifier_details": {"result": result.get("verifier_result") or unavailable("no verifier result"),
             "reward_txt": text(trial / "verifier/reward.txt") or unavailable("not produced"),
@@ -275,7 +289,7 @@ def finalize(trial):
             "stdout": text(trial / "verifier/test-stdout.txt") or unavailable("not produced")},
         "attempt_status": status, "reason": reason, "classifier": "v1-exitcode",
         "usage": agent["usage"], "cost": agent["usage"].get("cost_usd", agent["usage"]),
-        "unsettled_dispatched_requests": agent["cost_report"].get("unsettled_dispatched_requests", unavailable("cost report missing")),
+        "unsettled_dispatched_requests": (agent["cost_report"].get("unsettled_dispatched_requests", unavailable("cost report missing")) if isinstance(agent["cost_report"], dict) else unavailable("cost report unreadable")),
         "per_attempt_models": agent["per_attempt_models"], "timings": {"queue": unavailable("not exported"), **phases},
         "trajectory": {"stdout": "agent/prx-stdout.txt", "log": "trial.log", "commands": unavailable("not exported")},
         "diff": unavailable("not exported"), "artifacts": artifacts,

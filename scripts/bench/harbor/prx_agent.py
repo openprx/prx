@@ -15,7 +15,50 @@ from record import AGENT_KEYS, agent_metadata, build_agent, endpoint, sha256, un
 
 CONFIG_DIR = "/opt/prx-bench"
 LOG_DIR = "/logs/agent"
-KILL_PRX = 'for p in /proc/[0-9]*; do [ "$(readlink $p/exe 2>/dev/null)" = /usr/local/bin/prx ] && kill -KILL ${p#/proc/}; done; true'
+# Freeze parents before discovery so children cannot escape by reparenting.
+# The caller also enforces a ten-second exec deadline.
+KILL_PRX = r"""
+exe=${PRX_EXE:-/usr/local/bin/prx}
+pids=" "
+for path in /proc/[0-9]*; do
+    if [ "$(readlink "$path/exe" 2>/dev/null)" = "$exe" ]; then
+        pid=${path#/proc/}
+        kill -STOP "$pid" 2>/dev/null || true
+        pids="$pids$pid "
+    fi
+done
+roots=$pids
+pass=0
+while [ "$pass" -lt 32 ]; do
+    added=0
+    tree=$(awk '{sub(/.*\) /, ""); print FILENAME, $2}' /proc/[0-9]*/stat 2>/dev/null)
+    while read -r path parent; do
+        pid=${path#/proc/}; pid=${pid%/stat}
+        case "$pids" in *" $pid "*) continue ;; esac
+        case "$pids" in
+            *" $parent "*)
+                kill -STOP "$pid" 2>/dev/null || true
+                pids="$pids$pid "
+                added=1 ;;
+        esac
+    done <<EOF
+$tree
+EOF
+    [ "$added" = 1 ] || break
+    pass=$((pass + 1))
+done
+for pid in $pids; do
+    case "$roots" in *" $pid "*) continue ;; esac
+    # A negative pid kills a group only when this pid leads that group.
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+done
+for pid in $roots; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+done
+true
+"""
 
 
 def read_key_file(path):
@@ -42,8 +85,8 @@ class PrxAgent(BaseInstalledAgent):
         self.git_sha = str(git_sha)
         self.agent_timeout_sec = float(agent_timeout_sec)
         self.temperature = float(temperature)
-        if not math.isfinite(self.agent_timeout_sec) or self.agent_timeout_sec <= 30:
-            raise ValueError("agent_timeout_sec must exceed the 30 second cleanup reserve")
+        if not math.isfinite(self.agent_timeout_sec) or self.agent_timeout_sec <= 50:
+            raise ValueError("agent_timeout_sec must exceed the 50 second cleanup reserve")
         if not math.isfinite(self.temperature):
             raise ValueError("temperature must be finite")
         self.prices = {key: float(kwargs.pop("price_" + key)) for key in PRICES}
@@ -96,7 +139,7 @@ class PrxAgent(BaseInstalledAgent):
             if locked.return_code != 0:
                 raise RuntimeError("cannot secure private config")
             timeout_available = await environment.exec(command="command -v timeout", timeout_sec=10)
-            seconds = self.agent_timeout_sec - 30
+            seconds = self.agent_timeout_sec - 50
             timeout_prefix = f"timeout -k 5s {seconds:g}s " if timeout_available.return_code == 0 else ""
             no_proxy = f"NO_PROXY={shlex.quote(endpoint(self.provider))} no_proxy={shlex.quote(endpoint(self.provider))} " if self.provider.startswith("custom:") else ""
             command = (f"env -u PRX_BENCH_API_KEY {no_proxy}{timeout_prefix}prx --config-dir {CONFIG_DIR} "
@@ -106,17 +149,17 @@ class PrxAgent(BaseInstalledAgent):
             try:
                 await environment.exec(command=command, user="root", timeout_sec=seconds + (15 if timeout_prefix else 0))
             except (TimeoutError, asyncio.TimeoutError):
-                await environment.exec(command=KILL_PRX, user="root", timeout_sec=5)
+                await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await environment.exec(command=f"printf '124\\n' >{LOG_DIR}/prx-exit-code", timeout_sec=5)
             except RuntimeError as error:
                 # Harbor 0.25 DockerEnvironment translates its asyncio timeout.
                 if not str(error).startswith("Command timed out after "):
                     raise
-                await environment.exec(command=KILL_PRX, user="root", timeout_sec=5)
+                await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await environment.exec(command=f"printf '124\\n' >{LOG_DIR}/prx-exit-code", timeout_sec=5)
         finally:
             try:
-                await environment.exec(command=KILL_PRX, user="root", timeout_sec=5)
+                await environment.exec(command=KILL_PRX, user="root", timeout_sec=10)
                 await asyncio.wait_for(self._collect(environment), timeout=15)
             except (sqlite3.Error, ValueError, KeyError, TypeError, OSError, asyncio.TimeoutError, RuntimeError) as error:
                 self._metadata["per_attempt_models"] = unavailable(f"per-attempt ledger unreadable: {type(error).__name__}")

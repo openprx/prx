@@ -140,6 +140,7 @@ class RecordTests(unittest.TestCase):
         write(self.root / 'result.json', {**self.result, 'exception_info': {'exception_type': 'AgentSetupError'}})
         record = finalize(self.root)
         self.assertEqual(record['attempt_status'], 'infra_error')
+        self.assertEqual(record['reason'], 'harbor_exception')
         self.assertEqual(record['profile_sha256']['status'], 'unavailable')
 
     def test_sqlite_provider_attempts_read_from_finalized_turn(self):
@@ -205,3 +206,28 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(metadata['profile_values']['cost']['daily_limit_usd'], values['cost']['daily_limit_usd'])
         build_agent(self.logs, metadata)
         scan_secrets(self.root, self.secret)
+
+    def test_oversized_stdout_is_unavailable(self):
+        self.check_oversized_stream('stdout')
+
+    def test_oversized_stderr_is_unavailable(self):
+        self.check_oversized_stream('stderr')
+
+    def check_oversized_stream(self, name):
+        with (self.logs / f'prx-{name}.txt').open('wb') as stream:
+            stream.truncate(16 * 1024 * 1024 + 1)
+        agent = build_agent(self.logs, self.metadata)
+        self.assertEqual(agent[f'{name}_sha256'], unavailable(f'{name} unreadable'))
+
+    def test_truncated_cost_report_is_unavailable(self):
+        (self.logs / 'prx-cost.json').write_text('{')
+        self.assertEqual(build_agent(self.logs, self.metadata)['cost_report'], unavailable('cost report unreadable'))
+
+    def test_invalid_negative_exit_is_unavailable(self):
+        (self.logs / 'prx-exit-code').write_text('--1')
+        self.assertEqual(build_agent(self.logs, self.metadata)['exit_code']['status'], 'unavailable')
+
+    def test_nonobject_cost_report_is_unavailable(self):
+        write(self.logs / 'prx-cost.json', [])
+        self.assertEqual(build_agent(self.logs, self.metadata)['cost_report'], unavailable('cost report unreadable'))
+        self.assertEqual(finalize(self.root)['unsettled_dispatched_requests']['status'], 'unavailable')

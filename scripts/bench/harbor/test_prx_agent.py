@@ -2,6 +2,11 @@
 import asyncio
 import importlib.util
 import json
+import os
+import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
 import sqlite3
 import sys
@@ -87,7 +92,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 if mode == 'no_timeout':
                     self.assertNotIn('timeout -k', invocation)
                 else:
-                    self.assertIn('timeout -k 5s', invocation)
+                    self.assertIn('timeout -k 5s 70s', invocation)
+                execution = next(c for c in environment.calls if 'agent -t' in c['command'])
+                self.assertEqual(execution['timeout_sec'], 70 if mode == 'no_timeout' else 85)
+                self.assertEqual(agent._metadata['agent_exec_timeout_sec'], 70)
+                self.assertTrue(all(c['timeout_sec'] == 10 for c in environment.calls if c['command'] == adapter.KILL_PRX))
 
     async def test_key_file_rejects_wrong_path_and_mode(self):
         with self.assertRaises(ValueError):
@@ -102,3 +111,47 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                     adapter.read_key_file('/opt/ops/bench/secrets/key')
                 key.chmod(0o600)
                 self.assertEqual(adapter.read_key_file('/opt/ops/bench/secrets/key'), 'fixture-credential')
+
+
+class DescendantCleanupTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'requires Linux /proc and setsid')
+    def test_cleanup_kills_separate_session_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'prx-stand-in'
+            shutil.copyfile(shutil.which('sh'), executable)
+            executable.chmod(0o700)
+            marker, ready = root / 'marker', root / 'ready'
+            child = 'echo $$ > "$2"; while :; do echo x >> "$1"; sleep 0.1; done'
+            parent = subprocess.Popen([str(executable), '-c',
+                'setsid sh -c "$1" sh "$2" "$3" & wait', 'sh', child, str(marker), str(ready)])
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if ready.exists() and marker.exists():
+                        child_pid = int(ready.read_text())
+                        if marker.stat().st_size >= 4:
+                            break
+                    time.sleep(0.02)
+                self.assertIsNotNone(child_pid, 'stand-in child did not start')
+                self.assertGreaterEqual(marker.stat().st_size, 4, 'marker must grow before cleanup')
+                subprocess.run(['sh', '-c', adapter.KILL_PRX],
+                    env={**os.environ, 'PRX_EXE': str(executable)}, timeout=10, check=True)
+                parent.wait(timeout=2)
+                size = marker.stat().st_size
+                # This is the specified one-second post-cleanup observation window.
+                time.sleep(1)
+                self.assertEqual(marker.stat().st_size, size, 'detached tool child survived cleanup')
+                stat_path = Path(f'/proc/{child_pid}/stat')
+                if stat_path.exists():
+                    self.assertEqual(stat_path.read_text().rsplit(') ', 1)[1].split()[0], 'Z',
+                                     'detached child must be dead (an unreaped zombie is allowed)')
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                parent.kill()
+                parent.wait(timeout=2)

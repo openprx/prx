@@ -69,8 +69,8 @@ for index, task_name in enumerate(a.tasks):
         p.error('task escaped pinned dataset directory')
     config = tomllib.loads(read_bounded(task / 'task.toml').decode())
     seconds = float(config['agent']['timeout_sec']) * a.agent_timeout_multiplier
-    if not math.isfinite(seconds) or seconds <= 30:
-        p.error('effective task timeout must exceed 30 seconds')
+    if not math.isfinite(seconds) or seconds <= 50:
+        p.error('effective task timeout must exceed 50 seconds')
     deadline = time.monotonic() + 240 * 60
     while float(read_bounded('/proc/loadavg', 1024).decode().split()[0]) >= 8:
         if time.monotonic() >= deadline:
@@ -93,7 +93,12 @@ for index, task_name in enumerate(a.tasks):
             rc = proc.wait(timeout=seconds + 1800)
         except subprocess.TimeoutExpired:
             proc.send_signal(signal.SIGINT)
-            rc = proc.wait(timeout=180)
+            try:
+                rc = proc.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait(timeout=30)
+                failed = True
         failed |= rc != 0
     finally:
         trials = list(job.glob('*/config.json'))
@@ -105,7 +110,7 @@ for index, task_name in enumerate(a.tasks):
             except (ValueError, OSError, KeyError, TypeError) as error:
                 failed = True
                 print(f"finalize failed for {cfg.parent.name}: {type(error).__name__}", file=sys.stderr)
-                continue
-            scan_secrets(cfg.parent, secret)
+            finally:
+                scan_secrets(cfg.parent, secret)
 raise SystemExit(1 if failed else 0)
 PY
