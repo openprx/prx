@@ -1390,13 +1390,16 @@ With event recording enabled, SQLite, Lucid's local store, and encrypted
 SQLite scopes commit the terminal events, recovery attestation, and an
 authenticated cost outbox together. A metered terminal records
 `projection_pending`; cost projection follows the commit and retries at startup,
-including when the causal decision plane is disabled. Projection reuses an
+including when the causal decision plane is disabled. Projection failures after
+the durable commit are logged and deferred; they do not fail the committed turn.
+Repeated authenticated acknowledgements succeed. Projection reuses an
 identical settlement, leaves I/O failures retryable, and blocks conflicting or
 incomplete ledger rows without truncating them. Restart repair does not repeat
 provider or tool execution. Subscription and unknown pricing dispositions do
 not append monetary ledger rows. PostgreSQL retains its existing terminal path.
 When reply text would exceed the serialized recovery-claim limit, the terminal
-binds its SHA-256 digest and byte length instead of retaining the text. The first
+binds its SHA-256 digest and byte length instead of retaining the text in the
+claim. Assistant history retains the reply for subsequent turns. The first
 webhook response still returns the reply. A duplicate, including after a restart,
 returns `409` with `status: "replay_unavailable"` and `result_hash`, without
 calling the provider again. Altered or unavailable authentication evidence

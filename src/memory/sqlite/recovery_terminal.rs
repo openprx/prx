@@ -158,7 +158,7 @@ fn commit_blocking(
         publication.terminal = Some(recovery_authority::event(&tx, &publication.chain, &terminal_id)?);
         let receipt = match recovery_authority::publish_in(&tx, &directory, &publication, true) {
             Ok(receipt) => receipt,
-            Err(error) if error.to_string().contains("conflicting recovery") => {
+            Err(error) if error.is::<RecoveryTerminalConflict>() => {
                 return Err(RecoveryTerminalConflict.into());
             }
             Err(error) => return Err(error),

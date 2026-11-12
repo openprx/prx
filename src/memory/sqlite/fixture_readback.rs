@@ -128,6 +128,7 @@ pub(crate) struct OutboxRow {
     pub(crate) pricing: String,
     pub(crate) state: String,
     pub(crate) facts: Vec<u8>,
+    pub(crate) usage_digest: Vec<u8>,
 }
 
 pub(crate) fn outbox_rows(workspace: &std::path::Path) -> Vec<OutboxRow> {
@@ -136,7 +137,7 @@ pub(crate) fn outbox_rows(workspace: &std::path::Path) -> Vec<OutboxRow> {
     }
     read_only(workspace)
         .prepare(
-            "SELECT settlement_id, owner_id, pricing, state, facts FROM recovery_cost_outbox ORDER BY settlement_id",
+            "SELECT settlement_id, owner_id, pricing, state, facts, usage_digest FROM recovery_cost_outbox ORDER BY settlement_id",
         )
         .expect("test: outbox statement")
         .query_map([], |row| {
@@ -146,6 +147,7 @@ pub(crate) fn outbox_rows(workspace: &std::path::Path) -> Vec<OutboxRow> {
                 pricing: row.get(2)?,
                 state: row.get(3)?,
                 facts: row.get(4)?,
+                usage_digest: row.get(5)?,
             })
         })
         .expect("test: outbox query")

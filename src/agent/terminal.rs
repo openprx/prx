@@ -1382,6 +1382,27 @@ mod tests {
         enabled: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
     ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+        bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, enabled, ingress_memory, false).await
+    }
+
+    pub(crate) async fn bind_terminal_parameter_fixture(
+        workspace: &Path,
+        memory: Arc<dyn Memory>,
+        draft: &mut TurnTerminalDraft,
+        cost_config: &CostConfig,
+    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+        bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, true, None, true).await
+    }
+
+    async fn bind_terminal_fixture_with_capture(
+        workspace: &Path,
+        memory: Arc<dyn Memory>,
+        draft: &mut TurnTerminalDraft,
+        cost_config: &CostConfig,
+        enabled: bool,
+        ingress_memory: Option<Arc<dyn Memory>>,
+        capture_parameters: bool,
+    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
         boxed_terminal_fixture_setup(move || async move {
             let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
             let input = if scoped_retrieval {
@@ -1515,6 +1536,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            if capture_parameters {
+                context.capture_main_parameters(true);
+            }
+
             if enabled {
                 assert!(
                     matches!(
@@ -3165,6 +3190,6 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) use tests::{
-    bind_terminal_fixture, bind_terminal_fixture_mode, completed_commit, priced_cost_config,
-    seed_replayable_completed_terminal,
+    bind_terminal_fixture, bind_terminal_fixture_mode, bind_terminal_parameter_fixture, completed_commit,
+    priced_cost_config, seed_replayable_completed_terminal,
 };

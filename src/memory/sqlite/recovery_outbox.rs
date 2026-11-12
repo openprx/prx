@@ -206,6 +206,9 @@ pub(super) fn finish_recovery_cost(
     )?;
     let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
     let row = authenticate(&directory, raw)?;
+    if row.state == state {
+        return Ok(());
+    }
     anyhow::ensure!(
         matches!(row.state, RecoveryCostState::Pending | RecoveryCostState::Error),
         "illegal recovery cost outbox transition"
@@ -588,6 +591,17 @@ pub(crate) fn forge_acknowledged_cost_for_test(workspace: &std::path::Path, sett
     let memory = SqliteMemory::new(workspace)?;
     let changed = memory.pool.write().execute(
         "UPDATE recovery_cost_outbox SET state='acknowledged' WHERE settlement_id=?1 AND state='pending'",
+        [settlement],
+    )?;
+    anyhow::ensure!(changed == 1, "test: expected one pending outbox row");
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn forge_error_cost_for_test(workspace: &std::path::Path, settlement: &str) -> anyhow::Result<()> {
+    let memory = SqliteMemory::new(workspace)?;
+    let changed = memory.pool.write().execute(
+        "UPDATE recovery_cost_outbox SET state='error' WHERE settlement_id=?1 AND state='pending'",
         [settlement],
     )?;
     anyhow::ensure!(changed == 1, "test: expected one pending outbox row");

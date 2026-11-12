@@ -9,6 +9,11 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 
 #[cfg(test)]
+#[derive(Debug, thiserror::Error)]
+#[error("test: crash")]
+pub(crate) struct TestCrash;
+
+#[cfg(test)]
 thread_local! {
     static CRASH_BEFORE_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CRASH_AFTER_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -83,7 +88,7 @@ impl CostTracker {
         #[cfg(test)]
         if CRASH_BEFORE_APPEND.with(std::cell::Cell::get) {
             CRASH_BEFORE_APPEND.with(|cell| cell.set(false));
-            anyhow::bail!("test: crash before cost ledger append");
+            return Err(TestCrash.into());
         }
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
@@ -94,6 +99,7 @@ impl CostTracker {
                 file.sync_all()
                     .with_context(|| format!("Failed to sync cost storage at {}", storage.path.display()))?;
             }
+            #[cfg(unix)]
             if let Some(parent) = storage.path.parent() {
                 std::fs::File::open(parent)?.sync_all()?;
             }
@@ -122,7 +128,7 @@ impl CostTracker {
         #[cfg(test)]
         if CRASH_AFTER_APPEND.with(std::cell::Cell::get) {
             CRASH_AFTER_APPEND.with(|cell| cell.set(false));
-            anyhow::bail!("test: crash after cost ledger append");
+            return Err(TestCrash.into());
         }
         Ok(())
     }

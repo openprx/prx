@@ -270,7 +270,7 @@ impl RecoveryScope {
             let workspace = scope.workspace.clone();
             let workspace_id = workspace.to_string_lossy().into_owned();
             let cost = config.cost.clone();
-            let _ = tokio::time::timeout(
+            match tokio::time::timeout(
                 Duration::from_secs(15),
                 owned_store_operation(owner, move || {
                     crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
@@ -281,7 +281,12 @@ impl RecoveryScope {
                     )
                 }),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "recovery cost restart scan failed"),
+                Err(_) => tracing::warn!("recovery cost restart scan exceeded its deadline"),
+            }
         }
         Ok(scope)
     }

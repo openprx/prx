@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_INLINE_PROJECTION: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
     static SKIP_INLINE_PROJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CRASH_BEFORE_ACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -48,6 +49,11 @@ pub(crate) fn skip_inline_projection(skip: bool) {
 #[cfg(test)]
 pub(crate) fn crash_before_ack(crash: bool) {
     CRASH_BEFORE_ACK.with(|cell| cell.set(crash));
+}
+
+#[cfg(test)]
+pub(crate) fn before_inline_projection(hook: Box<dyn FnOnce() + Send>) {
+    BEFORE_INLINE_PROJECTION.with(|cell| *cell.borrow_mut() = Some(hook));
 }
 
 pub(super) struct ReplyAndUsage {
@@ -76,10 +82,6 @@ pub(super) async fn finalize_recovery_terminal(
     ensure_runtime_authority(&commit.scope, "terminal-marker").await?;
 
     let memory = fabric.memory();
-    let repository = memory
-        .recovery_repository()
-        .context("recovery repository unavailable")?;
-    repository.activate_recovery_authority()?;
     let existing_claim = memory
         .find_message_event_by_idempotency_key(
             fabric.workspace_id(),
@@ -98,14 +100,6 @@ pub(super) async fn finalize_recovery_terminal(
             .context("recovery terminal claim payload is invalid")
         })
         .transpose()?;
-    let key_id = match existing_payload.as_ref() {
-        Some(payload) => payload
-            .get("recovery_key_id")
-            .and_then(serde_json::Value::as_str)
-            .context("recovery terminal claim key is missing")?
-            .to_owned(),
-        None => repository.activate_recovery_authority()?,
-    };
     let recorded = commit.decision.is_recorded();
 
     if !recorded {
@@ -120,41 +114,73 @@ pub(super) async fn finalize_recovery_terminal(
     }
 
     let prepared_parameters = commit.decision.context.prepared_main_parameters();
-    let (semantic, reply_reference) = claim_semantic(
-        &commit,
-        fabric.workspace_id(),
-        recorded,
-        execution_trace.as_ref(),
-        &prepared_parameters,
-        &key_id,
-        original_reference,
-    )?;
-    let semantic_bytes = serde_json::to_vec(&semantic)?;
-    let mut claim_preimage = semantic_bytes.clone();
-    claim_preimage.extend_from_slice(key_id.as_bytes());
-    if let Some(payload) = existing_payload.as_ref() {
-        let tag = hex::decode(
-            payload
-                .get("semantic_mac_v3")
-                .and_then(serde_json::Value::as_str)
-                .context("recovery terminal claim mac is missing")?,
-        )?;
-        let tag = crate::memory::recovery_authority::RecoveryTag {
-            key_id: key_id.clone(),
-            tag: tag
-                .as_slice()
-                .try_into()
-                .context("recovery terminal claim mac length")?,
-        };
-        repository
-            .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
-            .context("recovery terminal commit conflict")?;
-    }
-    let semantic_mac_v3 = hex::encode(
-        repository
-            .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
-            .tag,
-    );
+    let redacted_usage = usage_settlement
+        .as_ref()
+        .map(crate::security::redaction::redact_json_structure)
+        .transpose()?;
+    let usage_json = serde_json::to_vec(&redacted_usage)?;
+    let mac_memory = std::sync::Arc::clone(&memory);
+    let mac_commit = commit.clone();
+    let mac_workspace = fabric.workspace_id().to_owned();
+    let mac_trace = execution_trace.clone();
+    let mac_parameters = prepared_parameters.clone();
+    let (key_id, semantic, reply_reference, semantic_bytes, semantic_mac_v3, usage_digest) =
+        crate::runtime::blocking::spawn_blocking(move || {
+            let repository = mac_memory
+                .recovery_repository()
+                .context("recovery repository unavailable")?;
+            let active_id = repository.activate_recovery_authority()?;
+            let key_id = match existing_payload.as_ref() {
+                Some(payload) => payload
+                    .get("recovery_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .context("recovery terminal claim key is missing")?,
+                None => active_id,
+            };
+            let (semantic, reply_reference) = claim_semantic(
+                &mac_commit,
+                &mac_workspace,
+                recorded,
+                mac_trace.as_ref(),
+                &mac_parameters,
+                &key_id,
+                original_reference,
+            )?;
+            let semantic_bytes = serde_json::to_vec(&semantic)?;
+            let mut claim_preimage = semantic_bytes.clone();
+            claim_preimage.extend_from_slice(key_id.as_bytes());
+            if let Some(payload) = existing_payload.as_ref() {
+                let bytes = hex::decode(
+                    payload
+                        .get("semantic_mac_v3")
+                        .and_then(serde_json::Value::as_str)
+                        .context("recovery terminal claim mac is missing")?,
+                )?;
+                let tag = crate::memory::recovery_authority::RecoveryTag {
+                    key_id: key_id.clone(),
+                    tag: bytes
+                        .as_slice()
+                        .try_into()
+                        .context("recovery terminal claim mac length")?,
+                };
+                repository
+                    .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
+                    .context("recovery terminal commit conflict")?;
+            }
+            let claim = hex::encode(
+                repository
+                    .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
+                    .tag,
+            );
+            let usage = hex::encode(
+                repository
+                    .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
+                    .tag,
+            );
+            Ok::<_, anyhow::Error>((key_id, semantic, reply_reference, semantic_bytes, claim, usage))
+        })
+        .await??;
     let semantic_mac_v2 = if recorded {
         let recorded_link = commit
             .decision
@@ -278,17 +304,13 @@ pub(super) async fn finalize_recovery_terminal(
     if let (Some(history), Some(id)) = (commit.history.as_ref(), assistant_id.as_ref()) {
         if commit.status == TurnTerminalStatus::Completed {
             let scope = commit.history_scope.clone().unwrap_or_else(|| commit.scope.clone());
-            let mut assistant = assistant_event(
+            let assistant = assistant_event(
                 fabric,
                 scope,
                 history.assistant_content.clone(),
                 format!("turn:{}:assistant", commit.terminal_id),
                 id.clone(),
             );
-            if let Some(reference) = &reply_reference {
-                assistant.content = "reply_unavailable".into();
-                assistant.raw_payload_json = Some(serde_json::json!({"replay_unavailable": reference}).to_string());
-            }
             events.push(assistant);
         }
     }
@@ -313,16 +335,6 @@ pub(super) async fn finalize_recovery_terminal(
         Some(final_id.clone()),
     ));
 
-    let redacted_usage = usage_settlement
-        .as_ref()
-        .map(crate::security::redaction::redact_json_structure)
-        .transpose()?;
-    let usage_json = serde_json::to_vec(&redacted_usage)?;
-    let usage_digest = hex::encode(
-        repository
-            .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
-            .tag,
-    );
     let status = match commit.status {
         TurnTerminalStatus::Completed => "completed",
         TurnTerminalStatus::Silent => "silent",
@@ -435,9 +447,8 @@ pub(super) async fn finalize_recovery_terminal(
         memory.commit_recovery_terminal(terminal_commit, deadline).await?
     };
 
-    let (events, replayed) = match outcome {
-        RecoveryTerminalOutcome::Committed { events, .. } => (events, false),
-        RecoveryTerminalOutcome::Replayed { events, .. } => (events, true),
+    let events = match outcome {
+        RecoveryTerminalOutcome::Committed { events, .. } | RecoveryTerminalOutcome::Replayed { events, .. } => events,
         RecoveryTerminalOutcome::Conflict => anyhow::bail!("recovery terminal commit conflict"),
     };
 
@@ -462,6 +473,8 @@ pub(super) async fn finalize_recovery_terminal(
             let faults = crate::cost::tracker::take_recovery_projection_faults();
             #[cfg(test)]
             let crash_ack = CRASH_BEFORE_ACK.with(std::cell::Cell::get);
+            #[cfg(test)]
+            let before_projection = BEFORE_INLINE_PROJECTION.with(|cell| cell.borrow_mut().take());
             crate::runtime::blocking::spawn_blocking(move || {
                 #[cfg(test)]
                 let _faults = faults.install();
@@ -470,16 +483,18 @@ pub(super) async fn finalize_recovery_terminal(
                 let repository = memory
                     .recovery_repository()
                     .context("recovery repository unavailable")?;
-                match find_pending_cost(repository, &workspace_id, &settlement_id)? {
-                    Some(row) => {
-                        project_committed_usage(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &row)
-                    }
-                    None if replayed => Ok(()),
-                    None => anyhow::bail!("metered recovery cost outbox row missing after commit"),
-                }
+                #[cfg(test)]
+                if let Some(hook) = before_projection { hook(); }
+                // The commit inserted the row; an authenticated finish can remove it from the retryable set.
+                find_pending_cost(repository, &workspace_id, &settlement_id)?.map_or_else(
+                    || Ok(()),
+                    |row| project_committed_usage(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &row),
+                )
             })
             .await
-            .context("recovery cost projection worker failed")??;
+            .context("recovery cost projection worker failed")
+            .and_then(|result| result)
+            .unwrap_or_else(|_error| tracing::warn!(settlement_id = %commit.terminal_id, "recovery cost projection deferred to the restart scan"));
         }
     }
 
@@ -742,6 +757,35 @@ fn claim_semantic(
 }
 
 #[cfg(test)]
+pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalDraft) {
+    draft
+        .decision
+        .as_ref()
+        .expect("test: issued decision")
+        .context
+        .capture_main_parameters(true)
+        .scope(async {
+            crate::providers::parameter_capture::record(crate::providers::catalog::parameters::ResolvedParameters {
+                model: "prx-local-model".into(),
+                catalog_revision: "test-revision".into(),
+                values: Default::default(),
+            });
+        })
+        .await;
+    let parameters = draft
+        .decision
+        .as_ref()
+        .expect("test: issued decision")
+        .context
+        .prepared_main_parameters();
+    draft
+        .provider_outcome
+        .as_mut()
+        .expect("test: provider outcome")
+        .prepared_parameters = parameters;
+}
+
+#[cfg(test)]
 pub(crate) fn claim_semantic_for_test(
     commit: &super::TurnTerminalCommit,
     fabric_workspace: &str,
@@ -915,7 +959,14 @@ fn project_committed_usage(
             false
         }
     };
-    if crash_before_ack || projected.as_ref().is_err_and(is_test_crash) {
+    if crash_before_ack {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if projected
+        .as_ref()
+        .is_err_and(|error| error.is::<crate::cost::tracker::TestCrash>())
+    {
         return Ok(());
     }
     let state = match projected {
@@ -926,15 +977,10 @@ fn project_committed_usage(
     repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)
 }
 
-fn is_test_crash(error: &anyhow::Error) -> bool {
-    error.to_string().contains("test: crash")
-}
-
 fn is_blocked(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let text = cause.to_string();
-        text.contains("incomplete row") || text.contains("conflicts with the cost ledger")
-    })
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::cost::tracker::LedgerBlocked>())
 }
 
 /// Restart scan: project pending/error rows. Failures never fail prepare.
@@ -1001,7 +1047,11 @@ pub(crate) fn scan_pending_recovery_costs(
             }
         };
         let projected = tracker.project_recovery_usage(&usage);
-        if projected.as_ref().is_err_and(is_test_crash) {
+        #[cfg(test)]
+        if projected
+            .as_ref()
+            .is_err_and(|error| error.is::<crate::cost::tracker::TestCrash>())
+        {
             continue;
         }
         let state = match projected {

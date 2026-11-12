@@ -103,7 +103,7 @@ fn verify_scope(event: &MessageEvent, scope: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Authenticate the compact terminal, its claim, and its assistant reference.
+/// Authenticate the compact terminal and claim without reading assistant content.
 /// The repository enforces the unchanged evidence-entry budget before reads.
 async fn verify_terminal(
     memory: Arc<dyn Memory>,
@@ -145,9 +145,6 @@ async fn verify_terminal(
         let facts = SettledTerminalFacts::parse(&receipt.settled_facts()?)?;
         anyhow::ensure!(facts.key_id == receipt.key_id, "reply receipt key differs");
         repository.recovery_event_evidence(&checked_chain, &facts.claim_event_id)?;
-        if let Some(id) = &facts.assistant_event_id {
-            repository.recovery_event_evidence(&checked_chain, id)?;
-        }
         Ok::<_, anyhow::Error>(facts)
     })
     .await??;
@@ -207,6 +204,8 @@ async fn verify_terminal(
             "reply terminal semantics differ"
         );
     }
+    // The authenticated receipt and final marker bind this ID. History content
+    // is not replay evidence and may exceed the bounded ingress-read budget.
     let assistant_id = facts
         .assistant_event_id
         .as_deref()
@@ -215,31 +214,6 @@ async fn verify_terminal(
         terminal_payload.get("assistant_event_id").and_then(Value::as_str) == Some(assistant_id),
         "reply assistant identity differs"
     );
-    let assistant = read_event(
-        memory.as_ref(),
-        &scope,
-        IngressEventLookup::OwnedEventId(assistant_id.to_owned()),
-    )
-    .await?
-    .context("reply assistant missing")?;
-    anyhow::ensure!(
-        assistant.role == "assistant"
-            && assistant.event_type == "message.created"
-            && assistant.content == "reply_unavailable",
-        "reply projection is not a bounded reference"
-    );
-    verify_scope(
-        &assistant,
-        semantic
-            .get("history_scope")
-            .filter(|value| !value.is_null())
-            .unwrap_or(bound_scope),
-    )?;
-    let assistant_reference = payload(&assistant)?
-        .get("replay_unavailable")
-        .context("reply projection reference missing")?
-        .clone();
-    ReplyReference::parse(&assistant_reference)?;
     let claim_mac = claim_payload
         .get("semantic_mac_v3")
         .and_then(Value::as_str)
@@ -260,7 +234,7 @@ async fn verify_terminal(
             };
             // Check every copy through the existing ClaimV3 verifier, including
             // digest and byte-length fields; never compare tags/digests with ==.
-            for reference in [claim_reference.clone(), reference.clone(), assistant_reference.clone()] {
+            for reference in [claim_reference.clone(), reference.clone()] {
                 let mut candidate = semantic.clone();
                 candidate
                     .as_object_mut()
@@ -282,6 +256,15 @@ async fn verify_terminal(
         terminal_id: run,
         result_hash: parsed.result_hash,
     }))
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_terminal_for_test(
+    memory: Arc<dyn Memory>,
+    terminal: MessageEvent,
+    input_id: String,
+) -> anyhow::Result<Option<ReplayUnavailable>> {
+    verify_terminal(memory, terminal, input_id).await
 }
 
 /// Read-only replay for the same authenticated owner, stable key and request.

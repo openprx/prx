@@ -778,7 +778,7 @@ pub(in crate::memory::sqlite) fn publish_in(
     if let Some(old) = &old_facts {
         anyhow::ensure!(
             old.input.as_ref().map(|e| &e.id) == input.as_ref().map(|e| &e.id),
-            "conflicting recovery input"
+            crate::memory::recovery_authority::RecoveryTerminalConflict
         );
         if !settle || previous.as_ref().is_some_and(|r| r.state == "settled") {
             anyhow::ensure!(
@@ -787,7 +787,7 @@ pub(in crate::memory::sqlite) fn publish_in(
                 } else {
                     old.pending == publication.facts
                 },
-                "conflicting recovery publication"
+                crate::memory::recovery_authority::RecoveryTerminalConflict
             );
             return previous.context("missing prior receipt");
         }

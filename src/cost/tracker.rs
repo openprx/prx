@@ -1,3 +1,14 @@
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LedgerBlocked {
+    #[error("cost ledger ends with an incomplete row")]
+    TornTail,
+    #[error("Metered usage settlement conflicts with the cost ledger")]
+    Conflict,
+}
+
+#[cfg(test)]
+pub(crate) use settlement::TestCrash;
+
 use super::types::{BudgetCheck, CostRecord, CostSettlement, CostSummary, ModelStats, TokenUsage, UsagePeriod};
 use crate::config::schema::CostConfig;
 use anyhow::{Context, Result, anyhow};
@@ -80,7 +91,7 @@ pub(super) fn read_state_ledger_bounded(workspace: &Path, filename: &str) -> Res
     }
     let ledger = String::from_utf8(bytes).context("cost ledger is not UTF-8")?;
     if !ledger.is_empty() && !ledger.ends_with('\n') {
-        return Err(anyhow!("cost ledger ends with an incomplete row"));
+        return Err(LedgerBlocked::TornTail.into());
     }
     Ok(Some(ledger))
 }
@@ -1173,10 +1184,7 @@ impl CostStorage {
                     .as_deref()
                     .is_some_and(|prior| prior != fingerprint);
         })?;
-        anyhow::ensure!(
-            matches == 1 && !conflict,
-            "Metered usage settlement conflicts with the cost ledger"
-        );
+        anyhow::ensure!(matches == 1 && !conflict, LedgerBlocked::Conflict);
         Ok(())
     }
 
@@ -1208,7 +1216,7 @@ impl CostStorage {
             // A synced append always includes its newline. Even a valid JSON
             // value without that delimiter may be an interrupted append; do
             // not accept it and concatenate the next settlement onto its tail.
-            anyhow::ensure!(raw_line.ends_with('\n'), "cost ledger ends with an incomplete row");
+            anyhow::ensure!(raw_line.ends_with('\n'), LedgerBlocked::TornTail);
 
             let trimmed = raw_line.trim();
             if trimmed.is_empty() {
