@@ -47,6 +47,15 @@ pub(super) static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, re
 
 // ── Proxy ───────────────────────────────────────────────────────
 
+// PRX never writes the process environment (`HTTP_PROXY` and friends): a
+// `setenv` next to a concurrent `getenv` in another thread is undefined
+// behaviour, and no single-threaded startup path ever needed it. Runtime
+// proxy changes go to the in-process state (`set_runtime_proxy_config`) that
+// client builders read explicitly. With `scope = "environment"` PRX adds no
+// explicit proxy; `reqwest` then honours the variables the process was
+// started with. (Plain comments: the doc comments below are published in the
+// config JSON schema.)
+
 /// Proxy application scope — determines which outbound traffic uses the proxy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -233,25 +242,6 @@ impl ProxyConfig {
         builder
     }
 
-    pub fn apply_to_process_env(&self) {
-        set_proxy_env_pair("HTTP_PROXY", self.http_proxy.as_deref());
-        set_proxy_env_pair("HTTPS_PROXY", self.https_proxy.as_deref());
-        set_proxy_env_pair("ALL_PROXY", self.all_proxy.as_deref());
-
-        let no_proxy_joined = {
-            let list = self.normalized_no_proxy();
-            (!list.is_empty()).then(|| list.join(","))
-        };
-        set_proxy_env_pair("NO_PROXY", no_proxy_joined.as_deref());
-    }
-
-    pub fn clear_process_env() {
-        clear_proxy_env_pair("HTTP_PROXY");
-        clear_proxy_env_pair("HTTPS_PROXY");
-        clear_proxy_env_pair("ALL_PROXY");
-        clear_proxy_env_pair("NO_PROXY");
-    }
-
     pub(super) fn no_proxy_value(&self) -> Option<reqwest::NoProxy> {
         let joined = {
             let list = self.normalized_no_proxy();
@@ -366,40 +356,6 @@ pub(super) fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[allow(unsafe_code)]
-pub(super) fn set_proxy_env_pair(key: &str, value: Option<&str>) {
-    let lowercase_key = key.to_ascii_lowercase();
-    if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
-        // SAFETY: Called during single-threaded config initialization before any
-        // concurrent HTTP clients are created or read these env variables.
-        // `set_proxy_env_vars` is invoked from `Config::apply_to_env`, which is
-        // called only during startup before the async runtime spawns worker threads
-        // that could observe the environment. No concurrent readers exist at this
-        // point in the startup sequence.
-        unsafe {
-            std::env::set_var(key, &value);
-            std::env::set_var(lowercase_key, value);
-        }
-    } else {
-        // SAFETY: Same single-threaded initialization context as the set branch
-        // above — no concurrent readers of these env vars exist during startup.
-        unsafe {
-            std::env::remove_var(key);
-            std::env::remove_var(lowercase_key);
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-pub(super) fn clear_proxy_env_pair(key: &str) {
-    // SAFETY: Called during single-threaded config initialization to clear stale
-    // proxy env vars before any concurrent HTTP clients are created.
-    unsafe {
-        std::env::remove_var(key);
-        std::env::remove_var(key.to_ascii_lowercase());
-    }
 }
 
 pub(super) fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {

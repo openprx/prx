@@ -107,10 +107,17 @@ impl HttpRequestTool {
         headers: Vec<(String, String)>,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
+        // Resolve once, refuse any non-global address, and pin the checked
+        // addresses for this host: the client must not resolve the name a
+        // second time (DNS rebinding). Redirects are never followed, so this
+        // is the only hop.
+        let target = resolve_pinned_target(url).await?;
+        let builder = target.pin(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none()),
+        );
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
@@ -384,6 +391,80 @@ pub(crate) fn is_non_global_ip(ip: std::net::IpAddr) -> bool {
         }
 }
 
+/// Why a request target could not be pinned to a checked address.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PinError {
+    #[error("Invalid request URL: {0}")]
+    InvalidUrl(String),
+    #[error("DNS resolution failed for {host}: {source}")]
+    Lookup {
+        host: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Host {host} did not resolve to any address")]
+    Unresolved { host: String },
+    #[error("Blocked local/private host: {host} resolves to {address}")]
+    NonGlobal { host: String, address: std::net::IpAddr },
+}
+
+/// A request host together with the addresses it resolved to, every one of
+/// them checked to be globally routable. A client built through [`Self::pin`]
+/// connects to exactly these addresses and never resolves the name again, so
+/// a hostile DNS server cannot answer public for the check and private for
+/// the connection (DNS rebinding). TLS SNI and the `Host` header keep the
+/// name. Same pattern as `media::artifact::prepare_remote_target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinnedTarget {
+    pub(crate) host: String,
+    pub(crate) addrs: Vec<std::net::SocketAddr>,
+}
+
+impl PinnedTarget {
+    /// The target of `host` when it resolved to `addrs`: refused when the
+    /// list is empty or when any address is not globally routable (one
+    /// private address among public ones is enough to refuse).
+    pub(crate) fn from_resolved(host: &str, addrs: Vec<std::net::SocketAddr>) -> Result<Self, PinError> {
+        if addrs.is_empty() {
+            return Err(PinError::Unresolved { host: host.to_string() });
+        }
+        if let Some(blocked) = addrs.iter().find(|addr| is_non_global_ip(addr.ip())) {
+            return Err(PinError::NonGlobal {
+                host: host.to_string(),
+                address: blocked.ip(),
+            });
+        }
+        Ok(Self {
+            host: host.to_string(),
+            addrs,
+        })
+    }
+
+    /// `builder` with this host pinned to the checked addresses.
+    pub(crate) fn pin(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder.resolve_to_addrs(&self.host, &self.addrs)
+    }
+}
+
+/// Resolve the host of `url` once and return it pinned to the checked
+/// addresses. The host is the one `reqwest` itself parses from the URL, so
+/// the name that is checked is the name that is connected to. One hop only:
+/// a caller that follows redirects calls this again for every hop.
+pub(crate) async fn resolve_pinned_target(url: &str) -> Result<PinnedTarget, PinError> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| PinError::InvalidUrl(error.to_string()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| PinError::InvalidUrl("missing host".to_string()))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| PinError::InvalidUrl("missing port".to_string()))?;
+    let addrs = lookup_host(host, port).await.map_err(|source| PinError::Lookup {
+        host: host.to_string(),
+        source,
+    })?;
+    PinnedTarget::from_resolved(host, addrs)
+}
+
 /// Resolve `host:port` for a connection, through the system resolver. Every
 /// production lookup of a user-supplied host (media downloads, node
 /// callbacks, the doctor's gateway probe) goes through this, so under test it
@@ -454,8 +535,8 @@ fn resolved_addresses(host: &str) -> Vec<std::net::IpAddr> {
 /// The addresses `host` resolves to under test: a fixed table, never the
 /// network (INT-2B FLAKE-DNS), so no test depends on live DNS. The
 /// `example.com` names resolve to a public address, `rebind.test` to a
-/// private one (a rebinding host), `localhost` to loopback, and every other
-/// name to nothing.
+/// private one (a rebinding host), `mixed.test` to one public and one private
+/// address, `localhost` to loopback, and every other name to nothing.
 #[cfg(test)]
 fn resolved_addresses(host: &str) -> Vec<std::net::IpAddr> {
     match host {
@@ -464,6 +545,10 @@ fn resolved_addresses(host: &str) -> Vec<std::net::IpAddr> {
             vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 215, 14))]
         }
         "rebind.test" => vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))],
+        "mixed.test" => vec![
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 215, 14)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+        ],
         _ => Vec::new(),
     }
 }
@@ -919,6 +1004,112 @@ mod tests {
         assert_eq!(
             blocking.first().map(|addr| addr.ip().to_string()),
             Some("10.0.0.1".to_string())
+        );
+    }
+
+    fn socket(ip: [u8; 4], port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((ip, port))
+    }
+
+    /// M2: the pinned target carries exactly the checked addresses, so the
+    /// client connects to them and never resolves the name again.
+    #[test]
+    fn pinned_target_keeps_the_host_and_every_checked_address() {
+        let addrs = vec![socket([93, 184, 215, 14], 443), socket([8, 8, 8, 8], 443)];
+        let target = PinnedTarget::from_resolved("example.com", addrs.clone()).expect("test: public addresses pin");
+        assert_eq!(target.host, "example.com", "the pin must be keyed by the request host");
+        assert_eq!(target.addrs, addrs, "the pin must hold exactly the checked addresses");
+        target
+            .pin(reqwest::Client::builder())
+            .build()
+            .expect("test: a pinned client builds");
+    }
+
+    /// M2: one private address among public ones refuses the whole host.
+    #[test]
+    fn pinned_target_refuses_a_host_with_one_public_and_one_private_address() {
+        let error = PinnedTarget::from_resolved(
+            "mixed.test",
+            vec![socket([93, 184, 215, 14], 443), socket([10, 0, 0, 1], 443)],
+        )
+        .expect_err("test: a private address must refuse the host");
+        assert!(
+            matches!(&error, PinError::NonGlobal { host, address }
+                if host == "mixed.test" && address.to_string() == "10.0.0.1"),
+            "expected NonGlobal for 10.0.0.1, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("Blocked local/private host"),
+            "the refusal must read as an SSRF block: {error}"
+        );
+    }
+
+    #[test]
+    fn pinned_target_refuses_a_host_without_addresses() {
+        let error = PinnedTarget::from_resolved("unlisted.test", Vec::new()).expect_err("test: nothing to pin");
+        assert!(
+            matches!(error, PinError::Unresolved { .. }),
+            "expected Unresolved, got {error:?}"
+        );
+    }
+
+    /// M2: the per-hop step resolves once (test table, never the network),
+    /// checks every address and pins them with the URL's port.
+    #[tokio::test]
+    async fn resolve_pinned_target_checks_every_resolved_address() {
+        let target = resolve_pinned_target("https://example.com/v1")
+            .await
+            .expect("test: public table name pins");
+        assert_eq!(target.host, "example.com", "host comes from the parsed URL");
+        assert_eq!(
+            target.addrs,
+            vec![socket([93, 184, 215, 14], 443)],
+            "the checked address is pinned with the scheme's port"
+        );
+
+        for url in [
+            "https://mixed.test/",
+            "https://rebind.test/",
+            "http://10.0.0.1/secret",
+            "http://127.0.0.1:8080/",
+        ] {
+            let error = resolve_pinned_target(url)
+                .await
+                .expect_err("test: a non-global target must not pin");
+            assert!(
+                matches!(error, PinError::NonGlobal { .. }),
+                "{url}: expected NonGlobal, got {error:?}"
+            );
+        }
+
+        let error = resolve_pinned_target("https://unlisted.test/")
+            .await
+            .expect_err("test: an unresolvable name must not pin");
+        assert!(
+            matches!(error, PinError::Lookup { .. }),
+            "expected Lookup, got {error:?}"
+        );
+        let error = resolve_pinned_target("not a url")
+            .await
+            .expect_err("test: a malformed URL must not pin");
+        assert!(
+            matches!(error, PinError::InvalidUrl(_)),
+            "expected InvalidUrl, got {error:?}"
+        );
+    }
+
+    /// M2: `execute_request` refuses before any connection when the host
+    /// resolves to a private address, even if only one of several is private.
+    #[tokio::test]
+    async fn execute_request_refuses_a_host_that_resolves_privately() {
+        let tool = test_tool(Vec::new());
+        let error = tool
+            .execute_request("http://mixed.test/", reqwest::Method::GET, Vec::new(), None)
+            .await
+            .expect_err("test: a mixed public/private host must be refused");
+        assert!(
+            error.to_string().contains("Blocked local/private host"),
+            "expected an SSRF block, got {error}"
         );
     }
 }

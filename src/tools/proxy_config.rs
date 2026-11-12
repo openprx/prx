@@ -20,6 +20,20 @@ struct PreparedSet {
     revision: Option<String>,
 }
 
+/// Why a `proxy_config` action that used to write the process environment is
+/// refused. Mutating the environment of a running multi-threaded process is
+/// undefined behaviour (other threads read it through `getenv`), so no agent
+/// action does it; the proxy is activated through the configuration instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProxyEnvError {
+    #[error(
+        "'{action}' is not supported: PRX does not modify the process environment at runtime. \
+         Use action 'set' with scope 'prx' or 'services' to route PRX traffic through the proxy, \
+         or start the process with HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY set for scope 'environment'"
+    )]
+    RuntimeMutationUnsupported { action: &'static str },
+}
+
 pub struct ProxyConfigTool {
     config: SharedConfig,
     security: Arc<SecurityPolicy>,
@@ -277,8 +291,7 @@ impl ProxyConfigTool {
     }
 
     async fn handle_set(&self, prepared: &PreparedSet, summary: &ConfigChangeSummary) -> anyhow::Result<ToolResult> {
-        let (current, cfg) = (&prepared.current, &prepared.updated);
-        let previous_scope = current.proxy.scope;
+        let cfg = &prepared.updated;
         let proxy = cfg.proxy.clone();
         // Saved through the transaction layer: history record, revision check
         // against the configuration the change was built on, compensating
@@ -312,14 +325,11 @@ impl ProxyConfigTool {
         let report = &outcome.report;
         let active_proxy = self.config.load_full().proxy.clone();
 
-        if report.rebuilt.iter().any(|field| field == "proxy")
-            && proxy.has_any_proxy_url()
-            && proxy.scope == ProxyScope::Environment
-        {
-            proxy.apply_to_process_env();
-        } else if report.rebuilt.iter().any(|field| field == "proxy") && previous_scope == ProxyScope::Environment {
-            ProxyConfig::clear_process_env();
-        }
+        // The process environment is never written here (a `setenv` while
+        // other threads read the environment is undefined behaviour). The
+        // saved configuration reaches the in-process runtime proxy state
+        // through the configuration generation; `environment` below is a
+        // read-only snapshot of what the process was started with.
 
         Ok(ToolResult {
             success: true,
@@ -345,44 +355,11 @@ impl ProxyConfigTool {
         })
     }
 
-    fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
-        let proxy = self.config.load_full().proxy.clone();
-        proxy.validate()?;
-
-        if !proxy.has_any_proxy_url() {
-            anyhow::bail!("Proxy is not configured. Use action 'set' with a proxy URL first");
-        }
-
-        if proxy.scope != ProxyScope::Environment {
-            anyhow::bail!(
-                "apply_env only works when proxy.scope is 'environment' (current: {:?})",
-                proxy.scope
-            );
-        }
-
-        proxy.apply_to_process_env();
-
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "message": "Proxy environment variables applied",
-                "proxy": Self::proxy_json(&proxy),
-                "environment": Self::env_snapshot(),
-            }))?,
-            error: None,
-        })
-    }
-
-    fn handle_clear_env(&self) -> anyhow::Result<ToolResult> {
-        ProxyConfig::clear_process_env();
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "message": "Proxy environment variables cleared",
-                "environment": Self::env_snapshot(),
-            }))?,
-            error: None,
-        })
+    /// `apply_env` and `clear_env` used to write and remove the proxy
+    /// variables of the running process. They are refused with a typed
+    /// error: nothing mutates the process environment after startup.
+    fn refuse_env_mutation(action: &'static str) -> ProxyEnvError {
+        ProxyEnvError::RuntimeMutationUnsupported { action }
     }
 }
 
@@ -528,8 +505,8 @@ impl Tool for ProxyConfigTool {
                 }
 
                 match action.as_str() {
-                    "apply_env" => self.handle_apply_env(),
-                    "clear_env" => self.handle_clear_env(),
+                    "apply_env" => Err(Self::refuse_env_mutation("apply_env").into()),
+                    "clear_env" => Err(Self::refuse_env_mutation("clear_env").into()),
                     other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
                 }
             }
@@ -778,6 +755,79 @@ mod tests {
         let parsed: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(parsed["proxy"]["http_proxy"].is_null());
         assert!(parsed["runtime_proxy"]["http_proxy"].is_null());
+    }
+
+    const PROXY_ENV_NAMES: [&str; 8] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ];
+
+    fn proxy_env() -> Vec<Option<std::ffi::OsString>> {
+        PROXY_ENV_NAMES.iter().map(std::env::var_os).collect()
+    }
+
+    /// M4, RED before: `apply_env` and `clear_env` called `set_var` /
+    /// `remove_var` inside the multi-threaded runtime. After: both are
+    /// refused with a typed error and the process environment is untouched.
+    #[tokio::test]
+    async fn env_actions_are_refused_and_never_touch_the_process_environment() {
+        let tmp = TempDir::new().expect("test: temp dir");
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let before = proxy_env();
+
+        for action in ["apply_env", "clear_env"] {
+            let result = tool
+                .execute(json!({"action": action}))
+                .await
+                .expect("test: a refused action is a tool result, not a crash");
+            assert!(!result.success, "{action} must be refused");
+            let error = result.error.unwrap_or_default();
+            assert!(
+                error.contains(action) && error.contains("does not modify the process environment"),
+                "{action}: the refusal must name the action and the reason, got {error}"
+            );
+        }
+        assert_eq!(
+            ProxyConfigTool::refuse_env_mutation("apply_env"),
+            ProxyEnvError::RuntimeMutationUnsupported { action: "apply_env" },
+            "the refusal is the typed error"
+        );
+        assert_eq!(proxy_env(), before, "the process environment must be unchanged");
+    }
+
+    /// M4, RED before: a `set` with scope `environment` exported the proxy
+    /// URLs into the process environment. After: the configuration is saved
+    /// and the environment is untouched.
+    #[tokio::test]
+    async fn set_with_environment_scope_saves_config_without_touching_the_environment() {
+        const PROXY_URL: &str = "http://proxy-m4-sentinel.example:3128";
+        let tmp = TempDir::new().expect("test: temp dir");
+        let tool = ProxyConfigTool::new(test_config(&tmp).await, test_security());
+        let before = proxy_env();
+
+        let result = tool
+            .execute(json!({"action": "set", "scope": "environment", "http_proxy": PROXY_URL}))
+            .await
+            .expect("test: set runs");
+        assert!(result.success, "set must still persist the proxy: {:?}", result.error);
+
+        let desired = tool.config.desired().config.proxy.clone();
+        assert_eq!(desired.scope, ProxyScope::Environment, "the scope is saved");
+        assert_eq!(desired.http_proxy.as_deref(), Some(PROXY_URL), "the URL is saved");
+        assert_eq!(proxy_env(), before, "the process environment must be unchanged");
+        assert!(
+            !proxy_env()
+                .iter()
+                .flatten()
+                .any(|value| value.to_string_lossy().contains("proxy-m4-sentinel")),
+            "the configured URL must not be exported"
+        );
     }
 
     /// RED before SECRETS-OTHER: `set` and `get` returned a proxy URL's
