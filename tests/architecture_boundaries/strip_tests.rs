@@ -293,15 +293,33 @@ fn a_file_level_cfg_test_marker_makes_the_whole_file_test_code() {
 
 #[test]
 fn all_cfg_requires_test_but_any_cfg_does_not() {
-    for predicate in ["test", "all(test, unix)", "all(unix, test)", "all(unix, all(test, feature = \"probe\"))"] {
+    for predicate in [
+        "test",
+        "all(test, unix)",
+        "all(unix, test)",
+        "all(unix, all(test, feature = \"probe\"))",
+    ] {
         let source = format!("#[cfg({predicate})] fn probe() {{ value.unwrap(); }}\nfn production() {{ keep(); }}");
         let stripped = strip_cfg_test_items(&blank_comments_and_literals(&source));
-        assert!(!stripped.contains("unwrap"), "test-requiring predicate {predicate} must be stripped");
-        assert!(stripped.contains("keep"), "stripping {predicate} must preserve production after the item");
+        assert!(
+            !stripped.contains("unwrap"),
+            "test-requiring predicate {predicate} must be stripped"
+        );
+        assert!(
+            stripped.contains("keep"),
+            "stripping {predicate} must preserve production after the item"
+        );
     }
-    for predicate in ["any(test, unix)", "all(unix, any(test, feature = \"probe\"))", "not(test)"] {
+    for predicate in [
+        "any(test, unix)",
+        "all(unix, any(test, feature = \"probe\"))",
+        "not(test)",
+    ] {
         let source = format!("#[cfg({predicate})] fn probe() {{ value.unwrap(); }}");
         let stripped = strip_cfg_test_items(&blank_comments_and_literals(&source));
-        assert!(stripped.contains("unwrap"), "predicate {predicate} can compile outside tests and must remain production");
+        assert!(
+            stripped.contains("unwrap"),
+            "predicate {predicate} can compile outside tests and must remain production"
+        );
     }
 }

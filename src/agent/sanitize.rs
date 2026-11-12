@@ -52,7 +52,12 @@ static PREFILTER: LazyLock<Result<Regex, regex::Error>> = LazyLock::new(|| {
     Regex::new(r"[<\{\[]")
 });
 fn prefilter() -> Result<&'static Regex, &'static regex::Error> {
-    PREFILTER.as_ref()
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = PREFILTER.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("sanitize prefilter unavailable");
+    }
+    pattern
 }
 
 /// Lower-case names of every registered tool. Used by the scrubbers to
@@ -123,16 +128,7 @@ fn sanitize_stream_chunk_with_pattern<'a>(
 }
 
 fn prefilter_is_clean(input: &str, pattern: Result<&Regex, &regex::Error>) -> bool {
-    match pattern {
-        Ok(pattern) => !pattern.is_match(input.as_bytes()),
-        Err(_) => {
-            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::error!("sanitize prefilter unavailable");
-            }
-            false
-        }
-    }
+    pattern.is_ok_and(|pattern| !pattern.is_match(input.as_bytes()))
 }
 
 #[cfg(test)]

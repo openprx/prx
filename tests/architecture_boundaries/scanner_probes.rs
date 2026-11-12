@@ -997,6 +997,12 @@ fn panic_ratchet_rejects_new_production_and_test_files() {
         "fn probe() { std::panic::catch_unwind(|| ()); }",
         "#![cfg(test)]\nfn probe() { std::panic::catch_unwind(|| ()); }",
     ] {
-        assert!(scanner_fails_with(super::panic_policy::catch_unwind_file_inventory_only_shrinks, vec![("src/panic_catch_probe.rs".to_string(), code.to_string())]), "a new catch_unwind file must fail even when it is test-only");
+        assert!(
+            scanner_fails_with(
+                super::panic_policy::catch_unwind_file_inventory_only_shrinks,
+                vec![("src/panic_catch_probe.rs".to_string(), code.to_string())]
+            ),
+            "a new catch_unwind file must fail even when it is test-only"
+        );
     }
 }

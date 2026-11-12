@@ -221,7 +221,9 @@ impl Tool for WebSearchTool {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        if let Err(error) = re_strip_tags() {
+        if matches!(self.provider.as_str(), "duckduckgo" | "ddg")
+            && let Err(error) = re_strip_tags()
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

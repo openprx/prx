@@ -211,10 +211,9 @@ fn pii_issues(content: &str, patterns: [std::result::Result<&Regex, &regex::Erro
 }
 
 fn mask_uuids<'a>(content: &'a str, pattern: std::result::Result<&Regex, &regex::Error>) -> std::borrow::Cow<'a, str> {
-    match pattern {
-        Ok(pattern) => pattern.replace_all(content, "<uuid>"),
-        Err(_) => std::borrow::Cow::Borrowed(content),
-    }
+    pattern.map_or(std::borrow::Cow::Borrowed(content), |pattern| {
+        pattern.replace_all(content, "<uuid>")
+    })
 }
 fn pii_pattern_match<'a>(
     content: &str,

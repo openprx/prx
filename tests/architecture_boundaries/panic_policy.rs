@@ -4,22 +4,21 @@ use super::helpers::{
 };
 
 fn violations(source: &str) -> Vec<String> {
-    let tokens: Vec<&str> = source.split(|c: char| c.is_whitespace()).collect();
     // Preserve punctuation as individual tokens, and identifiers as whole words.
     let mut lexed = Vec::new();
-    for token in tokens {
+    for token in source.split_whitespace() {
         let mut start = 0;
         for (index, ch) in token.char_indices() {
             if !(ch.is_ascii_alphanumeric() || ch == '_') {
                 if start < index {
-                    lexed.push(token[start..index].to_string());
+                    lexed.push(&token[start..index]);
                 }
-                lexed.push(ch.to_string());
+                lexed.push(&token[index..index + ch.len_utf8()]);
                 start = index + ch.len_utf8();
             }
         }
         if start < token.len() {
-            lexed.push(token[start..].to_string());
+            lexed.push(&token[start..]);
         }
     }
     let mut found = Vec::new();
@@ -34,7 +33,7 @@ fn violations(source: &str) -> Vec<String> {
         }
     }
     for window in lexed.windows(2) {
-        if matches!(window[0].as_str(), "panic" | "unreachable" | "todo" | "unimplemented") && window[1] == "!" {
+        if matches!(window[0], "panic" | "unreachable" | "todo" | "unimplemented") && window[1] == "!" {
             found.push(format!("{}!", window[0]));
         }
     }
@@ -66,7 +65,7 @@ fn violations(source: &str) -> Vec<String> {
                 ["clippy::unwrap_used", "clippy::expect_used", "clippy::panic"]
                     .iter()
                     .any(|lint| {
-                        inner.match_indices(lint).any(|(start, _)| {
+                        inner.match_indices(*lint).any(|(start, _)| {
                             !inner
                                 .get(start + lint.len()..)
                                 .and_then(|s| s.chars().next())
