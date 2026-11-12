@@ -1540,8 +1540,8 @@ mod tests {
                 ),
             )
             .await
-            .expect("terminal fixture admission must complete its real I/O")
-            .unwrap();
+            .expect("test: terminal fixture admission must complete its real I/O")
+            .expect("test: bind_terminal_fixture_mode fixture operation");
             if capture_parameters {
                 context.capture_main_parameters(true);
             }
@@ -1732,12 +1732,14 @@ mod tests {
 
     #[tokio::test]
     async fn skill_awaiting_approval_reads_ledger_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let temp = tempfile::tempdir().expect("test: skill_awaiting_approval_reads_ledger_state fixture operation");
+        let memory: Arc<dyn Memory> = Arc::new(
+            SqliteMemory::new(temp.path()).expect("test: skill_awaiting_approval_reads_ledger_state fixture operation"),
+        );
         let mut draft = completed_commit("prx_awaiting_ledger");
         let _service =
             bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut draft, &CostConfig::default()).await;
-        let mut decision = draft.decision.expect("fixture settlement");
+        let mut decision = draft.decision.expect("test: fixture settlement");
         assert!(
             !skill_awaiting_approval(&decision, None),
             "an ordinary completed turn is not awaiting approval"
@@ -1754,12 +1756,12 @@ mod tests {
                     "test",
                     "probe",
                 )
-                .expect("test capability id"),
+                .expect("test: test capability id"),
                 fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
                 generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
             });
         Arc::get_mut(&mut decision.context)
-            .expect("fixture settlement uniquely owns its context")
+            .expect("test: fixture settlement uniquely owns its context")
             .install_collection_proof_for_test(
                 crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
                     cap,
@@ -1780,7 +1782,7 @@ mod tests {
             &CostConfig::default(),
         )
         .await;
-        let decision_attempts = draft_attempts.decision.expect("attempts settlement");
+        let decision_attempts = draft_attempts.decision.expect("test: attempts settlement");
         let snapshot = crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
             awaiting_approval_attempts: 1,
             ..Default::default()

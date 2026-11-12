@@ -139,7 +139,7 @@ mod tests {
     fn h2_call_digest_matches_previous_decision_call_digest_formula() {
         let capability = CapabilityRef {
             id: CapabilityId::new(CapabilityTarget::NativeTool, "native", "skills_manage")
-                .expect("fixture capability id"),
+                .expect("test: fixture capability id"),
             fingerprint: SchemaFingerprint([0; 32]),
             generation: CatalogGeneration([0; 32]),
         };
@@ -161,7 +161,7 @@ mod tests {
             "skills_manage",
             RiskLevel::High,
         )
-        .expect("fixture digest");
+        .expect("test: fixture digest");
         assert_eq!(
             hex::encode(digest),
             "db5274901a343d56949875f0600ca3ba25acd926ae3307e05d7a7f98c6cc5cc1"

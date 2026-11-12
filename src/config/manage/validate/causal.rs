@@ -357,12 +357,14 @@ mod tests {
     /// store is never opened (D-082 N-9).
     #[test]
     fn disabled_engine_never_opens_the_credential_store() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp =
+            tempfile::TempDir::new().expect("test: disabled_engine_never_opens_the_credential_store fixture operation");
         let mut config = loopback_plane();
         config.config_path = temp.path().join("config.toml");
         config.causal_tree.backend.credential_ref =
             crate::causal_tree::config::CredentialRefSetting::Profile("cred-decider".to_string());
-        std::fs::write(temp.path().join("auth-profiles.json"), "not json").unwrap();
+        std::fs::write(temp.path().join("auth-profiles.json"), "not json")
+            .expect("test: disabled_engine_never_opens_the_credential_store fixture operation");
         assert_eq!(check_decision_plane(None, &config), Ok(None));
         config.decision_engine.enabled = true;
         assert!(check_decision_plane(None, &config).is_err());

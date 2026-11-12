@@ -74,7 +74,7 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
         channels_by_name: Arc::new(channels_by_name),
         provider: Arc::new(DummyProvider),
         default_provider: Arc::new("test-provider".to_string()),
-        memory: Arc::new(crate::memory::SqliteMemory::new(workspace).expect("channel sqlite")),
+        memory: Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: channel sqlite")),
         tools_registry: Arc::new(vec![]),
         observer: Arc::new(NoopObserver),
         hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf())),

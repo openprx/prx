@@ -196,10 +196,17 @@ async fn persist_completed_chat(
     history_commit_len: usize,
 ) -> TurnTerminalReceipt {
     assert!(
-        binding.fixed_reply().unwrap().is_some(),
+        binding
+            .fixed_reply()
+            .expect("test: persist_completed_chat fixture operation")
+            .is_some(),
         "fixture must select a Close terminal"
     );
-    let run = binding.envelope().run_id.as_deref().expect("completed chat has a run");
+    let run = binding
+        .envelope()
+        .run_id
+        .as_deref()
+        .expect("test: completed chat has a run");
     let receipt = binding
         .close(
             fabric,
@@ -208,8 +215,11 @@ async fn persist_completed_chat(
             &CancellationToken::new(),
         )
         .await
-        .unwrap();
-    binding.rejoin_recovery_terminal(run).await.unwrap();
+        .expect("test: persist_completed_chat fixture operation");
+    binding
+        .rejoin_recovery_terminal(run)
+        .await
+        .expect("test: persist_completed_chat fixture operation");
     receipt
 }
 

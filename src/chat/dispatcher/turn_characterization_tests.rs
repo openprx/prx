@@ -481,7 +481,7 @@ async fn admit_chat_fixture_with_mode(
                 "provider": selection.0, "model": selection.1,
                 "operations": ["chat"], "native_tools": true,
             }))
-            .expect("fixture model descriptor"),
+            .expect("test: fixture model descriptor"),
         );
     }
     let generation = crate::config::new_shared(config.clone()).pin();
@@ -576,7 +576,7 @@ async fn admit_chat_fixture_with_mode(
         .decide(&decisions, &CancellationToken::new())
         .await
         .expect("chat decision");
-    let routing = binding.decision_routing().expect("chat decision routing");
+    let routing = binding.decision_routing().expect("test: chat decision routing");
     assert!(
         routing.context.engine().prediction.is_none(),
         "chat decide uses open_turn_context, which has no prediction port"
@@ -675,7 +675,7 @@ async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed
         &owner,
         admitted.fabric.clone(),
     );
-    assert!(admitted.binding.fixed_reply().unwrap().is_none());
+    assert!(admitted.binding.fixed_reply().expect("test: queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed_terminal fixture operation").is_none());
     drive_start_turn_stream(
         Some(Arc::clone(&admitted.binding)),
         None,
@@ -1125,7 +1125,7 @@ pub(crate) async fn drive_disabled_engine_chat_entry(workspace: &std::path::Path
         admitted
             .binding
             .decision_routing()
-            .expect("chat decide issued")
+            .expect("test: chat decide issued")
             .context
             .engine()
             .prediction

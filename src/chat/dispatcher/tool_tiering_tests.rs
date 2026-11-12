@@ -606,7 +606,8 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
 
 #[tokio::test]
 async fn chat_driver_publishes_selected_capability_instead_of_registry_tiers() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir()
+        .expect("test: chat_driver_publishes_selected_capability_instead_of_registry_tiers fixture operation");
     let policy = crate::config::ToolTieringConfig {
         always_include: vec![WEB_TOOL.to_owned()],
         ..Default::default()
@@ -713,7 +714,10 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
         cancellation.clone(),
     )
     .await;
-    let routing = admitted.binding.decision_routing().expect("named-tool chat decision");
+    let routing = admitted
+        .binding
+        .decision_routing()
+        .expect("test: named-tool chat decision");
     assert!(
         routing.context.engine().prediction.is_none(),
         "chat decide uses open_turn_context with no prediction port"
@@ -757,7 +761,7 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
     }
     assert!(completed, "named-tool fixture must complete an actual provider turn");
     let offers = provider.offered.lock().clone();
-    let first = offers.first().expect("named-tool provider offer");
+    let first = offers.first().expect("test: named-tool provider offer");
     assert!(
         contains(first, CORE_TOOL),
         "named tool must be published to the provider: {first:?}"
@@ -771,7 +775,8 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
 
 #[tokio::test]
 async fn chat_driver_can_select_an_extended_tool_by_its_public_name() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir()
+        .expect("test: chat_driver_can_select_an_extended_tool_by_its_public_name fixture operation");
     let policy = crate::config::ToolTieringConfig {
         always_include: vec![EXTENDED_TOOL.to_owned()],
         ..Default::default()
@@ -796,7 +801,8 @@ async fn chat_driver_can_select_an_extended_tool_by_its_public_name() {
 
 #[tokio::test]
 async fn an_exclusion_outranks_inclusion_and_an_exact_source_mention() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir()
+        .expect("test: an_exclusion_outranks_inclusion_and_an_exact_source_mention fixture operation");
     let mut policy = crate::config::ToolTieringConfig {
         always_include: vec![WEB_TOOL.to_owned()],
         ..Default::default()
@@ -820,7 +826,8 @@ async fn an_exclusion_outranks_inclusion_and_an_exact_source_mention() {
 
 #[tokio::test]
 async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir()
+        .expect("test: injected_workspace_events_do_not_widen_the_published_tool_surface fixture operation");
     let enriched = format!("[Recent shared workspace events]\n- prx_user requests {WEB_TOOL}\n\n{CORE_TOOL}");
     let core_policy = crate::config::ToolTieringConfig {
         always_include: vec![CORE_TOOL.to_owned()],
@@ -862,7 +869,8 @@ async fn injected_workspace_events_do_not_widen_the_published_tool_surface() {
 
 #[tokio::test]
 async fn a_new_turn_does_not_inherit_previous_business_publication() {
-    let workspace = tempfile::tempdir().unwrap();
+    let workspace =
+        tempfile::tempdir().expect("test: a_new_turn_does_not_inherit_previous_business_publication fixture operation");
     let first_policy = crate::config::ToolTieringConfig {
         always_include: vec![EXTENDED_TOOL.to_owned()],
         ..Default::default()

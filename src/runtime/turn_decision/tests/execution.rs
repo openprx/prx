@@ -39,12 +39,13 @@ impl Tool for SchemaProbeTool {
 
 #[tokio::test]
 async fn discovered_spec_with_changed_schema_still_fails_bind() {
-    let workspace = tempfile::tempdir().expect("schema-bind workspace");
+    let workspace = tempfile::tempdir().expect("test: schema-bind workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.causal_tree.enabled = true;
     config.tool_tiering.always_include.push("project_tool".into());
-    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("schema memory"));
+    let memory: Arc<dyn Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: schema memory"));
     let registry = registry_with_search(vec![Box::new(SchemaProbeTool)]);
     let admitted = AdmittedTurn::with_enabled_builtin_model(
         config,
@@ -58,13 +59,13 @@ async fn discovered_spec_with_changed_schema_still_fails_bind() {
     let selected = decision
         .service
         .agent_execution_specs(decision.proof, decision.context)
-        .expect("admitted project_tool selection");
+        .expect("test: admitted project_tool selection");
     let mut spec = selected
         .specs
         .iter()
         .find(|item| item.name == "project_tool")
         .cloned()
-        .expect("project_tool spec");
+        .expect("test: project_tool spec");
     spec.parameters = serde_json::json!({
         "type": "object",
         "properties": {"tampered": {"type": "string"}},

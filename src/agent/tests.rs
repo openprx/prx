@@ -835,15 +835,15 @@ impl Provider for SpawnSpyProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> Result<ChatResponse> {
-        if self.offered.lock().unwrap().is_empty() {
-            *self.offered.lock().unwrap() = request
+        if self.offered.lock().expect("test: chat fixture operation").is_empty() {
+            *self.offered.lock().expect("test: chat fixture operation") = request
                 .tools
                 .unwrap_or(&[])
                 .iter()
                 .map(|spec| spec.name.clone())
                 .collect();
         }
-        let mut responses = self.responses.lock().unwrap();
+        let mut responses = self.responses.lock().expect("test: chat fixture operation");
         if responses.is_empty() {
             return Ok(text_response("spawned"));
         }
@@ -877,14 +877,30 @@ async fn default_config_heavy_task_dispatches_sessions_spawn() {
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .build()
-        .unwrap();
-    let _response = agent.turn("please fix this bug for me").await.unwrap();
+        .expect("test: default_config_heavy_task_dispatches_sessions_spawn fixture operation");
+    let _response = agent
+        .turn("please fix this bug for me")
+        .await
+        .expect("test: default_config_heavy_task_dispatches_sessions_spawn fixture operation");
     assert!(
-        offered.lock().unwrap().iter().any(|name| name == "sessions_spawn"),
+        offered
+            .lock()
+            .expect("test: default_config_heavy_task_dispatches_sessions_spawn fixture operation")
+            .iter()
+            .any(|name| name == "sessions_spawn"),
         "provider spy must see sessions_spawn in tools: {:?}",
-        offered.lock().unwrap()
+        offered
+            .lock()
+            .expect("test: default_config_heavy_task_dispatches_sessions_spawn fixture operation")
     );
-    assert_eq!(calls.lock().unwrap().len(), 1, "MockSessionsSpawnTool must run once");
+    assert_eq!(
+        calls
+            .lock()
+            .expect("test: default_config_heavy_task_dispatches_sessions_spawn fixture operation")
+            .len(),
+        1,
+        "MockSessionsSpawnTool must run once"
+    );
 }
 
 #[tokio::test]
@@ -922,7 +938,9 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
         "configured delegation response: {response:?}; history: {:?}",
         agent.history()
     );
-    let calls = calls.lock().unwrap();
+    let calls = calls
+        .lock()
+        .expect("test: turn_delegates_heavy_task_to_sessions_spawn_tool fixture operation");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["action"], "spawn");
     assert_eq!(calls[0]["mode"], "process");

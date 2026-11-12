@@ -98,7 +98,7 @@ async fn failed_cached_call_is_not_another_physical_failure_and_fresh_ids_still_
         first.unbound_attempts, 0,
         "a registered call has an execution-owned identity"
     );
-    let observed = first.calls.first().expect("actual registered call");
+    let observed = first.calls.first().expect("test: actual registered call");
     assert_eq!(observed.capability_id, "native_tool:native:native_write");
     assert_eq!(observed.status, "failed");
     assert_eq!(

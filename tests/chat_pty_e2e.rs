@@ -2301,16 +2301,16 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     let sentinel = "[MOCK-B2-FANOUT-DONE]";
     let tool_call =
         r#"sessions_spawn:{"action":"spawn_batch","tasks":["b2 fan-out one","b2 fan-out two","b2 fan-out three"]}"#;
-    let guard = new_harness_guard().expect("isolated batch fixture");
+    let guard = new_harness_guard().expect("test: isolated batch fixture");
     let mut config = openprx::config::Config::default();
     // This fixture tests the batch lifecycle with an explicitly offered tool.
     // Default-chat deferred discovery is exercised by search_reachability.
     config.tool_tiering.always_include.push("sessions_spawn".to_owned());
     std::fs::write(
         guard.config_dir.join("config.toml"),
-        toml::to_string_pretty(&config).expect("serialize batch fixture"),
+        toml::to_string_pretty(&config).expect("test: serialize batch fixture"),
     )
-    .expect("write batch fixture");
+    .expect("test: write batch fixture");
     let mut sg = spawn_chat_in(
         &guard,
         &["--plain"],
@@ -2324,7 +2324,7 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     drain_with_dsr(session, Duration::from_millis(200));
     session
         .send("Call sessions_spawn to fan this out\r")
-        .expect("send prompt");
+        .expect("test: send prompt");
     read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
 
     session.send("/sessions\r").expect("send /sessions");

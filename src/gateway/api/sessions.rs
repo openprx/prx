@@ -2737,7 +2737,7 @@ mod tests {
 
     pub(super) async fn drive_disabled_engine_console_entry(workspace: &std::path::Path) {
         let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
-            .expect("console engine-off cleanup");
+            .expect("test: console engine-off cleanup");
         cleanup
             .run(Box::pin(async {
                 let mut config = Config::default();
@@ -2749,7 +2749,7 @@ mod tests {
                     toml::from_str(
                         "provider = \"ollama\"\nmodel = \"test-model\"\noperations = [\"chat\"]\nnative_tools = false\n",
                     )
-                    .expect("console model declaration"),
+                    .expect("test: console model declaration"),
                 );
                 config.cost.prices.insert(
                     "ollama/test-model".to_owned(),
@@ -2781,7 +2781,7 @@ mod tests {
                 Ok::<(), anyhow::Error>(())
             }))
             .await
-            .expect("console engine-off entry");
+            .expect("test: console engine-off entry");
     }
 
     #[test]

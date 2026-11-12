@@ -585,61 +585,91 @@ fn write_source(m: &Managed, script: &str) -> (PathBuf, String) {
 }
 
 #[tokio::test]
-async fn publishing_an_executable_needs_a_grant_bound_to_the_reviewed_bundle_hash() {
-    for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
-        let m = managed("grant-import");
-        let tool = manage_tool(&m, LifecycleMode::Auto, autonomy);
+async fn supervised_publication_needs_a_grant_bound_to_the_reviewed_bundle_hash() {
+    let autonomy = AutonomyLevel::Supervised;
+    let m = managed("grant-import");
+    let tool = manage_tool(&m, LifecycleMode::Auto, autonomy);
+    let (source, revision) = write_source(&m, "#!/bin/sh\necho A\n");
+    let source_text = source.to_string_lossy().to_string();
+    let args = json!({"action": "lifecycle_import_executable", "source": source_text, "revision_id": revision});
+    let operation = format!("skills_manage:lifecycle_import_executable:{source_text}:{revision}");
+
+    // No grant, a grant for another hash, and a grant for another action.
+    let other = format!("r1-{}", "7".repeat(64));
+    for operation in [
+        None,
+        Some(format!(
+            "skills_manage:lifecycle_import_executable:{source_text}:{other}"
+        )),
+        Some(format!("skills_manage:lifecycle_publish:{source_text}:{revision}")),
+    ] {
+        let call = operation.map_or_else(
+            || {
+                let mut call = args.clone();
+                call["_zc_scope_trusted"] = json!(true);
+                call["_zc_scope"] = json!({"owner_id": m.owner});
+                call
+            },
+            |operation| with_grant(args.clone(), &operation, &m.owner),
+        );
+        let refused = tool.execute(call).await.expect("test: execute");
+        assert!(!refused.success, "{autonomy:?}");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval grant"),
+            "{autonomy:?}: {:?}",
+            refused.error
+        );
+    }
+    assert!(
+        SkillLifecycleStore::open(m.tmp.path(), OwnerScope::new(&m.owner).expect("test: owner"))
+            .expect("test: store")
+            .list_active_bindings()
+            .expect("test: bindings")
+            .is_empty(),
+        "nothing was published without the bound grant"
+    );
+
+    let call = with_grant(args.clone(), &operation, &m.owner);
+    let published = tool.execute(call.clone()).await.expect("test: execute");
+    assert!(published.success, "{autonomy:?}: {:?}", published.error);
+    assert!(published.output.contains(&revision), "{}", published.output);
+    // The one-shot grant cannot be replayed.
+    let replay = tool.execute(call).await.expect("test: execute");
+    assert!(!replay.success, "{autonomy:?}: a spent grant must not publish again");
+}
+
+#[tokio::test]
+async fn full_publication_executes_without_a_grant_and_supplied_grants_remain_single_use() {
+    for supplied in [false, true] {
+        let m = managed("full-import");
+        let tool = manage_tool(&m, LifecycleMode::Auto, AutonomyLevel::Full);
         let (source, revision) = write_source(&m, "#!/bin/sh\necho A\n");
         let source_text = source.to_string_lossy().to_string();
-        let args = json!({"action": "lifecycle_import_executable", "source": source_text, "revision_id": revision});
-        let operation = format!("skills_manage:lifecycle_import_executable:{source_text}:{revision}");
-
-        // No grant, a grant for another hash, and a grant for another action.
-        let other = format!("r1-{}", "7".repeat(64));
-        for operation in [
-            None,
-            Some(format!(
-                "skills_manage:lifecycle_import_executable:{source_text}:{other}"
-            )),
-            Some(format!("skills_manage:lifecycle_publish:{source_text}:{revision}")),
-        ] {
-            let call = operation.map_or_else(
-                || {
-                    let mut call = args.clone();
-                    call["_zc_scope_trusted"] = json!(true);
-                    call["_zc_scope"] = json!({"owner_id": m.owner});
-                    call
-                },
-                |operation| with_grant(args.clone(), &operation, &m.owner),
-            );
-            let refused = tool.execute(call).await.expect("test: execute");
-            assert!(!refused.success, "{autonomy:?}");
-            assert!(
-                refused
-                    .error
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("explicit approval grant"),
-                "{autonomy:?}: {:?}",
-                refused.error
-            );
+        let mut args = json!({"action":"lifecycle_import_executable", "source":source_text, "revision_id":revision,
+            "_zc_scope_trusted":true, "_zc_scope":{"owner_id":m.owner}});
+        if supplied {
+            let operation = format!("skills_manage:lifecycle_import_executable:{source_text}:{revision}");
+            args = with_grant(args, &operation, &m.owner);
         }
-        assert!(
-            SkillLifecycleStore::open(m.tmp.path(), OwnerScope::new(&m.owner).expect("test: owner"))
-                .expect("test: store")
-                .list_active_bindings()
-                .expect("test: bindings")
-                .is_empty(),
-            "nothing was published without the bound grant"
+        let published = tool.execute(args.clone()).await.expect("test: full publication");
+        assert!(published.success, "full publication: {:?}", published.error);
+        let store = SkillLifecycleStore::open(m.tmp.path(), OwnerScope::new(&m.owner).expect("test: owner"))
+            .expect("test: lifecycle store");
+        let bindings = store.list_active_bindings().expect("test: published binding");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings.first().expect("test: one binding").revision_id.as_str(),
+            revision
         );
-
-        let call = with_grant(args.clone(), &operation, &m.owner);
-        let published = tool.execute(call.clone()).await.expect("test: execute");
-        assert!(published.success, "{autonomy:?}: {:?}", published.error);
-        assert!(published.output.contains(&revision), "{}", published.output);
-        // The one-shot grant cannot be replayed.
-        let replay = tool.execute(call).await.expect("test: execute");
-        assert!(!replay.success, "{autonomy:?}: a spent grant must not publish again");
+        if supplied {
+            let replay = tool.execute(args).await.expect("test: supplied grant replay");
+            assert!(!replay.success, "a supplied one-shot cannot publish twice");
+            assert_eq!(store.list_active_bindings().expect("test: unchanged binding"), bindings);
+        }
     }
 }
 

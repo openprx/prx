@@ -168,7 +168,7 @@ async fn full_mode_executes_non_read_only_without_approval() {
 }
 
 #[tokio::test]
-async fn explicit_grant_call_asks_in_full_mode() {
+async fn full_lifecycle_call_executes_without_forced_approval() {
     let path = tempfile::tempdir().unwrap();
     let mut context = ledger_context(path.path()).await;
     assert!(context.admitted_binding.is_none());
@@ -196,24 +196,10 @@ async fn explicit_grant_call_asks_in_full_mode() {
         )
     };
     let outcome = service.execute(command(), context.clone(), None).await;
-    assert_eq!(outcome.decision, Some(ToolExecutionDecision::Ask));
-    assert_eq!(outcome.status, ToolExecutionStatus::AwaitingApproval);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        ledger_port(&context)
-            .list_pending_calls(context.envelope.owner_id.as_deref().unwrap(), 0, 10)
-            .await
-            .unwrap()
-            .items
-            .len(),
-        1
-    );
-    review(&context, true).await;
-    assert_eq!(
-        service.execute(command(), context.clone(), None).await.status,
-        ToolExecutionStatus::Succeeded
-    );
+    assert_eq!(outcome.decision, Some(ToolExecutionDecision::Allow));
+    assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_no_pending(&context).await;
 }
 
 #[tokio::test]

@@ -1904,29 +1904,32 @@ workers carry the narrowed ceiling in their authenticated manifest. A parent
 unable to fund one cent refuses the launch. This is monetary admission; it does
 not merge the distinct per-turn token/context windows or claim a vendor billing cap.
 
-### Supervised exact-call collection
+### Execution approval
 
-Interactive Chat and authenticated Console can collect one proposed call for
-`file_write`, `file_edit`, an MCP tool with one fixed approval operation,
-`shell`, `http_request`, or a grant-bound `skills_manage` lifecycle action.
-Collection exposes only the selected schema and never dispatches the tool.
-Review approves the normalized complete arguments; changing a command, URL,
-method, header, body, artifact hash or target invalidates the approval. Resume
-uses the original call once, through the ordinary tool policy. HTTP private-host
-and allowlist checks still apply after approval.
+Supervised chat displays the actual proposed tool and arguments in its
+interactive approval prompt. Denial never starts the backend. Approval runs the
+reviewed call once through the execution service, which rechecks the tool schema,
+source, policy and budget before dispatch. Repeated approval responses or a
+`/resume-decision` request cannot execute a completed ordinary chat call again.
 
-The plain `prx agent` CLI has no approval-review adapter. Use `prx chat` or the
-Console for Supervised collection, review and explicit resume; the CLI does not
-silently approve an operation or create an unreviewable pending request.
+Full autonomy executes calls, including lifecycle imports and discovered tools,
+without forcing an approval prompt. Workspace boundaries, owner isolation,
+artifact-hash validation and lifecycle mode still apply. The verified controlled
+experiment ingress retains its existing durable exact-call ledger protocol.
+Authenticated Console and channel sources keep their execution-owned approval
+routing. Their durable review records are bound to the source and exact call;
+changing a command, URL, method, body, artifact hash or target changes that call.
+HTTP private-host and allowlist checks still apply after approval.
+
+The plain `prx agent` CLI has no interactive approval-review adapter. A
+Supervised call that needs an unavailable resolver fails closed. Ordinary chat
+approval does not require a separate durable decision approval or resume command.
 
 Lifecycle reads have separate capabilities: `lifecycle_status`, `lifecycle_list`
 and `lifecycle_inspect`. Each requires its matching `action`; inspection also
 requires `proposal_id`. They retain owner checks and cannot accept a write
-action. The mixed-effect `skills_manage` capability remains approval-gated.
-An unnamed lifecycle request can enter proposal collection after a unique,
-current, source-bound discovery identifies that capability. Stale, ambiguous or
-absent discovery provides no authority. The proposed action must still be a
-grant-bound lifecycle mutation, and the operator must inspect and approve it.
+action. `skills_manage` mutations follow the configured execution policy.
+Discovery publishes metadata and schemas; it never grants execution authority.
 
 ### Reload a trusted plugin in a running gateway
 

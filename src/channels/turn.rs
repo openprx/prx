@@ -34,11 +34,15 @@ use super::{
     truncate_with_ellipsis,
 };
 
-/// Decision id embedded by the durable approval path.
-///
-/// The tool executor returns `Approval is required for decision {id}.` and
-/// does not run the tool. The channel reports that id on `turn.status`.
+/// Authenticated pending approval id returned by the execution ledger.
+/// The channel keeps the same turn.status payload for run-keyed approvals and
+/// retained legacy decision receipts. This is called only for typed waits.
 fn decision_id_from_approval_reply(reply: &str) -> Option<String> {
+    if let Some(id) = reply.strip_prefix("Error: awaiting approval: ") {
+        let id = id.trim();
+        crate::security::approval_ledger::keys::RunCallAuthority::parse_call_id(id).ok()?;
+        return Some(id.to_owned());
+    }
     let rest = reply.strip_prefix("Approval is required for decision ")?;
     let id = rest.split('.').next().map(str::trim).filter(|id| !id.is_empty())?;
     Some(id.to_string())

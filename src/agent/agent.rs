@@ -2979,7 +2979,8 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_routes_on_the_user_message_parameter() {
-        let workspace = tempfile::TempDir::new().unwrap();
+        let workspace =
+            tempfile::TempDir::new().expect("test: agent_turn_routes_on_the_user_message_parameter fixture operation");
         let skill_refreshes = Arc::new(AtomicUsize::new(0));
         let mcp_refreshes = Arc::new(AtomicUsize::new(0));
 
@@ -3054,7 +3055,7 @@ mod tests {
         let response = agent
             .turn("use skill_probe to create a PDF file. Do not use browser, MCP, HTTP, plugins, or WASM.")
             .await
-            .unwrap();
+            .expect("test: agent_turn_routes_on_the_user_message_parameter fixture operation");
 
         assert_eq!(response, "done");
         assert_eq!(

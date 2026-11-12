@@ -2804,10 +2804,11 @@ impl ToolExecutionService {
             service_level.min(scope.gate_inputs().0.authority.level)
         });
         let decision = admission::child_autonomy(&context, &descriptor, self.policy.decide(&descriptor, &context));
-        // A call the tool itself only accepts with a signed one-shot grant
-        // needs a human approval at every autonomy level, also where policy
-        // would allow it. Deny stays Deny.
+        // Ordinary calls honor the execution policy, including Full's Allow.
+        // Only the verified controlled H2 ingress retains its durable exact
+        // grant protocol. Deny always remains Deny.
         let decision = if decision != ToolExecutionDecision::Deny
+            && context.h2_origin().is_some()
             && crate::security::approval_operation::requires_explicit_grant(&descriptor.public_name, &command.arguments)
         {
             ToolExecutionDecision::Ask

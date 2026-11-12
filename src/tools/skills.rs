@@ -789,13 +789,14 @@ impl SkillsManageTool {
             |target| format!("skills_manage:{action}:{target}"),
         );
         let grant = Self::approval_grant(args);
-        if matches!(
-            action,
-            "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
-        ) {
-            // Publication changes what every future task reads, so it needs an
-            // explicit grant bound to its target in every autonomy level, also
-            // under full autonomy where the gate would otherwise let it pass.
+        if (self.security.autonomy != crate::security::AutonomyLevel::Full || args.get("_zc_approval_grant").is_some())
+            && matches!(
+                action,
+                "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
+            )
+        {
+            // Supervised publication needs an exact one-shot grant. Full
+            // follows the operator's execution policy without a forced Ask.
             let now = chrono::Utc::now().timestamp();
             // Only a signed one-shot (v2) grant qualifies: it expires and can be
             // spent once, which a v1 hash grant cannot.
@@ -822,10 +823,9 @@ impl SkillsManageTool {
                 };
                 Self::lifecycle_refusal(code, None, error)
             })?;
-        // Replay ledger. Under `supervised` the gate above has just spent the
-        // grant; under `full` it lets the call through without looking at the
-        // grant, so spend it here, after the gate allowed the call (a call the
-        // gate refuses must not burn the approval). The ledger is in memory:
+        // Supervised spends its grant in the gate. Full needs no grant, but
+        // an explicitly supplied one-shot must still reject replay. Consume
+        // it after the gate allows the call. The ledger is in memory:
         // a restart forgets it, which is acceptable because runtime grants
         // live about a minute, a repeated publish is idempotent by proposal
         // state, and a repeated rollback fails its expected_generation CAS.
@@ -833,6 +833,7 @@ impl SkillsManageTool {
             action,
             "lifecycle_publish" | "lifecycle_rollback" | "lifecycle_import_executable"
         ) && self.security.autonomy == crate::security::AutonomyLevel::Full
+            && grant.is_some()
             && !grant.as_ref().is_some_and(ApprovalGrant::consume_single_use)
         {
             return Err(Self::lifecycle_refusal(
@@ -998,9 +999,9 @@ impl Tool for SkillsManageTool {
             return h2::DESCRIPTION;
         }
         if self.lifecycle.is_some() {
-            "Manage skill lifecycle: import reviewed executable bundles, publish proposals, and roll back revisions. Lifecycle writes require exact operator approval. Also 'create', 'install', 'update', 'enable', 'disable', 'validate', 'sync' and 'remove' instruction skills. Lifecycle actions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read and must use their same-named read-only capabilities instead of this mixed-effect root; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-reviewed executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions are approval-gated."
+            "Manage skill lifecycle: import reviewed executable bundles, publish proposals, and roll back revisions. Supervised lifecycle writes require exact operator approval; Full executes under the configured policy. Also 'create', 'install', 'update', 'enable', 'disable', 'validate', 'sync' and 'remove' instruction skills. Lifecycle actions: 'lifecycle_status', 'lifecycle_list' and 'lifecycle_inspect' only read and must use their same-named read-only capabilities instead of this mixed-effect root; 'lifecycle_publish' publishes an eligible proposal, 'lifecycle_cancel' closes one and 'lifecycle_rollback' re-activates an earlier revision and 'lifecycle_import_executable' publishes an operator-reviewed executable bundle from a directory, bound to the complete bundle hash the operator reviewed, all under the operator's lifecycle mode and policy. Mutating actions follow the configured execution and approval policy."
         } else {
-            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions are approval-gated."
+            "Manage PRX skills: 'create' writes a new instruction skill, 'install' adds one from a source, 'update' refreshes an installed one, 'enable' and 'disable' toggle one, 'validate' checks one, 'sync' synchronizes the community skill repositories, and 'remove' deletes one. Mutating actions follow the configured execution and approval policy."
         }
     }
 
@@ -2428,10 +2429,10 @@ mod tests {
     const PROPOSAL: &str = "prop-00000000000000000000000000000000";
     const OTHER_PROPOSAL: &str = "prop-11111111111111111111111111111111";
 
-    /// Publication and rollback need a grant bound to their target in every
-    /// autonomy level; cancel needs the bound grant when supervised.
+    /// Supervised needs review; supplied grants bind the target at every
+    /// autonomy level. Full without a grant still respects lifecycle mode.
     #[tokio::test]
-    async fn lifecycle_mutations_need_grants_bound_to_their_target() {
+    async fn lifecycle_mutations_bind_supplied_grants_and_supervised_requires_review() {
         use crate::security::AutonomyLevel;
         let revision = format!("r1-{}", "0".repeat(64));
         let rollback_args = json!({"action": "lifecycle_rollback", "skill_id": "release-notes", "revision_id": revision, "expected_generation": 1});
@@ -2451,7 +2452,7 @@ mod tests {
                 security,
             );
 
-            // No grant: refused before the service is reached.
+            // No grant: Supervised refuses review; Full reaches the Shadow mode gate.
             for args in [&publish_args, &rollback_args] {
                 let result = tool.execute(owned(args.clone())).await.unwrap();
                 assert!(!result.success);
@@ -2460,7 +2461,11 @@ mod tests {
                         .error
                         .as_deref()
                         .unwrap_or_default()
-                        .contains("explicit approval grant"),
+                        .contains(if autonomy == AutonomyLevel::Full {
+                            "does not allow"
+                        } else {
+                            "explicit approval grant"
+                        }),
                     "{autonomy:?}: {:?}",
                     result.error
                 );

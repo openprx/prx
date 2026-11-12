@@ -1,6 +1,7 @@
-//! Drive approval and resume through the real chat loop, then submit later input.
+//! Execution-owned approval through real chat, SQLite and a terminal.
 use super::*;
 use openprx::skills::lifecycle::{Bundle, OwnerScope, SkillLifecycleStore};
+use sha2::{Digest as _, Sha256};
 use std::os::unix::fs::PermissionsExt as _;
 
 const LATER_REPLY: &str = "[PRX-RESUME-LATER-REPLY]";
@@ -20,27 +21,27 @@ fn import_fixture() -> (HarnessGuard, String, String) {
 }
 
 fn import_fixture_at(level: openprx::security::AutonomyLevel) -> (HarnessGuard, String, String) {
-    let mut guard = new_harness_guard().expect("isolated resume fixture");
+    let mut guard = new_harness_guard().expect("test: isolated resume fixture");
     // CONFIG_DIR takes precedence over WORKSPACE in the real CLI loader.
     guard.workspace_dir = guard.config_dir.join("workspace");
     let source = guard.workspace_dir.join("incoming/report-runner");
-    std::fs::create_dir_all(source.join("scripts")).expect("bundle directory");
+    std::fs::create_dir_all(source.join("scripts")).expect("test: bundle directory");
     std::fs::write(
         source.join("SKILL.md"),
         "---\nname: Report runner\ndescription: Runs the report\n---\n\nRun the report.\n",
     )
-    .expect("skill instructions");
+    .expect("test: skill instructions");
     std::fs::write(
         source.join("SKILL.toml"),
         "[skill]\nname = \"Report runner\"\ndescription = \"Runs the report\"\nversion = \"1.0.0\"\n\n\
          [[tools]]\nname = \"run\"\ndescription = \"run report\"\nkind = \"script\"\ncommand = \"scripts/run.sh\"\n",
     )
-    .expect("skill manifest");
+    .expect("test: skill manifest");
     let script = source.join("scripts/run.sh");
-    std::fs::write(&script, "#!/bin/sh\nprintf 'report complete\\n'\n").expect("skill script");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("executable script");
+    std::fs::write(&script, "#!/bin/sh\nprintf 'report complete\\n'\n").expect("test: skill script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("test: executable script");
     let revision = Bundle::from_dir(&source)
-        .expect("reviewed bundle")
+        .expect("test: reviewed bundle")
         .revision_id()
         .to_string();
     let arguments = serde_json::json!({
@@ -56,353 +57,308 @@ fn import_fixture_at(level: openprx::security::AutonomyLevel) -> (HarnessGuard, 
     config.skills_lifecycle.owner_scope = Some(chat_owner(&guard));
     std::fs::write(
         guard.config_dir.join("config.toml"),
-        toml::to_string_pretty(&config).expect("resume config"),
+        toml::to_string_pretty(&config).expect("test: resume config"),
     )
-    .expect("write resume config");
+    .expect("test: write resume config");
     (guard, arguments.to_string(), revision)
 }
 
 fn assert_import_generation(guard: &HarnessGuard, revision: &str, expected: usize) {
     let store = SkillLifecycleStore::open(
         &guard.workspace_dir,
-        OwnerScope::new(&chat_owner(guard)).expect("owner"),
+        OwnerScope::new(&chat_owner(guard)).expect("test: owner"),
     )
-    .expect("lifecycle store");
-    let bindings = store.list_active_bindings().expect("active imports");
+    .expect("test: lifecycle store");
+    let bindings = store.list_active_bindings().expect("test: active imports");
     assert_eq!(bindings.len(), expected);
     if expected != 0 {
-        assert_eq!(bindings[0].revision_id.as_str(), revision);
-        assert_eq!(bindings[0].generation, 1, "resume must execute the import only once");
+        assert_eq!(
+            bindings.first().expect("test: one binding").revision_id.as_str(),
+            revision
+        );
+        assert_eq!(
+            bindings.first().expect("test: one binding").generation,
+            1,
+            "resume must execute the import only once"
+        );
     }
 }
 
-fn approve_and_resume_import(guard: &HarnessGuard, arguments: &str, revision: &str) -> (SessionGuard, String) {
-    let tool_call = format!("skills_manage:{arguments}");
-    let mut sg = spawn_chat_in(
-        guard,
-        &["--plain"],
-        &[
-            ("OPENPRX_MOCK_TOOL_CALL", &tool_call),
-            ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
-        ],
-    );
-    let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    drain_with_dsr(session, Duration::from_millis(200));
-    session
-        .send(format!(
-            "Call the skills_manage tool with these arguments: {arguments}\r"
-        ))
-        .expect("request import");
-    let pending = read_until_with_dsr(session, "The operation has not run.", TURN_TIMEOUT);
-    let captures = regex::Regex::new(r"Approval is required for decision ([0-9a-f-]{36})")
-        .expect("decision regex")
-        .captures(&pending)
-        .unwrap_or_else(|| panic!("missing pending approval: {pending}"));
-    let decision_id = captures[1].to_owned();
-    assert_import_generation(guard, revision, 0);
-    session
-        .send(format!("/approve --decision {decision_id}\r"))
-        .expect("approve");
-    read_until_with_dsr(session, "explicit resume is required.", TURN_TIMEOUT);
-    assert_import_generation(guard, revision, 0);
-    session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("resume");
-    read_until_with_dsr(session, "\"replaced\": null", TURN_TIMEOUT);
-    assert_import_generation(guard, revision, 1);
-    (sg, decision_id)
-}
-
-fn later_input_and_exit(session: &mut TrackedSession) {
-    session.send("/help\r").expect("help after resume");
-    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
-    session.send("hi\r").expect("later message");
-    read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
-    session.send("/exit\r").expect("exit after resume");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat must exit after later input");
-}
-
-// A real grant-bound call whose tool failure leaves the pinned catalog intact.
-// This covers the same foreground completion path while allowing the following
-// model turn; successful catalog-changing imports are covered separately below.
-fn approve_and_resume_publish_failure() -> (HarnessGuard, SessionGuard, String) {
-    approve_and_resume_publish_failure_with_env(&[])
-}
-
-fn approve_and_resume_publish_failure_with_env(extra_env: &[(&str, &str)]) -> (HarnessGuard, SessionGuard, String) {
-    let (guard, _, _) = import_fixture();
-    approve_and_resume_publish_failure_with_env_on(guard, extra_env)
-}
-
-fn approve_and_resume_publish_failure_with_env_on(
-    guard: HarnessGuard,
-    extra_env: &[(&str, &str)],
-) -> (HarnessGuard, SessionGuard, String) {
-    let arguments =
-        serde_json::json!({"action": "lifecycle_publish", "proposal_id": format!("prop-{}", "0".repeat(32))});
-    let tool_call = format!("skills_manage:{arguments}");
-    let mut env = vec![
-        ("OPENPRX_MOCK_TOOL_CALL", tool_call.as_str()),
-        ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
-    ];
-    env.extend_from_slice(extra_env);
-    let mut sg = spawn_chat_in(&guard, &["--plain"], &env);
-    let session = sg.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    drain_with_dsr(session, Duration::from_millis(200));
-    session
-        .send(format!(
-            "Call the skills_manage tool with these arguments: {arguments}\r"
-        ))
-        .expect("request publish");
-    let pending = read_until_with_dsr(session, "The operation has not run.", TURN_TIMEOUT);
-    let captures = regex::Regex::new(r"Approval is required for decision ([0-9a-f-]{36})")
-        .expect("decision regex")
-        .captures(&pending)
-        .unwrap_or_else(|| panic!("missing pending approval: {pending}"));
-    let decision_id = captures[1].to_owned();
-    assert_publish_attempts(&guard, 0);
-    session
-        .send(format!("/approve --decision {decision_id}\r"))
-        .expect("approve publish");
-    read_until_with_dsr(session, "explicit resume is required.", TURN_TIMEOUT);
-    assert_publish_attempts(&guard, 0);
-    session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("resume publish");
-    read_until_with_dsr(session, "Approved operation could not be completed.", TURN_TIMEOUT);
-    assert_publish_attempts(&guard, 1);
-    (guard, sg, decision_id)
-}
-
-fn assert_publish_attempts(guard: &HarnessGuard, expected: usize) {
+fn receipts(guard: &HarnessGuard) -> Vec<serde_json::Value> {
     let db = rusqlite::Connection::open_with_flags(
         guard.workspace_dir.join("memory/brain.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
-    .expect("read owned fixture events");
+    .expect("test: owned event store");
     let mut query = db
-        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type = 'tool.execution.finalized'")
-        .expect("query tool execution receipts");
-    let receipts = query
+        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type='tool.execution.finalized' LIMIT 2")
+        .expect("test: tool receipts query");
+    query
         .query_map([], |row| row.get::<_, String>(0))
-        .expect("receipt rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read receipts");
+        .expect("test: receipt rows")
+        .map(|row| serde_json::from_str(&row.expect("test: receipt row")).expect("test: receipt JSON"))
+        .collect()
+}
+
+fn executed_receipts(guard: &HarnessGuard) -> usize {
+    receipts(guard)
+        .iter()
+        .filter(|row| row["outcome"]["status"] == "succeeded")
+        .count()
+}
+
+fn assert_exact_execution(guard: &HarnessGuard, arguments: &str, succeeded: bool) {
+    let rows = receipts(guard);
+    assert_eq!(rows.len(), 1, "one proposal executes exactly once");
+    let row = rows.first().expect("test: one execution receipt");
+    let arguments: serde_json::Value = serde_json::from_str(arguments).expect("test: proposed arguments");
+    let digest = hex::encode(Sha256::digest(arguments.to_string().as_bytes()));
     assert_eq!(
-        receipts.len(),
-        expected,
-        "approval must not execute; a consumed resume must not execute again"
+        row["reservation"]["input_sha256"], digest,
+        "execution uses the exact proposed argument digest"
     );
-    for receipt in receipts {
-        let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("execution receipt");
-        assert_eq!(receipt["outcome"]["descriptor"]["public_name"], "skills_manage");
-        assert_eq!(
-            receipt["outcome"]["status"], "failed",
-            "resume must reach tool execution"
-        );
-        assert_eq!(receipt["outcome"]["result"]["success"], false);
-        assert!(
-            receipt["outcome"]["result"]["error"]
-                .as_str()
-                .expect("tool error")
-                .contains("proposal")
-        );
-    }
-    let resolved: i64 = db
+    assert_eq!(row["outcome"]["descriptor"]["public_name"], "skills_manage");
+    assert_eq!(row["outcome"]["status"], if succeeded { "succeeded" } else { "failed" });
+    assert_eq!(row["outcome"]["result"]["success"], succeeded);
+}
+
+fn completed_decision(guard: &HarnessGuard) -> Option<String> {
+    let db = rusqlite::Connection::open_with_flags(
+        guard.workspace_dir.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let raw: String = db
         .query_row(
-            "SELECT count(*) FROM message_events WHERE event_type = 'approval.decision.resolved'",
+            "SELECT raw_payload_json FROM message_events WHERE event_type='turn.finalized' ORDER BY id DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
-        .expect("consumed grants");
-    assert_eq!(
-        resolved,
-        i64::try_from(expected).expect("receipt count"),
-        "one-use grant consumption must match the execution"
-    );
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("decision_id")?.as_str().map(str::to_owned)
 }
 
-#[test]
-#[serial(prx_chat_pty)]
-fn chat_resume_decision_processes_later_commands_and_messages() {
-    let (guard, mut sg, _decision_id) = approve_and_resume_publish_failure();
-    later_input_and_exit(sg.session());
-    assert_publish_attempts(&guard, 1);
+// Poll a durable semantic event while servicing terminal DSR; no timing guess
+// establishes completion. TrackedSession owns kill/reap on every failure path.
+fn wait_for_completion(guard: &HarnessGuard, session: &mut TrackedSession) -> (String, String) {
+    let deadline = std::time::Instant::now() + TURN_TIMEOUT;
+    let mut output = String::new();
+    let mut pending = String::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        if let Some(id) = completed_decision(guard) {
+            return (id, output);
+        }
+        match session.try_read(&mut buffer) {
+            Ok(0) => panic!("test: chat exited before durable completion: {output}"),
+            Ok(n) => {
+                ack_all_dsr_with_pending(session, &buffer[..n], &mut pending);
+                output.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                assert!(output.len() <= 2 * 1024 * 1024, "bounded PTY capture");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(error) => panic!("test: completion PTY read: {error}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "durable completion timeout: {output}"
+        );
+    }
 }
 
-#[test]
-#[serial(prx_chat_pty)]
-fn chat_resume_consumed_decision_in_same_chat_refuses_and_processes_later_input() {
-    let (guard, mut sg, decision_id) = approve_and_resume_publish_failure();
-    let session = sg.session();
+fn launch_call(guard: &HarnessGuard, arguments: &str, tui: bool, extra: &[(&str, &str)]) -> SessionGuard {
+    let tool = format!("skills_manage:{arguments}");
+    let mut env = vec![
+        ("OPENPRX_MOCK_TOOL_CALL", tool.as_str()),
+        ("OPENPRX_MOCK_RESPONSE", LATER_REPLY),
+    ];
+    env.extend_from_slice(extra);
+    if tui {
+        env.push(("PRX_TUI", "1"));
+    }
+    let mut process = spawn_chat_in(guard, if tui { &[] } else { &["--plain"] }, &env);
+    let session = process.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
     session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("resume consumed decision");
-    read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
-    later_input_and_exit(session);
-    assert_publish_attempts(&guard, 1);
+        .send(format!(
+            "Call the skills_manage tool with these arguments: {arguments}\r"
+        ))
+        .expect("test: propose actual import");
+    process
+}
+
+fn later_input_and_exit(session: &mut TrackedSession) {
+    session.send("/help\r").expect("test: help after tool turn");
+    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
+    session.send("hi\r").expect("test: later input");
+    read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
+    session.send("/exit\r").expect("test: exit");
+    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat exits after later input");
+}
+
+fn completed_publish(extra: &[(&str, &str)]) -> (HarnessGuard, SessionGuard, String, String) {
+    let (guard, _, _) = import_fixture();
+    let arguments =
+        serde_json::json!({"action":"lifecycle_publish", "proposal_id":format!("prop-{}", "0".repeat(32))}).to_string();
+    let mut process = launch_call(&guard, &arguments, false, extra);
+    let (id, output) = wait_for_completion(&guard, process.session());
+    assert!(!output.contains("Tool Approval"), "Full does not ask");
+    assert_exact_execution(&guard, &arguments, false);
+    (guard, process, id, arguments)
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_full_publish_failure_processes_later_input() {
+    let (guard, mut process, _, args) = completed_publish(&[]);
+    later_input_and_exit(process.session());
+    assert_exact_execution(&guard, &args, false);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_completed_operation_cannot_resume_in_same_chat() {
+    let (guard, mut process, id, args) = completed_publish(&[]);
+    process
+        .session()
+        .send(format!("/resume-decision {id}\r"))
+        .expect("test: reject removed resume authority");
+    read_until_with_dsr(process.session(), REFUSAL, TURN_TIMEOUT);
+    later_input_and_exit(process.session());
+    assert_exact_execution(&guard, &args, false);
 }
 
 fn wait_for_path(session: &mut TrackedSession, path: &std::path::Path, total: Duration) {
     let deadline = std::time::Instant::now() + total;
-    let mut buf = [0u8; 4096];
+    let mut buffer = [0u8; 4096];
     let mut pending = String::new();
-    loop {
-        if path.exists() {
-            return;
-        }
-        match session.try_read(&mut buf) {
-            Ok(0) => panic!("PTY hit EOF before {} appeared", path.display()),
-            Ok(n) => ack_all_dsr_with_pending(session, &buf[..n], &mut pending),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20));
+    while !path.exists() {
+        match session.try_read(&mut buffer) {
+            Ok(0) => panic!("test: EOF before semantic hold event"),
+            Ok(n) => ack_all_dsr_with_pending(session, &buffer[..n], &mut pending),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20))
             }
-            Err(e) => panic!("PTY read error before {}: {e}", path.display()),
+            Err(error) => panic!("test: held turn read: {error}"),
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timeout waiting for {} after {total:?}",
-            path.display()
-        );
+        assert!(std::time::Instant::now() < deadline, "held turn did not signal start");
     }
 }
 
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_queued_consumed_resume_releases_queue_and_processes_later_input() {
-    // Event hold, not a sleep: the mock keeps the busy turn open while
-    // `prx_busy_resume_hold` exists and writes `*.started` when it begins
-    // waiting. /queue is sent only after that file appears, so the resume is
-    // queued behind a turn that cannot finish early (FU-FLAKE-PTY-RESUME-HANG).
+fn chat_completed_operation_refusal_releases_queue() {
     let (guard, _, _) = import_fixture();
-    let hold_path = guard.workspace_dir.join("prx_busy_resume_hold");
-    let started_path = guard.workspace_dir.join("prx_busy_resume_hold.started");
-    std::fs::write(&hold_path, b"hold").expect("busy-turn hold file");
-    let hold_spec = format!("prx_busy_resume_turn={}", hold_path.display());
-    let (guard, mut sg, decision_id) =
-        approve_and_resume_publish_failure_with_env_on(guard, &[("OPENPRX_MOCK_HOLD_WHILE_FILE", &hold_spec)]);
-    let session = sg.session();
-    session.send("hi prx_busy_resume_turn\r").expect("start held turn");
-    wait_for_path(session, &started_path, TURN_TIMEOUT);
-    session.send("/queue\r").expect("inspect running turn");
+    let hold = guard.workspace_dir.join("prx_busy_resume_hold");
+    std::fs::write(&hold, b"hold").expect("test: semantic hold file");
+    let started = hold.with_extension("started");
+    let spec = format!("prx_busy_resume_turn={}", hold.display());
+    let args =
+        serde_json::json!({"action":"lifecycle_publish", "proposal_id":format!("prop-{}", "0".repeat(32))}).to_string();
+    let mut process = launch_call(&guard, &args, false, &[("OPENPRX_MOCK_HOLD_WHILE_FILE", &spec)]);
+    let (id, _) = wait_for_completion(&guard, process.session());
+    let session = process.session();
+    session
+        .send("hi prx_busy_resume_turn\r")
+        .expect("test: start held turn");
+    wait_for_path(session, &started, TURN_TIMEOUT);
+    session.send("/queue\r").expect("test: inspect busy queue");
     read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 1 running.", TURN_TIMEOUT);
     session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("queue consumed resume behind running turn");
-    session.send("/queue\r").expect("inspect queued resume");
-    // Prove the resume actually waited behind a running turn, rather than
-    // relying on a fixture delay to establish the interleaving.
+        .send(format!("/resume-decision {id}\r"))
+        .expect("test: queue refused request");
+    session.send("/queue\r").expect("test: inspect queued request");
     read_until_with_dsr(session, "Main queue: 1 queued (0 priority), 1 running.", TURN_TIMEOUT);
-    std::fs::remove_file(&hold_path).expect("release busy-turn hold");
+    std::fs::remove_file(&hold).expect("test: release held turn");
     read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
-    session.send("/queue\r").expect("inspect released queue");
+    session.send("/queue\r").expect("test: inspect released queue");
     read_until_with_dsr(session, "Main queue: 0 queued (0 priority), 0 running.", TURN_TIMEOUT);
     later_input_and_exit(session);
-    assert_publish_attempts(&guard, 1);
+    assert_exact_execution(&guard, &args, false);
+}
+
+fn full_import() -> (HarnessGuard, SessionGuard, String, String, String) {
+    let (guard, args, revision) = import_fixture();
+    let mut process = launch_call(&guard, &args, false, &[]);
+    let (id, output) = wait_for_completion(&guard, process.session());
+    assert!(!output.contains("Tool Approval"), "Full import has no forced Ask");
+    assert_import_generation(&guard, &revision, 1);
+    assert_exact_execution(&guard, &args, true);
+    (guard, process, id, args, revision)
 }
 
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_resume_consumed_decision_from_new_chat_refuses_and_processes_later_input() {
-    let (guard, arguments, revision) = import_fixture();
-    let (mut original, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
-    original.session().send("/exit\r").expect("exit original chat");
-    assert!(
-        wait_for_exit(original.session(), EXIT_TIMEOUT),
-        "original chat must exit"
-    );
+fn chat_completed_import_cannot_resume_from_new_chat() {
+    let (guard, mut original, id, args, revision) = full_import();
+    original.session().send("/exit\r").expect("test: exit original chat");
+    assert!(wait_for_exit(original.session(), EXIT_TIMEOUT));
     let mut fresh = spawn_chat_in(&guard, &["--plain"], &[("OPENPRX_MOCK_RESPONSE", LATER_REPLY)]);
-    let session = fresh.session();
-    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-    drain_with_dsr(session, Duration::from_millis(200));
-    session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("resume consumed decision");
-    read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
-    later_input_and_exit(session);
+    read_until_with_dsr(fresh.session(), "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(fresh.session(), Duration::from_millis(200));
+    fresh
+        .session()
+        .send(format!("/resume-decision {id}\r"))
+        .expect("test: reject completed cross-session replay");
+    read_until_with_dsr(fresh.session(), REFUSAL, TURN_TIMEOUT);
+    later_input_and_exit(fresh.session());
     assert_import_generation(&guard, &revision, 1);
+    assert_exact_execution(&guard, &args, true);
 }
 
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_import_resume_refreshes_catalog_for_later_input_in_the_same_chat() {
-    let (guard, arguments, revision) = import_fixture();
-    let (mut sg, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
-    let session = sg.session();
-    session.send("/help\r").expect("help after import resume");
-    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
-    session
-        .send(format!("/approval --decision {decision_id}\r"))
-        .expect("inspect after import resume");
-    // The consumed decision stays consumed. A later source turn gets a new
-    // catalog publication without restarting this chat or reusing the grant.
-    read_until_with_dsr(
-        session,
-        "No inspectable pending decision is available for this chat.",
-        TURN_TIMEOUT,
-    );
-    session.send("hi\r").expect("message after catalog-changing resume");
-    read_until_with_dsr(session, LATER_REPLY, TURN_TIMEOUT);
-    session.send("/exit\r").expect("exit after import resume");
-    assert!(
-        wait_for_exit(session, EXIT_TIMEOUT),
-        "chat must exit after import resume"
-    );
+fn chat_full_import_refreshes_catalog_for_later_input() {
+    let (guard, mut process, _, args, revision) = full_import();
+    later_input_and_exit(process.session());
     assert_import_generation(&guard, &revision, 1);
+    assert_exact_execution(&guard, &args, true);
 }
 
-/// Finalized, succeeded `skills_manage` execution receipts: the approved import.
-fn executed_receipts(guard: &HarnessGuard) -> usize {
-    let db = rusqlite::Connection::open_with_flags(
-        guard.workspace_dir.join("memory/brain.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("read owned fixture events");
-    let mut query = db
-        .prepare("SELECT raw_payload_json FROM message_events WHERE event_type = 'tool.execution.finalized'")
-        .expect("query tool execution receipts");
-    let receipts = query
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("receipt rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read receipts");
-    receipts
-        .iter()
-        .map(|receipt| serde_json::from_str::<serde_json::Value>(receipt).expect("execution receipt"))
-        .filter(|receipt| {
-            receipt["outcome"]["descriptor"]["public_name"] == "skills_manage"
-                && receipt["outcome"]["status"] == "succeeded"
-        })
-        .count()
+fn supervised_import(approved: bool) {
+    let (guard, args, revision) = import_fixture_at(openprx::security::AutonomyLevel::Supervised);
+    let mut process = launch_call(&guard, &args, true, &[]);
+    read_until_with_dsr(process.session(), "Tool Approval", TURN_TIMEOUT);
+    assert_import_generation(&guard, &revision, 0);
+    assert!(receipts(&guard).is_empty(), "review must precede execution");
+    process
+        .session()
+        .send(if approved { "y" } else { "n" })
+        .expect("test: actual interactive decision");
+    let (id, _) = wait_for_completion(&guard, process.session());
+    assert_import_generation(&guard, &revision, usize::from(approved));
+    if approved {
+        assert_exact_execution(&guard, &args, true);
+    } else {
+        assert_eq!(executed_receipts(&guard), 0, "denied call never executes");
+    }
+    process
+        .session()
+        .send(format!("/resume-decision {id}\r"))
+        .expect("test: no replay authority");
+    read_until_with_dsr(process.session(), REFUSAL, TURN_TIMEOUT);
+    later_input_and_exit(process.session());
+    assert_import_generation(&guard, &revision, usize::from(approved));
+    assert_eq!(executed_receipts(&guard), usize::from(approved));
 }
 
-// Finding 115.1: at supervised autonomy a named, grant-bound skills_manage call
-// is collected by the plain chat loop (the dispatcher stream path), recorded as
-// a pending approval, approved, and resumed into exactly one execution.
 #[test]
 #[serial(prx_chat_pty)]
-fn chat_supervised_named_import_collects_approves_and_resumes_once() {
-    let (guard, arguments, revision) = import_fixture_at(openprx::security::AutonomyLevel::Supervised);
-    let (mut sg, decision_id) = approve_and_resume_import(&guard, &arguments, &revision);
-    assert_eq!(executed_receipts(&guard), 1, "one approved call is one execution");
-    let session = sg.session();
-    session
-        .send(format!("/resume-decision {decision_id}\r"))
-        .expect("resume the consumed decision");
-    read_until_with_dsr(session, REFUSAL, TURN_TIMEOUT);
-    assert_eq!(executed_receipts(&guard), 1, "a consumed decision does not run again");
-    session.send("/help\r").expect("help after resume");
-    read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
-    session.send("/exit\r").expect("exit");
-    assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat must exit after resume");
-    assert_import_generation(&guard, &revision, 1);
+fn chat_supervised_import_approval_executes_exact_call_once() {
+    supervised_import(true);
 }
 
-// Finding 115.2: a turn-engine error on the dispatcher path is shown in chat
-// and the loop keeps accepting input. The provider fails during non-executing
-// argument collection. An ordinary reply with no call is now a valid decline.
+#[test]
+#[serial(prx_chat_pty)]
+fn chat_supervised_import_denial_never_executes() {
+    supervised_import(false);
+}
+
+// Provider failure remains visible and never executes an import.
 #[test]
 #[serial(prx_chat_pty)]
 fn chat_turn_engine_error_is_visible_and_chat_keeps_running() {
@@ -422,11 +378,11 @@ fn chat_turn_engine_error_is_visible_and_chat_keeps_running() {
         .send(format!(
             "Call the skills_manage tool with these arguments: {arguments}\r"
         ))
-        .expect("request import");
+        .expect("test: request import");
     read_until_with_dsr(session, "Error: ", TURN_TIMEOUT);
-    session.send("/help\r").expect("help after a failed turn");
+    session.send("/help\r").expect("test: help after a failed turn");
     read_until_with_dsr(session, "Available commands:", TURN_TIMEOUT);
-    session.send("/exit\r").expect("exit");
+    session.send("/exit\r").expect("test: exit");
     assert!(
         wait_for_exit(session, EXIT_TIMEOUT),
         "chat must exit after a failed turn"

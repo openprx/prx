@@ -814,7 +814,7 @@ fn mutation_proof_embedded_input_guard() {
     let path = "src/agent/embedded_turn.rs";
     let scanner = embedded_user_input_cannot_bypass_reserved_marker_neutralization;
     assert!(!scanner_fails_with(scanner, Vec::new()));
-    let source = fs::read_to_string(repository_root().join(path)).expect("read actual mutation source");
+    let source = fs::read_to_string(repository_root().join(path)).expect("test: read actual mutation source");
     let needle = "crate::agent::turn_contracts::inbound_user_message(input)";
     let replacement = "ChatMessage::user(input)";
     assert!(source.contains(needle), "reviewed mutation site disappeared: {path}");

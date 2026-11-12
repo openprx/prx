@@ -79,7 +79,7 @@ async fn default_config_skill_solver_reads_its_instruction_file() -> Result<()> 
                     })
                 })
             })
-            .expect("the solver request must reach the serving model");
+            .expect("test: the solver request must reach the serving model");
         assert!(
             solver["tools"].as_array().is_some_and(|tools| tools
                 .iter()

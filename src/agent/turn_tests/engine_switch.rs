@@ -386,7 +386,7 @@ impl Provider for CollectIgnoreProvider {
 /// Re-inserting a Collect match at `run_turn` start fails this cell.
 #[tokio::test]
 async fn run_turn_ignores_recorded_collect_directive() {
-    let workspace = tempfile::tempdir().expect("collect-ignore workspace");
+    let workspace = tempfile::tempdir().expect("test: collect-ignore workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     assert!(
@@ -403,7 +403,7 @@ async fn run_turn_ignores_recorded_collect_directive() {
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .expect("disabled engine opens a turn context");
+        .expect("test: disabled engine opens a turn context");
     let cap =
         context
             .execution_refs()
@@ -416,12 +416,12 @@ async fn run_turn_ignores_recorded_collect_directive() {
                     "test",
                     "probe",
                 )
-                .expect("test capability id"),
+                .expect("test: test capability id"),
                 fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
                 generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
             });
     Arc::get_mut(&mut context)
-        .expect("opened context is uniquely owned")
+        .expect("test: opened context is uniquely owned")
         .install_collect_directive_for_test(
             crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
                 cap,
@@ -481,7 +481,7 @@ async fn run_turn_ignores_recorded_collect_directive() {
         },
     )
     .await
-    .expect("run_turn ignores a recorded Collect directive");
+    .expect("test: run_turn ignores a recorded Collect directive");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -529,7 +529,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
     use crate::tools::sessions_spawn::SessionsSpawnTool;
     use std::collections::BTreeMap;
 
-    let workspace = tempfile::tempdir().expect("child-stamp workspace");
+    let workspace = tempfile::tempdir().expect("test: child-stamp workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
@@ -542,7 +542,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         workspace.path(),
     ));
     let memory: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("child-stamp memory"));
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: child-stamp memory"));
     let spawn = SessionsSpawnTool::new(
         Arc::new(SpawnFixtureChannel),
         "ollama",
@@ -570,22 +570,22 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
     let selected = decision
         .service
         .agent_execution_specs(decision.proof, decision.context)
-        .expect("parent selected sessions_spawn");
+        .expect("test: parent selected sessions_spawn");
     let incoming = admitted.adapter().tool_execution_context;
     let (_, parent_bound) = decision
         .service
         .bind_agent_execution_with_runtime(decision.proof, decision.context, &incoming, &selected.specs, None)
-        .expect("parent bind stamps an outgoing grant");
+        .expect("test: parent bind stamps an outgoing grant");
     let grant = parent_bound
         .child_grant
         .clone()
-        .expect("parent bind stamps an outgoing grant");
+        .expect("test: parent bind stamps an outgoing grant");
     let recursive = grant
         .for_spawn_request(true, "ollama", "prx-local-model")
-        .expect("recursive child retains sessions_spawn");
+        .expect("test: recursive child retains sessions_spawn");
     let credential = crate::providers::selection::credential_for(&recursive.generation().effective, "ollama");
     let binding = ChildProviderBinding::build(Arc::clone(&recursive), "ollama", "prx-local-model", credential)
-        .expect("child provider binding");
+        .expect("test: child provider binding");
     let provider = binding.provider();
     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
@@ -594,7 +594,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         .with_run_id("prx_child_stamp_task");
     recursive
         .bind_event_scope(&mut task_scope)
-        .expect("grant binds the child event scope");
+        .expect("test: grant binds the child event scope");
     let receipt = crate::runtime::child_source::record_child_input(
         &fabric,
         task_scope,
@@ -604,14 +604,14 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         Some(recursive.as_ref()),
     )
     .await
-    .expect("record child input")
-    .expect("durable child input receipt");
+    .expect("test: record child input")
+    .expect("test: durable child input receipt");
     let child_proof = binding
         .source_proof(recursive.as_ref(), &receipt, &provider)
-        .expect("child source proof");
+        .expect("test: child source proof");
     let mut child_execution_context = receipt
         .execution_context(&child_proof)
-        .expect("child execution context");
+        .expect("test: child execution context");
     child_execution_context.child_pin = None;
     let child_spawn = SessionsSpawnTool::new(
         Arc::new(SpawnFixtureChannel),
@@ -684,7 +684,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         },
     )
     .await
-    .expect("child worker service");
+    .expect("test: child worker service");
     let child_context = child_service
         .decide_agent_initial(
             &child_proof,
@@ -692,10 +692,10 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .expect("child turn admission");
+        .expect("test: child turn admission");
     let child_specs = child_service
         .agent_execution_specs(&child_proof, &child_context)
-        .expect("child execution specs");
+        .expect("test: child execution specs");
     let (execution, bound) = child_service
         .bind_agent_execution_with_runtime(
             &child_proof,
@@ -704,7 +704,7 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
             &child_specs.specs,
             None,
         )
-        .expect("child bind stamps scope, pin and grant");
+        .expect("test: child bind stamps scope, pin and grant");
     assert!(bound.child_scope.is_some());
     assert!(bound.child_pin.is_some());
     assert!(bound.child_grant.is_some());
@@ -755,7 +755,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
     use crate::tools::sessions_spawn::SessionsSpawnTool;
     use std::collections::BTreeMap;
 
-    let workspace = tempfile::tempdir().expect("segment-admit workspace");
+    let workspace = tempfile::tempdir().expect("test: segment-admit workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
@@ -768,7 +768,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
         workspace.path(),
     ));
     let memory: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("segment-admit memory"));
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: segment-admit memory"));
     let spawn = SessionsSpawnTool::new(
         Arc::new(SpawnFixtureChannel),
         "ollama",
@@ -796,22 +796,22 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
     let selected = decision
         .service
         .agent_execution_specs(decision.proof, decision.context)
-        .expect("parent selected sessions_spawn");
+        .expect("test: parent selected sessions_spawn");
     let incoming = admitted.adapter().tool_execution_context;
     let (_, parent_bound) = decision
         .service
         .bind_agent_execution_with_runtime(decision.proof, decision.context, &incoming, &selected.specs, None)
-        .expect("parent bind stamps an outgoing grant");
+        .expect("test: parent bind stamps an outgoing grant");
     let grant = parent_bound
         .child_grant
         .clone()
-        .expect("parent bind stamps an outgoing grant");
+        .expect("test: parent bind stamps an outgoing grant");
     let recursive = grant
         .for_spawn_request(true, "ollama", "prx-local-model")
-        .expect("recursive child retains sessions_spawn");
+        .expect("test: recursive child retains sessions_spawn");
     let credential = crate::providers::selection::credential_for(&recursive.generation().effective, "ollama");
     let binding = ChildProviderBinding::build(Arc::clone(&recursive), "ollama", "prx-local-model", credential)
-        .expect("child provider binding");
+        .expect("test: child provider binding");
     let provider = binding.provider();
     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
@@ -820,7 +820,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
         .with_run_id("prx_child_segment_task");
     recursive
         .bind_event_scope(&mut task_scope)
-        .expect("grant binds the child event scope");
+        .expect("test: grant binds the child event scope");
     let receipt = crate::runtime::child_source::record_child_input(
         &fabric,
         task_scope,
@@ -830,16 +830,16 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
         Some(recursive.as_ref()),
     )
     .await
-    .expect("record child input")
-    .expect("durable child input receipt");
+    .expect("test: record child input")
+    .expect("test: durable child input receipt");
     let child_proof = Arc::new(
         binding
             .source_proof(recursive.as_ref(), &receipt, &provider)
-            .expect("child source proof"),
+            .expect("test: child source proof"),
     );
     let child_execution_context = receipt
         .execution_context(child_proof.as_ref())
-        .expect("child execution context");
+        .expect("test: child execution context");
     let child_spawn = SessionsSpawnTool::new(
         Arc::new(SpawnFixtureChannel),
         "ollama",
@@ -911,7 +911,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
         },
     )
     .await
-    .expect("child worker service");
+    .expect("test: child worker service");
     let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     owner.retain_service(Arc::clone(&child_service));
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -925,7 +925,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
         None,
     )
     .await
-    .expect("ungated child segment admits");
+    .expect("test: ungated child segment admits");
     AdmittedBoundChild {
         turn,
         service: child_service,
@@ -938,7 +938,7 @@ pub(crate) async fn admit_bound_child_segment() -> AdmittedBoundChild {
 /// `capability_search` and then dispatched.
 #[tokio::test]
 async fn default_config_discovered_tool_is_published_then_dispatched() {
-    let workspace = tempfile::tempdir().expect("discovered-tool workspace");
+    let workspace = tempfile::tempdir().expect("test: discovered-tool workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     assert!(
@@ -962,7 +962,7 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
-        .expect("disabled engine opens a turn context");
+        .expect("test: disabled engine opens a turn context");
     let opened = TurnDecision {
         service: decision.service,
         context: &context,
@@ -1039,18 +1039,18 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
         },
     )
     .await
-    .expect("discovered-tool turn completes");
+    .expect("test: discovered-tool turn completes");
     assert!(
         published
             .lock()
-            .expect("published tools")
+            .expect("test: published tools")
             .iter()
             .any(|name| name == "discovered_probe"),
         "discovered tool must be published after search: {:?}",
-        published.lock().expect("published tools")
+        published.lock().expect("test: published tools")
     );
     assert_eq!(
-        *dispatches.lock().expect("dispatch log"),
+        *dispatches.lock().expect("test: dispatch log"),
         vec!["discovered_probe".to_owned()],
         "discovered tool must be dispatched"
     );
@@ -1097,7 +1097,7 @@ fn engine_off_config(workspace: &std::path::Path) -> crate::config::Config {
 async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::config::Config) {
     config.workspace_dir = workspace.to_owned();
     let memory: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace).expect("agent sqlite"));
+        Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: agent sqlite"));
     let provider = EngineOffProvider {
         published: Arc::new(Mutex::new(Vec::new())),
         responses: Mutex::new(
@@ -1118,7 +1118,7 @@ async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::confi
         .observer(Arc::new(crate::observability::NoopObserver))
         .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
         .build()
-        .expect("agent entry");
+        .expect("test: agent entry");
     let _ = agent.turn("hello").await;
 }
 
@@ -1135,37 +1135,37 @@ async fn disabled_engine_constructs_nothing() {
     }
 
     {
-        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let workspace = tempfile::tempdir().expect("test: engine-off workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         drive_agent_entry(workspace.path(), engine_off_config(workspace.path())).await;
         assert_cell("agent", workspace.path(), &spy);
     }
     {
-        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let workspace = tempfile::tempdir().expect("test: engine-off workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         crate::chat::dispatcher::drive_disabled_engine_chat_entry(workspace.path()).await;
         assert_cell("chat", workspace.path(), &spy);
     }
     {
-        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let workspace = tempfile::tempdir().expect("test: engine-off workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         crate::channels::drive_disabled_engine_channel_entry(workspace.path()).await;
         assert_cell("channel", workspace.path(), &spy);
     }
     {
-        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let workspace = tempfile::tempdir().expect("test: engine-off workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         crate::gateway::drive_disabled_engine_webhook_entry(workspace.path()).await;
         assert_cell("gateway", workspace.path(), &spy);
     }
     {
-        let workspace = tempfile::tempdir().expect("engine-off workspace");
+        let workspace = tempfile::tempdir().expect("test: engine-off workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         crate::gateway::drive_disabled_engine_console_entry(workspace.path()).await;
         assert_cell("console", workspace.path(), &spy);
     }
 
-    let workspace = tempfile::tempdir().expect("remote-keys workspace");
+    let workspace = tempfile::tempdir().expect("test: remote-keys workspace");
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let mut config = engine_off_config(workspace.path());
     config.causal_tree.enabled = true;
@@ -1182,7 +1182,7 @@ async fn disabled_engine_constructs_nothing() {
             "model": "decision-model",
             "operations": ["decision_endpoint"],
         }))
-        .expect("decision model declaration"),
+        .expect("test: decision model declaration"),
     );
     drive_agent_entry(workspace.path(), config).await;
     spy.assert_constructs_nothing("causal_tree remote keys");
@@ -1198,12 +1198,12 @@ async fn disabled_engine_constructs_nothing() {
 #[tokio::test]
 async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
     async fn published_tools(enabled: bool) -> (Vec<String>, Vec<String>) {
-        let workspace = tempfile::tempdir().expect("brief workspace");
+        let workspace = tempfile::tempdir().expect("test: brief workspace");
         let mut config = engine_off_config(workspace.path());
         config.decision_engine.enabled = enabled;
         config.tool_tiering.always_include.push("project_tool".into());
         let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("brief sqlite"));
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: brief sqlite"));
         let published = Arc::new(Mutex::new(Vec::new()));
         let systems = Arc::new(Mutex::new(Vec::new()));
         struct BriefProvider {
@@ -1222,13 +1222,13 @@ async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
                 anyhow::bail!("fixture requires a structured request")
             }
             async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-                *self.published.lock().expect("published") = request
+                *self.published.lock().expect("test: published") = request
                     .tools
                     .unwrap_or(&[])
                     .iter()
                     .map(|spec| spec.name.clone())
                     .collect();
-                *self.systems.lock().expect("systems") = request
+                *self.systems.lock().expect("test: systems") = request
                     .messages
                     .iter()
                     .filter(|message| message.role == "system")
@@ -1256,11 +1256,11 @@ async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
             .observer(Arc::new(crate::observability::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
             .build()
-            .expect("brief agent");
+            .expect("test: brief agent");
         let _ = agent.turn("hello").await;
         (
-            published.lock().expect("published").clone(),
-            systems.lock().expect("systems").clone(),
+            published.lock().expect("test: published").clone(),
+            systems.lock().expect("test: systems").clone(),
         )
     }
     let (disabled_tools, disabled_systems) = published_tools(false).await;

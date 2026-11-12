@@ -179,9 +179,6 @@ pub(crate) fn admit_provider_send(
             crate::llm::route_decision::UsagePrice::Missing
         ) && !crate::cost::estimate::zero_price_exempt(&limits.model)
         {
-            if let Some(warning) = crate::providers::selection::pricing_warning(&limits.model, &cost) {
-                tracing::warn!("{warning}");
-            }
             crate::causal_tree::refusal::unpriced_reason(limits.model.provider_label(), limits.model.model())
         } else {
             RefusalReason::Budget

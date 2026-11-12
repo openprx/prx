@@ -14,23 +14,29 @@ async fn t31_approval_router_register_and_resolve_basic() {
     assert!(!router.resolve("call-1", false), "second resolve must miss");
 }
 
-/// The default causal plane turns an approval-required model call into a
-/// durable pending decision. Chat may continue the provider loop with that
-/// result, but it must not ask the legacy same-turn router for authority or
-/// start the backend. Review and execution happen later through the
-/// explicit decision approval and resume commands.
 #[tokio::test]
-async fn t31_driver_default_causal_approval_persists_without_backend_execution() {
+async fn supervised_chat_denial_never_executes_the_recorded_call() {
+    interactive_exact_call(false).await;
+}
+
+#[tokio::test]
+async fn supervised_chat_approval_executes_the_recorded_call_exactly_once() {
+    interactive_exact_call(true).await;
+}
+
+async fn interactive_exact_call(approved: bool) {
     use crate::providers::traits::{
         ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions, StreamResult,
         ToolCallChunk,
     };
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream, StreamExt};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct PendingShell {
-        executed: Arc<AtomicBool>,
+        executed: Arc<AtomicUsize>,
+        arguments: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
     }
 
     #[async_trait]
@@ -44,14 +50,16 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
+            serde_json::json!({"type":"object", "properties":{"command":{"type":"string"}},
+                "required":["command"], "additionalProperties":false})
         }
 
-        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
-            self.executed.store(true, AtomicOrdering::SeqCst);
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.executed.fetch_add(1, AtomicOrdering::SeqCst);
+            self.arguments.lock().push(args);
             Ok(crate::tools::ToolResult {
                 success: true,
-                output: "unexpected execution".into(),
+                output: "exact call executed".into(),
                 error: None,
             })
         }
@@ -99,7 +107,7 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
                 .boxed()
             } else {
                 stream::iter(vec![
-                    Ok(StreamChunk::delta("approval pending")),
+                    Ok(StreamChunk::delta("interactive approval complete")),
                     Ok(StreamChunk::final_chunk()),
                 ])
                 .boxed()
@@ -111,7 +119,8 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
         }
     }
 
-    let executed = Arc::new(AtomicBool::new(false));
+    let executed = Arc::new(AtomicUsize::new(0));
+    let arguments = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
     let shutdown = CancellationToken::new();
     let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
@@ -120,12 +129,14 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
     });
     deps.tools_registry = Some(Arc::new(vec![Box::new(PendingShell {
         executed: Arc::clone(&executed),
+        arguments: Arc::clone(&arguments),
     }) as Box<dyn crate::tools::Tool>]));
     deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
     let (binding, cleanup) =
         admit_owned_start_turn_fixture(&deps, "draft-pending-approval", "stream the fixture reply", true)
             .await
             .expect("Q42 genuine admission prerequisite");
+    let router = Arc::clone(&deps.approval_router);
     let executor = EffectExecutor::new_with_deps(deps);
     executor
         .execute(Effect::StartTurn {
@@ -143,50 +154,60 @@ async fn t31_driver_default_causal_approval_persists_without_backend_execution()
         })
         .await;
 
-    let mut saw_pending = false;
+    let mut reviewed = None;
     let mut saw_completion = false;
     for _ in 0..32 {
         let action = tokio::time::timeout(Duration::from_secs(3), action_rx.recv())
             .await
-            .expect("action within 3s")
-            .expect("must arrive");
+            .expect("test: interactive action within bound")
+            .expect("test: action channel remains open");
         match action {
-            Action::ToolApprovalRequested { .. } => {
-                panic!("default causal approval must not use same-turn router authority")
-            }
-            Action::ToolStarted { .. } => panic!("pending approval must not start the backend"),
-            Action::ToolFinished {
-                success, name, result, ..
+            Action::ToolApprovalRequested {
+                name, tool_id, args, ..
             } => {
                 assert_eq!(name, "shell");
-                assert!(!success, "pending approval is not an executed tool success");
-                let result = result.expect("pending approval result");
+                assert_eq!(executed.load(AtomicOrdering::SeqCst), 0, "review precedes execution");
+                let recorded: serde_json::Value = serde_json::from_str(&args).expect("test: reviewed arguments");
+                assert_eq!(recorded, serde_json::json!({"command":"echo pending"}));
+                reviewed = Some(Sha256::digest(recorded.to_string().as_bytes()));
                 assert!(
-                    result.contains("Approval is required for decision"),
-                    "result={result:?}"
+                    router.resolve(&tool_id, approved),
+                    "resolve the actual execution-owned request"
                 );
-                assert!(result.contains("operation has not run"), "result={result:?}");
-                saw_pending = true;
+                assert!(
+                    !router.resolve(&tool_id, true),
+                    "a repeated approval cannot execute again"
+                );
             }
-            Action::StreamCompleted { final_text, .. } => {
-                assert!(
-                    final_text.contains("Approval is required for decision")
-                        && final_text.contains("operation has not run"),
-                    "final_text={final_text:?}"
-                );
+            Action::ToolStarted { .. } => assert!(approved && reviewed.is_some()),
+            Action::ToolFinished { success, name, .. } => {
+                assert_eq!(name, "shell");
+                assert_eq!(success, approved);
+            }
+            Action::StreamCompleted { .. } => {
                 saw_completion = true;
                 break;
             }
-            Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+            Action::StreamFailed { err, .. } => panic!("test: interactive turn failed: {err}"),
             _ => {}
         }
     }
-    assert!(saw_pending, "Chat must publish the durable pending decision result");
-    assert!(
-        saw_completion,
-        "Chat must finish after reporting the pending decision to the provider"
-    );
-    assert!(!executed.load(AtomicOrdering::SeqCst), "unapproved tool backend ran");
+    assert!(saw_completion, "interactive turn completes");
+    let reviewed = reviewed.expect("test: actual call was reviewed");
+    assert_eq!(executed.load(AtomicOrdering::SeqCst), usize::from(approved));
+    {
+        let calls = arguments.lock();
+        assert_eq!(calls.len(), usize::from(approved));
+        if approved {
+            let actual = calls.first().expect("test: one backend call");
+            let business = serde_json::json!({"command": actual.get("command").expect("test: executed command")});
+            assert_eq!(
+                Sha256::digest(business.to_string().as_bytes()),
+                reviewed,
+                "backend executes the exact reviewed argument digest"
+            );
+        }
+    }
     finish_owned_start_turn_fixture(cleanup).await;
 }
 

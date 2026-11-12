@@ -134,22 +134,23 @@ fn unpriced_single_shot_prints_reason_and_exits_two() {
         workspace.join("memory/brain.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
-    .expect("read actual refused-turn store");
+    .expect("test: read actual refused-turn store");
     let markers = database
         .prepare("SELECT raw_payload_json FROM message_events WHERE event_type='turn.finalized'")
-        .expect("terminal marker query")
+        .expect("test: terminal marker query")
         .query_map([], |row| row.get::<_, String>(0))
-        .expect("terminal markers")
+        .expect("test: terminal markers")
         .collect::<Result<Vec<_>, _>>()
-        .expect("durable terminal payloads");
+        .expect("test: durable terminal payloads");
     assert_eq!(markers.len(), 1, "one real terminal for the refused send");
-    let payload: serde_json::Value = serde_json::from_str(markers.first().expect("one marker")).expect("terminal JSON");
+    let payload: serde_json::Value =
+        serde_json::from_str(markers.first().expect("test: one marker")).expect("test: terminal JSON");
     if let Some(outcome) = payload.get("provider_outcome").filter(|value| !value.is_null()) {
         assert!(
             outcome
                 .get("attempts")
                 .and_then(serde_json::Value::as_array)
-                .expect("reported provider attempts")
+                .expect("test: reported provider attempts")
                 .is_empty(),
             "a pre-send refusal cannot fabricate a provider attempt",
         );

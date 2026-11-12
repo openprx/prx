@@ -44,7 +44,7 @@ async fn resume_context_carries_budget() {
         &crate::tools::capability::catalog::CatalogSources::default(),
         &publication_policy,
     )
-    .expect("catalog");
+    .expect("test: catalog");
     let tiering = crate::config::ToolTieringConfig::default();
     let security = crate::security::SecurityPolicy::default();
     let service = crate::tools::ToolExecutionService::from_boxed(

@@ -304,7 +304,12 @@ async fn small_native_schema_fixture(excluded: bool) {
                         .is_empty()
                 );
                 assert!(decision.context.execution_refs().is_empty());
-                assert!(decision.context.is_run().unwrap());
+                assert!(
+                    decision
+                        .context
+                        .is_run()
+                        .expect("test: small_native_schema_fixture fixture operation")
+                );
             } else {
                 let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
                     "selection":format!("{:?}", hop.selection),
@@ -518,7 +523,7 @@ async fn configured_small_native_schema_fixture() {
                         crate::causal_tree::logical_clock::ManualClock::new(),
                         crate::agent::turn_tests::admission::AdmittedTurn::configured_native_schema(
                             admission_config,
-                            &history.last().expect("current fixture input").content,
+                            &history.last().expect("test: current fixture input").content,
                             Arc::clone(&tools_registry),
                             Arc::clone(&memory),
                             &endpoint,
@@ -527,7 +532,7 @@ async fn configured_small_native_schema_fixture() {
                     ),
                 )
                 .await
-                .expect("native schema admission must complete real I/O");
+                .expect("test: native schema admission must complete real I/O");
                 let decision = admission.decision();
                 if excluded {
                     assert!(
@@ -536,7 +541,12 @@ async fn configured_small_native_schema_fixture() {
                             .agent_execution_specs(decision.proof, decision.context)
                             .is_err()
                     );
-                    assert!(!decision.context.is_run().unwrap());
+                    assert!(
+                        !decision
+                            .context
+                            .is_run()
+                            .expect("test: configured_small_native_schema_fixture fixture operation")
+                    );
                 } else {
                     let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
                     "selection":format!("{:?}", hop.selection),
@@ -2525,7 +2535,7 @@ async fn assessment_send_over_budget_is_refused_before_provider() {
         }
     }
 
-    let workspace = TempDir::new().expect("assessment budget workspace");
+    let workspace = TempDir::new().expect("test: assessment budget workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
     let sends = Arc::new(AtomicUsize::new(0));

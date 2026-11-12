@@ -1627,7 +1627,7 @@ mod tests {
         });
         let request = [ChatMessage::user("Call prx_fixture_tool")];
         let unrelated = [ChatMessage::user("hi")];
-        let only_other = std::slice::from_ref(offered.first().expect("other tool"));
+        let only_other = std::slice::from_ref(offered.first().expect("test: other tool"));
         let absent = provider
             .chat(
                 ChatRequest {
@@ -1665,12 +1665,12 @@ mod tests {
             .await?;
         assert_eq!(proposed.tool_calls.len(), 1);
         assert_eq!(
-            proposed.tool_calls.first().expect("one proposal").name,
+            proposed.tool_calls.first().expect("test: one proposal").name,
             "prx_fixture_tool"
         );
         let assessment = [
             ChatMessage::system("Classify the execution requirement of current_request"),
-            request.first().expect("request").clone(),
+            request.first().expect("test: request").clone(),
         ];
         let assessed = provider
             .chat(

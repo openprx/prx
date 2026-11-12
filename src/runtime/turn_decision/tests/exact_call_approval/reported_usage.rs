@@ -165,7 +165,10 @@ async fn exercise_owned(f: &Fixture<'_>) {
                 events: None,
                 stream_provider: false,
                 tool_execution_service: None,
-                tool_execution_context: ToolExecutionContext::new(f.envelope.clone(), f.proof.policy_chat_type()),
+                // This fixture explicitly exercises the execution ledger;
+                // ordinary chat preserves its interactive ingress strategy.
+                tool_execution_context: ToolExecutionContext::new(f.envelope.clone(), f.proof.policy_chat_type())
+                    .with_approval_ledger(f.service.execution_approval_ledger()),
                 allowed_tool_names: None,
             }),
             memory: ToolLoopMemory::new(f.memory, &f.config.workspace_dir, None),

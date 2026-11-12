@@ -662,14 +662,14 @@ pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::P
             "operations": ["chat"],
             "native_tools": true,
         }))
-        .expect("webhook model declaration"),
+        .expect("test: webhook model declaration"),
     );
     let mut state = AppState {
         config: crate::config::new_shared(config),
         provider,
         model: "test-model".into(),
         temperature: 0.0,
-        mem: Arc::new(SqliteMemory::new(workspace).expect("webhook sqlite")),
+        mem: Arc::new(SqliteMemory::new(workspace).expect("test: webhook sqlite")),
         auto_save: false,
         tools_registry: Arc::new(vec![]),
         mcp_tool: None,

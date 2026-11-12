@@ -30,7 +30,7 @@ impl Tool for CountedNativeReload {
 }
 
 #[tokio::test]
-async fn native_discovery_approval_retains_reported_usage_in_normal_terminal() {
+async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_terminal() {
     let _keyring = crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let workspace = tempfile::tempdir().unwrap();
     let tool_name = "config_reload";
@@ -194,12 +194,21 @@ async fn native_discovery_approval_retains_reported_usage_in_normal_terminal() {
             cleanup_confirmed: &owned_cleanup_confirmed,
         }))
         .await;
-        assert!(
-            service
-                .inspect_pending_decision_approval(proof.owner_id(), proof.session_key(), context.decision_id())
-                .await
-                .is_ok()
-        );
+        let ledger = service
+            .execution_approval_ledger()
+            .expect("test: durable execution ledger");
+        let keyring = crate::acl::approval_grant::WitnessKeyring::global().expect("test: execution keyring");
+        let port = crate::security::approval_ledger::run_call::ApprovalLedgerPort {
+            memory: &ledger.memory,
+            state_key: &ledger.state_key,
+            workspace: &ledger.workspace,
+            keyring,
+        };
+        let pending = port
+            .list_pending_calls(proof.owner_id(), 0, 10)
+            .await
+            .expect("test: execution-owned pending call");
+        assert_eq!(pending.items.len(), 1, "one exact call waits without execution");
         assert_eq!(
             dispatches.load(Ordering::SeqCst),
             0,

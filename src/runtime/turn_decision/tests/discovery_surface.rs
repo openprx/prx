@@ -569,35 +569,13 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                         .iter()
                         .any(|code| code.as_str() == "intercepts_writes")
                 );
-                // The control remains reachable for eligible read tools. Plan
-                // still excludes skill execution from its discovery offers.
+                // Plan intercepts the only deferred peer in this fixture.
+                // The admitted core read remains available without search.
                 assert!(
                     service
                         .agent_capability_search_spec(&proof, &context)
-                        .unwrap()
-                        .is_some()
-                );
-                let port = service.capability_search_port(&proof, &context).unwrap();
-                let result = with_search_authority(
-                    Some(port),
-                    CapabilitySearchTool.execute(serde_json::json!({"query":"skills_list","limit":4})),
-                )
-                .await
-                .unwrap();
-                assert!(result.success);
-                let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-                assert!(
-                    !output
-                        .get("hits")
-                        .and_then(serde_json::Value::as_array)
-                        .unwrap()
-                        .iter()
-                        .any(|hit| {
-                            hit.get("schema")
-                                .and_then(|schema| schema.get("name"))
-                                .and_then(serde_json::Value::as_str)
-                                == Some("skills_list")
-                        })
+                        .expect("test: Plan search exposure")
+                        .is_none()
                 );
                 assert!(
                     service
