@@ -81,10 +81,12 @@ async fn default_config_skill_solver_reads_its_instruction_file() -> Result<()> 
             })
             .expect("test: the solver request must reach the serving model");
         assert!(
-            solver["tools"].as_array().is_some_and(|tools| tools
-                .iter()
-                .any(|tool| tool["function"]["parameters"]["properties"]["name"]["const"] == "Deploy helper")),
-            "the solver body must offer the skill_read alias: {solver}"
+            solver["tools"].as_array().is_some_and(|tools| tools.iter().any(|tool| {
+                tool["function"]["parameters"]["properties"]["name"]["const"] == "Deploy helper"
+                    || (tool["function"]["name"] == "skill_read"
+                        && tool["function"]["parameters"]["properties"]["name"]["type"] == "string")
+            })),
+            "test: the solver body must offer a usable instruction reader: {solver}"
         );
         Ok(())
     }

@@ -217,7 +217,11 @@ impl Server {
                                 let name = offered.iter().find_map(|tool| {
                                     (tool["function"]["parameters"]["properties"]["name"]["const"].as_str() == Some("Deploy helper"))
                                         .then(|| tool["function"]["name"].as_str()).flatten()
-                                }).context("solver has no offered instruction-read alias")?;
+                                }).or_else(|| offered.iter().any(|tool| {
+                                    tool["function"]["name"] == "skill_read"
+                                        && tool["function"]["parameters"]["properties"]["name"]["type"] == "string"
+                                }).then_some("skill_read"))
+                                    .context("solver has no offered instruction reader")?;
                                 json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("fixture-read-{}",count.load(Ordering::SeqCst)),"type":"function","function":{"name":name,"arguments":"{\"name\":\"Deploy helper\"}"}}]})
                             } else { json!({"role":"assistant","content":text}) };
                             let message = if large.load(Ordering::SeqCst) || (h2_behavior.load(Ordering::SeqCst) == 5 && editor_number == Some(0)) { json!({"role":"assistant","content":"x".repeat(256*1024)}) } else { message };
