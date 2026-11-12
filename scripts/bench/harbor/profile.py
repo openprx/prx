@@ -72,12 +72,15 @@ def check(path):
     return config
 
 
-def render(out, model_name, api_key, prices, provider_override=None):
+def render(out, model_name, api_key, prices, provider_override=None, api_url=None):
     provider, model = identity(model_name, provider_override)
     if set(prices) != set(PRICES):
         raise ValueError("all four prices are required")
     q = json.dumps
     text = f"default_provider = {q(provider)}\ndefault_model = {q(model)}\napi_key = {q(api_key)}\n"
+    if api_url is not None:
+        # Endpoint override for a built-in provider; its name and catalog entry stay.
+        text += f"api_url = {q(api_url)}\n"
     text += read_bounded(Path(__file__).with_name("prx_bench_profile.toml")).decode()
     text += f"\n[cost.prices.{q(provider + '/' + model)}]\n"
     text += "".join(f"{key} = {float(prices[key])}\n" for key in PRICES)

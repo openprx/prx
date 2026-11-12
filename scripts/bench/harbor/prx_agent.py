@@ -1,10 +1,12 @@
 """Harbor 0.25.0 installed-agent adapter; all accounting lives in record.py.
 
-The provider key never enters the task container. For a `custom:https://`
-provider the adapter runs key_proxy.KeyProxy on the host for one trial and the
-container profile holds the proxy URL plus a per-trial token. A plain
-`custom:http://` provider is the unpaid smoke endpoint: it is reached directly
-and also receives a throwaway token, never the key file content.
+The provider key never enters the task container. The adapter runs
+key_proxy.KeyProxy on the host for one trial and the container profile holds
+the proxy URL plus a per-trial token: a `custom:https://` provider is renamed
+to the proxy URL, and a built-in provider in BUILTIN_UPSTREAMS keeps its name
+(and so its catalog entry) and gets the proxy URL as the root `api_url`. A
+plain `custom:http://` provider is the unpaid smoke endpoint: it is reached
+directly and also receives a throwaway token, never the key file content.
 """
 import asyncio
 import logging
@@ -86,11 +88,18 @@ def read_key_file(path):
     return key.decode().strip()
 
 
+# Built-in providers whose endpoint PRX lets the root `api_url` replace, with
+# the fixed upstream the proxy forwards to. Keep in step with the factory arm
+# in src/providers/mod.rs.
+KIMI_CODE = "https://api.kimi.com/coding/v1"
+BUILTIN_UPSTREAMS = {"kimi-code": KIMI_CODE, "kimi_coding": KIMI_CODE, "kimi_for_coding": KIMI_CODE}
+
+
 def require_proxy_route(provider):
-    # Built-in providers have a fixed base URL in PRX, so the key would have
-    # to enter the container. Fail closed instead.
-    if not provider.startswith("custom:"):
-        raise ValueError("built-in providers cannot use the host key proxy; "
+    # Any other built-in provider has a fixed base URL in PRX, so the key
+    # would have to enter the container. Fail closed instead.
+    if not provider.startswith("custom:") and provider not in BUILTIN_UPSTREAMS:
+        raise ValueError("this built-in provider cannot use the host key proxy; "
                          "pass provider=custom:https://<provider base URL>")
 
 
@@ -138,25 +147,34 @@ class PrxAgent(BaseInstalledAgent):
         # Keep context empty: Harbor invokes populate_context_post_run after log download.
         del context
         key = read_key_file(self.key_file)
+        require_proxy_route(self.provider)
         proxy = None
+        api_url = None
         container_provider = self.provider
-        if self.provider.startswith("custom:https://"):
+        if self.provider in BUILTIN_UPSTREAMS:
+            proxy = KeyProxy(BUILTIN_UPSTREAMS[self.provider], key, self.proxy_bind or primary_ipv4())
+            api_url = proxy.container_base_url()
+        elif self.provider.startswith("custom:https://"):
             proxy = KeyProxy(self.provider[7:], key, self.proxy_bind or primary_ipv4())
             container_provider = "custom:" + proxy.container_base_url()
-            proxy.start()
         try:
-            await self._trial(instruction, environment, key, proxy, container_provider)
+            if proxy is not None:
+                proxy.start()
+            await self._trial(instruction, environment, key, proxy, container_provider, api_url)
         finally:
             # Synchronous on purpose: cancellation cannot skip it.
             if proxy is not None:
                 proxy.stop()
 
-    async def _trial(self, instruction, environment, key, proxy, container_provider):
+    async def _trial(self, instruction, environment, key, proxy, container_provider, api_url):
         credential = proxy.token if proxy is not None else secrets.token_urlsafe(32)
         with tempfile.TemporaryDirectory(prefix="prx-bench-profile-") as directory:
             path = Path(directory) / "config.toml"
-            profile_text = render(path, self.model_name, credential, self.prices, container_provider)
+            override = container_provider if container_provider.startswith("custom:") else None
+            profile_text = render(path, self.model_name, credential, self.prices, override, api_url)
             values = check(path)
+        # The per-trial proxy URL is covered by the canonical hash, not the record.
+        values.pop("api_url", None)
         if holds_key(profile_text.encode(), key):
             raise RuntimeError("refusing to upload a profile that contains the provider key")
         # Hash a canonical profile: the token and proxy port change every trial.
@@ -181,7 +199,7 @@ class PrxAgent(BaseInstalledAgent):
             if locked.return_code != 0:
                 raise RuntimeError("cannot secure private config")
             seconds = self.agent_timeout_sec - 50
-            host = shlex.quote(endpoint(container_provider))
+            host = shlex.quote(CONTAINER_HOST if proxy is not None else endpoint(container_provider))
             no_proxy = f"NO_PROXY={host} no_proxy={host} "
             command = (f"env -u PRX_BENCH_API_KEY {no_proxy}prx --config-dir {CONFIG_DIR} "
                        f"agent -t {self.temperature:g} -m {shlex.quote(instruction)} "
