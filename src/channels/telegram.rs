@@ -587,13 +587,18 @@ impl TelegramChannel {
     }
 
     async fn fetch_bot_username(&self) -> anyhow::Result<String> {
-        let resp = self.http_client().get(self.api_url("getMe")).send().await?;
+        let resp = self
+            .http_client()
+            .get(self.api_url("getMe"))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch bot info: {}", resp.status());
         }
 
-        let data: serde_json::Value = resp.json().await?;
+        let data: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
         let username = data
             .get("result")
             .and_then(|r| r.get("username"))
@@ -1061,7 +1066,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .post(self.api_url("sendMessage"))
                 .json(&markdown_body)
                 .send()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
 
             if markdown_resp.status().is_success() {
                 if index < chunks.len() - 1 {
@@ -1096,7 +1102,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .post(self.api_url("sendMessage"))
                 .json(&plain_body)
                 .send()
-                .await?;
+                .await
+                .map_err(reqwest::Error::without_url)?;
 
             if !plain_resp.status().is_success() {
                 let plain_status = plain_resp.status();
@@ -1143,10 +1150,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        let resp = self.http_client().post(self.api_url(method)).json(&body).send().await?;
+        let resp = self
+            .http_client()
+            .post(self.api_url(method))
+            .json(&body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram {method} by URL failed: {err}");
         }
 
@@ -1250,10 +1263,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendDocument"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
@@ -1287,10 +1301,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendDocument"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendDocument failed: {err}");
         }
 
@@ -1326,10 +1341,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendPhoto"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
@@ -1363,10 +1379,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendPhoto"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendPhoto failed: {err}");
         }
 
@@ -1402,10 +1419,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendVideo"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendVideo failed: {err}");
         }
 
@@ -1441,10 +1459,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendAudio"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendAudio failed: {err}");
         }
 
@@ -1480,10 +1499,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendVoice"))
             .multipart(form)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendVoice failed: {err}");
         }
 
@@ -1521,10 +1541,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendDocument"))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendDocument by URL failed: {err}");
         }
 
@@ -1562,10 +1583,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .post(self.api_url("sendPhoto"))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
-            let err = resp.text().await?;
+            let err = resp.text().await.map_err(reqwest::Error::without_url)?;
             anyhow::bail!("Telegram sendPhoto by URL failed: {err}");
         }
 
@@ -1668,14 +1690,20 @@ impl Channel for TelegramChannel {
             }
         }
 
-        let resp = self.client.post(self.api_url("sendMessage")).json(&body).send().await?;
+        let resp = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
             anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
         }
 
-        let resp_json: serde_json::Value = resp.json().await?;
+        let resp_json: serde_json::Value = resp.json().await.map_err(reqwest::Error::without_url)?;
         let message_id = resp_json
             .get("result")
             .and_then(|r| r.get("message_id"))
@@ -1737,7 +1765,8 @@ impl Channel for TelegramChannel {
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if resp.status().is_success() {
             self.last_draft_edit
@@ -1805,7 +1834,8 @@ impl Channel for TelegramChannel {
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -1823,7 +1853,8 @@ impl Channel for TelegramChannel {
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if resp.status().is_success() {
             return Ok(());
@@ -1854,7 +1885,8 @@ impl Channel for TelegramChannel {
                 "message_id": message_id,
             }))
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1931,7 +1963,7 @@ impl Channel for TelegramChannel {
             let resp = match self.http_client().post(&url).json(&body).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("Telegram poll error: {e}");
+                    tracing::warn!("Telegram poll error: {}", e.without_url());
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -1940,7 +1972,7 @@ impl Channel for TelegramChannel {
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("Telegram parse error: {e}");
+                    tracing::warn!("Telegram parse error: {}", e.without_url());
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -2011,7 +2043,7 @@ Ensure only one `openprx` process is using this bot token."
         match tokio::time::timeout(timeout_duration, self.http_client().get(self.api_url("getMe")).send()).await {
             Ok(Ok(resp)) => resp.status().is_success(),
             Ok(Err(e)) => {
-                tracing::debug!("Telegram health check failed: {e}");
+                tracing::debug!("Telegram health check failed: {}", e.without_url());
                 false
             }
             Err(_) => {
@@ -2597,6 +2629,58 @@ mod tests {
     }
 
     // ── File sending integration tests (with mock server) ──────────
+
+    /// Bot token used only by the leak test; it has the real `<id>:<secret>` shape.
+    const LEAK_TEST_TOKEN: &str = "987654321:AAFakeTokenForLeakTest_0123456789abc";
+    /// Upper bound for one refused loopback connection in the leak test.
+    const LEAK_TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn bot_api_errors_do_not_carry_the_bot_token() {
+        // The default test API base is a loopback port nothing listens on, so
+        // every call fails with a transport error built from the token URL.
+        let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false);
+        let url = ch.api_url("getUpdates");
+        assert!(
+            url.contains(LEAK_TEST_TOKEN),
+            "test setup: the request URL is expected to embed the token"
+        );
+
+        // The raw transport error, formatted the way the long-poll and
+        // health-check log sites format it.
+        let raw = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.http_client().post(&url).send())
+            .await
+            .expect("test: a refused loopback connection must fail within the deadline")
+            .expect_err("test: nothing listens on the test API base");
+        assert!(
+            raw.to_string().contains(LEAK_TEST_TOKEN),
+            "test premise: an unstripped reqwest error names its URL, token included; \
+             if this fails the test no longer proves anything"
+        );
+        let logged = format!("Telegram poll error: {}", raw.without_url());
+        assert!(
+            !logged.contains(LEAK_TEST_TOKEN),
+            "a log line built from a Bot API transport error leaked the token: {logged}"
+        );
+
+        // Errors returned to callers (and logged by them) are stripped at the source.
+        let fetch_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_bot_username())
+            .await
+            .expect("test: getMe against a closed port must fail within the deadline")
+            .expect_err("test: getMe cannot succeed without a server");
+        let send_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.send_text_chunks("hello", "123456", None))
+            .await
+            .expect("test: sendMessage against a closed port must fail within the deadline")
+            .expect_err("test: sendMessage cannot succeed without a server");
+        for (site, err) in [("fetch_bot_username", fetch_err), ("send_text_chunks", send_err)] {
+            for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+                assert!(
+                    !rendered.contains(LEAK_TEST_TOKEN),
+                    "{site} returned an error that still names the bot token: {rendered}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn telegram_send_document_bytes_builds_correct_form() {
