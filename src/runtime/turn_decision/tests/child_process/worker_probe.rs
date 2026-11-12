@@ -34,8 +34,10 @@ where
             Ok(std::panic::AssertUnwindSafe(boxed_parent_issuance(|| async {
                 let mut config = config.clone();
                 config.decision_engine.enabled = true;
-                config.causal_tree.backend.kind =
-                    crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+                if crate::decision::factory::configured_selection(&config.causal_tree).is_none() {
+                    config.causal_tree.backend.kind =
+                        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+                }
                 let generation = crate::config::new_shared(config.clone()).pin();
                 let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));
                 let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&workspace)?);
