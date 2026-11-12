@@ -1,5 +1,5 @@
 //! Concrete auxiliary target selection after actual source/context admission.
-use super::{TurnDecisionContext, TurnDecisionService, TurnDisposition, TurnSourceProof};
+use super::{TurnDecisionContext, TurnDecisionService, TurnSourceProof};
 use crate::providers::catalog::ResolvedModel;
 use crate::providers::catalog::{Requirement, UnknownPolicy};
 use crate::runtime::auxiliary_call::{AuxiliaryAccounting, AuxiliaryPurpose};
@@ -67,10 +67,7 @@ impl TurnDecisionService {
         smart_group_selection: Option<(&str, &str)>,
     ) -> anyhow::Result<((String, String), ResolvedModel)> {
         self.agent_execution_specs(proof, context)?;
-        anyhow::ensure!(
-            matches!(context.disposition()?, TurnDisposition::Run),
-            "auxiliary call requires a running decision"
-        );
+        anyhow::ensure!(context.is_run()?, "auxiliary call requires a running decision");
         #[cfg(test)]
         crate::causal_tree::logical_clock::visit_site("auxiliary_deadline");
         // Minted from `logical_clock::now()`. `Instant::now()` ignores a logical

@@ -566,19 +566,7 @@ async fn selected_execute_retains_exact_gated_refs_without_dispatch() {
                 }
             );
         }
-        assert!(matches!(context.disposition(), Ok(TurnDisposition::Run)));
-        let ports = ReceiptClosePorts {
-            receipt: None,
-            calls: AtomicUsize::new(0),
-            cancellation: None,
-        };
-        assert!(
-            service
-                .close_agent_directive_turn(&proof, Arc::clone(&context), &ports, &CancellationToken::new())
-                .await
-                .is_err()
-        );
-        assert_eq!(ports.calls.load(Ordering::SeqCst), 0);
+        assert!(context.is_run().expect("test: live execution"));
         assert_eq!(predictions.load(Ordering::SeqCst), 1);
         assert_eq!(transports.0.load(Ordering::SeqCst), 0);
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
@@ -591,9 +579,9 @@ async fn selected_execute_retains_exact_gated_refs_without_dispatch() {
             .expect("unshared returned context")
             .engine
             .deadline = Instant::now();
-        assert!(matches!(expired.disposition(), Ok(TurnDisposition::Run)));
+        assert!(expired.is_run().expect("test: live execution"));
         let _ = expired.terminal_execution_trace();
-        assert!(matches!(expired.disposition(), Err(DirectiveError::NotAdmitted)));
+        assert!(!expired.is_run().expect("test: sealed execution"));
     }
 }
 

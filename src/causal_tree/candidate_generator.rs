@@ -207,25 +207,6 @@ pub(crate) struct PendingApproval {
 
 pub(crate) struct CausalCandidateGenerator;
 
-/// Resolve all discovery identities against the current catalog. Ambiguous,
-/// stale or read-only discoveries cannot be promoted to a lifecycle proposal.
-#[cfg(test)]
-fn discovered_lifecycle_entry<'a>(catalog: &CatalogView<'a>, refs: &DiscoveredRefs) -> Option<&'a CapabilityEntry> {
-    let mut selected = catalog.iter_entries().filter(|entry| {
-        entry.effect != SideEffectClass::ReadOnly
-            && refs.contains(&CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            })
-    });
-    let entry = selected.next()?;
-    if selected.next().is_some() || entry.public_name != "skills_manage" || !entry.collects_exact_call() {
-        return None;
-    }
-    Some(entry)
-}
-
 impl CausalCandidateGenerator {
     pub(crate) fn generate(
         state: &CausalState,
@@ -3822,44 +3803,6 @@ mod tests {
         assert!(!names_entry("write a poem about spring", write));
         assert!(!names_entry("search the docs for write", write));
         assert!(names_entry("please call mcp__prx_server__write now", write));
-    }
-
-    #[test]
-    fn unnamed_lifecycle_collection_requires_unique_current_discovery() {
-        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ProbeTool("skills_manage")), Box::new(ProbeTool("shell"))];
-        let catalog =
-            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
-        let view = catalog.view(&CatalogScope::default());
-        let manage = view
-            .iter_entries()
-            .find(|entry| entry.public_name == "skills_manage")
-            .unwrap();
-        let shell = view.iter_entries().find(|entry| entry.public_name == "shell").unwrap();
-        let reference = |entry: &CapabilityEntry| CapabilityRef {
-            id: entry.id.clone(),
-            fingerprint: entry.fingerprint,
-            generation: entry.generation,
-        };
-        assert!(discovered_lifecycle_entry(&view, &DiscoveredRefs::empty()).is_none());
-        let discovered = DiscoveredRefs::from_refs_for_test(BTreeSet::from([reference(manage)]));
-        assert_eq!(
-            discovered_lifecycle_entry(&view, &discovered).unwrap().public_name,
-            "skills_manage"
-        );
-        let ambiguous = DiscoveredRefs::from_refs_for_test(BTreeSet::from([reference(manage), reference(shell)]));
-        assert!(discovered_lifecycle_entry(&view, &ambiguous).is_none());
-        for schema in [true, false] {
-            let mut stale = reference(manage);
-            if schema {
-                *stale.fingerprint.0.first_mut().unwrap() ^= 1;
-            } else {
-                *stale.generation.0.first_mut().unwrap() ^= 1;
-            }
-            assert!(
-                discovered_lifecycle_entry(&view, &DiscoveredRefs::from_refs_for_test(BTreeSet::from([stale])))
-                    .is_none()
-            );
-        }
     }
 
     /// Only the built-in native `skills_manage` is collectable by name; an

@@ -554,6 +554,7 @@ fn bind_mcp_execution_context(
         context.envelope.clone(),
         true,
     );
+    context.execution_admission = Some(binding.admission());
     context.admitted_binding = Some(binding);
     context.execution_trace = Some(crate::tools::capability::execution_trace::ExecutionTrace::default());
     Ok(context)

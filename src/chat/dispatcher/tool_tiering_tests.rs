@@ -283,7 +283,13 @@ async fn offered_tools_for(
         })
         .collect::<Vec<_>>();
     assert!(
-        admitted.binding.fixed_reply().expect("tiering decision").is_none(),
+        admitted
+            .binding
+            .decision_routing()
+            .expect("test: admitted routing")
+            .context
+            .is_run()
+            .expect("test: live execution"),
         "tiering fixture closed before provider execution: {:?}; {audit:?}",
         routing.context.directive()
     );
@@ -726,7 +732,15 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
         routing.context.engine().prediction.is_none(),
         "named-tool chat uses open_turn_context with no prediction port"
     );
-    assert!(admitted.binding.fixed_reply().expect("model-backed Answer").is_none());
+    assert!(
+        admitted
+            .binding
+            .decision_routing()
+            .expect("test: admitted routing")
+            .context
+            .is_run()
+            .expect("test: live execution")
+    );
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user(CORE_TOOL)];
     drive_start_turn_stream(
         Some(admitted.binding),
@@ -981,6 +995,7 @@ async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Res
     use anyhow::Context as _;
     for (input, excluded) in [("hi", false), ("sessions_spawn", false), ("sessions_spawn", true)] {
         let workspace = tempfile::tempdir()?;
+        let access = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.autonomy.level = crate::security::AutonomyLevel::Full;
@@ -1003,6 +1018,11 @@ async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Res
             .binding
             .decision_routing()
             .context("source-bound chat routing")?;
+        assert_eq!(
+            access.counts.delegation_storage.load(AtomicOrdering::SeqCst),
+            0,
+            "test: no-spawn chat admission reads no delegation storage"
+        );
         let initial = routing.service.agent_execution_specs(routing.proof, routing.context)?;
         assert!(!initial.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL));
         assert!(

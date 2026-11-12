@@ -109,13 +109,37 @@ async fn model_turn_budget_without_spend_is_denied() {
 async fn pre_invoke_recheck_denies_missing_budget() {
     let fixture = fixture();
     let service = fixture.service(CONFIG_RELOAD, vec![], ToolExecutionDecision::Allow, approved(), true);
-    let outcome = service.execute(command(), model_turn(context()), None).await;
-    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let live_reads = Arc::clone(&reads);
+    let mut context = model_turn(context());
+    context.turn_surface = Some(Arc::new(crate::tools::execution::admission::TurnSurface::build_from(
+        &service,
+        service.current_descriptors(),
+        &crate::config::ToolTieringConfig::default(),
+        "prx_model",
+        false,
+        |_| true,
+    )));
+    assert!(
+        context
+            .turn_surface
+            .as_ref()
+            .is_some_and(|surface| surface.contains(CONFIG_RELOAD)),
+        "test: admitted turn surface includes the called tool"
+    );
+    context.call_budget = Some(CallTokenBudget::new(|| 4096, |_| Some(1)).with_spend(
+        move || (live_reads.fetch_add(1, Ordering::SeqCst) == 0).then_some(1_000),
+        |_| Some(1),
+    ));
+    let outcome = service.execute(command(), context, None).await;
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied, "test: recheck denies");
     assert_eq!(
         outcome.error.as_deref(),
-        Some("tool 'config_reload' has no call budget")
+        Some("tool 'config_reload' has no live spend ceiling"),
+        "test: denial comes from the live pre-invoke recheck"
     );
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "test: admit then recheck");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0, "test: backend never runs");
 }
 
 #[tokio::test]

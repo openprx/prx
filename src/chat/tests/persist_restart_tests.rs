@@ -45,6 +45,15 @@ fn config_at(workspace: &Path) -> crate::config::Config {
     config.default_provider = Some("ollama".into());
     config.default_model = Some("prx-local-model".into());
     config.causal_tree.enabled = true;
+    config.cost.prices.insert(
+        "ollama/prx-local-model".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
     // Recovery fixtures deliberately exercise a local, selected Close terminal.
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
@@ -187,39 +196,131 @@ async fn drain_legacy_fixture_decisions(service: &crate::runtime::turn_decision:
     );
 }
 
-/// Produce a real selected Close receipt for the recovery fixtures. The local
-/// backend is explicit; no unexecuted Direct turn is recorded as completed.
+/// Recovery fixtures execute a provider turn and persist its real trace.
 async fn persist_completed_chat(
     binding: &ChatTurnBinding,
     fabric: &MemoryFabric,
-    _workspace: &Path,
+    workspace: &Path,
     history_commit_len: usize,
 ) -> TurnTerminalReceipt {
-    assert!(
-        binding
-            .fixed_reply()
-            .expect("test: persist_completed_chat fixture operation")
-            .is_some(),
-        "fixture must select a Close terminal"
-    );
-    let run = binding
-        .envelope()
-        .run_id
-        .as_deref()
-        .expect("test: completed chat has a run");
+    use crate::agent::terminal::{
+        TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalStatus, TurnTerminalTelemetry,
+    };
+    use crate::agent::turn_request::{
+        ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices,
+    };
+    struct FixtureProvider;
+    #[async_trait::async_trait]
+    impl Provider for FixtureProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("Project response".into())
+        }
+    }
+    let routing = binding.decision_routing().expect("test: admitted source");
+    let memory = fabric.memory();
+    let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(Vec::new());
+    let observer = crate::observability::NoopObserver;
+    let hooks = crate::hooks::HookManager::new(workspace.to_owned());
+    let cancellation = CancellationToken::new();
+    let started = chrono::Utc::now();
+    let mut history = vec![
+        crate::providers::ChatMessage::system("Project assistant"),
+        crate::providers::ChatMessage::user("  "),
+    ];
+    let (_, trace) = Box::pin(crate::agent::turn_engine::run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "terminal",
+            scope: None,
+            mode: Default::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: Vec::new(),
+            },
+            compaction: None,
+            decision: TurnDecision {
+                service: routing.service,
+                context: routing.context,
+                proof: routing.proof,
+            },
+        },
+        TurnServices {
+            provider: &FixtureProvider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: registry,
+            observer: &observer,
+            hooks: &hooks,
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                verify_chat_completion: false,
+                provider_trace: binding.retained_provider_trace(),
+                events: None,
+                stream_provider: false,
+                tool_execution_service: None,
+                tool_execution_context: crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private"),
+                allowed_tool_names: None,
+            }),
+            memory: ToolLoopMemory::new(&memory, workspace, None),
+        },
+        TurnDelivery {
+            cancellation: Some(cancellation),
+            on_delta: None,
+            on_tool_call: None,
+        },
+    ))
+    .await
+    .expect("test: real recovery fixture turn");
+    binding.capture_trace(&trace).expect("test: authenticated trace");
+    let route = crate::llm::route_decision::RouteDecision::single_candidate("ollama", "prx-local-model");
+    let provider = crate::agent::terminal::provider_outcome_from_trace(&route, started, trace);
+    let run = binding.envelope().run_id.as_deref().expect("test: completed run");
+    let scope = binding.envelope().message_scope();
     let receipt = binding
-        .close(
+        .commit_terminal(
             fabric,
-            history_commit_len,
-            chrono::Utc::now(),
-            &CancellationToken::new(),
+            TurnTerminalDraft {
+                decision: binding.settlement_ref(run).expect("test: settlement"),
+                terminal_id: run.to_owned(),
+                scope: scope.clone(),
+                status: TurnTerminalStatus::Completed,
+                history: Some(TurnHistoryProjection {
+                    assistant_content: "Project response".into(),
+                    history_commit_len,
+                }),
+                history_scope: Some(scope.with_sender("prx_runtime").with_recipient("local-user")),
+                provider_outcome: Some(provider),
+                telemetry: TurnTerminalTelemetry {
+                    summary: "Project response".into(),
+                    started_at: started,
+                    finished_at: chrono::Utc::now(),
+                },
+                delivery_intent: TurnDeliveryIntent::Reply {
+                    target: "terminal:local-user".into(),
+                },
+            },
+            &config_at(workspace).cost,
+            workspace,
         )
         .await
-        .expect("test: persist_completed_chat fixture operation");
+        .expect("test: persist provider terminal");
     binding
         .rejoin_recovery_terminal(run)
         .await
-        .expect("test: persist_completed_chat fixture operation");
+        .expect("test: recovery terminal");
     receipt
 }
 
@@ -874,9 +975,8 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
 
             let cancel = CancellationToken::new();
             binding.decide(&service, &cancel).await?;
-            assert!(binding.fixed_reply()?.is_some());
             let fabric = MemoryFabric::new(memory.clone(), dir.path().to_string_lossy());
-            let receipt = binding.close(&fabric, 2, chrono::Utc::now(), &cancel).await?;
+            let receipt = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             let mut payload: serde_json::Value = serde_json::from_str(
                 receipt
                     .terminal_event

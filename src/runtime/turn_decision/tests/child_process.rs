@@ -1143,12 +1143,13 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         );
     } else {
         let answer = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly);
-        match context.disposition()? {
-            TurnDisposition::Close { .. } => assert!(service.agent_execution_specs(&proof, &context).is_err()),
-            TurnDisposition::Run => {
-                assert!(answer, "unapproved delegation may only reach the explanatory model");
-                service.agent_execution_specs(&proof, &context)?;
-            }
+        if answer {
+            service.agent_execution_specs(&proof, &context)?;
+        } else {
+            assert!(
+                service.agent_execution_specs(&proof, &context).is_err(),
+                "test: no selected executable delegation"
+            );
         }
         assert!(service.issue_child_grant(&proof, &context).is_err());
         assert_eq!(

@@ -35,6 +35,7 @@ struct ProbeState {
     completion: tokio::sync::Notify,
     parent_mode: Option<&'static str>,
     parent_calls: std::sync::atomic::AtomicUsize,
+    deadline: tokio::time::Instant,
 }
 
 pub struct WireProbe {
@@ -58,6 +59,7 @@ impl WireProbe {
             completed: AtomicBool::new(false),
             completion: tokio::sync::Notify::default(),
             parent_calls: std::sync::atomic::AtomicUsize::default(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(20),
         });
         let stop = CancellationToken::new();
         let server_stop = stop.clone();
@@ -260,9 +262,13 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
             !latest.to_string().contains("failed:"),
             "worker failed before probe completion: {latest}"
         );
+        ensure!(
+            tokio::time::Instant::now() < state.deadline,
+            "parent completion deadline elapsed"
+        );
         let notified = state.completion.notified();
         if !state.completed.load(Ordering::Acquire)
-            && tokio::time::timeout(Duration::from_secs(60), notified).await.is_err()
+            && tokio::time::timeout(Duration::from_secs(5), notified).await.is_err()
         {
             // Read the runtime's terminal status through the same admitted
             // tool before the next response can claim parent completion.

@@ -299,7 +299,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
         ));
         assert!(terminal.prediction.is_none(), "local terminal makes no backend call");
 
-        let execution_refs = direct_answer_refs(&terminal, &view, &gates, &BTreeSet::new());
+        let execution_refs = direct_answer_refs(&terminal, &view, &gates, &BTreeSet::new(), &|_| None);
         let file_read_ref = view
             .entries()
             .iter()
@@ -332,7 +332,7 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
-            approval_collection_started: AtomicBool::new(false),
+
             collected_approval_result: std::sync::OnceLock::new(),
             discovery_offers: std::sync::OnceLock::new(),
             discovery_admissions: std::sync::OnceLock::new(),
@@ -343,8 +343,6 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             main_compaction: config.agent.compaction.clone(),
             execution_refs,
             selected_retrieved: observed.selected_artifacts.clone(),
-            #[cfg(feature = "llm-router")]
-            router_transition: None,
         };
         let specs = service
             .agent_execution_specs(&proof_a, &answer_context)
@@ -353,96 +351,24 @@ async fn selected_memory_service_rejects_foreign_turn_and_keeps_direct_core_afte
             specs.specs.iter().any(|spec| spec.name == "file_read"),
             "the production request after Retrieve must still publish the Direct file tool"
         );
-        assert!(matches!(answer_context.disposition(), Ok(TurnDisposition::Run)));
+        assert!(answer_context.is_run().expect("test: live execution"));
         assert_eq!(answer_context.retrieved().expect("live selected evidence").len(), 1);
-        let close_spy = CloseSpy::default();
         let mut answer_context = Arc::new(answer_context);
+        Arc::get_mut(&mut answer_context)
+            .expect("test: unique context")
+            .engine
+            .deadline = Instant::now();
         assert!(
-            close_directive_turn(Arc::clone(&answer_context), &close_spy)
-                .await
-                .is_err()
+            answer_context.is_run().expect("test: live execution"),
+            "test: decision deadline does not close issued execution"
         );
-        assert!(close_spy.replies.lock().is_empty(), "Run cannot call the terminal port");
-        let answer_context_mut = Arc::get_mut(&mut answer_context).expect("exclusive context after close check");
-        answer_context_mut.engine.deadline = Instant::now();
-        // Decision work has ended; the admitted turn retains its selected
-        // evidence until the real terminal lifecycle seals execution.
-        assert!(matches!(answer_context.disposition(), Ok(TurnDisposition::Run)));
-        assert_eq!(
-            answer_context
-                .retrieved()
-                .expect("selected evidence before terminal closure")
-                .len(),
-            1
+        assert_eq!(answer_context.retrieved().expect("test: retained evidence").len(), 1);
+        answer_context.terminal_execution_trace();
+        assert!(
+            !answer_context.is_run().expect("test: sealed execution"),
+            "test: actual terminal seals execution"
         );
-        let _ = answer_context.terminal_execution_trace();
-        assert!(matches!(answer_context.disposition(), Err(DirectiveError::NotAdmitted)));
         assert!(matches!(answer_context.retrieved(), Err(DirectiveError::NotAdmitted)));
-        assert!(
-            close_directive_turn(Arc::clone(&answer_context), &close_spy)
-                .await
-                .is_err()
-        );
-        assert!(
-            close_spy.replies.lock().is_empty(),
-            "expired Run cannot call the terminal port"
-        );
-        // Even a corrupted internal reason code cannot escape through Close.
-        Arc::get_mut(&mut answer_context)
-            .expect("exclusive context after close check")
-            .directive = TurnExecutionDirective::Refuse {
-            policy_code: "HIDDEN-CAP-9V".to_string(),
-            user_hint: None,
-        };
-        let TurnDisposition::Close { reply } = answer_context.disposition().expect("fixed close reply") else {
-            panic!("refusal must close");
-        };
-        assert_eq!(reply, "I can't complete this request under the current policy.");
-        assert!(!reply.contains("HIDDEN-CAP-9V"));
-        assert!(!reply.contains("Reason:"), "{reply}");
-        assert_eq!(
-            close_directive_turn(Arc::clone(&answer_context), &close_spy)
-                .await
-                .expect("fixed refusal reaches terminal port"),
-            "fixture terminal receipt"
-        );
-        assert_eq!(close_spy.replies.lock().as_slice(), &[reply.as_ref()]);
-        close_spy.fail.store(true, Ordering::SeqCst);
-        assert!(
-            close_directive_turn(Arc::clone(&answer_context), &close_spy)
-                .await
-                .expect_err("terminal failure must propagate")
-                .to_string()
-                .contains("fixture terminal failure")
-        );
-        assert_eq!(close_spy.replies.lock().as_slice(), &[reply.as_ref(), reply.as_ref()]);
-        close_spy.fail.store(false, Ordering::SeqCst);
-        Arc::get_mut(&mut answer_context)
-            .expect("exclusive context after close check")
-            .directive = TurnExecutionDirective::Clarify {
-            reason_code: "HIDDEN-CAP-9V".to_string(),
-        };
-        close_directive_turn(Arc::clone(&answer_context), &close_spy)
-            .await
-            .expect("clarification reaches terminal port");
-        assert_eq!(close_spy.replies.lock().len(), 3);
-        assert_eq!(
-            close_spy.replies.lock().get(2).map(String::as_str),
-            Some("Could you clarify the result you want?")
-        );
-        Arc::get_mut(&mut answer_context)
-            .expect("exclusive context after close check")
-            .directive = TurnExecutionDirective::Discover {
-            families: Vec::new(),
-            query: "fixture".to_string(),
-            limit: 1,
-        };
-        assert!(
-            close_directive_turn(Arc::clone(&answer_context), &close_spy)
-                .await
-                .is_err()
-        );
-        assert_eq!(close_spy.replies.lock().len(), 3, "unsupported directive cannot close");
 
         memory.return_empty.store(true, Ordering::SeqCst);
         let empty_observed = service
@@ -820,10 +746,7 @@ async fn builtin_agent_discovery_runs_a_bounded_dependent_hop() {
                 }),
                 "the dependent hop must carry the selected discovery observation"
             );
-            assert!(matches!(
-                context.disposition(),
-                Ok(TurnDisposition::Close { .. } | TurnDisposition::Run)
-            ));
+            assert!(context.is_run().expect("test: live issued context"));
             assert_eq!(
                 transports.0.load(Ordering::SeqCst),
                 0,

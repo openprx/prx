@@ -1258,6 +1258,10 @@ mod tests {
         let mut builder = embedded_provider_builder(workspace.path())
             .provider(Box::new(CustomContextSpy(ModelSpy(Arc::clone(&models), "ollama"))))
             .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
+        let selected_config = &mut builder.runtime_config.as_mut().expect("test: configured builder").0;
+        selected_config.decision_engine.enabled = true;
+        selected_config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
         // The durable case selects Builtin; the other case installs its scoped
         // selected-loader Mock backend explicitly through with_first_other.
         if record_decisions {
@@ -1283,9 +1287,13 @@ mod tests {
             assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
             models.lock().unwrap().clear();
         } else {
-            assert_eq!(
-                agent.turn("unclear request").await.unwrap(),
-                "Could you clarify the result you want?"
+            let error = agent
+                .turn("unclear request")
+                .await
+                .expect_err("test: explicit prediction abstention has no executable selection");
+            assert!(
+                error.to_string().contains("decision has no executable selection"),
+                "test: explicit prediction failure: {error}"
             );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(models.lock().unwrap().is_empty());

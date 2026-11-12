@@ -601,52 +601,7 @@ pub(super) async fn run_channel_turn(
             );
         }
     }
-    match decision_turn.close_reply() {
-        #[cfg(not(test))]
-        Ok(Some(_)) => {
-            tracing::warn!("decision requires the constrained execution reader");
-            return;
-        }
-        #[cfg(test)]
-        Ok(Some(reply)) => {
-            if let Err(error) = decision_turn
-                .close(ctx.as_ref(), security.as_ref(), &msg, &cancellation_token)
-                .await
-            {
-                tracing::warn!(%error, "channel decision close failed");
-                return;
-            }
-            let _ = append_sender_turn(
-                ctx.as_ref(),
-                &config_generation,
-                &history_key,
-                &msg.channel,
-                &msg.sender,
-                Some(&msg.reply_target),
-                ChatMessage::assistant(&reply),
-                message_visibility.clone(),
-                None,
-                Some(&turn_run_id),
-                &turn_run_id,
-                false,
-                &turn_memory,
-            )
-            .await;
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = send_recording_activity(
-                    channel.as_ref(),
-                    &SendMessage::new(reply, &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
-                .await;
-            }
-            return;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, "invalid channel decision disposition");
-            return;
-        }
-    }
+
     let vision_required = is_signal_image_message(&msg);
     if vision_required {
         if authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel).is_err()

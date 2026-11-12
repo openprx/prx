@@ -3,11 +3,27 @@
 //! Integrity only: the decision plane does not mint this receipt. Full
 //! autonomy is unaffected.
 
+use super::CapabilityCatalog;
 use super::{CallDigestSource, ToolExecutionError, admitted_call_digest};
-use crate::causal_tree::branch::{CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration};
+use crate::causal_tree::branch::CapabilityRef;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::capability::fingerprint::tool_spec_fingerprint;
 use crate::tools::execution::{ToolDescriptor, ToolExecutionCommand, ToolExecutionService};
+use std::sync::Arc;
+
+/// Catalog and source scope retained by execution admission.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionAdmission {
+    pub(crate) catalog: Arc<CapabilityCatalog>,
+    pub(crate) scope: RuntimeEnvelope,
+}
+
+impl PartialEq for ExecutionAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.catalog, &other.catalog) && self.scope == other.scope
+    }
+}
+impl Eq for ExecutionAdmission {}
 
 /// Opaque receipt that the execution service minted from the admitted
 /// descriptor. Never decoded from caller JSON.
@@ -53,6 +69,7 @@ impl ToolExecutionService {
     pub(crate) fn verify_admitted_call(
         &self,
         envelope: &RuntimeEnvelope,
+        admission: &ExecutionAdmission,
         descriptor: &ToolDescriptor,
         command: &ToolExecutionCommand,
     ) -> Result<VerifiedExecutionCall, ToolExecutionError> {
@@ -82,11 +99,21 @@ impl ToolExecutionService {
         if admitted_fingerprint != live_fingerprint {
             return Err(refuse());
         }
+        if envelope != &admission.scope {
+            return Err(refuse());
+        }
+        admission.catalog.check_parity(self).map_err(|_| refuse())?;
+        let entry = admission
+            .catalog
+            .entry_for_public_name(&descriptor.public_name)
+            .ok_or_else(refuse)?;
+        if entry.root != descriptor.backend_name || entry.fingerprint != live_fingerprint {
+            return Err(refuse());
+        }
         let capability = CapabilityRef {
-            id: CapabilityId::new(CapabilityTarget::NativeTool, "native", &descriptor.public_name)
-                .map_err(|_| refuse())?,
-            fingerprint: live_fingerprint,
-            generation: CatalogGeneration(admitted_fingerprint.0),
+            id: entry.id.clone(),
+            fingerprint: entry.fingerprint,
+            generation: entry.generation,
         };
         let owner = envelope.resolved_owner_id();
         let (operation, risk) =
@@ -124,7 +151,7 @@ impl ToolExecutionService {
             capability,
             scope: envelope.clone(),
             call_digest: digest,
-            catalog_generation: admitted_fingerprint.0,
+            catalog_generation: admission.catalog.generation().0,
         })
     }
 }
@@ -133,7 +160,7 @@ impl ToolExecutionService {
 mod tests {
     use super::*;
     use crate::acl::approval_grant::RiskLevel;
-    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, SchemaFingerprint};
+    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
 
     #[test]
     fn h2_call_digest_matches_previous_decision_call_digest_formula() {

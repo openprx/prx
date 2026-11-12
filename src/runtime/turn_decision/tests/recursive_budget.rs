@@ -180,3 +180,41 @@ async fn allowance_fixture(recursive_enabled: bool) -> anyhow::Result<()> {
     cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
     result
 }
+
+#[tokio::test]
+async fn authenticated_resume_without_original_allowance_cannot_mint_a_child_slot() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.sessions_spawn.allow_recursive_delegation = true;
+    let admitted = AdmittedTurn::with_config(config, "project request", Arc::new(Vec::new())).await;
+    let turn = admitted.decision();
+    assert!(
+        turn.proof.source_event_id().is_some(),
+        "test: source proof is authenticated by durable ingress"
+    );
+    let resumed = turn
+        .service
+        .recursive_allowances
+        .inherit_resume(turn.proof, "prx_missing_original_run");
+    assert!(
+        resumed.funded_money().is_none(),
+        "test: resume cannot manufacture original funding"
+    );
+    assert_eq!(
+        resumed
+            .ensure_available()
+            .expect_err("test: missing original allowance")
+            .to_string(),
+        "original recursive allowance is unavailable after resume"
+    );
+    assert_eq!(
+        resumed
+            .carve_child(100)
+            .err()
+            .expect("test: child slot refused")
+            .to_string(),
+        "original recursive allowance is unavailable after resume"
+    );
+    Ok(())
+}

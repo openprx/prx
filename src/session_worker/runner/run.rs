@@ -366,6 +366,20 @@ fn owned_worker_future(
     ))
 }
 
+pub(crate) fn worker_child_skill_reader(
+    config: &Config,
+    catalog: &crate::tools::capability::catalog::CapabilityCatalog,
+    allowed: &std::collections::BTreeSet<crate::causal_tree::branch::CapabilityRef>,
+) -> anyhow::Result<crate::tools::SkillReadTool> {
+    let references: Vec<_> = allowed.iter().cloned().collect();
+    let metadata: Vec<crate::skills::SkillMetadata> = catalog
+        .resolve(&references)?
+        .into_iter()
+        .filter_map(|entry| entry.skill_metadata.as_deref().cloned())
+        .collect();
+    Ok(crate::tools::SkillReadTool::new(config.workspace_dir.clone(), config.clone()).with_child_metadata(metadata))
+}
+
 async fn run_owned_manifest(
     manifest: WorkerManifest,
     mut steer_rx: Option<tokio::sync::mpsc::Receiver<String>>,
@@ -516,13 +530,24 @@ async fn run_owned_manifest(
     // Read-only skills retain the authenticated parent's catalog location.
     // The worker's private workspace scopes mutable tools, but rebuilding the
     // reader there would lose the signed skill bindings inherited by the child.
-    let source_skill_reader = (child_parent.is_some() || ordinary_snapshots.is_some() || operator_snapshots.is_some())
-        .then(|| -> Box<dyn crate::tools::Tool> {
-            Box::new(crate::tools::SkillReadTool::new(
-                config.workspace_dir.clone(),
-                config.clone(),
-            ))
+    let source_skill_binding = child_parent
+        .as_ref()
+        .map(|parent| (&parent.catalog, &parent.scope.gate_inputs().0.allowed))
+        .or_else(|| {
+            ordinary_snapshots
+                .as_ref()
+                .map(|parent| (&parent.catalog, &parent.scope.gate_inputs().0.allowed))
+        })
+        .or_else(|| {
+            operator_snapshots
+                .as_ref()
+                .map(|parent| (&parent.catalog, parent.publication.allowed()))
         });
+    let source_skill_reader = source_skill_binding
+        .map(|(catalog, allowed)| -> anyhow::Result<Box<dyn crate::tools::Tool>> {
+            Ok(Box::new(super::worker_child_skill_reader(&config, catalog, allowed)?))
+        })
+        .transpose()?;
     config.workspace_dir = manifest.workspace_dir.clone();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
@@ -1205,38 +1230,7 @@ async fn run_owned_manifest(
                     } else {
                         None
                     };
-                    if let Some(turn) = child_turn.as_ref() {
-                        match turn.is_close() {
-                            #[cfg(not(test))]
-                            Ok(true) => {
-                                return (
-                                    segment_history,
-                                    Err(anyhow::anyhow!("decision requires the constrained execution reader")),
-                                );
-                            }
-                            #[cfg(test)]
-                            Ok(true) => {
-                                let closed = async {
-                                    cleanup.run(async { Ok(()) }).await?;
-                                    let reply = child_segments
-                                        .as_ref()
-                                        .context("worker completion port missing")?
-                                        .completion
-                                        .close(turn, &cancel)
-                                        .await?
-                                        .context("worker close disposition changed")?;
-                                    Ok((reply, crate::agent::turn_contracts::ToolLoopTrace::default()))
-                                }
-                                .await;
-                                if let Ok((reply, _)) = &closed {
-                                    segment_history.push(ChatMessage::assistant(reply.clone()));
-                                }
-                                return (segment_history, closed);
-                            }
-                            Ok(false) => {}
-                            Err(error) => return (segment_history, Err(error)),
-                        }
-                    }
+
                     let initial_input = segment_history.is_empty();
                     let selected_prompt = if let Some(turn) = child_turn.as_ref() {
                         match turn.prompt_skills() {

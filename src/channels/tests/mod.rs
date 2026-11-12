@@ -46,6 +46,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tempfile::TempDir;
 
+struct EngineOffChannelProvider(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl Provider for EngineOffChannelProvider {
+    async fn chat_with_system(
+        &self,
+        _system: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok("ok".into())
+    }
+}
+
 pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::Path) {
     let mut config = Config::default();
     config.workspace_dir = workspace.to_owned();
@@ -64,7 +79,8 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
     let shared = crate::config::new_shared(config);
     let generation = shared.pin();
     let channel_impl = Arc::new(RecordingChannel::default());
-    let channel: Arc<dyn Channel> = channel_impl;
+    let channel: Arc<dyn Channel> = channel_impl.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -72,7 +88,7 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
         config: shared,
         config_generation: generation,
         channels_by_name: Arc::new(channels_by_name),
-        provider: Arc::new(DummyProvider),
+        provider: Arc::new(EngineOffChannelProvider(Arc::clone(&calls))),
         default_provider: Arc::new("test-provider".to_string()),
         memory: Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: channel sqlite")),
         tools_registry: Arc::new(vec![]),
@@ -129,6 +145,12 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
         CancellationToken::new(),
     )
     .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "test: channel provider called once");
+    assert_eq!(
+        response_messages(&channel_impl.sent_messages.lock().await).as_slice(),
+        ["ok"],
+        "test: channel turn completed"
+    );
 }
 
 fn make_workspace() -> TempDir {

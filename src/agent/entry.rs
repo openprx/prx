@@ -207,60 +207,6 @@ fn decision_settlement_snapshot(
     settlement.lock().clone()
 }
 
-#[cfg(test)]
-struct CliDecisionClose<'a> {
-    terminal_guard: Option<&'a crate::runtime::turn_terminal::TurnTerminalGuard>,
-    service: &'a crate::runtime::turn_decision::TurnDecisionService,
-    fabric: &'a MemoryFabric,
-    config: &'a Config,
-    scope: MessageEventScope,
-    terminal_id: String,
-    history_commit_len: usize,
-    started_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::runtime::turn_decision::CloseTurnPorts for CliDecisionClose<'_> {
-    type Receipt = crate::agent::terminal::TurnTerminalReceipt;
-
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        crate::runtime::turn_terminal::commit_terminal(
-            self.terminal_guard,
-            self.fabric,
-            crate::agent::terminal::TurnTerminalDraft {
-                decision: Some(self.service.terminal_settlement_ref(context)?),
-                terminal_id: self.terminal_id.clone(),
-                scope: self.scope.clone(),
-                status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                history: Some(crate::agent::terminal::TurnHistoryProjection {
-                    assistant_content: reply.to_owned(),
-                    history_commit_len: self.history_commit_len,
-                }),
-                history_scope: Some(
-                    self.scope
-                        .clone()
-                        .with_sender("prx_runtime")
-                        .with_recipient("local-user"),
-                ),
-                provider_outcome: None,
-                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                    summary: "agent decision closed".to_owned(),
-                    started_at: self.started_at,
-                    finished_at: chrono::Utc::now(),
-                },
-                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-            },
-            self.config,
-        )
-        .await
-    }
-}
-
 /// A CLI Agent turn whose origin was checked by this entrypoint after inbound
 /// event recording was attempted. Fields stay private; the decision service
 /// reads them but cannot manufacture an authenticated source from a public
@@ -2082,36 +2028,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     terminal_guard
                         .set(guard)
                         .map_err(|_| anyhow::anyhow!("agent terminal owner already exists"))?;
-                    #[cfg(test)]
-                    if let Some(reply) = decision.close_reply()? {
-                        let ports = CliDecisionClose {
-                            terminal_guard: terminal_guard.get(),
-                            service,
-                            fabric: &memory_fabric,
-                            config: &config,
-                            scope: runtime_envelope.message_scope(),
-                            terminal_id: turn_run_id.clone(),
-                            history_commit_len: 2,
-                            started_at: turn_started_at,
-                        };
-                        service
-                            .close_agent_directive_turn(proof, Arc::clone(&decision), &ports, shutdown)
-                            .await?;
-                        final_output = reply.to_string();
-                        if !QUIET_SINGLE_SHOT.try_with(|quiet| *quiet).unwrap_or(false) {
-                            println!("{reply}");
-                            if matches!(
-                                decision.directive(),
-                                crate::causal_tree::directive::TurnExecutionDirective::Refuse { .. }
-                            ) {
-                                return Err(AgentTurnRefused {
-                                    reply: final_output.clone(),
-                                }
-                                .into());
-                            }
-                        }
-                        return Ok::<(), anyhow::Error>(());
-                    }
+
                     (service, proof, decision, route_decision, advice)
                 };
 
@@ -2571,37 +2488,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         None,
                     )?
                     .with_provider_trace(Arc::clone(&retained_provider_trace), route_decision.clone());
-                    #[cfg(test)]
-                    if let Some(reply) = decision.close_reply()? {
-                        if history.is_empty() {
-                            history.push(ChatMessage::system(""));
-                        }
-                        let ports = CliDecisionClose {
-                            terminal_guard: Some(&terminal_guard),
-                            service,
-                            fabric: &memory_fabric,
-                            config: &config,
-                            scope: runtime_envelope.message_scope(),
-                            terminal_id: turn_run_id.clone(),
-                            history_commit_len: history.len() + 2,
-                            started_at: chrono::Utc::now(),
-                        };
-                        service
-                            .close_agent_directive_turn(&proof, Arc::clone(&decision), &ports, shutdown)
-                            .await?;
-                        history.push(crate::agent::turn_contracts::inbound_user_message(&user_input));
-                        history.push(ChatMessage::assistant(reply.as_ref()));
-                        final_output = reply.to_string();
-                        println!("{reply}\n");
-                        observer.record_event(&ObserverEvent::TurnComplete);
-                        hooks
-                            .emit(
-                                HookEvent::TurnComplete,
-                                serde_json::json!({"mode":"interactive","response_chars":reply.chars().count()}),
-                            )
-                            .await;
-                        continue;
-                    }
+
                     (
                         service,
                         proof,

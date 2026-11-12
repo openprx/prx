@@ -19,6 +19,7 @@ use self::paths::parse_tools_override;
 pub(crate) use self::provider::build_worker_provider_selection;
 use self::provider::worker_credentials;
 use self::run::run_authenticated_manifest;
+pub(crate) use self::run::worker_child_skill_reader;
 use self::steering::spawn_stdin_control_reader;
 use self::validate::{validate_worker_cli_overrides, validate_worker_manifest_with_capability_env};
 use crate::config::Config;

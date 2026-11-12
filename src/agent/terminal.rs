@@ -1739,41 +1739,11 @@ mod tests {
         let mut draft = completed_commit("prx_awaiting_ledger");
         let _service =
             bind_terminal_fixture(temp.path(), Arc::clone(&memory), &mut draft, &CostConfig::default()).await;
-        let mut decision = draft.decision.expect("test: fixture settlement");
+        let decision = draft.decision.expect("test: fixture settlement");
         assert!(
             !skill_awaiting_approval(&decision, None),
             "an ordinary completed turn is not awaiting approval"
         );
-        let cap = decision
-            .context
-            .execution_refs()
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
-                id: crate::causal_tree::branch::CapabilityId::new(
-                    crate::causal_tree::branch::CapabilityTarget::NativeTool,
-                    "test",
-                    "probe",
-                )
-                .expect("test: test capability id"),
-                fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
-                generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
-            });
-        Arc::get_mut(&mut decision.context)
-            .expect("test: fixture settlement uniquely owns its context")
-            .install_collection_proof_for_test(
-                crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
-                    cap,
-                    crate::causal_tree::approval_collection::ApprovalReviewAdapter::ChatOwnerReview,
-                    "0".repeat(64),
-                ),
-            );
-        assert!(
-            !skill_awaiting_approval(&decision, None),
-            "a collection proof is not 02a ledger state; pending events and trace attempts are"
-        );
-
         let mut draft_attempts = completed_commit("prx_awaiting_attempts");
         let _service = bind_terminal_fixture(
             temp.path(),

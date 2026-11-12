@@ -49,25 +49,13 @@ mod pending_approval;
 pub(crate) use pending_approval::DecisionApprovalView;
 #[path = "turn_decision/routing/replay_facts.rs"]
 mod router_replay_facts;
-pub(crate) use router_replay_facts::{RouterReadFacts, provider_binding as router_provider_binding};
+pub(crate) use router_replay_facts::provider_binding as router_provider_binding;
 mod latency_snapshot;
 #[cfg(feature = "llm-router")]
 mod routing;
-#[cfg(all(test, feature = "llm-router"))]
-pub(crate) use routing::RouterModelReadmission;
+
 #[cfg(feature = "llm-router")]
 pub(crate) use routing::commit_training_owned;
-
-#[cfg(all(test, feature = "llm-router"))]
-#[inline(never)]
-fn boxed_router_history_field<'a, F>(
-    make: impl FnOnce() -> F,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = F::Output> + Send + 'a>>
-where
-    F: std::future::Future + Send + 'a,
-{
-    Box::pin(make())
-}
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,8 +78,7 @@ use crate::causal_tree::decision_engine::{CausalDecisionEngine, EngineInputs};
 use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, EngineError, RetrievalIssueError};
 use crate::causal_tree::decision_rehearsal::RehearsalPorts;
 use crate::causal_tree::decision_rehearsal::{CatalogProbe, MemoryProbe, PinnedCount, ProbeUnavailable, SkillProbe};
-#[cfg(test)]
-use crate::causal_tree::directive::render_terminal_directive;
+
 use crate::causal_tree::directive::{DirectiveContext, directive_from_selection};
 use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective, selected_discovery_family};
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
@@ -694,8 +681,7 @@ pub(crate) struct TurnDecisionContext {
     main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     execution_closed: Arc<AtomicBool>,
-    #[cfg(test)]
-    approval_collection_started: AtomicBool,
+
     collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
     discovery_offers: std::sync::OnceLock<Arc<parking_lot::Mutex<discovery::DiscoveryOffers>>>,
     discovery_admissions: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, discovery::DiscoveryAdmission>>>,
@@ -709,8 +695,6 @@ pub(crate) struct TurnDecisionContext {
     execution_refs: BTreeSet<CapabilityRef>,
     #[cfg(test)]
     selected_retrieved: Vec<ObservedArtifact>,
-    #[cfg(all(test, feature = "llm-router"))]
-    router_transition: Option<Arc<routing::RouterTransition>>,
 }
 
 /// Ids of the discovery admissions that can run without an approval. One that
@@ -723,39 +707,6 @@ fn unprompted_admission_ids(
         .values()
         .filter(|admission| !admission.requires_approval)
         .map(|admission| admission.reference.id.as_str().to_owned())
-}
-
-pub(crate) enum TurnDisposition {
-    #[cfg(test)]
-    Close {
-        reply: std::borrow::Cow<'static, str>,
-    },
-    Run,
-}
-
-/// CDP-23 supplies the durable terminal adapter. The service passes no caller
-/// chosen scope, terminal ID, or reply text across this boundary.
-#[cfg(test)]
-#[async_trait::async_trait]
-pub(crate) trait CloseTurnPorts: Send + Sync {
-    type Receipt: Send;
-
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt>;
-}
-
-#[cfg(test)]
-pub(crate) async fn close_directive_turn<P: CloseTurnPorts>(
-    context: Arc<TurnDecisionContext>,
-    ports: &P,
-) -> anyhow::Result<P::Receipt> {
-    let TurnDisposition::Close { reply } = context.disposition()? else {
-        anyhow::bail!("decision requires the constrained execution reader");
-    };
-    ports.finalize_closed_turn(context, &reply).await
 }
 
 /// Applied-event admission issued by the owning service after terminal commit
@@ -816,134 +767,6 @@ impl VerifiedDirectiveApplication {
 
     pub(super) fn into_parts(self) -> (CausalEvent, String, Option<(u64, Arc<str>)>) {
         (self.event, self.idempotency_key, self.original_generation)
-    }
-}
-
-impl TurnDecisionService {
-    /// Close an authenticated fixed terminal through its owning service.
-    /// Applied telemetry is queued only after a matching durable receipt;
-    /// persistence failure is reported as incomplete and remains retryable.
-    #[cfg(test)]
-    pub(crate) async fn close_agent_directive_turn<P>(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: Arc<TurnDecisionContext>,
-        ports: &P,
-        cancellation: &CancellationToken,
-    ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt>
-    where
-        P: CloseTurnPorts<Receipt = crate::agent::terminal::TurnTerminalReceipt>,
-    {
-        validate_agent_turn_origin(&self.generation, self.surface, proof)?;
-        anyhow::ensure!(
-            context.source_actor_matches(Some(proof.policy_channel()), Some(proof.policy_sender())),
-            "closing decision belongs to another ingress actor"
-        );
-        let hop = context
-            .audit_hops()
-            .last()
-            .context("closing decision has no final hop")?;
-        let trusted = hop.state.trusted.parts();
-        anyhow::ensure!(
-            context.service_id == self.service_id
-                && trusted.surface == self.surface
-                && trusted.channel.is_none()
-                && trusted.workspace_id.as_ref() == proof.workspace_id()
-                && trusted.owner_id.as_deref() == Some(proof.owner_id())
-                && trusted.session_key.as_deref() == Some(proof.session_key())
-                && trusted.run_id.as_deref() == Some(proof.run_id())
-                && trusted.task_id.as_deref() == proof.task_id()
-                && trusted.source_event_id.as_deref() == proof.source_event_id()
-                && hop.state.routing_input.as_str()
-                    == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref()
-                && trusted.catalog_generation == *self.catalog.generation()
-                && trusted.policy_version == self.policy_version
-                && context.hop_ids().last().copied() == Some(context.decision_id()),
-            "closing decision does not match its source-owned turn"
-        );
-        #[cfg(not(test))]
-        {
-            let _ = (ports, cancellation);
-            anyhow::bail!("decision requires the constrained execution reader");
-        }
-        #[cfg(test)]
-        {
-            let TurnDisposition::Close { reply } = context.disposition()? else {
-                anyhow::bail!("decision requires the constrained execution reader");
-            };
-            anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
-            let eligible = self.generation.effective.causal_tree.enabled
-                && self.durable_key
-                && self.recordable
-                && context.record_admitted.load(Ordering::Acquire)
-                && self.store.mode() == StoreMode::ReadWrite
-                && self.durable_events.is_some();
-            if eligible {
-                self.settlement_ref(Arc::clone(&context))?
-                    .validate_durable_chain()
-                    .await?;
-            }
-            anyhow::ensure!(!cancellation.is_cancelled(), "terminal close was cancelled");
-            let receipt = ports.finalize_closed_turn(Arc::clone(&context), &reply).await?;
-            // Cancellation can leave an actually committed marker. Do not claim
-            // application from this cancelled helper or pretend to undo that I/O.
-            anyhow::ensure!(
-                !cancellation.is_cancelled(),
-                "terminal close was cancelled after finalization"
-            );
-            if eligible {
-                let facts = TerminalFacts::from_receipt(&context, &receipt)?;
-                anyhow::ensure!(
-                    facts.is_completed_local_close(),
-                    "terminal receipt is not a completed local close"
-                );
-                let key = format!("turn:{}:final", receipt.terminal_id);
-                let stored = self
-                    .memory
-                    .find_message_event_by_idempotency_key(proof.workspace_id(), &key)
-                    .await?
-                    .context("terminal receipt is not in the owning service memory")?;
-                anyhow::ensure!(
-                    serde_json::to_value(&stored)? == serde_json::to_value(&receipt.terminal_event)?,
-                    "terminal receipt differs from its committed marker"
-                );
-                anyhow::ensure!(
-                    !cancellation.is_cancelled(),
-                    "terminal close was cancelled before application"
-                );
-                let event = CausalEvent {
-                    kind: CausalEventKind::DirectiveApplied,
-                    lineage: CausalLineage {
-                        workspace_id: Arc::from(proof.workspace_id()),
-                        owner_id: Some(Arc::from(proof.owner_id())),
-                        session_key: Some(Arc::from(proof.session_key())),
-                        run_id: Some(Arc::from(proof.run_id())),
-                        source_event_id: proof.source_event_id().map(Arc::from),
-                        causation_event_id: Some(Arc::from(stored.event_id)),
-                        decision_id: Some(Arc::from(context.decision_id().to_string())),
-                        ..CausalLineage::default()
-                    },
-                    fields: CausalEventFields {
-                        item_count: Some(1),
-                        ..CausalEventFields::default()
-                    },
-                };
-                let application = VerifiedDirectiveApplication {
-                    event,
-                    idempotency_key: format!("causal:{}:directive-applied", context.decision_id()),
-                    original_generation: None,
-                };
-                anyhow::ensure!(
-                    !cancellation.is_cancelled(),
-                    "terminal close was cancelled before queue admission"
-                );
-                self.durable_events
-                    .as_ref()
-                    .context("applied event sink is unavailable")?
-                    .emit_applied(application);
-            }
-            Ok(receipt)
-        }
     }
 }
 
@@ -1038,6 +861,7 @@ fn direct_answer_refs(
     catalog: &CatalogView<'_>,
     gates: &GateInputs<'_>,
     selected_discovery_refs: &BTreeSet<CapabilityRef>,
+    estimate: &dyn Fn(usize) -> Option<crate::causal_tree::branch::CostEstimate>,
 ) -> BTreeSet<CapabilityRef> {
     let fallback_answer = matches!(
         decision.selection,
@@ -1099,19 +923,7 @@ fn direct_answer_refs(
                     required_capabilities: vec![reference.clone()],
                     side_effect: entry.effect,
                     approval: entry.approval.clone(),
-                    estimated_cost: gates.child_scope.and_then(|_| {
-                        delegation::publication_cost(decision, &reference, delegation).or_else(|| {
-                            // Engine-off Direct never admits UseTool candidates, so
-                            // G1 would otherwise refuse every child Direct ref.
-                            decision
-                                .prediction
-                                .is_none()
-                                .then_some(crate::causal_tree::branch::CostEstimate {
-                                    tokens: 0,
-                                    micro_usd: 0,
-                                })
-                        })
-                    }),
+                    estimated_cost: gates.child_scope.and_then(|_| estimate(entry.schema_bytes)),
                     estimated_latency_ms: None,
                 },
             );
@@ -1160,43 +972,6 @@ fn discovery_can_answer(decision: &EngineDecision) -> bool {
 }
 
 impl TurnDecisionContext {
-    /// Only already-issued Router work may finish its fixed close after the
-    /// caller cancels. This is persistence cleanup, never an execution lease.
-    pub(crate) const fn router_cleanup_close(&self) -> bool {
-        #[cfg(all(test, feature = "llm-router"))]
-        {
-            self.router_transition.is_some()
-                && matches!(
-                    self.directive,
-                    TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-                )
-        }
-        #[cfg(not(all(test, feature = "llm-router")))]
-        {
-            false
-        }
-    }
-
-    #[cfg(all(feature = "llm-router", test))]
-    pub(crate) fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
-        self.router_transition
-            .as_ref()
-            .map(|transition| transition.replay_facts(self, key))
-            .transpose()
-    }
-
-    #[cfg(all(feature = "llm-router", not(test)))]
-    pub(crate) const fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
-        let _ = key;
-        Ok(None)
-    }
-
-    #[cfg(not(feature = "llm-router"))]
-    pub(crate) const fn router_replay_facts(&self, key: &DecisionKey) -> anyhow::Result<Option<RouterReadFacts>> {
-        let _ = key;
-        Ok(None)
-    }
-
     pub(crate) fn claimed_resume_event(&self) -> Option<&crate::memory::MessageEvent> {
         self.resume.as_ref().and_then(|resume| resume.claimed_event())
     }
@@ -1275,8 +1050,6 @@ impl TurnDecisionContext {
             }
             crate::causal_tree::decision_select::Selection::Abstain { .. } => Some("none"),
             crate::causal_tree::decision_select::Selection::RequestApproval { .. } => None,
-            #[cfg(test)]
-            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(_) => None,
         }
     }
 
@@ -1305,28 +1078,6 @@ impl TurnDecisionContext {
         &self.engine.state.trusted.parts().constraints
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_collection_proof_for_test(
-        &mut self,
-        proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
-    ) {
-        self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_collect_directive_for_test(
-        &mut self,
-        proof: crate::causal_tree::approval_collection::DeferredArgumentProof,
-    ) {
-        self.directive = TurnExecutionDirective::CollectApprovalArguments;
-        self.engine.selection = crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn approval_collection_started_for_test(&self) -> bool {
-        self.approval_collection_started.load(Ordering::Acquire)
-    }
-
     /// Exact final-gated parent execution metadata. Reading these references
     /// grants no dispatch lease; the constrained reader must recheck scope,
     /// generation, security and approval at its execution boundary.
@@ -1342,16 +1093,6 @@ impl TurnDecisionContext {
             .get()
             .map(|result| result.event())
             .filter(|event| event.event_type == "approval.collection.declined")
-    }
-
-    pub(crate) const fn approval_collection_proof(
-        &self,
-    ) -> Option<&crate::causal_tree::approval_collection::DeferredArgumentProof> {
-        match &self.engine.selection {
-            #[cfg(test)]
-            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(proof) => Some(proof),
-            _ => None,
-        }
     }
 
     pub(crate) const fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
@@ -1385,35 +1126,6 @@ impl TurnDecisionContext {
         Ok(&self.selected_retrieved)
     }
 
-    pub(crate) fn disposition(&self) -> Result<TurnDisposition, DirectiveError> {
-        match &self.directive {
-            #[cfg(test)]
-            TurnExecutionDirective::Clarify { .. }
-            | TurnExecutionDirective::RequestApproval { .. }
-            | TurnExecutionDirective::Refuse { .. } => Ok(TurnDisposition::Close {
-                reply: render_terminal_directive(&self.directive)?,
-            }),
-            #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments if !self.execution_closed.load(Ordering::Acquire) => {
-                Ok(TurnDisposition::Run)
-            }
-            TurnExecutionDirective::AnswerDirectly if !self.execution_closed.load(Ordering::Acquire) => {
-                Ok(TurnDisposition::Run)
-            }
-            TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. }
-                if !self.execution_closed.load(Ordering::Acquire) =>
-            {
-                Ok(TurnDisposition::Run)
-            }
-            #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments => Err(DirectiveError::NotAdmitted),
-            TurnExecutionDirective::AnswerDirectly
-            | TurnExecutionDirective::Execute { .. }
-            | TurnExecutionDirective::Delegate { .. } => Err(DirectiveError::NotAdmitted),
-            _ => Err(DirectiveError::ActionMismatch),
-        }
-    }
-
     fn refusal_reply(&self) -> Option<std::borrow::Cow<'static, str>> {
         let crate::causal_tree::decision_select::Selection::Abstain {
             action: CausalActionKind::Refuse,
@@ -1429,55 +1141,12 @@ impl TurnDecisionContext {
         ))
     }
 
-    pub(crate) fn close_reply(&self) -> anyhow::Result<Option<std::borrow::Cow<'static, str>>> {
-        let disposition = self.disposition().map_err(|error| {
-            let error = anyhow::Error::new(error);
-            match self.refusal_reply() {
-                Some(reply) => error.context(reply.into_owned()),
-                None => error,
-            }
-        })?;
-        match disposition {
-            #[cfg(test)]
-            TurnDisposition::Close { reply } => Ok(Some(reply)),
-            TurnDisposition::Run => Ok(None),
-        }
-    }
-
     pub(crate) fn is_run(&self) -> Result<bool, DirectiveError> {
-        Ok(matches!(self.disposition()?, TurnDisposition::Run))
+        Ok(!self.execution_closed.load(Ordering::Acquire))
     }
 
-    #[cfg(not(test))]
     pub(crate) const fn pending_approval_id(&self) -> Option<DecisionId> {
         None
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_approval_id(&self) -> Option<DecisionId> {
-        matches!(self.directive, TurnExecutionDirective::RequestApproval { .. }).then(|| self.decision_id())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn diagnostic_directive_kind(&self) -> (&'static str, String) {
-        match &self.directive {
-            TurnExecutionDirective::Clarify { reason_code } => ("Clarify", reason_code.clone()),
-            TurnExecutionDirective::Refuse { policy_code, .. } => ("Refuse", policy_code.clone()),
-            TurnExecutionDirective::AnswerDirectly => ("AnswerDirectly", "not_applicable".to_owned()),
-            TurnExecutionDirective::Execute { .. } => ("Execute", "not_applicable".to_owned()),
-            TurnExecutionDirective::Delegate { .. } => ("Delegate", "not_applicable".to_owned()),
-            TurnExecutionDirective::Retrieve { .. } => ("Retrieve", "not_applicable".to_owned()),
-            TurnExecutionDirective::Discover { .. } => ("Discover", "not_applicable".to_owned()),
-            TurnExecutionDirective::RequestApproval { .. } => ("RequestApproval", "not_applicable".to_owned()),
-            TurnExecutionDirective::CollectApprovalArguments => {
-                ("CollectApprovalArguments", "not_applicable".to_owned())
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn carries_collect_directive_for_test(&self) -> bool {
-        matches!(self.directive, TurnExecutionDirective::CollectApprovalArguments)
     }
 }
 
@@ -1533,9 +1202,7 @@ pub(crate) enum AgentDecisionError {
     EventMemory(#[source] anyhow::Error),
     #[error("durable ingress recovery is not ready")]
     IngressRecovery(#[source] anyhow::Error),
-    #[cfg(all(test, feature = "llm-router"))]
-    #[error("Router purpose-bound decision failed")]
-    Router(#[source] anyhow::Error),
+
     #[error("previous segment observation could not be verified")]
     SegmentObservation(#[source] anyhow::Error),
     #[error("pending approval could not be persisted")]
@@ -2108,12 +1775,8 @@ impl TurnDecisionService {
     /// enabled the decision engine with a remote backend. Default
     /// Auto-without-endpoint and engine-off remote stay on the Direct surface.
     pub(super) fn should_run_prediction_hop(&self) -> bool {
-        #[cfg(test)]
-        if selected_loader_fixture::is_active() {
-            return true;
-        }
         let config = &self.generation.effective;
-        if !config.causal_tree.enabled {
+        if !config.decision_engine.enabled {
             return false;
         }
         if matches!(
@@ -2324,7 +1987,9 @@ impl TurnDecisionService {
             replayed_non_idempotent: &replayed_non_idempotent,
             retry_limit: None,
         };
-        let execution_refs = direct_answer_refs(&engine, &catalog, &gates, &BTreeSet::new());
+        let execution_refs = direct_answer_refs(&engine, &catalog, &gates, &BTreeSet::new(), &|bytes| {
+            crate::cost::estimate::estimate_cost(&model, &self.generation.effective.cost, bytes)
+        });
         Ok(Arc::new(TurnDecisionContext {
             _event_memory: event_memory,
             model_catalog: self.provider_catalog.release_pin(),
@@ -2338,8 +2003,6 @@ impl TurnDecisionService {
             main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
-            approval_collection_started: AtomicBool::new(false),
             collected_approval_result: std::sync::OnceLock::new(),
             discovery_offers: std::sync::OnceLock::new(),
             discovery_admissions: std::sync::OnceLock::new(),
@@ -2351,8 +2014,6 @@ impl TurnDecisionService {
             execution_refs,
             #[cfg(test)]
             selected_retrieved: Vec::new(),
-            #[cfg(all(test, feature = "llm-router"))]
-            router_transition: None,
         }))
     }
 
@@ -2372,15 +2033,7 @@ impl TurnDecisionService {
             return self.open_turn_context(proof, kind, cancellation).await;
         }
         let context = self
-            .decide_agent_initial_inner(
-                proof,
-                kind,
-                cancellation,
-                None,
-                None,
-                #[cfg(all(test, feature = "llm-router"))]
-                None,
-            )
+            .decide_agent_initial_inner(proof, kind, cancellation, None, None)
             .await?;
         self.record_issued_decision(proof, context, cancellation).await
     }
@@ -2404,15 +2057,7 @@ impl TurnDecisionService {
             .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
         if self.should_run_prediction_hop() {
             let admission = self
-                .decide_agent_initial_inner(
-                    proof,
-                    kind,
-                    cancellation,
-                    Some(&admitted),
-                    None,
-                    #[cfg(all(test, feature = "llm-router"))]
-                    None,
-                )
+                .decide_agent_initial_inner(proof, kind, cancellation, Some(&admitted), None)
                 .await?;
             return self.record_issued_decision(proof, admission, cancellation).await;
         }
@@ -2429,7 +2074,6 @@ impl TurnDecisionService {
         cancellation: &CancellationToken,
         resume: Option<&pending_approval::AdmittedDecisionResume>,
         segment_observation: Option<&segment_observation::SegmentObservation>,
-        #[cfg(all(test, feature = "llm-router"))] mut routing: Option<&mut routing::RouterContinuation<'_>>,
     ) -> Result<accounting::AdmissionDecision, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
@@ -2563,73 +2207,10 @@ impl TurnDecisionService {
             lineage: HopLineage::First,
             built_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
         };
-        #[cfg(all(test, feature = "llm-router"))]
-        let mut routing_hop = None;
-        #[cfg(all(test, feature = "llm-router"))]
-        let mut routing_closed = false;
-        #[cfg(all(test, feature = "llm-router"))]
-        if let Some(continuation) = routing.as_deref_mut() {
-            let (decision, next) = boxed_router_history_field(|| {
-                self.router_history_hop(&state, deadline, continuation, cancellation, &accounting)
-            })
-            .await?;
-            match next {
-                Some(next) => state = next,
-                None => {
-                    state = decision.state.clone();
-                    routing_closed = true;
-                }
-            }
-            routing_hop = Some(decision);
-        }
-        #[cfg(all(test, feature = "llm-router"))]
-        let proof: &dyn TurnSourceProof = routing
-            .as_deref()
-            .map_or(proof, |continuation| continuation.source().as_ref());
-        #[cfg(all(test, feature = "llm-router"))]
-        let router_transition = routing.as_deref().and_then(routing::RouterContinuation::transition);
-        #[cfg(all(test, feature = "llm-router"))]
-        let has_router_transition = router_transition.is_some();
-        #[cfg(not(all(test, feature = "llm-router")))]
-        let has_router_transition = false;
-        #[cfg(all(test, feature = "llm-router"))]
-        let routing_failed = routing.as_deref().is_some_and(routing::RouterContinuation::failed);
-        #[cfg(not(all(test, feature = "llm-router")))]
-        let routing_failed = false;
-        #[cfg(all(test, feature = "llm-router"))]
-        let budget = if let Some(compaction) = routing
-            .as_deref()
-            .and_then(routing::RouterContinuation::main_compaction)
-        {
-            let mut compaction = compaction.clone();
-            let original_limit = budget
-                .main_compaction
-                .max_context_tokens
-                .saturating_sub(budget.main_compaction.reserve_tokens);
-            let admitted_limit = compaction.max_context_tokens.saturating_sub(compaction.reserve_tokens);
-            if admitted_limit > original_limit {
-                compaction.reserve_tokens = compaction
-                    .max_context_tokens
-                    .checked_sub(original_limit)
-                    .ok_or(AgentDecisionError::Deadline)?;
-            }
-            AgentDecisionBudget {
-                budgets: budget.budgets,
-                main_compaction: compaction,
-            }
-        } else {
-            budget
-        };
+
         // Only the history path re-admits a model. The ordinary path retains
         // its existing resolved value and allocation count.
-        #[cfg(all(test, feature = "llm-router"))]
-        let (model, model_ref) = if routing.is_some() {
-            let model = self.resolve_agent_model(proof)?;
-            let model_ref = Arc::from(format!("{}:{}", model.provider_label(), model.model()));
-            (model, model_ref)
-        } else {
-            (model, model_ref)
-        };
+
         let decision_request_model = self.factory.request_model().or_else(|| Some(model.model()));
         let cost_model = super::turn_cost::RuntimeCostModel::new(&model, config, &observed_latency);
         let mut discovered_refs = DiscoveredRefs::empty();
@@ -2673,226 +2254,133 @@ impl TurnDecisionService {
         };
         let configured_delegation_target = self.configured_delegation_target(proof);
         // A live registry drift cannot authorize a stale work selection. The
-        // source and PMM model have already been checked above; rebuild only
-        // a local gated Close directive from the pinned turn facts. The fresh
-        // Router transitions retain every completed hop; ordinary drift keeps
-        // its established single-close representation.
-        let terminal_after_catalog_drift = |source: &CausalState,
-                                            prior_hops: Vec<EngineDecision>|
-         -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-            if cancellation.is_cancelled() && !has_router_transition {
-                return Err(AgentDecisionError::Cancelled);
-            }
-            #[cfg(all(test, feature = "llm-router"))]
-            let prior_hops = if router_transition.is_some() {
-                prior_hops
-            } else {
-                Vec::new()
-            };
-            #[cfg(not(all(test, feature = "llm-router")))]
-            let prior_hops = {
-                let _ = prior_hops;
-                Vec::<EngineDecision>::new()
-            };
-            let mut terminal_state = source.clone();
-            if prior_hops.is_empty() {
+        // source and PMM model have already been checked above. Preserve the
+        // conservative single-hop terminal representation after registry drift.
+        let terminal_after_catalog_drift =
+            |source: &CausalState| -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
+                if cancellation.is_cancelled() {
+                    return Err(AgentDecisionError::Cancelled);
+                }
+                let prior_hops = Vec::<EngineDecision>::new();
+                let mut terminal_state = source.clone();
                 terminal_state.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0)
                     .with_exact_call_observations(terminal_state.observed.exact_call_observations().cloned());
-            }
-            terminal_state.lineage = match prior_hops.last() {
-                Some(prior) => HopLineage::After {
-                    hop: u8::try_from(prior_hops.len())
-                        .ok()
-                        .and_then(NonZeroU8::new)
-                        .ok_or(AgentDecisionError::UnsupportedAction)?,
-                    prior_decision_id: prior.decision_id.as_uuid(),
-                },
-                None => HopLineage::First,
-            };
-            if has_router_transition {
-                let mut parts = terminal_state.trusted.parts().clone();
-                parts.budgets.latency_ms = parts.budgets.latency_ms.min(
-                    u64::try_from(
-                        deadline
-                            .saturating_duration_since(crate::causal_tree::logical_clock::now())
-                            .as_millis(),
-                    )
-                    .unwrap_or(0),
+                terminal_state.lineage = HopLineage::First;
+                terminal_state.derived = DerivedState::default();
+                terminal_state.built_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+                let no_work_refs = DiscoveredRefs::empty();
+                let decision_id = DecisionId::new_runtime();
+                self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
+                let inputs = EngineInputs {
+                    state: &terminal_state,
+                    catalog: &catalog,
+                    config: &config.causal_tree,
+                    key: &self.state_key,
+                    decision_id,
+                    cost_model: &cost_model,
+                    discovered_refs: &no_work_refs,
+                    gates: &gates,
+                    delegation: None,
+                    delegation_max_depth: 0,
+                    prediction: self.factory.prediction_port(Some(&accounting)),
+                    rehearsal_ports: &rehearsal_ports,
+                    request_limits: RequestLimits {
+                        max_request_bytes: config.causal_tree.backend.max_request_bytes,
+                        ..RequestLimits::default()
+                    },
+                    model: decision_request_model,
+                    can_deliver_text: true,
+                    may_delegate: false,
+                    delegation_target: configured_delegation_target,
+                    terminal_only: true,
+                    allow_terminal_answer: false,
+                    deadline,
+                    #[cfg(test)]
+                    inject_builtin_failure: false,
+                    #[cfg(test)]
+                    after_prediction_pause: None,
+                };
+                let prepared = match resume_evidence.as_ref() {
+                    Some(evidence) => CausalDecisionEngine::prepare_hop_with_resume_target(
+                        &inputs,
+                        Some(&evidence.candidate_reference),
+                    )?,
+                    None => CausalDecisionEngine::prepare_hop(&inputs)?,
+                };
+                self.emit_agent_phase(
+                    proof,
+                    decision_id,
+                    CausalEventKind::CandidatesGenerated,
+                    Some(prepared.candidate_count()),
                 );
-                terminal_state.trusted = TrustedState::from_runtime(parts);
-            }
-            terminal_state.derived = DerivedState::default();
-            terminal_state.built_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
-            let no_work_refs = DiscoveredRefs::empty();
-            let decision_id = DecisionId::new_runtime();
-            self.emit_agent_phase(proof, decision_id, CausalEventKind::SnapshotCreated, None);
-            let inputs = EngineInputs {
-                state: &terminal_state,
-                catalog: &catalog,
-                config: &config.causal_tree,
-                key: &self.state_key,
-                decision_id,
-                cost_model: &cost_model,
-                discovered_refs: &no_work_refs,
-                gates: &gates,
-                delegation: None,
-                delegation_max_depth: 0,
-                prediction: self.factory.prediction_port(Some(&accounting)),
-                rehearsal_ports: &rehearsal_ports,
-                request_limits: RequestLimits {
-                    max_request_bytes: config.causal_tree.backend.max_request_bytes,
-                    ..RequestLimits::default()
-                },
-                model: decision_request_model,
-                can_deliver_text: true,
-                may_delegate: false,
-                delegation_target: configured_delegation_target,
-                terminal_only: true,
-                allow_terminal_answer: false,
-                deadline,
-                #[cfg(test)]
-                inject_builtin_failure: false,
-                #[cfg(test)]
-                after_prediction_pause: None,
-            };
-            let prepared = match resume_evidence.as_ref() {
-                Some(evidence) => {
-                    CausalDecisionEngine::prepare_hop_with_resume_target(&inputs, Some(&evidence.candidate_reference))?
-                }
-                None => CausalDecisionEngine::prepare_hop(&inputs)?,
-            };
-            self.emit_agent_phase(
-                proof,
-                decision_id,
-                CausalEventKind::CandidatesGenerated,
-                Some(prepared.candidate_count()),
-            );
-            let decision = CausalDecisionEngine::decide_terminal_for_reason(prepared, "catalog_drift")?;
-            self.emit_agent_phase(
-                proof,
-                decision_id,
-                CausalEventKind::CandidateGated,
-                Some(decision.pre_commit.outcomes.len()),
-            );
-            let directive = directive_from_selection(
-                &decision,
-                &DirectiveContext {
-                    current_generation: catalog.generation(),
-                    approval_expires_at: chrono::Utc::now(),
-                    discovery_limit: 0,
-                },
-            )?;
-            if !matches!(
-                directive,
-                TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-            ) {
-                return Err(AgentDecisionError::UnsupportedAction);
-            }
-            if cancellation.is_cancelled() && !has_router_transition {
-                return Err(AgentDecisionError::Cancelled);
-            }
-            Ok(Arc::new(TurnDecisionContext {
-                _event_memory: Arc::clone(&event_memory),
-                model_catalog: self.provider_catalog.release_pin(),
-                resume: None,
-                accounting: accounting.retained_scope(),
-                owner_filesystem: owner_filesystem.clone(),
-                source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
-                service_id: self.service_id,
-                record_admitted: AtomicBool::new(false),
-                recursive_allowance: self.recursive_allowances.retain(proof),
-                main_parameters: Default::default(),
-                execution_trace: std::sync::OnceLock::new(),
-                execution_closed: Arc::new(AtomicBool::new(false)),
-                #[cfg(test)]
-                approval_collection_started: AtomicBool::new(false),
-                collected_approval_result: std::sync::OnceLock::new(),
-                discovery_offers: std::sync::OnceLock::new(),
-                discovery_admissions: std::sync::OnceLock::new(),
-                engine: decision,
-                hop_ids: prior_hops
-                    .iter()
-                    .map(|hop| hop.decision_id)
-                    .chain(std::iter::once(decision_id))
-                    .collect(),
-                prior_hops,
-                directive,
-                main_compaction: budget.main_compaction.clone(),
-                execution_refs: BTreeSet::new(),
-                #[cfg(test)]
-                selected_retrieved: Vec::new(),
-                #[cfg(all(test, feature = "llm-router"))]
-                router_transition: router_transition.clone(),
-            }))
-        };
-        let mut stop_hops = routing_failed;
-        let mut allow_terminal_answer = false;
-        let mut hop_ids = Vec::new();
-        let mut prior_hops = Vec::new();
-        #[cfg(all(test, feature = "llm-router"))]
-        if let Some(decision) = routing_hop.take() {
-            hop_ids.push(decision.decision_id);
-            if routing_closed {
+                let decision = CausalDecisionEngine::decide_terminal_for_reason(prepared, "catalog_drift")?;
+                self.emit_agent_phase(
+                    proof,
+                    decision_id,
+                    CausalEventKind::CandidateGated,
+                    Some(decision.pre_commit.outcomes.len()),
+                );
                 let directive = directive_from_selection(
                     &decision,
                     &DirectiveContext {
                         current_generation: catalog.generation(),
                         approval_expires_at: chrono::Utc::now(),
-                        discovery_limit: 1,
+                        discovery_limit: 0,
                     },
                 )?;
-                let execution_refs = if matches!(directive, TurnExecutionDirective::AnswerDirectly) {
-                    direct_answer_refs(&decision, &catalog, &gates, &BTreeSet::new())
-                } else {
-                    BTreeSet::new()
-                };
-                return Ok((
-                    Arc::new(TurnDecisionContext {
-                        _event_memory: Arc::clone(&event_memory),
-                        model_catalog: self.provider_catalog.release_pin(),
-                        resume: None,
-                        accounting: accounting.retained_scope(),
-                        owner_filesystem: owner_filesystem.clone(),
-                        source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
-                        service_id: self.service_id,
-                        record_admitted: AtomicBool::new(false),
-                        recursive_allowance: self.recursive_allowances.retain(proof),
-                        main_parameters: Default::default(),
-                        execution_trace: std::sync::OnceLock::new(),
-                        execution_closed: Arc::new(AtomicBool::new(false)),
-                        #[cfg(test)]
-                        approval_collection_started: AtomicBool::new(false),
-                        collected_approval_result: std::sync::OnceLock::new(),
-                        discovery_offers: std::sync::OnceLock::new(),
-                        discovery_admissions: std::sync::OnceLock::new(),
-                        engine: decision,
-                        prior_hops,
-                        directive,
-                        main_compaction: budget.main_compaction,
-                        hop_ids,
-                        execution_refs,
-                        #[cfg(test)]
-                        selected_retrieved: Vec::new(),
-                        #[cfg(all(test, feature = "llm-router"))]
-                        router_transition: None,
-                    }),
-                    telemetry,
-                ));
-            }
-            prior_hops.push(decision);
-        }
+                if !matches!(
+                    directive,
+                    TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
+                ) {
+                    return Err(AgentDecisionError::UnsupportedAction);
+                }
+                if cancellation.is_cancelled() {
+                    return Err(AgentDecisionError::Cancelled);
+                }
+                Ok(Arc::new(TurnDecisionContext {
+                    _event_memory: Arc::clone(&event_memory),
+                    model_catalog: self.provider_catalog.release_pin(),
+                    resume: None,
+                    accounting: accounting.retained_scope(),
+                    owner_filesystem: owner_filesystem.clone(),
+                    source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
+                    service_id: self.service_id,
+                    record_admitted: AtomicBool::new(false),
+                    recursive_allowance: self.recursive_allowances.retain(proof),
+                    main_parameters: Default::default(),
+                    execution_trace: std::sync::OnceLock::new(),
+                    execution_closed: Arc::new(AtomicBool::new(false)),
+                    collected_approval_result: std::sync::OnceLock::new(),
+                    discovery_offers: std::sync::OnceLock::new(),
+                    discovery_admissions: std::sync::OnceLock::new(),
+                    engine: decision,
+                    hop_ids: prior_hops
+                        .iter()
+                        .map(|hop| hop.decision_id)
+                        .chain(std::iter::once(decision_id))
+                        .collect(),
+                    prior_hops,
+                    directive,
+                    main_compaction: budget.main_compaction.clone(),
+                    execution_refs: BTreeSet::new(),
+                    #[cfg(test)]
+                    selected_retrieved: Vec::new(),
+                }))
+            };
+        let mut stop_hops = false;
+        let mut allow_terminal_answer = false;
+        let mut hop_ids = Vec::new();
+        let mut prior_hops = Vec::new();
+
         #[cfg(test)]
         let mut selected_retrieved = Vec::new();
         let max_hops = config.causal_tree.policy.max_decision_hops;
         for hop in state.lineage.hop()..=max_hops {
             if cancellation.is_cancelled() {
-                if has_router_transition {
-                    return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
-                }
                 return Err(AgentDecisionError::Cancelled);
             }
             if self.check_live_parity().is_err() {
-                return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
+                return terminal_after_catalog_drift(&state).map(|context| (context, telemetry));
             }
             let terminal_only = state.routing_input.as_str().trim().is_empty()
                 || stop_hops
@@ -2943,9 +2431,6 @@ impl TurnDecisionService {
                 None => CausalDecisionEngine::prepare_hop(&inputs)?,
             };
             if cancellation.is_cancelled() {
-                if has_router_transition {
-                    return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
-                }
                 return Err(AgentDecisionError::Cancelled);
             }
             self.emit_agent_phase(
@@ -2955,25 +2440,18 @@ impl TurnDecisionService {
                 Some(prepared.candidate_count()),
             );
             let decision = if terminal_only {
-                if routing_failed {
-                    CausalDecisionEngine::decide_terminal_for_reason(prepared, "routing_failed")?
-                } else {
-                    CausalDecisionEngine::decide_terminal_prepared(prepared)?
-                }
+                CausalDecisionEngine::decide_terminal_prepared(prepared)?
             } else {
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => {
-                        if has_router_transition { return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry)); }
+
                         return Err(AgentDecisionError::Cancelled);
                     },
                     decided = CausalDecisionEngine::decide_prepared(prepared) => decided?,
                 }
             };
             if cancellation.is_cancelled() {
-                if has_router_transition {
-                    return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
-                }
                 return Err(AgentDecisionError::Cancelled);
             }
             self.emit_agent_phase(
@@ -2992,7 +2470,7 @@ impl TurnDecisionService {
             }
             hop_ids.push(decision.decision_id);
             if self.check_live_parity().is_err() {
-                return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
+                return terminal_after_catalog_drift(&state).map(|context| (context, telemetry));
             }
             let context = DirectiveContext {
                 current_generation: catalog.generation(),
@@ -3008,7 +2486,7 @@ impl TurnDecisionService {
                     let observed = tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {
-                        if has_router_transition { return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry)); }
+
                         return Err(AgentDecisionError::Cancelled);
                     },
                         observed = self.observe_selected_agent_memory(proof, &decision) => observed,
@@ -3016,22 +2494,13 @@ impl TurnDecisionService {
                     let observed = match observed {
                         Ok(observed) => observed,
                         Err(AgentRetrievalError::Parity(_)) => {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
+                            return terminal_after_catalog_drift(&state).map(|context| (context, telemetry));
                         }
                         Err(error) => {
-                            if has_router_transition {
-                                return terminal_after_catalog_drift(&state, prior_hops)
-                                    .map(|context| (context, telemetry));
-                            }
                             return Err(error.into());
                         }
                     };
                     if cancellation.is_cancelled() {
-                        if has_router_transition {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
-                        }
                         return Err(AgentDecisionError::Cancelled);
                     }
                     allow_terminal_answer = read_finishes_retrieval(&observed, proof.routing_input());
@@ -3063,14 +2532,9 @@ impl TurnDecisionService {
                     let selected_refs = match self.discover_selected_agent_refs(proof, &decision, &catalog) {
                         Ok(refs) => refs,
                         Err(AgentDiscoveryError::Parity(_)) => {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
+                            return terminal_after_catalog_drift(&state).map(|context| (context, telemetry));
                         }
                         Err(error) => {
-                            if has_router_transition {
-                                return terminal_after_catalog_drift(&state, prior_hops)
-                                    .map(|context| (context, telemetry));
-                            }
                             return Err(error.into());
                         }
                     };
@@ -3110,7 +2574,10 @@ impl TurnDecisionService {
                 }
                 TurnExecutionDirective::AnswerDirectly => {
                     let selected_discovery_refs = discovered_refs.iter().cloned().collect();
-                    let mut execution_refs = direct_answer_refs(&decision, &catalog, &gates, &selected_discovery_refs);
+                    let mut execution_refs =
+                        direct_answer_refs(&decision, &catalog, &gates, &selected_discovery_refs, &|bytes| {
+                            crate::cost::estimate::estimate_cost(&model, &config.cost, bytes)
+                        });
                     let recovery_family = discovery_scope(prior_hops.iter().chain(std::iter::once(&decision)))?;
                     if let Some(family) = recovery_family {
                         execution_refs.retain(|reference| {
@@ -3120,10 +2587,6 @@ impl TurnDecisionService {
                         });
                     }
                     if cancellation.is_cancelled() {
-                        if has_router_transition {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
-                        }
                         return Err(AgentDecisionError::Cancelled);
                     }
                     return Ok((
@@ -3140,8 +2603,6 @@ impl TurnDecisionService {
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             execution_closed: Arc::new(AtomicBool::new(false)),
-                            #[cfg(test)]
-                            approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
@@ -3153,8 +2614,6 @@ impl TurnDecisionService {
                             execution_refs,
                             #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(all(test, feature = "llm-router"))]
-                            router_transition: router_transition.clone(),
                         }),
                         telemetry,
                     ));
@@ -3163,10 +2622,6 @@ impl TurnDecisionService {
                 | TurnExecutionDirective::RequestApproval { .. }
                 | TurnExecutionDirective::Refuse { .. } => {
                     if cancellation.is_cancelled() {
-                        if has_router_transition {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
-                        }
                         return Err(AgentDecisionError::Cancelled);
                     }
                     return Ok((
@@ -3183,8 +2638,6 @@ impl TurnDecisionService {
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             execution_closed: Arc::new(AtomicBool::new(false)),
-                            #[cfg(test)]
-                            approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
@@ -3196,52 +2649,11 @@ impl TurnDecisionService {
                             execution_refs: BTreeSet::new(),
                             #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(all(test, feature = "llm-router"))]
-                            router_transition: router_transition.clone(),
                         }),
                         telemetry,
                     ));
                 }
-                #[cfg(test)]
-                TurnExecutionDirective::CollectApprovalArguments => {
-                    if cancellation.is_cancelled() {
-                        if has_router_transition {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
-                        }
-                        return Err(AgentDecisionError::Cancelled);
-                    }
-                    return Ok((
-                        Arc::new(TurnDecisionContext {
-                            _event_memory: Arc::clone(&event_memory),
-                            model_catalog: self.provider_catalog.release_pin(),
-                            resume: None,
-                            accounting: accounting.retained_scope(),
-                            owner_filesystem: owner_filesystem.clone(),
-                            source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
-                            service_id: self.service_id,
-                            record_admitted: AtomicBool::new(false),
-                            recursive_allowance: self.recursive_allowances.retain(proof),
-                            main_parameters: Default::default(),
-                            execution_trace: std::sync::OnceLock::new(),
-                            execution_closed: Arc::new(AtomicBool::new(false)),
-                            approval_collection_started: AtomicBool::new(false),
-                            collected_approval_result: std::sync::OnceLock::new(),
-                            discovery_offers: std::sync::OnceLock::new(),
-                            discovery_admissions: std::sync::OnceLock::new(),
-                            engine: decision,
-                            prior_hops,
-                            directive,
-                            main_compaction: budget.main_compaction,
-                            hop_ids,
-                            execution_refs: BTreeSet::new(),
-                            selected_retrieved,
-                            #[cfg(all(test, feature = "llm-router"))]
-                            router_transition: router_transition.clone(),
-                        }),
-                        telemetry,
-                    ));
-                }
+
                 TurnExecutionDirective::Execute { .. } | TurnExecutionDirective::Delegate { .. } => {
                     let execution_refs = selected_execute_refs(&decision, &directive, &catalog)?;
                     let recovery_family = discovery_scope(prior_hops.iter().chain(std::iter::once(&decision)))?;
@@ -3255,13 +2667,9 @@ impl TurnDecisionService {
                         return Err(DirectiveError::NotAdmitted.into());
                     }
                     if self.check_live_parity().is_err() {
-                        return terminal_after_catalog_drift(&state, prior_hops).map(|context| (context, telemetry));
+                        return terminal_after_catalog_drift(&state).map(|context| (context, telemetry));
                     }
                     if cancellation.is_cancelled() {
-                        if has_router_transition {
-                            return terminal_after_catalog_drift(&state, prior_hops)
-                                .map(|context| (context, telemetry));
-                        }
                         return Err(AgentDecisionError::Cancelled);
                     }
                     return Ok((
@@ -3278,8 +2686,6 @@ impl TurnDecisionService {
                             main_parameters: Default::default(),
                             execution_trace: std::sync::OnceLock::new(),
                             execution_closed: Arc::new(AtomicBool::new(false)),
-                            #[cfg(test)]
-                            approval_collection_started: AtomicBool::new(false),
                             collected_approval_result: std::sync::OnceLock::new(),
                             discovery_offers: std::sync::OnceLock::new(),
                             discovery_admissions: std::sync::OnceLock::new(),
@@ -3291,8 +2697,6 @@ impl TurnDecisionService {
                             execution_refs,
                             #[cfg(test)]
                             selected_retrieved,
-                            #[cfg(all(test, feature = "llm-router"))]
-                            router_transition: router_transition.clone(),
                         }),
                         telemetry,
                     ));

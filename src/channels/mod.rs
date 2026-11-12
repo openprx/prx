@@ -93,8 +93,6 @@ mod turn_failure;
 
 pub use self::doctor::*;
 use self::history::append_sender_turn;
-#[cfg(test)]
-use self::inbound_policy::authorize_channel_outbound;
 use self::inbound_policy::{ConversationKey, chat_kind_from_message};
 pub use self::prompt_context::*;
 pub(crate) use self::response_sanitize::*;
@@ -103,8 +101,6 @@ pub(crate) use self::runtime_commands::*;
 
 pub use self::startup::*;
 
-#[cfg(test)]
-use self::turn::ensure_notice_before_channel_output;
 #[cfg(test)]
 pub(crate) use self::turn_failure::*;
 

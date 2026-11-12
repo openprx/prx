@@ -73,13 +73,7 @@ pub(super) struct ProviderTurnCompletionContext {
 
 #[cfg(feature = "terminal-tui")]
 pub(super) struct PerTurnContext {
-    #[cfg(test)]
-    pub(super) cancellation: CancellationToken,
     pub(super) turn_binding: Option<Arc<decision_source::ChatTurnBinding>>,
-    /// The disposition captured before provider execution can seal the
-    /// decision context. `Some` identifies the fixed-terminal path; `None`
-    /// identifies a provider-backed completion.
-    pub(super) fixed_reply: Option<String>,
     pub(super) task_id: crate::chat::turn_scheduler::TurnTaskId,
     pub(super) draft_id: String,
     pub(super) delta_tx: Option<mpsc::Sender<String>>,
@@ -924,38 +918,7 @@ async fn commit_completed_provider_turn(
     // finalizer runs. Re-reading the live disposition here would therefore
     // reject every successful provider-backed turn. Use the immutable
     // pre-execution classification carried with the turn instead.
-    let fixed_reply = pending.fixed_reply.take();
-    let (provider_outcome, terminal_usage) = if let Some(reply) = fixed_reply {
-        if empty_response || final_text != reply || recorded_response != reply || !reasoning.is_empty() {
-            tracing::error!("Chat fixed reply differs from its decision");
-            return false;
-        }
-        let Some(binding) = pending.turn_binding.as_ref() else {
-            return false;
-        };
-        #[cfg(test)]
-        match binding
-            .close(
-                memory_fabric,
-                history_commit_len,
-                pending.provider_started_at,
-                &pending.cancellation,
-            )
-            .await
-        {
-            Ok(receipt) => (None, receipt.usage_settlement),
-            Err(error) => {
-                tracing::error!(error = %error, "Chat fixed terminal commit failed");
-                return false;
-            }
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (binding, memory_fabric, history_commit_len, reply);
-            tracing::error!("decision requires the constrained execution reader");
-            return false;
-        }
-    } else {
+    let (provider_outcome, terminal_usage) = {
         let provider_outcome = if let Some(binding) = pending.turn_binding.as_ref() {
             match binding.provider_outcome(&pending.route_decision, pending.provider_started_at) {
                 Ok(outcome) => outcome,

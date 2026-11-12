@@ -2320,45 +2320,6 @@ async fn run_console_message_job_work(
         terminal_guard
     };
     let work = async {
-        #[cfg(test)]
-        if let Some(reply) = decision.context.close_reply().map_err(|error| error.to_string())? {
-            let ports = crate::gateway::decision_runtime::GatewayDecisionClose {
-                resource: "gateway_api:sessions:assistant_message",
-                history_commit_len: turns.len() + 2,
-                terminal_guard: &terminal_guard,
-                service: &decision.service,
-                config,
-                envelope: &runtime_envelope,
-                started_at: chrono::Utc::now(),
-            };
-            decision
-                .service
-                .close_agent_directive_turn(
-                    decision.proof,
-                    std::sync::Arc::clone(&decision.context),
-                    &ports,
-                    &cancellation,
-                )
-                .await
-                .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
-            if !config.causal_tree.enabled {
-                let record_event = matches!(
-                    runtime_envelope
-                        .agent_partition
-                        .as_ref()
-                        .map(|partition| &partition.key),
-                    Some(crate::memory::PartitionKey::Named { .. })
-                );
-                append_console_turn(&state, &runtime_envelope, "assistant", &reply, record_event, false)
-                    .await
-                    .map_err(|_| "Failed to persist assistant response".to_owned())?;
-            }
-            // Enabled terminal rejoin already projected the transcript.
-            return Ok(jobs::JobOutput::new(
-                StatusCode::OK,
-                serde_json::json!({ "status": "ok", "reply": reply }),
-            ));
-        }
         if mode == ConsoleTurnMode::Resume {
             crate::gateway::authorize_gateway_config_resource_mutation(
                 config,
@@ -2760,7 +2721,8 @@ mod tests {
                         cache_read: 1.0,
                     },
                 );
-                let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+                let captured = Arc::new(CapturingProvider::default());
+                let provider: Arc<dyn Provider> = captured.clone();
                 let mut state = test_app_state_with_config(config, provider);
                 let envelope = console_runtime_envelope_for_workspace(
                     workspace.to_string_lossy().to_string(),
@@ -2769,7 +2731,7 @@ mod tests {
                     "prx_user",
                 );
                 let (runtime, _, _, proof) = console_test_source(&mut state, envelope, "hello").await;
-                let _ = run_console_message_job(
+                run_console_message_job(
                     runtime,
                     state,
                     "hello".to_string(),
@@ -2777,7 +2739,8 @@ mod tests {
                     ConsoleTurnSource::Message(proof),
                     None,
                 )
-                .await;
+                .await.map_err(anyhow::Error::msg)?;
+                assert_eq!(captured.requests.lock().len(), 1, "test: console provider called once");
                 Ok::<(), anyhow::Error>(())
             }))
             .await

@@ -2703,26 +2703,6 @@ async fn run_gateway_chat_with_multimodal(
     )?;
     let turn_result: anyhow::Result<GatewayTurnResult> = child_cleanup
         .run(async {
-            #[cfg(test)]
-            if let Some(reply) = context.close_reply()? {
-                let ports = decision_runtime::GatewayDecisionClose {
-                    resource: "gateway:webhook:message_event:assistant",
-                    history_commit_len: 2,
-                    terminal_guard: &terminal_guard,
-                    service,
-                    config: &config_snapshot,
-                    envelope: &runtime_envelope,
-                    started_at: chrono::Utc::now(),
-                };
-                let receipt = service
-                    .close_agent_directive_turn(&gateway_proof, Arc::clone(&context), &ports, &cancellation)
-                    .await?;
-                let replay_unavailable = crate::agent::terminal::oversized_reply::from_receipt(&receipt)?;
-                return Ok(GatewayTurnResult {
-                    response: reply.into_owned(),
-                    replay_unavailable,
-                });
-            }
             let mem_context = crate::agent::context_recall::scoped_recall(
                 state.mem.as_ref(),
                 &crate::agent::context_recall::RecallScope::from_envelope(

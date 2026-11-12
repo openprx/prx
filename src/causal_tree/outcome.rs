@@ -134,44 +134,6 @@ impl DecisionRecordBuilder {
         Ok(records)
     }
 
-    /// Persist the actual selected first Router hop before its read begins.
-    /// Rebuilding it in the eventual full chain uses the same immutable hop,
-    /// IDs and timestamps, so the store requires an identical replay hash.
-    #[cfg(all(test, feature = "llm-router"))]
-    pub(crate) fn build_router_history_read(
-        hop: &EngineDecision,
-        key: &DecisionKey,
-        record_redacted_projection: bool,
-    ) -> Result<DecisionRecord, RecordBuildError> {
-        if hop.state.lineage != HopLineage::First || hop.state.trusted.router_history().is_none() {
-            return Err(RecordBuildError::Binding);
-        }
-        let selected = match &hop.selection {
-            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. }
-            | crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
-            _ => return Err(RecordBuildError::Binding),
-        };
-        let candidate = hop
-            .state
-            .derived
-            .candidates()
-            .iter()
-            .find(|candidate| candidate.candidate.candidate_id() == selected)
-            .map(|candidate| &candidate.candidate)
-            .ok_or(RecordBuildError::Binding)?;
-        if candidate.action() != crate::causal_tree::branch::CausalActionKind::Retrieve
-            || candidate.target() != crate::causal_tree::branch::CapabilityTarget::Memory
-            || candidate.required_capabilities().len() != 1
-            || !matches!(
-                hop.pre_commit.outcomes.get(selected),
-                Some(crate::causal_tree::gates::GateOutcome::Passed)
-            )
-        {
-            return Err(RecordBuildError::Binding);
-        }
-        Self::build_hop(hop, key, None, true, record_redacted_projection)
-    }
-
     pub(super) fn build_hop(
         hop: &EngineDecision,
         key: &DecisionKey,
@@ -258,31 +220,8 @@ impl DecisionRecordBuilder {
         let rejected = json!(GateRejections::for_hop(hop));
         gate_values.insert("rejected_by_gate".to_owned(), rejected.clone());
         gate_values.insert("turn_rejected_by_gate".to_owned(), rejected);
-        #[cfg(test)]
-        let mut gates = Value::Object(gate_values);
-        #[cfg(not(test))]
         let gates = Value::Object(gate_values);
-        #[cfg(test)]
-        if let Selection::CollectApprovalArguments(proof) = &hop.selection {
-            if proof.state_fingerprint() != state_fingerprint
-                || hop.request_compiled
-                || hop.prediction.is_some()
-                || !hop.scores.is_empty()
-                || hop.outgoing_child.is_some()
-            {
-                return Err(RecordBuildError::Binding);
-            }
-            gates.as_object_mut().ok_or(RecordBuildError::Binding)?.insert(
-                "approval_collection".to_owned(),
-                json!({ "version": 1, "state_fingerprint": proof.state_fingerprint(),
-                    "capability": { "id": proof.capability().id.as_str(),
-                        "schema": hex::encode(proof.capability().fingerprint.0),
-                        "generation": proof.capability().generation.to_hex() }, "adapter": match proof.adapter() {
-                        super::approval_collection::ApprovalReviewAdapter::ChatOwnerReview => "chat_owner_review",
-                        super::approval_collection::ApprovalReviewAdapter::ConsoleOwnerReview => "console_owner_review",
-                    } }),
-            );
-        }
+
         let attempts = hop.prediction.as_ref().map_or_else(Vec::new, |prediction| {
             prediction
                 .attempts
@@ -381,8 +320,6 @@ impl DecisionRecordBuilder {
 fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Option<String>, f64), RecordBuildError> {
     let fallback = hop.fallback_cause.map(fallback_code);
     let (selected, action, reason, propensity) = match &hop.selection {
-        #[cfg(test)]
-        Selection::CollectApprovalArguments(_) => (None, "collect_approval_arguments", None, 0.0),
         Selection::Commit {
             candidate_id,
             propensity,

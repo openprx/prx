@@ -780,13 +780,6 @@ impl<'a> CatalogView<'a> {
     }
 
     /// Narrow a view without copying entries, schemas, bindings or the search index.
-    #[cfg(not(test))]
-    pub(crate) const fn with_surface(mut self, surface: &'a SurfacePolicy) -> Self {
-        self.surface = Some(surface);
-        self
-    }
-
-    #[cfg(test)]
     pub(crate) fn with_surface(mut self, surface: &'a SurfacePolicy) -> Self {
         self.surface = Some(surface);
         #[cfg(test)]

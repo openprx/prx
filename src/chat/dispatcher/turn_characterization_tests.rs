@@ -651,7 +651,7 @@ async fn run_chat_fixture_with_history(
 }
 
 #[tokio::test]
-async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed_terminal() {
+async fn queued_plan_mode_change_fails_before_execution_and_commits_one_failed_terminal() {
     use crate::agent::turn_contracts::ChatMode;
     let dir = tempfile::tempdir().unwrap();
     let config = admission_config(dir.path());
@@ -675,7 +675,15 @@ async fn queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed
         &owner,
         admitted.fabric.clone(),
     );
-    assert!(admitted.binding.fixed_reply().expect("test: queued_plan_mode_change_fails_before_fixed_reply_and_commits_one_failed_terminal fixture operation").is_none());
+    assert!(
+        admitted
+            .binding
+            .decision_routing()
+            .expect("test: admitted routing")
+            .context
+            .is_run()
+            .expect("test: live execution")
+    );
     drive_start_turn_stream(
         Some(Arc::clone(&admitted.binding)),
         None,
@@ -1102,35 +1110,62 @@ async fn step_7_1_same_blocking_fixture_characterizes_cancellation_terminals() {
 }
 
 pub(crate) async fn drive_disabled_engine_chat_entry(workspace: &std::path::Path) {
-    let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace.to_owned();
-    config.config_path = workspace.join("config.toml");
-    let provider: Arc<dyn Provider> = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
+    let (actions, mut receiver) = mpsc::channel::<Action>(128);
+    let mut config = enabled_builtin_admission_config(workspace);
+    config.decision_engine.enabled = false;
+    let provider = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
         chunks: vec!["ok".to_owned()],
         reasoning: String::new(),
         usage: reported_usage(1, 1),
     }]));
+    let port: Arc<dyn Provider> = provider.clone();
+    let cancellation = CancellationToken::new();
     let admitted = admit_chat_fixture_with_config(
-        provider,
+        port.clone(),
         None,
         config,
         ("ollama", "prx-local-model", None),
         ("engine-off-chat", "hello"),
-        action_tx,
-        CancellationToken::new(),
+        actions.clone(),
+        cancellation.clone(),
     )
     .await;
-    assert!(
-        admitted
-            .binding
-            .decision_routing()
-            .expect("test: chat decide issued")
-            .context
-            .engine()
-            .prediction
-            .is_none()
-    );
+    let history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
+    drive_start_turn_stream(
+        Some(admitted.binding),
+        None,
+        port,
+        history.clone(),
+        history,
+        "prx-local-model".into(),
+        0.0,
+        None,
+        cancellation,
+        "engine-off-chat".into(),
+        actions,
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
+        None,
+        crate::agent::turn_contracts::ChatMode::Edit,
+        Arc::new(crate::observability::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),
+    )
+    .await;
+    let mut completed = 0;
+    while let Ok(action) = receiver.try_recv() {
+        match action {
+            Action::StreamFailed { err, .. } => panic!("test: engine-off chat failed: {err}"),
+            Action::StreamCompleted { final_text, .. } => {
+                assert_eq!(final_text, "ok", "test: provider reply");
+                completed += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 1, "test: chat completed");
+    assert_eq!(provider.histories().len(), 1, "test: provider called once");
 }
 
 pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input: &str) -> anyhow::Result<()> {
@@ -1180,9 +1215,9 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
             Arc::new(crate::hooks::HookManager::new(workspace)),
         )
     }));
-    let result = async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
-            let action = tokio::time::timeout(std::time::Duration::from_secs(60), receiver.recv())
+            let action = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
                 .await?
                 .context("chat action stream closed before completion")?;
             match action {
@@ -1192,8 +1227,10 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
             }
         }
         Ok::<(), anyhow::Error>(())
-    }
-    .await;
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(std::convert::identity);
     if result.is_err() {
         driver.abort();
     }

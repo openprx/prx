@@ -66,22 +66,17 @@ fn record_builder_distinguishes_local_terminal_from_failed_compiled_request() {
         main_parameters: Default::default(),
         execution_trace: std::sync::OnceLock::new(),
         execution_closed: Arc::new(AtomicBool::new(false)),
-        approval_collection_started: AtomicBool::new(false),
+
         collected_approval_result: std::sync::OnceLock::new(),
         discovery_offers: std::sync::OnceLock::new(),
         discovery_admissions: std::sync::OnceLock::new(),
         engine,
         prior_hops: Vec::new(),
-        directive: TurnExecutionDirective::Refuse {
-            policy_code: "hop_stopped".to_owned(),
-            user_hint: None,
-        },
+        directive: TurnExecutionDirective::Refuse {},
         main_compaction: crate::config::AgentCompactionConfig::default(),
         hop_ids: vec![decision_id],
         execution_refs: BTreeSet::new(),
         selected_retrieved: Vec::new(),
-        #[cfg(feature = "llm-router")]
-        router_transition: None,
     };
     use crate::causal_tree::outcome::{DecisionRecordBuilder, RecordBuildError};
     assert!(matches!(
@@ -698,7 +693,7 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         result.retrieved().expect("live selected evidence").is_empty(),
         "expected an empty value"
     );
-    assert!(matches!(result.disposition(), Ok(TurnDisposition::Run)));
+    assert!(result.is_run().expect("test: live execution"));
     // Exercise fresh admission with this actual selected engine decision,
     // not a fabricated selection or an already-consumed context getter.
     let directive_context = DirectiveContext {
@@ -729,129 +724,15 @@ async fn disabled_agent_initial_decision_runs_generator_gates_and_builtin() {
         expired.retrieved().expect("already selected evidence").is_empty(),
         "expected an empty value"
     );
-    assert!(matches!(expired.disposition(), Ok(TurnDisposition::Run)));
+    assert!(expired.is_run().expect("test: live execution"));
     assert_eq!(expired.decision_id(), issued_id);
     assert_eq!(expired.engine().state.routing_input, issued_input);
     assert_eq!(expired.engine().state.trusted, issued_trusted);
     let _ = expired.terminal_execution_trace();
     assert!(matches!(expired.retrieved(), Err(DirectiveError::NotAdmitted)));
     // A sealed Answer cannot re-enter the provider loop.
-    assert!(matches!(expired.disposition(), Err(DirectiveError::NotAdmitted)));
+    assert!(!expired.is_run().expect("test: sealed execution"));
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
-}
-
-#[tokio::test]
-async fn disabled_or_keyless_fixed_close_has_no_applied_write() {
-    for enabled in [false, true] {
-        let workspace = tempfile::tempdir().expect("test workspace");
-        let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.path().to_path_buf();
-        config.causal_tree.enabled = enabled;
-        if enabled {
-            let directory = workspace.path().join("self/causal_tree");
-            std::fs::create_dir_all(&directory).expect("fixture key directory");
-            std::fs::write(directory.join(".decision_key"), b"short").expect("unavailable fixture key");
-        }
-        let memory: Arc<dyn Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("ordinary history memory"));
-        let generation = crate::config::new_shared(config.clone()).pin();
-        let service = agent_service_with_memory(
-            &generation,
-            &ProviderCatalogView::from_config(&config),
-            Arc::clone(&memory),
-        )
-        .await;
-        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
-            &generation,
-            Arc::clone(&memory),
-            "  ",
-            "prx_close_run",
-        )
-        .await;
-        let context = service
-            .decide_agent_initial(&proof, AgentTurnKind::Repl, &CancellationToken::new())
-            .await
-            .expect("local fixed decision");
-        assert!(matches!(context.disposition(), Ok(TurnDisposition::Close { .. })));
-        let decision = if enabled {
-            assert!(!service.durable_key, "corrupt key must not issue durable authority");
-            assert!(!context.record_admitted.load(Ordering::Acquire));
-            assert!(
-                service.terminal_settlement_ref(Arc::clone(&context)).is_err(),
-                "enabled keyless context must not issue a terminal decision"
-            );
-            None
-        } else {
-            Some(
-                service
-                    .terminal_settlement_ref(Arc::clone(&context))
-                    .expect("disabled service issues a genuine same-context terminal decision"),
-            )
-        };
-        let now = chrono::Utc::now();
-        let ports = FinalizingClosePorts {
-            fabric: MemoryFabric::new(Arc::clone(&memory), proof.workspace_id()),
-            commit: crate::agent::terminal::TurnTerminalDraft {
-                decision,
-                terminal_id: "prx_unrecorded_close".to_owned(),
-                scope: {
-                    let mut scope =
-                        crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-                            .with_owner_id(proof.owner_id())
-                            .with_channel("cli")
-                            .with_session_key(proof.session_key())
-                            .with_run_id(proof.run_id());
-                    scope.causation_event_id = proof.source_event_id().map(str::to_owned);
-                    scope
-                },
-                status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                history: None,
-                history_scope: None,
-                provider_outcome: None,
-                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                    summary: "local close".to_owned(),
-                    started_at: now,
-                    finished_at: now,
-                },
-                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-            },
-            cost: config.cost.clone(),
-            workspace: workspace.path().to_path_buf(),
-            calls: AtomicUsize::new(0),
-            cancellation: None,
-        };
-        let close = service
-            .close_agent_directive_turn(&proof, Arc::clone(&context), &ports, &CancellationToken::new())
-            .await;
-        if enabled {
-            let error = close.expect_err("enabled keyless close must fail at terminal linkage");
-            assert_eq!(error.to_string(), "terminal draft has no service-issued decision");
-            assert!(
-                memory
-                    .find_message_event_by_idempotency_key(proof.workspace_id(), "turn:prx_unrecorded_close:final")
-                    .await
-                    .expect("keyless terminal marker lookup")
-                    .is_none(),
-                "keyless close must not persist a terminal marker"
-            );
-        } else {
-            close.expect("ordinary close stays available");
-        }
-        assert_eq!(ports.calls.load(Ordering::SeqCst), 1);
-        assert!(!context.record_admitted.load(Ordering::Acquire));
-        assert!(service.durable_events.is_none());
-        assert!(
-            memory
-                .find_message_event_by_idempotency_key(
-                    proof.workspace_id(),
-                    &format!("causal:{}:directive-applied", context.decision_id())
-                )
-                .await
-                .expect("no applied write")
-                .is_none()
-        );
-        assert!(!workspace.path().join("self/causal_tree/decisions.db").exists());
-    }
 }
 
 #[tokio::test]

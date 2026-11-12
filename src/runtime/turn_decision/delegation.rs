@@ -19,31 +19,6 @@ pub(super) struct OutgoingDelegation {
     pub requested: Vec<CapabilityRef>,
 }
 
-/// A child publication must retain the estimate that passed candidate
-/// admission. Missing estimates remain unknown and G1 continues to refuse
-/// them; constructing an unpriced publication must not erase an admitted one.
-pub(super) fn publication_cost(
-    decision: &crate::causal_tree::decision_engine::EngineDecision,
-    reference: &CapabilityRef,
-    delegator: bool,
-) -> Option<crate::causal_tree::branch::CostEstimate> {
-    use crate::causal_tree::branch::CausalActionKind;
-    let candidates = match &decision.candidates {
-        super::CandidateSet::Legal { candidates, .. } => candidates,
-        super::CandidateSet::NoLegalPath { .. } => return None,
-    };
-    let action = if delegator {
-        CausalActionKind::Delegate
-    } else {
-        CausalActionKind::UseTool
-    };
-    candidates.iter().find_map(|candidate| {
-        (candidate.action() == action && candidate.required_capabilities() == std::slice::from_ref(reference))
-            .then(|| candidate.estimated_cost())
-            .flatten()
-    })
-}
-
 impl TurnDecisionService {
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
@@ -65,6 +40,8 @@ impl TurnDecisionService {
     /// Children may read the parent immediately, including in another process.
     /// Queue admission alone cannot authorize that launch.
     pub(super) async fn validate_delegation_storage(&self, context: Arc<TurnDecisionContext>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record_delegation_storage(&self.generation.effective.workspace_dir);
         let deadline = crate::causal_tree::logical_clock::now()
             .checked_add(DELEGATION_DURABILITY_TIMEOUT)
             .context("delegation durability deadline cannot be represented")?;

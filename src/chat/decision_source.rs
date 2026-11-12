@@ -874,17 +874,8 @@ impl ChatTurnBinding {
                         .open_issued_resume_turn_context(self, kind, cancellation)
                         .await?
                 } else {
-                    #[cfg(test)]
-                    {
-                        // Retain explicit local prediction fixtures without
-                        // reinstating prediction admission in production chat.
-                        service.open_issued_turn_context(self, kind, cancellation).await?
-                    }
-                    #[cfg(not(test))]
-                    {
-                        let opened = service.open_turn_context(self, kind, cancellation).await?;
-                        service.record_opened_context(self, opened, cancellation).await?
-                    }
+                    let opened = service.open_turn_context(self, kind, cancellation).await?;
+                    service.record_opened_context(self, opened, cancellation).await?
                 };
                 let advice = service.analyze_advisory(&context, cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
@@ -918,13 +909,6 @@ impl ChatTurnBinding {
         .await
     }
 
-    pub(super) fn fixed_reply(&self) -> anyhow::Result<Option<String>> {
-        let Some(decided) = self.decision.get() else {
-            return Ok(None);
-        };
-        Ok(decided.context.close_reply()?.map(|reply| reply.into_owned()))
-    }
-
     pub(super) fn main_compaction(&self) -> Option<&crate::config::AgentCompactionConfig> {
         self.decision.get().map(|decided| decided.context.main_compaction())
     }
@@ -939,29 +923,6 @@ impl ChatTurnBinding {
         Ok(decided
             .service
             .effective_compaction(self.choice.provider_name(), self.choice.model_name()))
-    }
-
-    /// Persist a fixed directive without inventing provider execution. The
-    /// caller must separately commit ordered session history and deliver it.
-    #[cfg(test)]
-    pub(super) async fn close(
-        &self,
-        fabric: &crate::memory::MemoryFabric,
-        history_commit_len: usize,
-        started_at: chrono::DateTime<chrono::Utc>,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
-        let decided = self.decision.get().context("chat close has no decision")?;
-        let ports = ChatDecisionClose {
-            binding: self,
-            fabric,
-            history_commit_len,
-            started_at,
-        };
-        decided
-            .service
-            .close_agent_directive_turn(self, Arc::clone(&decided.context), &ports, cancellation)
-            .await
     }
 
     /// Direct approved-call execution has its own sealed tool trace. It must
@@ -1289,64 +1250,6 @@ impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
     }
 }
 
-/// Only the owning binding supplies source scope and settlement authority.
-#[cfg(test)]
-struct ChatDecisionClose<'a> {
-    binding: &'a ChatTurnBinding,
-    fabric: &'a crate::memory::MemoryFabric,
-    history_commit_len: usize,
-    started_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::runtime::turn_decision::CloseTurnPorts for ChatDecisionClose<'_> {
-    type Receipt = crate::agent::terminal::TurnTerminalReceipt;
-
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        let decided = self.binding.decision.get().context("chat close has no decision")?;
-        anyhow::ensure!(Arc::ptr_eq(&context, &decided.context), "chat close decision changed");
-        let terminal_id = self
-            .binding
-            .envelope
-            .run_id
-            .as_deref()
-            .context("chat close has no run")?;
-        let scope = self.binding.envelope.message_scope();
-        self.binding
-            .commit_terminal(
-                self.fabric,
-                crate::agent::terminal::TurnTerminalDraft {
-                    decision: self.binding.settlement_ref(terminal_id)?,
-                    terminal_id: terminal_id.to_owned(),
-                    history_scope: Some(scope.clone().with_sender("prx_runtime").with_recipient("local-user")),
-                    scope,
-                    status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                    history: Some(crate::agent::terminal::TurnHistoryProjection {
-                        assistant_content: reply.to_owned(),
-                        history_commit_len: self.history_commit_len,
-                    }),
-                    provider_outcome: None,
-                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                        summary: "chat decision closed".to_owned(),
-                        started_at: self.started_at,
-                        finished_at: chrono::Utc::now(),
-                    },
-                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
-                        target: "terminal:local-user".to_owned(),
-                    },
-                },
-                &self.binding.generation.effective.cost,
-                &self.binding.generation.effective.workspace_dir,
-            )
-            .await
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod admission_failure_tests {
     mod operator_accounting;
@@ -1493,21 +1396,20 @@ pub(crate) mod admission_failure_tests {
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let context = binding.decide(&service, &cancellation).await?;
-        let (directive, reason) = context.diagnostic_directive_kind();
-        let reason = match reason.as_str() {
-            "insufficient_evidence"
-            | "commit_threshold_or_margin"
-            | "no_legal_path"
-            | "retrieve_evidence"
-            | "hop_stopped"
-            | "choice_outside_legal_set"
-            | "approval_only"
-            | "deadline_exceeded"
-            | "not_applicable" => reason.as_str(),
-            _ => "unclassified",
-        };
-        eprintln!("PRX_Q47_PARENT_ADMISSION directive={directive} reason_code={reason}");
-        let specs = service.agent_execution_specs(binding.as_ref(), context)?;
+        use crate::tools::Tool as _;
+        let search = service.capability_search_port(binding.as_ref(), context)?;
+        let found = crate::tools::capability::search_tool::with_search_authority(
+            Some(search),
+            crate::tools::capability::search_tool::CapabilitySearchTool
+                .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
+        )
+        .await?;
+        anyhow::ensure!(found.success, "source-owned spawn search failed");
+        service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
+        let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
+        specs
+            .specs
+            .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
         anyhow::ensure!(
             specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
             "genuine model admission did not select sessions_spawn"
@@ -1608,22 +1510,20 @@ pub(crate) mod admission_failure_tests {
         )?;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let context = binding.decide(&service, &cancellation).await?;
-        let (directive, reason) = context.diagnostic_directive_kind();
-        let reason = match reason.as_str() {
-            "insufficient_evidence"
-            | "commit_threshold_or_margin"
-            | "no_legal_path"
-            | "retrieve_evidence"
-            | "hop_stopped"
-            | "choice_outside_legal_set"
-            | "approval_only"
-            | "deadline_exceeded"
-            | "not_applicable" => reason.as_str(),
-            _ => "unclassified",
-        };
-        let specs = service
-            .agent_execution_specs(binding.as_ref(), context)
-            .with_context(|| format!("unknown-agent parent admission directive={directive} reason_code={reason}"))?;
+        use crate::tools::Tool as _;
+        let search = service.capability_search_port(binding.as_ref(), context)?;
+        let found = crate::tools::capability::search_tool::with_search_authority(
+            Some(search),
+            crate::tools::capability::search_tool::CapabilitySearchTool
+                .execute(serde_json::json!({"query":"sessions_spawn","limit":1})),
+        )
+        .await?;
+        anyhow::ensure!(found.success, "source-owned spawn search failed");
+        service.admit_offered_discoveries(binding.as_ref(), context, |_, _| false);
+        let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
+        specs
+            .specs
+            .extend(service.agent_appended_execution_specs(binding.as_ref(), context)?.specs);
         anyhow::ensure!(
             specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
             "genuine model admission did not select sessions_spawn"

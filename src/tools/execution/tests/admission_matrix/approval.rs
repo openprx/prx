@@ -107,6 +107,7 @@ async fn experiment_action_with_admitted_descriptor_and_h2_origin_proceeds() {
     let mut context = context();
     context.envelope = envelope;
     context.set_h2_origin(Some(origin));
+    context.execution_admission = Some(issued_binding(&fixture, "skills_manage", context.envelope.clone()).admission());
     let outcome = service
         .execute(
             ToolExecutionCommand::new(
@@ -336,4 +337,46 @@ async fn experiment_action_with_stale_descriptor_refuses() {
         outcome.model_content
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn verify_admitted_call_capability_equals_catalog_entry() {
+    let fixture = fixture();
+    let service = allow_service(&fixture, "project_tool");
+    let envelope = context().envelope.with_source_message_event_id("prx_source_event");
+    let binding = issued_binding(&fixture, "project_tool", envelope.clone());
+    let admission = binding.admission();
+    let descriptor = service
+        .current_descriptor("project_tool")
+        .expect("test: real descriptor");
+    let command = ToolExecutionCommand::new("project_tool", serde_json::json!({"value":1}));
+    let verified = service
+        .verify_admitted_call(&envelope, &admission, &descriptor, &command)
+        .expect("test: admitted call");
+    let entry = admission
+        .catalog
+        .entry_for_public_name("project_tool")
+        .expect("test: admitted catalog entry");
+    assert_eq!(
+        verified.capability(),
+        &crate::causal_tree::branch::CapabilityRef {
+            id: entry.id.clone(),
+            fingerprint: entry.fingerprint,
+            generation: entry.generation
+        },
+        "test: exact catalog identity and generation"
+    );
+    assert_eq!(
+        verified.catalog_generation(),
+        admission.catalog.generation().0,
+        "test: actual catalog generation"
+    );
+    let mut changed_scope = envelope;
+    changed_scope.run_id = Some("prx_foreign_run".into());
+    assert!(
+        service
+            .verify_admitted_call(&changed_scope, &admission, &descriptor, &command)
+            .is_err(),
+        "test: admission scope cannot be substituted"
+    );
 }

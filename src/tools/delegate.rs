@@ -1508,23 +1508,7 @@ impl DelegateLoopResources {
         {
             let turn = &mut child_turn;
             turn.project_history(history.len() + 1);
-            #[cfg(test)]
-            if turn.is_close()? {
-                loop_cleanup.run(async { Ok(()) }).await?;
-                let reply = turn
-                    .close(&cancellation)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("delegate close disposition changed"))?;
-                return Ok(DelegateAgenticExecution {
-                    child_terminal_committed: true,
-                    result: ToolResult {
-                        success: true,
-                        output: reply,
-                        error: None,
-                    },
-                    trace: None,
-                });
-            }
+
             let prompt = turn.prompt_with_skills(&role_prompt)?;
             if let Some(system) = history.first_mut().filter(|message| message.role == "system") {
                 *system = ChatMessage::system(prompt);

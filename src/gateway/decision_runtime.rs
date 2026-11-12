@@ -117,69 +117,6 @@ impl Drop for GatewayDecisionSlot {
     }
 }
 
-#[cfg(test)]
-pub(super) struct GatewayDecisionClose<'a> {
-    pub(super) resource: &'static str,
-    pub(super) history_commit_len: usize,
-    pub(super) terminal_guard: &'a GatewayTerminalGuard,
-    pub(super) service: &'a TurnDecisionService,
-    pub(super) config: &'a crate::config::Config,
-    pub(super) envelope: &'a crate::runtime::envelope::RuntimeEnvelope,
-    pub(super) started_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::runtime::turn_decision::CloseTurnPorts for GatewayDecisionClose<'_> {
-    type Receipt = crate::agent::terminal::TurnTerminalReceipt;
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        super::authorize_gateway_config_resource_mutation(self.config, self.resource, super::ResourceRiskLevel::Low)
-            .map_err(|(_, body)| {
-                anyhow::anyhow!(
-                    "{}",
-                    body.0
-                        .get("error")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("gateway resource mutation denied")
-                )
-            })?;
-        let terminal_id = self
-            .envelope
-            .run_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("gateway close has no run"))?;
-        let scope = self.envelope.message_scope();
-        self.terminal_guard
-            .commit(crate::agent::terminal::TurnTerminalDraft {
-                decision: Some(self.service.terminal_settlement_ref(context)?),
-                terminal_id,
-                scope: scope.clone(),
-                status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                history: Some(crate::agent::terminal::TurnHistoryProjection {
-                    assistant_content: reply.to_owned(),
-                    history_commit_len: self.history_commit_len,
-                }),
-                history_scope: (self.envelope.source != crate::runtime::envelope::RuntimeSource::Console).then(|| {
-                    scope
-                        .with_sender("prx_runtime")
-                        .with_recipient(self.envelope.sender.clone().unwrap_or_default())
-                }),
-                provider_outcome: None,
-                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                    summary: "gateway decision closed".to_owned(),
-                    started_at: self.started_at,
-                    finished_at: chrono::Utc::now(),
-                },
-                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-            })
-            .await
-    }
-}
-
 pub(super) use crate::runtime::turn_terminal::TurnTerminalGuard as GatewayTerminalGuard;
 
 pub(super) use crate::runtime::turn_terminal::commit_terminal;

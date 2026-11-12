@@ -754,7 +754,7 @@ fn capture_expected(
         let selected = match &hop.selection {
             Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => candidate_id.clone(),
             Selection::Abstain { action, .. } => CandidateId::new(*action, CapabilityTarget::None, None),
-            Selection::RequestApproval { .. } | Selection::CollectApprovalArguments(_) => {
+            Selection::RequestApproval { .. } => {
                 panic!("no fabricated approval producer")
             }
         };
@@ -980,7 +980,7 @@ fn capture_expected(
             Selection::Abstain { action, reason_code } => {
                 json!({"kind":"abstain","id":ids.candidate(selected.as_str()),"action":action.as_str(),"reason":reason_code})
             }
-            Selection::RequestApproval { .. } | Selection::CollectApprovalArguments(_) => {
+            Selection::RequestApproval { .. } => {
                 panic!("no fabricated approval producer")
             }
         };
@@ -1023,11 +1023,19 @@ fn capture_expected(
         TurnExecutionDirective::Execute { allowed_capability_ids } => {
             json!({"kind":"use_tool","capability_ids":allowed_capability_ids.iter().map(|id|id.as_str()).collect::<Vec<_>>()})
         }
-        TurnExecutionDirective::Clarify { reason_code } => {
-            json!({"kind":"clarify","reason":reason_code})
+        TurnExecutionDirective::Clarify { .. } => {
+            let reason = match &context.engine().selection {
+                Selection::Abstain { reason_code, .. } => *reason_code,
+                _ => "",
+            };
+            json!({"kind":"clarify","reason":reason})
         }
-        TurnExecutionDirective::Refuse { policy_code, .. } => {
-            json!({"kind":"refuse","reason":policy_code})
+        TurnExecutionDirective::Refuse { .. } => {
+            let reason = match &context.engine().selection {
+                Selection::Abstain { reason_code, .. } => *reason_code,
+                _ => "",
+            };
+            json!({"kind":"refuse","reason":reason})
         }
         _ => panic!("unconsumed Read or fabricated approval/child context"),
     };

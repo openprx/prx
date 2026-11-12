@@ -597,59 +597,6 @@ impl EmbeddedAgentSource {
         Ok(router.has_history() && task.intent != super::classifier::TaskIntent::Delegate && task.model_hint.is_none())
     }
 
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
-    pub(crate) fn prepare_router_selection(
-        &self,
-        ranked: &crate::router::scorer::RouterResult,
-    ) -> anyhow::Result<SelectedEmbeddedModel> {
-        let config = &self.binding.generation.effective;
-        let choice = if let (Some(provider), Some(model)) =
-            (ranked.chosen_provider.as_deref(), ranked.chosen_model.as_deref())
-        {
-            if let Some(route) = config
-                .model_routes
-                .iter()
-                .find(|route| route.provider == provider && route.model == model)
-            {
-                super::entry::resolve_agent_model_choice(
-                    config,
-                    Some(self.binding.choice.provider_name()),
-                    Some(&format!("hint:{}", route.hint)),
-                )?
-            } else {
-                let model = if provider == "ollama" && model == "*" {
-                    self.binding.choice.resolved_selection().1
-                } else {
-                    model
-                };
-                super::entry::resolve_agent_model_choice(config, Some(provider), Some(model))?
-            }
-        } else {
-            self.binding.choice.clone()
-        };
-        self.binding.bind_selected_model(choice)
-    }
-
-    #[cfg(test)]
-    #[cfg(feature = "llm-router")]
-    pub(crate) fn with_admitted_router_selection(
-        self: &Arc<Self>,
-        token: crate::runtime::turn_decision::RouterModelReadmission,
-    ) -> anyhow::Result<Arc<Self>> {
-        let selected_choice = token.consume_for(self)?;
-        Ok(Arc::new(Self {
-            binding: Arc::clone(&self.binding),
-            selected_choice: Some(selected_choice),
-            envelope: self.envelope.clone(),
-            owner: self.owner.clone(),
-            input: self.input.clone(),
-            scope: self.scope.clone(),
-            fabric: self.fabric.clone(),
-            issued_input: self.issued_input.clone(),
-        }))
-    }
-
     #[cfg(feature = "llm-router")]
     pub(super) fn with_local_router(
         self: &Arc<Self>,

@@ -95,6 +95,7 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = true;
         if prediction {
+            config.decision_engine.enabled = true;
             config.causal_tree.backend.kind =
                 crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
             config.causal_tree.backend.endpoint = endpoint.clone();
@@ -303,22 +304,19 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
                 );
                 if prediction {
                     assert!(
-                        turn.is_close()?,
-                        "test: missing prediction answers must not produce executable admission"
-                    );
-                    assert!(
                         matches!(
-                            turn.routing().context.directive(),
-                            crate::causal_tree::directive::TurnExecutionDirective::Clarify { reason_code }
-                                if reason_code == "decision_failed"
+                            &turn.routing().context.engine().selection,
+                            crate::causal_tree::decision_select::Selection::Abstain {
+                                reason_code: "decision_failed",
+                                ..
+                            }
                         ),
-                        "test: semantic prediction failure keeps its bounded close"
+                        "test: failed physical prediction is recorded as abstention"
                     );
                 } else {
                     assert!(
-                        !turn.is_close()?,
-                        "test: Auto without a backend stays Direct-surface Run: {:?}",
-                        turn.routing().context.directive()
+                        turn.routing().context.engine().prediction.is_none(),
+                        "test: direct admission has no prediction"
                     );
                 }
                 drop(turn);

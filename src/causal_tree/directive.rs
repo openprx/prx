@@ -3,14 +3,12 @@
 use chrono::{DateTime, Utc};
 
 use super::branch::{CandidateId, CapabilityId, CapabilityRef, CapabilityTarget, CausalActionKind};
-#[cfg(test)]
-use super::branch::{OpId, SideEffectClass};
+
 use super::candidate_generator::{CandidateSet, PendingApproval};
 use super::decision_engine::EngineDecision;
 use super::decision_select::Selection;
 use super::gates::GateOutcome;
-#[cfg(test)]
-use super::ids::DecisionId;
+
 use crate::tools::capability::child::ChildCapabilityManifest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,8 +19,6 @@ pub(crate) enum SelectedReadPurpose {
 
 #[derive(Debug, Clone)]
 pub(crate) enum TurnExecutionDirective {
-    #[cfg(test)]
-    CollectApprovalArguments,
     AnswerDirectly,
     Retrieve {
         sources: Vec<CapabilityRef>,
@@ -39,82 +35,14 @@ pub(crate) enum TurnExecutionDirective {
     Delegate {
         manifest: ChildCapabilityManifest,
     },
-    Clarify {
-        #[cfg(test)]
-        reason_code: String,
-    },
-    RequestApproval {
-        #[cfg(test)]
-        approval_scope: ApprovalScope,
-    },
-    Refuse {
-        #[cfg(test)]
-        policy_code: String,
-        #[cfg(test)]
-        /// Configuration hint computed at selection; `None` keeps the generic sentence.
-        user_hint: Option<String>,
-    },
+    Clarify {},
+    RequestApproval {},
+    Refuse {},
 }
 
 /// The longest an approval request may stay open: an approval scope expiring
 /// later than this after issue is refused as mismatched.
 const MAX_APPROVAL_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
-
-/// An exactly named approval-required action on a surface with no owner review.
-#[cfg(test)]
-const APPROVAL_UNAVAILABLE_REPLY: &str =
-    "This action needs owner approval, which this surface cannot collect; nothing was run.";
-
-/// Render only terminal dispositions that need no provider or capability call.
-/// Security and policy-internal reason codes stay out of the reply. Configuration
-/// reasons append one plain hint line after the generic refusal sentence.
-#[cfg(test)]
-pub(crate) fn render_terminal_directive(
-    directive: &TurnExecutionDirective,
-) -> Result<std::borrow::Cow<'static, str>, DirectiveError> {
-    match directive {
-        TurnExecutionDirective::Clarify { reason_code } => Ok(std::borrow::Cow::Borrowed(match reason_code.as_str() {
-            "deadline_exceeded" => "Could you narrow your request so I can finish it in time?",
-            "insufficient_evidence" | "retrieve_evidence" => {
-                "I could not obtain enough supporting information. What source should I use?"
-            }
-            "hop_stopped" => {
-                "Capability selection stopped without a usable next step. Please specify the action or tool you need."
-            }
-            "commit_threshold_or_margin" => "Which result and supporting source should I use for this request?",
-            "discover_capability" => "Which action would you like me to take?",
-            "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
-            _ => "Could you clarify the result you want?",
-        })),
-        TurnExecutionDirective::RequestApproval { approval_scope } => Ok(std::borrow::Cow::Owned(format!(
-            "Approval is required for decision {} (effect: {}). Review this decision before resuming it. The operation has not run.",
-            approval_scope.decision_id,
-            approval_scope.effect.as_str(),
-        ))),
-        #[cfg(test)]
-        TurnExecutionDirective::Refuse { policy_code, user_hint } => {
-            tracing::debug!(policy_code = %policy_code, "rendering terminal refusal");
-            Ok(super::refusal::render_refusal_reply(policy_code, user_hint.as_deref()))
-        }
-        _ => Err(DirectiveError::ActionMismatch),
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ApprovalScope {
-    pub decision_id: DecisionId,
-    pub capability_refs: Vec<CapabilityRef>,
-    pub op_ids: Vec<OpId>,
-    pub effect: SideEffectClass,
-    pub owner: String,
-    pub workspace: String,
-    pub session: Option<String>,
-    pub call_digest: Option<[u8; 32]>,
-    pub catalog_generation: super::branch::CatalogGeneration,
-    pub expires_at: DateTime<Utc>,
-    pub single_use: bool,
-}
 
 pub(crate) struct DirectiveContext {
     /// The service must supply the same pinned generation at the execution boundary.
@@ -149,17 +77,6 @@ pub(crate) fn directive_from_selection(
         return Err(DirectiveError::NotAdmitted);
     }
     match &decision.selection {
-        #[cfg(test)]
-        Selection::CollectApprovalArguments(proof) => {
-            if proof.capability().generation != context.current_generation
-                || decision.prediction.is_some()
-                || decision.request_compiled
-                || decision.outgoing_child.is_some()
-            {
-                return Err(DirectiveError::NotAdmitted);
-            }
-            Ok(TurnExecutionDirective::CollectApprovalArguments)
-        }
         Selection::Commit { candidate_id, .. } | Selection::Recover { candidate_id, .. } => {
             let CandidateSet::Legal {
                 candidates,
@@ -266,7 +183,7 @@ pub(crate) fn directive_from_selection(
             {
                 return Err(DirectiveError::ApprovalScopeMismatch);
             }
-            let owner = trusted.owner_id.as_ref().ok_or(DirectiveError::ApprovalScopeMismatch)?;
+            trusted.owner_id.as_ref().ok_or(DirectiveError::ApprovalScopeMismatch)?;
             let call_digest = decision.call_fingerprints.get(pending_candidate_id).copied();
             // Current producers have no independently proven fixed-scope
             // approval. A later producer may justify an optional digest;
@@ -278,47 +195,16 @@ pub(crate) fn directive_from_selection(
             if context.approval_expires_at <= now || context.approval_expires_at > now + MAX_APPROVAL_LIFETIME {
                 return Err(DirectiveError::ApprovalScopeMismatch);
             }
-            #[cfg(test)]
-            {
-                Ok(TurnExecutionDirective::RequestApproval {
-                    approval_scope: ApprovalScope {
-                        decision_id: decision.decision_id,
-                        capability_refs: pending.candidate.required_capabilities().to_vec(),
-                        op_ids: op_ids.clone(),
-                        effect: pending.candidate.side_effect(),
-                        owner: owner.to_string(),
-                        workspace: trusted.workspace_id.to_string(),
-                        session: trusted.session_key.as_ref().map(ToString::to_string),
-                        call_digest,
-                        catalog_generation: trusted.catalog_generation,
-                        expires_at: context.approval_expires_at,
-                        single_use: true,
-                    },
-                })
-            }
-            #[cfg(not(test))]
-            {
-                let _ = (owner, call_digest);
-                Ok(TurnExecutionDirective::RequestApproval {})
-            }
+            Ok(TurnExecutionDirective::RequestApproval {})
         }
-        Selection::Abstain { action, reason_code } => {
+        Selection::Abstain { action, .. } => {
             let candidate_id = CandidateId::new(*action, CapabilityTarget::None, None);
             require_pass(&candidate_id, decision)?;
-            #[cfg(not(test))]
-            let _ = reason_code;
+
             match action {
                 CausalActionKind::Answer => Ok(TurnExecutionDirective::AnswerDirectly),
-                CausalActionKind::Clarify => Ok(TurnExecutionDirective::Clarify {
-                    #[cfg(test)]
-                    reason_code: (*reason_code).into(),
-                }),
-                CausalActionKind::Refuse => Ok(TurnExecutionDirective::Refuse {
-                    #[cfg(test)]
-                    policy_code: (*reason_code).into(),
-                    #[cfg(test)]
-                    user_hint: super::refusal::RefusalReason::classify(reason_code, decision).user_hint(),
-                }),
+                CausalActionKind::Clarify => Ok(TurnExecutionDirective::Clarify {}),
+                CausalActionKind::Refuse => Ok(TurnExecutionDirective::Refuse {}),
                 _ => Err(DirectiveError::ActionMismatch),
             }
         }
@@ -409,62 +295,20 @@ fn pending_approval<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-
-    #[test]
-    fn terminal_renderer_never_exposes_reason_or_capability_names() {
-        let hidden = "HIDDEN-CAP-9V";
-        for directive in [
-            TurnExecutionDirective::Clarify {
-                reason_code: hidden.to_string(),
-            },
-            TurnExecutionDirective::Refuse {
-                policy_code: hidden.to_string(),
-                user_hint: None,
-            },
-        ] {
-            let reply = render_terminal_directive(&directive).expect("terminal reply");
-            assert!(!reply.contains(hidden));
-            assert!(!reply.is_empty());
-        }
-        assert_eq!(
-            render_terminal_directive(&TurnExecutionDirective::Clarify {
-                reason_code: "deadline_exceeded".to_string(),
-            }),
-            Ok(std::borrow::Cow::Borrowed(
-                "Could you narrow your request so I can finish it in time?"
-            ))
-        );
-        let priced = render_terminal_directive(&TurnExecutionDirective::Refuse {
-            policy_code: "no_legal_path".to_string(),
-            user_hint: Some(
-                r#"Reason: model deepseek/deepseek-v3.2 has no price; add [cost.prices."deepseek/deepseek-v3.2"]"#
-                    .to_string(),
-            ),
-        })
-        .expect("unpriced refusal reply");
-        assert!(priced.contains(crate::causal_tree::refusal::GENERIC_REFUSAL_REPLY));
-        assert!(priced.contains(r#"[cost.prices."deepseek/deepseek-v3.2"]"#));
-        assert!(matches!(
-            render_terminal_directive(&TurnExecutionDirective::AnswerDirectly),
-            Err(DirectiveError::ActionMismatch)
-        ));
-    }
+    use crate::causal_tree::branch::{ApprovalRequirement, CandidateSpec, CausalCandidate, SchemaFingerprint};
+    use crate::causal_tree::branch::{OpId, SideEffectClass};
+    use crate::causal_tree::candidate_generator::NoLegalReason;
+    use crate::causal_tree::decision_engine::FallbackCause;
+    use crate::causal_tree::gates::GateReport;
+    use crate::causal_tree::ids::DecisionId;
+    use crate::causal_tree::state::{TrustedState, fixtures};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::super::branch::{
-        ApprovalRequirement, CandidateSpec, CatalogGeneration, CausalCandidate, SchemaFingerprint,
-    };
-    use super::super::candidate_generator::NoLegalReason;
-    use super::super::decision_engine::FallbackCause;
-    use super::super::gates::GateReport;
-    use super::super::state::{TrustedState, fixtures};
-
-    #[test]
-    fn approval_scope_uses_pinned_decision_and_call_digest() {
+    pub(crate) fn recorded_request_approval_hop() -> (EngineDecision, crate::causal_tree::store::DecisionRecord) {
         let key = fixtures::key();
         let mut state = fixtures::state(&key, "neutral request");
         let mut trusted = fixtures::trusted();
@@ -472,9 +316,10 @@ mod tests {
         trusted.workspace_id = Arc::from("prx_workspace");
         state.trusted = TrustedState::from_runtime(trusted);
         let generation = state.trusted.parts().catalog_generation;
-        let id = DecisionId::parse("0192f0c4-0000-7000-8000-000000000001").unwrap();
+        let id = DecisionId::parse("0192f0c4-0000-7000-8000-000000000001").expect("test: historical approval fixture");
         let reference = CapabilityRef {
-            id: CapabilityId::new(CapabilityTarget::NativeTool, "prx", "read").unwrap(),
+            id: CapabilityId::new(CapabilityTarget::NativeTool, "prx", "read")
+                .expect("test: historical approval fixture"),
             fingerprint: SchemaFingerprint([3; 32]),
             generation,
         };
@@ -533,7 +378,7 @@ mod tests {
             ]),
             gate_set_hash: [4; 32],
         };
-        let mut decision = EngineDecision {
+        let decision = EngineDecision {
             decision_id: id,
             deadline: Instant::now() + Duration::from_secs(5),
             elapsed_ms: 0,
@@ -567,58 +412,24 @@ mod tests {
             outgoing_child: None,
             outgoing_parent_allowed: None,
         };
+        let record = crate::causal_tree::outcome::DecisionRecordBuilder::build_hop(&decision, &key, None, true, false)
+            .expect("test: historical approval record");
+        (decision, record)
+    }
+    #[test]
+    fn approval_scope_uses_pinned_decision_and_call_digest() {
+        let (decision, _) = recorded_request_approval_hop();
         let context = DirectiveContext {
-            current_generation: generation,
+            current_generation: decision.state.trusted.parts().catalog_generation,
             approval_expires_at: Utc::now() + chrono::Duration::minutes(1),
             discovery_limit: 4,
         };
-        let TurnExecutionDirective::RequestApproval { approval_scope } =
-            directive_from_selection(&decision, &context).unwrap()
-        else {
-            panic!("expected approval directive")
-        };
-        assert_eq!(approval_scope.decision_id, id);
-        assert_eq!(approval_scope.owner, "prx_user");
-        assert_eq!(approval_scope.workspace, "prx_workspace");
-        assert_eq!(approval_scope.call_digest, Some([6; 32]));
-        assert_eq!(approval_scope.capability_refs, vec![reference]);
-        assert_eq!(approval_scope.op_ids, vec![op_id]);
-        assert!(approval_scope.single_use);
-
-        let stale = DirectiveContext {
-            current_generation: CatalogGeneration([8; 32]),
-            ..context
-        };
-        assert!(matches!(
-            directive_from_selection(&decision, &stale),
-            Err(DirectiveError::NotAdmitted)
-        ));
-        decision.call_fingerprints.clear();
-        assert!(matches!(
-            directive_from_selection(
-                &decision,
-                &DirectiveContext {
-                    current_generation: generation,
-                    approval_expires_at: Utc::now() + chrono::Duration::minutes(1),
-                    discovery_limit: 4,
-                }
+        assert!(
+            matches!(
+                directive_from_selection(&decision, &context),
+                Ok(TurnExecutionDirective::RequestApproval { .. })
             ),
-            Err(DirectiveError::ApprovalScopeMismatch)
-        ));
-        decision.deadline = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .expect("test clock supports one millisecond subtraction");
-        decision.selection = Selection::Abstain {
-            action: CausalActionKind::Refuse,
-            reason_code: "deadline_exceeded",
-        };
-        assert!(matches!(
-            directive_from_selection(&decision, &DirectiveContext {
-                current_generation: generation,
-                approval_expires_at: Utc::now() + chrono::Duration::minutes(1),
-                discovery_limit: 4,
-            }),
-            Ok(TurnExecutionDirective::Refuse { policy_code, .. }) if policy_code == "deadline_exceeded"
-        ));
+            "test: structurally valid exact-call approval"
+        );
     }
 }

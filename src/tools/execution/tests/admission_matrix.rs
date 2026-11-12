@@ -4,6 +4,7 @@ use super::*;
 mod approval;
 mod budget;
 mod policy;
+mod switch_properties;
 use crate::security::approval_ledger::{run_call::ApprovalLedgerPort, strategy::ExecutionApprovalLedger};
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
 use crate::tools::execution::admission::CallTokenBudget;

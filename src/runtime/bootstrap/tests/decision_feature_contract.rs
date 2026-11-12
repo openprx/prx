@@ -7,9 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::{BootstrapProfile, RuntimeBootstrap};
 use crate::agent::entry::{test_cli_agent_turn_proof, test_recorded_cli_agent_turn_proof};
-use crate::causal_tree::directive::TurnExecutionDirective;
-use crate::decision::factory::ServedBy;
-use crate::runtime::turn_decision::{AgentTurnKind, TurnDisposition};
+use crate::runtime::turn_decision::AgentTurnKind;
 
 /// G-07 runs this exact selector in each feature configuration. In particular,
 /// this module is not gated on llm-router: the published decision service must
@@ -40,32 +38,14 @@ async fn decision_service_present_in_every_model_turn_build() {
             test_cli_agent_turn_proof(&context.config_generation, "ollama", "prx-local-model")
         };
         let cancellation = CancellationToken::new();
-        let decision = Box::pin(service.decide_agent_initial(&proof, AgentTurnKind::SingleShot, &cancellation))
+        let decision = Box::pin(service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation))
             .await
             .expect("published service must return a source-bound directive");
-        assert!(matches!(
-            decision.directive(),
-            TurnExecutionDirective::AnswerDirectly
-                | TurnExecutionDirective::Refuse { .. }
-                | TurnExecutionDirective::Clarify { .. }
-                | TurnExecutionDirective::RequestApproval { .. }
-        ));
-        assert_eq!(
-            decision
-                .engine()
-                .prediction
-                .as_ref()
-                .map(|prediction| prediction.served_by),
-            Some(ServedBy::Builtin),
-            "fallback_cause={:?}, elapsed_ms={}",
-            decision.engine().fallback_cause,
-            decision.engine().elapsed_ms
+        assert!(
+            decision.engine().prediction.is_none(),
+            "test: engine-off bootstrap never predicts"
         );
-        assert!(!decision.engine().pre_commit.outcomes.is_empty());
-        assert!(matches!(
-            decision.disposition(),
-            Ok(TurnDisposition::Run | TurnDisposition::Close { .. })
-        ));
+        assert!(decision.is_run().expect("test: live issued execution"));
         assert_eq!(decision.hop_ids().last(), Some(&decision.decision_id()));
         assert!(service.drain_writes(Instant::now() + Duration::from_secs(2)).await);
         let key = workspace.path().join("self/causal_tree/.decision_key");

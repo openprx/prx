@@ -779,10 +779,13 @@ async fn interactive_chat_clear_shell_request_with_empty_memory_is_not_clarified
             let binding = admit_start_turn_fixture(&deps, "draft-f112-chat", "Run the shell command: echo hi", true)
                 .await
                 .expect("test: genuine admission");
-            assert_eq!(
-                binding.fixed_reply().expect("test: decided turn"),
-                None,
-                "a clear request must run, not close with Clarify/Refuse"
+            assert!(
+                binding
+                    .decision_routing()
+                    .expect("test: admitted routing")
+                    .context
+                    .is_run()
+                    .expect("test: live execution")
             );
             Ok(())
         })

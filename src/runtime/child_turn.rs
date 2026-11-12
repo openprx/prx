@@ -1,7 +1,6 @@
 //! Source-bound decision and terminal ownership for one child execution segment.
-#[cfg(test)]
-use super::turn_decision::CloseTurnPorts;
-use super::turn_decision::{TurnDecisionContext, TurnDecisionService, TurnDisposition};
+
+use super::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use super::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use crate::agent::terminal::{
     TurnDeliveryIntent, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus, TurnTerminalTelemetry,
@@ -95,7 +94,7 @@ impl ChildSegmentTurn {
             owner,
             cancellation,
         )?;
-        if matches!(turn.decision.disposition()?, TurnDisposition::Run) {
+        {
             turn.recalled_context = crate::agent::context_recall::scoped_recall(
                 recall_memory.as_ref(),
                 &recall_scope,
@@ -169,14 +168,6 @@ impl ChildSegmentTurn {
         self
     }
 
-    pub(crate) fn is_close(&self) -> anyhow::Result<bool> {
-        match self.decision.disposition()? {
-            #[cfg(test)]
-            TurnDisposition::Close { .. } => Ok(true),
-            TurnDisposition::Run => Ok(false),
-        }
-    }
-
     /// A synchronous child owns its own assistant projection; task segments
     /// leave this unset because their logical task owns the projection.
     pub(crate) const fn project_history(&mut self, history_commit_len: usize) {
@@ -240,26 +231,6 @@ impl ChildSegmentTurn {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn close(&self, cancellation: &CancellationToken) -> anyhow::Result<Option<String>> {
-        #[cfg(not(test))]
-        {
-            let _ = (self.decision.disposition()?, cancellation);
-            return Ok(None);
-        }
-        #[cfg(test)]
-        {
-            let TurnDisposition::Close { reply } = self.decision.disposition()? else {
-                return Ok(None);
-            };
-            self.service
-                .close_agent_directive_turn(self.proof.as_ref(), Arc::clone(&self.decision), self, cancellation)
-                .await
-                .map_err(|error| error.context(super::turn_cleanup::CleanupIncomplete))?;
-            Ok(Some(reply.to_string()))
-        }
-    }
-
     fn proposal(
         &self,
         status: TurnTerminalStatus,
@@ -313,21 +284,5 @@ impl ChildSegmentTurn {
             .finish_failure(error, cancelled)
             .await
             .map_err(|error| error.context(super::turn_cleanup::CleanupIncomplete))
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl CloseTurnPorts for ChildSegmentTurn {
-    type Receipt = TurnTerminalReceipt;
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        anyhow::ensure!(Arc::ptr_eq(&context, &self.decision), "child close decision changed");
-        self.terminal
-            .commit(self.proposal(TurnTerminalStatus::Completed, reply.to_owned(), None))
-            .await
     }
 }

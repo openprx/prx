@@ -17,8 +17,6 @@ use crate::decision::DecisionKey;
 /// A selected working candidate or an explicit terminal disposition.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Selection {
-    #[cfg(test)]
-    CollectApprovalArguments(super::approval_collection::DeferredArgumentProof),
     Commit {
         candidate_id: CandidateId,
         /// One when exploration is off; the exploration module can replace

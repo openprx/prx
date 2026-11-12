@@ -622,7 +622,9 @@ fn test_connect_info() -> ConnectInfo<SocketAddr> {
     ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
 }
 
-struct EngineOffWebhookProvider;
+struct EngineOffWebhookProvider {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[async_trait]
 impl Provider for EngineOffWebhookProvider {
@@ -633,6 +635,7 @@ impl Provider for EngineOffWebhookProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok("ok".into())
     }
 
@@ -642,6 +645,7 @@ impl Provider for EngineOffWebhookProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<crate::providers::ChatResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(crate::providers::ChatResponse {
             text: Some("ok".into()),
             tool_calls: Vec::new(),
@@ -651,7 +655,10 @@ impl Provider for EngineOffWebhookProvider {
 }
 
 pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::Path) {
-    let provider: Arc<dyn Provider> = Arc::new(EngineOffWebhookProvider);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(EngineOffWebhookProvider {
+        calls: Arc::clone(&calls),
+    });
     let mut config = webhook_test_config();
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");
@@ -663,6 +670,15 @@ pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::P
             "native_tools": true,
         }))
         .expect("test: webhook model declaration"),
+    );
+    config.cost.prices.insert(
+        "mock/test-model".into(),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
     );
     let mut state = AppState {
         config: crate::config::new_shared(config),
@@ -696,7 +712,7 @@ pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::P
         plugin_runtime: None,
     };
     install_webhook_turn_runtime(&mut state);
-    let _ = handle_webhook(
+    let response = handle_webhook(
         State(state),
         test_connect_info(),
         test_uri(),
@@ -704,6 +720,16 @@ pub(crate) async fn drive_disabled_engine_webhook_entry(workspace: &std::path::P
         Bytes::from_static(br#"{"message":"hello","reply_target":"client-a"}"#),
     )
     .await;
+    assert_eq!(
+        response.into_response().status(),
+        axum::http::StatusCode::OK,
+        "test: webhook completed"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "test: provider called once"
+    );
 }
 
 fn webhook_test_config() -> Config {

@@ -31,6 +31,7 @@ fn channel_message() -> crate::channels::traits::ChannelMessage {
 struct EngineOffProvider {
     published: Arc<Mutex<Vec<String>>>,
     responses: Mutex<VecDeque<ChatResponse>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait]
@@ -51,6 +52,7 @@ impl Provider for EngineOffProvider {
             .iter()
             .map(|spec| spec.name.clone())
             .collect();
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.published.lock().expect("published tools") = names;
         self.responses
             .lock()
@@ -81,6 +83,7 @@ async fn tool_surface_is_built_without_decision_service() {
     let admitted = AdmittedTurn::with_channel(config, channel_message(), Arc::clone(&registry)).await;
     let published = Arc::new(Mutex::new(Vec::new()));
     let provider = EngineOffProvider {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         published: Arc::clone(&published),
         responses: Mutex::new(
             vec![
@@ -269,6 +272,7 @@ async fn disabled_entry_turn_has_finite_call_budget() {
     };
     let published = Arc::new(Mutex::new(Vec::new()));
     let provider = EngineOffProvider {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         published: Arc::clone(&published),
         responses: Mutex::new(
             vec![
@@ -379,118 +383,6 @@ impl Provider for CollectIgnoreProvider {
             reasoning_content: None,
         })
     }
-}
-
-/// A Collect directive in the opened context does not take the collection
-/// path: the provider is called once and no collection lease starts.
-/// Re-inserting a Collect match at `run_turn` start fails this cell.
-#[tokio::test]
-async fn run_turn_ignores_recorded_collect_directive() {
-    let workspace = tempfile::tempdir().expect("test: collect-ignore workspace");
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = workspace.path().to_owned();
-    assert!(
-        !config.decision_engine.enabled,
-        "this cell runs with the decision engine off"
-    );
-    let admitted = AdmittedTurn::with_config(config, "answer the user", Arc::new(Vec::new())).await;
-    let decision = admitted.decision();
-    let mut context = decision
-        .service
-        .open_turn_context(
-            decision.proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect("test: disabled engine opens a turn context");
-    let cap =
-        context
-            .execution_refs()
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| crate::causal_tree::branch::CapabilityRef {
-                id: crate::causal_tree::branch::CapabilityId::new(
-                    crate::causal_tree::branch::CapabilityTarget::NativeTool,
-                    "test",
-                    "probe",
-                )
-                .expect("test: test capability id"),
-                fingerprint: crate::causal_tree::branch::SchemaFingerprint([0; 32]),
-                generation: crate::causal_tree::branch::CatalogGeneration([0; 32]),
-            });
-    Arc::get_mut(&mut context)
-        .expect("test: opened context is uniquely owned")
-        .install_collect_directive_for_test(
-            crate::causal_tree::approval_collection::DeferredArgumentProof::issue_for_test(
-                cap,
-                crate::causal_tree::approval_collection::ApprovalReviewAdapter::ChatOwnerReview,
-                "0".repeat(64),
-            ),
-        );
-    assert!(
-        context.carries_collect_directive_for_test(),
-        "the fixture must carry a Collect directive"
-    );
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let provider = CollectIgnoreProvider {
-        calls: Arc::clone(&calls),
-    };
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("answer the user")];
-    let opened = TurnDecision {
-        service: decision.service,
-        context: &context,
-        proof: decision.proof,
-    };
-    run_turn(
-        &mut history,
-        TurnRequest {
-            advice: None,
-            channel_name: "wacli",
-            scope: None,
-            mode: ChatMode::default(),
-            silent: true,
-            expose_stay_silent: false,
-            multimodal: &crate::config::MultimodalConfig::default(),
-            schedule: TurnSchedule {
-                read_only_tool_concurrency_window: 1,
-                priority_scheduling_enabled: false,
-                low_priority_tool_names: Vec::new(),
-            },
-            compaction: None,
-            decision: opened,
-        },
-        TurnServices {
-            provider: &provider,
-            provider_name: "ollama",
-            model: "prx-local-model",
-            temperature: 0.0,
-            tools_registry: Arc::new(Vec::<Box<dyn Tool>>::new()),
-            observer: &crate::observability::NoopObserver,
-            hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-            approval: None,
-            approval_resolver: None,
-            runtime_adapter: Some(admitted.adapter()),
-            memory: admitted.memory_runtime(),
-        },
-        TurnDelivery {
-            cancellation: None,
-            on_delta: None,
-            on_tool_call: None,
-        },
-    )
-    .await
-    .expect("test: run_turn ignores a recorded Collect directive");
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "Collect in context must not skip the provider turn"
-    );
-    assert!(
-        !context.approval_collection_started_for_test(),
-        "Collect in context must not start a collection lease"
-    );
 }
 
 struct SpawnFixtureChannel;
@@ -970,6 +862,7 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
     };
     let published = Arc::new(Mutex::new(Vec::new()));
     let provider = EngineOffProvider {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         published: Arc::clone(&published),
         responses: Mutex::new(
             vec![
@@ -1098,8 +991,11 @@ async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::confi
     config.workspace_dir = workspace.to_owned();
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: agent sqlite"));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let published = Arc::new(Mutex::new(Vec::new()));
     let provider = EngineOffProvider {
-        published: Arc::new(Mutex::new(Vec::new())),
+        calls: Arc::clone(&calls),
+        published: Arc::clone(&published),
         responses: Mutex::new(
             vec![ChatResponse {
                 text: Some("ok".into()),
@@ -1109,17 +1005,35 @@ async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::confi
             .into(),
         ),
     };
+    config.tool_tiering.always_include.push("project_tool".into());
     let mut agent = crate::agent::agent::Agent::builder()
         .runtime_config(config, "ollama")
         .workspace_dir(workspace.to_owned())
         .provider(Box::new(provider))
-        .tools(Vec::new())
+        .tools(vec![Box::new(RecordingTool {
+            name: "project_tool".into(),
+            execution_order: Arc::new(Mutex::new(Vec::new())),
+        }) as Box<dyn Tool>])
         .memory(memory)
         .observer(Arc::new(crate::observability::NoopObserver))
         .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
         .build()
         .expect("test: agent entry");
-    let _ = agent.turn("hello").await;
+    assert_eq!(
+        agent.turn("hello").await.expect("test: entry completes"),
+        "ok",
+        "test: real provider response"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "test: agent provider called once"
+    );
+    assert_eq!(
+        *published.lock().expect("test: published surface"),
+        vec!["project_tool"],
+        "test: default Direct surface survives engine-off backend configuration"
+    );
 }
 
 /// Disabled engine never constructs a factory, telemetry store, or credential
@@ -1128,6 +1042,10 @@ async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::confi
 async fn disabled_engine_constructs_nothing() {
     fn assert_cell(name: &str, workspace: &std::path::Path, spy: &crate::decision_engine::access_spy::AccessSpy) {
         spy.assert_constructs_nothing(name);
+        assert!(
+            workspace.join("self/causal_tree/decisions.db").is_file(),
+            "{name}: recovery database exists"
+        );
         assert!(
             !workspace.join("decision-engine.sqlite").exists(),
             "{name}: decision-engine.sqlite must not be created"
@@ -1165,6 +1083,27 @@ async fn disabled_engine_constructs_nothing() {
         assert_cell("console", workspace.path(), &spy);
     }
 
+    for kind in [
+        crate::decision::BackendKind::Builtin,
+        crate::decision::BackendKind::CompatibleHttp,
+    ] {
+        let workspace = tempfile::tempdir().expect("test: local backend workspace");
+        let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+        let mut config = engine_off_config(workspace.path());
+        config.causal_tree.enabled = true;
+        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(kind);
+        if kind == crate::decision::BackendKind::CompatibleHttp {
+            config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
+            config.causal_tree.backend.model = "prx-decision-probe".into();
+            config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: declared loopback decision model"));
+        }
+        drive_agent_entry(workspace.path(), config).await;
+        assert_cell(&format!("local backend {kind:?}"), workspace.path(), &spy);
+        assert!(
+            workspace.path().join("self/causal_tree/decisions.db").is_file(),
+            "test: recovery decisions database exists"
+        );
+    }
     let workspace = tempfile::tempdir().expect("test: remote-keys workspace");
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let mut config = engine_off_config(workspace.path());
@@ -1187,8 +1126,7 @@ async fn disabled_engine_constructs_nothing() {
     drive_agent_entry(workspace.path(), config).await;
     spy.assert_constructs_nothing("causal_tree remote keys");
     assert!(
-        workspace.path().join("self/causal_tree/decisions.db").exists()
-            || workspace.path().join("self/causal_tree").exists(),
+        workspace.path().join("self/causal_tree/decisions.db").exists(),
         "recovery stays on when [causal_tree].enabled is true"
     );
 }
@@ -1257,7 +1195,7 @@ async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
             .build()
             .expect("test: brief agent");
-        let _ = agent.turn("hello").await;
+        agent.turn("hello").await.expect("test: advisory entry completes");
         (
             published.lock().expect("test: published").clone(),
             systems.lock().expect("test: systems").clone(),

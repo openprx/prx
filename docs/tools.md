@@ -431,7 +431,12 @@ a narrower allowlist intentionally exposes only the named capabilities. Task
 children proxy the live parent registry. Process workers reconstruct native,
 Skill, MCP, WASM, Hook, memory, network, scheduling, session orchestration,
 daemon messaging, and Gateway tools from the parent's sealed configuration.
-Each child still obtains its own decision within that inherited boundary.
+A process worker's `skill_read` serves only the authenticated Skill metadata
+in its inherited capability subset. Reads fail when the skill's name, location,
+or frontmatter digest differs from that binding. Child reads do not create task
+pins in the parent's lifecycle store. This metadata check does not make skill
+instruction bodies or resources immutable.
+Each child still obtains its own turn context within that inherited boundary.
 UI-owner controls such as attaching a TUI viewport remain in the UI process and
 are not agent execution capabilities.
 

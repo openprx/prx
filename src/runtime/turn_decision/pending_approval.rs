@@ -4,8 +4,6 @@ mod h2;
 mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
 use crate::acl::approval_grant::{ApprovalGrantV2, RiskLevel, WitnessKeyring};
-#[cfg(test)]
-use crate::acl::approval_grant::{DecisionApprovalBinding, Subject};
 use crate::causal_tree::ids::DecisionId;
 use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
@@ -88,144 +86,6 @@ impl TurnDecisionService {
     ) -> anyhow::Result<PendingApprovalPage> {
         self.approval_ledger()
             .list_pending_decision_approvals(owner, after_id, limit)
-            .await
-    }
-
-    #[cfg(test)]
-    pub(super) async fn record_pending_decision_approval(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
-    ) -> anyhow::Result<()> {
-        self.resolve_agent_model(proof)?;
-        self.check_live_parity()?;
-        let TurnExecutionDirective::RequestApproval { approval_scope } = &context.directive else {
-            anyhow::bail!("decision has no pending approval scope");
-        };
-        anyhow::ensure!(
-            context.source_actor_matches(Some(proof.policy_channel()), Some(proof.policy_sender()))
-                && approval_scope.decision_id == context.decision_id()
-                && approval_scope.owner == proof.owner_id()
-                && approval_scope.workspace == proof.workspace_id()
-                && approval_scope.session.as_deref() == Some(proof.session_key())
-                && approval_scope.catalog_generation == *self.catalog.generation()
-                && approval_scope.single_use
-                && !approval_scope.op_ids.is_empty()
-                && !approval_scope.capability_refs.is_empty()
-                && approval_scope.expires_at > Utc::now(),
-            "pending approval differs from its issued decision scope"
-        );
-        let fresh = crate::causal_tree::directive::directive_from_selection(
-            &context.engine,
-            &crate::causal_tree::directive::DirectiveContext {
-                current_generation: *self.catalog.generation(),
-                approval_expires_at: approval_scope.expires_at,
-                discovery_limit: 1,
-            },
-        )?;
-        anyhow::ensure!(
-            matches!(fresh, TurnExecutionDirective::RequestApproval { approval_scope: fresh } if fresh == *approval_scope),
-            "pending approval does not match the gated selection"
-        );
-        self.catalog.resolve(&approval_scope.capability_refs)?;
-        let link = self.settlement_ref(Arc::clone(context))?;
-        link.validate_durable_chain().await?;
-        let source_id = proof.source_event_id().context("pending approval source missing")?;
-        let source = self
-            .memory
-            .find_owned_message_event(proof.workspace_id(), proof.owner_id(), source_id)
-            .await?
-            .context("pending approval source is not durable")?;
-        anyhow::ensure!(
-            source.role == "user"
-                && source.event_type == "message.created"
-                && source.session_key.as_deref() == Some(proof.session_key())
-                && source.run_id.as_deref() == Some(proof.run_id())
-                && crate::runtime::turn_source::subject_task_id(source.subject.as_ref()) == proof.task_id()
-                && context.source_actor_matches(source.channel.as_deref(), source.sender.as_deref())
-                && crate::runtime::turn_source::recorded_input_matches(proof.surface(), &source, proof.routing_input()),
-            "pending approval source differs from admitted input"
-        );
-        let store_workspace = self.store.workspace_id().context("approval decision store missing")?;
-        let decision_digests = self
-            .journal_decision_digests(
-                &store_workspace,
-                proof.owner_id(),
-                context.hop_ids(),
-                "pending approval decision is not durable",
-            )
-            .await?;
-        let principal = crate::memory::principal::OwnerPrincipal::new(
-            proof.workspace_id(),
-            proof.policy_channel(),
-            proof.policy_sender(),
-            proof.session_key(),
-            vec![crate::memory::principal::Role::Anonymous],
-        );
-        let record = PendingRecord {
-            h2_origin: proof.h2_entry_origin().map(|origin| Box::new(origin.record().clone())),
-            subject: Subject {
-                agent_id: format!("prx:agent:{}", proof.policy_channel()),
-                principal_id: principal.principal_id,
-                owner_id: proof.owner_id().to_owned(),
-                workspace_id: proof.workspace_id().to_owned(),
-                session_key: Some(proof.session_key().to_owned()),
-            },
-            binding: DecisionApprovalBinding {
-                decision_id: context.decision_id().to_string(),
-                catalog_generation: approval_scope.catalog_generation.0,
-                call_digest: approval_scope
-                    .call_digest
-                    .context("pending approval has no proven call digest")?,
-            },
-            source_event_id: source.event_id.clone(),
-            source_mac: self
-                .state_key
-                .hmac(KeyDomain::ApprovalState, &[b"source", &serde_json::to_vec(&source)?]),
-            run_id: proof.run_id().to_owned(),
-            decision_digests,
-            policy_version: self.policy_version.to_string(),
-            capabilities: approval_scope
-                .capability_refs
-                .iter()
-                .map(|reference| {
-                    (
-                        reference.id.as_str().to_owned(),
-                        reference.fingerprint.0,
-                        reference.generation.0,
-                    )
-                })
-                .collect(),
-            op_ids: approval_scope.op_ids.iter().map(|op| op.as_str().to_owned()).collect(),
-            effect: approval_scope.effect.as_str().to_owned(),
-            risk: None,
-            schema_dialect: None,
-            sealed_call: None,
-            expires_at: proof.h2_entry_origin().map_or(approval_scope.expires_at, |origin| {
-                approval_scope.expires_at.min(origin.record().authority_expires_at)
-            }),
-        };
-        let expires_at = record.expires_at;
-        self.persist_pending_record(record, &source).await?;
-        if let Some(owner) = context.recursive_allowance.get() {
-            owner.retain_pending(expires_at);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn persist_pending_record(&self, record: PendingRecord, source: &MessageEvent) -> anyhow::Result<()> {
-        self.persist_pending_record_receipt(record, source).await.map(|_| ())
-    }
-
-    #[cfg(test)]
-    async fn persist_pending_record_receipt(
-        &self,
-        record: PendingRecord,
-        source: &MessageEvent,
-    ) -> anyhow::Result<MessageEvent> {
-        self.approval_ledger()
-            .persist_pending_record_receipt(record, source)
             .await
     }
 
@@ -948,35 +808,7 @@ impl AdmittedDecisionResume {
     }
 }
 
-impl TurnDecisionService {
-    /// Chain digests of recorded decisions, read from the authority journal.
-    /// The async decision store is a projection and may lag the journal, so it
-    /// is never consulted. A missing journal row is a refusal.
-    #[cfg(test)]
-    pub(super) async fn journal_decision_digests(
-        &self,
-        store_workspace: &str,
-        owner: &str,
-        ids: &[DecisionId],
-        missing: &'static str,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let workspace = &self.generation.effective.workspace_dir;
-        let mut digests = Vec::with_capacity(ids.len());
-        for id in ids {
-            let row = crate::agent::terminal::read_journal_replay_record(
-                workspace,
-                &self.state_key,
-                store_workspace,
-                owner,
-                id,
-            )
-            .await?
-            .context(missing)?;
-            digests.push((id.to_string(), row.digest));
-        }
-        Ok(digests)
-    }
-}
+impl TurnDecisionService {}
 
 impl TurnDecisionService {
     pub(super) fn approval_ledger(&self) -> ApprovalLedger<'_> {

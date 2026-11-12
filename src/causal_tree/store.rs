@@ -1076,8 +1076,7 @@ pub(crate) use child_outcome::{ChildOutcomeLink, ChildOutcomeView};
 enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
-    #[cfg(test)]
-    VerifiedDecision(Box<acknowledged::VerifiedDecision>),
+
     ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
     /// A v1 file's progress, saved only when every listed decision is
@@ -2987,8 +2986,7 @@ fn run_writer(mut thread: WriterThread) {
         let _held = hold.as_ref().map(|hold| hold.lock());
         match command {
             WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
-            #[cfg(test)]
-            WriterMessage::VerifiedDecision(record) => record.finish(&mut thread),
+
             WriterMessage::ReplayChain(read) => read.finish(&mut thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),

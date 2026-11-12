@@ -52,22 +52,10 @@ enum RecordedDirective {
 const APPROVAL_UNAVAILABLE_REPLY: &str =
     "This action needs owner approval, which this surface cannot collect; nothing was run.";
 
-#[cfg(test)]
-fn hop_candidates(
-    hop: &crate::causal_tree::decision_engine::EngineDecision,
-) -> &[crate::causal_tree::branch::CausalCandidate] {
-    match &hop.candidates {
-        crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
-        #[cfg(test)]
-        crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals,
-    }
-}
-
 fn recorded_from_hop(
     row: &DecisionReplayRecord,
     hop: &crate::causal_tree::decision_engine::EngineDecision,
 ) -> anyhow::Result<RecordedDirective> {
-    #[cfg(test)]
     use crate::causal_tree::decision_select::Selection;
     Ok(match row.decision.directive_kind.as_str() {
         "collect_approval_arguments" => RecordedDirective::CollectApprovalArguments,
@@ -80,22 +68,32 @@ fn recorded_from_hop(
             reason_code: row.decision.abstention_reason.clone().unwrap_or_default(),
         },
         "request_approval" => {
-            #[cfg(test)]
-            let effect = match &hop.selection {
-                Selection::RequestApproval {
-                    pending_candidate_id, ..
-                } => hop_candidates(hop)
+            let Selection::RequestApproval {
+                pending_candidate_id, ..
+            } = &hop.selection
+            else {
+                anyhow::bail!("recorded approval row differs from its persisted hop selection");
+            };
+            let pending = match &hop.candidates {
+                crate::causal_tree::candidate_generator::CandidateSet::Legal {
+                    candidates,
+                    approval_scopes,
+                    ..
+                } => candidates
                     .iter()
-                    .find(|candidate| candidate.candidate_id() == pending_candidate_id)
-                    .map(|candidate| candidate.side_effect().as_str().to_owned())
-                    .unwrap_or_default(),
-                _ => row.decision.abstention_reason.clone().unwrap_or_default(),
-            };
-            #[cfg(not(test))]
-            let effect = {
-                let _ = hop;
-                row.decision.abstention_reason.clone().unwrap_or_default()
-            };
+                    .chain(approval_scopes.values().flatten().map(|item| &item.candidate))
+                    .find(|candidate| candidate.candidate_id() == pending_candidate_id),
+                crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath {
+                    terminals,
+                    approval_only,
+                    ..
+                } => terminals
+                    .iter()
+                    .chain(approval_only.iter().map(|item| &item.candidate))
+                    .find(|candidate| candidate.candidate_id() == pending_candidate_id),
+            }
+            .context("recorded approval candidate is missing")?;
+            let effect = pending.side_effect().as_str().to_owned();
             RecordedDirective::RequestApproval {
                 decision_id: row.decision.decision_id.to_string(),
                 effect,
@@ -348,6 +346,18 @@ fn event_scope(event: &MessageEvent) -> Value {
 }
 
 impl PreparedReplay {
+    fn classify_recorded_hop(
+        row: &DecisionReplayRecord,
+        hop: &crate::causal_tree::decision_engine::EngineDecision,
+        status: TurnTerminalStatus,
+        has_provider: bool,
+        assistant: Option<&str>,
+    ) -> anyhow::Result<(RecordedDirective, bool)> {
+        let directive = recorded_from_hop(row, hop)?;
+        let fixed_close = recorded_fixed_close(&directive, status, has_provider, assistant)?;
+        Ok((directive, fixed_close))
+    }
+
     pub(super) async fn capture(link: &DecisionSettlementRef, commit: &TurnTerminalCommit) -> anyhow::Result<Self> {
         link.context
             .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
@@ -402,14 +412,6 @@ impl PreparedReplay {
             true,
             link.record_redacted_projection,
         )?;
-        let mut router_read = link
-            .context
-            .router_replay_facts(&recorded.key)?
-            .map(router_history::RouterReadReplay::from_issued)
-            .transpose()?;
-        if let Some(router) = &router_read {
-            router.validate_source(&source)?;
-        }
         let mut hops = Vec::with_capacity(link.context.hop_ids().len());
         let mut last_recorded = None;
         for (position, hop) in link.context.audit_hops().enumerate() {
@@ -455,37 +457,24 @@ impl PreparedReplay {
                 row.digest == expected.replay_digest(&recorded.store_workspace_id)?,
                 "persisted decision facts differ from the service-issued record"
             );
-            if let Some(router) = &mut router_read {
-                router.capture_row(&row)?;
-            }
-            last_recorded = Some(recorded_from_hop(&row, hop)?);
+            last_recorded = Some(Self::classify_recorded_hop(
+                &row,
+                hop,
+                commit.status,
+                commit.provider_outcome.is_some(),
+                commit
+                    .history
+                    .as_ref()
+                    .map(|history| history.assistant_content.as_str()),
+            )?);
             hops.push(ReplayHop {
                 decision_id: hop.decision_id.to_string(),
                 digest: row.digest,
             });
         }
         anyhow::ensure!(!hops.is_empty() && hops.len() <= 5, "invalid decision replay chain");
-        let recorded_directive = last_recorded.context("decision replay chain has no recorded directive")?;
-        // Completion can legitimately outlive the decision-stage deadline.
-        // Inspect the recorded hop without issuing a fresh execution lease.
-        let fixed_close = recorded_fixed_close(
-            &recorded_directive,
-            commit.status,
-            commit.provider_outcome.is_some(),
-            commit
-                .history
-                .as_ref()
-                .map(|history| history.assistant_content.as_str()),
-        )?;
-        if let Some(router) = &router_read {
-            router.validate_complete()?;
-            router.validate_serving(
-                &recorded.key,
-                commit.provider_outcome.as_ref(),
-                commit.status,
-                fixed_close,
-            )?;
-        }
+        let (recorded_directive, fixed_close) =
+            last_recorded.context("decision replay chain has no recorded directive")?;
         let resume_claim = if let Some(expected) = link.context.claimed_resume_event() {
             let stored = link
                 .memory
@@ -581,7 +570,7 @@ impl PreparedReplay {
             .collected_pending_event()
             .map(|event| event_binding(&recorded.key, COLLECTION_DOMAIN, event))
             .transpose()?;
-        let collection = link.context.approval_collection_proof().is_some();
+        let collection = matches!(recorded_directive, RecordedDirective::CollectApprovalArguments);
         let collected_declined = link
             .context
             .collected_declined_event()
@@ -616,7 +605,7 @@ impl PreparedReplay {
             collected_pending,
             collected_declined,
             version: 1,
-            router_read,
+            router_read: None,
             served_auxiliary: None,
             parent,
             operator,
@@ -1556,3 +1545,66 @@ pub(crate) fn reseal_payload_for_test(
 
 #[cfg(all(test, unix, feature = "llm-router"))]
 mod legacy_tests;
+
+#[cfg(test)]
+mod recorded_approval_tests {
+    use super::*;
+    #[tokio::test]
+    async fn prepared_replay_reads_pre_switch_request_approval_effect_from_recorded_hop() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let (hop, record) = crate::causal_tree::directive::tests::recorded_request_approval_hop();
+        let store = crate::causal_tree::store::testing::open_private(
+            workspace.path(),
+            Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+        );
+        let writer = store.writer().context("test: actual decision writer")?;
+        assert_eq!(
+            writer.record_decision(record),
+            crate::causal_tree::store::Enqueue::Queued,
+            "test: persist historical row"
+        );
+        assert!(
+            writer
+                .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await,
+            "test: committed row"
+        );
+        let row = store
+            .reader()
+            .replay_record(
+                &DecisionScope::Owner {
+                    workspace_id: store.workspace_id().context("test: store namespace")?,
+                    owner_id: Arc::from("prx_user"),
+                },
+                &hop.decision_id,
+            )?
+            .context("test: recorded pre-switch approval row")?;
+        assert_eq!(
+            row.decision.directive_kind, "request_approval",
+            "test: historical row type"
+        );
+        let reply = "Approval is required for decision 0192f0c4-0000-7000-8000-000000000001 (effect: local_write). Review this decision before resuming it. The operation has not run.";
+        let (directive, fixed_close) =
+            PreparedReplay::classify_recorded_hop(&row, &hop, TurnTerminalStatus::Completed, false, Some(reply))?;
+        assert!(
+            matches!(directive, RecordedDirective::RequestApproval { effect, .. } if effect == "local_write"),
+            "test: persisted pending candidate supplies the effect"
+        );
+        assert!(
+            fixed_close,
+            "test: PreparedReplay classifies the original approval text as fixed"
+        );
+        assert!(
+            !PreparedReplay::classify_recorded_hop(
+                &row,
+                &hop,
+                TurnTerminalStatus::Completed,
+                false,
+                Some("Could you clarify the result you want?")
+            )?
+            .1,
+            "test: mismatched historical text is refused"
+        );
+        Ok(())
+    }
+}

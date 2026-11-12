@@ -152,6 +152,14 @@ fn trusted_scope_field(args: &serde_json::Value, keys: &[&str]) -> Option<String
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ChildSkillReadError {
+    #[error("skill is outside the child's authenticated metadata set")]
+    Unbound,
+    #[error("skill metadata differs from the child's authenticated binding")]
+    MetadataChanged,
+}
+
 pub struct SkillReadTool {
     workspace_dir: PathBuf,
     config: Config,
@@ -159,6 +167,7 @@ pub struct SkillReadTool {
     /// default: `agent::terminal::finalize_turn` releases the task's pins at its
     /// terminal.
     pin_tasks: bool,
+    child_metadata: Option<BTreeMap<String, crate::skills::SkillMetadata>>,
 }
 
 /// Stable provider-compatible identity. Display names and bound read arguments
@@ -205,6 +214,7 @@ impl SkillReadTool {
             workspace_dir,
             config,
             pin_tasks: true,
+            child_metadata: None,
         }
     }
 
@@ -217,12 +227,45 @@ impl SkillReadTool {
         self
     }
 
+    /// Restrict a worker reader to its authenticated metadata; terminals never
+    /// need to release pins in the parent's lifecycle store.
+    pub(crate) fn with_child_metadata(mut self, metadata: Vec<crate::skills::SkillMetadata>) -> Self {
+        self.child_metadata = Some(metadata.into_iter().map(|skill| (skill.name.clone(), skill)).collect());
+        self.pin_tasks = false;
+        self
+    }
+
+    fn check_child_binding(&self, current: &crate::skills::SkillMetadata) -> Result<(), ChildSkillReadError> {
+        let Some(allowed) = &self.child_metadata else {
+            return Ok(());
+        };
+        let signed = allowed.get(&current.name).ok_or(ChildSkillReadError::Unbound)?;
+        if crate::skills::catalog_skill_binding_digest(current) != crate::skills::catalog_skill_binding_digest(signed) {
+            return Err(ChildSkillReadError::MetadataChanged);
+        }
+        Ok(())
+    }
+
+    fn check_child_metadata(&self, name: &str) -> Result<(), ChildSkillReadError> {
+        let Some(allowed) = &self.child_metadata else {
+            return Ok(());
+        };
+        if !allowed.contains_key(name) {
+            return Err(ChildSkillReadError::Unbound);
+        }
+        let current = crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
+            .into_iter()
+            .find(|skill| skill.name == name)
+            .ok_or(ChildSkillReadError::MetadataChanged)?;
+        self.check_child_binding(&current)
+    }
+
     fn metadata_for_name(&self, name: &str) -> Option<crate::skills::SkillMetadata> {
         let skills = crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config);
         skills
             .iter()
-            .find(|skill| skill.name == name)
-            .or_else(|| skills.iter().find(|skill| catalog_skill_read_name(&skill.name) == name))
+            .filter(|skill| self.check_child_binding(skill).is_ok())
+            .find(|skill| skill.name == name || catalog_skill_read_name(&skill.name) == name)
             .cloned()
     }
 
@@ -365,6 +408,7 @@ impl Tool for SkillReadTool {
     fn catalog_binding_snapshot(&self) -> std::collections::BTreeMap<String, [u8; 32]> {
         crate::skills::catalog_skill_metadata(&self.workspace_dir, &self.config)
             .into_iter()
+            .filter(|skill| self.check_child_binding(skill).is_ok())
             .flat_map(|skill| {
                 let digest = crate::skills::catalog_skill_binding_digest(&skill);
                 // Synthetic dispatch binds the original `name` argument;
@@ -445,6 +489,7 @@ impl Tool for SkillReadTool {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing non-empty 'name' parameter"))?;
+        self.check_child_metadata(name)?;
         let resource_path = args.get("resource_path").and_then(serde_json::Value::as_str);
         if let Some(result) = self.read_lifecycle_managed(name, resource_path, &args).await? {
             return Ok(result);
@@ -3049,3 +3094,7 @@ mod tests {
 
 #[cfg(test)]
 mod executable_tests;
+
+#[cfg(test)]
+#[path = "skills/child_reader_tests.rs"]
+mod child_reader_tests;

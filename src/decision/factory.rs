@@ -781,7 +781,7 @@ impl DecisionBackendFactory {
         let selected = match configured_selection(section) {
             None => None,
             // A disabled plane builds no backend. A disabled decision engine
-            // still builds a public loopback HTTP slot for local predictions.
+            // also builds no slot, including public loopback HTTP.
             // No engine-off slot may resolve a stored credential (D-082 N-9).
             Some(selection) if !section.enabled => {
                 crate::providers::selection::check_decision_model(
@@ -793,11 +793,7 @@ impl DecisionBackendFactory {
                 .map_err(FactoryBuildError::Selection)?;
                 None
             }
-            Some(selection)
-                if !config.decision_engine.enabled
-                    && (selection.locality != BackendLocality::Loopback
-                        || !matches!(&selection.credential, CredentialRef::None)) =>
-            {
+            Some(selection) if !config.decision_engine.enabled => {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
                     &selection.provider,
@@ -845,6 +841,8 @@ impl DecisionBackendFactory {
                 provider: Some(ProviderId::of(provider)),
                 configured_model: Arc::clone(&request_model),
             };
+            #[cfg(test)]
+            crate::decision_engine::access_spy::record_backend_slot(&config.workspace_dir);
             let built = deps
                 .transports
                 .build(&BackendSpec {

@@ -1,7 +1,7 @@
 //! Pinned capability identity carried from selection to backend dispatch.
 
 mod admitted_call;
-pub(crate) use admitted_call::VerifiedExecutionCall;
+pub(crate) use admitted_call::{ExecutionAdmission, VerifiedExecutionCall};
 mod dispatch;
 pub(crate) use dispatch::{scope_dispatch_binding, verify_current_dispatch};
 
@@ -39,6 +39,13 @@ impl PartialEq for ExecutionBinding {
 impl Eq for ExecutionBinding {}
 
 impl ExecutionBinding {
+    pub(crate) fn admission(&self) -> ExecutionAdmission {
+        ExecutionAdmission {
+            catalog: Arc::clone(&self.catalog),
+            scope: self.scope.clone(),
+        }
+    }
+
     pub(crate) const fn is_selected(&self) -> bool {
         self.selected
     }

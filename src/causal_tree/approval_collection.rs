@@ -1,64 +1,9 @@
 //! Non-executing, source-bound argument collection. No proof grants dispatch.
-use super::branch::CapabilityRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApprovalReviewAdapter {
     ChatOwnerReview,
     ConsoleOwnerReview,
-}
-
-/// Issued only after exact-source eligibility and all three gate passes.
-/// This evidence cannot be deserialized into live authority.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct DeferredArgumentProof {
-    capability: CapabilityRef,
-    adapter: ApprovalReviewAdapter,
-    state_fingerprint: String,
-}
-impl std::fmt::Debug for DeferredArgumentProof {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeferredArgumentProof")
-            .field("adapter", &self.adapter)
-            .field("state_fingerprint", &self.state_fingerprint)
-            .finish_non_exhaustive()
-    }
-}
-impl DeferredArgumentProof {
-    #[cfg(test)]
-    pub(super) const fn issue(
-        capability: CapabilityRef,
-        adapter: ApprovalReviewAdapter,
-        state_fingerprint: String,
-    ) -> Self {
-        Self {
-            capability,
-            adapter,
-            state_fingerprint,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn issue_for_test(
-        capability: CapabilityRef,
-        adapter: ApprovalReviewAdapter,
-        state_fingerprint: String,
-    ) -> Self {
-        Self::issue(capability, adapter, state_fingerprint)
-    }
-    #[cfg(test)]
-    pub(crate) const fn capability(&self) -> &CapabilityRef {
-        &self.capability
-    }
-
-    #[cfg(test)]
-    pub(crate) fn state_fingerprint(&self) -> &str {
-        &self.state_fingerprint
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn adapter(&self) -> ApprovalReviewAdapter {
-        self.adapter
-    }
 }
 
 /// Validation of persisted evidence is not an authority constructor.

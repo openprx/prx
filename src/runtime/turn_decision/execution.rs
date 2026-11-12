@@ -571,6 +571,10 @@ impl TurnDecisionService {
         }
         self.verify_console_filesystem_context(proof, context)?;
         let mut execution_context = execution_context.clone();
+        execution_context.execution_admission = Some(crate::tools::capability::execution_binding::ExecutionAdmission {
+            catalog: Arc::clone(&self.catalog),
+            scope: execution_context.envelope.clone(),
+        });
         // Incoming child authority comes only from the authenticated source and is
         // overwritten unconditionally, so a caller cannot carry or strip it.
         let child_origin = proof.child_scope().is_some()
@@ -914,15 +918,7 @@ impl TurnDecisionService {
                 );
                 &abstention_answer
             }
-            #[cfg(test)]
-            crate::causal_tree::decision_select::Selection::CollectApprovalArguments(_) => {
-                abstention_answer = crate::causal_tree::branch::CandidateId::new(
-                    crate::causal_tree::branch::CausalActionKind::Answer,
-                    crate::causal_tree::branch::CapabilityTarget::None,
-                    None,
-                );
-                &abstention_answer
-            }
+
             _ => {
                 if let Some(reply) = context.refusal_reply() {
                     anyhow::bail!("{reply}");
@@ -977,27 +973,17 @@ impl TurnDecisionService {
                         && selected_references.is_empty(),
                     "answer directive differs from its selected candidate"
                 );
-                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates, &context.execution_refs);
+                let direct =
+                    super::direct_answer_refs(&context.engine, &catalog, &gates, &context.execution_refs, &|bytes| {
+                        crate::cost::estimate::estimate_cost(&model, &self.generation.effective.cost, bytes)
+                    });
                 anyhow::ensure!(
                     direct == context.execution_refs,
                     "answer direct surface changed after admission"
                 );
                 direct
             }
-            #[cfg(test)]
-            TurnExecutionDirective::CollectApprovalArguments => {
-                anyhow::ensure!(
-                    selected.action() == crate::causal_tree::branch::CausalActionKind::Answer
-                        && selected_references.is_empty(),
-                    "leftover Collect must serve the Direct answer surface"
-                );
-                let direct = super::direct_answer_refs(&context.engine, &catalog, &gates, &context.execution_refs);
-                anyhow::ensure!(
-                    direct == context.execution_refs,
-                    "answer direct surface changed after admission"
-                );
-                direct
-            }
+
             TurnExecutionDirective::Execute { allowed_capability_ids } => {
                 let ids: BTreeSet<_> = selected_references.iter().map(|reference| &reference.id).collect();
                 anyhow::ensure!(

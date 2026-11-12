@@ -559,9 +559,11 @@ mod tests {
         assert!(
             admitted
                 .binding
-                .fixed_reply()
-                .expect("stream fixture decision")
-                .is_none(),
+                .decision_routing()
+                .expect("test: admitted routing")
+                .context
+                .is_run()
+                .expect("test: live execution"),
             "stream fixture closed before provider execution: {:?}; {audit:?}",
             routing.context.directive()
         );

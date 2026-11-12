@@ -311,49 +311,6 @@ pub(crate) struct DiscoveryIssueError;
 #[error("selected retrieval is unavailable for this pinned turn")]
 pub(crate) struct RetrievalIssueError;
 
-/// Private fields prevent storage authority from being assembled by callers.
-/// The runtime phase, not this type alone, enforces exactly one issuance.
-#[cfg(all(test, feature = "llm-router"))]
-pub(crate) struct SelectedRouterReadGrant {
-    decision_id: DecisionId,
-    reference: CapabilityRef,
-    purpose: super::state::RouterHistoryReadBinding,
-    workspace: Arc<str>,
-    owner: Arc<str>,
-    session: Arc<str>,
-    run: Arc<str>,
-    source: Arc<str>,
-    deadline: Instant,
-}
-
-#[cfg(all(test, feature = "llm-router"))]
-impl SelectedRouterReadGrant {
-    pub(crate) fn matches_source(
-        &self,
-        workspace: &str,
-        owner: &str,
-        session: &str,
-        run: &str,
-        source: Option<&str>,
-    ) -> bool {
-        self.workspace.as_ref() == workspace
-            && self.owner.as_ref() == owner
-            && self.session.as_ref() == session
-            && self.run.as_ref() == run
-            && Some(self.source.as_ref()) == source
-    }
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        DecisionId,
-        CapabilityRef,
-        super::state::RouterHistoryReadBinding,
-        Instant,
-    ) {
-        (self.decision_id, self.reference, self.purpose, self.deadline)
-    }
-}
-
 impl EngineDecision {
     /// Trusted state and G6 slice for a disabled engine: no prediction port
     /// and no compiled request. A committed Legal Answer with a known cost
@@ -480,37 +437,6 @@ impl EngineDecision {
             return Err(RetrievalIssueError);
         }
         Ok((entry.family, reference.clone()))
-    }
-
-    /// Runtime calls this only while consuming its unique Pending routing
-    /// phase. The opaque grant cannot be constructed from a caller enum.
-    #[cfg(all(test, feature = "llm-router"))]
-    pub(crate) fn issue_selected_router_read(
-        &self,
-        catalog: &CatalogView<'_>,
-        context: &DirectiveContext,
-        source_query: &str,
-    ) -> Result<SelectedRouterReadGrant, RetrievalIssueError> {
-        let purpose = self.state.trusted.router_history().ok_or(RetrievalIssueError)?;
-        if purpose.version != 1 {
-            return Err(RetrievalIssueError);
-        }
-        let (family, reference) = self.selected_retrieval(catalog, context, source_query)?;
-        if family != super::branch::CapabilityTarget::Memory {
-            return Err(RetrievalIssueError);
-        }
-        let parts = self.state.trusted.parts();
-        Ok(SelectedRouterReadGrant {
-            decision_id: self.decision_id,
-            reference,
-            purpose: purpose.clone(),
-            workspace: Arc::clone(&parts.workspace_id),
-            owner: Arc::clone(parts.owner_id.as_ref().ok_or(RetrievalIssueError)?),
-            session: Arc::clone(parts.session_key.as_ref().ok_or(RetrievalIssueError)?),
-            run: Arc::clone(parts.run_id.as_ref().ok_or(RetrievalIssueError)?),
-            source: Arc::clone(parts.source_event_id.as_ref().ok_or(RetrievalIssueError)?),
-            deadline: self.deadline,
-        })
     }
 
     /// Issue exact refs only after final-gated conversion selected Discover.

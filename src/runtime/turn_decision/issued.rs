@@ -24,16 +24,7 @@ impl TurnDecisionService {
         if self.should_run_prediction_hop() {
             // Keep the optional prediction state out of every caller's
             // async frame, including child admission on ordinary stacks.
-            let admission = Box::pin(self.decide_agent_initial_inner(
-                proof,
-                kind,
-                cancellation,
-                None,
-                None,
-                #[cfg(all(test, feature = "llm-router"))]
-                None,
-            ))
-            .await?;
+            let admission = Box::pin(self.decide_agent_initial_inner(proof, kind, cancellation, None, None)).await?;
             return self.record_issued_decision(proof, admission, cancellation).await;
         }
         let opened = self.open_turn_context(proof, kind, cancellation).await?;
@@ -55,8 +46,6 @@ impl TurnDecisionService {
                 cancellation,
                 None,
                 observation,
-                #[cfg(all(test, feature = "llm-router"))]
-                None,
             ))
             .await?;
             return self.record_issued_decision(proof, admission, cancellation).await;
@@ -75,7 +64,7 @@ impl TurnDecisionService {
         // Admission, including a pause before any child publication, owns the
         // original run allowance. The context lease cleans up failed issuance.
         self.issue_recursive_allowance(proof, &context);
-        if cancellation.is_cancelled() && !context.router_cleanup_close() {
+        if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
         }
         if self.durable_key && self.recordable && self.generation.effective.causal_tree.enabled {
@@ -85,7 +74,7 @@ impl TurnDecisionService {
                 true,
                 self.generation.effective.causal_tree.store.record_redacted_projection,
             )?;
-            if cancellation.is_cancelled() && !context.router_cleanup_close() {
+            if cancellation.is_cancelled() {
                 return Err(AgentDecisionError::Cancelled);
             }
             // Replay evidence is durable before admission. Its physical write
@@ -112,7 +101,7 @@ impl TurnDecisionService {
             .await
             .map_err(|error| AgentDecisionError::DecisionEvidence(error.into()))?;
             written.map_err(AgentDecisionError::DecisionEvidence)?;
-            if cancellation.is_cancelled() && !context.router_cleanup_close() {
+            if cancellation.is_cancelled() {
                 return Err(AgentDecisionError::Cancelled);
             }
             let writer = self.store.writer().ok_or(AgentDecisionError::RecordWriterUnavailable)?;
@@ -130,8 +119,7 @@ impl TurnDecisionService {
                         && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
                 })
             });
-        if admits_delegation || context.engine.outgoing_child.is_some() && self.generation.effective.causal_tree.enabled
-        {
+        if admits_delegation {
             if self.generation.effective.causal_tree.enabled {
                 tokio::select! {
                     biased;
@@ -148,16 +136,11 @@ impl TurnDecisionService {
                 self.verified_delegation_scope(&context)
                     .map_err(AgentDecisionError::DelegationScope)?;
             }
-            if cancellation.is_cancelled() && !context.router_cleanup_close() {
+            if cancellation.is_cancelled() {
                 return Err(AgentDecisionError::Cancelled);
             }
         }
-        #[cfg(test)]
-        if matches!(context.directive, TurnExecutionDirective::RequestApproval { .. }) {
-            self.record_pending_decision_approval(proof, &context)
-                .await
-                .map_err(AgentDecisionError::PendingApproval)?;
-        }
+
         Ok(context)
     }
 }

@@ -671,10 +671,8 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .await?;
         let routing = first.routing();
         assert!(
-            matches!(
-                routing.context.disposition().expect("test: admitted child disposition"),
-                crate::runtime::turn_decision::TurnDisposition::Run
-            ) && matches!(routing.context.directive(), TurnExecutionDirective::AnswerDirectly)
+            routing.context.is_run().expect("test: live admitted child")
+                && matches!(routing.context.directive(), TurnExecutionDirective::AnswerDirectly)
                 && routing.context.engine.prediction.is_none(),
             "ungated child is Direct-surface Run: selection={:?}; directive={:?}; fallback={:?}",
             routing.context.engine.selection,

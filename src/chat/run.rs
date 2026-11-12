@@ -3148,9 +3148,9 @@ Retry with a compatible model: /provider {shown} <model>",
                 Err(_) => emit_chat_output("A display number is unavailable; use the explicit decision UUID."),
             }
         }
-        let fixed_reply = admitted_binding.fixed_reply()?;
 
-        let direct_decision_turn = resume_decision || fixed_reply.is_some();
+
+        let direct_decision_turn = resume_decision;
         let file_mention_enrichment = if direct_decision_turn {
             FileMentionEnrichment { prompt: user_input.clone(), visible_note: None }
         } else {
@@ -3574,7 +3574,7 @@ Retry with a compatible model: /provider {shown} <model>",
         // replies, including builds without the terminal TUI.
         if provider_worker_kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
             && let Some(binding) = chat_turn_binding.as_ref()
-            && (resume_decision || binding.fixed_reply()?.is_some())
+            && resume_decision
         {
             anyhow::ensure!(history_commit_coordinator.pending_tasks() == 1,
                 "foreground Chat close has an earlier uncommitted turn");
@@ -3600,20 +3600,7 @@ Retry with a compatible model: /provider {shown} <model>",
             let lease_id = task_id.get();
             provider_turn_workers.record_execution_started(task_id, lease_id)
                 .map_err(|error| anyhow::anyhow!("Chat close execution start failed: {error:?}"))?;
-            let (reply, succeeded) = if let Some(reply) = binding.fixed_reply()? {
-                #[cfg(test)]
-                {
-                    binding.close(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
-                    (reply, true)
-                }
-                #[cfg(not(test))]
-                {
-                    let _ = reply;
-                    anyhow::bail!("decision requires the constrained execution reader");
-                }
-            } else {
-                binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?
-            };
+            let (reply, succeeded) = binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
             provider_turn_workers.record_execution_exited(task_id, lease_id)
                 .map_err(|error| anyhow::anyhow!("Chat close execution exit failed: {error:?}"))?;
             provider_turn_workers.record_completion_ready(task_id)
@@ -3782,10 +3769,8 @@ Retry with a compatible model: /provider {shown} <model>",
                     .insert(
                         task_id,
                         PerTurnContext {
-                            #[cfg(test)]
-                            cancellation: cancellation.clone(),
                             turn_binding: chat_turn_binding.clone(),
-                            fixed_reply: fixed_reply.clone(),
+
                             task_id,
                             draft_id: d_id.clone(),
                             delta_tx: Some(delta_tx),

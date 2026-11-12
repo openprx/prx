@@ -14,6 +14,8 @@ pub(crate) struct AccessCounts {
     pub credentials: AtomicUsize,
     pub factory: AtomicUsize,
     pub constructor: AtomicUsize,
+    pub backend_slots: AtomicUsize,
+    pub delegation_storage: AtomicUsize,
 }
 static SPIES: LazyLock<Mutex<HashMap<PathBuf, Weak<AccessCounts>>>> = LazyLock::new(Default::default);
 pub(crate) struct AccessSpy {
@@ -35,6 +37,11 @@ impl AccessSpy {
             self.counts.factory.load(Ordering::SeqCst),
             0,
             "{cell}: prediction_port must not run"
+        );
+        assert_eq!(
+            self.counts.backend_slots.load(Ordering::SeqCst),
+            0,
+            "{cell}: disabled engine must construct no backend slot"
         );
         assert_eq!(
             self.counts.constructor.load(Ordering::SeqCst),
@@ -81,4 +88,12 @@ fn bump(workspace: &Path, counter: impl FnOnce(&AccessCounts) -> &AtomicUsize) {
     if let Some(counts) = counts {
         counter(&counts).fetch_add(1, Ordering::SeqCst);
     }
+}
+
+pub(crate) fn record_backend_slot(workspace: &Path) {
+    bump(workspace, |counts| &counts.backend_slots);
+}
+
+pub(crate) fn record_delegation_storage(workspace: &Path) {
+    bump(workspace, |counts| &counts.delegation_storage);
 }

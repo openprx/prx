@@ -562,6 +562,7 @@ pub struct ToolExecutionContext {
     /// Admission-time pin for MCP schema-drift (gateway compat). Agent turns
     /// leave this empty; H2 uses `verify_admitted_call` against the service catalog.
     pub(crate) admitted_binding: Option<super::capability::execution_binding::ExecutionBinding>,
+    pub(crate) execution_admission: Option<super::capability::execution_binding::ExecutionAdmission>,
     pub envelope: RuntimeEnvelope,
     pub chat_type: String,
     pub chat_id: String,
@@ -638,6 +639,7 @@ impl ToolExecutionContext {
             decision_resume: None,
             pending_approval_denied: false,
             admitted_binding: None,
+            execution_admission: None,
             execution_trace: None,
             envelope,
             chat_type: chat_type.into(),
@@ -2769,8 +2771,12 @@ impl ToolExecutionService {
                 .h2_origin()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("experiment action has no actual controlled source"))?;
+            let admission = context
+                .execution_admission
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
             let verified = self
-                .verify_admitted_call(&context.envelope, &descriptor, &command)
+                .verify_admitted_call(&context.envelope, admission, &descriptor, &command)
                 .map_err(|_| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
             // Only execution after the original approval can consume this port.
             // The initial pending call still needs to be recorded first.

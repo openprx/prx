@@ -329,7 +329,7 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         );
         // Search stays reachable, but publishing its schema does not offer or
         // admit a file mutation or authorize approval collection.
-        assert!(context.approval_collection_proof().is_none());
+
         assert!(selected.specs.iter().all(|spec| spec.name != tool_name));
         let entry = service.catalog.entry_for_public_name(tool_name).unwrap();
         assert!(

@@ -253,30 +253,6 @@ impl ChannelDecisionTurn {
         ))
     }
 
-    pub(super) fn close_reply(&self) -> anyhow::Result<Option<String>> {
-        Ok(self.context.close_reply()?.map(|reply| reply.into_owned()))
-    }
-
-    #[cfg(test)]
-    pub(super) async fn close(
-        &self,
-        ctx: &super::ChannelRuntimeContext,
-        security: &crate::security::SecurityPolicy,
-        message: &super::traits::ChannelMessage,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<()> {
-        let ports = ChannelClose {
-            turn: self,
-            ctx,
-            security,
-            message,
-        };
-        self.service
-            .close_agent_directive_turn(&self.proof, Arc::clone(&self.context), &ports, cancellation)
-            .await?;
-        Ok(())
-    }
-
     pub(super) fn routing(&self) -> crate::agent::turn_request::TurnDecision<'_> {
         crate::agent::turn_request::TurnDecision {
             service: &self.service,
@@ -325,57 +301,5 @@ impl ChannelDecisionTurn {
         }
         proposal.scope = self.envelope.message_scope();
         self.terminal.commit(proposal).await
-    }
-}
-
-#[cfg(test)]
-struct ChannelClose<'a> {
-    turn: &'a ChannelDecisionTurn,
-    ctx: &'a super::ChannelRuntimeContext,
-    security: &'a crate::security::SecurityPolicy,
-    message: &'a super::traits::ChannelMessage,
-}
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::runtime::turn_decision::CloseTurnPorts for ChannelClose<'_> {
-    type Receipt = TurnTerminalReceipt;
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        anyhow::ensure!(
-            Arc::ptr_eq(&context, &self.turn.context),
-            "channel close decision changed"
-        );
-        super::authorize_channel_outbound(self.ctx, self.security, &self.message.channel)
-            .map_err(|reason| anyhow::anyhow!("channel decision outbound denied: {reason}"))?;
-        let channel = self.ctx.channels_by_name.get(&self.message.channel);
-        anyhow::ensure!(
-            super::ensure_notice_before_channel_output(self.ctx, &self.turn.generation, self.message, channel).await,
-            "channel decision identity notice was not acknowledged"
-        );
-        self.turn
-            .commit(TurnTerminalDraft {
-                decision: None,
-                terminal_id: self.turn.proof.run_id().to_owned(),
-                scope: self.turn.envelope.message_scope(),
-                status: crate::agent::terminal::TurnTerminalStatus::Completed,
-                history: Some(crate::agent::terminal::TurnHistoryProjection {
-                    assistant_content: reply.to_owned(),
-                    history_commit_len: 2,
-                }),
-                history_scope: None,
-                provider_outcome: None,
-                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                    summary: "channel decision closed".to_owned(),
-                    started_at: chrono::Utc::now(),
-                    finished_at: chrono::Utc::now(),
-                },
-                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
-                    target: self.message.reply_target.clone(),
-                },
-            })
-            .await
     }
 }

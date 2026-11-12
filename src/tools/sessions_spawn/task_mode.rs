@@ -403,23 +403,7 @@ pub(super) async fn run_sub_agent_task(
                 .await?
                 .with_child_cleanup(cleanup_confirmed);
                 let _ = segment_admitted.send(());
-                #[cfg(test)]
-                if child_turn.is_close()? {
-                    loop_cleanup.run(async { Ok(()) }).await?;
-                    let reply = child_turn
-                        .close(&cancel_token_owned)
-                        .await?
-                        .context("child segment close disposition changed")?;
-                    task_history.push(ChatMessage::assistant(reply.clone()));
-                    if let Some(sender) = on_delta_iter.as_ref() {
-                        let _ = sender.try_send(reply.clone());
-                    }
-                    return Ok(SubAgentTaskResult {
-                        segment_usage: Vec::new(),
-                        output: reply,
-                        history_commit_len: task_history.len(),
-                    });
-                }
+
                 if let Some(system) = initial_system {
                     let system = child_turn.prompt_with_skills(&system)?;
                     if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {

@@ -634,8 +634,8 @@ fn recovered_skill(
         commit.provider_outcome.clone(),
         trace.cloned(),
     );
-    let kind = match commit.decision.context.directive() {
-        crate::causal_tree::directive::TurnExecutionDirective::RequestApproval { .. } => "request_approval",
+    let kind = match &commit.decision.context.audit_hops().last().map(|hop| &hop.selection) {
+        Some(crate::causal_tree::decision_select::Selection::RequestApproval { .. }) => "request_approval",
         _ => "",
     };
     facts.recovered_signals(kind)

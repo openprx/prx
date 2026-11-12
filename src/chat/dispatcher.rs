@@ -2438,50 +2438,7 @@ async fn drive_start_turn_stream(
             .await;
         return;
     };
-    // Fixed directives bypass compaction, provider execution and tool setup.
-    // Completion still travels through the task-scoped ordered history owner.
-    match binding.fixed_reply() {
-        Ok(Some(reply)) => {
-            let action = if cancel.is_cancelled() {
-                Action::StreamCancelled { draft_id }
-            } else if provider_turn_task_id.is_some() {
-                Action::ProviderTurnReadyForCommit {
-                    draft_id,
-                    final_text: reply.to_owned(),
-                    reasoning: String::new(),
-                }
-            } else {
-                if action_tx
-                    .send(Action::RecordAssistantTurn {
-                        task_id: None,
-                        content: reply.to_owned(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                Action::StreamCompleted {
-                    draft_id,
-                    final_text: reply.to_owned(),
-                    reasoning: String::new(),
-                }
-            };
-            let _ = action_tx.send(action).await;
-            return;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            let _ = action_tx
-                .send(Action::StreamFailed {
-                    draft_id,
-                    err: error.to_string(),
-                    retryable: false,
-                })
-                .await;
-            return;
-        }
-    }
+
     // Preserve a separate reducer source only if preflight changes the worker
     // snapshot; ordinary turns move the existing guard view into the sink.
     let mut reducer_source_history = None;

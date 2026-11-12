@@ -1,14 +1,10 @@
 //! Complete source-bound execution for the public embedded Agent API.
 use super::Agent;
-#[cfg(test)]
-use crate::agent::terminal::TurnTerminalReceipt;
 use crate::agent::terminal::{
     TurnDeliveryIntent, TurnHistoryProjection, TurnTerminalDraft, TurnTerminalStatus, TurnTerminalTelemetry,
 };
 use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopOutcome, ToolLoopRuntimeAdapter};
 use crate::providers::{ChatMessage, ConversationMessage};
-#[cfg(test)]
-use crate::runtime::turn_decision::CloseTurnPorts;
 use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::runtime::turn_terminal::TurnTerminalGuard;
@@ -92,8 +88,6 @@ impl Drop for HistoryWriteback<'_> {
 }
 
 struct Terminal<'a> {
-    #[cfg(test)]
-    guard: &'a TurnTerminalGuard,
     service: &'a TurnDecisionService,
     decision: &'a Arc<TurnDecisionContext>,
     source: &'a crate::agent::embedded_source::EmbeddedAgentSource,
@@ -131,24 +125,6 @@ impl Terminal<'_> {
             },
             delivery_intent: TurnDeliveryIntent::ReturnToCaller,
         })
-    }
-}
-#[cfg(test)]
-#[async_trait::async_trait]
-impl CloseTurnPorts for Terminal<'_> {
-    type Receipt = TurnTerminalReceipt;
-    async fn finalize_closed_turn(
-        &self,
-        context: Arc<TurnDecisionContext>,
-        reply: &str,
-    ) -> anyhow::Result<Self::Receipt> {
-        anyhow::ensure!(
-            Arc::ptr_eq(&context, self.decision),
-            "embedded Agent closing decision changed"
-        );
-        self.guard
-            .commit(self.proposal(TurnTerminalStatus::Completed, reply.to_owned(), None)?)
-            .await
     }
 }
 
@@ -274,7 +250,7 @@ async fn run_work(
         source
     };
     let started_at = chrono::Utc::now();
-    #[cfg(all(not(test), feature = "llm-router"))]
+    #[cfg(feature = "llm-router")]
     let issued = service
         .open_issued_turn_context(
             source.as_ref(),
@@ -283,21 +259,6 @@ async fn run_work(
         )
         .await
         .map(|decision| (decision, source, None));
-    #[cfg(all(test, feature = "llm-router"))]
-    let issued = if let Some(router) = agent.router.as_ref().filter(|_| history_route) {
-        service
-            .open_issued_embedded_router_turn_context(source, router, cancellation)
-            .await
-    } else {
-        service
-            .open_issued_turn_context(
-                source.as_ref(),
-                crate::runtime::turn_decision::AgentTurnKind::Repl,
-                cancellation,
-            )
-            .await
-            .map(|decision| (decision, source, None))
-    };
     #[cfg(not(feature = "llm-router"))]
     let issued = service
         .open_issued_turn_context(
@@ -346,55 +307,12 @@ async fn run_work(
         None,
     )?
     .with_provider_trace(Arc::clone(&retained), route.clone());
-    if !(cancellation.is_cancelled() && decision.router_cleanup_close()) && source.autosave_user_input().await.is_err()
-    {
+    if source.autosave_user_input().await.is_err() {
         // Autosave remains best effort. Do not log raw input or backend
         // errors that may contain the private content being saved.
         tracing::warn!("embedded Agent user memory promotion failed");
     }
-    #[cfg(test)]
-    if let Some(reply) = decision.close_reply()? {
-        let reply = reply.into_owned();
-        // A fixed close adds the raw user input and the final reply after
-        // durable terminal commit; record that projected final length.
-        let history_commit_len = agent
-            .history
-            .len()
-            .checked_add(2)
-            .context("embedded Agent history length overflow")?;
-        let ports = Terminal {
-            #[cfg(test)]
-            guard: &guard,
-            service: &service,
-            decision: &decision,
-            source,
-            started_at,
-            history_commit_len,
-        };
-        if cancellation.is_cancelled() && decision.router_cleanup_close() {
-            // The read already happened. Persist its fixed cancelled
-            // close through the existing terminal cleanup owner without
-            // granting a fresh decision deadline or provider lease.
-            guard
-                .commit(ports.proposal(TurnTerminalStatus::Cancelled, reply.clone(), None)?)
-                .await?;
-        } else {
-            service
-                .close_agent_directive_turn(source, Arc::clone(&decision), &ports, cancellation)
-                .await?;
-        }
-        agent.history.push(ConversationMessage::Chat(
-            crate::agent::turn_contracts::inbound_user_message(input),
-        ));
-        agent
-            .history
-            .push(ConversationMessage::Chat(ChatMessage::assistant(&reply)));
-        anyhow::ensure!(
-            !cancellation.is_cancelled() || !decision.router_cleanup_close(),
-            "embedded Router turn cancelled after durable close"
-        );
-        return Ok(reply);
-    }
+
     if let Some(task) = source.configured_delegation() {
         agent.history.push(ConversationMessage::Chat(
             crate::agent::turn_contracts::inbound_user_message(input),
@@ -470,8 +388,6 @@ async fn run_work(
             .checked_add(1)
             .context("embedded Agent history length overflow")?;
         let ports = Terminal {
-            #[cfg(test)]
-            guard: &guard,
             service: &service,
             decision: &decision,
             source,
@@ -682,8 +598,6 @@ async fn run_work(
     // Only its completed history is authoritative for this projection.
     let history_commit_len = agent.history.len();
     let ports = Terminal {
-        #[cfg(test)]
-        guard: &guard,
         service: &service,
         decision: &decision,
         source,

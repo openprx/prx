@@ -3,7 +3,7 @@
 use super::{DecisionKey, MessageEvent, TurnTerminalStatus};
 use crate::causal_tree::store::DecisionReplayRecord;
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, ProviderExecutionOutcome};
-use crate::runtime::turn_decision::{RouterReadFacts, router_provider_binding};
+use crate::runtime::turn_decision::router_provider_binding;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,36 +38,6 @@ pub(super) struct RouterReadReplay {
 }
 
 impl RouterReadReplay {
-    pub(super) fn from_issued(facts: RouterReadFacts) -> anyhow::Result<Self> {
-        let projection = Self {
-            readmission_succeeded: facts.readmission_succeeded,
-            failure_stage: facts.failure_stage.map(str::to_owned),
-            version: facts.version,
-            read_decision_id: facts.read_decision_id.to_string(),
-            read_state_fingerprint: facts.read_state_fingerprint,
-            read_digest: String::new(),
-            selected_candidate_id: facts.selected_candidate_id,
-            capability_id: facts.capability_id,
-            capability_fingerprint: facts.capability_fingerprint,
-            catalog_generation: facts.catalog_generation,
-            domain_sha256: facts.domain_sha256,
-            query_sha256: facts.query_sha256,
-            history_snapshot_sha256: facts.history_snapshot_sha256,
-            next_decision_id: facts.next_decision_id.to_string(),
-            next_state_fingerprint: facts.next_state_fingerprint,
-            next_digest: String::new(),
-            from_provider_binding: facts.from_provider_binding,
-            from_model: facts.from_model,
-            to_provider_binding: facts.to_provider_binding,
-            to_model: facts.to_model,
-            pmm_route_binding: facts.pmm_route_binding,
-            original_budget: facts.original_budget,
-            remaining_budget: facts.remaining_budget,
-            source_sequence: facts.source_sequence,
-        };
-        projection.validate_shape()?;
-        Ok(projection)
-    }
     fn validate_shape(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == 1, "unsupported Router terminal replay version");
         for value in [
@@ -167,22 +137,7 @@ impl RouterReadReplay {
             Ok(0)
         }
     }
-    /// Called only after the enclosing capture has compared the full actual
-    /// row digest with the service-issued DecisionRecordBuilder result.
-    pub(super) fn capture_row(&mut self, row: &DecisionReplayRecord) -> anyhow::Result<()> {
-        match self.row_kind(row)? {
-            1 => {
-                anyhow::ensure!(self.read_digest.is_empty(), "duplicate Router read hop");
-                self.read_digest = row.digest.clone();
-            }
-            2 => {
-                anyhow::ensure!(self.next_digest.is_empty(), "duplicate Router next hop");
-                self.next_digest = row.digest.clone();
-            }
-            _ => {}
-        }
-        Ok(())
-    }
+
     pub(super) fn validate_complete(&self) -> anyhow::Result<()> {
         self.validate_shape()?;
         for value in [&self.read_digest, &self.next_digest] {
