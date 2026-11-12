@@ -1920,16 +1920,30 @@ async fn canary_text_is_absent_from_captured_logs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prx_ask_emits_awaiting_approval_with_the_decision_id() {
-    struct StoreProvider;
+    struct StoreProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl Provider for StoreProvider {
         async fn chat_with_system(
             &self,
             _system: Option<&str>,
-            _message: &str,
+            message: &str,
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
+            anyhow::ensure!(
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0,
+                "test: durable approval did not stop the loop; observed response: {}",
+                message
+                    .chars()
+                    .rev()
+                    .take(2048)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
+            );
             Ok("<tool_call>\n{\"name\":\"memory_store\",\"arguments\":{\"key\":\"approval-probe\",\"content\":\"durable approval must precede this write\"}}\n</tool_call>".to_owned())
         }
     }
@@ -1954,7 +1968,9 @@ async fn prx_ask_emits_awaiting_approval_with_the_decision_id() {
     let ctx = runtime_autonomy(
         dir.path(),
         channel.clone() as Arc<dyn Channel>,
-        Arc::new(StoreProvider),
+        Arc::new(StoreProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }),
         vec![Box::new(crate::tools::MemoryStoreTool::new(memory.clone(), security))],
         memory.clone(),
         crate::config::ToolTieringConfig {

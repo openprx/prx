@@ -33,10 +33,16 @@ impl Provider for ReportedApprovalProvider<'_> {
         anyhow::bail!("the approval regression requires the traced provider entry")
     }
 
-    async fn chat_traced(&self, _: ChatRequest<'_>, model: &str, _: f64) -> anyhow::Result<ChatTrace> {
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, _: f64) -> anyhow::Result<ChatTrace> {
         anyhow::ensure!(
             self.calls.fetch_add(1, Ordering::SeqCst) == 0,
-            "approval must stop the loop"
+            "approval must stop the loop; last tool response: {:?}",
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "tool")
+                .map(|message| message.content.chars().take(2048).collect::<String>())
         );
         let now = chrono::Utc::now();
         Ok(ChatTrace {

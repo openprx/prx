@@ -203,6 +203,9 @@ async fn model_turn_without_surface_is_denied() {
     let service = allow_service(&fixture);
     let mut context = context();
     context.dispatch_origin = crate::tools::DispatchOrigin::ModelTurn;
+    // Fund dispatch so this fixture isolates the missing surface invariant.
+    context.call_budget =
+        Some(CallTokenBudget::new(|| u64::MAX, |_| Some(0)).with_spend(|| Some(u64::MAX), |_| Some(0)));
     assert!(context.turn_surface.is_none());
     let outcome = service
         .execute(

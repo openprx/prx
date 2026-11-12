@@ -258,11 +258,12 @@ impl ApprovalLedgerPort<'_> {
         arguments: &serde_json::Value,
         entry: Option<&crate::tools::capability::catalog::CapabilityEntry>,
     ) -> anyhow::Result<PendingCall> {
-        let owner = envelope
-            .owner_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .context("approval owner missing")?;
+        // Canonical ingress envelopes may derive their owner instead of
+        // storing an override. The durable source below must still match the
+        // resolved owner, session and run before any pending call is written.
+        let resolved_owner = envelope.resolved_owner_id();
+        let owner = resolved_owner.as_str();
+        anyhow::ensure!(!owner.is_empty(), "approval owner missing");
         anyhow::ensure!(
             envelope.workspace_id == self.workspace && !envelope.session_key.is_empty(),
             "call approval scope is incomplete"

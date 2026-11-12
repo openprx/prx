@@ -27,13 +27,10 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
                 .record_pending_entry(&self.envelope, entry, &request.command.arguments)
                 .await?;
             // Claim is atomic and precedes backend dispatch.
+            let owner = self.envelope.resolved_owner_id();
             let grant = self
                 .port
-                .claim_if_approved(
-                    self.envelope.owner_id.as_deref().unwrap_or(""),
-                    &self.envelope.session_key,
-                    pending.authority(),
-                )
+                .claim_if_approved(&owner, &self.envelope.session_key, pending.authority())
                 .await?;
             Ok::<_, anyhow::Error>((
                 pending.authority().call_id(),
