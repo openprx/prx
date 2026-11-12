@@ -2995,8 +2995,16 @@ async fn r4c_factory_disabled_breaker_keeps_sending() {
 #[test]
 fn builtin_endpoint_keeps_the_default_when_api_url_is_unset_or_blank() {
     const DEFAULT: &str = "https://api.kimi.com/coding/v1";
-    assert_eq!(builtin_endpoint(None, DEFAULT), Ok(DEFAULT));
-    assert_eq!(builtin_endpoint(Some("  "), DEFAULT), Ok(DEFAULT));
+    assert_eq!(
+        builtin_endpoint(None, DEFAULT),
+        Ok(DEFAULT),
+        "an unset api_url keeps the built-in endpoint"
+    );
+    assert_eq!(
+        builtin_endpoint(Some("  "), DEFAULT),
+        Ok(DEFAULT),
+        "a blank api_url keeps the built-in endpoint"
+    );
 }
 
 #[test]
@@ -3034,9 +3042,53 @@ fn kimi_code_refuses_an_unsafe_api_url_with_a_typed_error() {
             .err()
             .as_ref()
             .and_then(|error| error.downcast_ref::<EndpointOverrideError>()),
-        Some(&EndpointOverrideError::Scheme)
+        Some(&EndpointOverrideError::Scheme),
+        "plain http to a remote host must be refused with the typed scheme error"
     );
     let local = "http://host.containers.internal:4123/coding/v1";
-    assert!(create_provider_with_url("kimi-code", Some("fixture-key"), Some(local)).is_ok());
-    assert!(create_provider_with_url("kimi-code", Some("fixture-key"), None).is_ok());
+    assert!(
+        create_provider_with_url("kimi-code", Some("fixture-key"), Some(local)).is_ok(),
+        "http to host.containers.internal must build the provider"
+    );
+    assert!(
+        create_provider_with_url("kimi-code", Some("fixture-key"), None).is_ok(),
+        "an unset api_url must build the provider on its built-in endpoint"
+    );
+}
+
+#[test]
+fn kimi_code_model_listing_resolves_the_same_base_url_as_chat() {
+    let gateway = "http://host.containers.internal:4123/coding/v1";
+    for name in ["kimi-code", "kimi_coding", "kimi_for_coding"] {
+        assert_eq!(
+            model_discovery::resolve_live_models_endpoint(name, Some(gateway)).as_deref(),
+            Some("http://host.containers.internal:4123/coding/v1/models"),
+            "{name}: a configured api_url must carry the model listing"
+        );
+        assert_eq!(
+            model_discovery::resolve_live_models_endpoint(name, None).as_deref(),
+            Some("https://api.kimi.com/coding/v1/models"),
+            "{name}: an unset api_url keeps the vendor listing URL"
+        );
+        assert_eq!(
+            model_discovery::resolve_live_models_endpoint(name, Some("http://gateway.example/coding/v1")),
+            None,
+            "{name}: a refused api_url must not fall back to the vendor host"
+        );
+        assert_eq!(
+            honoured_base_url(name, Some(gateway)),
+            Some(gateway),
+            "{name}: construction honours a valid api_url"
+        );
+        assert_eq!(
+            honoured_base_url(name, Some("http://gateway.example/coding/v1")),
+            None,
+            "{name}: a refused api_url is not an honoured endpoint"
+        );
+    }
+    assert_eq!(
+        kimi_code_base_url(None),
+        Ok(KIMI_CODE_BASE_URL),
+        "the shared resolver defaults to the vendor endpoint"
+    );
 }

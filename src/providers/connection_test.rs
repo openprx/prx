@@ -645,6 +645,29 @@ mod tests {
         assert_eq!(request.url, "http://127.0.0.1:9/v1/models?sig=abc&flag");
     }
 
+    /// The Kimi Code list request follows a configured `api_url` exactly as
+    /// its chat transport does, and a refused override plans no request, so
+    /// the credential never goes to the vendor host behind a gateway.
+    #[test]
+    fn the_kimi_code_list_request_follows_the_api_url_override() {
+        for label in ["kimi-code", "kimi_coding", "kimi_for_coding"] {
+            let provider = ProviderId::of(label);
+            let gateway = "http://host.containers.internal:4123/coding/v1";
+            let request = list_request(&provider, label, Some(gateway), Some(KEY)).expect("test: a list request");
+            assert_eq!(request.url, format!("{gateway}/models"), "{label}: override host");
+            let vendor = list_request(&provider, label, None, Some(KEY)).expect("test: a list request");
+            assert_eq!(
+                vendor.url, "https://api.kimi.com/coding/v1/models",
+                "{label}: unset keeps the vendor host"
+            );
+            let refused = list_request(&provider, label, Some("http://gateway.example/coding/v1"), Some(KEY));
+            assert!(
+                refused.is_none(),
+                "{label}: a refused override must not fall back to the vendor host"
+            );
+        }
+    }
+
     /// RED before PMME-h (D-095 N-1): `prx providers test` showed a
     /// provider URL's query values in its report.
     #[tokio::test]

@@ -32,6 +32,8 @@ p.add_argument('--temperature', type=float, default=0)
 p.add_argument('--provider')
 # Host address the per-trial key proxy binds; default is the primary IPv4 address.
 p.add_argument('--proxy-bind')
+# Optional comma-separated source networks allowed to reach the key proxy.
+p.add_argument('--proxy-peers')
 for key in ('input', 'output', 'cache_read', 'cache_write'):
     p.add_argument('--price-' + key.replace('_', '-'), type=float, required=True)
 p.add_argument('tasks', nargs='+')
@@ -89,6 +91,8 @@ for index, task_name in enumerate(a.tasks):
         options['provider'] = a.provider
     if a.proxy_bind:
         options['proxy_bind'] = a.proxy_bind
+    if a.proxy_peers:
+        options['proxy_peers'] = a.proxy_peers
     for key, value in options.items():
         command += ['--ak', f'{key}={value}']
     try:

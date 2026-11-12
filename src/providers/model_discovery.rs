@@ -375,6 +375,13 @@ pub(crate) fn resolve_live_models_endpoint(provider_name: &str, provider_api_url
     // The configured endpoint wherever provider construction honours it
     // (D-095 M-1): the key goes to the host the provider itself addresses,
     // never to the vendor's public host behind an operator's gateway.
+    // Kimi Code lists models on the base URL its chat transport uses. A
+    // refused `api_url` yields no endpoint at all: the credential is never
+    // sent to the vendor host behind a configured override.
+    if crate::providers::is_kimi_code_alias(&provider_name.trim().to_ascii_lowercase()) {
+        let base = crate::providers::kimi_code_base_url(provider_api_url).ok()?;
+        return crate::providers::endpoint_url(base, "/models");
+    }
     let configured = crate::providers::honoured_base_url(provider_name, provider_api_url).or_else(|| {
         (canonical_provider_name(provider_name) == "compatible")
             .then_some(provider_api_url)

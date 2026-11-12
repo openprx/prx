@@ -2747,7 +2747,7 @@ evidence rules out is refused.
 | `prx providers add <provider> --fallback` | appends it to the failover chain, `reliability.fallback_providers` (the role is required; the default is set with `prx models default set`) |
 | `prx providers update <provider> --api-url <url>` / `--clear-api-url` | `api_url`, which only the default provider uses (high risk) |
 | `prx providers remove <provider>` | removes its failover membership and its `[[providers.models]]`/`[[providers.tool_dialects]]` rows (not its auth profiles or `cred-` references); refused while any selection (the default, a route, an agent, an embedding route, the memory embedder, …) uses it, naming each |
-| `prx providers test [<provider>] [--model <m>] [--live]` | nothing: resolves locally; `--live` sends one model-list request, never a generation, to the host provider construction addresses: a configured `api_url` for the adapters that honour it (`openai`, `ollama`, llama.cpp, LiteLLM, vLLM, the Qwen OAuth aliases), else the provider's own endpoint. `prx models refresh` and `POST /api/providers/{id}/test` use the same host |
+| `prx providers test [<provider>] [--model <m>] [--live]` | nothing: resolves locally; `--live` sends one model-list request, never a generation, to the host provider construction addresses: a configured `api_url` for the adapters that honour it (`openai`, `ollama`, llama.cpp, LiteLLM, vLLM, the Qwen OAuth aliases, Kimi Code), else the provider's own endpoint. `prx models refresh` and `POST /api/providers/{id}/test` use the same host |
 | `prx providers credential set <provider> [--name <n>] [--from-stdin \| --from-env VAR]` | stores the credential reference `cred-<name>` (default name: the catalog provider's name) in the encrypted auth-profile store; the value comes from a hidden prompt, standard input or an environment variable, never an argument. A model route, embedding route or agent of that provider uses it once it names it in `credential_ref` (see below); an enabled decision backend can use a configured reference. The output also names the key PRX sends the provider when nothing names a reference (`prx auth paste-token --provider <p> --from-stdin`, or the root `api_key`). Replacing an existing reference is recorded in the configuration history (by id, never the value) |
 | `prx providers credential remove <name>` | removes it; refused while the stored configuration names it in a `credential_ref`, listing where |
 | `prx providers credential status [<provider>]` | nothing: every reference and who names it, or one provider's root connection, inline keys, auth profiles and references |
@@ -2764,6 +2764,20 @@ If `prx providers migrate --apply` would change `[[embedding_routes]]`, make
 their hints unique first. An existing configuration with duplicate hints still
 loads, but a migration that changes those routes is refused before writing
 configuration or storing credential references.
+
+Kimi Code (`kimi-code`, `kimi_coding`, `kimi_for_coding`) honours `api_url`
+when it is the default provider: chat, `prx models refresh` and
+`prx providers test --live` all address that base URL in place of
+`https://api.kimi.com/coding/v1`, and the provider name, catalog entry and
+billing stay Kimi Code's. The URL must be `https`, or `http` only for
+`localhost`, a loopback address or `host.containers.internal`, and must carry
+no userinfo, query or fragment. Any other value is refused when the provider is
+built, before a request is sent, and it never falls back to the vendor host.
+Earlier versions ignored `api_url` for Kimi Code. A configuration that still
+holds a stray value now sends Kimi requests and the Kimi credential to that
+URL, or fails to start the provider if the value is not allowed: run
+`prx providers update kimi-code --clear-api-url` unless the override is
+intended.
 
 The root connection (`api_key`, `api_url`, `reliability.api_keys`) belongs
 to the default provider. `prx models default set` refuses to switch the

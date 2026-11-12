@@ -105,7 +105,7 @@ def require_proxy_route(provider):
 
 class PrxAgent(BaseInstalledAgent):
     def __init__(self, *args, binary_path, binary_sha256, git_sha,
-                 agent_timeout_sec, key_file, temperature=0.0, provider=None, proxy_bind=None, **kwargs):
+                 agent_timeout_sec, key_file, temperature=0.0, provider=None, proxy_bind=None, proxy_peers=None, **kwargs):
         self.key_file = Path(key_file)
         self.binary_path = Path(binary_path)
         self.binary_sha256 = str(binary_sha256)
@@ -119,6 +119,8 @@ class PrxAgent(BaseInstalledAgent):
         self.prices = {key: float(kwargs.pop("price_" + key)) for key in PRICES}
         self.provider_override = provider
         self.proxy_bind = proxy_bind
+        # Optional comma-separated source networks; unset leaves the token as the only gate.
+        self.proxy_peers = proxy_peers
         super().__init__(*args, **kwargs)
         self.provider, self.model = identity(self.model_name or "", provider)
         require_proxy_route(self.provider)
@@ -152,10 +154,10 @@ class PrxAgent(BaseInstalledAgent):
         api_url = None
         container_provider = self.provider
         if self.provider in BUILTIN_UPSTREAMS:
-            proxy = KeyProxy(BUILTIN_UPSTREAMS[self.provider], key, self.proxy_bind or primary_ipv4())
+            proxy = self._proxy(BUILTIN_UPSTREAMS[self.provider], key)
             api_url = proxy.container_base_url()
         elif self.provider.startswith("custom:https://"):
-            proxy = KeyProxy(self.provider[7:], key, self.proxy_bind or primary_ipv4())
+            proxy = self._proxy(self.provider[7:], key)
             container_provider = "custom:" + proxy.container_base_url()
         try:
             if proxy is not None:
@@ -163,8 +165,12 @@ class PrxAgent(BaseInstalledAgent):
             await self._trial(instruction, environment, key, proxy, container_provider, api_url)
         finally:
             # Synchronous on purpose: cancellation cannot skip it.
-            if proxy is not None:
-                proxy.stop()
+            if proxy is not None and not proxy.stop():
+                logging.getLogger("prx_bench.adapter").warning("key proxy handler outlived stop")
+
+    def _proxy(self, upstream, key):
+        peers = [peer for peer in str(self.proxy_peers).split(",") if peer.strip()] if self.proxy_peers else None
+        return KeyProxy(upstream, key, self.proxy_bind or primary_ipv4(), allowed_peers=peers)
 
     async def _trial(self, instruction, environment, key, proxy, container_provider, api_url):
         credential = proxy.token if proxy is not None else secrets.token_urlsafe(32)

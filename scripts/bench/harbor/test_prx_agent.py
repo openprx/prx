@@ -1,5 +1,6 @@
 """Exercise adapter calls without installing Harbor in the unittest environment."""
 import asyncio
+import functools
 import importlib.util
 import json
 import os
@@ -25,6 +26,16 @@ spec = importlib.util.spec_from_file_location('prx_agent_under_test', Path(__fil
 adapter = importlib.util.module_from_spec(spec)
 with patch.dict(sys.modules, {'harbor.agents.installed.base': base}):
     spec.loader.exec_module(adapter)
+
+
+def deadline(seconds):
+    """Fail an async test that hangs instead of waiting for the CI job timeout."""
+    def wrap(test):
+        @functools.wraps(test)
+        async def bounded(self):
+            await asyncio.wait_for(test(self), timeout=seconds)
+        return bounded
+    return wrap
 
 
 class FakeEnvironment:
@@ -62,6 +73,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 agent.provider_override = 'custom:http://host.containers.internal:1234/v1'
                 agent.provider = agent.provider_override
                 agent.proxy_bind = None
+                agent.proxy_peers = None
                 agent.model = 'model'
                 agent.prices = dict.fromkeys(('input', 'output', 'cache_read', 'cache_write'), 0)
                 agent.temperature = 0
@@ -104,6 +116,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         agent.provider_override = 'custom:https://api.example.test/v1'
         agent.provider = agent.provider_override
         agent.proxy_bind = '127.0.0.1'
+        agent.proxy_peers = '127.0.0.0/8'
         agent.model = 'model'
         agent.prices = dict.fromkeys(('input', 'output', 'cache_read', 'cache_write'), 0)
         agent.temperature = 0
@@ -119,6 +132,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         agent._upload_config_text = upload
         return agent
 
+    @deadline(60)
     async def test_https_provider_runs_behind_per_trial_proxy_that_dies_with_the_trial(self):
         secret = 'prx-fixture-secret-not-exported'
         hashes = set()
@@ -156,6 +170,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 hashes.add(agent._metadata['profile_sha256'])
         self.assertEqual(len(hashes), 1, 'profile hash must not depend on the per-trial token or port')
 
+    @deadline(60)
     async def test_key_found_in_container_config_after_trial_fails_the_trial(self):
         secret = 'prx-fixture-secret-not-exported'
         for leaked in (secret, secret[:8]):
@@ -173,6 +188,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent._metadata['container_config_key_scan'], 'leak')
                 self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
 
+    @deadline(60)
     async def test_only_proxyable_providers_are_accepted(self):
         for refused in ('openai', 'anthropic', 'moonshot'):
             with self.subTest(provider=refused), self.assertRaisesRegex(ValueError, 'host key proxy'):
@@ -180,6 +196,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         for accepted in ('kimi-code', 'kimi_coding', 'custom:https://api.example.test/v1'):
             adapter.require_proxy_route(accepted)
 
+    @deadline(60)
     async def test_built_in_provider_keeps_its_name_and_gets_the_proxy_as_api_url(self):
         secret = 'prx-fixture-secret-not-exported'
         for mode in ('normal', 'timeout'):
