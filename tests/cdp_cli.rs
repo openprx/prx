@@ -161,6 +161,11 @@ fn with_decision_credential(dir: &Path, endpoint: &str) {
         .expect("test: stored");
     let mut root: toml::Value =
         toml::from_str(&std::fs::read_to_string(&config_path).expect("test: read")).expect("test: toml");
+    // Credential-transport coverage requires an explicitly enabled engine.
+    root.get_mut("decision_engine")
+        .and_then(toml::Value::as_table_mut)
+        .expect("test: decision engine table")
+        .insert("enabled".to_string(), toml::Value::Boolean(true));
     root["causal_tree"]["backend"]
         .as_table_mut()
         .expect("test: backend table")
