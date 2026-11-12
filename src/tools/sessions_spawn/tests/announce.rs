@@ -438,7 +438,7 @@ async fn a_kill_notice_to_a_denied_recipient_is_withheld_and_recorded_on_the_run
         kill.error
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
     assert!(
         wacli_sent.lock().await.is_empty(),
         "a send_deny hit must stop the kill notice from reaching the channel"
@@ -477,7 +477,7 @@ async fn a_kill_notice_is_unchanged_when_no_outbound_rules_are_configured() {
         .expect("kill executes");
     assert!(kill.success, "kill should succeed: {:?}", kill.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
     let sent = wacli_sent.lock().await;
     assert_eq!(
         sent.len(),
@@ -514,7 +514,7 @@ async fn a_kill_notice_is_not_denied_by_a_channel_registry_fallback() {
         .expect("kill executes");
     assert!(kill.success, "kill should succeed: {:?}", kill.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
     let sent = signal_sent.lock().await;
     assert_eq!(
         sent.len(),
@@ -554,7 +554,7 @@ async fn a_model_supplied_recipient_cannot_bypass_send_deny_through_the_kill_not
         .expect("kill executes");
     assert!(denied_kill.success, "kill should succeed: {:?}", denied_kill.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
     assert!(
         wacli_sent.lock().await.is_empty(),
         "a model-chosen recipient must not escape the operator's send_deny via the kill receipt"
@@ -575,7 +575,7 @@ async fn a_model_supplied_recipient_cannot_bypass_send_deny_through_the_kill_not
         .expect("kill executes");
     assert!(allowed_kill.success, "kill should succeed: {:?}", allowed_kill.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
     let sent = wacli_sent.lock().await;
     assert_eq!(sent.len(), 1, "the undenied recipient must still receive the receipt");
     assert!(sent[0].contains("killed"));

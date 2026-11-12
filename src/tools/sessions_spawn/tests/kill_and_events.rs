@@ -62,7 +62,7 @@ async fn kill_uses_per_turn_channel_not_shared_state() {
         .unwrap();
     assert!(kill.success, "kill should succeed: {:?}", kill.error);
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The awaited kill has completed notice delivery or refusal before returning.
 
     let on_wacli = wacli_sent.lock().await;
     let on_signal = signal_sent.lock().await;
@@ -150,8 +150,7 @@ async fn spawn_denied_without_grant_under_supervised() {
     // No run should have been registered.
     assert!(tool.active_runs_snapshot().await.is_empty());
 
-    // Give any (non-existent) async work a chance; nothing should be sent.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Admission denial returns before spawning any child or notice work.
     assert_eq!(sent.lock().await.len(), 0);
     assert_eq!(
         probe.requests().len(),
@@ -193,7 +192,9 @@ async fn spawn_records_request_and_result_message_events() {
     .unwrap();
     assert!(result.success);
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let runs = tool.active_runs_snapshot().await;
+    let run_id = &runs.first().expect("test: event fixture registered a run").id;
+    wait_for_run_finished(&tool, run_id).await;
 
     let principal = MemoryPrincipal {
         require_owner_match: false,

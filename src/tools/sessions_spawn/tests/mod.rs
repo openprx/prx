@@ -1102,3 +1102,21 @@ fn batch_run_ids(payload: &serde_json::Value) -> Vec<String> {
         })
         .collect()
 }
+
+async fn wait_for_run_finished(tool: &SessionsSpawnTool, run_id: &str) {
+    let runs = tool.active_runs_snapshot().await;
+    let task = runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .expect("test: spawned run must be registered")
+        .abort_handle
+        .as_ref()
+        .expect("test: spawned run must have a task handle");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !task.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test: spawned task must finish within 10 seconds");
+}

@@ -149,6 +149,10 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         // Real sockets and SQLite cannot use paused Tokio time. Give this
         // accounting fixture the largest valid configured latency budget.
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        // Keep decision transport and rehearsal stage caps from reintroducing
+        // a shorter deadline elsewhere in this real-I/O fixture.
+        config.causal_tree.backend.timeout_ms = 5_000;
+        config.causal_tree.rehearsal.timeout_ms = 5_000;
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = !text_only;
