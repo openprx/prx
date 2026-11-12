@@ -26,6 +26,27 @@ pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+const SHELL_SECRET_ENV: &[&str] = &[
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "SESSION_WORKER_SECRET",
+    "SESSION_WORKER_CAP_ENV",
+    "SESSION_WORKER_CAP_EXPIRY_ENV",
+];
+
+fn shell_secret_environment(name: &std::ffi::OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    bytes.starts_with(b"MINIMAX_OAUTH_")
+        || bytes.starts_with(b"OPENPRX_")
+        || name.to_str().is_some_and(|name| {
+            SHELL_SECRET_ENV.contains(&name)
+                || crate::providers::model_discovery::PROVIDER_CREDENTIAL_ENV.contains(&name)
+        })
+}
+
 /// Maximum retained bytes for each output stream. Readers continue draining
 /// after this limit so a noisy child can never block on a full pipe.
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 1_048_576;
@@ -37,9 +58,10 @@ const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_secs(1);
 /// How a shell job's git is treated (GIT-ENV, D-107).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellGitPolicy {
-    /// A model-driven surface (the `shell` tool, workspace skill scripts,
-    /// and cron and Xin jobs, whose stores cannot tell a tool-created job
-    /// from an operator's): a command string that runs git is refused.
+    /// Effective Full autonomy: ordinary git, without injected settings.
+    PlainGit,
+    /// Restricted shell tools, workspace skill scripts, and model-created
+    /// cron/Xin jobs refuse command strings that run git.
     RefuseGit,
     /// An operator-configured job: git runs, with the environment hardening
     /// of [`crate::security::git_launch::operator_git_environment`].
@@ -97,8 +119,8 @@ pub enum ShellProcessError {
     Timeout(Duration),
     #[error("command execution cancelled")]
     Cancelled,
-    /// The command string runs git (GIT-ENV, D-106): git runs only through
-    /// the hardened launch, which the shell cannot apply.
+    /// A restricted command string runs git (GIT-ENV, D-106).
+    /// Effective Full shell invocations select PlainGit instead.
     #[error(
         "refusing to run git through the shell: use the git_operations tool, which disables the programs a \
          repository's configuration names"
@@ -238,7 +260,7 @@ impl ShellProcessAdapter {
             .environment_allowlist
             .as_deref()
             .filter(|_| !end_group_on_exit)
-            .map(filtered_shell_environment)
+            .map(|extra| filtered_shell_environment(extra, self.runtime.name() == "native"))
             .transpose()
             .map_err(ShellProcessError::Runtime)?;
         let mut shell_environment = Vec::new();
@@ -419,10 +441,17 @@ impl ShellProcessAdapter {
 /// Baseline needed by local command-line tools, without credential, loader or
 /// interpreter-startup variables. Locale names are exact: `LC_*_TOKEN` is not
 /// a locale setting. Extra names are an explicit operator grant.
-fn filtered_shell_environment(extra: &[String]) -> anyhow::Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+fn filtered_shell_environment(
+    extra: &[String],
+    native: bool,
+) -> anyhow::Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
     crate::config::RuntimeConfig::validate_shell_env_allowlist(extra)?;
+    let full = native && crate::tools::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
     let mut environment: Vec<_> = std::env::vars_os()
         .filter(|(key, _)| {
+            if full {
+                return !shell_secret_environment(key);
+            }
             key.to_str().is_some_and(|key| {
                 SAFE_ENV_VARS.contains(&key)
                     || matches!(

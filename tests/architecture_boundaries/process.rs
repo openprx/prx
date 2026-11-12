@@ -463,8 +463,8 @@ pub(super) fn process_command_types_are_never_aliased() {
 }
 
 /// GIT-ENV (D-106, D-107 and its amendment): git in a shell command string
-/// is refused on the model-driven surfaces (the `shell` tool, workspace skill
-/// scripts, cron jobs and Xin tasks an agent tool created) and hardened
+/// is ordinary only in an effective Full shell. Restricted shells, workspace
+/// skill scripts, cron jobs and Xin tasks an agent tool created refuse it; git is hardened
 /// through the environment on the operator's (`prx cron`/`prx xin` jobs,
 /// system Xin tasks, node allowlists).
 #[test]
@@ -486,15 +486,27 @@ fn shell_sites_refuse_or_harden_git() {
             "ShellProcessAdapter::execute_with must use {required}"
         );
     }
-    for (relative, function) in [
-        ("src/tools/shell.rs", "execute_inner"),
-        ("src/tools/skills.rs", "execute_resolved"),
-    ] {
-        assert!(
-            body(relative, function).contains("ShellGitPolicy::RefuseGit"),
-            "{relative}::{function} is model-driven and must refuse git"
-        );
-    }
+    assert!(
+        body("src/tools/skills.rs", "execute_resolved").contains("ShellGitPolicy::RefuseGit"),
+        "workspace skill execution must still refuse git"
+    );
+    let policy = body("src/tools/shell.rs", "shell_git_policy");
+    let policy = policy
+        .split_once('{')
+        .expect("test: policy body")
+        .1
+        .strip_suffix('}')
+        .expect("test: policy end");
+    let compact: String = policy.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        compact,
+        "usecrate::runtime::shell_process::ShellGitPolicy::{PlainGit,RefuseGit};usecrate::security::AutonomyLevel::Full;matchlevel{Full=>PlainGit,_=>RefuseGit,}",
+        "shell git policy must widen only effective Full"
+    );
+    assert!(
+        body("src/tools/shell.rs", "execute_inner").contains("git: shell_git_policy("),
+        "shell must select git policy at invocation"
+    );
     // D-107 amendment: cron and Xin decide by the recorded creator.
     assert!(
         body("src/cron/scheduler.rs", "run_job_command_with_adapter").contains("git: shell_git_policy(config, job)")

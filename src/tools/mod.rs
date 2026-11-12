@@ -30,6 +30,7 @@ pub mod delegate;
 pub mod document_get_chunk;
 pub mod document_ingest;
 pub mod document_search;
+pub(crate) mod effective_autonomy;
 pub mod error_hints;
 pub mod execution;
 pub mod file_edit;
@@ -517,14 +518,22 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(
-            ShellTool::new(runtime.clone(), workspace_dir.to_path_buf())
-                .with_env_allowlist(config.runtime.shell_env_allowlist.clone()),
+            ShellTool::new(
+                runtime.clone(),
+                config.runtime.workdir.as_deref().unwrap_or(workspace_dir).to_path_buf(),
+            )
+            .with_env_allowlist(config.runtime.shell_env_allowlist.clone()),
         ),
-        Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(
+            FileReadTool::new(security.clone(), config.memory.acl_enabled).with_workdir(config.runtime.workdir.clone()),
+        ),
+        Arc::new(FileWriteTool::new(security.clone()).with_workdir(config.runtime.workdir.clone())),
+        Arc::new(FileEditTool::new(security.clone()).with_workdir(config.runtime.workdir.clone())),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
+        Arc::new(GitOperationsTool::new(
+            security.clone(),
+            config.runtime.workdir.as_deref().unwrap_or(workspace_dir).to_path_buf(),
+        )),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),
@@ -1505,3 +1514,7 @@ mod tests {
         assert!(!names.contains(&"delegate"));
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod shell_parity_tests;

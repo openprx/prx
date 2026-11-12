@@ -334,6 +334,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),
 
         Commands::Agent {
+            workdir: _,
             message_pos,
             message,
             provider,
@@ -756,6 +757,7 @@ mod tests {
 
     fn agent_single(message: bool, positional: bool) -> Commands {
         Commands::Agent {
+            workdir: None,
             message_pos: if positional { Some("hi".into()) } else { None },
             message: if message { Some("hi".into()) } else { None },
             provider: None,

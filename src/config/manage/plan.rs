@@ -1117,6 +1117,7 @@ fn containment_widenings(before: &Config, after: &Config, reasons: &mut Vec<Risk
         before.runtime.kind == "docker" && after.runtime.kind != "docker",
         "runtime.kind",
     );
+    push(before.runtime.workdir != after.runtime.workdir, "runtime.workdir");
     let (old_network, new_network) = (
         before.runtime.docker.network.trim(),
         after.runtime.docker.network.trim(),
@@ -3094,6 +3095,24 @@ mod tests {
                 None,
             ),
             // ── D-051: containment ──
+            (
+                "working directory set",
+                |_| {},
+                |c| c.runtime.workdir = Some(std::env::temp_dir()),
+                Some("runtime.workdir"),
+            ),
+            (
+                "working directory changed",
+                |c| c.runtime.workdir = Some(std::env::temp_dir()),
+                |c| c.runtime.workdir = Some(std::env::temp_dir().join("prx-other-root")),
+                Some("runtime.workdir"),
+            ),
+            (
+                "working directory unset",
+                |c| c.runtime.workdir = Some(std::env::temp_dir()),
+                |c| c.runtime.workdir = None,
+                Some("runtime.workdir"),
+            ),
             (
                 "shell gains a host environment variable",
                 |_| {},

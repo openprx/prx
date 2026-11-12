@@ -11,9 +11,10 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-/// Write file contents with path sandboxing
+/// Write file contents with effective-level confinement
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    working_root: Option<std::path::PathBuf>,
     controlled_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
 }
 
@@ -24,18 +25,29 @@ impl FileWriteTool {
     ) -> Self {
         Self {
             security,
+            working_root: None,
             controlled_filesystem: Some(filesystem),
         }
     }
     pub const fn new(security: Arc<SecurityPolicy>) -> Self {
         Self {
             security,
+            working_root: None,
             controlled_filesystem: None,
         }
     }
 }
 
 impl FileWriteTool {
+    pub fn with_workdir(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.working_root = root;
+        self
+    }
+
+    fn working_root(&self) -> &std::path::Path {
+        self.working_root.as_deref().unwrap_or(&self.security.workspace_dir)
+    }
+
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(expected) = &self.controlled_filesystem {
             anyhow::ensure!(
@@ -70,8 +82,9 @@ impl FileWriteTool {
             });
         }
 
+        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        if !full && !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -80,9 +93,7 @@ impl FileWriteTool {
         }
 
         let resolved_target =
-            match crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, true)
-                .await
-            {
+            match crate::security::approval_operation::resolve_file_target(self.working_root(), path, true).await {
                 Ok(target) => target,
                 Err(error) => {
                     return Ok(ToolResult {
@@ -95,7 +106,7 @@ impl FileWriteTool {
         let resolved_parent = resolved_target
             .parent()
             .ok_or_else(|| anyhow::anyhow!("file parent missing"))?;
-        if !self.security.is_resolved_path_allowed(resolved_parent) {
+        if !full && !self.security.is_resolved_path_allowed(resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -145,11 +156,12 @@ impl FileWriteTool {
         // away from the exact operation just authorized.
         tokio::fs::create_dir_all(resolved_parent).await?;
         let current =
-            crate::security::approval_operation::resolve_file_target(&self.security.workspace_dir, path, false).await?;
+            crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await?;
         if current != resolved_target
-            || !self
-                .security
-                .is_resolved_path_allowed(current.parent().ok_or_else(|| anyhow::anyhow!("file parent missing"))?)
+            || !full
+                && !self
+                    .security
+                    .is_resolved_path_allowed(current.parent().ok_or_else(|| anyhow::anyhow!("file parent missing"))?)
         {
             return Ok(ToolResult {
                 success: false,
@@ -238,7 +250,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write contents to a file in the workspace"
+        "Write contents to a file"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -247,7 +259,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "File path, relative to the working directory or absolute when policy permits"
                 },
                 "content": {
                     "type": "string",

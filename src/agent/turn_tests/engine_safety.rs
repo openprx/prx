@@ -763,6 +763,9 @@ async fn exhausted_daily_ceiling_refuses_provider_send() {
 /// Counts every admission attempt and denies it, as a read-only policy would.
 struct CountingDeny(Arc<AtomicUsize>);
 impl crate::tools::execution::EffectPolicy for CountingDeny {
+    fn autonomy_level(&self) -> crate::security::AutonomyLevel {
+        crate::security::AutonomyLevel::Supervised
+    }
     fn decide(
         &self,
         _: &crate::tools::ToolDescriptor,

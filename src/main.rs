@@ -100,6 +100,10 @@ use std::{fs, io::Write, path::PathBuf};
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt};
 
+fn parse_agent_workdir(value: &str) -> Result<std::path::PathBuf, String> {
+    openprx::config::RuntimeConfig::validate_workdir(std::path::Path::new(value)).map_err(|error| error.to_string())
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if !(0.0..=2.0).contains(&t) {
@@ -511,6 +515,9 @@ Examples:
   prx agent                             # interactive mode
   prx agent -p anthropic 'summarize x'  # pick a provider")]
     Agent {
+        /// Absolute existing working directory for shell, file tools and git.
+        #[arg(long, value_parser = parse_agent_workdir)]
+        workdir: Option<std::path::PathBuf>,
         /// Single message as a positional argument (UNIX-style, equivalent to -m).
         ///
         /// Mutually exclusive with `-m/--message`.
@@ -1652,12 +1659,8 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// synchronous, read-only pre-read of `[runtime] max_blocking_threads`, falling
 /// back to a cgroup-aware hardware-derived default.
 ///
-/// `try_parse` rather than `parse`: a malformed command line must still reach
-/// the real `Cli::parse()` in `async_main` so the user gets clap's diagnostics,
-/// not a bootstrap failure.
-fn resolve_max_blocking_threads() -> usize {
-    let explicit_config_dir = Cli::try_parse().ok().and_then(|cli| cli.config_dir);
-    openprx::config::bootstrap_max_blocking_threads(explicit_config_dir.as_deref())
+fn resolve_max_blocking_threads(cli: &Cli) -> usize {
+    openprx::config::bootstrap_max_blocking_threads(cli.config_dir.as_deref())
         .unwrap_or_else(openprx::runtime::blocking::default_max_blocking_threads)
 }
 
@@ -1672,7 +1675,8 @@ fn main() -> std::process::ExitCode {
     // concurrency gate now that turns, sub-agents and sessions are unbounded —
     // and it fails by deadlock, not rejection: once every slot is held, further
     // `spawn_blocking` calls queue forever with no timeout.
-    let max_blocking_threads = resolve_max_blocking_threads();
+    let cli = Cli::parse();
+    let max_blocking_threads = resolve_max_blocking_threads(&cli);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(max_blocking_threads)
@@ -1687,7 +1691,7 @@ fn main() -> std::process::ExitCode {
     };
     // Publish the real cap so blocking-pool saturation is measured against it.
     openprx::runtime::blocking::configure(max_blocking_threads);
-    let result = runtime.block_on(async_main());
+    let result = runtime.block_on(async_main(cli));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -1704,7 +1708,7 @@ fn main() -> std::process::ExitCode {
 
 #[allow(clippy::too_many_lines)]
 #[allow(unsafe_code)]
-async fn async_main() -> Result<()> {
+async fn async_main(cli: Cli) -> Result<()> {
     // Install default crypto provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -1712,7 +1716,6 @@ async fn async_main() -> Result<()> {
         eprintln!("Warning: Failed to install default crypto provider: {e:?}");
     }
 
-    let cli = Cli::parse();
     if let Some(warning) = argv_secret_warning(&cli.command) {
         eprintln!("{warning}");
     }
@@ -1909,7 +1912,7 @@ async fn async_main() -> Result<()> {
     );
     #[cfg(feature = "wasm-plugins")]
     let read_only_config_command = read_only_config_command || matches!(&cli.command, Commands::Plugin { .. });
-    let config = if read_only_config_command {
+    let mut config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
     } else if read_only_management_command(&cli.command) {
         // Without a configuration yet: the defaults, shown, nothing written
@@ -1926,6 +1929,14 @@ async fn async_main() -> Result<()> {
     } else {
         Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?
     };
+
+    if let Commands::Agent {
+        workdir: Some(root), ..
+    } = &cli.command
+    {
+        config.runtime.workdir = Some(root.clone());
+        config.validate()?;
+    }
 
     // Covers the resolutions the flag does not carry (`OPENPRX_CONFIG_DIR`,
     // `OPENPRX_WORKSPACE`, the active-workspace marker). No-op when the flag
@@ -4048,6 +4059,31 @@ mod tests {
                 assert_eq!(session.as_deref(), Some("abc"));
             }
             other => panic!("expected chat command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_workdir_is_canonical_and_requires_an_existing_absolute_directory() {
+        let root = tempfile::tempdir().expect("test: root");
+        let alias = root.path().join(".");
+        let cli = Cli::try_parse_from([
+            "prx",
+            "agent",
+            "--workdir",
+            alias.to_str().expect("test: root path"),
+            "hello",
+        ])
+        .expect("test: canonical workdir");
+        assert!(
+            matches!(cli.command, Commands::Agent { workdir: Some(ref workdir), .. } if *workdir == root.path().canonicalize().expect("test: canonical root")),
+            "test: parsed root canonicalized"
+        );
+        for path in [
+            "relative",
+            root.path().join("missing").to_str().expect("test: missing path"),
+        ] {
+            let error = Cli::try_parse_from(["prx", "agent", "--workdir", path]).expect_err("test: invalid root");
+            assert_eq!(error.exit_code(), 2, "test: clap usage exit");
         }
     }
 

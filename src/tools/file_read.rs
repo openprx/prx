@@ -8,9 +8,10 @@ use tokio::io::AsyncReadExt as _;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Read file contents with path sandboxing
+/// Read file contents with effective-level confinement
 pub struct FileReadTool {
     security: Arc<SecurityPolicy>,
+    working_root: Option<std::path::PathBuf>,
     controlled_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     acl_enabled: bool,
 }
@@ -19,6 +20,7 @@ impl FileReadTool {
     pub const fn new(security: Arc<SecurityPolicy>, acl_enabled: bool) -> Self {
         Self {
             security,
+            working_root: None,
             acl_enabled,
             controlled_filesystem: None,
         }
@@ -31,6 +33,7 @@ impl FileReadTool {
     ) -> Self {
         Self {
             security,
+            working_root: None,
             acl_enabled,
             controlled_filesystem: Some(filesystem),
         }
@@ -102,6 +105,15 @@ fn truncate_to_utf8_boundary(mut bytes: Vec<u8>, max_bytes: usize) -> Vec<u8> {
 }
 
 impl FileReadTool {
+    pub fn with_workdir(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.working_root = root;
+        self
+    }
+
+    fn working_root(&self) -> &std::path::Path {
+        self.working_root.as_deref().unwrap_or(&self.security.workspace_dir)
+    }
+
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(expected) = &self.controlled_filesystem {
             anyhow::ensure!(
@@ -123,8 +135,9 @@ impl FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
+        let full = super::effective_autonomy::current() == Some(crate::security::AutonomyLevel::Full);
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        if !full && !self.security.is_path_allowed(path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -132,7 +145,21 @@ impl FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        // Full still rejects parent traversal through the shared resolver.
+        let full_path = if full {
+            match crate::security::approval_operation::resolve_file_target(self.working_root(), path, false).await {
+                Ok(path) => path,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to resolve file path: {error}")),
+                    });
+                }
+            }
+        } else {
+            self.working_root().join(path)
+        };
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -146,7 +173,7 @@ impl FileReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
+        if !full && !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -249,7 +276,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the contents of a file in the workspace"
+        "Read the contents of a file"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -258,7 +285,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "File path, relative to the working directory or absolute when policy permits"
                 },
                 "max_bytes": {
                     "type": "integer",
