@@ -56,73 +56,86 @@ async fn read_plan(worker: &WorkerManifest, version: u8, batch: &str) -> Result<
 /// A real child that completed through the worker port. Its parent authority is
 /// sealed as a version-4 batch row before the child runs, so the batch reader
 /// verifies the same run that settles below. Returns plain data only.
+// Keep the real worker setup future out of each replay scenario's poll frame.
+#[inline(never)]
+fn boxed_completed_child_fixture<F, Fut>(make_fixture: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(WorkerManifest, WorkerResult)>>,
+{
+    Box::pin(make_fixture())
+}
+
 async fn completed_child_fixture(tmp: &tempfile::TempDir) -> Result<(WorkerManifest, WorkerResult)> {
-    let outcome = {
-        let probe = crate::providers::credential_probe::CredentialProbe::start_replying("r8 child completed").await;
-        with_worker_probe_manifest(tmp, probe.custom_provider(), false, |manifest| async move {
-            let source = manifest.child_source.as_ref().context("test: child source")?;
-            let workspace = PathBuf::from(&source.parent_constraints.workspace);
-            let owner = manifest.owner_id.clone().context("test: owner")?;
-            let parent = manifest
-                .capability_manifest
-                .as_ref()
-                .context("test: capability manifest")?
-                .parent_decision_id
-                .clone();
-            let key = crate::decision::DecisionKey::load_existing(&workspace)?;
-            // The signed launch row must describe this manifest and an eligible, non-legacy parent.
-            let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
-                .context("test: launch parent authority row")?;
-            anyhow::ensure!(
-                launch.version == 3
-                    && launch.run == manifest.run_id
-                    && launch.owner == owner
-                    && launch.parent_decision == parent
-                    && launch.parent_digest == source.parent_decision_digest
-                    && launch.store_workspace == source.parent_store_workspace
-                    && launch.enabled_snapshot
-                    && !launch.legacy_v1
-                    && launch.admits_issued_child,
-                "test: launch parent authority differs from the signed manifest"
-            );
-            let batch = authority_journal::BatchParentRow {
-                version: authority_journal::BATCH_PARENT_VERSION,
-                batch: "r8-batch".to_owned(),
-                owner: launch.owner.clone(),
-                parent_decision: launch.parent_decision.clone(),
-                parent_digest: launch.parent_digest.clone(),
-                store_workspace: launch.store_workspace.clone(),
-                enabled_snapshot: launch.enabled_snapshot,
-                legacy_v1: launch.legacy_v1,
-                admits_issued_child: launch.admits_issued_child,
-            };
-            authority_journal::persist_batch_parent(&workspace, &key, &batch)?;
-            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
-            let fabric = MemoryFabric::new(
-                memory,
-                manifest.memory_workspace_id.clone().context("test: memory workspace")?,
-            );
-            batch_journal::record_plan_fixture(
-                fabric,
-                Arc::clone(&key),
-                PlanFixture {
+    boxed_completed_child_fixture(|| async {
+        let outcome = {
+            let probe = crate::providers::credential_probe::CredentialProbe::start_replying("r8 child completed").await;
+            with_worker_probe_manifest(tmp, probe.custom_provider(), false, |manifest| async move {
+                let source = manifest.child_source.as_ref().context("test: child source")?;
+                let workspace = PathBuf::from(&source.parent_constraints.workspace);
+                let owner = manifest.owner_id.clone().context("test: owner")?;
+                let parent = manifest
+                    .capability_manifest
+                    .as_ref()
+                    .context("test: capability manifest")?
+                    .parent_decision_id
+                    .clone();
+                let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+                // The signed launch row must describe this manifest and an eligible, non-legacy parent.
+                let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
+                    .context("test: launch parent authority row")?;
+                anyhow::ensure!(
+                    launch.version == 3
+                        && launch.run == manifest.run_id
+                        && launch.owner == owner
+                        && launch.parent_decision == parent
+                        && launch.parent_digest == source.parent_decision_digest
+                        && launch.store_workspace == source.parent_store_workspace
+                        && launch.enabled_snapshot
+                        && !launch.legacy_v1
+                        && launch.admits_issued_child,
+                    "test: launch parent authority differs from the signed manifest"
+                );
+                let batch = authority_journal::BatchParentRow {
                     version: authority_journal::BATCH_PARENT_VERSION,
-                    owner: &batch.owner,
-                    batch: &batch.batch,
-                    parent_decision: &batch.parent_decision,
-                    parent_digest: &batch.parent_digest,
-                    store_workspace: &batch.store_workspace,
-                    run_ids: &[manifest.run_id.as_str()],
-                },
-            )
-            .await?;
-            let result = run_prepared_worker(manifest.clone()).await?;
-            anyhow::ensure!(result.success, "test: the child must complete: {:?}", result.error);
-            Ok((manifest, result))
-        })
-        .await?
-    };
-    Ok(outcome)
+                    batch: "r8-batch".to_owned(),
+                    owner: launch.owner.clone(),
+                    parent_decision: launch.parent_decision.clone(),
+                    parent_digest: launch.parent_digest.clone(),
+                    store_workspace: launch.store_workspace.clone(),
+                    enabled_snapshot: launch.enabled_snapshot,
+                    legacy_v1: launch.legacy_v1,
+                    admits_issued_child: launch.admits_issued_child,
+                };
+                authority_journal::persist_batch_parent(&workspace, &key, &batch)?;
+                let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
+                let fabric = MemoryFabric::new(
+                    memory,
+                    manifest.memory_workspace_id.clone().context("test: memory workspace")?,
+                );
+                batch_journal::record_plan_fixture(
+                    fabric,
+                    Arc::clone(&key),
+                    PlanFixture {
+                        version: authority_journal::BATCH_PARENT_VERSION,
+                        owner: &batch.owner,
+                        batch: &batch.batch,
+                        parent_decision: &batch.parent_decision,
+                        parent_digest: &batch.parent_digest,
+                        store_workspace: &batch.store_workspace,
+                        run_ids: &[manifest.run_id.as_str()],
+                    },
+                )
+                .await?;
+                let result = run_prepared_worker(manifest.clone()).await?;
+                anyhow::ensure!(result.success, "test: the child must complete: {:?}", result.error);
+                Ok((manifest, result))
+            })
+            .await?
+        };
+        Ok(outcome)
+    })
+    .await
 }
 
 /// Raw `(run, settlement, entry)` rows of the child outcome journal, read without repair.

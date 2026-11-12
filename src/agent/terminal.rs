@@ -538,12 +538,12 @@ where
 // finalizer state out of the nested entry, cleanup and terminal-guard futures.
 // Conversion and rejection of an invalid draft remain in the lazy wrappers.
 #[inline(never)]
-fn boxed_terminal_work<'a, F, Fut>(
+fn boxed_terminal_work<'a, F, Fut, T>(
     make_work: F,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<TurnTerminalReceipt>> + Send + 'a,
+    Fut: std::future::Future<Output = anyhow::Result<T>> + Send + 'a,
 {
     Box::pin(make_work())
 }
@@ -719,10 +719,12 @@ async fn finalize_turn_impl(
     workspace_dir: &Path,
     stop_after_marker: bool,
 ) -> anyhow::Result<TurnTerminalReceipt> {
-    boxed_terminal_work(move || async move {
+    // Keep pins across both phases, including errors and cancellation. The
+    // preparation frame ends before projection is polled, rather than staying
+    // nested beneath recovery persistence and its authenticated replay reads.
+    let _skill_pins = SkillPinGuard::new(&commit.scope);
+    let projection = boxed_terminal_work(move || async move {
         let mut commit = commit;
-        // Held for the whole finalization: every exit releases the run's pins.
-        let _skill_pins = SkillPinGuard::new(&commit.scope);
         anyhow::ensure!(!commit.terminal_id.trim().is_empty(), "terminal_id must not be empty");
         ensure_runtime_authority(&commit.scope, "start").await?;
         let mut execution_trace = None;
@@ -962,7 +964,7 @@ async fn finalize_turn_impl(
         if fabric.records_recovery_terminal() {
             // Keep the recovery transaction future out of the enclosing
             // terminal future, including in nested child/cleanup callers.
-            return boxed_terminal_work(move || recovery_commit::finalize_recovery_terminal(
+            return Ok(boxed_terminal_work(move || recovery_commit::finalize_recovery_terminal(
                 fabric,
                 commit,
                 cost_config,
@@ -971,10 +973,13 @@ async fn finalize_turn_impl(
                 execution_trace,
                 prepared_replay,
                 recovery_commit::ReplyAndUsage { reply_reference, usage_settlement },
-            ))
-            .await;
+            )));
         }
 
+        // Recovery and legacy projection are mutually exclusive. Construct the
+        // legacy future separately so its settlement/replay state does not
+        // occupy the recovery caller's poll stack during nested child completion.
+        Ok(boxed_terminal_work(move || async move {
         // The canonical usage event is written before the JSONL projection. A
         // crash can therefore leave usage awaiting projection, but can no longer
         // leave an untraceable cost-only settlement.
@@ -1174,8 +1179,10 @@ async fn finalize_turn_impl(
             }
         }
         Ok(receipt)
+        }))
     })
-    .await
+    .await?;
+    projection.await
 }
 
 /// Test support for the D-053 per-surface probes: a secret one surface's turn
@@ -1347,6 +1354,17 @@ mod tests {
 
     // Issue actual source authority, seed only that authenticated memory scope,
     // and let the production decision/turn loop produce its observations.
+    // Fixture setup must be constructed on its own frame: embedding its large
+    // future in each recovery scenario inflates the aggregate poll stack.
+    #[inline(never)]
+    fn boxed_terminal_fixture_setup<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Arc<crate::runtime::turn_decision::TurnDecisionService>>,
+    {
+        Box::pin(make_work())
+    }
+
     pub(crate) async fn bind_terminal_fixture(
         workspace: &Path,
         memory: Arc<dyn Memory>,
@@ -1364,286 +1382,289 @@ mod tests {
         enabled: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
     ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
-        let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
-        let input = if scoped_retrieval {
-            "Use memory_search to explain the saved expression `2 + 2`."
-        } else {
-            "Give a brief greeting."
-        };
-        let selection = draft
-            .provider_outcome
-            .as_ref()
-            .map_or(("ollama", "prx-local-model"), |outcome| {
-                (outcome.final_provider.as_str(), outcome.final_model.as_str())
-            });
-        let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.to_path_buf();
-        config.config_path = workspace.join("config.toml");
-        config.causal_tree.enabled = enabled;
-        config.causal_tree.policy.max_decision_hops = 1;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
-        config.causal_tree.backend.remote_enabled = false;
-        config.cost = cost_config.clone();
-        config
-            .providers
-            .models
-            .push(crate::config::schema::ProviderModelConfig {
-                provider: selection.0.to_owned(),
-                model: Some(selection.1.to_owned()),
-                operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
-                native_tools: Some(true),
-                vision_input: None,
-                streaming: None,
-                structured_output: None,
-                tool_schema_dialect: None,
-                tool_call_dialect: None,
-                context_window: None,
-            });
-        let generation = crate::config::new_shared(config).pin();
-        let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
-            Box::new(crate::tools::MemorySearchTool::new(
-                workspace.to_path_buf(),
-                Arc::clone(&memory),
-                true,
-            )),
-            Box::new(crate::tools::StaySilentTool::new()),
-        ]);
-        let observer = Arc::new(crate::observability::NoopObserver {});
-        let hooks = Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf()));
-        let service = crate::runtime::turn_publication::TurnDecisionPublication {
-            generation: Arc::clone(&generation),
-            registry: Arc::clone(&registry),
-            mcp_tool: None,
-            security: Arc::new(crate::security::SecurityPolicy::from_config(
-                &generation.effective.autonomy,
-                workspace,
-            )),
-            observer: observer.clone(),
-            hooks: Arc::clone(&hooks),
-            memory: Arc::clone(&memory),
-            plugin_generation: 0,
-        }
-        .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
-        .await
-        .unwrap();
-        let proof = match ingress_memory {
-            Some(ingress_memory) => {
-                crate::agent::entry::test_recovery_cli_agent_turn_proof_with_selection(
-                    &generation,
-                    ingress_memory,
-                    input,
-                    &draft.terminal_id,
-                    selection,
+        boxed_terminal_fixture_setup(move || async move {
+            let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
+            let input = if scoped_retrieval {
+                "Use memory_search to explain the saved expression `2 + 2`."
+            } else {
+                "Give a brief greeting."
+            };
+            let selection = draft
+                .provider_outcome
+                .as_ref()
+                .map_or(("ollama", "prx-local-model"), |outcome| {
+                    (outcome.final_provider.as_str(), outcome.final_model.as_str())
+                });
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.to_path_buf();
+            config.config_path = workspace.join("config.toml");
+            config.causal_tree.enabled = enabled;
+            config.causal_tree.policy.max_decision_hops = 1;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.remote_enabled = false;
+            config.cost = cost_config.clone();
+            config
+                .providers
+                .models
+                .push(crate::config::schema::ProviderModelConfig {
+                    provider: selection.0.to_owned(),
+                    model: Some(selection.1.to_owned()),
+                    operations: Some(vec![crate::config::schema::ModelOperationSetting::Chat]),
+                    native_tools: Some(true),
+                    vision_input: None,
+                    streaming: None,
+                    structured_output: None,
+                    tool_schema_dialect: None,
+                    tool_call_dialect: None,
+                    context_window: None,
+                });
+            let generation = crate::config::new_shared(config).pin();
+            let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
+                Box::new(crate::tools::MemorySearchTool::new(
+                    workspace.to_path_buf(),
+                    Arc::clone(&memory),
+                    true,
+                )),
+                Box::new(crate::tools::StaySilentTool::new()),
+            ]);
+            let observer = Arc::new(crate::observability::NoopObserver {});
+            let hooks = Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf()));
+            let service = crate::runtime::turn_publication::TurnDecisionPublication {
+                generation: Arc::clone(&generation),
+                registry: Arc::clone(&registry),
+                mcp_tool: None,
+                security: Arc::new(crate::security::SecurityPolicy::from_config(
+                    &generation.effective.autonomy,
+                    workspace,
+                )),
+                observer: observer.clone(),
+                hooks: Arc::clone(&hooks),
+                memory: Arc::clone(&memory),
+                plugin_generation: 0,
+            }
+            .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+            .await
+            .unwrap();
+            let proof = match ingress_memory {
+                Some(ingress_memory) => {
+                    crate::agent::entry::test_recovery_cli_agent_turn_proof_with_selection(
+                        &generation,
+                        ingress_memory,
+                        input,
+                        &draft.terminal_id,
+                        selection,
+                    )
+                    .await
+                }
+                None => {
+                    crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+                        &generation,
+                        Arc::clone(&memory),
+                        input,
+                        &draft.terminal_id,
+                        selection,
+                    )
+                    .await
+                }
+            };
+            assert!(
+                service.model_can_call_tools(&proof),
+                "fixture's actual traced provider supports verified native tools"
+            );
+            let source = memory
+                .find_owned_message_event(
+                    &workspace.to_string_lossy(),
+                    proof.owner_id(),
+                    proof.source_event_id().unwrap(),
                 )
                 .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.content, input);
+            assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
+            assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
+            if scoped_retrieval {
+                let mut write_scope = proof.memory_scope().clone();
+                write_scope.owner_id = Some(proof.owner_id().to_owned());
+                write_scope.require_owner_match = true;
+                memory
+                    .store_with_context_and_metadata(
+                        "prx_terminal_fixture_note",
+                        "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
+                        crate::memory::MemoryCategory::Core,
+                        Some(proof.session_key()),
+                        Some(&write_scope),
+                        crate::memory::MemoryStoreMetadata {
+                            workspace_id: Some(source.workspace_id.clone()),
+                            owner_id: source.owner_id.clone(),
+                            channel: source.channel.clone(),
+                            source_event_id: Some(source.event_id.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
             }
-            None => {
-                crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let context = service
+                .decide_agent_initial(
+                    &proof,
+                    crate::runtime::turn_decision::AgentTurnKind::Repl,
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            if enabled {
+                assert!(
+                    matches!(
+                        context.directive(),
+                        crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+                    ),
+                    "fixture requires an admitted Answer"
+                );
+            }
+            if draft.status == TurnTerminalStatus::Silent {
+                let mut spec = service
+                    .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                    .unwrap();
+                let mut cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
+                spec.description.push_str(" changed fixture schema");
+                let changed =
+                    crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+                let error = service.record_agent_silence(&proof, &context, &changed).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("silence dependency changed after provider request")
+                );
+                let foreign = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
                     &generation,
                     Arc::clone(&memory),
                     input,
-                    &draft.terminal_id,
+                    &format!("{}-foreign", draft.terminal_id),
                     selection,
                 )
-                .await
+                .await;
+                let spec = service
+                    .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
+                    .unwrap();
+                let offered =
+                    crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
+                let error = service.record_agent_silence(&foreign, &context, &offered).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("turn origin does not match the pinned decision service")
+                );
             }
-        };
-        assert!(
-            service.model_can_call_tools(&proof),
-            "fixture's actual traced provider supports verified native tools"
-        );
-        let source = memory
-            .find_owned_message_event(
-                &workspace.to_string_lossy(),
-                proof.owner_id(),
-                proof.source_event_id().unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(source.content, input);
-        assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
-        assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
-        if scoped_retrieval {
-            let mut write_scope = proof.memory_scope().clone();
-            write_scope.owner_id = Some(proof.owner_id().to_owned());
-            write_scope.require_owner_match = true;
-            memory
-                .store_with_context_and_metadata(
-                    "prx_terminal_fixture_note",
-                    "Use memory_search to explain the saved expression `2 + 2`. The expression adds two integers.",
-                    crate::memory::MemoryCategory::Core,
-                    Some(proof.session_key()),
-                    Some(&write_scope),
-                    crate::memory::MemoryStoreMetadata {
-                        workspace_id: Some(source.workspace_id.clone()),
-                        owner_id: source.owner_id.clone(),
-                        channel: source.channel.clone(),
-                        source_event_id: Some(source.event_id.clone()),
-                        ..Default::default()
+            if matches!(draft.status, TurnTerminalStatus::Completed | TurnTerminalStatus::Silent) {
+                let provider = TerminalFixtureProvider {
+                    outcome: draft
+                        .provider_outcome
+                        .clone()
+                        .expect("fixture actual provider response"),
+                    text: draft
+                        .history
+                        .as_ref()
+                        .map_or_else(|| "done".to_owned(), |history| history.assistant_content.clone()),
+                    silent: draft.status == TurnTerminalStatus::Silent,
+                    calls: Default::default(),
+                };
+                let mut history = vec![crate::providers::ChatMessage::user(input)];
+                let result = boxed_terminal_fixture_turn(
+                    &mut history,
+                    crate::agent::turn_request::TurnRequest {
+                        advice: None,
+                        channel_name: "cli",
+                        scope: None,
+                        mode: Default::default(),
+                        silent: true,
+                        expose_stay_silent: provider.silent,
+                        multimodal: &generation.effective.multimodal,
+                        schedule: crate::agent::turn_request::TurnSchedule {
+                            read_only_tool_concurrency_window: 1,
+                            priority_scheduling_enabled: false,
+                            low_priority_tool_names: Vec::new(),
+                        },
+                        compaction: None,
+                        decision: crate::agent::turn_request::TurnDecision {
+                            service: &service,
+                            context: &context,
+                            proof: &proof,
+                        },
+                    },
+                    crate::agent::turn_request::TurnServices {
+                        provider: &provider,
+                        provider_name: proof.provider_name(),
+                        model: proof.model_name(),
+                        temperature: 0.0,
+                        tools_registry: registry,
+                        observer: observer.as_ref(),
+                        hooks: hooks.as_ref(),
+                        approval: None,
+                        approval_resolver: None,
+                        runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+                            verify_chat_completion: false,
+                            provider_trace: None,
+                            events: None,
+                            stream_provider: false,
+                            tool_execution_service: None,
+                            tool_execution_context: crate::tools::ToolExecutionContext::new(
+                                crate::runtime::envelope::RuntimeEnvelope::agent(
+                                    workspace.to_string_lossy(),
+                                    proof.run_id(),
+                                )
+                                .with_config_generation(&generation)
+                                .with_source_message_event_id(proof.source_event_id().unwrap()),
+                                "private",
+                            ),
+                            allowed_tool_names: None,
+                        }),
+                        memory: crate::agent::turn_request::ToolLoopMemory::new(&memory, workspace, None),
+                    },
+                    crate::agent::turn_request::TurnDelivery {
+                        cancellation: Some(cancellation),
+                        on_delta: None,
+                        on_tool_call: None,
                     },
                 )
                 .await
                 .unwrap();
-        }
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = service
-            .decide_agent_initial(
-                &proof,
-                crate::runtime::turn_decision::AgentTurnKind::Repl,
-                &cancellation,
-            )
-            .await
-            .unwrap();
-        if enabled {
-            assert!(
-                matches!(
-                    context.directive(),
-                    crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-                ),
-                "fixture requires an admitted Answer"
-            );
-        }
-        if draft.status == TurnTerminalStatus::Silent {
-            let mut spec = service
-                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
-                .unwrap();
-            let mut cache = crate::agent::turn_context::ToolSnapshotRenderCache::default();
-            spec.description.push_str(" changed fixture schema");
-            let changed =
-                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
-            let error = service.record_agent_silence(&proof, &context, &changed).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("silence dependency changed after provider request")
-            );
-            let foreign = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
-                &generation,
-                Arc::clone(&memory),
-                input,
-                &format!("{}-foreign", draft.terminal_id),
-                selection,
-            )
-            .await;
-            let spec = service
-                .agent_runtime_dependency_spec(&proof, &context, crate::tools::STAY_SILENT_TOOL_NAME)
-                .unwrap();
-            let offered =
-                crate::agent::turn_context::CompiledToolContext::compile(true, vec![spec], Vec::new(), &mut cache);
-            let error = service.record_agent_silence(&foreign, &context, &offered).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("turn origin does not match the pinned decision service")
-            );
-        }
-        if matches!(draft.status, TurnTerminalStatus::Completed | TurnTerminalStatus::Silent) {
-            let provider = TerminalFixtureProvider {
-                outcome: draft
-                    .provider_outcome
-                    .clone()
-                    .expect("fixture actual provider response"),
-                text: draft
-                    .history
-                    .as_ref()
-                    .map_or_else(|| "done".to_owned(), |history| history.assistant_content.clone()),
-                silent: draft.status == TurnTerminalStatus::Silent,
-                calls: Default::default(),
-            };
-            let mut history = vec![crate::providers::ChatMessage::user(input)];
-            let result = boxed_terminal_fixture_turn(
-                &mut history,
-                crate::agent::turn_request::TurnRequest {
-                    advice: None,
-                    channel_name: "cli",
-                    scope: None,
-                    mode: Default::default(),
-                    silent: true,
-                    expose_stay_silent: provider.silent,
-                    multimodal: &generation.effective.multimodal,
-                    schedule: crate::agent::turn_request::TurnSchedule {
-                        read_only_tool_concurrency_window: 1,
-                        priority_scheduling_enabled: false,
-                        low_priority_tool_names: Vec::new(),
-                    },
-                    compaction: None,
-                    decision: crate::agent::turn_request::TurnDecision {
-                        service: &service,
-                        context: &context,
-                        proof: &proof,
-                    },
-                },
-                crate::agent::turn_request::TurnServices {
-                    provider: &provider,
-                    provider_name: proof.provider_name(),
-                    model: proof.model_name(),
-                    temperature: 0.0,
-                    tools_registry: registry,
-                    observer: observer.as_ref(),
-                    hooks: hooks.as_ref(),
-                    approval: None,
-                    approval_resolver: None,
-                    runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-                        verify_chat_completion: false,
-                        provider_trace: None,
-                        events: None,
-                        stream_provider: false,
-                        tool_execution_service: None,
-                        tool_execution_context: crate::tools::ToolExecutionContext::new(
-                            crate::runtime::envelope::RuntimeEnvelope::agent(
-                                workspace.to_string_lossy(),
-                                proof.run_id(),
-                            )
-                            .with_config_generation(&generation)
-                            .with_source_message_event_id(proof.source_event_id().unwrap()),
-                            "private",
-                        ),
-                        allowed_tool_names: None,
-                    }),
-                    memory: crate::agent::turn_request::ToolLoopMemory::new(&memory, workspace, None),
-                },
-                crate::agent::turn_request::TurnDelivery {
-                    cancellation: Some(cancellation),
-                    on_delta: None,
-                    on_tool_call: None,
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            assert_eq!(
-                matches!(result.0, crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. }),
-                provider.silent
-            );
-            let original = draft.provider_outcome.as_ref().unwrap();
-            assert_eq!(
-                result.1.tokens_used, original.tokens_used,
-                "real silent/text loop must retain complete reported usage"
-            );
-            let route = RouteDecision::single_candidate(&original.final_provider, &original.final_model);
-            let mut actual = provider_outcome_from_trace(&route, original.started_at, result.1);
-            // The upstream fixture's reason remains a redaction probe; execution
-            // status, attempts, serving tuple and usage all come from run_turn.
-            actual.fallback_reason.clone_from(&original.fallback_reason);
-            draft.provider_outcome = Some(actual);
-        }
-        let decision = service.terminal_settlement_ref(context).unwrap();
-        if decision.is_recorded() {
-            decision.validate_durable_chain().await.unwrap();
-        }
-        draft.scope = MessageEventScope::new("agent", MemoryVisibility::Session)
-            .with_owner_id(proof.owner_id())
-            .with_channel("cli")
-            .with_session_key(proof.session_key())
-            .with_run_id(proof.run_id());
-        draft.scope.causation_event_id = proof.source_event_id().map(str::to_owned);
-        draft.decision = Some(decision);
-        // The decision writer can enqueue causal events after its own commit.
-        // Establish fixture baselines only after both queues acknowledge.
-        assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
-        service
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(
+                    matches!(result.0, crate::agent::turn_contracts::ToolLoopOutcome::Silent { .. }),
+                    provider.silent
+                );
+                let original = draft.provider_outcome.as_ref().unwrap();
+                assert_eq!(
+                    result.1.tokens_used, original.tokens_used,
+                    "real silent/text loop must retain complete reported usage"
+                );
+                let route = RouteDecision::single_candidate(&original.final_provider, &original.final_model);
+                let mut actual = provider_outcome_from_trace(&route, original.started_at, result.1);
+                // The upstream fixture's reason remains a redaction probe; execution
+                // status, attempts, serving tuple and usage all come from run_turn.
+                actual.fallback_reason.clone_from(&original.fallback_reason);
+                draft.provider_outcome = Some(actual);
+            }
+            let decision = service.terminal_settlement_ref(context).unwrap();
+            if decision.is_recorded() {
+                decision.validate_durable_chain().await.unwrap();
+            }
+            draft.scope = MessageEventScope::new("agent", MemoryVisibility::Session)
+                .with_owner_id(proof.owner_id())
+                .with_channel("cli")
+                .with_session_key(proof.session_key())
+                .with_run_id(proof.run_id());
+            draft.scope.causation_event_id = proof.source_event_id().map(str::to_owned);
+            draft.decision = Some(decision);
+            // The decision writer can enqueue causal events after its own commit.
+            // Establish fixture baselines only after both queues acknowledge.
+            assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
+            service
+        })
+        .await
     }
 
     /// Production-faithful signed terminal without writing `outcomes`, so a later
