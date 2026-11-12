@@ -618,7 +618,7 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
 #[tokio::test]
 async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
     type Observation = (Option<SpawnExecutionContext>, Vec<String>, String);
-    struct ContextProbe(tokio::sync::mpsc::UnboundedSender<Observation>);
+    struct ContextProbe(tokio::sync::mpsc::Sender<Observation>);
     #[async_trait::async_trait]
     impl crate::providers::Provider for ContextProbe {
         fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
@@ -627,7 +627,9 @@ async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
             let context = current_spawn_execution_context();
             if context.as_ref().is_none_or(|context| context.run_id != "prx-parent") {
                 let key = spawn_session_scope_key(context.as_ref(), None);
-                let _ = self.0.send((context, ambient_channel_excluded_tools(), key));
+                // Non-blocking: this is a sync trait method. A full buffer drops
+                // the observation, which is safe because the test reads one only.
+                let _ = self.0.try_send((context, ambient_channel_excluded_tools(), key));
             }
             crate::providers::traits::ProviderCapabilities {
                 native_tool_calling: true,
@@ -638,7 +640,10 @@ async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
             Ok("done".into())
         }
     }
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    // Bounded test resource. The buffer is drained after setup and the test then
+    // asserts on the first later observation only, so that observation always
+    // finds a free slot; 16 slots merely keep a few setup or repeat calls.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
     let (channel, _) = RecordingChannel::new();
     let tool = make_tool(Arc::new(channel), Arc::new(ContextProbe(sender)));
     // Discard setup observations. Everything admitted below has parent scope.
