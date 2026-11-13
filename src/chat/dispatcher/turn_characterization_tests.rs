@@ -1253,7 +1253,9 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
 
 #[tokio::test]
 async fn enabled_interactive_backend_failure_publishes_provider_reply() {
-    tokio::time::timeout(Duration::from_secs(20), crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
+    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
+        .expect("test: interactive accounting cleanup owner");
+    tokio::time::timeout(Duration::from_secs(20), cleanup.run(crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
     let workspace = tempfile::tempdir().expect("test: chat workspace");
     let workspace = workspace.path();
     let (actions, _receiver) = mpsc::channel::<Action>(128);
@@ -1356,5 +1358,7 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     tokio::time::timeout(Duration::from_secs(5), failure_peer).await
         .expect("test: failure peer join deadline").expect("test: failure peer completed");
     decisions.shutdown(std::time::Instant::now() + Duration::from_secs(2)).await;
-    })).await.expect("test: interactive failure turn deadline");
+    Ok::<(), anyhow::Error>(())
+    }))).await.expect("test: interactive failure turn deadline")
+        .expect("test: interactive accounting cleanup settled");
 }
