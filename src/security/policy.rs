@@ -35,7 +35,7 @@ struct ShellLexToken {
 const MAX_NESTED_SHELL_VALIDATION_DEPTH: usize = 4;
 
 fn forbidden_path_argument(policy: &SecurityPolicy, command: &str) -> Option<CommandPathViolation> {
-    forbidden_path_argument_inner(policy, &policy.workspace_dir, command, 0)
+    forbidden_path_argument_inner(policy, &policy.workspace_dir, command, 0, true)
 }
 
 fn forbidden_path_argument_inner(
@@ -43,6 +43,7 @@ fn forbidden_path_argument_inner(
     root: &Path,
     command: &str,
     depth: usize,
+    enforce_dynamic: bool,
 ) -> Option<CommandPathViolation> {
     let folded_command = fold_shell_line_continuations(command);
     for segment in split_unquoted_segments(&folded_command) {
@@ -66,10 +67,10 @@ fn forbidden_path_argument_inner(
             if executable.kind == ShellLexTokenKind::CommandSeparator {
                 continue;
             }
-            if executable.active_substitution {
+            if enforce_dynamic && executable.active_substitution {
                 return Some(CommandPathViolation::ActiveSubstitution);
             }
-            if executable.dynamic {
+            if enforce_dynamic && executable.dynamic {
                 return Some(CommandPathViolation::Dynamic(executable.text.clone()));
             }
             let benign_dynamic_arguments = allows_benign_dynamic_arguments(&executable.text);
@@ -81,7 +82,7 @@ fn forbidden_path_argument_inner(
                 if token.kind == ShellLexTokenKind::CommandSeparator {
                     break;
                 }
-                if token.active_substitution {
+                if enforce_dynamic && token.active_substitution {
                     return Some(CommandPathViolation::ActiveSubstitution);
                 }
                 if token.kind == ShellLexTokenKind::Redirection {
@@ -89,7 +90,8 @@ fn forbidden_path_argument_inner(
                     index += 1;
                     continue;
                 }
-                if token.dynamic
+                if enforce_dynamic
+                    && token.dynamic
                     && (expects_redirection_operand || token.text.contains('/') || !benign_dynamic_arguments)
                 {
                     return Some(CommandPathViolation::Dynamic(token.text.clone()));
@@ -116,6 +118,7 @@ fn forbidden_path_argument_inner(
                 &executable.text,
                 tokens.get(arguments_start..index).unwrap_or_default(),
                 depth,
+                enforce_dynamic,
             ) {
                 return Some(violation);
             }
@@ -144,6 +147,7 @@ fn nested_wrapper_violation(
     executable: &str,
     arguments: &[ShellLexToken],
     depth: usize,
+    enforce_dynamic: bool,
 ) -> Option<CommandPathViolation> {
     let words = arguments
         .iter()
@@ -177,7 +181,7 @@ fn nested_wrapper_violation(
                 .iter()
                 .position(|word| matches!(*word, "-c" | "-e"))
                 .and_then(|flag| words.get(flag + 1))?;
-            return code_payload_violation(policy, root, payload);
+            return code_payload_violation(policy, root, payload, enforce_dynamic);
         }
         _ => None,
     }?;
@@ -185,13 +189,18 @@ fn nested_wrapper_violation(
         return None;
     }
     if depth >= MAX_NESTED_SHELL_VALIDATION_DEPTH {
-        return Some(CommandPathViolation::Dynamic(payload));
+        return enforce_dynamic.then_some(CommandPathViolation::Dynamic(payload));
     }
-    forbidden_path_argument_inner(policy, root, &payload, depth + 1)
+    forbidden_path_argument_inner(policy, root, &payload, depth + 1, enforce_dynamic)
 }
 
-fn code_payload_violation(policy: &SecurityPolicy, root: &Path, payload: &str) -> Option<CommandPathViolation> {
-    if payload.contains('$') {
+fn code_payload_violation(
+    policy: &SecurityPolicy,
+    root: &Path,
+    payload: &str,
+    enforce_dynamic: bool,
+) -> Option<CommandPathViolation> {
+    if enforce_dynamic && payload.contains('$') {
         return Some(CommandPathViolation::Dynamic(payload.to_string()));
     }
     for candidate in payload
@@ -1742,9 +1751,11 @@ impl SecurityPolicy {
         }
     }
 
-    /// Validate shell path arguments against the directory used by the process.
+    /// Check static shell path arguments against the process directory.
+    /// The orchestration validator retains its dynamic-expression restrictions;
+    /// this backend check preserves generic shell expansion support.
     pub(crate) fn validate_command_paths_at(&self, root: &Path, command: &str) -> Result<(), String> {
-        match forbidden_path_argument_inner(self, root, command, 0) {
+        match forbidden_path_argument_inner(self, root, command, 0, false) {
             None => Ok(()),
             Some(CommandPathViolation::Forbidden(path)) => Err(format!("forbidden path argument: {path}")),
             Some(CommandPathViolation::Dynamic(token)) => Err(format!("forbidden dynamic path argument: {token}")),
