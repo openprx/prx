@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- New workspace `state` and selected evolution/fitness `self` directories are
+  created privately under group-writable umasks. Cost state directories must be
+  owned by the effective uid, including when running as root; `sudo prx` on a
+  user's workspace and uid-mismatched container mounts are refused. Existing
+  writable state directories require an explicit `chmod 700 <workspace>/state`;
+  ownership mismatches require `chown <euid> <workspace>/state` or running as owner.
+
 - `prx agent`, `prx chat`, `prx go`, `prx doctor`, `prx status`, and other
   foreground commands default to `warn`-level tracing on stderr when
   `RUST_LOG` is unset, so `prx agent 'What is 2+2?'` prints only the reply

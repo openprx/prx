@@ -2,6 +2,25 @@
 //!
 //! This module contains reusable helper functions used across the codebase.
 
+/// Create missing parents normally and only the leaf with owner-only permissions.
+/// Existing entries are left untouched; callers validate opened handles.
+pub(crate) fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+}
+
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
 ///
 /// This function safely handles multi-byte UTF-8 characters (emoji, CJK, accented characters)
@@ -62,6 +81,21 @@ pub enum MaybeSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_dir_existing_symlink_is_untouched() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let temp = tempfile::tempdir().expect("test: temp root");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("test: symlink target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o775)).expect("test: target mode");
+        let link = temp.path().join("leaf");
+        symlink(&target, &link).expect("test: existing leaf symlink");
+        create_private_dir_all(&link).expect("test: existing leaf is left alone");
+        assert!(std::fs::symlink_metadata(&link).expect("test: leaf metadata").file_type().is_symlink(), "creation must not replace an existing symlink");
+        assert_eq!(std::fs::metadata(&target).expect("test: target metadata").permissions().mode() & 0o777, 0o775, "creation must not chmod a symlink target");
+    }
 
     #[test]
     fn test_truncate_ascii_no_truncation() {
@@ -149,3 +183,6 @@ mod tests {
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_helpers;

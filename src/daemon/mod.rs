@@ -1495,7 +1495,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     };
 
     let shared = new_shared_evolution_config(cfg.clone());
-    let storage_root = resolve_evolution_storage_root(config, &cfg.runtime);
+    let storage_root = resolve_evolution_storage_root(config, &cfg.runtime)?;
     let writer = Arc::new(
         AsyncJsonlWriter::new(
             JsonlStoragePaths::new(storage_root.clone()),
@@ -1696,13 +1696,18 @@ fn discover_evolution_config_path(config: &Config) -> PathBuf {
     candidates[0].clone()
 }
 
-fn resolve_evolution_storage_root(config: &Config, runtime: &EvolutionRuntimeConfig) -> PathBuf {
+fn resolve_evolution_storage_root(config: &Config, runtime: &EvolutionRuntimeConfig) -> anyhow::Result<PathBuf> {
     let root = Path::new(&runtime.storage_dir);
-    if root.is_absolute() {
+    let root = if root.is_absolute() {
         root.to_path_buf()
     } else {
         config.workspace_dir.join(root)
+    };
+    let self_dir = config.workspace_dir.join("self");
+    if root.starts_with(&self_dir) {
+        crate::util::create_private_dir_all(&self_dir)?;
     }
+    Ok(root)
 }
 
 const fn retention_from_runtime(retention: &EvolutionRetentionConfig) -> JsonlRetentionPolicy {
@@ -2095,7 +2100,7 @@ mod tests {
         let mut runtime = EvolutionRuntimeConfig::default();
         runtime.storage_dir = "self/evolution-data".to_string();
 
-        let root = resolve_evolution_storage_root(&config, &runtime);
+        let root = resolve_evolution_storage_root(&config, &runtime).expect("test: resolve evolution root");
         assert_eq!(root, config.workspace_dir.join("self/evolution-data"));
     }
 
@@ -2107,7 +2112,7 @@ mod tests {
         let abs = tmp.path().join("absolute-storage");
         runtime.storage_dir = abs.to_string_lossy().to_string();
 
-        let root = resolve_evolution_storage_root(&config, &runtime);
+        let root = resolve_evolution_storage_root(&config, &runtime).expect("test: resolve evolution root");
         assert_eq!(root, abs);
     }
 

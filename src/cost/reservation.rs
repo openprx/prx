@@ -1063,10 +1063,7 @@ fn append_inner(workspace: &Path, events: &[Event]) -> Result<()> {
     let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let root = rustix::fs::open(workspace, directory, Mode::empty())?;
     let state = rustix::fs::openat(&root, "state", directory, Mode::empty())?;
-    ensure!(
-        rustix::fs::fstat(&state)?.st_mode & 0o022 == 0,
-        "reservation directory is writable by another account"
-    );
+    super::state_dir::validate(&workspace.join("state"), &rustix::fs::fstat(&state)?)?;
     let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let (fd, created) = match rustix::fs::openat(
         &state,

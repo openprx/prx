@@ -60,9 +60,7 @@ pub(super) fn read_state_ledger_bounded(workspace: &Path, filename: &str) -> Res
         Err(error) => return Err(error).context("cost state directory cannot be opened safely"),
     };
     let state_stat = rustix::fs::fstat(&state).context("cost state directory cannot be inspected")?;
-    if FileType::from_raw_mode(state_stat.st_mode) != FileType::Directory || state_stat.st_mode & 0o022 != 0 {
-        return Err(anyhow!("cost state directory is writable by another account"));
-    }
+    super::state_dir::validate(&workspace.join("state"), &state_stat)?;
     let fd = match rustix::fs::openat(
         &state,
         filename,
@@ -283,10 +281,7 @@ fn open_cost_file(path: &Path, access: CostFileAccess) -> Result<Option<(File, O
         Err(rustix::io::Errno::NOENT) if matches!(access, CostFileAccess::Read) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(
-        rustix::fs::fstat(&state)?.st_mode & 0o022 == 0,
-        "cost state directory is writable by another account"
-    );
+    super::state_dir::validate(parent, &rustix::fs::fstat(&state)?)?;
     let flags = match access {
         CostFileAccess::Read => OFlags::RDONLY,
         CostFileAccess::Append => OFlags::WRONLY | OFlags::APPEND,
@@ -958,7 +953,8 @@ fn budget_check(
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
     let storage_path = workspace_dir.join("state").join("costs.jsonl");
     let legacy_path = workspace_dir.join(".openprx").join("costs.db");
-    fs::create_dir_all(workspace_dir.join("state")).context("failed to create cost state directory")?;
+    crate::util::create_private_dir_all(&workspace_dir.join("state"))
+        .context("failed to create cost state directory")?;
 
     // Migration shares the same lock as settlement. Open each inode before
     // copying; neither a legacy symlink nor a target link can redirect writes.
@@ -1111,7 +1107,8 @@ impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            crate::util::create_private_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
         let now = Utc::now();
@@ -1395,6 +1392,75 @@ impl CostStorage {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_dir_non_cost_creator_under_group_umask() {
+        const TEST: &str = "cost::tracker::tests::private_state_dir_non_cost_creator_under_group_umask";
+        if crate::util::test_helpers::run_in_isolated_process(TEST, "PRX_TEST_PRIVATE_STATE_CHILD") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o002));
+        let temp = TempDir::new().expect("test: temp root");
+        let workspace = temp.path().join("fresh-workspace");
+        crate::providers::catalog::discovery::save_model_cache_state(
+            &workspace,
+            &crate::providers::catalog::discovery::ModelCacheState::default(),
+        )
+        .expect("test: non-cost creator writes model cache first");
+        let tracker = CostTracker::new(enabled_config(), &workspace).expect("test: open cost tracker after cache");
+        tracker
+            .record_usage(TokenUsage::new("prx-model", 100, 50, 1.0, 1.0))
+            .expect("test: record real spend");
+        assert!(
+            tracker.get_summary().expect("test: summary").session_cost_usd > 0.0,
+            "recorded spend must appear in session summary"
+        );
+        for (path, mode) in [(workspace.join("state"), 0o700), (workspace, 0o775)] {
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("test: directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "creation mode for {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_dir_existing_writable_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = TempDir::new().expect("test: workspace");
+        let state = temp.path().join("state");
+        fs::create_dir(&state).expect("test: existing state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o775)).expect("test: shared state mode");
+        crate::util::create_private_dir_all(&state).expect("test: helper leaves existing leaf alone");
+        let error = match CostTracker::new(enabled_config(), temp.path()) {
+            Ok(_) => panic!("test: writable state must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&state.display().to_string())
+                && message.contains("chmod 700")
+                && message.contains("0o775"),
+            "refusal must include path, mode and manual remediation: {message}"
+        );
+        assert_eq!(
+            fs::metadata(state)
+                .expect("test: unchanged state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775,
+            "existing state must never be narrowed automatically"
+        );
+    }
 
     fn enabled_config() -> CostConfig {
         CostConfig::default()

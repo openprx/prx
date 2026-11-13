@@ -89,7 +89,7 @@ pub async fn handle_command(command: EvolutionCommands, as_json: bool, config: &
 
 async fn handle_status(as_json: bool, config: &Config) -> Result<()> {
     let (cfg, _path, _exists) = load_evolution_config(config).await?;
-    let storage_root = resolve_storage_root(config, &cfg.runtime);
+    let storage_root = resolve_storage_root(config, &cfg.runtime)?;
 
     let decisions =
         read_all_jsonl::<crate::self_system::evolution::DecisionLog>(&storage_root.join("decisions")).await?;
@@ -177,7 +177,7 @@ async fn handle_status(as_json: bool, config: &Config) -> Result<()> {
 
 async fn history_items(config: &Config, limit: usize) -> Result<Vec<EvolutionLog>> {
     let (cfg, _, _) = load_evolution_config(config).await?;
-    let storage_root = resolve_storage_root(config, &cfg.runtime);
+    let storage_root = resolve_storage_root(config, &cfg.runtime)?;
 
     let mut items = read_all_jsonl::<EvolutionLog>(&storage_root.join("evolution")).await?;
     items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -228,7 +228,7 @@ async fn handle_digest(as_json: bool, config: &Config, date: Option<String>) -> 
         .unwrap_or_else(|| Utc::now().date_naive());
 
     let (cfg, _, _) = load_evolution_config(config).await?;
-    let storage_root = resolve_storage_root(config, &cfg.runtime);
+    let storage_root = resolve_storage_root(config, &cfg.runtime)?;
     let digest_path = storage_root
         .join("analysis")
         .join("daily")
@@ -290,7 +290,7 @@ async fn handle_trigger_owned(as_json: bool, config: &Config, layer: Option<Evol
     let (cfg, cfg_path, _exists) = load_evolution_config(config).await?;
     let shared = new_shared_evolution_config(cfg.clone());
 
-    let storage_root = resolve_storage_root(config, &cfg.runtime);
+    let storage_root = resolve_storage_root(config, &cfg.runtime)?;
     let writer = Arc::new(
         AsyncJsonlWriter::new(
             JsonlStoragePaths::new(storage_root.clone()),
@@ -482,13 +482,18 @@ fn discover_evolution_config_path(config: &Config) -> PathBuf {
     candidates[0].clone()
 }
 
-fn resolve_storage_root(config: &Config, runtime: &EvolutionRuntimeConfig) -> PathBuf {
+fn resolve_storage_root(config: &Config, runtime: &EvolutionRuntimeConfig) -> anyhow::Result<PathBuf> {
     let root = Path::new(&runtime.storage_dir);
-    if root.is_absolute() {
+    let root = if root.is_absolute() {
         root.to_path_buf()
     } else {
         config.workspace_dir.join(root)
+    };
+    let self_dir = config.workspace_dir.join("self");
+    if root.starts_with(&self_dir) {
+        crate::util::create_private_dir_all(&self_dir)?;
     }
+    Ok(root)
 }
 
 fn infer_circuit_state(
@@ -578,6 +583,55 @@ fn debug_value<T: Debug>(v: &T) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn private_state_dir_evolution_root_under_group_umask() {
+        const TEST: &str = "evolution_cli::tests::private_state_dir_evolution_root_under_group_umask";
+        if crate::util::test_helpers::run_in_isolated_process(TEST, "PRX_TEST_PRIVATE_SELF_CHILD") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o002));
+        let temp = tempfile::tempdir().expect("test: temp root");
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = temp.path().join("fresh-workspace");
+        let mut runtime = EvolutionRuntimeConfig::default();
+        let root = resolve_storage_root(&config, &runtime).expect("test: default evolution root");
+        assert!(
+            root.starts_with(config.workspace_dir.join("self")),
+            "default evolution root must be under self"
+        );
+        for (path, mode) in [
+            (config.workspace_dir.join("self"), 0o700),
+            (config.workspace_dir.clone(), 0o775),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("test: root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode,
+                "creation mode for {}",
+                path.display()
+            );
+        }
+        crate::decision::key::DecisionKey::load_or_create(&config.workspace_dir)
+            .expect("test: decision key loads after evolution root creation");
+        config.workspace_dir = temp.path().join("outside-workspace");
+        for outside in [
+            "external-storage".to_owned(),
+            temp.path().join("absolute-storage").display().to_string(),
+        ] {
+            runtime.storage_dir = outside;
+            resolve_storage_root(&config, &runtime).expect("test: external evolution root");
+            assert!(
+                !config.workspace_dir.join("self").exists(),
+                "external storage must leave self uncreated"
+            );
+        }
+    }
+
     use super::*;
     use crate::self_system::evolution::DecisionLog;
     use crate::self_system::evolution::record::{

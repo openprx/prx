@@ -7,6 +7,7 @@ use crate::memory::ingress_recovery::IngressCapsule;
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use crate::memory::{MessageEvent, MessageEventInput, SqliteMemory};
 use crate::runtime::turn_cleanup::{CleanupScope, CleanupTracker};
+use crate::util::test_helpers::run_in_isolated_process;
 use anyhow::Context;
 use std::path::Path;
 
@@ -295,24 +296,6 @@ async fn marker(workspace: &Path, source: &MessageEvent) -> MessageEvent {
         .await
         .unwrap()
         .expect("quarantine evidence")
-}
-
-fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
-    if std::env::var_os(child_flag).is_some() {
-        return false;
-    }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([test, "--exact", "--nocapture"])
-        .env(child_flag, "1")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
 }
 
 #[tokio::test(flavor = "current_thread")]
