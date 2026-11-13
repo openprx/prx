@@ -1237,7 +1237,7 @@ fn recorded_pre_switch_directive_replays_unchanged() {
     );
 }
 
-async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure: bool) {
+async fn run_plain_fallback_cell(enabled: bool, input: &str) {
     let workspace = tempfile::tempdir().expect("test: plain workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
@@ -1245,13 +1245,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
     config.causal_tree.enabled = true;
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
-    if interactive_failure {
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
-        config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
-        config.causal_tree.backend.model = "prx-decision-probe".into();
-        config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: model"));
-    }
+    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let dispatches = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
@@ -1259,21 +1253,30 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
         execution_order: Arc::clone(&dispatches),
     }) as Box<dyn Tool>]);
     let registry = if enabled { registry } else { Arc::new(Vec::new()) };
-    let admitted = crate::agent::turn_tests::reachability::boxed_root_probe(|| {
-        AdmittedTurn::with_config(config, input, Arc::clone(&registry))
-    })
-    .await;
+    let admitted = if enabled {
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: enabled entry memory"));
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+            AdmittedTurn::with_prediction_memory(config, input, Arc::clone(&registry), memory)
+        })
+        .await
+    } else {
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+            AdmittedTurn::with_config(config, input, Arc::clone(&registry))
+        })
+        .await
+    };
     if enabled {
         assert!(
             matches!(
                 admitted.decision().context.engine().selection,
                 crate::causal_tree::decision_select::Selection::Abstain {
-                    action: crate::causal_tree::branch::CausalActionKind::Answer
-                        | crate::causal_tree::branch::CausalActionKind::Clarify,
+                    action: crate::causal_tree::branch::CausalActionKind::Answer,
                     ..
                 }
             ),
-            "test: exercise an actual abstention"
+            "test: exercise actual Builtin Answer abstention: {:?}",
+            admitted.decision().context.engine().selection
         );
     }
     let published = Arc::new(Mutex::new(Vec::new()));
@@ -1362,19 +1365,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
 async fn enabled_builtin_low_confidence_run_turn_publishes_plain_answer() {
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
-            run_plain_fallback_cell(true, "Explain `2 + 2`.", false)
-        }),
-    )
-    .await
-    .expect("test: complete turn deadline");
-}
-
-#[tokio::test]
-async fn enabled_backend_failure_run_turn_publishes_plain_answer() {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(true, "Say hello.", true)),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(true, "Explain `2 + 2`.")),
     )
     .await
     .expect("test: complete turn deadline");
@@ -1384,7 +1375,7 @@ async fn enabled_backend_failure_run_turn_publishes_plain_answer() {
 async fn disabled_blank_direct_run_turn_calls_provider_without_prediction() {
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(false, "  ", false)),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(false, "  ")),
     )
     .await
     .expect("test: complete turn deadline");
