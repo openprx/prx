@@ -416,11 +416,21 @@ pub(super) async fn run_sub_agent_task(
                     task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
                 }
                 child_turn.enrich_input(&mut task_history)?;
+                // R9/R26: an enabled engine analyses the child task turn on
+                // its own runtime context and accounting scope.
+                let advice = {
+                    let routing = child_turn.routing();
+                    routing
+                        .service
+                        .advisory()
+                        .analyze_turn(routing.runtime, &cancel_token_owned)
+                        .await
+                };
                 let loop_outcome = loop_cleanup
                     .run(crate::agent::turn_engine::run_turn(
                         &mut task_history,
                         crate::agent::turn_request::TurnRequest {
-                            advice: None,
+                            advice,
                             channel_name: "sessions_spawn",
                             // chat event bridge: incremental loop output (v1.1a)
                             scope: Some(&scope_ctx),

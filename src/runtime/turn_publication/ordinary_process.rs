@@ -71,10 +71,18 @@ pub(super) fn ordinary_process_publication(
             &snapshots.generation.effective,
             &build.security,
         )),
-        advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
-            Arc::clone(&snapshots.generation.effective),
-            None,
-        ),
+        // R9/R26: an enabled engine analyses the worker's turns on its own
+        // runtime context and accounting scope.
+        advisory: crate::runtime::decision_advisory::DecisionAdvisory::for_publication(
+            &snapshots.generation.effective,
+            FactoryDeps {
+                catalog: &snapshots.provider_catalog,
+                key: Some(Arc::clone(&parent.key)),
+                transports: build.transports,
+                config_generation: snapshots.generation.id.0,
+                events: Arc::clone(&build.events),
+            },
+        )?,
         child_recovery: Default::default(),
         memory_loader: None,
         loop_runtime: Some(runtime),

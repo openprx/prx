@@ -117,11 +117,13 @@ async fn ordinary_parent(
     level: AutonomyLevel,
     memory: Arc<dyn crate::memory::Memory>,
     message: &str,
+    engine_enabled: bool,
 ) -> OrdinaryParent {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
     config.config_path = workspace.join("config.toml");
     config.causal_tree.enabled = false;
+    config.decision_engine.enabled = engine_enabled;
     config.autonomy.level = level;
     let security = Arc::new(crate::security::SecurityPolicy::from_config(
         &config.autonomy,
@@ -195,8 +197,8 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let result = cleanup
         .scope(Box::pin(async {
-            let parent = ordinary_parent(workspace.path(), level, Arc::clone(&memory), "prx-child-parent").await;
-            let other = ordinary_parent(workspace.path(), level, Arc::clone(&memory), "prx-child-other").await;
+            let parent = ordinary_parent(workspace.path(), level, Arc::clone(&memory), "prx-child-parent", false).await;
+            let other = ordinary_parent(workspace.path(), level, Arc::clone(&memory), "prx-child-other", false).await;
             let (execution, bound) = parent.admitted.bind_selected("sessions_spawn")?;
             let publication = bound
                 .ordinary_child_publication
@@ -371,6 +373,45 @@ async fn child_publication_survives_without_turn_decision_service() -> anyhow::R
         operator_case(level)
             .await
             .with_context(|| format!("operator child, {level:?}"))?;
+    }
+    Ok(())
+}
+
+/// P1-05: an enabled engine builds the advisory driver of a child
+/// publication (its analysis then runs on the child's own runtime context and
+/// accounting scope); a disabled engine builds no factory (P1-I2).
+#[tokio::test]
+async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> anyhow::Result<()> {
+    for enabled in [false, true] {
+        let workspace = tempfile::tempdir()?;
+        let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+        let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let result = cleanup
+            .scope(Box::pin(async {
+                let parent = ordinary_parent(
+                    workspace.path(),
+                    AutonomyLevel::Supervised,
+                    Arc::clone(&memory),
+                    "prx-child-advisory",
+                    enabled,
+                )
+                .await;
+                let (_execution, bound) = parent.admitted.bind_selected("sessions_spawn")?;
+                let publication = bound
+                    .ordinary_child_publication
+                    .clone()
+                    .context("ordinary parent binding captured no child publication")?;
+                let child = publication.child_service(&bound, None)?;
+                assert_eq!(
+                    child.advisory().factory().is_some(),
+                    enabled,
+                    "child advisory factory follows the engine switch"
+                );
+                Ok::<(), anyhow::Error>(())
+            }))
+            .await;
+        cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+        result.with_context(|| format!("engine enabled: {enabled}"))?;
     }
     Ok(())
 }

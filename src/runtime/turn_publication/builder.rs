@@ -208,27 +208,20 @@ pub(crate) async fn build_publication(
     // The advisory engine's factory is built from the effective engine
     // backend with this service's state key, never through the plane switch
     // (R55, R9). A disabled engine builds no factory.
-    let advisory_factory = if config.decision_engine.enabled {
-        Some(DecisionBackendFactory::from_config(
-            config,
-            FactoryDeps {
-                catalog: build.provider_catalog,
-                key: Some(Arc::clone(&state_key)),
-                transports: build.transports,
-                config_generation: build.generation.id.0,
-                events: Arc::clone(&events),
-            },
-        )?)
-    } else {
-        None
-    };
+    let advisory = crate::runtime::decision_advisory::DecisionAdvisory::for_publication(
+        &build.generation.effective,
+        FactoryDeps {
+            catalog: build.provider_catalog,
+            key: Some(Arc::clone(&state_key)),
+            transports: build.transports,
+            config_generation: build.generation.id.0,
+            events: Arc::clone(&events),
+        },
+    )?;
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
         runtime: Arc::new(runtime),
-        advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
-            Arc::clone(&build.generation.effective),
-            advisory_factory,
-        ),
+        advisory,
         child_recovery: Default::default(),
         memory_loader: None,
         loop_runtime: None,

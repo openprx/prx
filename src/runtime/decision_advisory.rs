@@ -23,7 +23,7 @@ use crate::decision_engine::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
 };
 use crate::decision_engine::observe::{ObserveQueue, SqliteTelemetryWriter};
-use crate::decision_engine::prediction::factory::DecisionBackendFactory;
+use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryBuildError, FactoryDeps};
 use crate::decision_engine::prediction::{CandidateQuestion, GlobalQuestion, QuestionId, RequestLimits};
 use crate::decision_engine::prediction_port::PredictionPort;
 use crate::decision_engine::questions::{CompilerPolicy, QuestionCompiler};
@@ -217,6 +217,19 @@ impl DecisionAdvisory {
             telemetry: Arc::new(tokio::sync::OnceCell::new()),
             opening: parking_lot::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The advisory driver of one publication (root, child or worker). A
+    /// disabled engine builds no factory, store or credential (P1-I2); an
+    /// enabled one builds its factory from the effective engine backend with
+    /// the publication's state key in `deps` (R55, R9).
+    pub(crate) fn for_publication(config: &Arc<Config>, deps: FactoryDeps<'_>) -> Result<Self, FactoryBuildError> {
+        let factory = if config.decision_engine.enabled {
+            Some(DecisionBackendFactory::from_config(config, deps)?)
+        } else {
+            None
+        };
+        Ok(Self::new(Arc::clone(config), factory))
     }
 
     pub(crate) fn config(&self) -> &DecisionEngineConfig {

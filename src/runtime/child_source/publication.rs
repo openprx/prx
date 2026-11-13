@@ -272,10 +272,18 @@ impl OrdinaryChildPublication {
                 &parent.generation.effective,
                 &parent.security,
             )),
-            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
-                Arc::clone(&parent.generation.effective),
-                None,
-            ),
+            // R9/R26: an enabled engine analyses the child's own turns on
+            // the child's runtime context and accounting scope.
+            advisory: crate::runtime::decision_advisory::DecisionAdvisory::for_publication(
+                &parent.generation.effective,
+                FactoryDeps {
+                    catalog: &parent.provider_catalog,
+                    key: Some(Arc::clone(&parent.state_key)),
+                    transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
+                    config_generation: parent.generation.id.0,
+                    events: Arc::clone(&parent.events),
+                },
+            )?,
             child_recovery: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),

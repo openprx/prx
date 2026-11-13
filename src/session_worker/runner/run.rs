@@ -1317,6 +1317,11 @@ async fn run_owned_manifest(
                             Err(anyhow::anyhow!("worker decision admission missing")),
                         );
                     };
+                    // R9/R26: an enabled engine analyses the worker turn on its
+                    // own runtime context and accounting scope; a disabled engine
+                    // returns no advice without constructing anything.
+                    let routing = admitted_turn.routing();
+                    let advice = routing.service.advisory().analyze_turn(routing.runtime, &cancel).await;
                     let adapter = child_turn.as_ref().map(|turn| turn.adapter());
                     let child_execution = adapter.as_ref().map(|adapter| adapter.tool_execution_context.clone());
                     let child_scope = child_execution.as_ref().map(|context| {
@@ -1334,7 +1339,7 @@ async fn run_owned_manifest(
                             run_turn(
                                 &mut segment_history,
                                 crate::agent::turn_request::TurnRequest {
-                                    advice: None,
+                                    advice,
                                     channel_name: "session-worker",
                                     scope: loop_scope,
                                     mode: crate::agent::turn_contracts::ChatMode::default(),

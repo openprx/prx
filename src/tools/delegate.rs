@@ -1516,11 +1516,21 @@ impl DelegateLoopResources {
             turn.project_history(history.len() + 1);
             turn.enrich_input(&mut history)?;
         }
+        // R9/R26: an enabled engine analyses the delegated child turn on its
+        // own runtime context and accounting scope.
+        let advice = {
+            let routing = child_turn.routing();
+            routing
+                .service
+                .advisory()
+                .analyze_turn(routing.runtime, &cancellation)
+                .await
+        };
         let result = loop_cleanup
             .run(Box::pin(crate::agent::turn_engine::run_turn(
                 &mut history,
                 crate::agent::turn_request::TurnRequest {
-                    advice: None,
+                    advice,
                     channel_name: "delegate",
                     scope: Some(&scope_ctx),
                     mode: crate::agent::turn_contracts::ChatMode::default(),
