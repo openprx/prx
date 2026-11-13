@@ -29,14 +29,27 @@ pub(crate) async fn dropping_server(
                 let mut used = 0;
                 loop {
                     assert!(used < MAX_REQUEST, "test: request headers exceeded fixture limit");
-                    let count = socket.read(&mut bytes[used..]).await.expect("test: read request bytes");
+                    let count = socket
+                        .read(
+                            bytes
+                                .get_mut(used..)
+                                .expect("test: read offset fits bounded request buffer"),
+                        )
+                        .await
+                        .expect("test: read request bytes");
                     assert!(count > 0, "test: peer closed before complete request headers");
                     used += count;
-                    if bytes[..used].windows(4).any(|window| window == b"\r\n\r\n") {
+                    if bytes
+                        .get(..used)
+                        .expect("test: received bytes fit bounded request buffer")
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
                         break;
                     }
                 }
-                let wire = std::str::from_utf8(&bytes[..used]).expect("test: HTTP request text");
+                let wire = std::str::from_utf8(bytes.get(..used).expect("test: request text fits bounded buffer"))
+                    .expect("test: HTTP request text");
                 assert!(
                     wire.contains(MARKER),
                     "test: real request must carry the query credential"
