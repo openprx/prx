@@ -244,8 +244,8 @@ All contributors (human or agent) must follow the same collaboration flow:
 - Commit changes to that branch with clear, scoped commit messages.
 - The unit of work is one module: one branch and one PR with the whole module done. No stacked PRs. Settle every open design value before coding (design, protocol, crypto and security modules get a card audit first); stop and ask instead of inventing one.
 - While coding, push checkpoint commits to the branch only. Do not open a PR, run CI or request review mid-way.
-- When the module passes the local gates (including real-component tests and break-the-fix checks), open the PR (not a draft). CI is the only full gate; review starts only after CI is green.
-- One review by a different model: it reads the code and runs at most two break-the-fix checks. Fix every finding, Lows included, on the same PR; no follow-up cards.
+- When the module passes the local gates (including real-component tests), open the PR (not a draft). CI is the only full gate; review starts only after CI is green.
+- One review by a different model: it reads the code only (no break-the-fix checks) and checks that each test exercises the changed path through real components. Fix every finding, Lows included, on the same PR; no follow-up cards.
 - After the review passes: rebase locally onto the live `origin/main`. If there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage.
 - A red `main` becomes the next task.
 
@@ -330,7 +330,7 @@ cargo test --lib <module::path>                 # named tests + the touched modu
 cargo test --test architecture_boundaries
 ```
 
-Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes) and a break-the-fix check for every key fix.
+Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). No break-the-fix checks; the real test on QA after landing is the end-to-end proof.
 
 Do not run the full suite, mutation batches, stress loops or a full CI run locally. PR CI is the only full gate.
 

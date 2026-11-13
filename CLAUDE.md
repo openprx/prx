@@ -16,7 +16,7 @@ cargo test --lib <module::path>                    # the task's named tests + th
 cargo test --test architecture_boundaries          # fast boundary guard
 ```
 
-Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes), and for every key fix a break-the-fix check: break the production code and show the test fails.
+Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). Tests accept the business logic; there are no break-the-fix checks. After the module lands, it gets a real test on QA (real binary built from main, real provider keys); a failure is the next task.
 
 Do not run the full `cargo test --all-features` suite, mutation batches or stress loops locally. PR CI is the full gate.
 
@@ -166,7 +166,7 @@ The canonical panic and test rules (Google Rust Style Guide plus PRX resource li
 - See `AGENTS.md` for full architecture protocol
 - Extend via trait implementation + factory registration
 - One concern per module, one concern per PR
-- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model (code reading plus at most two break-the-fix checks); every finding, Lows included, is fixed on the same PR, with no follow-up cards. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. A red `main` becomes the next task.
+- Branch workflow: one module per branch and per PR. While coding, push checkpoint commits to the branch only (no PR, no CI, no review mid-way). When the whole module passes the local gates, open the PR; CI is the only full gate. After CI is green, one review by a different model (code reading only: check that each test exercises the changed path through real components; no break-the-fix checks); every finding, Lows included, is fixed on the same PR, with no follow-up cards. Then rebase locally onto `origin/main`; if there is no conflict, push `main` directly and delete the branch. There is no merge queue and no post-submit stage. Right after landing, run the module's real test on QA against a binary built from `main`. A red `main` or a failed real test becomes the next task.
 
 ## Commit Style
 
