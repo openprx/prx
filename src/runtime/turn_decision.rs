@@ -20,6 +20,8 @@ pub(crate) mod progress_diagnostic;
 #[cfg(test)]
 pub(crate) mod evidence_fixture;
 #[cfg(test)]
+pub(crate) mod plain_abstention_fixture;
+#[cfg(test)]
 pub(crate) mod selected_loader_fixture;
 
 mod accounting;
@@ -869,6 +871,25 @@ fn admitted_fallback_answer(decision: &EngineDecision) -> Option<&crate::causal_
     })
 }
 
+/// R177-6 rev 3: an engine Clarify degrades to one plain answer only when a
+/// legal Answer passed its pre-commit gates; otherwise the typed directive
+/// (and its refusal) is kept. Every issuing path uses this one rule.
+fn clarify_degraded_directive(
+    decision: &EngineDecision,
+    context: &DirectiveContext,
+) -> Result<TurnExecutionDirective, DirectiveError> {
+    if let crate::causal_tree::decision_select::Selection::Abstain {
+        action: CausalActionKind::Clarify,
+        reason_code,
+    } = &decision.selection
+        && admitted_fallback_answer(decision).is_some()
+    {
+        tracing::warn!(reason_code = %reason_code, "decision Clarify degrades to plain answer");
+        return Ok(TurnExecutionDirective::AnswerDirectly);
+    }
+    directive_from_selection(decision, context)
+}
+
 fn direct_answer_refs(
     decision: &EngineDecision,
     catalog: &CatalogView<'_>,
@@ -1029,6 +1050,8 @@ impl TurnDecisionContext {
         &self.engine
     }
 
+    /// Test fixtures use this to tell a plain fallback answer from Execute.
+    #[cfg(test)]
     pub(crate) const fn is_plain_answer_abstention(&self) -> bool {
         matches!(
             self.engine.selection,
@@ -2315,7 +2338,10 @@ impl TurnDecisionService {
                     CausalEventKind::CandidateGated,
                     Some(decision.pre_commit.outcomes.len()),
                 );
-                let directive = directive_from_selection(
+                // R177-6 rev 3 applies after drift too: the degraded answer
+                // publishes no refs or specs, so the drifted catalog grants
+                // nothing. Any other answer selection remains unsupported here.
+                let directive = clarify_degraded_directive(
                     &decision,
                     &DirectiveContext {
                         current_generation: catalog.generation(),
@@ -2323,10 +2349,20 @@ impl TurnDecisionService {
                         discovery_limit: 0,
                     },
                 )?;
-                if !matches!(
-                    directive,
-                    TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-                ) {
+                let degraded = matches!(directive, TurnExecutionDirective::AnswerDirectly)
+                    && matches!(
+                        decision.selection,
+                        crate::causal_tree::decision_select::Selection::Abstain {
+                            action: CausalActionKind::Clarify,
+                            ..
+                        }
+                    );
+                if !degraded
+                    && !matches!(
+                        directive,
+                        TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
+                    )
+                {
                     return Err(AgentDecisionError::UnsupportedAction);
                 }
                 if cancellation.is_cancelled() {
@@ -2472,21 +2508,7 @@ impl TurnDecisionService {
                 approval_expires_at: chrono::Utc::now(),
                 discovery_limit: 1,
             };
-            let directive = if let crate::causal_tree::decision_select::Selection::Abstain {
-                action: CausalActionKind::Clarify,
-                reason_code,
-                ..
-            } = &decision.selection
-            {
-                if admitted_fallback_answer(&decision).is_some() {
-                    tracing::warn!(reason_code = %reason_code, "decision Clarify degrades to plain answer");
-                    TurnExecutionDirective::AnswerDirectly
-                } else {
-                    directive_from_selection(&decision, &context)?
-                }
-            } else {
-                directive_from_selection(&decision, &context)?
-            };
+            let directive = clarify_degraded_directive(&decision, &context)?;
             let prior_evidence = decision.state.evidence_fingerprint(&self.state_key);
             let mut discovery_change = None;
             let mut retrieval_progress = None;
@@ -3182,6 +3204,8 @@ pub(crate) async fn build_turn_decision_service(
     let factory = evidence_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
     #[cfg(test)]
     let factory = selected_loader_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
+    #[cfg(test)]
+    let factory = plain_abstention_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
     #[cfg(test)]
     let factory = ordinary_child_fixture::wrap_factory(factory, Arc::clone(&state_key), Arc::clone(&events));
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;

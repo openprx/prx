@@ -169,12 +169,6 @@ impl TurnDecisionService {
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<super::super::execution::ConstrainedToolSelection> {
-        if context.is_plain_answer_abstention() {
-            return Ok(super::super::execution::ConstrainedToolSelection {
-                roots: BTreeSet::new(),
-                specs: Vec::new(),
-            });
-        }
         let names = context.discovery_admissions.get().map_or_else(Vec::new, |admissions| {
             admissions
                 .lock()

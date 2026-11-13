@@ -1249,15 +1249,31 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
     // Pin confidence abstention even when the catalog makes Answer the clear winner.
     config.causal_tree.policy.commit_threshold = 1.0;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
-    // No metadata discovery: this cell must exercise confidence abstention,
-    // rather than the separate committed Answer after a successful catalog read.
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: entry memory"));
+    // The enabled cell registers the loop's four control tools, as production
+    // does, so the plain fallback can be compared with main's control surface.
+    let registry: Arc<Vec<Box<dyn Tool>>> = if enabled {
+        Arc::new(vec![
+            Box::new(crate::tools::StaySilentTool::new()),
+            Box::new(crate::tools::SkillReadTool::new(
+                workspace.path().to_path_buf(),
+                config.clone(),
+            )),
+            Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::clone(&memory))),
+            Box::new(crate::tools::capability::search_tool::CapabilitySearchTool),
+        ])
+    } else {
+        Arc::new(Vec::new())
+    };
     let admitted = if enabled {
-        let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: enabled entry memory"));
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
-            AdmittedTurn::with_prediction_memory(config, input, Arc::clone(&registry), memory)
-        })
+        // A flat NextAction distribution forces the Answer abstention: with
+        // the control tools registered, the genuine Builtin would commit.
+        crate::runtime::turn_decision::plain_abstention_fixture::with_flat_next_action(
+            crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+                AdmittedTurn::with_prediction_memory(config, input, Arc::clone(&registry), memory)
+            }),
+        )
         .await
     } else {
         crate::agent::turn_tests::reachability::boxed_root_probe(|| {
@@ -1274,11 +1290,16 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
                     ..
                 }
             ),
-            "test: exercise actual Builtin Answer abstention: {:?}",
+            "test: exercise an actual Answer abstention: {:?}",
             admitted.decision().context.engine().selection
         );
-    }
-    if enabled {
+        assert!(
+            matches!(
+                admitted.decision().context.directive(),
+                crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
+            ),
+            "test: the abstention takes the plain-answer path"
+        );
         assert_eq!(
             admitted
                 .decision()
@@ -1287,8 +1308,8 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
                 .prediction
                 .as_ref()
                 .map(|prediction| prediction.served_by),
-            Some(crate::decision::factory::ServedBy::Builtin),
-            "test: actual Builtin prediction runs"
+            Some(crate::decision::factory::ServedBy::Primary),
+            "test: the scoped flat-NextAction backend serves the prediction"
         );
     }
     let published = Arc::new(Mutex::new(Vec::new()));
@@ -1305,7 +1326,13 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
             .into(),
         ),
     };
-    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(input)];
+    // The enabled cell advertises skills so main's skill_read publication applies.
+    let system = if enabled {
+        "sys\n<available_skills>\n</available_skills>"
+    } else {
+        "sys"
+    };
+    let mut history = vec![ChatMessage::system(system), ChatMessage::user(input)];
     let multimodal = crate::config::MultimodalConfig::default();
     let hooks = crate::hooks::HookManager::new(workspace.path().to_path_buf());
     let result = tokio::time::timeout(
@@ -1334,7 +1361,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
                     provider_name: "ollama",
                     model: "prx-local-model",
                     temperature: 0.0,
-                    tools_registry: registry,
+                    tools_registry: Arc::clone(&registry),
                     observer: &crate::observability::NoopObserver,
                     hooks: &hooks,
                     approval: None,
@@ -1359,9 +1386,21 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
         1,
         "test: exactly one serving request"
     );
-    assert!(
-        published.lock().expect("test: surface").is_empty(),
-        "test: fallback offers zero tools"
+    // As on main: a plain fallback answer has no selected capability specs,
+    // but keeps the loop's control tools, offered and never executed. Without
+    // a Switch-mode handoff, main does not publish the transcript lookup.
+    let expected_surface: Vec<String> = if enabled {
+        ["capability_search", "skill_read", "stay_silent"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        *published.lock().expect("test: surface"),
+        expected_surface,
+        "test: fallback publishes only main's control tools"
     );
     assert!(
         result
@@ -1371,6 +1410,22 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
             .is_none_or(|trace| trace.calls.is_empty()),
         "test: fallback executes zero tools"
     );
+    if enabled {
+        let decision = admitted.decision();
+        assert!(
+            decision
+                .service
+                .agent_execution_specs(decision.proof, decision.context)
+                .expect("test: fallback publication")
+                .specs
+                .is_empty(),
+            "test: fallback selects no capability specs"
+        );
+        decision
+            .service
+            .agent_runtime_dependency_spec(decision.proof, decision.context, "stay_silent")
+            .expect("test: the plain fallback keeps its runtime control dependency");
+    }
 
     if !enabled {
         spy.assert_constructs_nothing("blank Direct input");

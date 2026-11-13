@@ -362,10 +362,15 @@ enum CatalogDriftMoment {
     WhileBackendPending,
 }
 
-async fn run_catalog_drift_probe(
-    moment: CatalogDriftMoment,
-    cancel_while_pending: bool,
-) -> (Result<Arc<TurnDecisionContext>, AgentDecisionError>, usize, usize) {
+struct DriftProbe {
+    context: Result<Arc<TurnDecisionContext>, AgentDecisionError>,
+    requests: usize,
+    dispatches: usize,
+    /// Published spec count, or the refused selection kind.
+    specs: Option<Result<usize, &'static str>>,
+}
+
+async fn run_catalog_drift_probe(moment: CatalogDriftMoment, cancel_while_pending: bool) -> DriftProbe {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
@@ -472,7 +477,30 @@ async fn run_catalog_drift_probe(
             decision.await
         };
         let request_count = requests.lock().len();
-        (context, request_count, dispatches.load(Ordering::SeqCst))
+        // Execution first rechecks live parity, which a still-drifted registry
+        // fails for every selection. Let the drift settle, then read the issued
+        // context's real execution publication, as run_turn would.
+        changed.store(false, Ordering::SeqCst);
+        let specs = context.as_ref().ok().map(|context| {
+            service
+                .agent_execution_specs(&proof, context)
+                .map(|selection| selection.specs.len())
+                .map_err(|error| {
+                    error
+                        .downcast_ref::<crate::causal_tree::directive::DirectiveError>()
+                        .map(|error| match error {
+                            crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind } => *kind,
+                            _ => "other_directive_error",
+                        })
+                        .unwrap_or("other_error")
+                })
+        });
+        DriftProbe {
+            context,
+            requests: request_count,
+            dispatches: dispatches.load(Ordering::SeqCst),
+            specs,
+        }
     });
     ledger_probe::finish_service_fixture(&service, work).await
 }
@@ -484,10 +512,10 @@ async fn catalog_drift_closes_with_fresh_unlinked_terminal_and_no_dispatch() {
         (CatalogDriftMoment::AfterResponse, 1),
         (CatalogDriftMoment::WhileBackendPending, 1),
     ] {
-        let (context, requests, dispatches) = run_catalog_drift_probe(moment, false).await;
-        let context = context.expect("catalog drift closes locally");
-        assert_eq!(requests, expected_requests);
-        assert_eq!(dispatches, 0);
+        let probe = run_catalog_drift_probe(moment, false).await;
+        let context = probe.context.expect("catalog drift closes locally");
+        assert_eq!(probe.requests, expected_requests);
+        assert_eq!(probe.dispatches, 0);
         assert_eq!(context.hop_ids().len(), 1, "stale work hop must be discarded");
         assert_eq!(context.audit_hops().count(), 1);
         assert_eq!(context.engine().state.lineage.prior_decision_id(), None);
@@ -496,10 +524,32 @@ async fn catalog_drift_closes_with_fresh_unlinked_terminal_and_no_dispatch() {
             "recovery must not call a backend"
         );
         assert!(context.execution_refs().is_empty());
-        assert!(matches!(
-            context.directive(),
-            TurnExecutionDirective::Clarify { .. } | TurnExecutionDirective::Refuse { .. }
-        ));
+        // R177-6 rev 3 on the drift terminal: the interactive drift Clarify has
+        // a gate-passed Answer, so it degrades to one plain, tool-free answer.
+        assert!(
+            matches!(
+                context.engine().selection,
+                crate::causal_tree::decision_select::Selection::Abstain {
+                    action: crate::causal_tree::branch::CausalActionKind::Clarify,
+                    reason_code: "catalog_drift",
+                }
+            ),
+            "test: drift terminal keeps its Clarify accounting selection: {:?}",
+            context.engine().selection
+        );
+        assert!(
+            crate::runtime::turn_decision::admitted_fallback_answer(context.engine()).is_some(),
+            "test: the drift terminal has a gate-passed legal Answer"
+        );
+        assert!(
+            matches!(context.directive(), TurnExecutionDirective::AnswerDirectly),
+            "test: drift Clarify degrades like the normal path"
+        );
+        assert_eq!(
+            probe.specs,
+            Some(Ok(0)),
+            "test: the degraded drift answer publishes zero selected tools"
+        );
         let rows = DecisionRecordBuilder::build_enabled_chain(&context, &DecisionKey::ephemeral(), true, false)
             .expect("single local terminal audit row");
         assert_eq!(rows.len(), 1);
@@ -512,10 +562,10 @@ async fn catalog_drift_closes_with_fresh_unlinked_terminal_and_no_dispatch() {
 
 #[tokio::test]
 async fn cancellation_during_backend_and_catalog_drift_wins_before_recovery() {
-    let (result, requests, dispatches) = run_catalog_drift_probe(CatalogDriftMoment::WhileBackendPending, true).await;
-    assert!(matches!(result, Err(AgentDecisionError::Cancelled)));
-    assert_eq!(requests, 1);
-    assert_eq!(dispatches, 0);
+    let probe = run_catalog_drift_probe(CatalogDriftMoment::WhileBackendPending, true).await;
+    assert!(matches!(probe.context, Err(AgentDecisionError::Cancelled)));
+    assert_eq!(probe.requests, 1);
+    assert_eq!(probe.dispatches, 0);
 }
 
 #[tokio::test]

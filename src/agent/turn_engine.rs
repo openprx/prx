@@ -530,11 +530,7 @@ async fn run_turn_unguarded(
         let advertises_skills = history
             .iter()
             .any(|message| message.role == "system" && message.content.contains("<available_skills>"));
-        let skill_spec = if advertises_skills
-            && !context.is_plain_answer_abstention()
-            && proof.tool_calls_allowed()
-            && service.model_can_call_tools(proof)
-        {
+        let skill_spec = if advertises_skills && proof.tool_calls_allowed() && service.model_can_call_tools(proof) {
             // Exact selected/discovered skill readers already passed source
             // and fingerprint admission, including their bound skill name.
             let admitted = constrained
@@ -606,7 +602,7 @@ async fn run_turn_unguarded(
             tool_specs.retain(|candidate| candidate.name != spec.name);
             tool_specs.push(spec.clone());
         }
-        if expose_stay_silent && !context.is_plain_answer_abstention() {
+        if expose_stay_silent {
             {
                 tool_specs.push(service.agent_runtime_dependency_spec(proof, context, "stay_silent")?);
             }
@@ -670,9 +666,8 @@ async fn run_turn_unguarded(
         // what puts the handoff into history, and the iteration that receives
         // the handoff is the one that has to publish the recovery tool the
         // handoff tells the model to call.
-        let context_lookup_required = !context.is_plain_answer_abstention()
-            && compaction_config
-                .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
+        let context_lookup_required = compaction_config
+            .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
             && history.iter().any(is_context_handoff_message);
         if context_lookup_required
             && !selected_tools

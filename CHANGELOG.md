@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Engine-on Clarify degrades to a plain answer without tools only when a legal Answer passed its gate; abstention accounting is preserved.
+- Engine-on Clarify degrades to a plain answer with no selected tools only when a legal Answer passed its gate; the control tools stay available, and abstention accounting is preserved.
 
 - `prx agent`, `prx chat`, `prx go`, `prx doctor`, `prx status`, and other
   foreground commands default to `warn`-level tracing on stderr when
