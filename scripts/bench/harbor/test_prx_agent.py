@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 
 import key_proxy
-from record import AGENT_KEYS, unavailable
+from record import AGENT_KEYS, build_agent, finalize, unavailable, write
 
 
 base = ModuleType('harbor.agents.installed.base')
@@ -102,7 +102,25 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(adapter.KILL_PRX, commands)
                 self.assertEqual(agent._metadata['per_attempt_models']['status'], 'unavailable')
                 invocation = next(c for c in commands if 'agent -t' in c)
-                self.assertIn('NO_PROXY=host.containers.internal', invocation)
+                self.assertEqual(invocation,
+                    "env -u PRX_BENCH_API_KEY NO_PROXY=host.containers.internal "
+                    "no_proxy=host.containers.internal prx --config-dir /opt/prx-bench "
+                    "agent -t 0 --workdir /app -m 'fixture instruction' "
+                    ">/logs/agent/prx-stdout.txt 2>/logs/agent/prx-stderr.txt; "
+                    "code=$?; printf '%s\\n' \"$code\" >/logs/agent/prx-exit-code",
+                    'adapter must launch the task in /app with the expected arguments')
+                with tempfile.TemporaryDirectory() as directory:
+                    trial = Path(directory)
+                    task = trial / 'task'
+                    task.mkdir()
+                    (task / 'task.toml').write_text('[environment]\n')
+                    write(trial / 'config.json', {'task': {'path': str(task)}})
+                    write(trial / 'result.json', {'id': 'trial-fixture', 'started_at': '2026-11-13T00:00:00Z'})
+                    build_agent(trial / 'agent', agent._metadata)
+                    finalize(trial)
+                    record = json.loads((trial / 'agent/prx-trial.json').read_text())
+                    self.assertEqual(record['workdir'], '/app',
+                                     'trial record must preserve the workdir used by the adapter')
                 self.assertNotIn('timeout -k', invocation)
                 self.assertNotIn('command -v timeout', commands)
                 execution = next(c for c in environment.calls if 'agent -t' in c['command'])

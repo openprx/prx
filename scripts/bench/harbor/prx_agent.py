@@ -26,6 +26,7 @@ from profile import PRICES, check, identity, read_bounded, render
 from record import AGENT_KEYS, agent_metadata, build_agent, endpoint, sha256, unavailable, per_attempt_models
 
 CONFIG_DIR = "/opt/prx-bench"
+TASK_WORKDIR = "/app"
 LOG_DIR = "/logs/agent"
 # Freeze parents before discovery so children cannot escape by reparenting.
 # The caller also enforces a ten-second exec deadline.
@@ -193,6 +194,7 @@ class PrxAgent(BaseInstalledAgent):
         self._metadata = agent_metadata(values, self.provider, self.model, self.prices,
             self.temperature, self.git_sha, self.binary_sha256, canonical,
             instruction, self.version(), self.agent_timeout_sec, settlement=container_provider)
+        self._metadata["workdir"] = TASK_WORKDIR
         self._metadata["container_config_key_scan"] = unavailable("not run")
         setup = await environment.exec(
             command="test ! -e /opt/prx-bench && mkdir -p /opt/prx-bench /logs/agent && chown root:root /opt/prx-bench && chmod 0700 /opt/prx-bench",
@@ -211,7 +213,7 @@ class PrxAgent(BaseInstalledAgent):
             host = shlex.quote(CONTAINER_HOST if proxy is not None else endpoint(container_provider))
             no_proxy = f"NO_PROXY={host} no_proxy={host} "
             command = (f"env -u PRX_BENCH_API_KEY {no_proxy}prx --config-dir {CONFIG_DIR} "
-                       f"agent -t {self.temperature:g} -m {shlex.quote(instruction)} "
+                       f"agent -t {self.temperature:g} --workdir {TASK_WORKDIR} -m {shlex.quote(instruction)} "
                        f">{LOG_DIR}/prx-stdout.txt 2>{LOG_DIR}/prx-stderr.txt; "
                        f"code=$?; printf '%s\\n' \"$code\" >{LOG_DIR}/prx-exit-code")
             try:
