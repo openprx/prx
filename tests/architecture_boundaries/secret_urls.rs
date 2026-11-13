@@ -72,7 +72,7 @@ const BUILDERS: &[&str] = &[
     "src/channels/dingtalk.rs::listen::format!(\"{}?ticket={}\", gw.endpoint, gw.ticket)",
     // The wizard strips its Telegram probe error even though it is dropped.
     "src/initialization/wizard/channels.rs::setup_channels::format!(\"https://api.telegram.org/bot{token_clone}/getMe\")",
-    // Telegram transport protection belongs to PR #191; excluded until landed.
+    // Telegram requests use the shared transport_error URL/token sanitizer.
     "src/channels/telegram.rs::api_url::format!(\"{}/bot{}/{method}\", self.api_base, self.bot_token)",
 ];
 
@@ -117,7 +117,8 @@ fn carrier_offenders(relative: &str, source: &str) -> Vec<String> {
                 };
                 body.starts_with(&format!("StreamError::from({binding})"))
                     || (relative == "src/channels/telegram.rs"
-                        && body.starts_with(&format!("self.transport_error({binding})")))
+                        && (body.starts_with(&format!("self.transport_error({binding})"))
+                            || body.starts_with(&format!("transport_error(&bot_token,{binding})"))))
             });
             let same_chain = helper_closure
                 || compact.starts_with(".map_err(reqwest::Error::without_url)")
@@ -172,10 +173,6 @@ pub(super) fn secret_url_carriers_strip_request_urls() {
         }
         let production = blank_comments(&strip_cfg_test_items(&raw));
         if builders(&production).is_empty() {
-            continue;
-        }
-        // PR #191 owns Telegram. Include it once its stripping helper lands.
-        if relative == "src/channels/telegram.rs" && !production.contains("fn transport_error(") {
             continue;
         }
         offenders.extend(carrier_offenders(&relative, &production));
