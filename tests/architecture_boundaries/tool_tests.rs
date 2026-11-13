@@ -606,7 +606,7 @@ pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
 pub(super) fn resume_sites_go_through_model_turn_context() {
     for (relative, function) in [
         ("src/gateway/api/sessions.rs", "run_console_resume"),
-        ("src/chat/decision_source.rs", "execute_resume_and_finalize"),
+        ("src/chat/binding.rs", "execute_resume_and_finalize"),
     ] {
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
             &repository_root().join(relative),

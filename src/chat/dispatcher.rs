@@ -2388,7 +2388,7 @@ async fn flush_trailing_reasoning(
 }
 
 async fn drive_start_turn_stream(
-    turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
+    turn_binding: Option<Arc<super::binding::ChatTurnBinding>>,
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,

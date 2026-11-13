@@ -116,7 +116,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for crate::agent::entry::AgentTurnProof {}
     impl Sealed for crate::agent::embedded_source::EmbeddedAgentSource {}
-    impl Sealed for crate::chat::decision_source::ChatTurnBinding {}
+    impl Sealed for crate::chat::binding::ChatTurnBinding {}
     impl Sealed for crate::gateway::decision_source::GatewayTurnProof {}
     impl Sealed for crate::channels::decision_source::ChannelTurnProof {}
 }

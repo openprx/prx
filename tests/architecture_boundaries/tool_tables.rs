@@ -559,7 +559,7 @@ pub(super) struct NonToolCallSite {
 /// waved through by its name.
 pub(super) const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
     NonToolCallSite {
-        entry: "src/chat/decision_source/mailbox_fixture.rs::spawn",
+        entry: "src/chat/binding/mailbox_fixture.rs::spawn",
         receiver: "execution",
         occurrences: 1,
         evidence_file: "src/runtime/turn_decision/execution.rs",

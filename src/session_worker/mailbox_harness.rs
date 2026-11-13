@@ -337,7 +337,7 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
                     memory: memory.clone(),
                     plugin_generation: 0,
                 };
-                let result = crate::chat::decision_source::mailbox_fixture::spawn(
+                let result = crate::chat::binding::mailbox_fixture::spawn(
                     publication,
                     provider,
                     serde_json::json!({

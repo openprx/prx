@@ -330,7 +330,7 @@ fn console_and_chat_resume_go_through_model_turn_context() {
             "run_console_resume",
         ),
         (
-            include_str!("../../../../chat/decision_source.rs"),
+            include_str!("../../../../chat/binding.rs"),
             "execute_resume_and_finalize",
         ),
     ] {

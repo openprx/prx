@@ -387,7 +387,7 @@ async fn run_chat_fixture(
 }
 
 pub(super) struct ChatFixtureAdmission {
-    pub(super) binding: Arc<crate::chat::decision_source::ChatTurnBinding>,
+    pub(super) binding: Arc<crate::chat::binding::ChatTurnBinding>,
     pub(super) registry: Arc<Vec<Box<dyn Tool>>>,
     pub(super) service: Arc<ToolExecutionService>,
     pub(super) context: crate::tools::ToolExecutionContext,
@@ -558,7 +558,7 @@ async fn admit_chat_fixture_with_mode(
         .record_inbound_user_message(envelope.message_scope(), input, None, None)
         .await
         .expect("recorded chat source");
-    let source = crate::chat::decision_source::ChatSourceReceipt::issue(
+    let source = crate::chat::binding::ChatSourceReceipt::issue(
         ledger.as_ref(),
         &generation,
         "chat:characterization",
@@ -568,14 +568,13 @@ async fn admit_chat_fixture_with_mode(
     )
     .await
     .expect("durable chat source proof");
-    let selected =
-        crate::chat::decision_source::ChatProviderBinding::capture(&generation, &provider, selection.0, selection.1)
-            .expect("chat model binding")
-            .expect("selected chat model");
+    let selected = crate::chat::binding::ChatProviderBinding::capture(&generation, &provider, selection.0, selection.1)
+        .expect("chat model binding")
+        .expect("selected chat model");
     let binding = source
         .bind_provider(
             &selected,
-            crate::chat::decision_source::ChatAdmissionMode::Model(source_input.2),
+            crate::chat::binding::ChatAdmissionMode::Model(source_input.2),
         )
         .expect("source/provider binding");
     // The scenarios cancel after admission, while the provider turn is running.
@@ -677,11 +676,7 @@ async fn queued_plan_mode_change_fails_before_execution_and_commits_one_failed_t
     )
     .await;
     let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-    crate::chat::decision_source::admission_failure_tests::install_fixture_terminal(
-        &admitted.binding,
-        &owner,
-        admitted.fabric.clone(),
-    );
+    crate::chat::binding::tests::install_fixture_terminal(&admitted.binding, &owner, admitted.fabric.clone());
     assert!(
         admitted
             .binding

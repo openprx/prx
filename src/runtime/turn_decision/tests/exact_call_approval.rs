@@ -3,7 +3,7 @@
 //! Controlled decision answers never manufacture a source, grant, or call digest.
 use super::*;
 use crate::agent::turn_contracts::ChatMode;
-use crate::chat::decision_source::admission_failure_tests::recorded_approval_source;
+use crate::chat::binding::tests::recorded_approval_source;
 use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
 use crate::tools::execution::ToolExecutionContext;
 use crate::tools::file_write::FileWriteTool;

@@ -39,13 +39,8 @@ async fn chat_entrypoint_records_user_and_assistant_message_events() {
     let session_key = format!("chat:{}", session.id);
     let run_id = "chat-run-test";
 
-    let (binding, service, user_event) = decision_source::admission_failure_tests::decided_binding_for_input(
-        &fabric,
-        &session_key,
-        run_id,
-        "hello from chat",
-    )
-    .await;
+    let (binding, service, user_event) =
+        binding::tests::decided_binding_for_input(&fabric, &session_key, run_id, "hello from chat").await;
     let route = RouteDecision::single_candidate("ollama", "prx-local-model");
     finalize_chat_success_turn(
         Some(binding.as_ref()),

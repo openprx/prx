@@ -52,6 +52,7 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod action;
+pub(crate) mod binding;
 pub mod commands;
 pub(crate) mod decision_source;
 pub mod diff_apply;

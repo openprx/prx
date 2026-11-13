@@ -30,7 +30,7 @@ async fn equivalent_events_drive_resume_export_and_cost_without_output_drift() {
     save_session(memory.as_ref(), &snapshot).await.unwrap();
 
     let session_key = format!("chat:{}", snapshot.id);
-    let (binding, service, _) = decision_source::admission_failure_tests::decided_binding_for_provider(
+    let (binding, service, _) = binding::tests::decided_binding_for_provider(
         &fabric,
         &session_key,
         "turn-1",

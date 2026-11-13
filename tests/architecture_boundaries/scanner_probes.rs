@@ -833,7 +833,7 @@ fn mutation_proof_execution_binding_guard() {
     );
 }
 fn mutation_proof_resume_sites_guard() {
-    for path in ["src/gateway/api/sessions.rs", "src/chat/decision_source.rs"] {
+    for path in ["src/gateway/api/sessions.rs", "src/chat/binding.rs"] {
         assert_reviewed_source_mutation(
             resume_sites_go_through_model_turn_context,
             path,

@@ -150,7 +150,7 @@ where
     let generation = crate::config::new_shared(fixture.config.clone()).pin();
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());
-    let (source, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+    let (source, _) = crate::chat::binding::tests::recorded_approval_source(
         &generation,
         memory,
         "prx controlled planning",

@@ -308,15 +308,14 @@ async fn chat_per_turn_run_ids_are_distinct_and_have_no_parent() {
                     // Two turns, each with its own freshly generated run_id (mirroring the
                     // per-turn generation at the turn-loop entry).
                     let turn1_run_id = uuid::Uuid::new_v4().to_string();
-                    let (binding, service, user1) =
-                        decision_source::admission_failure_tests::decided_binding_for_input_retained(
-                            &fabric,
-                            &session_key,
-                            &turn1_run_id,
-                            "first turn",
-                            &mut retained,
-                        )
-                        .await;
+                    let (binding, service, user1) = binding::tests::decided_binding_for_input_retained(
+                        &fabric,
+                        &session_key,
+                        &turn1_run_id,
+                        "first turn",
+                        &mut retained,
+                    )
+                    .await;
                     let route = RouteDecision::single_candidate("ollama", "prx-local-model");
                     let asst1 = finalize_chat_success_turn(
                         Some(binding.as_ref()),
@@ -400,7 +399,7 @@ async fn save_and_message_event_boundaries_redact_aws_keys() {
     assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
 
     let session_key = format!("chat:{}", session.id);
-    let (binding, service, user_event) = decision_source::admission_failure_tests::decided_binding_for_input(
+    let (binding, service, user_event) = binding::tests::decided_binding_for_input(
         &fabric,
         &session_key,
         "run-secret",
@@ -545,7 +544,7 @@ async fn chat_persists_no_secret_from_a_reply_or_a_provider_error() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
     let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
     let (reply_binding, reply_service) =
-        decision_source::admission_failure_tests::decided_binding(&fabric, "chat-probe", "chat-probe-reply").await;
+        binding::tests::decided_binding(&fabric, "chat-probe", "chat-probe-reply").await;
     let decision = RouteDecision::single_candidate("ollama", "prx-local-model");
     let reply = finalize_chat_success_turn(
         Some(reply_binding.as_ref()),
@@ -568,7 +567,7 @@ async fn chat_persists_no_secret_from_a_reply_or_a_provider_error() {
     .unwrap();
     assert!(reply.content.contains("[REDACTED]"), "{}", reply.content);
     let (failed_binding, failed_service) =
-        decision_source::admission_failure_tests::decided_binding(&fabric, "chat-probe", "chat-probe-failed").await;
+        binding::tests::decided_binding(&fabric, "chat-probe", "chat-probe-failed").await;
     let error = anyhow::anyhow!("upstream rejected key {PROBE_SECRET}");
     finalize_chat_non_success_turn(
         Some(failed_binding.as_ref()),
@@ -604,8 +603,7 @@ async fn chat_route_payloads_remain_valid_json_and_redact_nested_secrets() {
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
     let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
     let session_key = "chat-route-sanitize".to_string();
-    let (binding, service) =
-        decision_source::admission_failure_tests::decided_binding(&fabric, &session_key, "route-run").await;
+    let (binding, service) = binding::tests::decided_binding(&fabric, &session_key, "route-run").await;
     let scope = binding.envelope().message_scope();
     let mut decision = RouteDecision::single_candidate("ollama", "prx-local-model");
     decision.user_hint = Some(format!("hint {secret}"));

@@ -531,12 +531,8 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                 SlotLimits::default(),
             );
             let proof = if plan {
-                let chat = crate::chat::decision_source::admission_failure_tests::recorded_plan_source(
-                    &generation,
-                    Arc::clone(&memory),
-                    input,
-                )
-                .await;
+                let chat =
+                    crate::chat::binding::tests::recorded_plan_source(&generation, Arc::clone(&memory), input).await;
                 crate::runtime::turn_source::OwnedTurnSourceProof::capture(chat.as_ref())
             } else {
                 let cli = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(

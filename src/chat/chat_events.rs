@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use super::session;
-use super::{decision_source, sanitize};
+use super::{binding, sanitize};
 use crate::llm::route_decision::ProviderExecutionOutcome;
 use crate::llm::route_decision::RouteDecision;
 use crate::llm::route_decision::record_route_decision_event as record_raw_route_decision_event;
@@ -154,7 +154,7 @@ pub(super) async fn record_route_decision_event(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_chat_success_turn(
-    turn_binding: Option<&decision_source::ChatTurnBinding>,
+    turn_binding: Option<&binding::ChatTurnBinding>,
     fabric: &MemoryFabric,
     _chat_session_key: &str,
     chat_run_id: &str,
@@ -216,7 +216,7 @@ pub(super) async fn finalize_chat_success_turn(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finalize_chat_non_success_turn(
-    turn_binding: Option<&decision_source::ChatTurnBinding>,
+    turn_binding: Option<&binding::ChatTurnBinding>,
     fabric: &MemoryFabric,
     chat_run_id: &str,
     _route_scope: MessageEventScope,

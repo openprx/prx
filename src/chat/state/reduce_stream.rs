@@ -126,7 +126,7 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
         routing_input: Option<String>,
-        turn_binding: Option<Arc<crate::chat::decision_source::ChatTurnBinding>>,
+        turn_binding: Option<Arc<crate::chat::binding::ChatTurnBinding>>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,
@@ -187,7 +187,7 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
         routing_input: Option<String>,
-        turn_binding: Option<Arc<crate::chat::decision_source::ChatTurnBinding>>,
+        turn_binding: Option<Arc<crate::chat::binding::ChatTurnBinding>>,
     ) -> Vec<Effect> {
         self.insert_visible_streaming_draft(
             provider_turn_task_id,

@@ -197,7 +197,7 @@ pub enum Effect {
         /// shared-workspace events before it reaches the driver; routing on
         /// that text let injected content widen the tool surface.
         routing_input: Option<String>,
-        turn_binding: Option<Arc<super::decision_source::ChatTurnBinding>>,
+        turn_binding: Option<Arc<super::binding::ChatTurnBinding>>,
     },
     /// Persist a snapshot of the current session
     SaveSession(ChatSession),

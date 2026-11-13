@@ -545,7 +545,7 @@ async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Resul
                             "turn-run-xyz".to_string(),
                             "chat:session-1".to_string(),
                         ),
-                        crate::chat::decision_source::admission_failure_tests::dispatch_recorded_model_spawn(
+                        crate::chat::binding::tests::dispatch_recorded_model_spawn(
                             crate::runtime::turn_publication::TurnDecisionPublication {
                                 generation: Arc::clone(&generation),
                                 registry: Arc::clone(&registry),
@@ -649,7 +649,7 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
             let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
             assert!(tools_handle.set(&registry));
             assert!(current_spawn_execution_context().is_none());
-            let (args, source) = crate::chat::decision_source::admission_failure_tests::recorded_local_operator_spawn(
+            let (args, source) = crate::chat::binding::tests::recorded_local_operator_spawn(
                 crate::runtime::turn_publication::TurnDecisionPublication {
                     generation: Arc::clone(&generation),
                     registry: Arc::clone(&registry),

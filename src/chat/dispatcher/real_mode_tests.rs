@@ -97,7 +97,7 @@ async fn admit_start_turn_fixture(
     run: &str,
     input: &str,
     native_tools: bool,
-) -> anyhow::Result<Arc<crate::chat::decision_source::ChatTurnBinding>> {
+) -> anyhow::Result<Arc<crate::chat::binding::ChatTurnBinding>> {
     let model = deps.model.current();
     let registry = deps.tools_registry.clone().unwrap_or_else(|| Arc::new(Vec::new()));
     let mut config = crate::config::Config {
@@ -179,21 +179,14 @@ async fn admit_start_turn_fixture(
     let event = fabric
         .record_inbound_user_message(envelope.message_scope(), input, None, None)
         .await?;
-    let receipt = crate::chat::decision_source::ChatSourceReceipt::issue(
-        ledger.as_ref(),
-        &generation,
-        session,
-        run,
-        input,
-        &event,
-    )
-    .await?;
-    let selected =
-        crate::chat::decision_source::ChatProviderBinding::capture(&generation, &deps.provider, "ollama", &model)?
-            .expect("Q42 original serving provider binding");
+    let receipt =
+        crate::chat::binding::ChatSourceReceipt::issue(ledger.as_ref(), &generation, session, run, input, &event)
+            .await?;
+    let selected = crate::chat::binding::ChatProviderBinding::capture(&generation, &deps.provider, "ollama", &model)?
+        .expect("Q42 original serving provider binding");
     let binding = receipt.bind_provider(
         &selected,
-        crate::chat::decision_source::ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
+        crate::chat::binding::ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
     let context = binding
         .issue_decision(&service, &CancellationToken::new(), false)
@@ -213,7 +206,7 @@ async fn admit_owned_start_turn_fixture(
     input: &str,
     native_tools: bool,
 ) -> anyhow::Result<(
-    Arc<crate::chat::decision_source::ChatTurnBinding>,
+    Arc<crate::chat::binding::ChatTurnBinding>,
     crate::runtime::turn_cleanup::CleanupScope,
 )> {
     let owner = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())?;

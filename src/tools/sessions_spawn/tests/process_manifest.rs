@@ -56,7 +56,7 @@ async fn spawn_rejects_unknown_agent() -> anyhow::Result<()> {
             assert_eq!(generation.effective.agents.len(), 1);
             assert!(generation.effective.agents.contains_key("alpha"));
             assert!(!generation.effective.agents.contains_key("missing"));
-            let result = crate::chat::decision_source::admission_failure_tests::dispatch_unknown_agent_fixture(
+            let result = crate::chat::binding::tests::dispatch_unknown_agent_fixture(
                 crate::runtime::turn_publication::TurnDecisionPublication {
                     generation,
                     registry,

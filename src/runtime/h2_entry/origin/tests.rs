@@ -16,7 +16,7 @@ async fn real_recorded_chat_binds_only_matching_input_and_one_original_turn() {
         Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());
     let mut producer = producer(fixture.profile.clone());
     let proof = producer.submitted("message", "prx input").unwrap();
-    let (source, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+    let (source, _) = crate::chat::binding::tests::recorded_approval_source(
         &generation,
         memory.clone(),
         "prx input",
@@ -30,7 +30,7 @@ async fn real_recorded_chat_binds_only_matching_input_and_one_original_turn() {
     assert_eq!(origin.record().actor, source.owner_id());
     assert_eq!(origin.record().target_owner, fixture.profile.owner.as_str());
     assert_eq!(proof.bind(source.as_ref()).unwrap().record(), origin.record());
-    let (other, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+    let (other, _) = crate::chat::binding::tests::recorded_approval_source(
         &generation,
         memory.clone(),
         "prx input",
@@ -76,7 +76,7 @@ async fn gateway_profile_cannot_adopt_actual_terminal_source_even_with_same_stri
     let generation = crate::config::new_shared(fixture.config.clone()).pin();
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());
-    let (source, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+    let (source, _) = crate::chat::binding::tests::recorded_approval_source(
         &generation,
         memory,
         "prx input",
@@ -92,7 +92,7 @@ async fn gateway_profile_cannot_adopt_actual_terminal_source_even_with_same_stri
 pub(crate) async fn recorded_terminal_approval_fixture() -> (
     tempfile::TempDir,
     crate::memory::MemoryFabric,
-    Arc<crate::chat::decision_source::ChatTurnBinding>,
+    Arc<crate::chat::binding::ChatTurnBinding>,
     Arc<VerifiedEntryOrigin>,
 ) {
     let fixture = Fixture::new(EntryKind::Terminal);
@@ -102,7 +102,7 @@ pub(crate) async fn recorded_terminal_approval_fixture() -> (
         Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());
     let fabric = crate::memory::MemoryFabric::new(memory.clone(), generation.effective.workspace_dir.to_string_lossy())
         .with_event_recording(generation.effective.memory.event_recording_config());
-    let (binding, _) = crate::chat::decision_source::admission_failure_tests::recorded_approval_source(
+    let (binding, _) = crate::chat::binding::tests::recorded_approval_source(
         &generation,
         memory,
         "prx input",

@@ -417,7 +417,7 @@ fn runtime_and_message_events_preserve_typed_config_generation_columns() {
         }
     }
 
-    for relative in ["src/agent/entry.rs", "src/chat/decision_source.rs"] {
+    for relative in ["src/agent/entry.rs", "src/chat/binding.rs"] {
         let source = fs::read_to_string(repository_root().join(relative))
             .unwrap_or_else(|error| panic!("read {relative}: {error}"));
         assert!(

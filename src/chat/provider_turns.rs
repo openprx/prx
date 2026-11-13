@@ -12,7 +12,7 @@ use super::session_glue::{surface_session_message, surface_turn_elapsed_message}
 #[cfg(feature = "terminal-tui")]
 use super::tui;
 #[cfg(feature = "terminal-tui")]
-use super::{decision_source, session};
+use super::{binding, session};
 #[cfg(feature = "terminal-tui")]
 use crate::agent::turn_contracts::ToolCallNotification;
 #[cfg(feature = "terminal-tui")]
@@ -73,7 +73,7 @@ pub(super) struct ProviderTurnCompletionContext {
 
 #[cfg(feature = "terminal-tui")]
 pub(super) struct PerTurnContext {
-    pub(super) turn_binding: Option<Arc<decision_source::ChatTurnBinding>>,
+    pub(super) turn_binding: Option<Arc<binding::ChatTurnBinding>>,
     pub(super) task_id: crate::chat::turn_scheduler::TurnTaskId,
     pub(super) draft_id: String,
     pub(super) delta_tx: Option<mpsc::Sender<String>>,

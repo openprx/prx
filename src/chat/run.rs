@@ -97,7 +97,7 @@ use super::views::{
 };
 use super::{
     CHAT_CONTROL_CHANNEL_CAPACITY, DOUBLE_CTRLC_WINDOW_MS, INPUT_CHANNEL_CAPACITY, TOOL_EVENT_CHANNEL_CAPACITY,
-    commands, decision_source, diff_apply, dispatcher, sanitize, session, terminal_proto,
+    binding, commands, diff_apply, dispatcher, sanitize, session, terminal_proto,
 };
 use crate::agent::context_recall::increment_recalled_useful_counts;
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -225,7 +225,7 @@ async fn run_internal(
     )?;
     let provider: Arc<dyn Provider> = Arc::from(startup_provider);
     let mut provider_binding =
-        decision_source::ChatProviderBinding::capture(&ctx.config_generation, &provider, provider_name, model_name)?;
+        binding::ChatProviderBinding::capture(&ctx.config_generation, &provider, provider_name, model_name)?;
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -1512,7 +1512,7 @@ async fn run_internal(
             match rebuilt {
                 Ok((_connection, built)) => {
                     let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
-                    let binding = match decision_source::ChatProviderBinding::capture(
+                    let binding = match binding::ChatProviderBinding::capture(
                         &ctx.config_generation,
                         &new_provider_arc,
                         provider_name,
@@ -1613,7 +1613,7 @@ Retry with a compatible model: /provider {shown} <model>",
             ) {
                 Ok((_switch_connection, built)) => {
                     let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
-                    let next_binding = match decision_source::ChatProviderBinding::capture(
+                    let next_binding = match binding::ChatProviderBinding::capture(
                         &ctx.config_generation, &new_provider_arc, &new_provider, &candidate_model,
                     ) {
                         Ok(binding) => binding,
@@ -2291,7 +2291,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 Some(tool) => {
                                     let command = provider_binding.as_ref()
                                         .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))
-                                        .and_then(|binding| decision_source::ChatOperatorSpawn::capture(
+                                        .and_then(|binding| binding::ChatOperatorSpawn::capture(
                                             &msg, &task, binding, &ctx.config_generation, &provider,
                                             &current_provider_owned, &current_model_owned,
                                         ));
@@ -3116,7 +3116,7 @@ Retry with a compatible model: /provider {shown} <model>",
         let admitted_chat_mode = chat_session.mode;
         let has_conversation_history = history.iter().any(|message| message.role != "system");
         let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded_with_origin(
-            memory_fabric.clone(), (input_scope, &chat_session_key, decision_source::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
+            memory_fabric.clone(), (input_scope, &chat_session_key, binding::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
             child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input,resume_decision)?,
         ).await?;
@@ -3134,7 +3134,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     super::input_queue::cancel_dequeued_input_task(&mut turn_scheduler, id)?;
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                 }
-                let reply = decision_source::resume_admission_failure_reply(&error);
+                let reply = binding::resume_admission_failure_reply(&error);
                 emit_chat_output(reply);
                 if let Some(guard) = assignment_guard.as_mut() { guard.failed(reply); }
                 continue;

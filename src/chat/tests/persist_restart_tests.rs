@@ -3,7 +3,7 @@
 //! Restart regressions use the real SQLite memory and decision stores.
 use super::*;
 use crate::agent::terminal::TurnTerminalReceipt;
-use crate::chat::decision_source::{ChatAdmissionMode, ChatProviderBinding, ChatTurnBinding};
+use crate::chat::binding::{ChatAdmissionMode, ChatProviderBinding, ChatTurnBinding};
 use crate::memory::ingress_recovery::IngressCapsule;
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use crate::memory::{MessageEvent, MessageEventInput, SqliteMemory};
@@ -90,8 +90,8 @@ async fn guarded_input(
     run: &str,
 ) -> Result<(
     MessageEvent,
-    Arc<crate::chat::decision_source::ChatTurnBinding>,
-    crate::chat::decision_source::ChatAdmissionGuard,
+    Arc<crate::chat::binding::ChatTurnBinding>,
+    crate::chat::binding::ChatAdmissionGuard,
 )> {
     let provider: Arc<dyn Provider> = Arc::new(crate::providers::ollama::OllamaProvider::new(None, None));
     guarded_input_with(provider, memory, generation, run).await
@@ -104,8 +104,8 @@ async fn guarded_input_with(
     run: &str,
 ) -> Result<(
     MessageEvent,
-    Arc<crate::chat::decision_source::ChatTurnBinding>,
-    crate::chat::decision_source::ChatAdmissionGuard,
+    Arc<crate::chat::binding::ChatTurnBinding>,
+    crate::chat::binding::ChatAdmissionGuard,
 )> {
     let selected = ChatProviderBinding::capture(generation, &provider, "ollama", "prx-local-model")?
         .context("selected provider")?;
@@ -836,7 +836,7 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
             memory_store: dir.path().join("memory/brain.db"),
             decision_store: crate::causal_tree::store::db_path(dir.path()),
         });
-    let private_reply = crate::chat::decision_source::chat_input_persistence_failure(&private_error).to_string();
+    let private_reply = crate::chat::binding::chat_input_persistence_failure(&private_error).to_string();
     assert!(!private_reply.contains('/'), "{private_reply}");
     assert!(!private_reply.contains("prx-private-run"), "{private_reply}");
     let log = std::fs::read_to_string(&log_path).unwrap();

@@ -353,7 +353,7 @@ pub enum Action {
         /// text and shared-workspace events widen the published tool surface.
         /// `None` keeps non-chat/test callers on the driver's history fallback.
         routing_input: Option<String>,
-        turn_binding: Option<std::sync::Arc<super::decision_source::ChatTurnBinding>>,
+        turn_binding: Option<std::sync::Arc<super::binding::ChatTurnBinding>>,
     },
     /// Received one streaming delta chunk
     StreamChunkReceived {
