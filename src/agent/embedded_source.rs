@@ -857,8 +857,8 @@ impl TurnSourceProof for EmbeddedAgentSource {
     fn config_generation_id(&self) -> u64 {
         self.binding.generation.id.0
     }
-    fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop
+    fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop
     }
     fn policy_channel(&self) -> &str {
         "agent_api"

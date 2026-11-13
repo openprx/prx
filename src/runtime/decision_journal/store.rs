@@ -52,11 +52,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::ids::DecisionId;
 use super::store_schema::{self, SchemaState};
-use crate::decision::telemetry::{
+use crate::observability::causal_event::{
     CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage, IncompleteReason,
 };
+use crate::security::decision_id::DecisionId;
 
 /// The database file, under `<workspace>/self/causal_tree/`.
 const DB_FILE: &str = "decisions.db";
@@ -354,29 +354,29 @@ pub(crate) struct RecordedApproval {
 /// vector means the source observed zero items. Raw turn text is not retained.
 #[derive(Clone, PartialEq)]
 pub(crate) struct OutcomeRecord {
-    pub(super) decision_id: DecisionId,
-    pub(super) settlement_id: String,
-    pub(super) recorded_at_ms: i64,
-    pub(super) classification: OutcomeClassification,
-    pub(super) executed_action: Option<String>,
-    pub(super) executed_target: Option<String>,
-    pub(super) provider_attempts: Option<Vec<RecordedOutcomeAttempt>>,
-    pub(super) tool_calls: Option<Vec<RecordedToolCall>>,
-    pub(super) capability_ids: Option<Vec<String>>,
-    pub(super) approvals: Option<Vec<RecordedApproval>>,
-    pub(super) tokens_in: Option<u64>,
-    pub(super) tokens_out: Option<u64>,
-    pub(super) latency_ms: Option<u64>,
-    pub(super) cost_micro_usd: Option<i64>,
-    pub(super) idempotency_status: Option<String>,
-    pub(super) reward: Option<BTreeMap<String, f64>>,
-    pub(super) prompt_bytes_before: Option<u64>,
-    pub(super) prompt_bytes_after: Option<u64>,
-    pub(super) tool_bytes_before: Option<u64>,
-    pub(super) tool_bytes_after: Option<u64>,
-    pub(super) denied_tool_attempts: Option<u64>,
-    pub(super) completeness: OutcomeCompleteness,
-    pub(super) coverage: Option<f64>,
+    pub(crate) decision_id: DecisionId,
+    pub(crate) settlement_id: String,
+    pub(crate) recorded_at_ms: i64,
+    pub(crate) classification: OutcomeClassification,
+    pub(crate) executed_action: Option<String>,
+    pub(crate) executed_target: Option<String>,
+    pub(crate) provider_attempts: Option<Vec<RecordedOutcomeAttempt>>,
+    pub(crate) tool_calls: Option<Vec<RecordedToolCall>>,
+    pub(crate) capability_ids: Option<Vec<String>>,
+    pub(crate) approvals: Option<Vec<RecordedApproval>>,
+    pub(crate) tokens_in: Option<u64>,
+    pub(crate) tokens_out: Option<u64>,
+    pub(crate) latency_ms: Option<u64>,
+    pub(crate) cost_micro_usd: Option<i64>,
+    pub(crate) idempotency_status: Option<String>,
+    pub(crate) reward: Option<BTreeMap<String, f64>>,
+    pub(crate) prompt_bytes_before: Option<u64>,
+    pub(crate) prompt_bytes_after: Option<u64>,
+    pub(crate) tool_bytes_before: Option<u64>,
+    pub(crate) tool_bytes_after: Option<u64>,
+    pub(crate) denied_tool_attempts: Option<u64>,
+    pub(crate) completeness: OutcomeCompleteness,
+    pub(crate) coverage: Option<f64>,
 }
 
 impl std::fmt::Debug for OutcomeRecord {
@@ -1671,7 +1671,7 @@ impl DecisionReplayRecord {
             );
             let gates: serde_json::Value = serde_json::from_str(&gates_json)?;
             anyhow::ensure!(
-                super::approval_collection::valid_projection(&gates, &state_fingerprint, &catalog_generation),
+                crate::security::approval_ledger::valid_projection(&gates, &state_fingerprint, &catalog_generation),
                 "decision evidence collection projection is invalid"
             );
         }
@@ -2012,6 +2012,8 @@ pub(crate) struct StoreCounts {
 /// takes no lock and creates no `-wal` or `-shm` file: the disabled plane's
 /// reads leave the directory as it was (D-091 F-5).
 fn open_reader_connection(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
+    #[cfg(test)]
+    open_spy::record(path);
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let conn = if immutable {
         Connection::open_with_flags(
@@ -2041,6 +2043,8 @@ fn wal_sidecar_present(path: &Path) -> bool {
 
 /// Recovery-only reader open: `immutable=1` or non-immutable `mode=ro`.
 fn open_recovery_reader_connection(path: &Path, immutable: bool) -> Result<Connection, StoreError> {
+    #[cfg(test)]
+    open_spy::record(path);
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW
@@ -2521,6 +2525,8 @@ fn probe_version(path: &Path) -> Result<i64, StoreError> {
 /// file is a database, switch it to WAL and bring its schema up to date in
 /// an IMMEDIATE transaction (D-091 F-2).
 fn open_writer(path: &Path) -> Result<(Connection, SchemaState), StoreError> {
+    #[cfg(test)]
+    open_spy::record(path);
     let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -3045,6 +3051,37 @@ impl WriterThread {
 #[cfg(test)]
 pub(crate) mod testing;
 
+/// Test-only count of decision-store connection opens per database path, so
+/// a test can prove that a path opened no `decisions.db` at all (R16).
+#[cfg(test)]
+pub(crate) mod open_spy {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    static OPENS: parking_lot::Mutex<Option<HashMap<PathBuf, usize>>> = parking_lot::Mutex::new(None);
+
+    pub(crate) fn record(path: &Path) {
+        *OPENS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
+    /// Opens of any decision database under `workspace` (as given or with
+    /// its ancestors resolved).
+    pub(crate) fn opens_under(workspace: &Path) -> usize {
+        let resolved = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        OPENS.lock().as_ref().map_or(0, |opens| {
+            opens
+                .iter()
+                .filter(|(path, _)| path.starts_with(workspace) || path.starts_with(&resolved))
+                .map(|(_, count)| *count)
+                .sum()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -3100,7 +3137,7 @@ fn replay_record_on_connection_with_deadline(
                 };
                 let state: String = row.get("replay_state_fingerprint")?;
                 let generation: String = row.get("replay_catalog_generation")?;
-                if !super::approval_collection::valid_projection(&gates, &state, &generation) {
+                if !crate::security::approval_ledger::valid_projection(&gates, &state, &generation) {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
             }

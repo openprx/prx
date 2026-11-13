@@ -55,8 +55,9 @@ fn config_at(workspace: &Path) -> crate::config::Config {
         },
     );
     // Recovery fixtures persist a real completed provider turn.
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.causal_tree.policy.max_decision_hops = 1;
     config
 }
@@ -80,7 +81,7 @@ async fn publish(
         memory,
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
     .await
 }
 
@@ -471,7 +472,7 @@ async fn chat_drained_service_releases_ingress_lease_before_restart() {
             let retained_sink = crate::runtime::causal_events::DurableCausalEventSink::new(
                 &generation,
                 memory.clone(),
-                Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                     crate::observability::noop::NoopObserver,
                 ))),
             )?;
@@ -820,7 +821,7 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
     assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
     for store in [
         dir.path().join("memory/brain.db"),
-        crate::causal_tree::store::db_path(dir.path()),
+        crate::runtime::decision_journal::store::db_path(dir.path()),
     ] {
         assert!(
             line.contains(store.to_str().unwrap()),
@@ -834,7 +835,7 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         .context(crate::runtime::ingress_recovery::IngressRecoveryDiagnostic {
             run_id: "/prx-private-run".into(),
             memory_store: dir.path().join("memory/brain.db"),
-            decision_store: crate::causal_tree::store::db_path(dir.path()),
+            decision_store: crate::runtime::decision_journal::store::db_path(dir.path()),
         });
     let private_reply = crate::chat::binding::chat_input_persistence_failure(&private_error).to_string();
     assert!(!private_reply.contains('/'), "{private_reply}");
@@ -942,10 +943,10 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
             let memory = Arc::new(SqliteMemory::new(dir.path())?);
             let generation = crate::config::new_shared(config_at(dir.path())).pin();
             let hold = Arc::new(parking_lot::Mutex::new(()));
-            let held_store = crate::causal_tree::store::CausalDecisionStore::open_shared_held(
+            let held_store = crate::runtime::decision_journal::store::CausalDecisionStore::open_shared_held(
                 dir.path(),
-                crate::causal_tree::store::Retention::days(1, 1),
-                Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+                crate::runtime::decision_journal::store::Retention::days(1, 1),
+                Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                     crate::observability::noop::NoopObserver,
                 ))),
                 Arc::clone(&hold),

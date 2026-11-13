@@ -768,8 +768,8 @@ impl<'a> CatalogView<'a> {
     pub(crate) fn model_admission_entry<'b>(
         &'b self,
         entry: &'b CapabilityEntry,
-    ) -> crate::causal_tree::state::model_admission::ModelAdmissionEntry<'b> {
-        crate::causal_tree::state::model_admission::ModelAdmissionEntry {
+    ) -> crate::tools::capability::turn_state::model_admission::ModelAdmissionEntry<'b> {
+        crate::tools::capability::turn_state::model_admission::ModelAdmissionEntry {
             public_name: &entry.public_name,
             root: &entry.root,
             generation: self.generation().0,
@@ -2090,7 +2090,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let key = DecisionKey::load_or_create(workspace.path()).unwrap();
         let parent = CapabilityConstraints {
-            parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
+            parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
             allowed,
             authority: AuthorityEnvelope {
                 owner: "prx_user".into(),

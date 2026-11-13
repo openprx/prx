@@ -172,7 +172,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
             "prx-policy",
             &key,
         ));
-        state.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
+        state.trusted = crate::tools::capability::turn_state::TrustedState::from_runtime(trusted);
         assert_ne!(state.material_fingerprint(&key)?, before);
         let policy = state
             .trusted
@@ -192,7 +192,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
         assert_ne!(policy.digest(), all_allowed.digest());
         let mut trusted = state.trusted.parts().clone();
         trusted.model_admission = None;
-        state.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
+        state.trusted = crate::tools::capability::turn_state::TrustedState::from_runtime(trusted);
         assert_eq!(state.material_fingerprint(&key)?, before);
     }
     assert_eq!(lengths, [32, 32, 32]);
@@ -201,7 +201,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
 
 #[test]
 fn model_admission_dyn_equality_compares_each_original_field() -> anyhow::Result<()> {
-    use crate::causal_tree::state::model_admission::ModelAdmissionView;
+    use crate::tools::capability::turn_state::model_admission::ModelAdmissionView;
     let registry: Vec<Box<dyn Tool>> = vec![Box::new(AliasTool {
         root: "prx_eq_root".into(),
         enabled: Arc::new(AtomicBool::new(true)),
@@ -273,7 +273,7 @@ fn model_admission_dyn_equality_compares_each_original_field() -> anyhow::Result
 
 #[test]
 fn model_admission_absent_slots_and_invalid_present_slots_remain_distinct() -> anyhow::Result<()> {
-    use crate::causal_tree::state::model_admission::{ModelAdmissionEntry, ModelAdmissionView};
+    use crate::tools::capability::turn_state::model_admission::{ModelAdmissionEntry, ModelAdmissionView};
     let registry: Vec<Box<dyn Tool>> = (0..33)
         .map(|index| {
             Box::new(AliasTool {

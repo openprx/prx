@@ -12,6 +12,7 @@ pub(crate) mod approval_ledger;
 pub(crate) mod approval_operation;
 pub mod audit;
 pub(crate) mod decision_approval;
+pub mod decision_id;
 pub mod git_launch;
 pub mod inbound_gate;
 pub mod op_id;

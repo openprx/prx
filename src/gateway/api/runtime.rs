@@ -731,7 +731,7 @@ mod tests {
                         generation:Arc::clone(&generation), registry:Arc::clone(&registry), mcp_tool:None,
                         security, observer:Arc::new(NoopObserver), hooks:Arc::new(HookManager::new(workspace.to_path_buf())),
                         memory:Arc::clone(&memory), plugin_generation:0,
-                    }.publish(crate::causal_tree::state::TurnSurfaceKind::Server).await?;
+                    }.publish(crate::tools::capability::turn_state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
                     let context = service.open_issued_turn_context(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
                     anyhow::ensure!(

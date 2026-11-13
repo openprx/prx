@@ -62,7 +62,7 @@ async fn configured_http_wrong_model_is_refused_before_send() {
             key: Some(Arc::clone(&key)),
             transports: &crate::decision::compatible_http::HttpDecisionTransports,
             config_generation: 7,
-            events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
     )
     .expect("genuine configured factory with actual HTTP adapter");
@@ -236,7 +236,7 @@ fn configured_adapter_cannot_replace_the_selected_model() {
             key: Some(key(&workspace)),
             transports: &Contradictory,
             config_generation: 7,
-            events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
     );
     assert!(matches!(

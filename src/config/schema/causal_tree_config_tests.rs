@@ -55,7 +55,7 @@ fn a_backend_table_loads() {
     assert!(loaded.causal_tree.enabled);
     assert_eq!(
         loaded.causal_tree.backend.kind,
-        crate::causal_tree::config::BackendSelection::Auto
+        crate::config::schema::causal_tree::BackendSelection::Auto
     );
     assert_eq!(
         loaded.causal_tree.backend.circuit_breaker.failure_threshold, 7,
@@ -74,7 +74,7 @@ fn an_enabled_only_section_loads_unset_and_warns_about_the_ignored_key() {
     let loaded = loaded.expect("test: the bare disable still loads");
     assert_eq!(
         loaded.causal_tree,
-        crate::causal_tree::CausalTreeConfig::default(),
+        crate::config::schema::causal_tree::CausalTreeConfig::default(),
         "D-074: a bare unversioned disable is read as unset"
     );
     assert!(loaded.causal_tree.enabled, "the plane keeps its enabled default");
@@ -117,7 +117,10 @@ fn an_enabled_only_section_with_the_schema_version_keeps_the_disable() {
 fn a_config_saved_by_8a5d160d_loads_and_maps() {
     let (_dir, loaded) = load(SAVED_BY_8A5D160D);
     let loaded = loaded.expect("test: the legacy save loads");
-    assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    assert_eq!(
+        loaded.causal_tree,
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
+    );
     assert!(
         loaded.causal_tree.enabled,
         "CDP-31 enables the local decision plane by default"
@@ -307,9 +310,12 @@ async fn a_base_init_install_reads_its_disable_as_unset_until_saved() {
         ("config.d/agent.toml", BASE_INIT_AGENT_BLOCK),
     ]);
     let loaded = loaded.expect("test: loads");
-    assert_eq!(loaded.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    assert_eq!(
+        loaded.causal_tree,
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
+    );
     let mut root: toml::Value = toml::from_str(BASE_INIT_AGENT_BLOCK).expect("test: toml");
-    let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
+    let report = crate::config::schema::causal_tree::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
     assert_eq!(report.dropped, ["enabled"], "the template's disable is the old default");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("config.d/agent.toml")).expect("test: read"),

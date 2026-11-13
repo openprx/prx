@@ -33,8 +33,8 @@ impl DecisionBackend for OrdinaryFixtureBackend {
         request: &crate::decision::protocol::DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
-    ) -> Result<DecisionResponse, crate::decision::DecisionError> {
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
+    ) -> Result<DecisionResponse, crate::cost::decision_attempt::DecisionError> {
         // In-process fixture prediction performs no provider I/O or physical charge.
         self.evaluate(request, body, deadline).await
     }
@@ -43,8 +43,8 @@ impl DecisionBackend for OrdinaryFixtureBackend {
         request: &crate::decision::protocol::DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-    ) -> Result<DecisionResponse, crate::decision::DecisionError> {
-        use crate::decision::DecisionError;
+    ) -> Result<DecisionResponse, crate::cost::decision_attempt::DecisionError> {
+        use crate::cost::decision_attempt::DecisionError;
         if Instant::now() >= deadline {
             return Err(DecisionError::Timeout);
         }

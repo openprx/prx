@@ -37,17 +37,19 @@ pub mod budget;
 pub mod builtin;
 pub mod cache;
 pub mod compatible_http;
-pub mod error;
+// Forwarding path until Part 2: moved to `cost::decision_attempt` (R17).
+pub use crate::cost::decision_attempt::error;
 pub mod factory;
 pub mod http;
-pub mod loopback;
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
-pub mod model_pin;
+// Forwarding paths until Part 2: moved to `providers` (05aS-HOME).
+pub use crate::providers::{loopback, model_pin};
 pub mod openrouter;
 pub mod outbound;
 pub mod protocol;
-pub mod telemetry;
+// Forwarding path until Part 2: moved to `observability::causal_event` (R17).
+pub use crate::observability::causal_event as telemetry;
 pub mod typesafe;
 pub mod validate;
 pub mod wire;

@@ -21,7 +21,7 @@ use super::catalog::{
 use super::credentials::{ConfigCredentialSource, CredentialRef, LegacySlot};
 use super::{ProviderId, default_provider_for_unset};
 use crate::config::Config;
-use crate::decision::model_pin::is_unpinned_model;
+use crate::providers::model_pin::is_unpinned_model;
 
 /// The model a surface runs when neither the selection nor `default_model`
 /// names one. The release catalog is the sole owner of that fact.
@@ -222,7 +222,7 @@ pub(crate) fn route_refusal(route: Option<&catalog::RouteTarget>, refusal: Resol
 /// [`ModelOperation::DecisionEndpoint`], at plan, factory build and status
 /// alike, so an operator selection is no more lenient than a model's. A
 /// hosted decision service (TypeSafe, OpenRouter) also needs a pinned model
-/// ([`crate::decision::model_pin::is_unpinned_model`]) and an auth-profile
+/// ([`crate::providers::model_pin::is_unpinned_model`]) and an auth-profile
 /// credential: never the root inline key, another inline slot or the
 /// provider's own store (D-040 OQ-A4, D-074). The credential is released by
 /// the resolver's owner rule; `CredentialRef::None` is accepted only where

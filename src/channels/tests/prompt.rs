@@ -639,7 +639,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
     let mut runtime_config = Config::default();
     assert_eq!(
         runtime_config.causal_tree,
-        crate::causal_tree::CausalTreeConfig::default()
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
     );
     runtime_config.default_provider = Some("test-provider".to_string());
     runtime_config.default_model = Some("test-model".to_string());

@@ -601,8 +601,8 @@ impl AgentTurnProof {
             .as_ref()
             .and_then(|source| source.envelope.task_id.as_deref())
     }
-    pub(crate) fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        use crate::causal_tree::state::TurnSurfaceKind;
+    pub(crate) fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        use crate::tools::capability::turn_state::TurnSurfaceKind;
         match self.scheduled.as_ref().map(|source| source.envelope.source) {
             Some(RuntimeSource::Cron) => TurnSurfaceKind::Cron,
             Some(RuntimeSource::Xin) => TurnSurfaceKind::Xin,
@@ -1052,14 +1052,14 @@ mod agent_turn_origin_tests {
         );
         crate::runtime::turn_decision::validate_agent_turn_origin(
             &generation,
-            crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
             &proof,
         )
         .expect("service accepts the pinned Agent origin");
         assert!(
             crate::runtime::turn_decision::validate_agent_turn_origin(
                 &generation,
-                crate::causal_tree::state::TurnSurfaceKind::Interactive,
+                crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
                 &proof,
             )
             .is_err()
@@ -1250,7 +1250,7 @@ mod agent_turn_origin_tests {
         assert_eq!(proof_a.owner_id(), proof_b.owner_id());
         assert_ne!(proof_a.session_key(), proof_b.session_key());
         let mut trusted = crate::causal_tree::state::fixtures::trusted();
-        trusted.surface = crate::causal_tree::state::TurnSurfaceKind::AgentLoop;
+        trusted.surface = crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop;
         trusted.channel = None;
         trusted.workspace_id = Arc::from(proof_a.workspace_id());
         trusted.owner_id = Some(Arc::from(proof_a.owner_id()));

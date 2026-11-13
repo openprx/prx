@@ -106,7 +106,7 @@ impl ExperimentStageRuntime {
             Arc::clone(&key),
             current_tracker().ok_or_else(|| anyhow::anyhow!("experiment stage has no cleanup owner"))?,
             identity,
-            crate::causal_tree::state::TurnBudgets {
+            crate::tools::capability::turn_state::TurnBudgets {
                 tokens: resources.tokens,
                 micro_usd: resources.micro_usd,
                 latency_ms: remaining_ms,

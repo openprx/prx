@@ -13,26 +13,25 @@
 // Decision state and candidates are independent of the optional model router.
 pub mod admin;
 pub(crate) mod admission_probe;
-pub(crate) mod approval_collection;
 pub mod branch;
 pub(crate) mod candidate_generator;
-pub mod config;
+// Forwarding path until Part 2: the schema lives in `config::schema::causal_tree`.
+pub use crate::config::schema::causal_tree as config;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_score;
 pub(crate) mod decision_select;
 pub(crate) mod directive;
 pub mod evaluate;
 pub(crate) mod gates;
-pub mod ids;
+// Forwarding path until Part 2: the id lives in `security::decision_id`.
+pub use crate::security::decision_id as ids;
 pub(crate) mod outcome;
 pub mod projection;
 pub(crate) mod questions;
 pub(crate) mod refusal;
 pub(crate) mod report_catalog;
 pub mod state;
-pub mod store;
-pub(crate) mod store_preparation;
-pub mod store_schema;
+// Forwarding paths until Part 2: the journal lives in `runtime::decision_journal`.
+pub(crate) use crate::runtime::decision_journal::store;
+pub(crate) use crate::runtime::decision_journal::store_preparation;
 pub mod v1_compat;
-
-pub use config::CausalTreeConfig;

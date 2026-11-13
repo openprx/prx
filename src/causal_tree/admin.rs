@@ -36,11 +36,11 @@ use crate::config::Config;
 use crate::decision::factory::{
     AttemptOutcome, DecisionBackendFactory, FactoryBuildError, FactoryDeps, HealthView, ServedBy,
 };
-use crate::decision::telemetry::{CausalEventSink, CausalLineage};
 use crate::decision::{
     BackendKind, BackendLocality, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, OptionId, QuestionId,
     RequestLimits, RequestParts, StructuredValue,
 };
+use crate::observability::causal_event::{CausalEventSink, CausalLineage};
 
 /// Builds the decision backend factory of a configuration: the caller's
 /// transports, catalog and event sink (the CLI's, and the Gateway's from
@@ -712,7 +712,7 @@ impl DecisionAdmin {
             |_| {},
         )
         .await?;
-        let key = super::store_preparation::load_key(self.config.clone()).await;
+        let key = load_key(self.config.clone()).await;
         let import = match (store.mode(), key) {
             (StoreMode::ReadWrite, Some(key)) => {
                 Some(import_v1_feedback(&store, &self.config.workspace_dir, &key).await?)
@@ -784,8 +784,10 @@ impl DecisionAdmin {
         };
         StatusView {
             enabled: self.config.causal_tree.enabled,
-            remote_enabled: crate::decision_engine::config::effective_engine_backend(&self.config).remote_enabled,
-            backend_timeout_ms: crate::decision_engine::config::effective_engine_backend(&self.config).timeout_ms,
+            remote_enabled: crate::config::schema::decision_engine::effective_engine_backend(&self.config)
+                .remote_enabled,
+            backend_timeout_ms: crate::config::schema::decision_engine::effective_engine_backend(&self.config)
+                .timeout_ms,
             latency_budget_warning: self.config.decision_latency_budget_warning(),
             policy: PolicyView::from(&self.config.causal_tree.policy),
             key_available,
@@ -872,9 +874,9 @@ impl DecisionAdmin {
     /// userinfo redacted; `None` when the configured backend is not remote
     /// (a live test then sends nothing off this machine).
     pub(crate) fn live_target(&self) -> Option<String> {
-        crate::decision::factory::configured_selection(crate::decision_engine::config::effective_engine_backend(
-            &self.config,
-        ))
+        crate::config::schema::causal_tree::configured_selection(
+            crate::config::schema::decision_engine::effective_engine_backend(&self.config),
+        )
         .filter(|selection| selection.locality == BackendLocality::Remote)
         .map(|selection| shown(&selection.provider))
     }
@@ -887,7 +889,7 @@ impl DecisionAdmin {
         BackendsView {
             enabled: self.config.causal_tree.enabled,
             order: DecisionBackendFactory::backend_order(
-                crate::decision_engine::config::effective_engine_backend(&self.config),
+                crate::config::schema::decision_engine::effective_engine_backend(&self.config),
                 self.config.decision_engine.enabled,
                 &health,
             )
@@ -956,7 +958,7 @@ impl DecisionAdmin {
                 "a remote backend is tested only with a confirmed live call (`--live --yes`); nothing was sent",
             ));
         }
-        let model = crate::decision_engine::config::effective_engine_backend(&self.config)
+        let model = crate::config::schema::decision_engine::effective_engine_backend(&self.config)
             .model
             .trim();
         let fixture = neutral_fixture(&key, (!model.is_empty()).then_some(model))?;
@@ -1136,7 +1138,7 @@ const FIXTURE: [(GlobalQuestion, &str); 3] = [
 /// The neutral test request for the configured `model`: no user state,
 /// one question per primitive.
 fn neutral_fixture(key: &DecisionKey, model: Option<&str>) -> Result<DecisionRequest, AdminError> {
-    let fixture = |error: crate::decision::DecisionError| AdminError::Fixture(error.class().to_string());
+    let fixture = |error: crate::cost::decision_attempt::DecisionError| AdminError::Fixture(error.class().to_string());
     let text = |value: &str| StructuredValue::try_from(serde_json::Value::from(value)).map_err(fixture);
     let mut questions = std::collections::BTreeMap::new();
     questions.insert(
@@ -1192,6 +1194,19 @@ pub(crate) const fn test_target(kind: Option<BackendKind>) -> TestTarget {
     }
 }
 
+// Moved from `causal_tree::store_preparation` (R16): the plane factory key is
+// not a journal concern.
+/// Key creation includes filesystem synchronization, just like store opening.
+pub(crate) async fn load_key(config: crate::config::Config) -> Option<Arc<crate::security::runtime_key::DecisionKey>> {
+    match tokio::task::spawn_blocking(move || crate::decision::factory::FactoryDeps::load_key(&config)).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(%error, "decision key preparation failed");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -1203,9 +1218,9 @@ mod tests {
     use crate::decision::backend::DecisionBackend;
     use crate::decision::factory::SlotLimits;
     use crate::decision::outbound::{GuardedBody, OutboundSecrets};
-    use crate::decision::telemetry::testing::RecordingSink;
     use crate::decision::validate::ModelVersionPolicy;
     use crate::decision::{BackendIdentity, DecisionError, DecisionResponse};
+    use crate::observability::causal_event::testing::RecordingSink;
 
     /// A remote backend that counts every call it gets.
     /// A counting backend at `locality`; its health probe fails unless it
@@ -1322,10 +1337,10 @@ mod tests {
         ) -> Result<DecisionBackendFactory, FactoryBuildError> {
             let mut config = config.clone();
             config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+                crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::CompatibleHttp);
             config.causal_tree.backend.endpoint = "https://decisions.example.com/v1".to_string();
             config.causal_tree.backend.model = "decider-1".to_string();
-            config.causal_tree.backend.credential_ref = crate::causal_tree::config::CredentialRefSetting::None;
+            config.causal_tree.backend.credential_ref = crate::config::schema::causal_tree::CredentialRefSetting::None;
             let catalog = crate::providers::catalog::CatalogView::from_config(&config).with_curated([
                 crate::providers::catalog::CuratedModel {
                     operations: Some(vec![crate::providers::catalog::ModelOperation::DecisionEndpoint]),
@@ -1388,7 +1403,8 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("test: private status workspace");
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_owned();
-        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(BackendKind::OpenRouter);
+        config.causal_tree.backend.kind =
+            crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::OpenRouter);
         config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
         let admin = DecisionAdmin::new(config, Arc::new(RefusedPlane), Arc::new(RecordingSink::default()));
         let status = admin.status().await;
@@ -1577,7 +1593,10 @@ mod tests {
         admin.close().await;
         assert_eq!(status.store.mode, "read_write");
         assert!(status.store.error.is_none(), "{status:?}");
-        assert_eq!(status.store.schema_version, super::super::store_schema::SCHEMA_VERSION);
+        assert_eq!(
+            status.store.schema_version,
+            crate::runtime::decision_journal::store_schema::SCHEMA_VERSION
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "status does not evaluate a backend");
     }
 

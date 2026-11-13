@@ -13,10 +13,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use super::turn_decision::VerifiedDirectiveApplication;
 use crate::config::ConfigGeneration;
-use crate::decision::telemetry::{
+use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
+use crate::observability::causal_event::{
     CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage, IncompleteReason,
 };
-use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
 // Ordinary events retain permits until they are persisted. Control has its
@@ -344,9 +344,9 @@ fn to_message_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::protocol::{BackendKind, BackendLocality};
-    use crate::decision::telemetry::testing::RecordingSink;
+    use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
     use crate::memory::{MemoryPrincipal, NoneMemory, SqliteMemory};
+    use crate::observability::causal_event::testing::RecordingSink;
 
     #[tokio::test(flavor = "current_thread")]
     async fn queue_overflow_and_store_failure_report_incomplete_without_blocking() {

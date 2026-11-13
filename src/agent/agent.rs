@@ -1260,16 +1260,18 @@ mod tests {
             .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
         let selected_config = &mut builder.runtime_config.as_mut().expect("test: configured builder").0;
         selected_config.decision_engine.enabled = true;
-        selected_config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        selected_config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         // The durable case selects Builtin; the other case installs its scoped
         // selected-loader Mock backend explicitly through with_first_other.
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
             config.causal_tree.enabled = true;
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::Builtin,
+            );
             config.causal_tree.backend.remote_enabled = false;
             config.causal_tree.store.record_redacted_projection = true;
             config.cost.prices.insert(
@@ -1326,16 +1328,17 @@ mod tests {
                 .iter()
                 .find(|event| event.role == "user" && event.content == "memory_search: Explain `2 + 2`.")
                 .unwrap();
-            let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+            let store =
+                crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
             let reader = store.reader();
-            let scope = crate::causal_tree::store::DecisionScope::Owner {
+            let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
                 workspace_id: store.workspace_id().unwrap(),
                 owner_id: Arc::from(anchor.owner_id()),
             };
             let decisions = reader
                 .list(
                     &scope,
-                    crate::causal_tree::store::TimeWindow {
+                    crate::runtime::decision_journal::store::TimeWindow {
                         from_ms: 0,
                         to_ms: i64::MAX,
                     },
@@ -1343,7 +1346,7 @@ mod tests {
                 )
                 .unwrap();
             // Q90 replaces the Q56 every-receipt Builtin oracle with this exact linked pair.
-            type Receipt = (crate::causal_tree::store::DecisionView, String, bool);
+            type Receipt = (crate::runtime::decision_journal::store::DecisionView, String, bool);
             fn valid_receipts(receipts: &[Receipt]) -> bool {
                 if receipts.len() != 2 {
                     return false;
@@ -2017,8 +2020,9 @@ mod tests {
         config.default_model = Some("model-a".to_owned());
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.causal_tree.backend.remote_enabled = false;
         config.providers.models.clear();
         config.providers.models.push(
@@ -2112,7 +2116,8 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let store =
+            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
         let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
         let store_id = store.workspace_id().unwrap();
         let replay = crate::agent::terminal::verify_terminal_replay(
@@ -2258,8 +2263,9 @@ mod tests {
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.causal_tree.backend.remote_enabled = false;
         config.cost.prices.insert(
             "ollama/prx-local-model".to_owned(),
@@ -2321,7 +2327,8 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let store =
+            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
         let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
         let store_id = store.workspace_id().unwrap();
         let replay = crate::agent::terminal::verify_terminal_replay(
@@ -2825,8 +2832,9 @@ mod tests {
         // Owned local fixture records the genuine Builtin decision chain; no remote backend.
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.causal_tree.backend.remote_enabled = false;
         config.tool_tiering.always_exclude.push("mcp_probe".to_owned());
         let memory = Arc::clone(builder.memory.as_ref().unwrap());
@@ -2942,16 +2950,17 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let store =
+            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
         let reader = store.reader();
-        let scope = crate::causal_tree::store::DecisionScope::Owner {
+        let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
             workspace_id: store.workspace_id().unwrap(),
             owner_id: Arc::from(terminal.owner_id.as_deref().unwrap()),
         };
         let answer = reader
             .replay_record(
                 &scope,
-                &crate::causal_tree::ids::DecisionId::parse(decision_id).unwrap(),
+                &crate::security::decision_id::DecisionId::parse(decision_id).unwrap(),
             )
             .unwrap()
             .unwrap();

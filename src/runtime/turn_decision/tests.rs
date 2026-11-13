@@ -25,11 +25,11 @@ use crate::decision::protocol::{
     BackendIdentity, BackendKind, BackendLocality, DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion,
     Probability, QuestionId,
 };
-use crate::decision::telemetry::CausalEvent;
-use crate::decision::telemetry::testing::RecordingSink;
 use crate::decision::validate::ModelVersionPolicy;
 use crate::decision::{DecisionError, KeyDomain};
 use crate::memory::{MemoryFabric, NoneMemory};
+use crate::observability::causal_event::CausalEvent;
+use crate::observability::causal_event::testing::RecordingSink;
 use crate::security::SecurityPolicy;
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, TracingToolExecutionAudit,

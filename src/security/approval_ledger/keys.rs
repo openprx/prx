@@ -1,5 +1,5 @@
 //! Key namespaces are independent of the persisted payloads.
-use crate::causal_tree::ids::DecisionId;
+use crate::security::decision_id::DecisionId;
 use sha2::{Digest, Sha256};
 
 pub(crate) trait ApprovalAuthority {

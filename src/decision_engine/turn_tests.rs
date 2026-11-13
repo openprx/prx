@@ -301,7 +301,7 @@ fn rendered_brief_is_bounded_redacted_deterministic() {
     assert_eq!(render::render_decision_brief(&analysis, 0, 0), "");
 }
 
-use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
+use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode};
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider, ToolCall};
 use parking_lot::Mutex;
 use std::sync::Arc;

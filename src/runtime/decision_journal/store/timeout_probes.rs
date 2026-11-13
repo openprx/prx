@@ -22,7 +22,7 @@ pub(crate) async fn writer_drain() -> anyhow::Result<String> {
     let store = CausalDecisionStore::open(
         temp.path(),
         Retention::days(30, 30),
-        Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+        Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         StoreMode::ReadWrite,
         WriterSetup {
             hold: Some(Arc::clone(&hold)),

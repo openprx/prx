@@ -1014,9 +1014,9 @@ mod tests {
 
         let mut decision = plain.clone();
         decision.causal_tree.backend.credential_ref =
-            crate::causal_tree::config::CredentialRefSetting::Profile("cred-decision".into());
+            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decision".into());
         assert_eq!(level(&plain, &decision), ResourceRiskLevel::High);
-        decision.causal_tree.backend.credential_ref = crate::causal_tree::config::CredentialRefSetting::None;
+        decision.causal_tree.backend.credential_ref = crate::config::schema::causal_tree::CredentialRefSetting::None;
         assert_eq!(level(&plain, &decision), ResourceRiskLevel::Low);
 
         let mut credentialed_proxy = plain;

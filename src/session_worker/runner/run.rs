@@ -265,7 +265,7 @@ impl WorkerChildSegments {
 }
 
 pub(super) struct VerifiedWorkerParent {
-    store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
     scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
     catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
 }
@@ -276,7 +276,7 @@ pub(super) fn verify_worker_parent_authority(
     manifest: &WorkerManifest,
     logical_workspace: &Path,
 ) -> Result<Option<VerifiedWorkerParent>> {
-    use crate::causal_tree::store::{CausalDecisionStore, DecisionScope};
+    use crate::runtime::decision_journal::store::{CausalDecisionStore, DecisionScope};
     use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest, VerifiedChildScope};
     anyhow::ensure!(
         manifest.ordinary_source.is_none() && manifest.operator_source.is_none(),

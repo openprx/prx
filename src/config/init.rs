@@ -158,7 +158,7 @@ impl Spec {
             match super::files::plan_mutation(&config_path, &workspace_dir, effective_main, effective_fragments) {
                 Ok(plan) => plan,
                 Err(error) if causal_guard => return Err(CausalRegenerationError(error).into()),
-                Err(error) if error.is::<crate::causal_tree::config::MigrationError>() => return Err(error),
+                Err(error) if error.is::<crate::config::schema::causal_tree::MigrationError>() => return Err(error),
                 // A readable tree without decision-plane settings can retain the
                 // existing repair fallback for other invalid settings; it
                 // is not allowed to do so quietly. The operator's values are in the
@@ -665,7 +665,7 @@ fn preserve_previous_settings(
             super::files::read_merged_toml_with_gate_once(config_path).map_err(CausalRegenerationError)?;
         let causal_guard = effective.get("causal_tree").is_some();
         let locate = |path: &[&str]| super::deprecations::file_holding(config_path, path);
-        let migration = crate::causal_tree::config::migrate_legacy(&mut effective, &locate)?;
+        let migration = crate::config::schema::causal_tree::migrate_legacy(&mut effective, &locate)?;
         let result = preserve_normalized_settings(
             config_path,
             main_template,
@@ -686,7 +686,7 @@ fn preserve_previous_settings(
         }
     })
     .map_err(|error| {
-        if error.is::<crate::causal_tree::config::MigrationError>() || error.is::<CausalRegenerationError>() {
+        if error.is::<crate::config::schema::causal_tree::MigrationError>() || error.is::<CausalRegenerationError>() {
             error
         } else {
             CausalRegenerationError(error).into()
@@ -700,11 +700,11 @@ fn preserve_normalized_settings(
     fragment_templates: &[(String, String)],
     previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
     effective: &toml::Value,
-    migration: &crate::causal_tree::config::MigrationReport,
+    migration: &crate::config::schema::causal_tree::MigrationReport,
     causal_guard: bool,
 ) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
     let mut main_previous = read_toml_document(config_path)?;
-    crate::causal_tree::config::normalize_regeneration_document(&mut main_previous, migration, config_path)?;
+    crate::config::schema::causal_tree::normalize_regeneration_document(&mut main_previous, migration, config_path)?;
     let mut fragment_previous: BTreeMap<String, toml::Value> = BTreeMap::new();
     for path in super::files::list_config_fragment_paths(config_path)? {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -714,7 +714,7 @@ fn preserve_normalized_settings(
             continue;
         }
         let mut value = read_toml_document(&path)?;
-        crate::causal_tree::config::normalize_regeneration_document(&mut value, migration, &path)?;
+        crate::config::schema::causal_tree::normalize_regeneration_document(&mut value, migration, &path)?;
         fragment_previous.insert(name.to_string(), value);
     }
 

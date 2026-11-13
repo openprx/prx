@@ -162,7 +162,7 @@ async fn admit_start_turn_fixture(
         memory: Arc::clone(&ledger),
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
     .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .expect("Q42 scoped fixture owner")

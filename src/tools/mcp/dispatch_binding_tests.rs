@@ -1,8 +1,8 @@
 #![cfg(test)]
 //! Transport-free checks of the real MCP dispatch guard after publication drift.
 use super::*;
-use crate::causal_tree::ids::DecisionId;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::decision_id::DecisionId;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
 use crate::tools::capability::execution_binding::{ExecutionBinding, ToolExecutionError, scope_dispatch_binding};
 use anyhow::Context;

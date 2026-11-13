@@ -462,8 +462,8 @@ fn published_decision_layer(status: super::turn_decision::DecisionPlaneStatus) -
             "config_generation": status.backend.config_generation,
             "catalog_generation": status.catalog_generation.to_hex(),
             "store_mode": match status.store_mode {
-                crate::causal_tree::store::StoreMode::ReadOnly => "read_only",
-                crate::causal_tree::store::StoreMode::ReadWrite => "read_write",
+                crate::runtime::decision_journal::store::StoreMode::ReadOnly => "read_only",
+                crate::runtime::decision_journal::store::StoreMode::ReadWrite => "read_write",
             },
             "durable_key": status.durable_key,
             "recordable": status.recordable,
@@ -504,9 +504,9 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
             // projection only, not attached execution authority or a per-turn
             // Chat mode restriction. Rehearsal remains independently read-only.
             "default_side_effect_mode": match config.autonomy.level {
-                crate::security::AutonomyLevel::ReadOnly => crate::causal_tree::state::SideEffectMode::ReadOnly,
-                crate::security::AutonomyLevel::Supervised => crate::causal_tree::state::SideEffectMode::ApprovalRequired,
-                crate::security::AutonomyLevel::Full => crate::causal_tree::state::SideEffectMode::GuardedWrite,
+                crate::security::AutonomyLevel::ReadOnly => crate::tools::capability::turn_state::SideEffectMode::ReadOnly,
+                crate::security::AutonomyLevel::Supervised => crate::tools::capability::turn_state::SideEffectMode::ApprovalRequired,
+                crate::security::AutonomyLevel::Full => crate::tools::capability::turn_state::SideEffectMode::GuardedWrite,
             },
         }),
     }
@@ -605,7 +605,7 @@ mod tests {
                 cached: 0,
             },
             catalog_generation: crate::tools::capability::contract::CatalogGeneration([7; 32]),
-            store_mode: crate::causal_tree::store::StoreMode::ReadOnly,
+            store_mode: crate::runtime::decision_journal::store::StoreMode::ReadOnly,
             durable_key: false,
             recordable: false,
         };

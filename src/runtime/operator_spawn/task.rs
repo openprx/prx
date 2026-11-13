@@ -188,7 +188,7 @@ impl OperatorTaskAuthority {
                 && proof.ordinary_task_authority_id().is_none()
                 && proof.ordinary_process_authority_id().is_none()
                 && proof.child_scope().is_none()
-                && proof.surface() == crate::causal_tree::state::TurnSurfaceKind::Worker
+                && proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Worker
                 && proof.workspace_id() == self.source.proof.workspace_id()
                 && proof.owner_id() == self.source.proof.owner_id()
                 && proof.session_key() == self.source.proof.session_key()
@@ -281,8 +281,8 @@ impl TurnSourceProof for OperatorTaskAuthority {
     fn config_generation_id(&self) -> u64 {
         self.source.generation.id.0
     }
-    fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        crate::causal_tree::state::TurnSurfaceKind::Worker
+    fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        crate::tools::capability::turn_state::TurnSurfaceKind::Worker
     }
     fn policy_channel(&self) -> &str {
         self.source.proof.policy_channel()

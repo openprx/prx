@@ -1,13 +1,13 @@
 #![cfg(test)]
 
 use super::recovery_config;
-use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::testing::{open_private, record};
-use crate::causal_tree::store::{CausalDecisionStore, Enqueue, arm_wal_reprobe_gate, db_path};
-use crate::decision::telemetry::testing::RecordingSink;
 use crate::memory::{Memory, SqliteMemory};
+use crate::observability::causal_event::testing::RecordingSink;
+use crate::runtime::decision_journal::store::testing::{open_private, record};
+use crate::runtime::decision_journal::store::{CausalDecisionStore, Enqueue, arm_wal_reprobe_gate, db_path};
 use crate::runtime::ingress_recovery::{PreparedAdvisory, RecoveryScope};
 use crate::runtime::turn_cleanup::CleanupTracker;
+use crate::security::decision_id::DecisionId;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,8 +21,9 @@ async fn publish_plane_on(
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");
     config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.causal_tree.backend.remote_enabled = false;
     let generation = crate::config::new_shared(config).pin();
     let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![
@@ -46,7 +47,7 @@ async fn publish_plane_on(
         memory,
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop)
     .await
 }
 
@@ -138,8 +139,8 @@ pub(super) async fn recovery_store_without_writer_rejoin_fails_closed() {
     config.causal_tree.enabled = true;
     let generation = crate::config::ConfigGenerationManager::new(config).pin();
     let tracker = Arc::new(CleanupTracker::default());
-    let observer: Arc<dyn crate::decision::telemetry::CausalEventSink> = Arc::new(
-        crate::decision::telemetry::ObserverCausalSink::new(Arc::new(crate::observability::NoopObserver)),
+    let observer: Arc<dyn crate::observability::causal_event::CausalEventSink> = Arc::new(
+        crate::observability::causal_event::ObserverCausalSink::new(Arc::new(crate::observability::NoopObserver)),
     );
     let (store, events) =
         crate::runtime::ingress_recovery::open_advisory_store(&generation, Arc::clone(&memory), observer, &tracker)
@@ -148,7 +149,7 @@ pub(super) async fn recovery_store_without_writer_rejoin_fails_closed() {
     let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         Some(key),
@@ -227,7 +228,7 @@ fn events() -> Arc<RecordingSink> {
     Arc::new(RecordingSink::default())
 }
 
-fn seeded_record(n: u8) -> crate::causal_tree::store::DecisionRecord {
+fn seeded_record(n: u8) -> crate::runtime::decision_journal::store::DecisionRecord {
     record(DecisionId::legacy(&[n; 32]), "ws", Some("prx_user"), 10)
 }
 
@@ -250,7 +251,7 @@ async fn prepare_recovery_only(workspace: &Path, memory: Arc<dyn Memory>) -> (Ar
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         None,
@@ -267,7 +268,7 @@ fn assert_recovery_only_reader(recovery: &RecoveryScope) {
     assert!(recovery.legacy_events().is_none(), "test: recovery-only events is None");
     assert_eq!(
         recovery.legacy_store().expect("test: store").mode(),
-        crate::causal_tree::store::StoreMode::ReadOnly,
+        crate::runtime::decision_journal::store::StoreMode::ReadOnly,
         "test: recovery-only never opens ReadWrite"
     );
 }

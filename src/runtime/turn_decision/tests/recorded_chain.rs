@@ -36,8 +36,9 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let workspace = tempfile::tempdir().expect("test workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -252,7 +253,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         .expect("same terminal replay");
     assert_eq!(replay.terminal_event.id, linked.terminal_event.id);
     assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
-    let linked_scope = crate::causal_tree::store::DecisionScope::Owner {
+    let linked_scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: service.store.workspace_id().expect("store scope"),
         owner_id: Arc::from(proof.owner_id()),
     };
@@ -292,7 +293,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         linked.terminal_event.id
     );
     assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
-    let conflicting_scope = crate::causal_tree::store::DecisionScope::Owner {
+    let conflicting_scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: service.store.workspace_id().expect("store scope"),
         owner_id: Arc::from(proof.owner_id()),
     };
@@ -547,7 +548,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     )
     .await
     .expect("real finalizer marker before outcome admission");
-    let rejoin_scope = crate::causal_tree::store::DecisionScope::Owner {
+    let rejoin_scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: service.store.workspace_id().expect("store scope"),
         owner_id: Arc::from(proof.owner_id()),
     };
@@ -641,7 +642,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         .expect("bounded hop count")
             + 5
     );
-    let scope = crate::causal_tree::store::DecisionScope::Owner {
+    let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: service.store.workspace_id().expect("store scope"),
         owner_id: Arc::from(proof.owner_id()),
     };
@@ -888,8 +889,9 @@ async fn disabled_service_ignores_an_unsafe_store_path_without_touching_it() {
     symlink(outside.path(), workspace.path().join("self/causal_tree")).expect("test unsafe store path");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.causal_tree.enabled = false;
     config.workspace_dir = workspace.path().to_path_buf();
     let generation = crate::config::new_shared(config.clone()).pin();

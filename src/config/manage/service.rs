@@ -766,7 +766,7 @@ fn uses_of(config: &Config, id: &ProviderId) -> Vec<String> {
             names.push(name);
         }
     }
-    if let Some(selection) = crate::decision::factory::configured_selection(&config.causal_tree.backend)
+    if let Some(selection) = crate::config::schema::causal_tree::configured_selection(&config.causal_tree.backend)
         && ProviderId::of(&selection.provider) == *id
     {
         names.push("the decision backend (causal_tree.backend)".to_string());
@@ -914,7 +914,7 @@ pub const REFERENCE_NOT_USED: &str = UNREFERENCED;
 pub fn reference_use(config: &Config, id: &str) -> Result<String, ManageError> {
     let decision_refers = matches!(
         &config.causal_tree.backend.credential_ref,
-        crate::causal_tree::config::CredentialRefSetting::Profile(used) if used == id
+        crate::config::schema::causal_tree::CredentialRefSetting::Profile(used) if used == id
     );
     let mut referrers = credential_referrers(config, id)?;
     const DECISION_PATH: &str = "causal_tree.backend.credential_ref";
@@ -924,9 +924,12 @@ pub fn reference_use(config: &Config, id: &str) -> Result<String, ManageError> {
     referrers.sort();
     referrers.dedup();
     let decision_can_run = config.causal_tree.enabled
-        && crate::decision::factory::configured_selection(&config.causal_tree.backend).is_some_and(|selection| {
-            selection.locality != crate::decision::BackendLocality::Remote || config.causal_tree.backend.remote_enabled
-        });
+        && crate::config::schema::causal_tree::configured_selection(&config.causal_tree.backend).is_some_and(
+            |selection| {
+                selection.locality != crate::config::schema::causal_tree::BackendLocality::Remote
+                    || config.causal_tree.backend.remote_enabled
+            },
+        );
     if decision_refers && decision_can_run {
         let mut description = format!("configured for the enabled decision backend ({DECISION_PATH})");
         if !referrers.is_empty() {
@@ -1781,12 +1784,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("test: temp dir");
         let config = loaded(dir.path(), |config| {
             config.causal_tree.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+            );
             config.causal_tree.backend.endpoint = ENDPOINT.into();
             config.causal_tree.backend.model = "decider-1".into();
             config.causal_tree.backend.credential_ref =
-                crate::causal_tree::config::CredentialRefSetting::Profile("cred-decision-used".into());
+                crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decision-used".into());
             config.providers.models.push(
                 serde_json::from_value(serde_json::json!({
                     "provider": format!("custom:{ENDPOINT}"),
@@ -2008,12 +2012,13 @@ mod tests {
             "{credentials:?}"
         );
         let mut combined = (*service.config()).clone();
-        combined.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        combined.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+        );
         combined.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".into();
         combined.causal_tree.backend.model = "decider-1".into();
         combined.causal_tree.backend.credential_ref =
-            crate::causal_tree::config::CredentialRefSetting::Profile("cred-shared".into());
+            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-shared".into());
         let disabled = reference_use(&combined, "cred-shared").expect("test: disabled status");
         assert!(disabled.contains("causal_tree.backend.credential_ref"), "{disabled}");
         assert!(

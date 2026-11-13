@@ -19,26 +19,27 @@ use crate::causal_tree::candidate_generator::{
 };
 use crate::causal_tree::decision_engine::PredictionPort;
 use crate::causal_tree::gates::GateInputs;
-use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::questions::{CompilerPolicy, QuestionCompiler};
-use crate::causal_tree::state::{CausalState, DerivedState, HopLineage, TrustedState};
+use crate::causal_tree::state::{CausalState, DerivedState, HopLineage};
 use crate::config::Config;
-use crate::decision::budget::DecisionAttemptAccounting;
+use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode, effective_engine_backend};
+use crate::cost::decision_attempt::DecisionAttemptAccounting;
 use crate::decision::factory::DecisionBackendFactory;
-use crate::decision::telemetry::CausalLineage;
 use crate::decision::{CandidateQuestion, GlobalQuestion, QuestionId, RequestLimits};
-use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode, effective_engine_backend};
 use crate::decision_engine::observe::{ObserveQueue, SqliteTelemetryWriter};
 use crate::decision_engine::{DecisionEngine, IntentAnalysis, IntentInput, TurnOutcome};
+use crate::observability::causal_event::CausalLineage;
 use crate::providers::catalog::ResolvedModel;
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::turn_context::TurnRuntimeContext;
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogView, SurfacePolicy};
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, CausalActionKind};
 use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
 use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
+use crate::tools::capability::turn_state::TrustedState;
 
 /// Exact call fingerprints by candidate id.
 pub(crate) type CallFingerprints = BTreeMap<CandidateId, [u8; 32]>;
@@ -325,7 +326,7 @@ impl DecisionAdvisory {
         #[cfg(test)]
         crate::decision_engine::access_spy::record_constructor(&self.config.workspace_dir);
         let backend = effective_engine_backend(&self.config);
-        if let Some(selection) = crate::decision::factory::configured_selection(backend) {
+        if let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) {
             // Builtin and cache hits spend nothing; a configured backend is
             // priced at its worst case before it may run.
             let tokens = u64::from(backend.max_request_bytes).saturating_add(u64::from(backend.max_response_bytes));

@@ -19,9 +19,13 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::decision::BackendKind;
-use crate::decision::loopback::{EndpointError, EndpointLocality, check_endpoint};
-use crate::decision::model_pin::is_unpinned_model;
+use crate::providers::loopback::{EndpointError, EndpointLocality, check_endpoint};
+use crate::providers::model_pin::is_unpinned_model;
+
+mod backend_kind;
+pub use backend_kind::{
+    BackendKind, BackendLocality, ConfiguredSelection, configured_kind, configured_selection, locality_of,
+};
 
 // ---------------------------------------------------------------------------
 // Defaults

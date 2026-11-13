@@ -72,7 +72,7 @@ pub(super) async fn start_local_control(
                             let text = std::str::from_utf8(&line).context("local review input is not UTF-8")?;
                             let fields: Vec<_> = text.split_whitespace().collect();
                             let outcome = handle.block_on(async {
-                                use crate::causal_tree::ids::DecisionId;
+                                use crate::security::decision_id::DecisionId;
                                 match fields.as_slice() {
                                     ["show", session, id] => {
                                         let view = service

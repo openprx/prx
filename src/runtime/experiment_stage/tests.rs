@@ -6,7 +6,7 @@ use crate::skills::lifecycle::experiment::*;
 
 #[tokio::test]
 async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel() -> anyhow::Result<()> {
-    use crate::decision::budget::DecisionAttemptReceipt;
+    use crate::cost::decision_attempt::DecisionAttemptReceipt;
     use crate::tools::traits::Tool as _;
     use crate::{
         config::Config,
@@ -90,7 +90,7 @@ async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel(
                 key,
                 crate::runtime::turn_cleanup::current_tracker().unwrap(),
                 [9; 32],
-                crate::causal_tree::state::TurnBudgets {
+                crate::tools::capability::turn_state::TurnBudgets {
                     tokens: 1024,
                     micro_usd: 10_000,
                     latency_ms: 30_000,
@@ -110,7 +110,7 @@ async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel(
             };
             let receipt = child.begin_physical(estimate()).await?;
             Box::new(receipt)
-                .settle(crate::decision::protocol::DecisionUsage {
+                .settle(crate::cost::decision_attempt::DecisionUsage {
                     input_tokens: Some(5),
                     output_tokens: Some(2),
                     cost_micro_usd: None,
@@ -184,7 +184,7 @@ async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel(
 #[tokio::test]
 async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented_scope_redirects() -> anyhow::Result<()>
 {
-    use crate::decision::budget::DecisionAttemptReceipt;
+    use crate::cost::decision_attempt::DecisionAttemptReceipt;
     use crate::runtime::decision_accounting::{AccountingScope, PhysicalEstimate};
     use crate::runtime::{experiment_stage::ExperimentStageRuntime, turn_cleanup::CleanupScope};
     use std::{
@@ -265,7 +265,7 @@ async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented
                     key.clone(),
                     crate::runtime::turn_cleanup::current_tracker().unwrap(),
                     [9; 32],
-                    crate::causal_tree::state::TurnBudgets {
+                    crate::tools::capability::turn_state::TurnBudgets {
                         tokens: 1024,
                         micro_usd: 10_000,
                         latency_ms: 30_000,
@@ -291,7 +291,10 @@ async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented
             first.ensure_active()?;
             second.ensure_active()?;
             let refused = second.scope(retained.begin_physical(estimate())).await;
-            assert!(matches!(refused, Err(crate::decision::DecisionError::BudgetExceeded)));
+            assert!(matches!(
+                refused,
+                Err(crate::cost::decision_attempt::DecisionError::BudgetExceeded)
+            ));
             let tracker = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), root.path())?;
             for runtime in [&first, &second] {
                 let usage = tracker.physical_scope_usage(&runtime.scope_id())?;
@@ -303,7 +306,7 @@ async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented
             // the current second owner; same-parent forwarding has its own test.
             let receipt = second.scope(unparented.begin_physical(estimate())).await?;
             Box::new(receipt)
-                .settle(crate::decision::protocol::DecisionUsage {
+                .settle(crate::cost::decision_attempt::DecisionUsage {
                     input_tokens: Some(5),
                     output_tokens: Some(2),
                     cost_micro_usd: None,

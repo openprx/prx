@@ -62,7 +62,7 @@ impl DecisionBackend for FilesystemApprovalBackend {
         request: &DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
     ) -> Result<DecisionResponse, DecisionError> {
         self.evaluate(request, body, deadline).await
     }
@@ -174,8 +174,9 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
     };
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
     config.causal_tree.enabled = true;

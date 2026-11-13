@@ -11,6 +11,7 @@ mod causal_policy;
 mod compaction;
 mod config;
 mod decision_backend;
+mod decision_engine;
 mod decision_seals;
 mod decision_terminals;
 mod helpers;

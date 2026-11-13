@@ -484,7 +484,7 @@ async fn old_read_only_stores_project_absent_columns_without_migration() {
         assert_eq!(hash_after, hash_before);
     }
 }
-use crate::decision::telemetry::testing::RecordingSink;
+use crate::observability::causal_event::testing::RecordingSink;
 
 fn id(n: u8) -> DecisionId {
     DecisionId::legacy(&[n; 32])

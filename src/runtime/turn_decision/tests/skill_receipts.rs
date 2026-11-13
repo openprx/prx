@@ -51,7 +51,7 @@ impl DecisionBackend for SelectSkillBackend {
         request: &DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
     ) -> Result<DecisionResponse, DecisionError> {
         self.evaluate(request, body, deadline).await
     }
@@ -132,8 +132,9 @@ fn managed_store(workspace: &std::path::Path, owner: &str) -> SkillLifecycleStor
 fn base_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.to_owned();
     config.skills.open_skills_dir = Some(workspace.join("missing-open-skills").to_string_lossy().to_string());
     config.skills.openclaw_skills_dir = Some(workspace.join("missing-openclaw-skills").to_string_lossy().to_string());
@@ -358,8 +359,9 @@ async fn crashed_after_marker(
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
     let generation = crate::config::new_shared(config.clone()).pin();

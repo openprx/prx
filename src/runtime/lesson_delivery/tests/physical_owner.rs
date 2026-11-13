@@ -2,13 +2,13 @@
 //! Real reservation/Tally/transport boundary. No prepared-context constructor
 //! or adoption/profile proof is fabricated by this owned-receipt fixture.
 use super::*;
-use crate::causal_tree::state::TurnBudgets;
 use crate::config::Config;
 use crate::providers::attempt_accounting::{AttemptAccounting, PhysicalKind, PhysicalRequest};
 use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
 use crate::providers::credential_probe::{CredentialProbe, PROBE_MODEL};
 use crate::runtime::decision_accounting::{AccountingScope, PhysicalEstimate};
 use crate::skills::lifecycle::{ManagedProviderModel, ModelCallError, ProposerModel, TallyCounters};
+use crate::tools::capability::turn_state::TurnBudgets;
 
 const PROVIDER: &str = "fixture-owned-provider";
 

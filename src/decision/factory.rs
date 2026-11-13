@@ -40,7 +40,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::backend::{DecisionBackend, locality_of};
+use super::backend::DecisionBackend;
 use super::breaker::{BreakerState, BreakerTransition, CircuitBreaker};
 use super::builtin::BuiltinDecisionBackend;
 use super::cache::{CacheKey, DecisionCache};
@@ -55,11 +55,11 @@ use super::telemetry::{
 };
 use super::validate::{DecisionResponseValidator, ModelVersionPolicy, ValidatedDecision, ValidationContext};
 use super::wire::SystemOneCodec;
-use crate::causal_tree::config::{BackendSelection, CredentialRefSetting, DecisionBackendConfig};
 use crate::config::Config;
+use crate::config::schema::causal_tree::locality_of;
+use crate::config::schema::causal_tree::{BackendSelection, DecisionBackendConfig};
 use crate::providers::ProviderId;
 use crate::providers::catalog::{CatalogView, ResolutionError, ResolvedModel};
-use crate::providers::credentials::CredentialRef;
 use crate::security::runtime_key::DecisionKey;
 
 /// The shortest attempt worth starting.
@@ -315,7 +315,7 @@ pub(crate) struct SlotLimits {
 #[cfg(test)]
 impl Default for SlotLimits {
     fn default() -> Self {
-        let defaults = crate::causal_tree::config::DecisionBackendConfig::default();
+        let defaults = crate::config::schema::causal_tree::DecisionBackendConfig::default();
         Self {
             timeout: Duration::from_millis(u64::from(defaults.timeout_ms)),
             failure_threshold: defaults.circuit_breaker.failure_threshold,
@@ -363,7 +363,7 @@ impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction
         &'a self,
         request: &'a crate::decision::DecisionRequest,
         lineage: &'a CausalLineage,
-    ) -> Result<PredictionResult, crate::decision::DecisionError> {
+    ) -> Result<PredictionResult, crate::cost::decision_attempt::DecisionError> {
         self.factory
             .decide_with_accounting(request, lineage, self.accounting)
             .await
@@ -425,73 +425,8 @@ impl std::fmt::Debug for DecisionBackendFactory {
     }
 }
 
-/// The configured non-builtin backend kind, if any: `auto` with an
-/// endpoint is the compatible backend, `auto` without one and `builtin` are
-/// none. The one reading of the `kind` setting, shared with the
-/// configuration's risk rule (D-082 N-5).
-#[must_use]
-pub fn configured_kind(backend: &DecisionBackendConfig) -> Option<BackendKind> {
-    match backend.kind {
-        BackendSelection::Auto if backend.endpoint.trim().is_empty() => None,
-        BackendSelection::Auto => Some(BackendKind::CompatibleHttp),
-        BackendSelection::Fixed(BackendKind::Builtin) => None,
-        BackendSelection::Fixed(kind) => Some(kind),
-    }
-}
-
-/// The provider a configured backend belongs to.
-fn provider_of(kind: BackendKind, endpoint: &str) -> String {
-    match kind {
-        BackendKind::CompatibleHttp => format!("custom:{endpoint}"),
-        other => other.as_str().to_string(),
-    }
-}
-
-/// The credential reference the strict selection checks (D-040 OQ-A4,
-/// D-074): an explicit `"none"` is anonymous; an unset reference is
-/// anonymous only on a literal loopback endpoint, and otherwise names the
-/// provider's own store, which a hosted backend refuses (it takes an auth
-/// profile only).
-fn credential_ref_for(setting: &CredentialRefSetting, locality: BackendLocality) -> CredentialRef {
-    match (setting, locality) {
-        (CredentialRefSetting::None, _) | (CredentialRefSetting::Unset, BackendLocality::Loopback) => {
-            CredentialRef::None
-        }
-        (CredentialRefSetting::Unset, BackendLocality::Builtin | BackendLocality::Remote) => {
-            CredentialRef::ProviderStore
-        }
-        (CredentialRefSetting::Profile(id), _) => CredentialRef::Profile { id: id.clone() },
-    }
-}
-
-/// The backend an effective engine backend configures (R55), as the strict
-/// selection sees it; `None` for the builtin, or `auto` without an
-/// endpoint. The factory builds from it and the configuration check
-/// (`config::manage::validate`) checks it, so both read one rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfiguredSelection {
-    pub kind: BackendKind,
-    pub locality: BackendLocality,
-    /// The provider id the backend belongs to (the owner of its credential).
-    pub provider: String,
-    /// The credential the strict selection checks.
-    pub credential: CredentialRef,
-}
-
-/// The configured selection of `backend` (the effective engine backend,
-/// `decision_engine::config::effective_engine_backend`, for every engine use).
-#[must_use]
-pub fn configured_selection(backend: &DecisionBackendConfig) -> Option<ConfiguredSelection> {
-    let kind = configured_kind(backend)?;
-    let endpoint = backend.endpoint.trim();
-    let locality = locality_of(kind, endpoint);
-    Some(ConfiguredSelection {
-        kind,
-        locality,
-        provider: provider_of(kind, endpoint),
-        credential: credential_ref_for(&backend.credential_ref, locality),
-    })
-}
+// Forwarding path until Part 2: moved to `config::schema::causal_tree` (R17).
+pub use crate::config::schema::causal_tree::{ConfiguredSelection, configured_kind, configured_selection};
 
 fn builtin_shadow(request: &DecisionRequest) -> Result<ValidatedDecision, BuiltinFailure> {
     let response = BuiltinDecisionBackend::answer(request).map_err(BuiltinFailure)?;
@@ -716,7 +651,7 @@ impl DecisionBackendFactory {
     /// the configured backend, [`FactoryBuildError::Transport`] when it
     /// cannot be built.
     pub fn from_config(config: &Config, deps: FactoryDeps<'_>) -> Result<Self, FactoryBuildError> {
-        let backend = crate::decision_engine::config::effective_engine_backend(config);
+        let backend = crate::config::schema::decision_engine::effective_engine_backend(config);
         let enabled = config.decision_engine.enabled;
         #[cfg(any(test, feature = "test-mock"))]
         if backend.kind == BackendSelection::Fixed(BackendKind::Mock) {
@@ -897,7 +832,7 @@ impl DecisionBackendFactory {
         secrets: OutboundSecrets,
         limits: SlotLimits,
     ) -> Self {
-        let defaults = crate::causal_tree::config::DecisionBackendConfig::default();
+        let defaults = crate::config::schema::causal_tree::DecisionBackendConfig::default();
         Self {
             enabled: true,
             budget_unproven: false,
@@ -1342,7 +1277,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::causal_tree::config::CausalTreeConfig;
+    use crate::config::schema::causal_tree::CausalTreeConfig;
+    use crate::config::schema::causal_tree::CredentialRefSetting;
     use crate::decision::mock::{MockDecisionBackend, MockOutcome, MockStep};
     use crate::decision::protocol::{
         DecisionQuestion, DecisionResponse, GlobalQuestion, QuestionId, RequestLimits, RequestParts, StructuredValue,
@@ -1430,19 +1366,19 @@ mod tests {
         owner_deadline: Instant,
     }
 
-    impl crate::decision::budget::sealed::AccountingOwner for DeadlineAccounting {}
-    impl crate::decision::budget::sealed::AttemptReceipt for DeadlineReceipt {}
+    impl crate::cost::decision_attempt::sealed::AccountingOwner for DeadlineAccounting {}
+    impl crate::cost::decision_attempt::sealed::AttemptReceipt for DeadlineReceipt {}
 
     #[async_trait]
-    impl crate::decision::budget::DecisionAttemptAccounting for DeadlineAccounting {
+    impl crate::cost::decision_attempt::DecisionAttemptAccounting for DeadlineAccounting {
         fn remaining_budget(&self) -> (u64, u64) {
             (u64::MAX, u64::MAX)
         }
 
         async fn begin(
             &self,
-            attempt: crate::decision::budget::AttemptBinding<'_>,
-        ) -> Result<Box<dyn crate::decision::budget::DecisionAttemptReceipt>, DecisionError> {
+            attempt: crate::cost::decision_attempt::AttemptBinding<'_>,
+        ) -> Result<Box<dyn crate::cost::decision_attempt::DecisionAttemptReceipt>, DecisionError> {
             if attempt.deadline() < self.minimum_attempt_deadline {
                 return Err(DecisionError::BudgetExceeded);
             }
@@ -1453,14 +1389,14 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::decision::budget::DecisionAttemptReceipt for DeadlineReceipt {
+    impl crate::cost::decision_attempt::DecisionAttemptReceipt for DeadlineReceipt {
         fn deadline(&self) -> Instant {
             self.owner_deadline
         }
 
         async fn settle(
             self: Box<Self>,
-            _usage: crate::decision::protocol::DecisionUsage,
+            _usage: crate::cost::decision_attempt::DecisionUsage,
         ) -> Result<(), DecisionError> {
             Ok(())
         }
@@ -1498,12 +1434,12 @@ mod tests {
             request: &DecisionRequest,
             body: &GuardedBody,
             deadline: Instant,
-            accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+            accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
         ) -> Result<DecisionResponse, DecisionError> {
             const TRANSPORT_BINDING: [u8; 32] = [7; 32];
             let receipt = accounting
                 .ok_or(DecisionError::BudgetExceeded)?
-                .begin(crate::decision::budget::AttemptBinding {
+                .begin(crate::cost::decision_attempt::AttemptBinding {
                     backend: &self.identity,
                     provider: "test",
                     model: MODEL,
@@ -1712,7 +1648,7 @@ mod tests {
                 key,
                 transports,
                 config_generation: 7,
-                events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+                events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
             },
         )
     }
@@ -2012,27 +1948,6 @@ mod tests {
         assert_eq!(result.attempts.len(), 1);
         assert_eq!(result.attempts[0].outcome, AttemptOutcome::Served);
         assert_eq!(result.fallback_order.last(), Some(&BuiltinDecisionBackend::identity()));
-    }
-
-    /// D-040 OQ-A4, D-074: anonymous only when asked for, or on a literal
-    /// loopback endpoint; otherwise the provider's own store, which a hosted
-    /// backend refuses.
-    #[test]
-    fn an_unset_credential_is_anonymous_only_on_loopback() {
-        assert_eq!(
-            credential_ref_for(&CredentialRefSetting::Unset, BackendLocality::Loopback),
-            CredentialRef::None
-        );
-        assert_eq!(
-            credential_ref_for(&CredentialRefSetting::Unset, BackendLocality::Remote),
-            CredentialRef::ProviderStore
-        );
-        for locality in [BackendLocality::Loopback, BackendLocality::Remote] {
-            assert_eq!(
-                credential_ref_for(&CredentialRefSetting::None, locality),
-                CredentialRef::None
-            );
-        }
     }
 
     /// D-077: a backend whose health probe failed is left out of every
@@ -2781,7 +2696,10 @@ mod tests {
         // D-079 L-9: a cache hit carries the current request's id and no
         // usage of its own.
         assert_eq!(cached.served.request_id(), again.request_id());
-        assert_eq!(cached.served.usage(), &crate::decision::DecisionUsage::default());
+        assert_eq!(
+            cached.served.usage(),
+            &crate::cost::decision_attempt::DecisionUsage::default()
+        );
         assert_eq!(cached.served.provider_request_id(), None);
         assert_eq!(mock.calls(), 1);
         assert_eq!(
@@ -2949,7 +2867,7 @@ mod tests {
     /// failed and fell back to B; B started and served as the fallback.
     #[tokio::test]
     async fn every_causal_event_emitted_with_lineage() {
-        use crate::decision::telemetry::{CausalEventKind as Kind, CircuitState, ServedLabel};
+        use crate::observability::causal_event::{CausalEventKind as Kind, CircuitState, ServedLabel};
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let key = key(&temp);
         let request = request(&key);
@@ -2963,7 +2881,7 @@ mod tests {
             "b",
             vec![MockStep::now(MockOutcome::Respond(answer_as(&request, "b")))],
         );
-        let sink = Arc::new(crate::decision::telemetry::testing::RecordingSink::default());
+        let sink = Arc::new(crate::observability::causal_event::testing::RecordingSink::default());
         let limits = SlotLimits {
             failure_threshold: 1,
             ..SlotLimits::default()
@@ -3004,7 +2922,7 @@ mod tests {
         assert_eq!(events[5].fields.served, Some(ServedLabel::Fallback));
 
         // The builtin serving is an event too.
-        let sink = Arc::new(crate::decision::telemetry::testing::RecordingSink::default());
+        let sink = Arc::new(crate::observability::causal_event::testing::RecordingSink::default());
         let (only, _) = scripted(
             &key,
             "a",
@@ -3043,7 +2961,7 @@ mod tests {
         hostile.resolved_model = "HOSTILE-CLAIMED-MODEL".to_string();
         let (first, _) = scripted(&key, "a", vec![MockStep::now(MockOutcome::Respond(hostile))]);
         let observer = Arc::new(crate::observability::PrometheusObserver::try_new().expect("test: observer"));
-        let sink = crate::decision::telemetry::ObserverCausalSink::new(
+        let sink = crate::observability::causal_event::ObserverCausalSink::new(
             Arc::clone(&observer) as Arc<dyn crate::observability::Observer>
         );
         let factory = DecisionBackendFactory::from_slots(

@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 /// This reads actual scoped rows; a prior queue admission grants no authority.
 pub(super) struct ReplayChain {
     scope: DecisionScope,
-    ids: Vec<crate::causal_tree::ids::DecisionId>,
+    ids: Vec<crate::security::decision_id::DecisionId>,
     deadline: Instant,
     done: oneshot::Sender<Result<Vec<Option<DecisionReplayRecord>>, StoreError>>,
 }
@@ -19,7 +19,7 @@ impl DecisionStoreWriter {
     pub(crate) async fn replay_chain(
         &self,
         scope: DecisionScope,
-        ids: Vec<crate::causal_tree::ids::DecisionId>,
+        ids: Vec<crate::security::decision_id::DecisionId>,
         deadline: Instant,
     ) -> Result<Vec<Option<DecisionReplayRecord>>, StoreError> {
         recovery_time_left(deadline)?;

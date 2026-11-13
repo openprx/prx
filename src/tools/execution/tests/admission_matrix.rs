@@ -722,7 +722,7 @@ pub(in crate::tools::execution::tests) mod child_fixture {
             };
             let key = DecisionKey::ephemeral();
             let parent = CapabilityConstraints {
-                parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
+                parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
                 allowed: [
                     "config_reload",
                     "file_write",

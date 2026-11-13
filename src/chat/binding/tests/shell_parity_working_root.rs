@@ -265,7 +265,7 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
                     memory: memory.clone(),
                     plugin_generation: 0,
                 }
-                .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+                .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
                 .await?;
                 owner.retain_service(publication.clone());
                 use crate::runtime::turn_source::TurnSourceProof as _;

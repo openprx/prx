@@ -71,7 +71,7 @@ pub enum ObserverEvent {
     /// A decision-plane event (CDP 18): a kind, the lineage of its decision
     /// and bounded fields. The lineage goes to logs and trace attributes
     /// only, never to a metric label.
-    Causal(Box<crate::decision::telemetry::CausalEvent>),
+    Causal(Box<crate::observability::causal_event::CausalEvent>),
 }
 
 /// Numeric metrics emitted by the agent runtime.

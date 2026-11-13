@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(reloaded.causal_tree, causal);
         assert_eq!(
             reloaded.causal_tree.schema_version,
-            crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+            crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
         );
         let mut stored = tokio::fs::read_to_string(&config_path).await.unwrap();
         if let Ok(entries) = std::fs::read_dir(tmp.path().join("config.d")) {
@@ -825,7 +825,7 @@ mod tests {
         assert!(
             stored.contains(&format!(
                 "schema_version = {}",
-                crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+                crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
             )),
             "{stored}"
         );

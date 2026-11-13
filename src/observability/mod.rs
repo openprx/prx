@@ -1,3 +1,4 @@
+pub mod causal_event;
 pub mod chat_metrics;
 pub mod labels;
 pub mod log;

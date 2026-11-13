@@ -112,7 +112,7 @@ pub(crate) fn assert_plane_off_no_decision_store(workspace: &Path) {
         "plane-off created .decision_key"
     );
     assert!(
-        !crate::causal_tree::store::db_path(workspace).exists(),
+        !crate::runtime::decision_journal::store::db_path(workspace).exists(),
         "plane-off created decisions.db"
     );
 }

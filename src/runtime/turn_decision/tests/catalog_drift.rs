@@ -55,8 +55,9 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.causal_tree.enabled = false;
         config.workspace_dir = workspace.path().to_path_buf();
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -156,8 +157,9 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;

@@ -37,9 +37,9 @@
 //! the engine is a `[decision_engine]` change, checked in full. Nothing is
 //! sent anywhere.
 
-use crate::causal_tree::config::BackendSelection;
 use crate::config::Config;
-use crate::decision::BackendKind;
+use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::causal_tree::BackendSelection;
 
 /// Whether the decision plane of `candidate` differs from `current` in
 /// what the check reads.
@@ -55,7 +55,7 @@ fn changed(current: Option<&Config>, candidate: &Config) -> bool {
 /// the setting and the reason; never a credential.
 fn check_section(config: &Config) -> Result<(), String> {
     // The same effective engine backend the factory builds from (R55).
-    let backend = crate::decision_engine::config::effective_engine_backend(config);
+    let backend = crate::config::schema::decision_engine::effective_engine_backend(config);
     let nothing_remote = match backend.kind {
         BackendSelection::Fixed(BackendKind::Builtin) => true,
         BackendSelection::Auto => backend.endpoint.trim().is_empty(),
@@ -68,7 +68,7 @@ fn check_section(config: &Config) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let Some(selection) = crate::decision::factory::configured_selection(backend) else {
+    let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) else {
         return Ok(());
     };
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
@@ -263,7 +263,7 @@ mod tests {
         current.decision_engine.enabled = true;
         current.config_path = temp.path().join("config.toml");
         current.causal_tree.backend.credential_ref =
-            crate::causal_tree::config::CredentialRefSetting::Profile("cred-decider".to_string());
+            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decider".to_string());
         std::fs::write(temp.path().join("auth-profiles.json"), "not json").unwrap();
         let mut candidate = current.clone();
         candidate
@@ -320,12 +320,12 @@ mod tests {
             let other = references
                 .set("openai", "chat-key", "sk-HOSTED-OTHER-SENTINEL-02")
                 .unwrap();
-            let with = |reference: crate::causal_tree::config::CredentialRefSetting| {
+            let with = |reference: crate::config::schema::causal_tree::CredentialRefSetting| {
                 let mut config = config.clone();
                 config.causal_tree.backend.credential_ref = reference;
                 check_decision_plane(None, &config)
             };
-            use crate::causal_tree::config::CredentialRefSetting as Ref;
+            use crate::config::schema::causal_tree::CredentialRefSetting as Ref;
             assert_eq!(with(Ref::Profile(own.id.clone())), Ok(None), "{provider}");
             for refused in [
                 Ref::Profile(other.id.clone()),
@@ -362,7 +362,7 @@ mod tests {
         let mut config = loopback_plane();
         config.config_path = temp.path().join("config.toml");
         config.causal_tree.backend.credential_ref =
-            crate::causal_tree::config::CredentialRefSetting::Profile("cred-decider".to_string());
+            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decider".to_string());
         std::fs::write(temp.path().join("auth-profiles.json"), "not json")
             .expect("test: disabled_engine_never_opens_the_credential_store fixture operation");
         assert_eq!(check_decision_plane(None, &config), Ok(None));

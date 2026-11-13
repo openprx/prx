@@ -159,7 +159,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         // the text-only case omits vision, not the explicit local prediction.
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
         // Narrow the allowed hops: one genuine memory read, then the existing
         // fresh-evidence terminal gate. Scoring thresholds remain unchanged.
         config.causal_tree.policy.max_decision_hops = 1;
@@ -462,7 +462,7 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         assert!(rows.iter().all(|row| row.0 != "retrieve"));
         let (directive, candidates, gates) = rows.get(1).expect("terminal refusal decision");
         assert_eq!(directive, "refuse");
-        let candidates: Vec<crate::causal_tree::store::RecordedCandidate> =
+        let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> =
             serde_json::from_str(candidates).expect("actual typed kept candidate records");
         assert!(
             candidates

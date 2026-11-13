@@ -156,7 +156,7 @@ impl DecisionBackend for ParentDelegateBackend {
         request: &DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
     ) -> Result<DecisionResponse, DecisionError> {
         self.evaluate(request, body, deadline).await
     }
@@ -320,8 +320,9 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         }
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.workspace_dir = workspace.clone();
         config.config_path = config_dir.join("config.toml");
         config.default_provider = Some("ollama".into());
@@ -909,8 +910,9 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     }
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());
@@ -1138,7 +1140,9 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         let mut trusted = resumed.trusted.parts().clone();
         trusted
             .constraints
-            .push(crate::causal_tree::state::ConstraintCode::new("resume_exact_call"));
+            .push(crate::tools::capability::turn_state::ConstraintCode::new(
+                "resume_exact_call",
+            ));
         resumed.trusted = TrustedState::from_runtime(trusted);
         assert_eq!(
             HardGates::check_one(&resumed, &view, candidate, &gates),
@@ -1243,8 +1247,9 @@ async fn durability_readback_body(
     }
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());
@@ -1301,9 +1306,9 @@ async fn durability_readback_body(
     let transports = CountingTransports(AtomicUsize::new(0));
     // Pre-open the shared store with a writer hold; the service joins it.
     let hold = Arc::new(parking_lot::Mutex::new(()));
-    let held_store = crate::causal_tree::store::CausalDecisionStore::open_shared_held(
+    let held_store = crate::runtime::decision_journal::store::CausalDecisionStore::open_shared_held(
         &workspace,
-        crate::causal_tree::store::Retention::days(1, 1),
+        crate::runtime::decision_journal::store::Retention::days(1, 1),
         Arc::new(SilentEvents),
         Arc::clone(&hold),
     )?;

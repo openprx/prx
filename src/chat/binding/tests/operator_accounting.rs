@@ -167,7 +167,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             memory: Arc::clone(&memory),
             plugin_generation: 0,
         }
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
         .await?;
         owner.retain_service(Arc::clone(&service));
         let task = "What is 2 plus 2?";

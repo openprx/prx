@@ -714,7 +714,7 @@ async fn config_toml_roundtrip() {
         nodes: NodesConfig::default(),
         agents: HashMap::new(),
         media: MediaConfig::default(),
-        causal_tree: crate::causal_tree::CausalTreeConfig::default(),
+        causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
         decision_engine: Default::default(),
         security: SecurityConfig::default(),
         compliance: ComplianceConfig::default(),
@@ -845,8 +845,9 @@ reasoning_enabled = false
 #[test]
 async fn hosted_latency_warning_does_not_change_the_configured_ceiling() {
     let mut config = Config::default();
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::OpenRouter,
+    );
     config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
     let warning = config
         .decision_latency_budget_warning()

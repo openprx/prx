@@ -53,7 +53,7 @@ impl ChannelDecisionSlot {
             memory: Arc::clone(&memory),
             plugin_generation: self.plugin_generation,
         }
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Channel)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Channel)
         .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service

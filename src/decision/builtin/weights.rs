@@ -4,13 +4,8 @@
 
 use super::features::Action;
 
-/// The model identifier the builtin reports.
-pub const MODEL_VERSION: &str = "builtin-v4";
-
-/// An artifact younger than this (ms) is fresh evidence.
-pub const FRESH_ARTIFACT_MS: u64 = 5 * 60 * 1000;
-/// An artifact older than this (ms) may be stale.
-pub const STALE_ARTIFACT_MS: u64 = 60 * 60 * 1000;
+// Forwarding path until Part 2: moved to `tools::capability::turn_state` (R15).
+pub use crate::tools::capability::turn_state::{FRESH_ARTIFACT_MS, MODEL_VERSION, STALE_ARTIFACT_MS};
 
 /// The evidence-sufficient probability of a plain conversational turn (or a
 /// model-managed delegation) with no artifacts and no lookups. The builtin

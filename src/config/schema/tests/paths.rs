@@ -101,7 +101,7 @@ extra_latency_budget_ms = 500
     let upgraded = crate::config::manage::mutation::causal::CausalConfigService::mutate(
         &loaded,
         &[crate::config::manage::mutation::causal::CausalMutation::SetBackend {
-            kind: crate::decision::BackendKind::OpenRouter,
+            kind: crate::config::schema::causal_tree::BackendKind::OpenRouter,
             endpoint: None,
             model: Some("typesafe/jev-1.13".to_owned()),
             pinned_snapshot: None,

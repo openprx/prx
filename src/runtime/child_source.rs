@@ -553,7 +553,7 @@ mod recursive;
 
 pub(crate) struct ChildGrantRuntime {
     pub(crate) recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
-    pub(crate) decision_store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    pub(crate) decision_store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
     pub(crate) source_fabric: MemoryFabric,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
     /// Present only for live issuance. Restored grants cannot write authority rows.

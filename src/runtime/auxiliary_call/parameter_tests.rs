@@ -84,7 +84,7 @@ async fn every_auxiliary_purpose_retains_prepared_parameters_after_success_or_fa
                 Arc::clone(&key),
                 Arc::clone(&cleanup),
                 [1; 32],
-                crate::causal_tree::state::TurnBudgets {
+                crate::tools::capability::turn_state::TurnBudgets {
                     tokens: 8000,
                     micro_usd: 1_000_000,
                     latency_ms: 500,

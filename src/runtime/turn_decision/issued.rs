@@ -82,7 +82,7 @@ impl TurnDecisionService {
             let writer = self.store.writer().ok_or(AgentDecisionError::RecordWriterUnavailable)?;
             // Admission to the bounded queue is not a durability receipt.
             // The writer reports a dropped chain through its incomplete event.
-            if writer.record_chain(records) == crate::causal_tree::store::Enqueue::Queued {
+            if writer.record_chain(records) == crate::runtime::decision_journal::store::Enqueue::Queued {
                 context.record_admitted.store(true, Ordering::Release);
             }
         }

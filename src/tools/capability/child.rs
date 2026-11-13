@@ -2,8 +2,8 @@ mod cost_allowance;
 pub(crate) mod wire;
 mod worker_constraints;
 
-use crate::causal_tree::ids::DecisionId;
 use crate::security::AutonomyLevel;
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use std::collections::BTreeSet;

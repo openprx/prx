@@ -1,6 +1,6 @@
 //! Known usage can overlap semantic admission while its durable hold stays owned.
 use super::{OwnedReceipt, reconcile_token_allowance};
-use crate::decision::DecisionError;
+use crate::cost::decision_attempt::DecisionError;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource, UsagePrice, usage_cost_resolution};
 use std::sync::atomic::Ordering;
 

@@ -384,11 +384,11 @@ impl crate::channels::traits::Channel for SpawnFixtureChannel {
 #[tokio::test]
 async fn bound_child_context_keeps_scope_pin_and_grant() {
     use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
-    use crate::causal_tree::state::TurnSurfaceKind;
     use crate::memory::{MemoryVisibility, MessageEventScope};
     use crate::runtime::child_source::ChildProviderBinding;
     use crate::runtime::turn_decision::{AgentTurnKind, TurnServiceBuild, build_turn_decision_service};
     use crate::tools::capability::catalog::CatalogSources;
+    use crate::tools::capability::turn_state::TurnSurfaceKind;
     use crate::tools::execution::{
         AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionCommand,
         ToolExecutionService, ToolExecutionStatus, TracingToolExecutionAudit,
@@ -618,11 +618,11 @@ pub(crate) async fn admit_priced_bound_child_segment() -> AdmittedBoundChild {
 
 async fn admit_bound_child_segment_with_pricing(priced: bool) -> AdmittedBoundChild {
     use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
-    use crate::causal_tree::state::TurnSurfaceKind;
     use crate::memory::{MemoryVisibility, MessageEventScope};
     use crate::runtime::child_source::ChildProviderBinding;
     use crate::runtime::turn_decision::{TurnServiceBuild, build_turn_decision_service};
     use crate::tools::capability::catalog::CatalogSources;
+    use crate::tools::capability::turn_state::TurnSurfaceKind;
     use crate::tools::execution::{
         AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
         TracingToolExecutionAudit,
@@ -1082,15 +1082,15 @@ async fn disabled_engine_constructs_nothing() {
     }
 
     for kind in [
-        crate::decision::BackendKind::Builtin,
-        crate::decision::BackendKind::CompatibleHttp,
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
     ] {
         let workspace = tempfile::tempdir().expect("test: local backend workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         let mut config = engine_off_config(workspace.path());
         config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(kind);
-        if kind == crate::decision::BackendKind::CompatibleHttp {
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(kind);
+        if kind == crate::config::schema::causal_tree::BackendKind::CompatibleHttp {
             config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
             config.causal_tree.backend.model = "prx-decision-probe".into();
             config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: declared loopback decision model"));
@@ -1106,13 +1106,14 @@ async fn disabled_engine_constructs_nothing() {
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let mut config = engine_off_config(workspace.path());
     config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+    );
     config.causal_tree.backend.remote_enabled = true;
     config.causal_tree.backend.endpoint = "https://example.invalid/v1".into();
     config.causal_tree.backend.model = "decision-model".into();
     config.causal_tree.backend.credential_ref =
-        crate::causal_tree::config::CredentialRefSetting::Profile("cred-engine-off".into());
+        crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-engine-off".into());
     config.providers.models.push(
         serde_json::from_value(serde_json::json!({
             "provider": "custom:https://example.invalid/v1",
@@ -1221,8 +1222,9 @@ async fn run_plain_fallback_cell(input: &str) {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
     // Pin confidence abstention even when the catalog makes Answer the clear winner.
     config.causal_tree.policy.commit_threshold = 1.0;
@@ -1513,8 +1515,10 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     use crate::runtime::decision_advisory::tests::{RecordingBackend, analysis_input, enabled_config};
     let temp = tempfile::tempdir().expect("test: budget workspace");
     let mut config = (*enabled_config(temp.path())).clone();
-    config.decision_engine.backend = Some(crate::causal_tree::config::DecisionBackendConfig {
-        kind: crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Mock),
+    config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
+        kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Mock,
+        ),
         model: "recording-model".into(),
         ..Default::default()
     });
@@ -1533,8 +1537,8 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     let advisory_with = |attempts: &Arc<std::sync::atomic::AtomicUsize>| {
         let factory = crate::decision::factory::DecisionBackendFactory::from_slots(
             vec![Box::new(RecordingBackend {
-                identity: crate::decision::BackendIdentity {
-                    kind: crate::decision::BackendKind::Mock,
+                identity: crate::cost::decision_attempt::BackendIdentity {
+                    kind: crate::config::schema::causal_tree::BackendKind::Mock,
                     provider: None,
                     configured_model: Arc::from("recording-model"),
                 },
@@ -1576,8 +1580,10 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     // Served: an engine-on turn whose priced analysis cannot be afforded
     // (no price for the remote decision model) is answered without a brief.
     let served = Box::pin(open_agent_turn(true, |config| {
-        config.decision_engine.backend = Some(crate::causal_tree::config::DecisionBackendConfig {
-            kind: crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp),
+        config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
+            kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+            ),
             remote_enabled: true,
             endpoint: "https://example.invalid/v1".into(),
             model: "decision-model".into(),

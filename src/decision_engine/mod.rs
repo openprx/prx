@@ -1,6 +1,7 @@
 //! Advisory intent analysis. This module never selects or authorizes execution.
 pub mod causal_adapter;
-pub mod config;
+// Forwarding path until Part 2: the schema lives in `config::schema::decision_engine`.
+pub use crate::config::schema::decision_engine as config;
 pub mod contract;
 pub mod noop;
 pub mod observe;

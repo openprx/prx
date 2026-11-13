@@ -52,7 +52,7 @@ pub(super) async fn open_store(
         .transpose()
         .map_err(TurnServiceBuildError::PreparationOwner)?;
     let config = &generation.effective;
-    Ok(crate::causal_tree::store_preparation::open_store(
+    Ok(crate::runtime::decision_journal::store_preparation::open_store(
         config.workspace_dir.clone(),
         Retention::days(
             config.causal_tree.store.retention_days,

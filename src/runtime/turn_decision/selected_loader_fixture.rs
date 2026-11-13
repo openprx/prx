@@ -14,8 +14,8 @@ use crate::decision::protocol::{
     BackendIdentity, BackendKind, BackendLocality, DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion,
     Probability, QuestionId,
 };
-use crate::decision::telemetry::CausalEventSink;
 use crate::decision::{DecisionError, DecisionKey, ModelVersionPolicy};
+use crate::observability::causal_event::CausalEventSink;
 
 tokio::task_local! {
     static FIRST_OTHER: Arc<std::sync::atomic::AtomicBool>;
@@ -80,7 +80,7 @@ impl DecisionBackend for FirstOtherBackend {
         request: &DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
     ) -> Result<DecisionResponse, DecisionError> {
         // Local deterministic computation does not invent a physical attempt.
         self.evaluate(request, body, deadline).await

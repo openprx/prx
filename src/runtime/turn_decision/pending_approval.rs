@@ -4,7 +4,6 @@ mod h2;
 mod sealed_call;
 use super::{TurnDecisionContext, TurnDecisionService};
 use crate::acl::approval_grant::{ApprovalGrantV2, RiskLevel, WitnessKeyring};
-use crate::causal_tree::ids::DecisionId;
 use crate::memory::MessageEvent;
 use crate::runtime::turn_source::TurnSourceProof;
 pub(crate) use crate::security::approval_ledger::pending::{
@@ -13,6 +12,7 @@ pub(crate) use crate::security::approval_ledger::pending::{
 };
 use crate::security::approval_ledger::pending::{PendingRecord, VerifiedDecisionApproval, scope_from_source};
 use crate::security::approval_ledger::{ApprovalLedger, ApprovalRuntime};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use chrono::Utc;

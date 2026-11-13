@@ -64,7 +64,7 @@ pub enum DecisionAdapterKind {
 
 impl DecisionAdapterKind {
     /// Whether the adapter talks to a hosted service, whose model must be
-    /// pinned (CDP 13.1; `crate::decision::model_pin`).
+    /// pinned (CDP 13.1; `crate::providers::model_pin`).
     #[must_use]
     pub const fn is_hosted(self) -> bool {
         matches!(self, Self::TypeSafe | Self::OpenRouter)

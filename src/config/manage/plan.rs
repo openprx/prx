@@ -262,7 +262,7 @@ impl ConfigChangeSummary {
         secret_writes.extend(attached_reference_paths);
         let decision_reference_added = matches!(
             &after.causal_tree.backend.credential_ref,
-            crate::causal_tree::config::CredentialRefSetting::Profile(_)
+            crate::config::schema::causal_tree::CredentialRefSetting::Profile(_)
         ) && before
             .is_none_or(|before| before.causal_tree.backend.credential_ref != after.causal_tree.backend.credential_ref);
         if decision_reference_added {
@@ -914,7 +914,7 @@ fn widenings(before: &Config, after: &Config) -> Vec<RiskReason> {
 /// [`secret_paths::ENDPOINT_PATHS`], so re-pointing it is an
 /// [`RiskReason::EndpointChanged`] from the tree walk above.
 fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskReason> {
-    let default_section = crate::causal_tree::config::CausalTreeConfig::default();
+    let default_section = crate::config::schema::causal_tree::CausalTreeConfig::default();
     let old_section = before.map_or(&default_section, |before| &before.causal_tree);
     let (old, new) = (&old_section.backend, &after.causal_tree.backend);
     let mut reasons = Vec::new();
@@ -970,12 +970,12 @@ fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskRe
 /// D-082 N-5): a hosted kind, or a compatible endpoint that is not a literal
 /// loopback address. The builtin, `auto` without an endpoint and a loopback
 /// endpoint are local.
-fn sends_remotely(section: &crate::causal_tree::config::CausalTreeConfig) -> bool {
+fn sends_remotely(section: &crate::config::schema::causal_tree::CausalTreeConfig) -> bool {
     section.enabled
         && section.backend.remote_enabled
-        && crate::decision::factory::configured_kind(&section.backend).is_some_and(|kind| {
-            crate::decision::backend::locality_of(kind, section.backend.endpoint.trim())
-                == crate::decision::BackendLocality::Remote
+        && crate::config::schema::causal_tree::configured_kind(&section.backend).is_some_and(|kind| {
+            crate::config::schema::causal_tree::locality_of(kind, section.backend.endpoint.trim())
+                == crate::config::schema::causal_tree::BackendLocality::Remote
         })
 }
 
@@ -1521,8 +1521,8 @@ mod tests {
     /// low.
     #[test]
     fn remote_decision_processing_changes_are_high_risk_and_narrowing_is_low() {
-        use crate::causal_tree::config::{BackendSelection, CredentialRefSetting};
-        use crate::decision::BackendKind;
+        use crate::config::schema::causal_tree::BackendKind;
+        use crate::config::schema::causal_tree::{BackendSelection, CredentialRefSetting};
         let reasons = |before: &Config, after: &Config| {
             let summary = ConfigChangeSummary::between(Some(before), after).expect("test: summary");
             assert_eq!(

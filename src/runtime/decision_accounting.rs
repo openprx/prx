@@ -10,17 +10,18 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::turn_cleanup::{CleanupTicket, CleanupTracker};
-use crate::causal_tree::state::TurnBudgets;
 use crate::config::Config;
+use crate::cost::decision_attempt::DecisionError;
+use crate::cost::decision_attempt::DecisionUsage;
+use crate::cost::decision_attempt::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
 use crate::cost::{
     reservation::{EstimatedReservationRequest, ReservationReceipt, ReservationRequest},
     tracker::CostTracker,
 };
-use crate::decision::budget::{self, AttemptBinding, DecisionAttemptAccounting, DecisionAttemptReceipt};
-use crate::decision::protocol::DecisionUsage;
-use crate::decision::{DecisionError, DecisionKey, KeyDomain};
 use crate::llm::route_decision::{TokenUsageSource, UsagePrice, usage_cost_resolution};
 use crate::providers::ProviderId;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
+use crate::tools::capability::turn_state::TurnBudgets;
 
 #[cfg(test)]
 pub(crate) mod timing;
@@ -182,7 +183,7 @@ impl AccountingScope {
     }
 }
 
-impl budget::sealed::AccountingOwner for AccountingScope {}
+impl decision_attempt::sealed::AccountingOwner for AccountingScope {}
 
 impl AccountingScope {
     /// The money one decision attempt of `tokens` may reserve on `provider`
@@ -708,7 +709,7 @@ impl Drop for OwnedReceipt {
     }
 }
 
-impl budget::sealed::AttemptReceipt for OwnedReceipt {}
+impl decision_attempt::sealed::AttemptReceipt for OwnedReceipt {}
 
 #[async_trait]
 impl DecisionAttemptReceipt for OwnedReceipt {

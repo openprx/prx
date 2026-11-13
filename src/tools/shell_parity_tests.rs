@@ -348,7 +348,7 @@ async fn full_parent_supervised_child_keeps_native_restrictions_after_approval()
     };
     let key = crate::security::runtime_key::DecisionKey::ephemeral();
     let parent = CapabilityConstraints {
-        parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
+        parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
         allowed: ["shell", "file_write", "file_read"]
             .into_iter()
             .map(reference)

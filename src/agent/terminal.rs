@@ -18,15 +18,15 @@ pub(crate) use replay::{
     verify_terminal_replay_journal, verify_terminal_replay_journal_until, verify_terminal_replay_until,
 };
 
-use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-use crate::causal_tree::store::{DecisionScope, DecisionStoreReader, DecisionStoreWriter, Enqueue};
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::memory::{Memory, MemoryFabric, MessageEvent, MessageEventScope};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
+use crate::runtime::decision_journal::store::{DecisionScope, DecisionStoreReader, DecisionStoreWriter, Enqueue};
 use crate::runtime::turn_decision::{SettlementIssueToken, TurnDecisionContext};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -1415,8 +1415,9 @@ mod tests {
             config.config_path = workspace.join("config.toml");
             config.causal_tree.enabled = enabled;
             config.causal_tree.policy.max_decision_hops = 1;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::Builtin,
+            );
             config.causal_tree.backend.remote_enabled = false;
             config.cost = cost_config.clone();
             config
@@ -1458,7 +1459,7 @@ mod tests {
                 memory: Arc::clone(&memory),
                 plugin_generation: 0,
             }
-            .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+            .publish(crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop)
             .await
             .unwrap();
             let proof = match ingress_memory {
@@ -3109,7 +3110,7 @@ mod tests {
     /// observations: an unavailable provider, a refused call and the called tools.
     #[test]
     fn skill_observations_carry_the_trace_and_provider_facts() {
-        use crate::causal_tree::store::RecordedToolCall;
+        use crate::runtime::decision_journal::store::RecordedToolCall;
         use crate::skills::lifecycle::{ObservedCallStatus, ProviderEnd};
         use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
         let call = |id: &str, status: &str| RecordedToolCall {

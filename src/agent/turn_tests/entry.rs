@@ -347,7 +347,10 @@ async fn cli_single_shot_plain_message_reaches_provider_with_default_causal_conf
     let tmp = TempDir::new().expect("test: tempdir");
     let probe = CredentialProbe::start().await;
     let config = cli_agent_probe_config(tmp.path(), &probe);
-    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    assert_eq!(
+        config.causal_tree,
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
+    );
 
     let reply = run_with_runtime_envelope(
         config,
@@ -942,8 +945,8 @@ fn assert_cli_redaction_answer_receipts(workspace: &std::path::Path, status: &st
         .expect("actual CLI decision identity");
     let tool_events = crate::memory::sqlite::fixture_readback::tool_event_count(workspace).unwrap();
     assert_eq!(tool_events, 0, "Answer redaction fixture must execute no tools");
-    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace);
-    let scope = crate::causal_tree::store::DecisionScope::Owner {
+    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace);
+    let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: store.workspace_id().unwrap(),
         owner_id: std::sync::Arc::from(terminals[0].owner_id.as_deref().expect("actual terminal owner")),
     };
@@ -951,7 +954,7 @@ fn assert_cli_redaction_answer_receipts(workspace: &std::path::Path, status: &st
         .reader()
         .get(
             &scope,
-            &crate::causal_tree::ids::DecisionId::parse(decision_id).unwrap(),
+            &crate::security::decision_id::DecisionId::parse(decision_id).unwrap(),
         )
         .unwrap()
         .unwrap();

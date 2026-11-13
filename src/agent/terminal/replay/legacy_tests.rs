@@ -24,7 +24,7 @@ struct Restored {
     workspace: tempfile::TempDir,
     fixture: Fixture,
     memory: SqliteMemory,
-    store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+    store: Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
     key: Arc<DecisionKey>,
 }
 
@@ -60,7 +60,8 @@ impl Restored {
         )?;
         let key = DecisionKey::load_existing(workspace.path())?;
         let memory = SqliteMemory::new(workspace.path())?;
-        let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
+        let store =
+            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
         Ok(Self {
             workspace,
             fixture,

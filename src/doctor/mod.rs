@@ -2762,8 +2762,9 @@ mod tests {
             workspace_dir: temp.path().join("workspace"),
             ..Config::default()
         };
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::OpenRouter);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::OpenRouter,
+        );
         config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
         let mut items = Vec::new();
         check_decision_plane(&config, &mut items);
@@ -2787,8 +2788,9 @@ mod tests {
             ..Config::default()
         };
         config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+        );
         config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".to_string();
         config.causal_tree.backend.model = "undeclared-model".to_string();
         let orphan = crate::config::manage::credentials::CredentialReferences::for_config(&config)

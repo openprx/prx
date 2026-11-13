@@ -53,7 +53,7 @@ impl TurnDecisionService {
         let _settlement = self.settlement_ref(Arc::clone(&context))?;
         let workspace = self.store.workspace_id().context("parent decision store missing")?;
         let trusted = context.engine.state.trusted.parts();
-        let scope = crate::causal_tree::store::DecisionScope::Owner {
+        let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
             workspace_id: Arc::clone(&workspace),
             owner_id: trusted.owner_id.clone().context("parent decision owner missing")?,
         };
@@ -372,7 +372,7 @@ impl TurnDecisionService {
         let max_cost_cents = u32::try_from(trusted.budgets.micro_usd / 10_000)
             .unwrap_or(u32::MAX)
             .min(self.security.max_cost_per_day_cents);
-        let level = if trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly {
+        let level = if trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly {
             crate::security::AutonomyLevel::ReadOnly
         } else {
             self.security.autonomy

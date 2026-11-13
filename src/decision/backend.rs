@@ -12,9 +12,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use super::error::DecisionError;
-use super::loopback::is_literal_loopback;
 use super::outbound::GuardedBody;
-use super::protocol::{BackendIdentity, BackendKind, BackendLocality, DecisionRequest, DecisionResponse};
+use super::protocol::{BackendIdentity, BackendLocality, DecisionRequest, DecisionResponse};
 use super::validate::ModelVersionPolicy;
 
 /// A decision backend other than the builtin.
@@ -96,51 +95,5 @@ pub trait DecisionBackend: Send + Sync {
     }
 }
 
-/// Where a backend of `kind` configured with `endpoint` runs (SP-CDP-A 5.6),
-/// derived from the kind and the literal-loopback predicate:
-///
-/// - `builtin` runs in process;
-/// - `compatible_http` is on loopback when its endpoint is written as a
-///   literal loopback address, and remote otherwise;
-/// - a hosted kind is always remote, even with an endpoint override that
-///   reads as loopback (COORD-6).
-#[must_use]
-pub fn locality_of(kind: BackendKind, endpoint: &str) -> BackendLocality {
-    match kind {
-        BackendKind::Builtin => BackendLocality::Builtin,
-        BackendKind::CompatibleHttp if is_literal_loopback(endpoint) => BackendLocality::Loopback,
-        BackendKind::CompatibleHttp | BackendKind::TypeSafe | BackendKind::OpenRouter => BackendLocality::Remote,
-        #[cfg(any(test, feature = "test-mock"))]
-        BackendKind::Mock => BackendLocality::Builtin,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn locality_follows_the_kind_and_the_written_endpoint() {
-        assert_eq!(locality_of(BackendKind::Builtin, ""), BackendLocality::Builtin);
-        assert_eq!(
-            locality_of(BackendKind::CompatibleHttp, "http://127.0.0.1:8900/v1"),
-            BackendLocality::Loopback
-        );
-        assert_eq!(
-            locality_of(BackendKind::CompatibleHttp, "http://127.1:8900/v1"),
-            BackendLocality::Remote,
-            "only a literal loopback spelling is loopback"
-        );
-        assert_eq!(
-            locality_of(BackendKind::CompatibleHttp, "https://decisions.example.com/v1"),
-            BackendLocality::Remote
-        );
-        for hosted in [BackendKind::TypeSafe, BackendKind::OpenRouter] {
-            assert_eq!(
-                locality_of(hosted, "http://127.0.0.1:8900/v1"),
-                BackendLocality::Remote,
-                "COORD-6: a hosted override that reads as loopback stays remote"
-            );
-        }
-    }
-}
+// Forwarding path until Part 2: moved to `config::schema::causal_tree` (R17).
+pub use crate::config::schema::causal_tree::locality_of;

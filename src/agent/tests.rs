@@ -413,7 +413,7 @@ fn fixture_runtime_config(workspace: &std::path::Path) -> crate::config::Config 
 
 fn default_causal_runtime_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut runtime = fixture_runtime_config(workspace);
-    runtime.causal_tree = crate::causal_tree::CausalTreeConfig::default();
+    runtime.causal_tree = crate::config::schema::causal_tree::CausalTreeConfig::default();
     runtime.autonomy.level = crate::security::AutonomyLevel::Full;
     runtime
 }
@@ -553,7 +553,10 @@ async fn default_causal_embedded_turn_runs_delegate_child_and_confirms_cleanup()
     let child_probe = CredentialProbe::start_replying("delegate child complete").await;
     let child_provider = child_probe.custom_provider();
     let mut config = default_causal_runtime_config(workspace.path());
-    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    assert_eq!(
+        config.causal_tree,
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
+    );
     config.auth.codex_auth_json_auto_import = false;
     config.auth.codex_auth_json_path = workspace.path().join("no-codex-auth.json");
     config.providers.models.push(serde_json::from_value(serde_json::json!({
@@ -659,7 +662,10 @@ async fn default_causal_embedded_turn_runs_sealed_spawn_child_and_confirms_clean
     let child_probe = CredentialProbe::start_replying("spawn child complete").await;
     let provider_name = child_probe.custom_provider();
     let mut config = default_causal_runtime_config(workspace.path());
-    assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+    assert_eq!(
+        config.causal_tree,
+        crate::config::schema::causal_tree::CausalTreeConfig::default()
+    );
     config.default_provider = Some(provider_name.clone());
     config.default_model = Some(PROBE_MODEL.to_owned());
     config.reliability.provider_retries = 0;

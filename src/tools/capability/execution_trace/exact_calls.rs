@@ -1,9 +1,9 @@
 //! The existing service ledger supplies these observations; they grant nothing.
 use super::ExecutionTrace;
-use crate::causal_tree::state::exact_calls::{
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
+use crate::tools::capability::turn_state::exact_calls::{
     BackendCompletion, ExactCallObservation, ExactCallObservations, LedgerDisposition, MAX_EXACT_CALLS,
 };
-use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::execution::{ToolExecutionCommand, ToolExecutionContext, ToolExecutionStatus};
 use std::sync::Arc;
 

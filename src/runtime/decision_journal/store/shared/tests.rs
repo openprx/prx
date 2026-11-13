@@ -1,7 +1,7 @@
 //! A blocked SQLite migration must not serialize unrelated workspace opens.
 #![cfg(test)]
 use super::*;
-use crate::decision::telemetry::testing::RecordingSink;
+use crate::observability::causal_event::testing::RecordingSink;
 use std::time::{Duration, Instant};
 
 #[test]

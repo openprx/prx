@@ -18,7 +18,7 @@ pub(crate) async fn spawn(
     let selected = ChatProviderBinding::capture(&generation, &provider, "mock", "prx-mailbox-model")?
         .context("mailbox parent provider missing")?;
     let service = publication
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
         .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .context("mailbox parent cleanup owner missing")?

@@ -1,8 +1,8 @@
 //! Parent provenance for child issuance, deliberately not a TurnSourceProof.
 use super::{Arc, ChildInputReceipt, Context, MemoryFabric};
-use crate::causal_tree::state::TurnSurfaceKind;
 use crate::memory::principal::MemoryWriteContext;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -54,7 +54,7 @@ impl ParentSourceSnapshot {
     pub(crate) fn matches_worker_parent_run(
         &self,
         worker: &crate::session_worker::protocol::WorkerManifest,
-        record: &crate::causal_tree::store::DecisionView,
+        record: &crate::runtime::decision_journal::store::DecisionView,
     ) -> bool {
         let Ok(fields) = serde_json::from_str::<SourceFields>(&self.payload) else {
             return false;
@@ -151,7 +151,7 @@ pub(crate) fn matches_parent_task_facts(
 
 pub(crate) fn matches_parent_task_segment(
     task: &str,
-    record: &crate::causal_tree::store::DecisionReplayRecord,
+    record: &crate::runtime::decision_journal::store::DecisionReplayRecord,
     source: &crate::memory::MessageEvent,
 ) -> bool {
     matches_parent_task_facts(
@@ -474,13 +474,13 @@ impl ParentSource {
 
     pub(crate) async fn restore_process(
         worker: &crate::session_worker::protocol::WorkerManifest,
-        store: Option<&crate::causal_tree::store::CausalDecisionStore>,
+        store: Option<&crate::runtime::decision_journal::store::CausalDecisionStore>,
         scope: &crate::tools::capability::child::VerifiedChildScope,
         fabric: &MemoryFabric,
         generation: &crate::config::ConfigGeneration,
         child_input: &ChildInputReceipt,
     ) -> anyhow::Result<Self> {
-        use crate::causal_tree::store::DecisionScope;
+        use crate::runtime::decision_journal::store::DecisionScope;
         let source = worker.child_source.as_ref().context("worker parent source missing")?;
         let snapshot = &source.parent_source;
         let (child, constraints) = scope.gate_inputs();
@@ -658,7 +658,7 @@ mod tests {
     fn recursive_parent_snapshot_seals_the_task_and_segment_separately() {
         let key = DecisionKey::ephemeral();
         let decision = crate::tools::capability::child::ParentAuthorityId::from(
-            crate::causal_tree::ids::DecisionId::new_runtime(),
+            crate::security::decision_id::DecisionId::new_runtime(),
         );
         let mut parent = parent(true);
         let legacy: serde_json::Value = serde_json::from_str(&parent.process_payload().unwrap()).unwrap();
@@ -696,7 +696,7 @@ mod tests {
     fn parent_snapshots_bind_explicit_execution_isolation() {
         let key = DecisionKey::ephemeral();
         let decision = crate::tools::capability::child::ParentAuthorityId::from(
-            crate::causal_tree::ids::DecisionId::new_runtime(),
+            crate::security::decision_id::DecisionId::new_runtime(),
         );
         let publication = uuid::Uuid::new_v4();
         for owner_isolated in [false, true] {

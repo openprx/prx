@@ -258,7 +258,7 @@ fn fresh_timestamp(timestamp: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(timestamp)
         .ok()
         .and_then(|created| u64::try_from(chrono::Utc::now().signed_duration_since(created).num_milliseconds()).ok())
-        .is_some_and(|age| age <= crate::decision::builtin::weights::STALE_ARTIFACT_MS)
+        .is_some_and(|age| age <= crate::tools::capability::turn_state::STALE_ARTIFACT_MS)
 }
 
 /// A remote-service hit without stored event provenance cannot prove owner or
@@ -361,7 +361,7 @@ async fn build_semantic_context(
         .filter(|hit| excluded_key != Some(hit.key.as_str()))
         .filter(|hit| excluded_event.is_none() || hit.source_event_id.as_deref() != excluded_event)
         .map(|hit| {
-            let content = crate::causal_tree::projection::bounded_artifact_summary(&hit.content).0;
+            let content = crate::memory::artifact_summary::bounded_artifact_summary(&hit.content).0;
             let source_event_id = hit.source_event_id;
             (hit.id, hit.key, content, source_event_id)
         })
@@ -401,7 +401,7 @@ async fn build_semantic_context(
                 break;
             }
             ids.push(id);
-            summaries.push(crate::causal_tree::projection::bounded_artifact_summary(&content).0);
+            summaries.push(crate::memory::artifact_summary::bounded_artifact_summary(&content).0);
             context.push_str(&line);
         }
         if context != "[Memory context]\n" {

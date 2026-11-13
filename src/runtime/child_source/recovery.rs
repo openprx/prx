@@ -5,9 +5,9 @@ use super::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::agent::terminal::{
     VerifiedTerminalReplay, read_journal_replay_record_on, verify_terminal_replay_journal_until,
 };
-use crate::causal_tree::store::ChildRecoveryLineage;
 use crate::memory::ingress_recovery::{IngressRecoveryScope, remaining};
 use crate::memory::{Memory, MessageEvent};
+use crate::runtime::decision_journal::store::ChildRecoveryLineage;
 use crate::runtime::turn_cleanup::CleanupTracker;
 use crate::security::runtime_key::DecisionKey;
 use anyhow::Context;

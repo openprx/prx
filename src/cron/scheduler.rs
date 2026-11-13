@@ -1886,7 +1886,10 @@ mod tests {
         let probe = CredentialProbe::start().await;
         let provider = probe.custom_provider();
         let mut config = test_config(&tmp).await;
-        assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        assert_eq!(
+            config.causal_tree,
+            crate::config::schema::causal_tree::CausalTreeConfig::default()
+        );
         config.default_provider = Some(provider.clone());
         config.default_model = Some(PROBE_MODEL.to_string());
         config.providers.models.push(
@@ -1929,7 +1932,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let model = ScriptedStoreModel::start("cron-default-entry-note", NOTE).await;
         let mut config = model.config(tmp.path());
-        assert_eq!(config.causal_tree, crate::causal_tree::CausalTreeConfig::default());
+        assert_eq!(
+            config.causal_tree,
+            crate::config::schema::causal_tree::CausalTreeConfig::default()
+        );
         config.cost.prices.insert(
             format!(
                 "{}/cron-origin-model",

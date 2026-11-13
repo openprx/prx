@@ -546,7 +546,7 @@ async fn verify_segment_replay(
                 "operator segment outcome is missing or conflicts"
             );
         } else {
-            let scope = crate::causal_tree::store::DecisionScope::Owner {
+            let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
                 workspace_id: store_workspace,
                 owner_id: std::sync::Arc::from(owner),
             };

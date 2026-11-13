@@ -532,7 +532,7 @@ pub(super) async fn run() {
         let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
         // The persisted-backend assertions deliberately require local prediction.
         initial.decision_engine.enabled = true;        initial.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
         initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
         initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
         assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());
@@ -629,11 +629,11 @@ pub(super) async fn run() {
                 "generation {phase} omitted its builtin decision row: {rows:?}"
             );
             assert!(rows.iter().any(|(candidates, selected, _, _, _)| {
-                let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
+                let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")
             }), "plain input must persist a selected direct answer");
             assert!(rows.iter().all(|(candidates, selected, _, _, _)| {
-                let candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
+                let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
                 candidates.iter().all(|candidate| Some(candidate.id.as_str()) != selected.as_deref() || candidate.action != "retrieve")
             }), "plain input must not select memory retrieval");
             let marker = format!("prx-factory-generation-{phase}");

@@ -238,7 +238,7 @@ pub(super) async fn read(
     workspace: &std::path::Path,
     batch: &str,
     owners: &crate::tools::sessions_read_model::RunOwnerScope,
-    expected_parent: Option<(crate::causal_tree::ids::DecisionId, &str)>,
+    expected_parent: Option<(crate::security::decision_id::DecisionId, &str)>,
 ) -> anyhow::Result<Option<BatchRoster>> {
     anyhow::ensure!(
         fabric.workspace_id() == workspace.to_string_lossy(),
@@ -276,7 +276,7 @@ pub(super) async fn read(
         "batch plan contains a dispatch result"
     );
     if plan_fields.ordinary_source.is_none() {
-        let decision = crate::causal_tree::ids::DecisionId::parse(&plan_fields.parent_decision)?;
+        let decision = crate::security::decision_id::DecisionId::parse(&plan_fields.parent_decision)?;
         if let Some((expected, digest)) = expected_parent {
             anyhow::ensure!(
                 decision == expected && plan_fields.parent_digest == digest,
@@ -367,20 +367,20 @@ fn verify_batch_parent_row(
 fn verify_store_parent(
     workspace: &std::path::Path,
     plan_fields: &Fields,
-    decision: crate::causal_tree::ids::DecisionId,
+    decision: crate::security::decision_id::DecisionId,
 ) -> anyhow::Result<()> {
     let original_store = plan_fields
         .store_workspace
         .as_deref()
         .filter(|_| plan_fields.version == 3)
         .context("legacy child batch lacks its original store namespace; membership remains unconfirmed")?;
-    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace);
+    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace);
     let store_workspace = store.workspace_id().context("batch decision store namespace missing")?;
     anyhow::ensure!(
         store_workspace.as_ref() == original_store,
         "batch original store namespace differs from configured store"
     );
-    let scope = crate::causal_tree::store::DecisionScope::Owner {
+    let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: store_workspace,
         owner_id: Arc::from(plan_fields.owner.as_str()),
     };

@@ -163,7 +163,7 @@ impl TerminalInputProof {
         self.0.profile.ensure_live()?;
         ensure!(
             self.0.profile.kind == EntryKind::Terminal
-                && source.surface() == crate::causal_tree::state::TurnSurfaceKind::Interactive
+                && source.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Interactive
                 && source.workspace_id() == self.0.profile.workspace.to_string_lossy()
                 && Some(source.owner_id()) == self.0.profile.principal.as_deref()
                 && source.policy_channel() == "terminal"
@@ -264,7 +264,7 @@ impl ControlledH2Profile {
         ensure!(
             self.kind == EntryKind::Gateway
                 && source.owner_isolated()
-                && source.surface() == crate::causal_tree::state::TurnSurfaceKind::Server
+                && source.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Server
                 && self.principal.as_deref() == Some(source.owner_id())
                 && source.workspace_id() == self.workspace.to_string_lossy(),
             "authenticated Gateway source is outside the local delegation"

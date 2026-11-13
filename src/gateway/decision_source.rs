@@ -490,11 +490,11 @@ impl crate::runtime::turn_source::TurnSourceProof for GatewayTurnProof {
     fn owner_isolated(&self) -> bool {
         self.envelope.owner_isolated
     }
-    fn approval_review_adapter(&self) -> Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter> {
+    fn approval_review_adapter(&self) -> Option<crate::security::approval_ledger::ApprovalReviewAdapter> {
         (self.envelope.source == crate::runtime::envelope::RuntimeSource::Console
             && self.envelope.owner_isolated
             && self.envelope.source_message_event_id.is_some())
-        .then_some(crate::causal_tree::approval_collection::ApprovalReviewAdapter::ConsoleOwnerReview)
+        .then_some(crate::security::approval_ledger::ApprovalReviewAdapter::ConsoleOwnerReview)
     }
     fn source_memory_principal(&self) -> crate::memory::MemoryPrincipal {
         self.envelope.memory_principal()
@@ -539,8 +539,8 @@ impl crate::runtime::turn_source::TurnSourceProof for GatewayTurnProof {
     fn config_generation_id(&self) -> u64 {
         self.generation.id.0
     }
-    fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        crate::causal_tree::state::TurnSurfaceKind::Server
+    fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        crate::tools::capability::turn_state::TurnSurfaceKind::Server
     }
     fn policy_channel(&self) -> &str {
         self.envelope.channel.as_deref().unwrap_or_default()

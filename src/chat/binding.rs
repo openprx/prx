@@ -674,7 +674,7 @@ impl ChatTurnBinding {
         outcome.finished_at = captured.finished_at;
         Ok(outcome)
     }
-    pub(super) fn pending_decision_id(&self) -> Option<crate::causal_tree::ids::DecisionId> {
+    pub(super) fn pending_decision_id(&self) -> Option<crate::security::decision_id::DecisionId> {
         self.decision.get()?.context.pending_approval_id()
     }
 
@@ -1126,11 +1126,11 @@ impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
     fn owner_isolated(&self) -> bool {
         self.envelope.owner_isolated
     }
-    fn approval_review_adapter(&self) -> Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter> {
+    fn approval_review_adapter(&self) -> Option<crate::security::approval_ledger::ApprovalReviewAdapter> {
         self.envelope
             .source_message_event_id
             .as_ref()
-            .map(|_| crate::causal_tree::approval_collection::ApprovalReviewAdapter::ChatOwnerReview)
+            .map(|_| crate::security::approval_ledger::ApprovalReviewAdapter::ChatOwnerReview)
     }
     fn intercepts_writes(&self) -> bool {
         matches!(self.admission_mode, ChatAdmissionMode::Model(mode) if mode.intercepts_writes())
@@ -1181,8 +1181,8 @@ impl crate::runtime::turn_source::TurnSourceProof for ChatTurnBinding {
     fn config_generation_id(&self) -> u64 {
         self.generation.id.0
     }
-    fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        crate::causal_tree::state::TurnSurfaceKind::Interactive
+    fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        crate::tools::capability::turn_state::TurnSurfaceKind::Interactive
     }
     fn policy_channel(&self) -> &str {
         "terminal"

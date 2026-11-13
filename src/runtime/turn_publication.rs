@@ -19,10 +19,10 @@ fn direct_tool_names(configured: &crate::config::ToolTieringConfig) -> std::coll
 }
 
 pub(crate) fn surface_policy(
-    surface: crate::causal_tree::state::TurnSurfaceKind,
+    surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     configured: &crate::config::ToolTieringConfig,
 ) -> crate::tools::capability::catalog::SurfacePolicy {
-    let channel_surface = surface == crate::causal_tree::state::TurnSurfaceKind::Channel;
+    let channel_surface = surface == crate::tools::capability::turn_state::TurnSurfaceKind::Channel;
     let tiering = if channel_surface {
         std::borrow::Cow::Owned(configured.for_channel_surface())
     } else {
@@ -60,14 +60,14 @@ pub(crate) struct TargetedSurface {
 impl TurnDecisionPublication {
     pub(crate) async fn publish(
         self,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
         self.publish_with_memory_loader(surface, None).await
     }
 
     pub(crate) async fn publish_with_memory_loader(
         self,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
     ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
         self.publish_scoped(surface, loader, None).await
@@ -77,7 +77,7 @@ impl TurnDecisionPublication {
     /// host surface policy. `None` is the ordinary host publication.
     pub(crate) async fn publish_scoped(
         self,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
         targeted: Option<TargetedSurface>,
     ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
@@ -151,8 +151,8 @@ impl TurnDecisionPublication {
             )
             .with_idempotency_memory(Arc::clone(memory)),
         );
-        let events: Arc<dyn crate::decision::telemetry::CausalEventSink> = Arc::new(
-            crate::decision::telemetry::ObserverCausalSink::new(Arc::clone(&observer)),
+        let events: Arc<dyn crate::observability::causal_event::CausalEventSink> = Arc::new(
+            crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(&observer)),
         );
         let provider_catalog = crate::providers::selection::catalog_for(&config);
         let service = super::turn_decision::build_turn_decision_service(
@@ -232,9 +232,11 @@ impl ChildDecisionPublication {
             direct_names: direct_tool_names(&config.tool_tiering),
             channel_allowed: false,
         };
-        let events = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(self.observer));
+        let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(
+            self.observer,
+        ));
         let service = super::turn_decision::build_turn_decision_service(
-            crate::causal_tree::state::TurnSurfaceKind::Worker,
+            crate::tools::capability::turn_state::TurnSurfaceKind::Worker,
             super::turn_decision::TurnServiceBuild {
                 parent_grant: Some(Arc::clone(&self.grant)),
                 generation: Arc::clone(&generation),
@@ -293,7 +295,7 @@ impl OrdinaryProcessDecisionPublication {
             )
             .with_idempotency_memory(Arc::clone(&memory)),
         );
-        let events = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::clone(
+        let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(
             &self.runtime.observer,
         )));
         let service = super::turn_decision::TurnDecisionService::ordinary_process_service(
@@ -353,7 +355,7 @@ impl OperatorProcessDecisionPublication {
             )
             .with_idempotency_memory(Arc::clone(&memory)),
         );
-        let events = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::clone(
+        let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(
             &self.runtime.observer,
         )));
         let service = super::turn_decision::TurnDecisionService::operator_process_service(
@@ -445,7 +447,7 @@ mod static_publication_tests {
                 mcp_alias: false,
             },
         )
-        .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop)
         .await
         .expect("actual static registry publication");
         service.check_live_parity().expect("same executable registry");
@@ -468,7 +470,7 @@ mod static_publication_tests {
         ] {
             let workspace = tempfile::tempdir().unwrap();
             let result = publication(workspace.path(), probe)
-                .publish(crate::causal_tree::state::TurnSurfaceKind::AgentLoop)
+                .publish(crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop)
                 .await;
             assert!(matches!(result, Err(error) if error.to_string().contains("registry MCP instance")));
         }

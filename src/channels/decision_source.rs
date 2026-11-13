@@ -540,8 +540,8 @@ impl crate::runtime::turn_source::TurnSourceProof for ChannelTurnProof {
     fn config_generation_id(&self) -> u64 {
         self.generation.id.0
     }
-    fn surface(&self) -> crate::causal_tree::state::TurnSurfaceKind {
-        crate::causal_tree::state::TurnSurfaceKind::Channel
+    fn surface(&self) -> crate::tools::capability::turn_state::TurnSurfaceKind {
+        crate::tools::capability::turn_state::TurnSurfaceKind::Channel
     }
     fn policy_channel(&self) -> &str {
         self.envelope.channel.as_deref().unwrap_or_default()

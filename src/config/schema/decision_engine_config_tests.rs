@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::decision_engine::config::*;
+use crate::config::schema::decision_engine::*;
 
 fn load(text: &str) -> Config {
     let mut root: toml::Value = toml::from_str(text).unwrap();
@@ -182,7 +182,7 @@ fn shared_backend_validation_preserves_typed_source() {
         error
             .source()
             .unwrap()
-            .is::<crate::causal_tree::config::CausalConfigError>()
+            .is::<crate::config::schema::causal_tree::CausalConfigError>()
     );
 }
 
@@ -239,7 +239,7 @@ fn disabled_direct_backend_obeys_configured_causal_latency_budget() {
     config.validate().unwrap();
 }
 
-fn remote_legacy() -> crate::causal_tree::config::DecisionBackendConfig {
+fn remote_legacy() -> crate::config::schema::causal_tree::DecisionBackendConfig {
     toml::from_str(REMOTE).unwrap()
 }
 
@@ -249,8 +249,9 @@ fn factory_for(config: &Config) -> crate::decision::factory::DecisionBackendFact
         fn build(
             &self,
             _: &crate::decision::factory::BackendSpec<'_>,
-        ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::decision::DecisionError> {
-            Err(crate::decision::DecisionError::Unavailable)
+        ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::cost::decision_attempt::DecisionError>
+        {
+            Err(crate::cost::decision_attempt::DecisionError::Unavailable)
         }
     }
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
@@ -261,7 +262,7 @@ fn factory_for(config: &Config) -> crate::decision::factory::DecisionBackendFact
             key: None,
             transports: &NoTransports,
             config_generation: 1,
-            events: std::sync::Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            events: std::sync::Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
     )
     .unwrap()
@@ -272,7 +273,7 @@ fn effective_backend_prefers_explicit_table_over_differing_legacy() {
     let mut config = Config::default();
     config.decision_engine.enabled = true;
     config.causal_tree.backend = remote_legacy();
-    let mut explicit = crate::causal_tree::config::DecisionBackendConfig::default();
+    let mut explicit = crate::config::schema::causal_tree::DecisionBackendConfig::default();
     explicit.max_request_bytes = 4096;
     explicit.model = "explicit-model".into();
     config.decision_engine.backend = Some(explicit.clone());
@@ -281,7 +282,7 @@ fn effective_backend_prefers_explicit_table_over_differing_legacy() {
     assert_eq!(effective.max_request_bytes, 4096);
     assert_eq!(effective.model, "explicit-model");
     // Factory selection reads the same table: the explicit builtin wins over the remote legacy slot.
-    assert!(crate::decision::factory::configured_selection(effective).is_none());
+    assert!(crate::config::schema::causal_tree::configured_selection(effective).is_none());
     let factory = factory_for(&config);
     assert!(
         factory.status().order.is_empty(),
@@ -303,8 +304,11 @@ fn explicit_empty_engine_backend_uses_defaults_not_legacy() {
     let mut config: Config = root.try_into().unwrap();
     config.causal_tree.backend = remote_legacy();
     let effective = effective_engine_backend(&config);
-    assert_eq!(effective, &crate::causal_tree::config::DecisionBackendConfig::default());
-    assert!(crate::decision::factory::configured_selection(effective).is_none());
+    assert_eq!(
+        effective,
+        &crate::config::schema::causal_tree::DecisionBackendConfig::default()
+    );
+    assert!(crate::config::schema::causal_tree::configured_selection(effective).is_none());
     let factory = factory_for(&config);
     assert!(factory.status().order.is_empty(), "no remote construction");
     assert!(factory.status().excluded.is_empty());
@@ -320,6 +324,9 @@ fn legacy_only_backend_is_copied_into_the_engine() {
     assert_eq!(effective, &remote_legacy());
     assert_eq!(effective.max_request_bytes, 8192);
     assert_eq!(effective.max_response_bytes, 16384);
-    let selection = crate::decision::factory::configured_selection(effective).unwrap();
-    assert_eq!(selection.kind, crate::decision::BackendKind::CompatibleHttp);
+    let selection = crate::config::schema::causal_tree::configured_selection(effective).unwrap();
+    assert_eq!(
+        selection.kind,
+        crate::config::schema::causal_tree::BackendKind::CompatibleHttp
+    );
 }

@@ -76,10 +76,12 @@ async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize, histor
         pid: std::process::id(),
         calls,
         historical_resends,
-        store_workspace_id: crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace)
-            .workspace_id()
-            .expect("actual decision Store UUID must already exist")
-            .to_string(),
+        store_workspace_id: crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(
+            workspace,
+        )
+        .workspace_id()
+        .expect("actual decision Store UUID must already exist")
+        .to_string(),
         key_sha256: hex::encode(Sha256::digest(
             std::fs::read(workspace.join("self/causal_tree/.decision_key")).unwrap(),
         )),
@@ -543,7 +545,7 @@ fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
 async fn copied_workspace_terminals_verify_through_the_real_store() {
     let workspace = PathBuf::from(std::env::var_os("PRX_REPLAY_TEST_WORKSPACE").expect("scratch workspace"));
     let memory = SqliteMemory::new(&workspace).unwrap();
-    let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(&workspace);
+    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(&workspace);
     let namespace = store.workspace_id().expect("preserved decision namespace");
     let key = DecisionKey::load_existing(&workspace).unwrap();
     let rows = crate::memory::sqlite::fixture_readback::terminal_rows(&workspace).unwrap();
@@ -637,7 +639,7 @@ async fn ingress_recovery_unchanged_by_switch() {
         let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
         let key = crate::security::runtime_key::DecisionKey::load_or_create(dir.path()).unwrap();
         let advisory = if plane {
-            let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+            let observer = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                 crate::observability::NoopObserver,
             )));
             let (store, events) = super::open_advisory_store(&generation, Arc::clone(&memory), observer, &tracker)
@@ -650,7 +652,7 @@ async fn ingress_recovery_unchanged_by_switch() {
         let recovery = RecoveryScope::prepare(
             &generation,
             memory,
-            crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
             None,
             &tracker,
             Some(key),
@@ -694,6 +696,24 @@ async fn ingress_recovery_unchanged_by_switch() {
 #[tokio::test]
 async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store() {
     let dir = tempfile::tempdir().unwrap();
+    // A populated legacy database (no key): the plane-off path must not open it.
+    {
+        let store = crate::runtime::decision_journal::store::testing::open_private(
+            dir.path(),
+            Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
+        );
+        let record = crate::runtime::decision_journal::store::testing::record(
+            crate::security::decision_id::DecisionId::new_runtime(),
+            &dir.path().to_string_lossy(),
+            None,
+            1,
+        );
+        let writer = store.writer().expect("test: read-write store has a writer");
+        let _ = writer.record_decision(record);
+    }
+    let legacy_db = crate::runtime::decision_journal::store::db_path(dir.path());
+    assert!(legacy_db.exists(), "test: the legacy database is populated");
+    let opens_before = crate::runtime::decision_journal::store::open_spy::opens_under(dir.path());
     let mut config = recovery_config(dir.path());
     config.causal_tree.enabled = false;
     let config = Arc::new(config);
@@ -716,7 +736,7 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         None,
@@ -729,7 +749,11 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
     assert!(recovery.legacy_store().is_none());
     assert!(recovery.legacy_events().is_none());
     assert!(!dir.path().join("self/causal_tree/.decision_key").exists());
-    assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
+    assert_eq!(
+        crate::runtime::decision_journal::store::open_spy::opens_under(dir.path()),
+        opens_before,
+        "plane-off ingress recovery opens no decision store"
+    );
     assert!(
         dir.path().join("memory/.recovery_keys").exists(),
         "plane-off first activation may create recovery keys"
@@ -751,7 +775,7 @@ async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         None,
@@ -811,7 +835,7 @@ fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
         memory,
         workspace: workspace.to_path_buf(),
         recordable: true,
-        surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         authority: Arc::new(RecoveryAuthority {
             repository: None,
             legacy: None,
@@ -882,7 +906,7 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         Some(key),

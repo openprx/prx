@@ -1311,8 +1311,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             let mut config = crate::config::Config::default();
             config.workspace_dir = tmp.path().to_path_buf();
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::Builtin,
+            );
             let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
                 config,
                 &history.last().expect("source input").content,

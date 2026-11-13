@@ -286,7 +286,7 @@ async fn run_internal(
     let mut turn_decisions = ctx
         .publish_turn_decisions(
             Arc::clone(&tools_registry),
-            crate::causal_tree::state::TurnSurfaceKind::Interactive,
+            crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
         )
         .await?;
     // Keep the publisher alive through every chat task and drain it even when
@@ -2801,7 +2801,7 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                             let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
                             let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
                             let inspected = turn_decisions.inspect_pending_decision_approval(
                                 &envelope.resolved_owner_id(), &envelope.session_key, id,
                             ).await.and_then(|view| serde_json::to_string_pretty(&view).map_err(Into::into));
@@ -2825,7 +2825,7 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                             let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
                             let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
                             match turn_decisions.revoke_pending_decision_approval(
                                 &envelope.resolved_owner_id(), &envelope.session_key, id,
                             ).await {
@@ -2841,7 +2841,7 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                             let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
                             let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::causal_tree::ids::DecisionId::parse(&decision_id.hyphenated().to_string())?;
+                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
                             match turn_decisions.review_pending_decision_approval(
                                 &envelope.resolved_owner_id(), &envelope.session_key, id, approved,
                             ).await {
@@ -3084,7 +3084,7 @@ Retry with a compatible model: /provider {shown} <model>",
             // stack, including unoptimized binaries used by PTY regression.
             let replacement = Box::pin(ctx.publish_turn_decisions(
                 Arc::clone(&tools_registry),
-                crate::causal_tree::state::TurnSurfaceKind::Interactive,
+                crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
             )).await?;
             child_cleanup.retain_service(Arc::clone(&replacement));
             let retired = std::mem::replace(&mut turn_decisions, replacement);

@@ -20,7 +20,7 @@ pub(in crate::runtime) struct SegmentObservation {
     terminal_event_id: Arc<str>,
     terminal_sequence: i64,
     steps: Option<Vec<ObservedStep>>,
-    exact_call_observations: Option<Arc<crate::causal_tree::state::exact_calls::ExactCallObservations>>,
+    exact_call_observations: Option<Arc<crate::tools::capability::turn_state::exact_calls::ExactCallObservations>>,
 }
 
 pub(in crate::runtime) fn validate_envelope(envelope: &RuntimeEnvelope) -> anyhow::Result<()> {
@@ -289,7 +289,7 @@ pub(super) fn initial_observations(
 mod tests {
     use super::{SegmentObservation, initial_observations, project_trace};
     use crate::causal_tree::state::{ObservedStepKind, ObservedStepStatus};
-    use crate::causal_tree::store::{RecordedOutcomeAttempt, RecordedToolCall};
+    use crate::runtime::decision_journal::store::{RecordedOutcomeAttempt, RecordedToolCall};
     use crate::runtime::envelope::RuntimeEnvelope;
     use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
     use std::sync::Arc;
@@ -402,7 +402,7 @@ mod tests {
     }
     #[test]
     fn segment_projection_retains_exact_call_facts_without_candidate_authority() {
-        use crate::causal_tree::state::exact_calls::{
+        use crate::tools::capability::turn_state::exact_calls::{
             BackendCompletion, ExactCallObservation, ExactCallObservations, LedgerDisposition,
         };
         let facts = Arc::new(ExactCallObservations {

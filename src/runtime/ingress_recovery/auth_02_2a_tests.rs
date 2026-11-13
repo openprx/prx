@@ -145,8 +145,8 @@ async fn assert_plane_on_legacy_rejoin(cell: &MatrixCell, recovery: &RecoverySco
     }
 }
 
-fn observer() -> Arc<dyn crate::decision::telemetry::CausalEventSink> {
-    Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+fn observer() -> Arc<dyn crate::observability::causal_event::CausalEventSink> {
+    Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
         crate::observability::NoopObserver,
     )))
 }
@@ -174,7 +174,7 @@ async fn prepare_recovery(
     RecoveryScope::prepare(
         generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         tracker,
         workspace_key,
@@ -488,7 +488,7 @@ fn settled_facts(terminal_id: &str, claim: &str, final_id: &str, key_id: &str) -
         final_event_id: final_id.to_owned(),
         semantic_mac_v3: "00".repeat(32),
         status: "completed".into(),
-        surface: crate::causal_tree::state::TurnSurfaceKind::AgentLoop
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop
             .as_str()
             .to_owned(),
         parent_authority_id: None,

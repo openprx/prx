@@ -297,11 +297,11 @@ pub struct Config {
     /// Default: enabled locally; remote processing remains explicit opt-in.
     /// A versioned `enabled = false` preserves an explicit disable.
     #[serde(default)]
-    pub causal_tree: crate::causal_tree::CausalTreeConfig,
+    pub causal_tree: crate::config::schema::causal_tree::CausalTreeConfig,
 
     /// Optional advisory decision engine, disabled by default.
     #[serde(default)]
-    pub decision_engine: crate::decision_engine::config::DecisionEngineConfig,
+    pub decision_engine: crate::config::schema::decision_engine::DecisionEngineConfig,
 
     /// Security configuration: sandboxing, resource limits, audit, tool policy (`[security]`).
     #[serde(default)]
@@ -492,8 +492,8 @@ impl Default for Config {
             agents: HashMap::new(),
             query_classification: QueryClassificationConfig::default(),
             media: MediaConfig::default(),
-            causal_tree: crate::causal_tree::CausalTreeConfig::default(),
-            decision_engine: crate::decision_engine::config::DecisionEngineConfig::default(),
+            causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
+            decision_engine: crate::config::schema::decision_engine::DecisionEngineConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
@@ -575,6 +575,9 @@ mod credentials;
 pub use credentials::*;
 
 mod lifecycle;
+
+pub mod causal_tree;
+pub mod decision_engine;
 
 mod atomic;
 pub(crate) use atomic::*;

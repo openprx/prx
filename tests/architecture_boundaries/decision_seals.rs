@@ -19,9 +19,14 @@ const TRUST_BEARING_CALLERS: &[&str] = &[
 ];
 
 /// The trust-bearing constructors, named by identifiers no other code uses,
-/// with the file that defines each once.
+/// with the file that defines each once (`from_runtime` moved to the
+/// neutral turn scope, R52).
 const TRUST_BEARING_CONSTRUCTORS: [&str; 3] = ["from_runtime", "from_runtime_records", "recorded_by_runtime"];
-const TRUST_BEARING_DEFINITIONS: &str = "src/causal_tree/state.rs";
+const TRUST_BEARING_DEFINITIONS: [(&str, &str); 3] = [
+    ("from_runtime", "src/tools/capability/turn_state.rs"),
+    ("from_runtime_records", "src/causal_tree/state.rs"),
+    ("recorded_by_runtime", "src/causal_tree/state.rs"),
+];
 
 /// AG-28 (CDP-PLAN 1.9, scope amended by D-066 N-3 and its amendment).
 /// Trusted and observed state carry authority: a trusted part grants or
@@ -51,7 +56,11 @@ pub(super) fn trust_bearing_turn_state_is_built_only_by_the_turn_decision_servic
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
         let compact = production.split_whitespace().collect::<Vec<_>>().join(" ");
         for constructor in TRUST_BEARING_CONSTRUCTORS {
-            let allowed = usize::from(relative == TRUST_BEARING_DEFINITIONS);
+            let allowed = usize::from(
+                TRUST_BEARING_DEFINITIONS
+                    .iter()
+                    .any(|(name, file)| *name == constructor && relative == *file),
+            );
             let named = identifier_count(&compact, constructor);
             let defined = identifier_count(&compact, &format!("fn {constructor}"));
             if named > allowed || defined > allowed {

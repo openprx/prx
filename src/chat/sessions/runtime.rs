@@ -177,7 +177,7 @@ pub struct ChatSessionsHandle {
     /// Next sequence number to hand out.
     next_seq: u64,
     /// Decision aliases share the allocator but never enter the child registry.
-    decision_seqs: Vec<(u64, String, crate::causal_tree::ids::DecisionId)>,
+    decision_seqs: Vec<(u64, String, crate::security::decision_id::DecisionId)>,
     /// First time this handle observed a PTY as exited. PTY sessions do not
     /// carry `finished_at`, so cleanup ages them from this observation point.
     pty_terminal_seen_at: HashMap<SessionId, DateTime<Utc>>,
@@ -322,7 +322,7 @@ impl ChatSessionsHandle {
     pub(crate) fn register_decision_seq(
         &mut self,
         session: &str,
-        decision: crate::causal_tree::ids::DecisionId,
+        decision: crate::security::decision_id::DecisionId,
     ) -> Result<u64> {
         if let Some((seq, _, _)) = self
             .decision_seqs
@@ -349,7 +349,7 @@ impl ChatSessionsHandle {
         &self,
         session: &str,
         seq: u64,
-    ) -> Result<Option<crate::causal_tree::ids::DecisionId>> {
+    ) -> Result<Option<crate::security::decision_id::DecisionId>> {
         let Some((_, owner_session, decision)) = self.decision_seqs.iter().find(|(id, _, _)| *id == seq) else {
             return Ok(None);
         };

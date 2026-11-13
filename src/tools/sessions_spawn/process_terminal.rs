@@ -5,11 +5,11 @@ pub(super) mod ordinary;
 use crate::agent::terminal::{
     TurnTerminalStatus, replay_requires_journal, verify_terminal_replay, verify_terminal_replay_journal,
 };
-use crate::causal_tree::store::CausalDecisionStore;
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject};
 use crate::runtime::child_source::authority_journal;
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::child_source::{ChildInputReceipt, IssuedChildGrant};
+use crate::runtime::decision_journal::store::CausalDecisionStore;
 use crate::session_worker::protocol::WorkerResult;
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -430,7 +430,7 @@ struct RecoveryProvenance<'a> {
 fn legacy_reader(
     repair_store: Option<&CausalDecisionStore>,
     provenance: &RecoveryProvenance<'_>,
-    reader: &mut Option<crate::causal_tree::store::DecisionStoreReader>,
+    reader: &mut Option<crate::runtime::decision_journal::store::DecisionStoreReader>,
 ) -> anyhow::Result<()> {
     if reader.is_none() {
         let opened = repair_store
@@ -653,18 +653,18 @@ async fn verify_bound(
             );
         } else {
             let reader = reader.as_ref().context("worker completion decision reader missing")?;
-            let scope = crate::causal_tree::store::DecisionScope::Owner {
+            let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
                 workspace_id: std::sync::Arc::from(provenance.store_workspace),
                 owner_id: std::sync::Arc::from(provenance.owner),
             };
-            let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
+            let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &outcome)
                 .context("worker segment outcome lineage is inconsistent")?;
             if !reader.child_outcome_matches(&scope, &link)? {
                 let writer = repair_store
                     .and_then(CausalDecisionStore::writer)
                     .context("worker parent outcome repair requires an existing owned writer")?;
                 anyhow::ensure!(
-                    writer.record_outcome(outcome.clone()) == crate::causal_tree::store::Enqueue::Queued,
+                    writer.record_outcome(outcome.clone()) == crate::runtime::decision_journal::store::Enqueue::Queued,
                     "recovered worker outcome could not be queued"
                 );
                 anyhow::ensure!(
@@ -674,10 +674,10 @@ async fn verify_bound(
                         && reader.outcome_matches(&scope, &outcome)?,
                     "recovered worker outcome is missing or conflicts"
                 );
-                let repair = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &outcome)
+                let repair = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &outcome)
                     .context("recovered worker outcome lineage changed")?;
                 anyhow::ensure!(
-                    writer.record_child_outcome(repair) == crate::causal_tree::store::Enqueue::Queued,
+                    writer.record_child_outcome(repair) == crate::runtime::decision_journal::store::Enqueue::Queued,
                     "recovered worker parent link could not be queued"
                 );
                 anyhow::ensure!(

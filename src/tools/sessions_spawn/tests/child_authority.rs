@@ -201,9 +201,9 @@ fn same_value(left: &rusqlite::types::Value, right: &rusqlite::types::Value) -> 
 
 #[test]
 fn decision_evidence_roundtrips_typed_columns() -> Result<()> {
-    use crate::causal_tree::ids::DecisionId;
-    use crate::causal_tree::store::testing;
     use crate::runtime::child_source::authority_journal as journal;
+    use crate::runtime::decision_journal::store::testing;
+    use crate::security::decision_id::DecisionId;
     use rusqlite::types::Value;
 
     let tmp = tempfile::tempdir()?;
@@ -255,9 +255,9 @@ fn decision_evidence_roundtrips_typed_columns() -> Result<()> {
 
 #[test]
 fn decision_evidence_rejects_scope_substitution() -> Result<()> {
-    use crate::causal_tree::ids::DecisionId;
-    use crate::causal_tree::store::testing;
     use crate::runtime::child_source::authority_journal as journal;
+    use crate::runtime::decision_journal::store::testing;
+    use crate::security::decision_id::DecisionId;
 
     let tmp = tempfile::tempdir()?;
     let key = crate::security::runtime_key::DecisionKey::load_or_create(tmp.path())?;
@@ -306,7 +306,7 @@ struct ReopenedChild {
 async fn reopened_child_evidence(manifest: &WorkerManifest, result: &WorkerResult) -> Result<ReopenedChild> {
     use crate::agent::terminal::verify_terminal_replay;
     use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-    use crate::causal_tree::store::CausalDecisionStore;
+    use crate::runtime::decision_journal::store::CausalDecisionStore;
 
     let source = manifest.child_source.as_ref().context("test: child source")?;
     let owner = manifest.owner_id.clone().context("test: owner")?;
@@ -570,7 +570,7 @@ async fn child_outcome_missing_row_is_refused_for_v3() -> Result<()> {
 fn named_evidence_columns(
     columns: Vec<(String, rusqlite::types::Value)>,
 ) -> Result<Vec<(&'static str, rusqlite::types::Value)>> {
-    let names = crate::causal_tree::store::replay_column_names();
+    let names = crate::runtime::decision_journal::store::replay_column_names();
     anyhow::ensure!(columns.len() == names.len(), "test: evidence column count");
     columns
         .into_iter()
@@ -585,13 +585,13 @@ fn named_evidence_columns(
 /// Rewrites the `candidates_json` column through `edit`, keeping its JSON array shape.
 fn edit_candidates(
     columns: &mut [(&'static str, rusqlite::types::Value)],
-    edit: impl FnOnce(&mut Vec<crate::causal_tree::store::RecordedCandidate>) -> Result<()>,
+    edit: impl FnOnce(&mut Vec<crate::runtime::decision_journal::store::RecordedCandidate>) -> Result<()>,
 ) -> Result<()> {
     let Some((_, rusqlite::types::Value::Text(text))) = columns.iter().find(|(name, _)| *name == "candidates_json")
     else {
         anyhow::bail!("test: candidates_json is not text");
     };
-    let mut candidates: Vec<crate::causal_tree::store::RecordedCandidate> = serde_json::from_str(text)?;
+    let mut candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(text)?;
     edit(&mut candidates)?;
     set_column(
         columns,
@@ -606,7 +606,7 @@ fn evidence_digest(columns: &[(&'static str, rusqlite::types::Value)]) -> Result
         .iter()
         .map(|(name, value)| ((*name).to_owned(), value.clone()))
         .collect();
-    Ok(crate::causal_tree::store::DecisionReplayRecord::from_evidence_columns(&owned)?.digest)
+    Ok(crate::runtime::decision_journal::store::DecisionReplayRecord::from_evidence_columns(&owned)?.digest)
 }
 
 /// Replaces the single `decision_evidence` row of one decision, test-only.
@@ -654,7 +654,7 @@ fn reseal_last_hop(
 #[tokio::test]
 async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
     use crate::agent::terminal::{verify_terminal_replay, verify_terminal_replay_journal};
-    use crate::causal_tree::store::{CausalDecisionStore, RecordedCandidate};
+    use crate::runtime::decision_journal::store::{CausalDecisionStore, RecordedCandidate};
 
     let tmp = tempfile::tempdir()?;
     let (manifest, result) = completed_child_fixture(&tmp).await?;
@@ -747,7 +747,7 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
     reseal_last_hop(&key, &mut terminal, &evidence_digest(&columns)?, assistant.as_ref())?;
 
     // Remove every decision store file, so the journal-only reads cannot reach it.
-    let db = crate::causal_tree::store::db_path(&workspace);
+    let db = crate::runtime::decision_journal::store::db_path(&workspace);
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{suffix}", db.display()));
         if path.exists() {
@@ -813,7 +813,7 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
 
 /// Moves the decision store database and its sidecars aside, so only journals remain.
 fn quarantine_decision_store(workspace: &std::path::Path) -> Result<PathBuf> {
-    let db = crate::causal_tree::store::db_path(workspace);
+    let db = crate::runtime::decision_journal::store::db_path(workspace);
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{suffix}", db.display()));
         if path.exists() {
@@ -1033,7 +1033,7 @@ async fn replay_candidate(
     key: &Arc<crate::security::runtime_key::DecisionKey>,
     store_workspace: &str,
     scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
-    lineage: &crate::causal_tree::store::ChildRecoveryLineage,
+    lineage: &crate::runtime::decision_journal::store::ChildRecoveryLineage,
     tracker: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
     deadline: std::time::Instant,
 ) -> Result<
@@ -1072,10 +1072,10 @@ async fn replay_candidate(
 
 #[tokio::test]
 async fn child_recovery_journal_cursor_wraps() -> Result<()> {
-    use crate::causal_tree::ids::DecisionId;
     use crate::memory::ingress_recovery::IngressRecoveryScope;
     use crate::runtime::child_source::recovery;
     use crate::runtime::turn_cleanup::CleanupTracker;
+    use crate::security::decision_id::DecisionId;
     use rusqlite::types::Value;
 
     let tmp = tempfile::tempdir()?;
@@ -1283,7 +1283,7 @@ async fn child_recovery_journal_cursor_wraps() -> Result<()> {
 #[tokio::test]
 async fn non_worker_child_replays_with_parent_evidence() -> Result<()> {
     use crate::agent::terminal::{replay_requires_journal, reseal_payload_for_test, verify_terminal_replay_journal};
-    use crate::causal_tree::store::{CausalDecisionStore, DecisionReplayRecord};
+    use crate::runtime::decision_journal::store::{CausalDecisionStore, DecisionReplayRecord};
 
     let tmp = tempfile::tempdir()?;
     let workspace = tmp.path().to_path_buf();

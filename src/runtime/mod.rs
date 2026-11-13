@@ -8,6 +8,7 @@ pub(crate) mod child_turn;
 pub mod control_ladder;
 pub(crate) mod decision_accounting;
 pub(crate) mod decision_advisory;
+pub(crate) mod decision_journal;
 pub mod docker;
 pub mod envelope;
 pub(crate) mod evolution_model;

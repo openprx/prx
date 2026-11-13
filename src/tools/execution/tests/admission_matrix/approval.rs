@@ -34,7 +34,7 @@ fn issued_binding(fixture: &Fixture, name: &'static str, envelope: RuntimeEnvelo
         .entry_for_public_name(name)
         .expect("test: catalog entry for binding pin");
     ExecutionBinding::issued(
-        crate::causal_tree::ids::DecisionId::new_runtime(),
+        crate::security::decision_id::DecisionId::new_runtime(),
         entry,
         Arc::clone(&catalog),
         envelope,
@@ -247,7 +247,7 @@ async fn binding_fingerprint_drift_with_live_trace_is_stale() {
     );
     let mut context = context();
     context.admitted_binding = Some(ExecutionBinding::issued(
-        crate::causal_tree::ids::DecisionId::new_runtime(),
+        crate::security::decision_id::DecisionId::new_runtime(),
         entry,
         Arc::clone(&catalog),
         context.envelope.clone(),

@@ -9,7 +9,7 @@ use super::tool_scanner::contains_identifier;
 /// migration and the derived legacy view. CDP-12 adds the typed mutation
 /// service (`src/config/manage/mutation/causal.rs`).
 const CAUSAL_POLICY_WRITERS: &[&str] = &[
-    "src/causal_tree/config.rs",
+    "src/config/schema/causal_tree.rs",
     // CDP-12: the one decision-plane mutation service (AG-13).
     "src/config/manage/mutation/causal.rs",
 ];

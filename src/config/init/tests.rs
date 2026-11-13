@@ -1288,7 +1288,7 @@ fn the_base_full_template_disable_reads_as_unset() {
         Some(vec!["enabled".to_string()]),
         "the template writes a bare disable"
     );
-    let report = crate::causal_tree::config::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
+    let report = crate::config::schema::causal_tree::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
     assert_eq!(report.dropped, ["enabled"]);
     assert!(root.get("causal_tree").and_then(|table| table.get("enabled")).is_none());
 }

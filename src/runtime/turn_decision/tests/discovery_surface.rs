@@ -17,7 +17,7 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
             config.causal_tree.enabled = true;
             config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -144,7 +144,7 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
             config.causal_tree.enabled = true;
             config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -311,8 +311,9 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.path().to_owned();
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -430,8 +431,9 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.workspace_dir = workspace.path().to_owned();
         config.causal_tree.enabled = true;
         config.causal_tree.policy.extra_latency_budget_ms = 5_000;

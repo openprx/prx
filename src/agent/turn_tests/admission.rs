@@ -6,14 +6,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::turn_request::TurnDecision;
-use crate::causal_tree::state::TurnSurfaceKind;
 use crate::decision::factory::{BackendSpec, DecisionTransports};
-use crate::decision::telemetry::{CausalEvent, CausalEventSink};
+use crate::observability::causal_event::{CausalEvent, CausalEventSink};
 use crate::runtime::turn_decision::{
     AgentTurnKind, TurnDecisionContext, TurnDecisionService, TurnServiceBuild, build_turn_decision_service,
 };
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::capability::catalog::CatalogSources;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
     TracingToolExecutionAudit,
@@ -25,8 +25,8 @@ impl DecisionTransports for NoExternalTransport {
     fn build(
         &self,
         _: &BackendSpec<'_>,
-    ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::decision::DecisionError> {
-        Err(crate::decision::DecisionError::Unavailable)
+    ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::cost::decision_attempt::DecisionError> {
+        Err(crate::cost::decision_attempt::DecisionError::Unavailable)
     }
 }
 
@@ -600,8 +600,9 @@ impl AdmittedTurn {
         let workspace = workspace_path.as_path();
         if keep_builtin_enabled {
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::Builtin,
+            );
         }
         if configured_native_tools.is_none() && !keep_builtin_enabled {
             config.causal_tree.enabled = false;
@@ -623,8 +624,9 @@ impl AdmittedTurn {
         let ordinary_controlled = matches!(&origin, FixtureOrigin::OrdinaryControlledChannel(_));
         if ordinary_controlled {
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::Builtin,
+            );
         }
         let channel_surface = matches!(
             &origin,

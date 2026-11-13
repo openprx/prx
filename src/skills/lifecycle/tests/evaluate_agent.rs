@@ -551,7 +551,7 @@ async fn the_evaluation_config_is_built_from_an_allowlist_and_cannot_reach_the_s
     assert_eq!(json(&config.browser), json(&default.browser));
     // The tool surface the turn publishes: nothing outside the allowlist is direct or discoverable.
     let policy = crate::runtime::turn_publication::surface_policy(
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         &config.tool_tiering,
     );
     assert!(policy.direct_names.contains("skill_read"));

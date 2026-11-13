@@ -1,13 +1,15 @@
 //! Bounded content-free observations from the actual execution service.
-use crate::causal_tree::store::{MAX_RECORDED_PROVIDER_ATTEMPTS, RecordedOutcomeAttempt, RecordedToolCall};
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
+use crate::runtime::decision_journal::store::{
+    MAX_RECORDED_PROVIDER_ATTEMPTS, RecordedOutcomeAttempt, RecordedToolCall,
+};
 use crate::tools::execution::ToolExecutionStatus;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 mod exact_calls;
-use crate::causal_tree::state::exact_calls::ExactCallObservations;
+use crate::tools::capability::turn_state::exact_calls::ExactCallObservations;
 
 const MAX_CALLS: usize = 64;
 
@@ -283,10 +285,9 @@ impl ExecutionTrace {
             .collect();
         let snapshot = ExecutionTraceSnapshot {
             exact_call_observations: state.exact_call_observations.clone().map(|mut facts| {
-                facts.incomplete |= facts
-                    .calls
-                    .iter()
-                    .any(|call| call.completion == crate::causal_tree::state::exact_calls::BackendCompletion::Unknown);
+                facts.incomplete |= facts.calls.iter().any(|call| {
+                    call.completion == crate::tools::capability::turn_state::exact_calls::BackendCompletion::Unknown
+                });
                 Arc::new(facts)
             }),
             authorized_silent: state.authorized_silent,

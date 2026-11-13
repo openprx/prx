@@ -235,7 +235,7 @@ impl CatalogView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::causal_tree::ids::DecisionId;
+    use crate::security::decision_id::DecisionId;
 
     fn catalog() -> CatalogView {
         let identities = [

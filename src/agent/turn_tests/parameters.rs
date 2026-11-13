@@ -187,7 +187,7 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             .await;
         let (prepared, body, receipt, events, rejoined) = result?;
         drained?;
-        assert_eq!(rejoined, crate::causal_tree::store::Enqueue::Queued);
+        assert_eq!(rejoined, crate::runtime::decision_journal::store::Enqueue::Queued);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared.first().unwrap().model, "ollama/llama3.2");
         assert_eq!(body.pointer("/options/temperature"), Some(&json!(2.0)));

@@ -45,7 +45,7 @@ impl OperatorSpawnSource {
         publication: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            proof.surface() == crate::causal_tree::state::TurnSurfaceKind::Interactive
+            proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Interactive
                 && proof.policy_channel() == "terminal"
                 && proof.policy_sender() == "local-user"
                 && proof.config_generation_id() == generation.id.0

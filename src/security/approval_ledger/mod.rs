@@ -10,12 +10,13 @@ pub(crate) mod run_call;
 pub(crate) mod strategy;
 pub(crate) use resume::ResumeRequestScope;
 mod review;
+pub(crate) use review::{ApprovalReviewAdapter, valid_projection};
 #[cfg(test)]
 mod tests;
 
 use crate::acl::approval_grant::{DecisionApprovalBinding, RiskLevel, Subject};
-use crate::causal_tree::store::CausalDecisionStore;
 use crate::memory::Memory;
+use crate::runtime::decision_journal::store::CausalDecisionStore;
 use crate::security::runtime_key::DecisionKey;
 use pending::{PendingRecord, VerifiedPendingDecisionApproval};
 use std::sync::Arc;

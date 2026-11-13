@@ -35,7 +35,7 @@ pub(crate) fn provider_is_zero_price_exempt(provider: &crate::providers::Provide
         && api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
-            .is_none_or(crate::decision::loopback::is_literal_loopback)
+            .is_none_or(crate::providers::loopback::is_literal_loopback)
 }
 
 /// One G6 refusal diagnostic per turn, shared with the missing-price warning.

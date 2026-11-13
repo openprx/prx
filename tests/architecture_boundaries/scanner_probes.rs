@@ -20,6 +20,7 @@ use super::decision_backend::{
     only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend,
     the_decision_store_database_is_opened_only_by_the_store,
 };
+use super::decision_engine::shared_types_are_not_engine_owned;
 use super::decision_seals::{
     decision_compiler_uses_typed_ids_and_only_redacted_state, only_reviewed_production_sites_seal_decision_requests,
     trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
@@ -561,7 +562,7 @@ planted_violation_probes! {
         "src/causal_tree/admin.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn planted_commit() { let _ = crate::config::files::commit_mutation_guarded; }\n";
     probe_causal_child_replay_memory_neighbor: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/store/child_outcome.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/runtime/decision_journal/store/child_outcome.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn planted_memory() { let _ = crate::memory::MemoryFabric::new; }\n";
     probe_causal_outcome_finalizer: the_causal_domain_imports_no_backend_and_no_network,
         "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
@@ -680,7 +681,7 @@ planted_violation_probes! {
         "src/decision/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_local(url: &Url) -> bool {\n    url.host_str() == Some(name)\n}\n";
     probe_decision_address_match: loopback_is_decided_only_by_the_shared_predicate,
-        "src/causal_tree/config.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/config/schema/causal_tree.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub fn d0_planted_v4(ip: std::net::Ipv4Addr) -> bool {\n    ip.is_loopback()\n}\n";
     probe_causal_metric_label: decision_metric_labels_come_from_bounded_allowlists,
         "src/observability/prometheus.rs", Planted::AppendedTo, Reads::ProductionText,
@@ -731,6 +732,12 @@ planted_violation_probes! {
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_build(transports: &dyn DecisionTransports, spec: &BackendSpec<'_>) {\n    \
          let _ = transports.build(spec);\n}\n";
+    probe_neutral_home_names_engine_path: shared_types_are_not_engine_owned,
+        "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn d0_planted_engine() { let _ = crate::decision_engine::status::snapshot; }\n";
+    probe_neutral_home_groups_engine_import: shared_types_are_not_engine_owned,
+        "src/config/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::{decision_engine::render, tools};\n";
     probe_causal_policy_assignment: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_threshold(config: &mut Config) {\n    config.causal_tree.policy.commit_threshold = 0.1;\n}\n";

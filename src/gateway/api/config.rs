@@ -1556,7 +1556,7 @@ mod tests {
         assert!(
             stored.contains(&format!(
                 "schema_version = {}",
-                crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION
+                crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
             )),
             "{stored}"
         );

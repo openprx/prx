@@ -1,8 +1,8 @@
 #![cfg(test)]
 //! Real service/SQLite execution and ledger outcomes, not a forged gate grant.
 use super::*;
-use crate::causal_tree::state::exact_calls::{BackendCompletion, LedgerDisposition};
 use crate::tools::capability::execution_trace::{ExecutionTrace, ExecutionTraceSnapshot};
+use crate::tools::capability::turn_state::exact_calls::{BackendCompletion, LedgerDisposition};
 
 struct FailingTool(Arc<AtomicUsize>);
 #[async_trait]
@@ -45,7 +45,9 @@ fn traced_context(
     (context, trace)
 }
 
-fn only_call(snapshot: &ExecutionTraceSnapshot) -> &crate::causal_tree::state::exact_calls::ExactCallObservation {
+fn only_call(
+    snapshot: &ExecutionTraceSnapshot,
+) -> &crate::tools::capability::turn_state::exact_calls::ExactCallObservation {
     let facts = snapshot
         .exact_call_observations
         .as_ref()

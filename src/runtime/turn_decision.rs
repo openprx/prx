@@ -12,7 +12,7 @@ pub(crate) use ordinary_child_fixture::{
 };
 
 #[cfg(test)]
-use crate::causal_tree::state::ConstraintCode;
+use crate::tools::capability::turn_state::ConstraintCode;
 
 #[cfg(test)]
 pub(crate) mod evidence_fixture;
@@ -75,26 +75,30 @@ use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, Causa
 
 use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective};
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
-use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::outcome::{DecisionRecordBuilder, OutcomeCorrelator, RecordBuildError, TerminalFacts};
-use crate::causal_tree::state::{
-    CausalState, DeliveryConstraints, DerivedState, HopLineage, RawRoutingInput, TrustedParts, TrustedState,
-    TurnBudgets, TurnSurfaceKind,
-};
+use crate::causal_tree::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
 #[cfg(test)]
 use crate::causal_tree::state::{ObservedStepKind, ObservedStepStatus};
-use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Enqueue, Retention, StoreError, StoreMode};
 use crate::config::ConfigGeneration;
 use crate::decision::factory::{
     BackendPlaneStatus, DecisionBackendFactory, DecisionTransports, FactoryBuildError, FactoryDeps,
 };
-use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage};
 use crate::memory::Memory;
+use crate::observability::causal_event::{
+    CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage,
+};
 use crate::providers::catalog::{CatalogView as ProviderCatalogView, Requirement, ResolvedModel, UnknownPolicy};
+use crate::runtime::decision_journal::store::{
+    CausalDecisionStore, DecisionScope, Enqueue, Retention, StoreError, StoreMode,
+};
 use crate::security::SecurityPolicy;
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::catalog::{
     CapabilityCatalog, CatalogError, CatalogScope, CatalogSources, CatalogView, Exposure, ParityError, SurfacePolicy,
+};
+use crate::tools::capability::turn_state::{
+    DeliveryConstraints, TrustedParts, TrustedState, TurnBudgets, TurnSurfaceKind,
 };
 use crate::tools::execution::ToolExecutionService;
 use crate::tools::traits::Tool;
@@ -394,7 +398,7 @@ fn pinned_policy_version(
 
 struct EffectiveAgentExclusions {
     names: Vec<Arc<str>>,
-    model_admission: Option<Arc<dyn crate::causal_tree::state::model_admission::ModelAdmissionView>>,
+    model_admission: Option<Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>>,
 }
 
 fn effective_agent_exclusions(
@@ -419,7 +423,7 @@ fn effective_agent_exclusions(
             allowlist,
             policy_version,
             key,
-        ) as Arc<dyn crate::causal_tree::state::model_admission::ModelAdmissionView>
+        ) as Arc<dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>
     });
     EffectiveAgentExclusions {
         names: names.into_iter().collect(),
@@ -463,7 +467,7 @@ pub(crate) fn validate_agent_retrieval_provenance(
     model_ref: &str,
     policy_version: &str,
     exclusions: &[Arc<str>],
-    model_admission: Option<&dyn crate::causal_tree::state::model_admission::ModelAdmissionView>,
+    model_admission: Option<&dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>,
 ) -> Result<(), TurnOriginMismatch> {
     if trusted.owner_isolated() != proof.owner_isolated()
         || trusted.surface != proof.surface()
@@ -721,7 +725,7 @@ fn direct_answer_refs(
             if trusted.constraints.iter().any(|code| {
                 matches!(code.as_str(), "resume_exact_call" | "tools_off")
                     || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
-            }) || trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
+            }) || trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly
                 && entry.effect > crate::tools::capability::contract::SideEffectClass::ReadOnly
             {
                 return None;
@@ -1273,27 +1277,37 @@ impl TurnDecisionService {
                 .map(|evidence| Arc::clone(evidence.causation())),
             surface: proof.surface(),
             side_effect_mode: match self.security.autonomy {
-                crate::security::AutonomyLevel::ReadOnly => crate::causal_tree::state::SideEffectMode::ReadOnly,
-                crate::security::AutonomyLevel::Supervised => {
-                    crate::causal_tree::state::SideEffectMode::ApprovalRequired
+                crate::security::AutonomyLevel::ReadOnly => {
+                    crate::tools::capability::turn_state::SideEffectMode::ReadOnly
                 }
-                crate::security::AutonomyLevel::Full => crate::causal_tree::state::SideEffectMode::GuardedWrite,
+                crate::security::AutonomyLevel::Supervised => {
+                    crate::tools::capability::turn_state::SideEffectMode::ApprovalRequired
+                }
+                crate::security::AutonomyLevel::Full => {
+                    crate::tools::capability::turn_state::SideEffectMode::GuardedWrite
+                }
             },
             exclusions: effective_exclusions.names,
             model_admission: effective_exclusions.model_admission,
             constraints: {
                 let mut constraints = Vec::new();
                 if proof.owner_isolated() {
-                    constraints.push(crate::causal_tree::state::ConstraintCode::new("owner_isolated"));
+                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
+                        "owner_isolated",
+                    ));
                 }
                 if resume_evidence.is_some() {
-                    constraints.push(crate::causal_tree::state::ConstraintCode::new("resume_exact_call"));
+                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
+                        "resume_exact_call",
+                    ));
                 }
                 if proof.intercepts_writes() {
-                    constraints.push(crate::causal_tree::state::ConstraintCode::new("intercepts_writes"));
+                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
+                        "intercepts_writes",
+                    ));
                 }
                 if owner_filesystem.is_some() {
-                    constraints.push(crate::causal_tree::state::ConstraintCode::new(
+                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
                         "owner_private_filesystem_v1",
                     ));
                 }

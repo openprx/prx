@@ -3,9 +3,9 @@
 //! Three sealed tables live in `self/child_authority/journal.db`. Each row is
 //! `(key, entry)`, where `entry` is `{payload, seal}`. The seal domain differs per
 //! table, and the seal is checked before the payload is interpreted.
-use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::{ChildRecoveryLineage, DecisionRecord, replay_column_names};
 use crate::runtime::child_source::completion::ChildOutcomeError;
+use crate::runtime::decision_journal::store::{ChildRecoveryLineage, DecisionRecord, replay_column_names};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::session_worker::protocol::WorkerManifest;
 use anyhow::Context;
@@ -72,7 +72,9 @@ impl ParentIssuerEvidence {
         let evidence = Self {
             enabled_snapshot: record.enabled_snapshot,
             legacy_v1: record.legacy_v1,
-            admits_issued_child: crate::causal_tree::store::directive_admits_issued_child(&record.directive_kind),
+            admits_issued_child: crate::runtime::decision_journal::store::directive_admits_issued_child(
+                &record.directive_kind,
+            ),
             run_id: record.lineage.run_id.as_deref().map(str::to_owned),
             session_key: record.lineage.session_key.as_deref().map(str::to_owned),
             task_id: record.lineage.task_id.as_deref().map(str::to_owned),

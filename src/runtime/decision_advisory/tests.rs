@@ -103,7 +103,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
 /// Answers every compiled request with a plain Answer and records what the
 /// factory hands the backend: the accounting owner and the request limits.
 pub(crate) struct RecordingBackend {
-    pub(crate) identity: crate::decision::BackendIdentity,
+    pub(crate) identity: crate::cost::decision_attempt::BackendIdentity,
     pub(crate) key: Arc<DecisionKey>,
     pub(crate) attempts: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) request_bytes: Arc<parking_lot::Mutex<Vec<usize>>>,
@@ -111,11 +111,11 @@ pub(crate) struct RecordingBackend {
 
 #[async_trait::async_trait]
 impl crate::decision::backend::DecisionBackend for RecordingBackend {
-    fn identity(&self) -> &crate::decision::BackendIdentity {
+    fn identity(&self) -> &crate::cost::decision_attempt::BackendIdentity {
         &self.identity
     }
-    fn locality(&self) -> crate::decision::BackendLocality {
-        crate::decision::BackendLocality::Builtin
+    fn locality(&self) -> crate::config::schema::causal_tree::BackendLocality {
+        crate::config::schema::causal_tree::BackendLocality::Builtin
     }
     fn version_policy(&self) -> crate::decision::ModelVersionPolicy {
         crate::decision::ModelVersionPolicy::ExactPinned(Arc::clone(&self.identity.configured_model))
@@ -126,7 +126,7 @@ impl crate::decision::backend::DecisionBackend for RecordingBackend {
         body: &crate::decision::outbound::GuardedBody,
         deadline: std::time::Instant,
         accounting: Option<&dyn DecisionAttemptAccounting>,
-    ) -> Result<crate::decision::DecisionResponse, crate::decision::DecisionError> {
+    ) -> Result<crate::decision::DecisionResponse, crate::cost::decision_attempt::DecisionError> {
         if accounting.is_some() {
             self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -138,8 +138,8 @@ impl crate::decision::backend::DecisionBackend for RecordingBackend {
         request: &crate::decision::DecisionRequest,
         body: &crate::decision::outbound::GuardedBody,
         _deadline: std::time::Instant,
-    ) -> Result<crate::decision::DecisionResponse, crate::decision::DecisionError> {
-        use crate::decision::DecisionError;
+    ) -> Result<crate::decision::DecisionResponse, crate::cost::decision_attempt::DecisionError> {
+        use crate::cost::decision_attempt::DecisionError;
         let wire: serde_json::Value = serde_json::from_slice(body.bytes()).map_err(|_| DecisionError::Unavailable)?;
         let answer = crate::agent::agent::native_decision_fixture::decision_answers_for_exact(&wire, "answer", "none")
             .map_err(|_| DecisionError::Unavailable)?;
@@ -231,8 +231,8 @@ async fn decision_advisory_runs_without_turn_decision_service() {
         let request_bytes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let factory = DecisionBackendFactory::from_slots(
             vec![Box::new(RecordingBackend {
-                identity: crate::decision::BackendIdentity {
-                    kind: crate::decision::BackendKind::Mock,
+                identity: crate::cost::decision_attempt::BackendIdentity {
+                    kind: crate::config::schema::causal_tree::BackendKind::Mock,
                     provider: None,
                     configured_model: Arc::from(model),
                 },
@@ -276,7 +276,7 @@ async fn decision_advisory_runs_without_turn_decision_service() {
             key: Some(Arc::clone(&key)),
             transports: &crate::decision::compatible_http::HttpDecisionTransports,
             config_generation: 1,
-            events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
     )
     .expect("test: builtin factory");
@@ -415,7 +415,7 @@ async fn engine_driver_generates_with_advisory_probe() {
             key: Some(Arc::clone(&key)),
             transports: &crate::decision::compatible_http::HttpDecisionTransports,
             config_generation: 1,
-            events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
     )
     .expect("test: builtin factory");
@@ -431,7 +431,7 @@ async fn engine_driver_generates_with_advisory_probe() {
         Arc::new(CapabilityCatalog::build(&registry, &Default::default(), &surface).expect("test: write-tool catalog"));
     let mut trusted = input.state.trusted.parts().clone();
     trusted.catalog_generation = *catalog.generation();
-    trusted.side_effect_mode = crate::causal_tree::state::SideEffectMode::ReadOnly;
+    trusted.side_effect_mode = crate::tools::capability::turn_state::SideEffectMode::ReadOnly;
     trusted.channel = None;
     trusted.exclusions.clear();
     input.state.trusted = TrustedState::from_runtime(trusted);

@@ -11,13 +11,14 @@ async fn four_candidate_timers_report_their_actual_contended_failure_detail() ->
         let started = std::time::Instant::now();
         let detail = match candidate {
             "wal-switch" => {
-                tokio::task::spawn_blocking(crate::causal_tree::store::timeout_probes::wal_switch).await??
+                tokio::task::spawn_blocking(crate::runtime::decision_journal::store::timeout_probes::wal_switch)
+                    .await??
             }
             "bounded-busy" => {
                 tokio::task::spawn_blocking(crate::runtime::sqlite_pool::probe_bounded_busy_contention).await??
             }
             "cost-ledger" => tokio::task::spawn_blocking(crate::cost::tracker::probe_ledger_lock_contention).await??,
-            "terminal-drain" => crate::causal_tree::store::timeout_probes::writer_drain().await?,
+            "terminal-drain" => crate::runtime::decision_journal::store::timeout_probes::writer_drain().await?,
             _ => anyhow::bail!("test: unknown timer candidate"),
         };
         assert!(!detail.is_empty(), "test: candidate must retain its actual error");

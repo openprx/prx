@@ -2,8 +2,8 @@
 use super::ApprovalLedger;
 use super::keys::{ApprovalAuthority, DecisionAuthority};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject};
-use crate::causal_tree::ids::DecisionId;
 use crate::memory::{MessageEvent, MessageEventScope};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use chrono::{DateTime, Utc};

@@ -268,8 +268,9 @@ pub(super) fn template(root: &Path, loopback: &Loopback) -> Config {
     // Auto turns intentionally keep their decision-free Direct surface.
     config.decision_engine.enabled = true;
     config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = root.join("workspace");
     config.config_path = root.join("config.toml");
     config.default_provider = Some(loopback.provider());

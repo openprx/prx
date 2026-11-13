@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
-use crate::causal_tree::store::{DecisionId, Retention, now_ms, store_schema, testing};
-use crate::decision::telemetry::CausalEventSink;
+use crate::observability::causal_event::CausalEventSink;
+use crate::runtime::decision_journal::store::{DecisionId, Retention, now_ms, store_schema, testing};
 use anyhow::Context;
 use std::sync::{
     Arc,

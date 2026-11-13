@@ -87,7 +87,7 @@ impl DecisionBackend for ReadBackend {
         request: &DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
-        _accounting: Option<&dyn crate::decision::budget::DecisionAttemptAccounting>,
+        _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
     ) -> Result<DecisionResponse, DecisionError> {
         self.evaluate(request, body, deadline).await
     }
@@ -198,8 +198,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
     }
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::Builtin,
+    );
     config.workspace_dir = workspace.clone();
     config.config_path = config_dir.join("config.toml");
     config.default_provider = Some("ollama".into());

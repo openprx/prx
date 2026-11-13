@@ -72,7 +72,7 @@ impl GatewayDecisionSlot {
                     plugin_generation: self.plugin_generation,
                 }
                 .publish_scoped(
-                    crate::causal_tree::state::TurnSurfaceKind::Server,
+                    crate::tools::capability::turn_state::TurnSurfaceKind::Server,
                     None,
                     self.targeted.clone(),
                 )

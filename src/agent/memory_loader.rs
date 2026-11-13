@@ -171,7 +171,7 @@ impl Memory for SelectedMemoryView<'_> {
                 && chrono::DateTime::parse_from_rfc3339(&hit.created_at)
                     .ok()
                     .and_then(|created| u64::try_from(now.signed_duration_since(created).num_milliseconds()).ok())
-                    .is_some_and(|age| age <= crate::decision::builtin::weights::STALE_ARTIFACT_MS)
+                    .is_some_and(|age| age <= crate::tools::capability::turn_state::STALE_ARTIFACT_MS)
         });
         self.reserved.fetch_sub(limit - hits.len(), Ordering::AcqRel);
         let entries = hits

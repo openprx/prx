@@ -495,9 +495,9 @@ impl LineReader {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::causal_tree::store::testing::open_private;
-    use crate::causal_tree::store::{DecisionScope, StoreMode};
-    use crate::decision::telemetry::testing::RecordingSink;
+    use crate::observability::causal_event::testing::RecordingSink;
+    use crate::runtime::decision_journal::store::testing::open_private;
+    use crate::runtime::decision_journal::store::{DecisionScope, StoreMode};
 
     const GOAL: &str = "GOAL-SENTINEL-73 please summarise my private notes";
 

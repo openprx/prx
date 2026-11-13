@@ -64,7 +64,7 @@ mod tests {
 
     #[tokio::test]
     async fn advisory_decide_mode_projects_prediction_and_lazily_opens_store() {
-        use crate::decision_engine::config::{DecisionEngineConfig, DecisionMode};
+        use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode};
         for (enabled, mode) in [
             (false, DecisionMode::Pre),
             (true, DecisionMode::Pre),

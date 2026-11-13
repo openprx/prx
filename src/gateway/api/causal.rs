@@ -29,14 +29,14 @@ use super::ApiPrincipal;
 use super::AppState;
 use super::manage::{self, Write, WriteQuery};
 use crate::causal_tree::admin::{DecisionAdmin, TestMode, TestRequest, test_target};
-use crate::causal_tree::config::{BackendSelection, CredentialRefSetting};
-use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::store::TimeWindow;
 use crate::config::manage::credentials::SecretString;
 use crate::config::manage::mutation::causal::{CausalMutation, PolicyPatch, paired};
 use crate::config::manage::{ConfigActor, RiskReason};
-use crate::decision::BackendKind;
-use crate::decision::telemetry::{CausalEventSink, ObserverCausalSink};
+use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::causal_tree::{BackendSelection, CredentialRefSetting};
+use crate::observability::causal_event::{CausalEventSink, ObserverCausalSink};
+use crate::security::decision_id::DecisionId;
 use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Extension, Json,
@@ -668,7 +668,7 @@ mod tests {
         let store = crate::causal_tree::store::CausalDecisionStore::open_shared(
             workspace,
             crate::causal_tree::store::Retention::days(30, 30),
-            Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
             crate::causal_tree::store::StoreMode::ReadWrite,
         )
         .expect("test: store");

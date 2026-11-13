@@ -548,7 +548,7 @@ fn bind_mcp_execution_context(
         .ok_or_else(|| anyhow::anyhow!("admitted tool has no capability catalog entry"))?;
     let mut context = mcp_execution_context(identity);
     let binding = crate::tools::capability::execution_binding::ExecutionBinding::issued(
-        crate::causal_tree::ids::DecisionId::new_runtime(),
+        crate::security::decision_id::DecisionId::new_runtime(),
         entry,
         Arc::clone(&catalog),
         context.envelope.clone(),

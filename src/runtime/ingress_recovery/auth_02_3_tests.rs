@@ -98,7 +98,7 @@ async fn prepare_scope(
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         None,
         &tracker,
         None,

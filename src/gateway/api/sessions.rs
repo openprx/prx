@@ -1218,7 +1218,7 @@ pub(super) async fn get_decision_approval(
     if decision_id.starts_with("call.") {
         return call_approval_action(state, session_id, decision_id, principal, None).await;
     }
-    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
         Ok(id) => id,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
     };
@@ -1332,7 +1332,7 @@ pub(super) async fn get_session_approvals(
             let mut rows = Vec::new();
             use crate::security::approval_ledger::keys::{ApprovalAuthority, DecisionAuthority};
             for item in page.items {
-                let key = DecisionAuthority(crate::causal_tree::ids::DecisionId::parse(&item.view.decision_id)?)
+                let key = DecisionAuthority(crate::security::decision_id::DecisionId::parse(&item.view.decision_id)?)
                     .pending_key();
                 let event = service
                     .memory()
@@ -1445,7 +1445,7 @@ async fn authorize_console_decision_control(
     service: &crate::runtime::turn_decision::TurnDecisionService,
     principal: &super::ApiPrincipal,
     session: &str,
-    decision_id: crate::causal_tree::ids::DecisionId,
+    decision_id: crate::security::decision_id::DecisionId,
     action: ConsoleDecisionControl,
 ) -> anyhow::Result<()> {
     // Authenticate the durable pending record, its original source and decision
@@ -1486,7 +1486,7 @@ async fn change_decision_approval(
     if decision_id.starts_with("call.") {
         return call_approval_action(state, session_id, decision_id, principal, Some(change)).await;
     }
-    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
         Ok(id) => id,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
     };
@@ -1890,7 +1890,7 @@ pub(super) async fn post_decision_resume(
     let Some(principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
         return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
     };
-    let decision_id = match crate::causal_tree::ids::DecisionId::parse(&decision_id) {
+    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
         Ok(id) => id,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
     };
@@ -3277,7 +3277,7 @@ mod tests {
                 );
                 assert_eq!(
                     config.causal_tree,
-                    crate::causal_tree::CausalTreeConfig::default(),
+                    crate::config::schema::causal_tree::CausalTreeConfig::default(),
                     "the Console proof must retain the default causal configuration"
                 );
 

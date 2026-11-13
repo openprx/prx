@@ -53,7 +53,7 @@ pub(super) fn validate_worker_manifest_with_capability_env(
     match (&manifest.capability_manifest, &manifest.child_source) {
         (None, None) => {}
         (Some(capabilities), Some(source)) => {
-            let parent = crate::causal_tree::ids::DecisionId::parse(&capabilities.parent_decision_id)
+            let parent = crate::security::decision_id::DecisionId::parse(&capabilities.parent_decision_id)
                 .context("session-worker parent decision id is malformed")?;
             anyhow::ensure!(
                 parent.to_string() == capabilities.parent_decision_id

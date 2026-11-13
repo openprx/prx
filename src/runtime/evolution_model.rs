@@ -105,7 +105,7 @@ impl EvolutionModel {
                 Arc::clone(&key),
                 cleanup,
                 scope_id,
-                crate::causal_tree::state::TurnBudgets {
+                crate::tools::capability::turn_state::TurnBudgets {
                     tokens: self.config.self_system.evolution_model_max_tokens,
                     micro_usd: self.config.self_system.evolution_model_max_micro_usd,
                     latency_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),

@@ -300,7 +300,7 @@ pub(crate) async fn for_input(
             && input.sender == scope.sender
             && input.recipient == scope.recipient
             && crate::runtime::turn_source::recorded_input_matches(
-                crate::causal_tree::state::TurnSurfaceKind::Server,
+                crate::tools::capability::turn_state::TurnSurfaceKind::Server,
                 &input,
                 input_text
             ),

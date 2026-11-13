@@ -258,8 +258,9 @@ impl Driver {
 pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> Result<()> {
     config.decision_engine.enabled = true;
     config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+    );
     config.causal_tree.backend.endpoint = endpoint.to_owned();
     config.causal_tree.backend.model = DECISION_MODEL.to_owned();
     config.causal_tree.backend.remote_enabled = false;

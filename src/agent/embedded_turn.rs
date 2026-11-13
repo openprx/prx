@@ -208,7 +208,7 @@ async fn run_work(
         plugin_generation: 0,
     }
     .publish_with_memory_loader(
-        crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         agent.memory_loader.clone(),
     )
     .await?;

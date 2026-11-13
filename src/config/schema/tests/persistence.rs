@@ -8,7 +8,7 @@ async fn explicit_hosted_latency_ceiling_loads_without_an_upgrade_warning() {
     let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
-    let version = crate::causal_tree::config::CAUSAL_CONFIG_SCHEMA_VERSION;
+    let version = crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION;
     std::fs::write(&path, format!("default_temperature = 0.7\n[auth]\ncodex_auth_json_auto_import = false\n[causal_tree]\nschema_version = {version}\nenabled = true\n[causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\npinned_snapshot = \"typesafe/jev-1.13-20260917\"\n[causal_tree.policy]\nextra_latency_budget_ms = 500\n")).unwrap();
     let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
     let config = loaded.unwrap();
@@ -110,7 +110,7 @@ async fn config_save_and_load_tmpdir() {
         nodes: NodesConfig::default(),
         agents: HashMap::new(),
         media: MediaConfig::default(),
-        causal_tree: crate::causal_tree::CausalTreeConfig::default(),
+        causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
         decision_engine: Default::default(),
         security: SecurityConfig::default(),
         compliance: ComplianceConfig::default(),

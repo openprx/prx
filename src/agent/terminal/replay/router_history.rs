@@ -1,8 +1,8 @@
 //! Authenticated historical Router readmission. This projection never issues
 //! a selected-read grant, model binding, or a live execution context.
 use super::{DecisionKey, MessageEvent, TurnTerminalStatus};
-use crate::causal_tree::store::DecisionReplayRecord;
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, ProviderExecutionOutcome};
+use crate::runtime::decision_journal::store::DecisionReplayRecord;
 use crate::runtime::turn_decision::router_provider_binding;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -51,8 +51,8 @@ impl RouterReadReplay {
                 "Router replay identity exceeds bounds"
             );
         }
-        let read = crate::causal_tree::ids::DecisionId::parse(&self.read_decision_id)?;
-        let next = crate::causal_tree::ids::DecisionId::parse(&self.next_decision_id)?;
+        let read = crate::security::decision_id::DecisionId::parse(&self.read_decision_id)?;
+        let next = crate::security::decision_id::DecisionId::parse(&self.next_decision_id)?;
         anyhow::ensure!(
             read != next && self.source_sequence > 0,
             "Router replay transition identity invalid"

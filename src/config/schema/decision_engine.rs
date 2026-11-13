@@ -1,6 +1,6 @@
 //! Default-off advisory engine configuration and raw-key migration.
-pub use crate::causal_tree::config::DecisionBackendConfig;
-use crate::causal_tree::config::DecisionBackendConfig as BackendConfig;
+pub use crate::config::schema::causal_tree::DecisionBackendConfig;
+use crate::config::schema::causal_tree::DecisionBackendConfig as BackendConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +58,7 @@ pub enum DecisionEngineConfigError {
     #[error("decision_engine.{key} must be between {min} and {max}")]
     OutOfRange { key: &'static str, min: u32, max: u32 },
     #[error("invalid decision_engine.backend: {0}")]
-    Backend(#[source] crate::causal_tree::config::CausalConfigError),
+    Backend(#[source] crate::config::schema::causal_tree::CausalConfigError),
 }
 
 fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(), DecisionEngineConfigError> {
@@ -72,7 +72,7 @@ fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(),
 impl DecisionEngineConfig {
     pub fn validate(&self) -> Result<(), DecisionEngineConfigError> {
         self.validate_with_latency_budget(
-            crate::causal_tree::config::CausalTreeConfig::default()
+            crate::config::schema::causal_tree::CausalTreeConfig::default()
                 .policy
                 .extra_latency_budget_ms,
         )
@@ -128,8 +128,8 @@ impl DecisionEngineConfig {
     }
     /// Hosted backends remain excluded until remote processing is enabled.
     pub fn backend_available(&self) -> bool {
-        use crate::causal_tree::config::BackendSelection;
-        use crate::decision::BackendKind;
+        use crate::config::schema::causal_tree::BackendKind;
+        use crate::config::schema::causal_tree::BackendSelection;
         self.backend.as_ref().is_none_or(|b| {
             b.remote_enabled
                 || !matches!(

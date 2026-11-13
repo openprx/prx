@@ -1,8 +1,8 @@
 //! Closed source-proof contract shared by admitted model turn adapters.
 //! Only ingress-owned opaque proofs implement the private sealing trait.
 use crate::agent::entry::{AgentModelBinding, AgentTurnProof};
-use crate::causal_tree::state::TurnSurfaceKind;
 use crate::memory::principal::MemoryWriteContext;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 
 /// Persistence shape for supported ingress adapters. This recognizes a
 /// format only; callers must separately authenticate lineage and signatures.
@@ -129,7 +129,7 @@ pub(crate) trait TurnSourceProof: sealed::Sealed + Send + Sync {
     /// Execution isolation from the actual sealed origin, never caller arguments.
     fn owner_isolated(&self) -> bool;
     /// Only the actual authenticated owner-review ingress opts in.
-    fn approval_review_adapter(&self) -> Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter> {
+    fn approval_review_adapter(&self) -> Option<crate::security::approval_ledger::ApprovalReviewAdapter> {
         None
     }
     /// Locally issued operator task identity, never a parent model decision.
@@ -262,7 +262,7 @@ impl TurnSourceProof for AgentTurnProof {
 pub(crate) struct OwnedTurnSourceProof {
     h2_origin: Option<std::sync::Arc<super::h2_entry::VerifiedEntryOrigin>>,
     owner_isolated: bool,
-    approval_review_adapter: Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter>,
+    approval_review_adapter: Option<crate::security::approval_ledger::ApprovalReviewAdapter>,
     previous_segment_input: Option<String>,
     segment_input_sequence: Option<i64>,
     operator_task_authority_id: Option<uuid::Uuid>,
@@ -867,7 +867,7 @@ impl TurnSourceProof for OwnedTurnSourceProof {
     fn owner_isolated(&self) -> bool {
         self.owner_isolated
     }
-    fn approval_review_adapter(&self) -> Option<crate::causal_tree::approval_collection::ApprovalReviewAdapter> {
+    fn approval_review_adapter(&self) -> Option<crate::security::approval_ledger::ApprovalReviewAdapter> {
         self.approval_review_adapter
     }
     fn source_memory_principal(&self) -> crate::memory::MemoryPrincipal {

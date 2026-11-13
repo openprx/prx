@@ -6,8 +6,8 @@ use super::{
 use crate::causal_tree::branch::{CandidateSpec, CausalCandidate};
 use crate::causal_tree::candidate_generator::CostEstimateSource;
 use crate::causal_tree::gates::{GateOutcome, HardGates};
-use crate::causal_tree::state::SideEffectMode;
 use crate::tools::capability::contract::SideEffectClass;
+use crate::tools::capability::turn_state::SideEffectMode;
 use anyhow::Context;
 
 /// Most discovered tools one turn may declare, counted across every search.

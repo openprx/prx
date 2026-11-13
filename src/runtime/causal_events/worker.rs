@@ -1,6 +1,6 @@
 //! Keep authority/control messages independent of the ordinary telemetry backlog.
 use super::{QueueItem, QueuedEvent, applied_input_matches, report_incomplete, to_message_input};
-use crate::decision::telemetry::{CausalEventSink, IncompleteReason};
+use crate::observability::causal_event::{CausalEventSink, IncompleteReason};
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 

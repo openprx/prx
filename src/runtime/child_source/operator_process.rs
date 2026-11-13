@@ -204,7 +204,7 @@ impl OperatorProcessAuthority {
                 && proof.ordinary_task_authority_id().is_none()
                 && proof.ordinary_process_authority_id().is_none()
                 && proof.child_scope().is_none()
-                && proof.surface() == crate::causal_tree::state::TurnSurfaceKind::Worker
+                && proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Worker
                 && proof.workspace_id() == parent.workspace_id()
                 && proof.owner_id() == parent.owner_id()
                 && proof.session_key() == self.session_key

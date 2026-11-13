@@ -40,11 +40,11 @@ use super::super::history::ConfigActor;
 use super::super::transaction::{
     ApplyOptions, ConfigChange, ConfigPlan, ConfigTransactionError, ConfigTransactionOutcome, ConfigTransactions,
 };
-use crate::causal_tree::config::{BackendSelection, CalibrationProfile, CausalPolicy, CredentialRefSetting};
 use crate::config::Config;
 use crate::config::files::ConfigRevisionConflict;
+use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::causal_tree::{BackendSelection, CalibrationProfile, CausalPolicy, CredentialRefSetting};
 use crate::config::schema::{ModelOperationSetting, ProviderModelConfig};
-use crate::decision::BackendKind;
 use crate::providers::catalog::{ModelOperation, Support};
 
 /// One change to the decision plane's configuration.
@@ -306,7 +306,8 @@ impl CausalConfigService {
             })
             .into());
         }
-        let Some(selection) = crate::decision::factory::configured_selection(&desired.causal_tree.backend) else {
+        let Some(selection) = crate::config::schema::causal_tree::configured_selection(&desired.causal_tree.backend)
+        else {
             return Err(CausalMutationError::Invalid(
                 "no decision backend that takes a credential is configured".to_string(),
             ));
@@ -427,7 +428,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             if let Some(timeout_ms) = timeout_ms {
                 section.backend.timeout_ms = *timeout_ms;
             }
-            if let Some(selection) = crate::decision::factory::configured_selection(&section.backend) {
+            if let Some(selection) = crate::config::schema::causal_tree::configured_selection(&section.backend) {
                 let model = section.backend.model.trim().to_string();
                 if let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
                     && let Some(entry) = catalog.model(&crate::providers::ProviderId::of(&selection.provider), &model)
@@ -496,7 +497,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             let pinned = section.backend.kind == BackendSelection::Fixed(kind)
                 && section.backend.model.trim() == model
                 && section.backend.endpoint.trim() == proposal.endpoint.trim()
-                && !crate::decision::model_pin::is_unpinned_model(&model);
+                && !crate::providers::model_pin::is_unpinned_model(&model);
             if !pinned {
                 return Err(CausalMutationError::Calibration(
                     "the report was measured on another backend, endpoint or model than the configured, pinned one"

@@ -222,6 +222,29 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "security::redaction::redact_json_value",
     "security::redaction::redact_provider_text",
     "security::redaction::redact_secrets",
+    // 05aS neutral homes (R15-R17, R52): the forwarding module paths in
+    // `causal_tree/mod.rs` and the moved shared items. None opens a
+    // connection.
+    "security::decision_id",
+    "config::schema::causal_tree",
+    "config::schema::decision_engine::effective_engine_backend",
+    "runtime::decision_journal::store",
+    "runtime::decision_journal::store_preparation",
+    "runtime::decision_journal::store_schema",
+    "tools::capability::turn_state::",
+    "memory::artifact_summary::cut_bytes",
+    "memory::artifact_summary::cut_chars",
+    "memory::artifact_summary::redact_text",
+    "providers::model_pin::is_unpinned_model",
+    "providers::loopback::",
+    "cost::decision_attempt::DecisionError",
+    "security::approval_ledger::valid_projection",
+    "observability::causal_event::CausalEvent",
+    "observability::causal_event::CausalEventFields",
+    "observability::causal_event::CausalEventKind",
+    "observability::causal_event::CausalEventSink",
+    "observability::causal_event::CausalLineage",
+    "observability::causal_event::IncompleteReason",
 ];
 
 // CDP-18's admission and enumeration ports read immutable catalog and policy
@@ -389,7 +412,8 @@ const CAUSAL_DOMAIN_FORBIDDEN_NAMES: [&str; 25] = [
 /// reaches a backend only through `DecisionBackend`, from the caller. The
 /// guard is an allowlist, so a new route out cannot pass by being unnamed:
 ///
-/// - every path a production file under `src/causal_tree/**` names from the
+/// - every path a production file under `src/causal_tree/**` (and the moved
+///   `src/runtime/decision_journal*`) names from the
 ///   crate root (`crate::`, or `super::super::` from a top-level file,
 ///   through `use` trees, aliases and qualified paths alike) must start with
 ///   an entry of [`CAUSAL_DOMAIN_CRATE_PATHS`]; a glob or a bare module
@@ -413,7 +437,9 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
         .collect();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/causal_tree/") {
+        // The decision journal moved out of the causal domain (R16) and keeps
+        // its purity guard.
+        if !relative.starts_with("src/causal_tree/") && !relative.starts_with("src/runtime/decision_journal") {
             continue;
         }
         scanned += 1;
@@ -443,7 +469,7 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
                     "config::files::read_merged_toml_with_gate_once",
                     "config::deprecations::file_holding",
                 ],
-                "src/causal_tree/store/child_outcome.rs" => &["agent::terminal::VerifiedTerminalReplay"],
+                "src/runtime/decision_journal/store/child_outcome.rs" => &["agent::terminal::VerifiedTerminalReplay"],
                 _ => &[],
             };
             let allowed = CAUSAL_DOMAIN_CRATE_PATHS.iter().chain(file_paths.iter()).any(|entry| {

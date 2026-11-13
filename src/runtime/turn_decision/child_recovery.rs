@@ -3,12 +3,12 @@ use super::{
     Arc, BTreeMap, Context, DecisionScope, Enqueue, Instant, OutcomeCorrelator, TerminalFacts, TurnDecisionService,
 };
 use crate::agent::terminal::replay_requires_journal;
-use crate::causal_tree::store::{ChildRecoveryCursor, ChildRecoveryLineage};
 use crate::memory::MessageEvent;
 use crate::memory::ingress_recovery::{IngressEventLookup, IngressLifetime, IngressRecoveryScope, remaining};
 use crate::runtime::child_source::authority_journal::{self, EvidenceCursor};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::child_source::recovery;
+use crate::runtime::decision_journal::store::{ChildRecoveryCursor, ChildRecoveryLineage};
 use crate::runtime::turn_cleanup::CleanupTracker;
 
 #[derive(Default)]
@@ -411,7 +411,7 @@ impl TurnDecisionService {
             let facts = TerminalFacts::from_persisted_marker(event, replay.decision(), source_owner, &workspace)?
                 .with_verified_resume(replay);
             let expected = OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
-            let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(replay, &expected)
+            let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(replay, &expected)
                 .context("verified child parent link is inconsistent")?;
             let reader = self.store.reader();
             let read_scope = scope.clone();
@@ -448,7 +448,7 @@ impl TurnDecisionService {
         {
             return Ok(None);
         }
-        let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(replay, &expected)
+        let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(replay, &expected)
             .context("verified child link changed")?;
         if remaining(deadline).is_err() || lifetime.validate(deadline).await.is_err() {
             return Ok(None);
@@ -459,7 +459,7 @@ impl TurnDecisionService {
         anyhow::ensure!(writer.drain(deadline).await, "child recovery link did not drain");
         let reader = self.store.reader();
         let read_scope = scope.clone();
-        let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(replay, &expected)
+        let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(replay, &expected)
             .context("verified child link changed")?;
         if !super::super::ingress_recovery::owned_store_read(owner, move || {
             Ok(reader.child_outcome_matches_until(&read_scope, &link, deadline)?)

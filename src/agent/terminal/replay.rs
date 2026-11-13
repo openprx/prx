@@ -5,9 +5,9 @@ mod operator;
 mod router_history;
 
 use super::{DecisionSettlementRef, TurnTerminalCommit, TurnTerminalStatus, terminal_semantic_scope};
-use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::store::{DecisionReplayRecord, DecisionScope, DecisionStoreReader, DecisionView};
 use crate::memory::{Memory, MessageEvent, MessageEventScope};
+use crate::runtime::decision_journal::store::{DecisionReplayRecord, DecisionScope, DecisionStoreReader, DecisionView};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -1157,7 +1157,8 @@ async fn verify_terminal_replay_inner(
         .get("execution_trace")
         .and_then(|trace| trace.get("exact_call_observations"))
     {
-        let _: crate::causal_tree::state::exact_calls::ExactCallObservations = serde_json::from_value(facts.clone())?;
+        let _: crate::tools::capability::turn_state::exact_calls::ExactCallObservations =
+            serde_json::from_value(facts.clone())?;
     }
     let terminal_status = TurnTerminalStatus::deserialize(payload.get("status").context("terminal status missing")?)?;
     anyhow::ensure!(
@@ -1376,7 +1377,7 @@ async fn read_replay_decision(
     scope: &DecisionScope,
     id: &DecisionId,
     bounded: Option<(std::time::Instant, &Arc<crate::runtime::turn_cleanup::CleanupTracker>)>,
-) -> anyhow::Result<Option<crate::causal_tree::store::DecisionReplayRecord>> {
+) -> anyhow::Result<Option<crate::runtime::decision_journal::store::DecisionReplayRecord>> {
     if let Some((deadline, owner)) = bounded {
         let reader = reader.clone();
         let scope = scope.clone();

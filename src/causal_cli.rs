@@ -17,16 +17,16 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::causal_tree::admin::{DecisionAdmin, DecisionPlaneBuilder, TestMode, TestRequest, test_target};
-use crate::causal_tree::config::CredentialRefSetting;
-use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::store::TimeWindow;
 use crate::config::Config;
 use crate::config::manage::mutation::causal::{CausalMutation, PolicyPatch};
-use crate::decision::BackendKind;
+use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::causal_tree::CredentialRefSetting;
 use crate::decision::compatible_http::HttpDecisionTransports;
 use crate::decision::factory::{DecisionBackendFactory, FactoryBuildError, FactoryDeps};
-use crate::decision::telemetry::{CausalEventSink, ObserverCausalSink};
+use crate::observability::causal_event::{CausalEventSink, ObserverCausalSink};
 use crate::providers::catalog::CatalogView;
+use crate::security::decision_id::DecisionId;
 
 /// Which backend `prx causal test` asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -672,7 +672,7 @@ impl DecisionSetup {
         let loopback = self
             .endpoint
             .as_deref()
-            .is_some_and(crate::decision::loopback::is_literal_loopback);
+            .is_some_and(crate::providers::loopback::is_literal_loopback);
         reasons.iter().all(|reason| match reason {
             crate::config::manage::RiskReason::EndpointChanged { path } => {
                 loopback
@@ -825,7 +825,7 @@ impl DecisionPlaneBuilder for HttpPlane {
                 .status()
                 .order
                 .iter()
-                .any(|slot| slot.locality == crate::decision::BackendLocality::Loopback)
+                .any(|slot| slot.locality == crate::config::schema::causal_tree::BackendLocality::Loopback)
             {
                 factory.check_health().await;
                 return Ok(true);
@@ -855,7 +855,7 @@ impl DecisionPlaneBuilder for HttpPlane {
         config: &'a Config,
         key: Arc<crate::security::runtime_key::DecisionKey>,
         request: &'a crate::decision::DecisionRequest,
-        lineage: &'a crate::decision::telemetry::CausalLineage,
+        lineage: &'a crate::observability::causal_event::CausalLineage,
     ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, crate::causal_tree::admin::AdminPrediction> {
         Box::pin(async move {
             if factory.status().order.is_empty() {
@@ -926,7 +926,9 @@ async fn admin_accounting_scope(
     let mut tokens = u64::MAX;
     let catalog = crate::providers::selection::catalog_for(config);
     for slot in factory.status().order {
-        if operation == b"health-loopback" && slot.locality != crate::decision::BackendLocality::Loopback {
+        if operation == b"health-loopback"
+            && slot.locality != crate::config::schema::causal_tree::BackendLocality::Loopback
+        {
             continue;
         }
         let provider = slot
@@ -970,10 +972,12 @@ async fn admin_accounting_scope(
             b"admin-accounting-v1",
             uuid::Uuid::new_v4().as_bytes(),
             operation,
-            &serde_json::to_vec(crate::decision_engine::config::effective_engine_backend(&config))?,
+            &serde_json::to_vec(crate::config::schema::decision_engine::effective_engine_backend(
+                &config,
+            ))?,
         ],
     );
-    let budgets = crate::causal_tree::state::TurnBudgets {
+    let budgets = crate::tools::capability::turn_state::TurnBudgets {
         tokens,
         latency_ms: config.causal_tree.policy.extra_latency_budget_ms,
         micro_usd,
@@ -1318,7 +1322,7 @@ mod tests {
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+            crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::CompatibleHttp);
         config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
         config.causal_tree.backend.model = "prx-admin-accounting-model".to_owned();
         config.providers.models.push(
@@ -1339,7 +1343,7 @@ mod tests {
         );
         let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
         let plane = HttpPlane {
-            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+            events: Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                 crate::observability::NoopObserver,
             ))),
         };
@@ -1431,10 +1435,11 @@ mod tests {
         };
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(BackendKind::Builtin);
+        config.causal_tree.backend.kind =
+            crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::Builtin);
         let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
         let plane = HttpPlane {
-            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+            events: Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                 crate::observability::NoopObserver,
             ))),
         };
@@ -1477,13 +1482,13 @@ mod tests {
         config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
         config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+            crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::CompatibleHttp);
         config.causal_tree.backend.endpoint = "http://127.0.0.1:12345".to_owned();
         config.causal_tree.backend.model = "prx-undeclared-admin-model".to_owned();
         config.providers.models.clear();
         let key = FactoryDeps::load_key(&config).expect("actual private DecisionKey");
         let plane = HttpPlane {
-            events: Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
+            events: Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
                 crate::observability::NoopObserver,
             ))),
         };
@@ -1564,9 +1569,10 @@ mod tests {
                 )) && error.contains(&format!("--reference cred-decision-{}", kind.as_str())),
                 "{error}"
             );
-            let mut section = crate::causal_tree::config::CausalTreeConfig::default();
-            section.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(kind);
-            let selection = crate::decision::factory::configured_selection(&section.backend).expect("test: selection");
+            let mut section = crate::config::schema::causal_tree::CausalTreeConfig::default();
+            section.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(kind);
+            let selection =
+                crate::config::schema::causal_tree::configured_selection(&section.backend).expect("test: selection");
             assert_eq!(
                 crate::providers::ProviderId::of(owner),
                 crate::providers::ProviderId::of(&selection.provider),
@@ -1801,14 +1807,15 @@ mod tests {
         let config = written(temp.path(), |config| {
             config.decision_engine.enabled = true;
             config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(BackendKind::CompatibleHttp);
+                crate::config::schema::causal_tree::BackendSelection::Fixed(BackendKind::CompatibleHttp);
             config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".to_string();
             config.causal_tree.backend.model = "decider-2026-09".to_string();
-            config.causal_tree.policy.calibration_profile = Some(crate::causal_tree::config::CalibrationProfile {
-                kind: BackendKind::CompatibleHttp,
-                endpoint: "http://127.0.0.1:8900/v1".to_string(),
-                model: "decider-2026-09".to_string(),
-            });
+            config.causal_tree.policy.calibration_profile =
+                Some(crate::config::schema::causal_tree::CalibrationProfile {
+                    kind: BackendKind::CompatibleHttp,
+                    endpoint: "http://127.0.0.1:8900/v1".to_string(),
+                    model: "decider-2026-09".to_string(),
+                });
         })
         .await;
         let setup = DecisionSetup {

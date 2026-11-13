@@ -85,7 +85,7 @@ impl TurnDecisionService {
                     .iter()
                     .any(|code| code.as_str() == "intercepts_writes")
                     && entry.plan_intercepted())
-                && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
+                && !(trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly
                     && entry.effect > crate::tools::capability::contract::SideEffectClass::ReadOnly)
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && proof.child_scope().is_none_or(|scope| {

@@ -245,7 +245,7 @@ fn cache_relabel_preserves_real_decoded_response_digest() {
         max_response_bytes: 262_144,
         version_policy: ModelVersionPolicy::ExactPinned(Arc::from("prx-fixture-model")),
         local_backend: BackendIdentity {
-            kind: crate::decision::protocol::BackendKind::CompatibleHttp,
+            kind: crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
             provider: None,
             configured_model: Arc::from("prx-fixture-model"),
         },

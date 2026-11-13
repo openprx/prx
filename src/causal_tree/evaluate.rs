@@ -767,7 +767,7 @@ fn calibration(decisions: &[DecisionView]) -> Availability<CalibrationProposal> 
             reason: "the decisions do not record the endpoint they were measured on",
         };
     };
-    if crate::decision::model_pin::is_unpinned_model(model) {
+    if crate::providers::model_pin::is_unpinned_model(model) {
         return Availability::Unavailable {
             reason: "the backend's model is not pinned to an exact version",
         };
@@ -1064,7 +1064,7 @@ mod tests {
     use crate::causal_tree::ids::DecisionId;
     use crate::causal_tree::store::testing::{OutcomeFixture, open_private, record, write_outcome};
     use crate::causal_tree::store::{CausalDecisionStore, RecordedCandidate, RecordedDistributions, RecordedShadow};
-    use crate::decision::telemetry::testing::RecordingSink;
+    use crate::observability::causal_event::testing::RecordingSink;
 
     const WS: &str = "ws";
 

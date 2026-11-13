@@ -1,10 +1,10 @@
 //! Exact terminal proposals retained across cancellation and future drop.
 use super::turn_decision::VerifiedDirectiveApplication;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-use crate::causal_tree::state::TurnSurfaceKind;
-use crate::causal_tree::store::{DecisionScope, Enqueue};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
+use crate::runtime::decision_journal::store::{DecisionScope, Enqueue};
 use crate::runtime::turn_decision::TurnDecisionService;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 use anyhow::Context;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1065,7 +1065,7 @@ impl super::ingress_recovery::RecoveryScope {
             },
         );
         if let (Some((store, writer)), true) = (projection, replay.parent_decision_id().is_some()) {
-            let link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
+            let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
                 .context("child outcome lineage is inconsistent")?;
             anyhow::ensure!(
                 writer.record_child_outcome(link) == Enqueue::Queued,
@@ -1077,8 +1077,9 @@ impl super::ingress_recovery::RecoveryScope {
                     .await,
                 "child outcome link persistence timed out"
             );
-            let expected_link = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
-                .context("child outcome lineage changed")?;
+            let expected_link =
+                crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
+                    .context("child outcome lineage changed")?;
             anyhow::ensure!(
                 if let Some((_, deadline, owner)) = bounded {
                     let reader = store.reader();
@@ -1144,8 +1145,9 @@ impl super::ingress_recovery::RecoveryScope {
                         tracing::warn!("rejoined outcome projection could not be queued");
                     }
                     if replay.parent_decision_id().is_some() {
-                        let queued = crate::causal_tree::store::ChildOutcomeLink::from_replay(&replay, &expected)
-                            .is_some_and(|link| writer.record_child_outcome(link) == Enqueue::Queued);
+                        let queued =
+                            crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
+                                .is_some_and(|link| writer.record_child_outcome(link) == Enqueue::Queued);
                         if !queued {
                             tracing::warn!("child outcome link projection could not be queued");
                         }

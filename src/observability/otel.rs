@@ -403,13 +403,15 @@ impl Observer for OtelObserver {
 }
 
 /// The metric attributes of a causal event: bounded values only (AG-11).
-fn causal_metric_attributes(event: &crate::decision::telemetry::CausalEvent) -> [KeyValue; 3] {
+fn causal_metric_attributes(event: &crate::observability::causal_event::CausalEvent) -> [KeyValue; 3] {
     let fields = &event.fields;
     [
         KeyValue::new("kind", event.kind.as_str()),
         KeyValue::new(
             "backend",
-            fields.backend.map_or("none", crate::decision::BackendKind::as_str),
+            fields
+                .backend
+                .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str),
         ),
         KeyValue::new("class", fields.error_class.unwrap_or("none")),
     ]
@@ -418,14 +420,16 @@ fn causal_metric_attributes(event: &crate::decision::telemetry::CausalEvent) -> 
 /// The span attributes of a causal event: the lineage identifiers and the
 /// bounded fields, the model through the configured-model allowlist; never
 /// state, text or a claimed model (D-060 L-1).
-fn causal_span_attributes(event: &crate::decision::telemetry::CausalEvent) -> Vec<KeyValue> {
+fn causal_span_attributes(event: &crate::observability::causal_event::CausalEvent) -> Vec<KeyValue> {
     let (fields, lineage) = (&event.fields, &event.lineage);
     let mut attributes = vec![
         KeyValue::new("causal.kind", event.kind.as_str()),
         KeyValue::new("causal.workspace", lineage.workspace_id.to_string()),
         KeyValue::new(
             "causal.backend",
-            fields.backend.map_or("none", crate::decision::BackendKind::as_str),
+            fields
+                .backend
+                .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str),
         ),
         KeyValue::new("causal.class", fields.error_class.unwrap_or("none")),
     ];
@@ -480,7 +484,7 @@ mod tests {
     /// capped.
     #[test]
     fn otel_attributes_are_bounded() {
-        use crate::decision::telemetry::{CausalEvent, CausalEventFields, CausalEventKind, CausalLineage};
+        use crate::observability::causal_event::{CausalEvent, CausalEventFields, CausalEventKind, CausalLineage};
         let event = CausalEvent {
             kind: CausalEventKind::PredictionFailed,
             lineage: CausalLineage {
@@ -489,7 +493,7 @@ mod tests {
                 ..CausalLineage::default()
             },
             fields: CausalEventFields {
-                backend: Some(crate::decision::BackendKind::CompatibleHttp),
+                backend: Some(crate::config::schema::causal_tree::BackendKind::CompatibleHttp),
                 configured_model: Some("HOSTILE-UNLISTED-MODEL-77".into()),
                 error_class: Some("transport"),
                 ..CausalEventFields::default()

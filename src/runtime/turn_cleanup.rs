@@ -52,7 +52,7 @@ struct State {
 
 #[derive(Clone)]
 struct PreparedStoreQueues {
-    store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
     events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
@@ -271,7 +271,7 @@ impl CleanupTicket {
     /// cancelled. This handoff precedes releasing its registered I/O ticket.
     pub(crate) fn retain_prepared_store(
         &self,
-        store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
         events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
     ) {
         self.tracker

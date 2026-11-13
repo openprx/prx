@@ -269,7 +269,7 @@ pub(super) fn setup_decision_plane() -> Result<
                 .default(true)
                 .interact()?;
             let setup = crate::causal_cli::DecisionSetup {
-                kind: crate::decision::BackendKind::CompatibleHttp,
+                kind: crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
                 endpoint: Some(endpoint.trim().to_string()),
                 model: Some(model.trim().to_string()),
                 enable,
@@ -281,8 +281,8 @@ pub(super) fn setup_decision_plane() -> Result<
             print_bullet("A hosted service needs a credential. Decision state is sent to it only after you run");
             print_bullet("`prx causal config enable-remote`; until then the builtin decides locally.");
             let kinds = [
-                crate::decision::BackendKind::TypeSafe,
-                crate::decision::BackendKind::OpenRouter,
+                crate::config::schema::causal_tree::BackendKind::TypeSafe,
+                crate::config::schema::causal_tree::BackendKind::OpenRouter,
             ];
             let kind_labels = ["TypeSafe", "OpenRouter (Decisions API)"];
             let kind = Select::new()
@@ -293,7 +293,7 @@ pub(super) fn setup_decision_plane() -> Result<
             let kind = kinds
                 .get(kind)
                 .copied()
-                .unwrap_or(crate::decision::BackendKind::TypeSafe);
+                .unwrap_or(crate::config::schema::causal_tree::BackendKind::TypeSafe);
             let model: String = Input::new().with_prompt("  Model, one exact version").interact_text()?;
             let enable = Confirm::new()
                 .with_prompt("  Turn the decision plane on now?")

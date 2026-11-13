@@ -28,11 +28,11 @@ use std::time::{Duration, Instant};
 use openprx::config::Config;
 use openprx::decision::compatible_http::HttpDecisionTransports;
 use openprx::decision::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
-use openprx::decision::telemetry::{CausalEvent, CausalEventSink, CausalLineage};
 use openprx::decision::{
     DecisionError, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId, RequestLimits,
     RequestParts, StructuredValue, ValidationRule,
 };
+use openprx::observability::causal_event::{CausalEvent, CausalEventSink, CausalLineage};
 use openprx::providers::ProviderId;
 use openprx::providers::catalog::{CatalogView, CuratedModel, ModelOperation};
 use parking_lot::Mutex;
@@ -1136,7 +1136,10 @@ async fn typesafe_backend_resolves_credential_ref_through_secret_store() {
             .await
             .expect("test: decide");
         assert_eq!(result.served_by, ServedBy::Primary, "{:?}", result.attempts);
-        assert_eq!(result.served.identity().kind, openprx::decision::BackendKind::TypeSafe);
+        assert_eq!(
+            result.served.identity().kind,
+            openprx::config::schema::causal_tree::BackendKind::TypeSafe
+        );
         assert_eq!(result.served.claimed_backend(), "typesafe");
         let sent = stub.requests.lock()[0].clone();
         assert!(sent.starts_with("POST /ts/v1/systemone HTTP/1.1"), "{sent}");
@@ -1146,7 +1149,10 @@ async fn typesafe_backend_resolves_credential_ref_through_secret_store() {
             "{sent}"
         );
         let status = plane.factory.status();
-        assert_eq!(status.order[0].locality, openprx::decision::BackendLocality::Remote);
+        assert_eq!(
+            status.order[0].locality,
+            openprx::config::schema::causal_tree::BackendLocality::Remote
+        );
     })
     .await;
 }
@@ -1502,7 +1508,7 @@ impl AccountedFactory {
             .status()
             .order
             .iter()
-            .any(|slot| slot.locality == openprx::decision::BackendLocality::Loopback)
+            .any(|slot| slot.locality == openprx::config::schema::causal_tree::BackendLocality::Loopback)
         {
             self.inner.check_health().await;
             return;
@@ -1528,7 +1534,7 @@ impl AccountedFactory {
 }
 
 fn fixture_price(config: &mut Config, catalog: &CatalogView) {
-    let selection = openprx::decision::factory::configured_selection(&config.causal_tree.backend)
+    let selection = openprx::config::schema::causal_tree::configured_selection(&config.causal_tree.backend)
         .expect("test: configured decision selection");
     let resolved = openprx::providers::selection::check_decision_backend(
         config,
@@ -1553,7 +1559,7 @@ fn fixture_price(config: &mut Config, catalog: &CatalogView) {
 
 fn decision_tranche_micro_usd(config: &Config, tokens: u64) -> u64 {
     use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
-    let selection = crate::decision::factory::configured_selection(&config.causal_tree.backend)
+    let selection = crate::config::schema::causal_tree::configured_selection(&config.causal_tree.backend)
         .expect("configured decision selection");
     let catalog = CatalogView::from_config(config).with_curated([CuratedModel {
         operations: Some(vec![ModelOperation::DecisionEndpoint]),

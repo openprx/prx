@@ -26,7 +26,6 @@ use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 use super::error::{DecisionError, RequestRule, ValidationRule};
-use crate::providers::ProviderId;
 use crate::security::runtime_key::DecisionKey;
 
 /// The decision protocol version PRX speaks.
@@ -1269,17 +1268,8 @@ impl DecisionAnswer {
     }
 }
 
-/// Token and cost accounting reported by a backend. Accounting only: a
-/// missing value is never a validation failure.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecisionUsage {
-    /// Input tokens.
-    pub input_tokens: Option<u32>,
-    /// Output tokens.
-    pub output_tokens: Option<u32>,
-    /// Cost in millionths of a US dollar, when the backend reports one.
-    pub cost_micro_usd: Option<u64>,
-}
+// Forwarding path until Part 2: moved to `cost::decision_attempt` (R17).
+pub use crate::cost::decision_attempt::DecisionUsage;
 
 /// A decoded, not yet validated, backend response.
 #[derive(Debug, Clone, PartialEq)]
@@ -1304,72 +1294,11 @@ pub struct DecisionResponse {
     pub response_sha256: [u8; 32],
 }
 
-/// The kind of backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BackendKind {
-    /// The local deterministic backend.
-    Builtin,
-    /// Any System One compatible HTTP endpoint.
-    CompatibleHttp,
-    /// The hosted TypeSafe adapter.
-    TypeSafe,
-    /// The hosted OpenRouter Decisions adapter.
-    OpenRouter,
-    /// The scripted test backend.
-    #[cfg(any(test, feature = "test-mock"))]
-    Mock,
-}
+// Forwarding path until Part 2: moved to `config::schema::causal_tree` (R17).
+pub use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
 
-impl BackendKind {
-    /// The stable kind name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::CompatibleHttp => "compatible_http",
-            Self::TypeSafe => "typesafe",
-            Self::OpenRouter => "openrouter",
-            #[cfg(any(test, feature = "test-mock"))]
-            Self::Mock => "mock",
-        }
-    }
-}
-
-/// Where a backend runs. It is derived from the backend kind and the literal
-/// loopback predicate, never from a URL alone for hosted kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BackendLocality {
-    /// In process.
-    Builtin,
-    /// On a literal loopback address.
-    Loopback,
-    /// Anywhere else.
-    Remote,
-}
-
-impl BackendLocality {
-    /// The stable locality name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Loopback => "loopback",
-            Self::Remote => "remote",
-        }
-    }
-}
-
-/// The locally configured identity of a backend: the audit truth, as opposed
-/// to the claims in a response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendIdentity {
-    /// The backend kind.
-    pub kind: BackendKind,
-    /// The provider the backend belongs to, for hosted kinds.
-    pub provider: Option<ProviderId>,
-    /// The configured model.
-    pub configured_model: Arc<str>,
-}
+// Forwarding path until Part 2: moved to `cost::decision_attempt` (R17).
+pub use crate::cost::decision_attempt::BackendIdentity;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,5 @@
 use super::keys::{ApprovalAuthority, DecisionAuthority};
-use crate::causal_tree::ids::DecisionId;
+use crate::security::decision_id::DecisionId;
 
 #[test]
 fn decision_keys_are_byte_identical_to_pre_extraction() {
@@ -93,8 +93,8 @@ use super::pending::{PendingRecord, VerifiedPendingDecisionApproval, scope_from_
 use super::resolution::ResumeClaimScope;
 use super::{ApprovalLedger, ApprovalRuntime, GrantScope};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
-use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Retention, StoreMode};
 use crate::memory::{Memory, MemoryFabric, MemoryVisibility, MessageEventScope, SqliteMemory};
+use crate::runtime::decision_journal::store::{CausalDecisionStore, DecisionScope, Retention, StoreMode};
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use std::sync::Arc;
 
@@ -148,7 +148,7 @@ impl LifecycleFixture {
         let store = CausalDecisionStore::open_shared(
             path,
             Retention::days(0, 0),
-            Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+            Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
             StoreMode::ReadWrite,
         )
         .unwrap();
@@ -175,7 +175,7 @@ impl LifecycleFixture {
             .await
             .unwrap();
         let scope = scope_from_source(&source);
-        let mut row = crate::causal_tree::store::testing::record(
+        let mut row = crate::runtime::decision_journal::store::testing::record(
             id,
             &workspace,
             Some(&subject.owner_id),
@@ -956,7 +956,7 @@ async fn pending_approval_loads_from_the_journal_with_a_dropped_store_projection
     let dir = tempfile::tempdir().unwrap();
     let fixture = LifecycleFixture::new(dir.path()).await;
     load(&fixture).await.expect("journal-backed approval loads");
-    let conn = rusqlite::Connection::open(crate::causal_tree::store::db_path(dir.path())).unwrap();
+    let conn = rusqlite::Connection::open(crate::runtime::decision_journal::store::db_path(dir.path())).unwrap();
     conn.execute_batch("DELETE FROM outcomes; DELETE FROM decisions;")
         .unwrap();
     assert_eq!(

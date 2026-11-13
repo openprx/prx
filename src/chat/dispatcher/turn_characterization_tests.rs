@@ -510,7 +510,7 @@ async fn admit_chat_fixture_with_mode(
     };
     let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
     let decisions = crate::runtime::turn_decision::build_turn_decision_service(
-        crate::causal_tree::state::TurnSurfaceKind::Interactive,
+        crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
         crate::runtime::turn_decision::TurnServiceBuild {
             parent_grant: None,
             generation: Arc::clone(&generation),
@@ -524,13 +524,15 @@ async fn admit_chat_fixture_with_mode(
                 0,
             ),
             surface_policy: crate::runtime::turn_publication::surface_policy(
-                crate::causal_tree::state::TurnSurfaceKind::Interactive,
+                crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
                 &config.tool_tiering,
             ),
             provider_catalog: &provider_catalog,
             transports: if matches!(
                 config.causal_tree.backend.kind,
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp)
+                crate::config::schema::causal_tree::BackendSelection::Fixed(
+                    crate::config::schema::causal_tree::BackendKind::CompatibleHttp
+                )
             ) {
                 &crate::decision::compatible_http::HttpDecisionTransports
             } else {

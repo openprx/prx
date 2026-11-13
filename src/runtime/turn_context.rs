@@ -4,15 +4,16 @@
 
 use std::sync::Arc;
 
-use crate::causal_tree::ids::DecisionId;
-use crate::causal_tree::state::{ObservedState, RawRoutingInput, TrustedParts, TurnBudgets};
+use crate::causal_tree::state::{ObservedState, RawRoutingInput};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::turn_decision::{AdmittedDecisionResume, SendLimits};
+use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
 use crate::tools::capability::contract::CatalogGeneration;
 use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
+use crate::tools::capability::turn_state::{TrustedParts, TurnBudgets};
 
 /// The execution-owned runtime context of one turn.
 pub(crate) struct TurnRuntimeContext {

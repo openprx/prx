@@ -9,7 +9,7 @@ async fn worker_verifies_parent_from_authority_journal_without_decision_store() 
     let tmp = tempfile::tempdir()?;
     with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
         let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
-        let db = crate::causal_tree::store::db_path(workspace);
+        let db = crate::runtime::decision_journal::store::db_path(workspace);
         std::fs::rename(&db, db.with_extension("unavailable"))?;
         assert!(verify_worker_parent_authority(&worker, workspace)?.is_some());
         assert!(!db.exists());
@@ -87,6 +87,40 @@ async fn pre_upgrade_child_verifies_through_causal_store_fallback() -> Result<()
     .await
 }
 
+/// R16: the historical (pre-upgrade) parent is verified through the decision
+/// journal with the existing key only. A missing `.decision_key` refuses the
+/// child and is never recreated (`DecisionKey::load_existing`).
+#[tokio::test]
+async fn historical_parent_missing_key_refuses_without_recreation() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    with_prepared_worker_manifest(&tmp, "ollama".into(), None, |mut worker| async move {
+        let workspace = worker
+            .child_source
+            .as_ref()
+            .expect("test: child source")
+            .parent_constraints
+            .workspace
+            .clone();
+        let workspace = std::path::Path::new(&workspace);
+        worker
+            .child_source
+            .as_mut()
+            .expect("test: child source")
+            .journal_version = None;
+        std::fs::remove_file(authority_journal::path(workspace))?;
+        let key = workspace.join("self").join("causal_tree").join(".decision_key");
+        assert!(key.exists(), "test: the parent wrote its decision key");
+        std::fs::remove_file(&key)?;
+        assert!(
+            verify_worker_parent_authority(&worker, workspace).is_err(),
+            "a historical parent without its decision key must be refused"
+        );
+        assert!(!key.exists(), "the refused verification must not recreate the key");
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 async fn launch_v3_refuses_missing_parent_row() -> Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -143,7 +177,7 @@ fn startup_footprint(
     };
     let authority = rows("SELECT entry FROM authority ORDER BY run")?;
     let launch = rows("SELECT entry FROM launch_parent ORDER BY run")?;
-    let store = std::fs::metadata(crate::causal_tree::store::db_path(workspace))
+    let store = std::fs::metadata(crate::runtime::decision_journal::store::db_path(workspace))
         .ok()
         .map(|meta| meta.modified().map(|modified| (meta.len(), modified)))
         .transpose()?;

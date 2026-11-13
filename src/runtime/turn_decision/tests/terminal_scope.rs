@@ -24,8 +24,9 @@ impl LinkedFixture {
         let workspace = tempfile::tempdir().expect("owned workspace");
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind =
-            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
         config.workspace_dir = workspace.path().to_path_buf();
         config.causal_tree.enabled = enabled;
         let generation = crate::config::new_shared(config.clone()).pin();
@@ -425,7 +426,7 @@ fn reseal_journal_fingerprint(fixture: &LinkedFixture, owner: &str, decision: &s
     .expect("journal evidence row of the issued hop");
     let mut named = Vec::with_capacity(columns.len());
     for (name, value) in columns {
-        let name = crate::causal_tree::store::replay_column_names()
+        let name = crate::runtime::decision_journal::store::replay_column_names()
             .into_iter()
             .find(|candidate| *candidate == name)
             .expect("known replay column");

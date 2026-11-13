@@ -4,9 +4,9 @@
 //! selects the physical namespace independently of arguments and approvals.
 use super::{TurnDecisionContext, TurnDecisionService};
 use crate::acl::approval_grant::RiskLevel;
-use crate::causal_tree::approval_collection::ApprovalReviewAdapter;
 use crate::memory::{MessageEvent, MessageEventSource};
 use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::approval_ledger::ApprovalReviewAdapter;
 use crate::tools::owner_filesystem::OwnerFilesystem;
 use anyhow::Context;
 use std::sync::Arc;

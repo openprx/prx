@@ -20,7 +20,7 @@ pub enum ToolExecutionError {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionBinding {
-    decision_id: crate::causal_tree::ids::DecisionId,
+    decision_id: crate::security::decision_id::DecisionId,
     capability: CapabilityRef,
     catalog: Arc<CapabilityCatalog>,
     scope: RuntimeEnvelope,
@@ -54,7 +54,7 @@ impl ExecutionBinding {
     }
 
     pub(crate) fn issued(
-        decision_id: crate::causal_tree::ids::DecisionId,
+        decision_id: crate::security::decision_id::DecisionId,
         entry: &CapabilityEntry,
         catalog: Arc<CapabilityCatalog>,
         scope: RuntimeEnvelope,

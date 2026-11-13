@@ -115,10 +115,10 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
 }
 
 /// AG-17 (CDP-PLAN 1.5 and 1.7; SP-CDP-A 5.3 and 5.8): whether a decision
-/// endpoint is loopback is decided in one place, `decision::loopback`, from
+/// endpoint is loopback is decided in one place, `providers::loopback`, from
 /// the host as written. Configuration validation, the factory's locality and
 /// the HTTP client share it. Elsewhere in `src/decision/**` and in
-/// `src/causal_tree/config.rs`:
+/// `src/config/schema/causal_tree.rs` (+ `causal_tree/`) and `src/providers/loopback.rs`:
 ///
 /// - no parsed host is consulted (`host_str`, which normalizes `127.1` and
 ///   `0x7f000001` to `127.0.0.1`);
@@ -129,18 +129,21 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
 #[test]
 pub(super) fn loopback_is_decided_only_by_the_shared_predicate() {
     const RULES: [(&str, &[&str]); 4] = [
-        ("host_str", &["src/decision/loopback.rs"]),
-        ("Ipv4Addr", &["src/decision/loopback.rs", "src/decision/http.rs"]),
-        ("Ipv6Addr", &["src/decision/loopback.rs", "src/decision/http.rs"]),
+        ("host_str", &["src/providers/loopback.rs"]),
+        ("Ipv4Addr", &["src/providers/loopback.rs", "src/decision/http.rs"]),
+        ("Ipv6Addr", &["src/providers/loopback.rs", "src/decision/http.rs"]),
         (
             "is_loopback",
-            &["src/decision/loopback.rs", "src/decision/compatible_http.rs"],
+            &["src/providers/loopback.rs", "src/decision/compatible_http.rs"],
         ),
     ];
     let mut violations = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/") && relative != "src/causal_tree/config.rs" {
+        if !relative.starts_with("src/decision/")
+            && !relative.starts_with("src/config/schema/causal_tree")
+            && relative != "src/providers/loopback.rs"
+        {
             continue;
         }
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
@@ -211,15 +214,15 @@ pub(super) fn decision_http_clients_come_only_from_the_pinned_builder() {
 }
 
 /// AG-10 (SP-CDP-A 5.10): the decision store's database is named, and so
-/// opened, only by `causal_tree/store.rs`. Its `store/` child modules are
+/// opened, only by `runtime/decision_journal/store.rs`. Its `store/` child modules are
 /// scanned like any other file; test-only files are empty production text.
 /// Comments may mention it.
 #[test]
 pub(super) fn the_decision_store_database_is_opened_only_by_the_store() {
-    const STORE: &str = "src/causal_tree/store.rs";
+    const STORE: &str = "src/runtime/decision_journal/store.rs";
     const SCANNED_CHILDREN: [&str; 2] = [
-        "src/causal_tree/store/child_outcome.rs",
-        "src/causal_tree/store/child_recovery.rs",
+        "src/runtime/decision_journal/store/child_outcome.rs",
+        "src/runtime/decision_journal/store/child_recovery.rs",
     ];
     let mut violations = Vec::new();
     let mut scanned_children = 0_usize;

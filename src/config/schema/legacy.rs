@@ -149,7 +149,7 @@ pub(super) fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Op
     // plane map to their new homes before the unknown-path check, keeping
     // operator values; one without a faithful home stops the load.
     let locate = |path: &[&str]| config_path.and_then(|main| crate::config::deprecations::file_holding(main, path));
-    let causal = crate::causal_tree::config::migrate_legacy(root, &locate)?;
+    let causal = crate::config::schema::causal_tree::migrate_legacy(root, &locate)?;
     if causal.ignored.is_empty() && causal.found_legacy_keys() {
         tracing::warn!(
             moved = ?causal.moved,
@@ -167,7 +167,7 @@ pub(super) fn migrate_legacy_config_keys(root: &mut toml::Value, config_path: Op
         );
     }
     // Copy the legacy backend before retired-key removal and empty-table pruning.
-    crate::decision_engine::config::migrate_backend(root)?;
+    crate::config::schema::decision_engine::migrate_backend(root)?;
     // Retired keys are dropped *here*, before the unknown-path check below, so
     // that a config written against an older prx keeps loading with a warning
     // instead of failing to start. Only the paths on the published list are

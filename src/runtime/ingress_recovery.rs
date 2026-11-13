@@ -61,10 +61,10 @@ impl RepairSpies {
 #[derive(Clone)]
 pub(crate) struct LegacyEvidence {
     pub(crate) key: Arc<DecisionKey>,
-    pub(crate) reader: crate::causal_tree::store::DecisionStoreReader,
-    pub(crate) writer: Option<crate::causal_tree::store::DecisionStoreWriter>,
+    pub(crate) reader: crate::runtime::decision_journal::store::DecisionStoreReader,
+    pub(crate) writer: Option<crate::runtime::decision_journal::store::DecisionStoreWriter>,
     pub(crate) events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
-    pub(crate) store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+    pub(crate) store: Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
 }
 
 /// Advisory ReadWrite store opened by a plane-on builder and passed into
@@ -72,15 +72,15 @@ pub(crate) struct LegacyEvidence {
 /// A store without a writer is not a valid construction: use [`Self::opened`].
 #[derive(Clone, Default)]
 pub(crate) struct PreparedAdvisory {
-    pub writer: Option<crate::causal_tree::store::DecisionStoreWriter>,
+    pub writer: Option<crate::runtime::decision_journal::store::DecisionStoreWriter>,
     pub events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
-    pub store: Option<Arc<crate::causal_tree::store::CausalDecisionStore>>,
+    pub store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
 }
 
 impl PreparedAdvisory {
     /// Pair the ReadWrite store with its writer. A store without a writer is refused.
     pub(crate) fn opened(
-        store: Arc<crate::causal_tree::store::CausalDecisionStore>,
+        store: Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
         events: Arc<super::causal_events::DurableCausalEventSink>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -94,7 +94,7 @@ impl PreparedAdvisory {
 impl LegacyEvidence {
     pub(crate) fn owns_prepared_queues(
         &self,
-        store: Option<&Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        store: Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
         events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
     ) -> bool {
         store.is_some_and(|store| Arc::ptr_eq(store, &self.store))
@@ -111,10 +111,10 @@ impl LegacyEvidence {
 pub(crate) async fn open_advisory_store(
     generation: &crate::config::ConfigGeneration,
     memory: Arc<dyn Memory>,
-    observer: Arc<dyn crate::decision::telemetry::CausalEventSink>,
+    observer: Arc<dyn crate::observability::causal_event::CausalEventSink>,
     owner: &Arc<super::turn_cleanup::CleanupTracker>,
 ) -> anyhow::Result<(
-    Arc<crate::causal_tree::store::CausalDecisionStore>,
+    Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
     Arc<super::causal_events::DurableCausalEventSink>,
 )> {
     let config = &generation.effective;
@@ -123,14 +123,14 @@ pub(crate) async fn open_advisory_store(
     )?);
     let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
     let prepared_events = Arc::clone(&events);
-    let store = crate::causal_tree::store_preparation::open_store(
+    let store = crate::runtime::decision_journal::store_preparation::open_store(
         config.workspace_dir.clone(),
-        crate::causal_tree::store::Retention::days(
+        crate::runtime::decision_journal::store::Retention::days(
             config.causal_tree.store.retention_days,
             config.self_system.fitness.retention_days,
         ),
         events.clone(),
-        Some(crate::causal_tree::store::StoreMode::ReadWrite),
+        Some(crate::runtime::decision_journal::store::StoreMode::ReadWrite),
         move |result| {
             ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
             ticket.finish(result.is_ok());
@@ -157,7 +157,7 @@ pub(crate) struct RecoveryScope {
     pub(super) memory: Arc<dyn Memory>,
     pub(super) workspace: std::path::PathBuf,
     pub(super) recordable: bool,
-    pub(super) surface: crate::causal_tree::state::TurnSurfaceKind,
+    pub(super) surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     pub(super) authority: Arc<RecoveryAuthority>,
     pub(super) parent_authority_id: Option<crate::tools::capability::child::ParentAuthorityId>,
     #[cfg(test)]
@@ -168,7 +168,7 @@ impl RecoveryScope {
     pub(super) fn unrecorded(
         memory: Arc<dyn Memory>,
         workspace: std::path::PathBuf,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     ) -> Self {
         Self {
             memory,
@@ -191,7 +191,7 @@ impl RecoveryScope {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_store(&self) -> Option<&Arc<crate::causal_tree::store::CausalDecisionStore>> {
+    pub(crate) fn legacy_store(&self) -> Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>> {
         self.authority.legacy.as_ref().map(|legacy| &legacy.store)
     }
 
@@ -201,7 +201,7 @@ impl RecoveryScope {
     }
 
     #[cfg(test)]
-    pub(crate) fn legacy_writer(&self) -> Option<&crate::causal_tree::store::DecisionStoreWriter> {
+    pub(crate) fn legacy_writer(&self) -> Option<&crate::runtime::decision_journal::store::DecisionStoreWriter> {
         self.authority.legacy.as_ref().and_then(|legacy| legacy.writer.as_ref())
     }
 
@@ -213,7 +213,7 @@ impl RecoveryScope {
     pub(crate) async fn prepare(
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn Memory>,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         parent_grant: Option<&super::child_source::IssuedChildGrant>,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
         workspace_key: Option<Arc<DecisionKey>>,
@@ -293,7 +293,7 @@ impl RecoveryScope {
 
     pub(super) fn owns_prepared_queues(
         &self,
-        store: Option<&Arc<crate::causal_tree::store::CausalDecisionStore>>,
+        store: Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
         events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
     ) -> bool {
         self.authority
@@ -340,7 +340,7 @@ impl RecoveryScope {
         &self,
         memory: &Arc<dyn Memory>,
         workspace: &str,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     ) -> bool {
         Arc::ptr_eq(memory, &self.memory)
             && self.workspace.to_string_lossy() == workspace
@@ -354,7 +354,7 @@ impl RecoveryScope {
         &self,
         terminal_id: &str,
         owner_id: &str,
-    ) -> anyhow::Result<crate::causal_tree::store::Enqueue> {
+    ) -> anyhow::Result<crate::runtime::decision_journal::store::Enqueue> {
         self.rejoin_terminal_inner(terminal_id, owner_id, None).await
     }
 
@@ -363,7 +363,7 @@ impl RecoveryScope {
         capsule: &IngressCapsule,
         deadline: Instant,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
-    ) -> anyhow::Result<crate::causal_tree::store::Enqueue> {
+    ) -> anyhow::Result<crate::runtime::decision_journal::store::Enqueue> {
         anyhow::ensure!(
             capsule.scope.workspace_id == self.workspace.to_string_lossy(),
             "recovery service workspace differs from capsule"
@@ -418,7 +418,10 @@ pub(crate) struct IngressRecorder {
     run_id: std::sync::OnceLock<String>,
     warned_markers: parking_lot::Mutex<std::collections::HashSet<String>>,
     barrier: Arc<tokio::sync::Mutex<()>>,
-    source: std::sync::OnceLock<(IngressRecoveryScope, crate::causal_tree::state::TurnSurfaceKind)>,
+    source: std::sync::OnceLock<(
+        IngressRecoveryScope,
+        crate::tools::capability::turn_state::TurnSurfaceKind,
+    )>,
     /// `causal_tree.enabled` at prepare. Plane off never opens `.decision_key`.
     plane: bool,
 }
@@ -983,7 +986,7 @@ impl IngressRecorder {
         IngressRecoveryDiagnostic {
             run_id: run.to_owned(),
             memory_store: self.workspace.join("memory/brain.db"),
-            decision_store: crate::causal_tree::store::db_path(&self.workspace),
+            decision_store: crate::runtime::decision_journal::store::db_path(&self.workspace),
         }
     }
 
@@ -1061,7 +1064,7 @@ impl IngressRecorder {
                     tracing::warn!(run_id = %capsule.run_id,
                         marker_id = %event.event_id,
                         brain_db = %self.workspace.join("memory/brain.db").display(),
-                        decisions_db = %crate::causal_tree::store::db_path(&self.workspace).display(),
+                        decisions_db = %crate::runtime::decision_journal::store::db_path(&self.workspace).display(),
                         "ignored unauthenticated ingress quarantine marker; recovery will proceed; remove the unauthenticated marker row or rerun ingress recovery");
                 }
             }
@@ -1156,7 +1159,7 @@ impl IngressRecorder {
         );
         tracing::error!(reason, run_id = %capsule.run_id,
             brain_db = %self.workspace.join("memory/brain.db").display(),
-            decisions_db = %crate::causal_tree::store::db_path(&self.workspace).display(),
+            decisions_db = %crate::runtime::decision_journal::store::db_path(&self.workspace).display(),
             "quarantined unverifiable ingress record; startup recovery will continue");
         Ok(())
     }
@@ -1208,7 +1211,7 @@ fn pending_attestation(
     key_id: &str,
     capsule: &IngressCapsule,
     input: &MessageEventInput,
-    surface: crate::causal_tree::state::TurnSurfaceKind,
+    surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     transport_bytes: &[u8],
 ) -> anyhow::Result<IngressAttestation> {
     use base64::Engine as _;
@@ -1345,7 +1348,8 @@ fn recovery_only_legacy_sync(workspace: &std::path::Path) -> anyhow::Result<Opti
             return Ok(None);
         }
     };
-    let Some(store) = crate::causal_tree::store::CausalDecisionStore::open_recovery_read_only(workspace)? else {
+    let Some(store) = crate::runtime::decision_journal::store::CausalDecisionStore::open_recovery_read_only(workspace)?
+    else {
         return Ok(None);
     };
     let store = Arc::new(store);

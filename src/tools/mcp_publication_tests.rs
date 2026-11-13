@@ -64,7 +64,7 @@ async fn cold_mcp_publication_survives_first_selected_tool_refresh() {
         memory,
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
     .await
     .expect("production publication");
     // The real turn engine refreshes the selected MCP root before exposing

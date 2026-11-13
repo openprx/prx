@@ -144,7 +144,7 @@ pub struct ProcessGenerationBinding {
 // must bind the same representation while retaining explicit overrides.
 fn normalized_process_config(config: &Config) -> anyhow::Result<serde_json::Value> {
     let mut normalized = serde_json::to_value(config)?;
-    let backend = crate::decision_engine::config::effective_engine_backend(config);
+    let backend = crate::config::schema::decision_engine::effective_engine_backend(config);
     let mut engine = config.decision_engine.clone();
     engine.backend = Some(backend.clone());
     if let Some(root) = normalized.as_object_mut() {
@@ -1771,11 +1771,12 @@ mod tests {
     /// the reload can warn; a local edit is not.
     #[test]
     fn a_hand_edited_remote_enablement_is_reported() {
-        use crate::causal_tree::config::BackendSelection;
+        use crate::config::schema::causal_tree::BackendSelection;
         let old = Config::default();
         let mut new = old.clone();
         new.causal_tree.enabled = true;
-        new.causal_tree.backend.kind = BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        new.causal_tree.backend.kind =
+            BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::CompatibleHttp);
         new.causal_tree.backend.endpoint = "https://decisions.example.com/v1".to_string();
         new.causal_tree.backend.remote_enabled = true;
         assert_eq!(

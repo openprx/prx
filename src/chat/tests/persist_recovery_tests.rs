@@ -267,7 +267,7 @@ async fn unverifiable_terminal_is_quarantined_so_chat_can_start() {
                 memory: memory_for_publish,
                 plugin_generation: 0,
             }
-            .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+            .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
             .await;
             if let Ok(service) = &published {
                 service

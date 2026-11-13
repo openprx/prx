@@ -34,13 +34,14 @@ where
             Ok(std::panic::AssertUnwindSafe(boxed_parent_issuance(|| async {
                 let mut config = config.clone();
                 config.decision_engine.enabled = true;
-                if crate::decision::factory::configured_selection(
-                    crate::decision_engine::config::effective_engine_backend(&config),
+                if crate::config::schema::causal_tree::configured_selection(
+                    crate::config::schema::decision_engine::effective_engine_backend(&config),
                 )
                 .is_none()
                 {
-                    config.causal_tree.backend.kind =
-                        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+                    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+                        crate::config::schema::causal_tree::BackendKind::Builtin,
+                    );
                 }
                 let generation = crate::config::new_shared(config.clone()).pin();
                 let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &workspace));

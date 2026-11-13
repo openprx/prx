@@ -275,7 +275,7 @@ impl AppContext {
     pub(crate) async fn publish_turn_decisions(
         &self,
         registry: Arc<Vec<Box<dyn Tool>>>,
-        surface: crate::causal_tree::state::TurnSurfaceKind,
+        surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
         super::turn_publication::TurnDecisionPublication {
             generation: Arc::clone(&self.config_generation),
@@ -316,7 +316,7 @@ impl RuntimeBootstrap {
         Self::build_inner(
             config.into(),
             profile,
-            crate::causal_tree::state::TurnSurfaceKind::AgentLoop,
+            crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
             None,
         )
         .await
@@ -333,7 +333,7 @@ impl RuntimeBootstrap {
                 producer: Box::new(producer),
             },
             profile,
-            crate::causal_tree::state::TurnSurfaceKind::Interactive,
+            crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
             None,
         )
         .await
@@ -347,8 +347,8 @@ impl RuntimeBootstrap {
         envelope: Option<&crate::runtime::envelope::RuntimeEnvelope>,
         scheduled: Option<&crate::tools::execution::ScheduledToolScope>,
     ) -> Result<Arc<AppContext>> {
-        use crate::causal_tree::state::TurnSurfaceKind;
         use crate::runtime::envelope::RuntimeSource;
+        use crate::tools::capability::turn_state::TurnSurfaceKind;
         let config = config_source.effective();
         if let AgentRuntimeConfig::Pinned { generation, .. } = &config_source
             && let Some(envelope) = envelope
@@ -405,7 +405,7 @@ impl RuntimeBootstrap {
     async fn build_inner(
         config_source: AgentRuntimeConfig,
         profile: BootstrapProfile,
-        agent_surface: crate::causal_tree::state::TurnSurfaceKind,
+        agent_surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         security_override: Option<Arc<SecurityPolicy>>,
     ) -> Result<Arc<AppContext>> {
         // Wrap config once so all downstream users share the same allocation

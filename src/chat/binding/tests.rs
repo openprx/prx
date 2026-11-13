@@ -74,7 +74,7 @@ pub(crate) async fn recorded_local_operator_spawn(
     let binding = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
         .context("operator fixture provider binding missing")?;
     let service = publication
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
         .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .context("operator fixture cleanup owner missing")?
@@ -119,7 +119,7 @@ pub(crate) async fn dispatch_recorded_model_spawn(
     let selected = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
         .context("model fixture provider binding missing")?;
     let service = publication
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
         .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .context("model fixture cleanup owner missing")?
@@ -235,7 +235,7 @@ pub(crate) async fn dispatch_unknown_agent_fixture(
     let selected = ChatProviderBinding::capture(&generation, &provider, provider_name, model_name)?
         .context("model fixture provider binding missing")?;
     let service = publication
-        .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+        .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
         .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .context("model fixture cleanup owner missing")?
@@ -342,7 +342,7 @@ async fn fixture_with_plane(
 pub(in crate::chat) async fn fixture_with_advisory(
     record_input: bool,
     enabled: bool,
-    advisory: crate::decision_engine::config::DecisionEngineConfig,
+    advisory: crate::config::schema::decision_engine::DecisionEngineConfig,
 ) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
@@ -579,7 +579,7 @@ pub(in crate::chat) async fn service(
         memory: fabric.memory(),
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::Interactive)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
     .await
     .unwrap()
 }
@@ -666,7 +666,7 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
         let mut without_plan = actual.clone();
         let mut trusted = without_plan.trusted.parts().clone();
         trusted.constraints.retain(|code| code.as_str() != "intercepts_writes");
-        without_plan.trusted = crate::causal_tree::state::TrustedState::from_runtime(trusted);
+        without_plan.trusted = crate::tools::capability::turn_state::TrustedState::from_runtime(trusted);
         let key = crate::causal_tree::state::fixtures::key();
         assert_ne!(
             actual

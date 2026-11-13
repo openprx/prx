@@ -1,7 +1,7 @@
 //! Fresh model policy snapshot; no backend output can construct this authority.
 use super::catalog::CatalogView;
-impl crate::causal_tree::state::model_admission::model_admission_sealed::Producer for ModelAdmission {}
-impl crate::causal_tree::state::model_admission::ModelAdmissionView for ModelAdmission {
+impl crate::tools::capability::turn_state::model_admission::model_admission_sealed::Producer for ModelAdmission {}
+impl crate::tools::capability::turn_state::model_admission::ModelAdmissionView for ModelAdmission {
     fn denied_words(&self) -> &[u64] {
         &self.denied
     }
@@ -98,7 +98,7 @@ impl ModelAdmission {
 
     #[cfg(test)]
     pub(crate) fn excludes(&self, catalog: &CatalogView<'_>, entry: &CapabilityEntry) -> bool {
-        crate::causal_tree::state::model_admission::ModelAdmissionView::excludes(
+        crate::tools::capability::turn_state::model_admission::ModelAdmissionView::excludes(
             self,
             catalog.model_admission_entry(entry),
         )

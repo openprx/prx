@@ -1,7 +1,7 @@
 //! Real SQLite preparation remains cleanup-owned after its publisher is dropped.
 #![cfg(test)]
 use super::*;
-use crate::decision::telemetry::testing::RecordingSink;
+use crate::observability::causal_event::testing::RecordingSink;
 use std::time::Duration;
 
 #[tokio::test]

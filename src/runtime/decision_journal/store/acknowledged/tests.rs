@@ -14,7 +14,7 @@ async fn queued_chain_replay_reads_real_scoped_rows_and_preserves_missing_hops()
     let workspace = tempfile::tempdir()?;
     let store = testing::open_private(
         workspace.path(),
-        Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+        Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
     );
     let writer = store.writer().context("writer")?;
     let workspace_id = store.workspace_id().context("workspace")?;

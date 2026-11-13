@@ -1017,7 +1017,7 @@ async fn run_admitted_webhook_spawn(
         memory,
         plugin_generation: 0,
     }
-    .publish(crate::causal_tree::state::TurnSurfaceKind::Server)
+    .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Server)
     .await?;
     crate::runtime::turn_cleanup::current_tracker()
         .ok_or_else(|| anyhow::anyhow!("gateway fixture cleanup owner missing"))?

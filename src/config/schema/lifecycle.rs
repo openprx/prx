@@ -35,7 +35,7 @@ impl Config {
         if !section.enabled || section.policy.extra_latency_budget_ms_explicit {
             return None;
         }
-        let selection = crate::decision::factory::configured_selection(&section.backend)?;
+        let selection = crate::config::schema::causal_tree::configured_selection(&section.backend)?;
         let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref()
             .inspect_err(|error| tracing::warn!(%error, "cannot read the catalog latency recommendation"))
             .ok()?;

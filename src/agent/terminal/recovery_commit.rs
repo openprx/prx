@@ -8,7 +8,6 @@ use super::{
     terminal_semantic_scope, verify_terminal_replay, verify_terminal_replay_journal,
 };
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-use crate::causal_tree::store::Enqueue;
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, UsagePrice, usage_cost_resolution};
@@ -18,6 +17,7 @@ use crate::memory::recovery_authority::{
     RecoveryPricing, RecoveryPublication, RecoveryTerminalCommit, RecoveryTerminalOutcome,
 };
 use crate::memory::{Memory, MessageEventInput, MessageEventScope};
+use crate::runtime::decision_journal::store::Enqueue;
 use crate::runtime::ingress_recovery::{SettledTerminalFacts, SkillObservation};
 use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;

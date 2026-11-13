@@ -261,10 +261,12 @@ fn encode_families(families: &[prometheus::proto::MetricFamily]) -> String {
 impl PrometheusObserver {
     /// A decision-plane event: counters and histograms with bounded labels
     /// only; the lineage is never a label (AG-11).
-    fn record_causal(&self, event: &crate::decision::telemetry::CausalEvent) {
-        use crate::decision::telemetry::{CausalEventKind, IncompleteReason};
+    fn record_causal(&self, event: &crate::observability::causal_event::CausalEvent) {
+        use crate::observability::causal_event::{CausalEventKind, IncompleteReason};
         let fields = &event.fields;
-        let backend = fields.backend.map_or("none", crate::decision::BackendKind::as_str);
+        let backend = fields
+            .backend
+            .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str);
         match event.kind {
             CausalEventKind::SnapshotCreated
             | CausalEventKind::CandidatesGenerated
@@ -279,10 +281,12 @@ impl PrometheusObserver {
             }
             CausalEventKind::PredictionStarted => {}
             CausalEventKind::PredictionSucceeded => {
-                let locality = fields.locality.map_or("none", crate::decision::BackendLocality::as_str);
+                let locality = fields
+                    .locality
+                    .map_or("none", crate::config::schema::causal_tree::BackendLocality::as_str);
                 let served = fields
                     .served
-                    .map_or("none", crate::decision::telemetry::ServedLabel::as_str);
+                    .map_or("none", crate::observability::causal_event::ServedLabel::as_str);
                 self.causal_decisions
                     .with_label_values(&[backend, locality, served])
                     .inc();
@@ -298,13 +302,15 @@ impl PrometheusObserver {
                     .inc();
             }
             CausalEventKind::BackendFallback => {
-                let to = fields.to_backend.map_or("none", crate::decision::BackendKind::as_str);
+                let to = fields
+                    .to_backend
+                    .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str);
                 self.causal_fallbacks.with_label_values(&[backend, to]).inc();
             }
             CausalEventKind::BackendCircuitOpened => {
                 let state = fields
                     .circuit
-                    .map_or("none", crate::decision::telemetry::CircuitState::as_str);
+                    .map_or("none", crate::observability::causal_event::CircuitState::as_str);
                 self.causal_circuit_transitions
                     .with_label_values(&[backend, state])
                     .inc();
@@ -420,10 +426,10 @@ mod tests {
     /// the lineage and the configured model are never labels.
     #[test]
     fn causal_events_land_on_their_metrics() {
-        use crate::decision::telemetry::{
+        use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+        use crate::observability::causal_event::{
             CausalEvent, CausalEventFields, CausalEventKind, CausalLineage, CircuitState, IncompleteReason, ServedLabel,
         };
-        use crate::decision::{BackendKind, BackendLocality};
         let obs = PrometheusObserver::try_new().expect("test: observer");
         let lineage = CausalLineage {
             workspace_id: "WORKSPACE-SENTINEL".into(),

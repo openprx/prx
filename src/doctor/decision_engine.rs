@@ -18,7 +18,7 @@ mod tests {
     fn decision_engine_doctor_reports_configuration_without_secrets() {
         let mut config = Config::default();
         config.decision_engine.enabled = true;
-        config.decision_engine.mode = crate::decision_engine::config::DecisionMode::Both;
+        config.decision_engine.mode = crate::config::schema::decision_engine::DecisionMode::Both;
         config.causal_tree.backend.endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
         let mut items = Vec::new();
         check(&config, &mut items);

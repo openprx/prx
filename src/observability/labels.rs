@@ -143,7 +143,7 @@ pub const UNLISTED_MODEL: &str = "unlisted";
 pub const MAX_MODEL_LABEL_CHARS: usize = 64;
 
 /// The builtin decision backend's model, always listed.
-const BUILTIN_MODEL: &str = crate::decision::builtin::weights::MODEL_VERSION;
+const BUILTIN_MODEL: &str = crate::tools::capability::turn_state::MODEL_VERSION;
 
 /// A configured-model allowlist. The process has one ([`ModelAllowlist::global`]),
 /// which the configuration generation manager refreshes on every applied
@@ -191,7 +191,7 @@ pub fn configured_models(config: &crate::config::Config) -> Vec<String> {
         models.extend(fallbacks.iter().cloned());
     }
     models.push(
-        crate::decision_engine::config::effective_engine_backend(config)
+        crate::config::schema::decision_engine::effective_engine_backend(config)
             .model
             .clone(),
     );
