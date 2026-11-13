@@ -78,9 +78,27 @@ impl LinkedFixture {
             .await
             .expect("genuine catalog drift terminal");
         if enabled {
+            // R177-6 rev 3 on the drift terminal: the recorded selection stays
+            // the drift Clarify, and its gate-passed Answer degrades the
+            // directive to one plain answer.
+            assert!(
+                matches!(
+                    context.engine().selection,
+                    crate::causal_tree::decision_select::Selection::Abstain {
+                        action: crate::causal_tree::branch::CausalActionKind::Clarify,
+                        reason_code: "catalog_drift",
+                    }
+                ),
+                "test: drift terminal keeps its Clarify accounting selection: {:?}",
+                context.engine().selection
+            );
+            assert!(
+                matches!(context.directive(), TurnExecutionDirective::AnswerDirectly),
+                "test: drift Clarify degrades to a plain answer"
+            );
             assert_eq!(
                 context.terminal_outcome_action(),
-                Some(crate::causal_tree::branch::CausalActionKind::Clarify),
+                Some(crate::causal_tree::branch::CausalActionKind::Answer),
             );
         }
         let now = chrono::Utc::now();
@@ -90,6 +108,24 @@ impl LinkedFixture {
             .with_session_key(proof.session_key())
             .with_run_id(proof.run_id());
         scope.causation_event_id = proof.source_event_id().map(str::to_owned);
+        // The degraded drift terminal is a plain answer served by the model.
+        // Record that serving request on the issued trace exactly as the
+        // serving loop does, so the terminal carries real serving evidence.
+        let served = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly).then(|| {
+            let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision(
+                &crate::llm::route_decision::RouteDecision::single_candidate("ollama", "prx-local-model"),
+                now,
+            );
+            let trace = context.execution_trace.get_or_init(Default::default);
+            trace
+                .bind_exact_call_key(Arc::clone(&service.state_key))
+                .expect("serving trace binds the decision key");
+            trace
+                .begin_provider()
+                .expect("serving request observed")
+                .finish(Some(&outcome.attempts));
+            outcome
+        });
         let commit = crate::agent::terminal::TurnTerminalDraft {
             decision: Some(
                 service
@@ -104,7 +140,7 @@ impl LinkedFixture {
                 history_commit_len: 0,
             }),
             history_scope: Some(scope.with_sender("ollama/prx-local-model").with_recipient("local-user")),
-            provider_outcome: None,
+            provider_outcome: served,
             telemetry: crate::agent::terminal::TurnTerminalTelemetry {
                 summary: "linked local scope boundary".to_owned(),
                 started_at: now,
