@@ -4,6 +4,8 @@ use super::helpers::{
 };
 use std::fs;
 const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
+    // Exact environment probe: bounded output, deadline, owned child and reap.
+    "src/tools/shell_parity_tests.rs::run_exact_environment_probe::let mut child = command.spawn().expect(\"test: isolated environment probe\");",
     // Oversized terminal restart fixture: real HTTP, acknowledged child, kill and reap.
     "src/gateway/tests/oversized_restart.rs::spawn_webhook_child::.spawn()",
     // Linux-only opt-in regression: a real setsid descendant proves the cgroup
@@ -621,7 +623,7 @@ fn stdio_mcp_launches_start_from_a_cleared_environment() {
 
 /// Plain git is an explicit Full-shell exception. Every production spelling is reviewed.
 #[test]
-fn plain_git_policy_has_only_the_reviewed_production_sites() {
+pub(super) fn plain_git_policy_has_only_the_reviewed_production_sites() {
     let mut actual = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
