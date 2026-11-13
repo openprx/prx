@@ -473,7 +473,7 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         // Family selection discards an early blocked Retrieve before the final
         // report. Answer is explicitly proposed and its G6 result remains in
         // NoLegalPath.report even though candidates_json keeps only Refuse.
-        let answer = crate::causal_tree::branch::CandidateId::new(
+        let answer = crate::decision_engine::candidate::CandidateId::new(
             crate::tools::capability::contract::CausalActionKind::Answer,
             crate::tools::capability::contract::CapabilityTarget::None,
             None,

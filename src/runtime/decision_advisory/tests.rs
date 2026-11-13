@@ -110,23 +110,24 @@ pub(crate) struct RecordingBackend {
 }
 
 #[async_trait::async_trait]
-impl crate::decision::backend::DecisionBackend for RecordingBackend {
+impl crate::decision_engine::prediction::backend::DecisionBackend for RecordingBackend {
     fn identity(&self) -> &crate::cost::decision_attempt::BackendIdentity {
         &self.identity
     }
     fn locality(&self) -> crate::config::schema::causal_tree::BackendLocality {
         crate::config::schema::causal_tree::BackendLocality::Builtin
     }
-    fn version_policy(&self) -> crate::decision::ModelVersionPolicy {
-        crate::decision::ModelVersionPolicy::ExactPinned(Arc::clone(&self.identity.configured_model))
+    fn version_policy(&self) -> crate::decision_engine::prediction::ModelVersionPolicy {
+        crate::decision_engine::prediction::ModelVersionPolicy::ExactPinned(Arc::clone(&self.identity.configured_model))
     }
     async fn evaluate_with_accounting(
         &self,
-        request: &crate::decision::DecisionRequest,
-        body: &crate::decision::outbound::GuardedBody,
+        request: &crate::decision_engine::prediction::DecisionRequest,
+        body: &crate::decision_engine::prediction::outbound::GuardedBody,
         deadline: std::time::Instant,
         accounting: Option<&dyn DecisionAttemptAccounting>,
-    ) -> Result<crate::decision::DecisionResponse, crate::cost::decision_attempt::DecisionError> {
+    ) -> Result<crate::decision_engine::prediction::DecisionResponse, crate::cost::decision_attempt::DecisionError>
+    {
         if accounting.is_some() {
             self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -135,18 +136,19 @@ impl crate::decision::backend::DecisionBackend for RecordingBackend {
     }
     async fn evaluate(
         &self,
-        request: &crate::decision::DecisionRequest,
-        body: &crate::decision::outbound::GuardedBody,
+        request: &crate::decision_engine::prediction::DecisionRequest,
+        body: &crate::decision_engine::prediction::outbound::GuardedBody,
         _deadline: std::time::Instant,
-    ) -> Result<crate::decision::DecisionResponse, crate::cost::decision_attempt::DecisionError> {
+    ) -> Result<crate::decision_engine::prediction::DecisionResponse, crate::cost::decision_attempt::DecisionError>
+    {
         use crate::cost::decision_attempt::DecisionError;
         let wire: serde_json::Value = serde_json::from_slice(body.bytes()).map_err(|_| DecisionError::Unavailable)?;
         let answer = crate::agent::agent::native_decision_fixture::decision_answers_for_exact(&wire, "answer", "none")
             .map_err(|_| DecisionError::Unavailable)?;
         let bytes = serde_json::to_vec(&answer).map_err(|_| DecisionError::Unavailable)?;
-        crate::decision::wire::SystemOneCodec::new(request, &self.key)?.decode_response(
+        crate::decision_engine::prediction::wire::SystemOneCodec::new(request, &self.key)?.decode_response(
             &bytes,
-            crate::decision::wire::ResponseEnvelope {
+            crate::decision_engine::prediction::wire::ResponseEnvelope {
                 backend: "mock",
                 provider_request_id: None,
                 elapsed_ms: 0,
@@ -163,7 +165,7 @@ pub(crate) fn analysis_input(
     let catalog = Arc::new(
         CapabilityCatalog::build(&[], &Default::default(), &SurfacePolicy::default()).expect("test: empty catalog"),
     );
-    let mut trusted = crate::causal_tree::state::fixtures::trusted();
+    let mut trusted = crate::decision_engine::state::fixtures::trusted();
     trusted.catalog_generation = *catalog.generation();
     let budgets = trusted.budgets;
     let model = crate::providers::selection::check_default(
@@ -185,8 +187,8 @@ pub(crate) fn analysis_input(
         predicted: None,
         derived: DerivedState::default(),
         has_conversation_history: false,
-        routing_input: crate::causal_tree::state::RawRoutingInput::new("hello".into()),
-        goal: crate::causal_tree::state::RawRoutingInput::new("hello".into()),
+        routing_input: crate::decision_engine::state::RawRoutingInput::new("hello".into()),
+        goal: crate::decision_engine::state::RawRoutingInput::new("hello".into()),
         lineage: HopLineage::First,
         built_at_ms: 0,
     };
@@ -224,7 +226,7 @@ pub(crate) fn analysis_input(
 async fn decision_advisory_runs_without_turn_decision_service() {
     let temp = tempfile::tempdir().unwrap();
     let config = enabled_config(temp.path());
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let cancellation = CancellationToken::new();
     for model in ["recording-model", "typesafe/jev-1.13"] {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -241,8 +243,8 @@ async fn decision_advisory_runs_without_turn_decision_service() {
                 request_bytes: Arc::clone(&request_bytes),
             })],
             Arc::clone(&key),
-            crate::decision::outbound::OutboundSecrets::default(),
-            crate::decision::factory::SlotLimits::default(),
+            crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
+            crate::decision_engine::prediction::factory::SlotLimits::default(),
         );
         let advisory = DecisionAdvisory::new(Arc::clone(&config), Some(factory));
         let limits = advisory.request_limits();
@@ -271,10 +273,10 @@ async fn decision_advisory_runs_without_turn_decision_service() {
     // The builtin factory begins no accounting attempt.
     let builtin = DecisionBackendFactory::from_config(
         &config,
-        crate::decision::factory::FactoryDeps {
+        crate::decision_engine::prediction::factory::FactoryDeps {
             catalog: &crate::providers::catalog::CatalogView::from_config(&config),
             key: Some(Arc::clone(&key)),
-            transports: &crate::decision::compatible_http::HttpDecisionTransports,
+            transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
             config_generation: 1,
             events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
@@ -406,14 +408,14 @@ async fn engine_driver_generates_with_advisory_probe() {
     use crate::tools::traits::Tool;
     let temp = tempfile::tempdir().unwrap();
     let config = enabled_config(temp.path());
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let cancellation = CancellationToken::new();
     let builtin = DecisionBackendFactory::from_config(
         &config,
-        crate::decision::factory::FactoryDeps {
+        crate::decision_engine::prediction::factory::FactoryDeps {
             catalog: &crate::providers::catalog::CatalogView::from_config(&config),
             key: Some(Arc::clone(&key)),
-            transports: &crate::decision::compatible_http::HttpDecisionTransports,
+            transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
             config_generation: 1,
             events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
         },
@@ -450,7 +452,8 @@ async fn engine_driver_generates_with_advisory_probe() {
         gates: &gates,
     };
     let observed_latency = BTreeMap::new();
-    let cost_model = crate::runtime::turn_cost::RuntimeCostModel::new(&input.model, &config, &observed_latency);
+    let cost_model =
+        crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &config, &observed_latency);
     let discovered = DiscoveredRefs::empty();
     let policy = CandidatePolicy {
         key: &key,

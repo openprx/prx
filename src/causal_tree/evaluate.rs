@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use rand::{RngExt, SeedableRng};
 use serde::Serialize;
 
-use super::store::{DecisionScope, DecisionStoreReader, DecisionView, EvaluationRows, StoreError, TimeWindow};
+use crate::causal_tree::store::{
+    DecisionScope, DecisionStoreReader, DecisionView, EvaluationRows, StoreError, TimeWindow,
+};
 
 /// The report format version.
 pub(crate) const REPORT_VERSION: u32 = 2;
@@ -356,7 +358,7 @@ fn is_success(classification: &str) -> bool {
 }
 
 /// The complete outcome of a decision, if it has one.
-fn complete_outcome(decision: &DecisionView) -> Option<&super::store::OutcomeView> {
+fn complete_outcome(decision: &DecisionView) -> Option<&crate::causal_tree::store::OutcomeView> {
     decision
         .outcomes
         .iter()
@@ -365,7 +367,7 @@ fn complete_outcome(decision: &DecisionView) -> Option<&super::store::OutcomeVie
 
 /// The reward of an outcome: its recorded `reward`, else 1 for a success
 /// and 0 otherwise.
-fn reward_of(outcome: &super::store::OutcomeView) -> f64 {
+fn reward_of(outcome: &crate::causal_tree::store::OutcomeView) -> f64 {
     outcome
         .reward
         .as_ref()
@@ -489,7 +491,7 @@ impl CalibrationBins {
 
 /// The observed truth of a Noul feature: a boolean (or 0/1) under the
 /// feature's name in the outcome's reward components.
-fn observed_feature(outcome: &super::store::OutcomeView, feature: &str) -> Option<f64> {
+fn observed_feature(outcome: &crate::causal_tree::store::OutcomeView, feature: &str) -> Option<f64> {
     let value = outcome.reward.as_ref()?.get(feature)?;
     value
         .as_bool()
@@ -980,7 +982,7 @@ fn report(
             .iter()
             .map(|decision| decision.scorer_version.clone())
             .collect(),
-        builtin_version: crate::decision::builtin::weights::MODEL_VERSION,
+        builtin_version: crate::tools::capability::turn_state::MODEL_VERSION,
         scope,
         accuracy_meaning: ACCURACY_MEANING,
         coverage,
@@ -1199,7 +1201,7 @@ mod tests {
         )
     }
 
-    use super::super::store::DecisionRecord;
+    use crate::causal_tree::store::DecisionRecord;
 
     async fn store_with(temp: &tempfile::TempDir, rows: Vec<(DecisionRecord, f64)>) -> CausalDecisionStore {
         let store = open_private(temp.path(), Arc::new(RecordingSink::default()));
@@ -1428,7 +1430,7 @@ mod tests {
         assert_eq!(written["report_version"], REPORT_VERSION);
         assert_eq!(
             written["builtin_version"],
-            crate::decision::builtin::weights::MODEL_VERSION
+            crate::tools::capability::turn_state::MODEL_VERSION
         );
         assert!(
             write_report(temp.path(), &report).is_err(),

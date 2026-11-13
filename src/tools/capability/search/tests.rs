@@ -75,12 +75,12 @@ fn ranked_search_allocations_do_not_grow_with_matching_inventory() {
         }
         let expected = legacy_find(&view, "beta alpha evidence", &[], 1);
         assert_eq!(expected.first().unwrap().entry.public_name, "prx_doc_0000");
-        let (cold_hits, cold_count) = crate::decision::builtin::allocation_counter::count(|| {
+        let (cold_hits, cold_count) = crate::decision_engine::prediction::builtin::allocation_counter::count(|| {
             CatalogSearch::find(&view, "beta alpha evidence", &[], 1)
         });
         assert_same(&cold_hits, &expected);
         std::hint::black_box(&cold_hits);
-        let (hits, count) = crate::decision::builtin::allocation_counter::count(|| {
+        let (hits, count) = crate::decision_engine::prediction::builtin::allocation_counter::count(|| {
             CatalogSearch::find(&view, "beta alpha evidence", &[], 1)
         });
         assert_same(&hits, &expected);

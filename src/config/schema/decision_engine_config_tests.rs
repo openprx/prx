@@ -243,21 +243,23 @@ fn remote_legacy() -> crate::config::schema::causal_tree::DecisionBackendConfig 
     toml::from_str(REMOTE).unwrap()
 }
 
-fn factory_for(config: &Config) -> crate::decision::factory::DecisionBackendFactory {
+fn factory_for(config: &Config) -> crate::decision_engine::prediction::factory::DecisionBackendFactory {
     struct NoTransports;
-    impl crate::decision::factory::DecisionTransports for NoTransports {
+    impl crate::decision_engine::prediction::factory::DecisionTransports for NoTransports {
         fn build(
             &self,
-            _: &crate::decision::factory::BackendSpec<'_>,
-        ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::cost::decision_attempt::DecisionError>
-        {
+            _: &crate::decision_engine::prediction::factory::BackendSpec<'_>,
+        ) -> Result<
+            Box<dyn crate::decision_engine::prediction::backend::DecisionBackend>,
+            crate::cost::decision_attempt::DecisionError,
+        > {
             Err(crate::cost::decision_attempt::DecisionError::Unavailable)
         }
     }
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
-    crate::decision::factory::DecisionBackendFactory::from_config(
+    crate::decision_engine::prediction::factory::DecisionBackendFactory::from_config(
         config,
-        crate::decision::factory::FactoryDeps {
+        crate::decision_engine::prediction::factory::FactoryDeps {
             catalog: &catalog,
             key: None,
             transports: &NoTransports,

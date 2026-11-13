@@ -652,10 +652,8 @@ pub(crate) fn pricing_warning(
     if !matches!(
         usage_cost_resolution(provider, model, 64, 64, 0, 0, cost),
         UsagePrice::Missing
-    ) || crate::runtime::turn_cost::provider_is_zero_price_exempt(
-        resolved.provider(),
-        resolved.credential().api_url(),
-    ) {
+    ) || crate::cost::estimate::provider_is_zero_price_exempt(resolved.provider(), resolved.credential().api_url())
+    {
         return None;
     }
     let key = crate::config::schema::usage_pricing_key(provider, model);

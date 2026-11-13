@@ -79,7 +79,7 @@ where
                     Arc::new(TracingToolExecutionAudit),
                 ));
                 let catalog = ProviderCatalogView::from_config(&config);
-                let transports = crate::decision::compatible_http::HttpDecisionTransports;
+                let transports = crate::decision_engine::prediction::compatible_http::HttpDecisionTransports;
                 let mut service = build_turn_decision_service(
                     TurnSurfaceKind::AgentLoop,
                     TurnServiceBuild {

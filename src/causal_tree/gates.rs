@@ -5,18 +5,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::branch::{CandidateId, CausalCandidate};
-use super::state::{CausalState, SideEffectMode};
 use crate::capability::CapabilityAvailabilityLevel;
+use crate::decision_engine::candidate::{CandidateId, CausalCandidate};
+use crate::decision_engine::state::CausalState;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CatalogView, Exposure};
 use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest};
 use crate::tools::capability::contract::{ApprovalRequirement, CapabilityRef, CausalActionKind, OpId, SideEffectClass};
+use crate::tools::capability::turn_state::SideEffectMode;
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
 // The gate outcome and report are the admission probe's types (R11); the
 // hard gates are the probe's execution implementation until Part 2.
-pub(crate) use super::admission_probe::{
+pub(crate) use crate::decision_engine::admission_probe::{
     Admission as GateOutcome, GenerationError as GateError, ProbeReport as GateReport,
 };
 
@@ -73,10 +74,10 @@ impl HardGates {
         catalog: &CatalogView<'_>,
         candidates: &[CausalCandidate],
         inputs: &GateInputs<'_>,
-        remaining: super::state::TurnBudgets,
+        remaining: crate::tools::capability::turn_state::TurnBudgets,
     ) -> Result<GateReport, GateError> {
         let original = state.trusted.parts().budgets;
-        let remaining = super::state::TurnBudgets {
+        let remaining = crate::tools::capability::turn_state::TurnBudgets {
             tokens: original.tokens.min(remaining.tokens),
             micro_usd: original.micro_usd.min(remaining.micro_usd),
             latency_ms: original.latency_ms.min(remaining.latency_ms),
@@ -140,7 +141,7 @@ impl HardGates {
         candidate: &CausalCandidate,
         inputs: &GateInputs<'_>,
         scope: GateScope,
-        remaining: super::state::TurnBudgets,
+        remaining: crate::tools::capability::turn_state::TurnBudgets,
     ) -> GateOutcome {
         let trusted = state.trusted.parts();
         let references = candidate.required_capabilities();
@@ -441,13 +442,14 @@ fn effective_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::causal_tree::branch::CandidateSpec;
     use crate::causal_tree::ids::DecisionId;
-    use crate::causal_tree::state::{ConstraintCode, TrustedState, fixtures};
+    use crate::decision_engine::candidate::CandidateSpec;
+    use crate::decision_engine::state::fixtures;
     use crate::security::AutonomyLevel;
     use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
     use crate::tools::capability::child::AuthorityEnvelope;
     use crate::tools::capability::contract::{CapabilityTarget, CatalogGeneration, CostEstimate, SchemaFingerprint};
+    use crate::tools::capability::turn_state::{ConstraintCode, TrustedState};
     use crate::tools::mcp::McpCapabilitySpec;
     use crate::tools::traits::{Tool, ToolResult, ToolSpec};
     use async_trait::async_trait;

@@ -188,7 +188,7 @@ impl OperatorChildPublication {
             FactoryDeps {
                 catalog: &parent.provider_catalog,
                 key: parent.durable_key.then(|| Arc::clone(&parent.state_key)),
-                transports: &crate::decision::compatible_http::HttpDecisionTransports,
+                transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
                 config_generation: parent.generation.id.0,
                 events: Arc::clone(&parent.events),
             },

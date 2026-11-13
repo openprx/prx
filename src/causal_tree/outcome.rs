@@ -7,24 +7,25 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::candidate_generator::CandidateSet;
-use super::decision_engine::{EngineDecision, FallbackCause};
-use super::decision_score::SCORER_VERSION;
-use super::decision_select::Selection;
-use super::gates::{GateOutcome, GateReport};
-use super::ids::DecisionId;
-use super::state::HopLineage;
-use super::store::{
+use crate::agent::terminal::{TurnTerminalReceipt, TurnTerminalStatus};
+use crate::causal_tree::candidate_generator::CandidateSet;
+use crate::causal_tree::decision_engine::{EngineDecision, FallbackCause};
+use crate::causal_tree::decision_select::Selection;
+use crate::causal_tree::gates::{GateOutcome, GateReport};
+use crate::causal_tree::ids::DecisionId;
+use crate::causal_tree::store::{
     DecisionRecord, DecisionStoreWriter, DecisionView, Enqueue, OutcomeClassification, OutcomeCompleteness,
     OutcomeRecord, RecordLineage, RecordedAttempt, RecordedCandidate, RecordedDistributions, RecordedOutcomeAttempt,
     RecordedShadow, same_turn_chain,
 };
-use crate::agent::terminal::{TurnTerminalReceipt, TurnTerminalStatus};
 use crate::cost::types::CostSettlement;
-use crate::decision::factory::{AttemptOutcome, FallbackReason, ServedBy};
-use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, KeyDomain, PROTOCOL_VERSION, QuestionId};
+use crate::decision_engine::decision_score::SCORER_VERSION;
+use crate::decision_engine::prediction::factory::{AttemptOutcome, FallbackReason, ServedBy};
+use crate::decision_engine::prediction::{DecisionAnswer, GlobalQuestion, PROTOCOL_VERSION, QuestionId};
+use crate::decision_engine::state::HopLineage;
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::runtime::turn_decision::TurnDecisionContext;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::contract::CausalActionKind;
 
 #[derive(Debug, thiserror::Error)]
@@ -1119,7 +1120,7 @@ fn exact_cost_micro(usd: f64) -> Result<i64, OutcomeCorrelationError> {
 mod tests {
     use super::*;
     use crate::causal_tree::gates::GateOutcome;
-    use crate::causal_tree::state::fixtures;
+    use crate::decision_engine::state::fixtures;
     use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};

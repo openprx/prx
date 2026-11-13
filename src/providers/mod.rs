@@ -955,7 +955,7 @@ pub(crate) fn fallback_admission_for(
                     crate::llm::route_decision::UsagePrice::Priced(_)
                     | crate::llm::route_decision::UsagePrice::Subscription => true,
                     crate::llm::route_decision::UsagePrice::Missing => {
-                        crate::runtime::turn_cost::provider_is_zero_price_exempt(
+                        crate::cost::estimate::provider_is_zero_price_exempt(
                             &provider_id,
                             // Sibling models and a deduplicated fallback entry of the primary
                             // provider run on the primary connection; other providers use

@@ -26,15 +26,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use openprx::config::Config;
-use openprx::decision::compatible_http::HttpDecisionTransports;
-use openprx::decision::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
-use openprx::decision::{
-    DecisionError, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId, RequestLimits,
-    RequestParts, StructuredValue, ValidationRule,
+use openprx::cost::decision_attempt::error::{DecisionError, ValidationRule};
+use openprx::decision_engine::prediction::compatible_http::HttpDecisionTransports;
+use openprx::decision_engine::prediction::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
+use openprx::decision_engine::prediction::{
+    DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId, RequestLimits, RequestParts, StructuredValue,
 };
 use openprx::observability::causal_event::{CausalEvent, CausalEventSink, CausalLineage};
 use openprx::providers::ProviderId;
 use openprx::providers::catalog::{CatalogView, CuratedModel, ModelOperation};
+use openprx::security::runtime_key::DecisionKey;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -1328,7 +1329,7 @@ async fn openrouter_failures_map_to_their_classes() {
             ),
             (
                 Reply::Status(413, Vec::new(), Vec::new()),
-                DecisionError::InvalidRequest(openprx::decision::RequestRule::RejectedByBackend),
+                DecisionError::InvalidRequest(openprx::cost::decision_attempt::error::RequestRule::RejectedByBackend),
             ),
             (Reply::Status(524, Vec::new(), Vec::new()), DecisionError::Timeout),
             (Reply::Status(529, Vec::new(), Vec::new()), DecisionError::Unavailable),
@@ -1481,7 +1482,7 @@ impl AccountedFactory {
         &self,
         request: &DecisionRequest,
         lineage: &CausalLineage,
-    ) -> anyhow::Result<openprx::decision::factory::PredictionResult> {
+    ) -> anyhow::Result<openprx::decision_engine::prediction::factory::PredictionResult> {
         if self.inner.status().order.is_empty() {
             return Ok(self.inner.decide(request, lineage).await?);
         }
@@ -1528,7 +1529,7 @@ impl AccountedFactory {
             "health actually observed"
         );
     }
-    fn status(&self) -> openprx::decision::factory::BackendPlaneStatus {
+    fn status(&self) -> openprx::decision_engine::prediction::factory::BackendPlaneStatus {
         self.inner.status()
     }
 }
@@ -1752,7 +1753,7 @@ async fn insufficient_retry_money_refuses_second_decision_socket() {
             crate::providers::context_window::ContextWindowSources::from_config(&plane.factory.config),
             &plane.factory.config.model_routes,
         );
-        let reserve = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+        let reserve = crate::cost::estimate::DecisionTokenReservation::from_effective_compaction(
             &effective.config,
             plane.factory.config.causal_tree.policy.extra_token_ratio_limit,
         )

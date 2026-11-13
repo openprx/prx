@@ -230,7 +230,7 @@ fn estimated_cost(
             UsagePrice::Priced(cost) => cost,
             UsagePrice::Subscription => 0.0,
             UsagePrice::Missing
-                if super::turn_cost::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
+                if crate::cost::estimate::provider_is_zero_price_exempt(&ProviderId::of(provider), api_url) =>
             {
                 0.0
             }
@@ -874,13 +874,13 @@ mod tranche_tests {
         assert_eq!(effective_api_url(&config, "ollama"), None);
         config.api_url = Some("https://ollama.com".to_string());
         let url = effective_api_url(&config, "ollama");
-        assert!(!super::super::turn_cost::provider_is_zero_price_exempt(
+        assert!(!crate::cost::estimate::provider_is_zero_price_exempt(
             &ProviderId::of("ollama"),
             url
         ));
         config.api_url = Some("http://localhost:11434".to_string());
         let url = effective_api_url(&config, "ollama");
-        assert!(super::super::turn_cost::provider_is_zero_price_exempt(
+        assert!(crate::cost::estimate::provider_is_zero_price_exempt(
             &ProviderId::of("ollama"),
             url
         ));

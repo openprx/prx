@@ -341,11 +341,15 @@ pub(super) fn provider_label_sinks_redact_url_userinfo() {
         // AG-12 (CDP-08): the decision factory's status shows a backend's
         // provider label redacted.
         (
-            "src/decision/factory.rs",
+            "src/decision_engine/prediction/factory.rs",
             "fn shown_identity(",
             "redact_endpoint_userinfo(",
         ),
-        ("src/decision/factory.rs", "pub fn status(", "shown_identity("),
+        (
+            "src/decision_engine/prediction/factory.rs",
+            "pub fn status(",
+            "shown_identity(",
+        ),
         // INT-2B USERINFO-3: values built outside a log macro. Every log
         // argument of the label-bearing files is checked site by site by
         // `provider_labels_never_reach_a_log_field_raw`.

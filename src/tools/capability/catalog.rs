@@ -2193,7 +2193,8 @@ mod tests {
                     families,
                     channel: true,
                 };
-                let (view, allocations) = crate::decision::builtin::allocation_counter::count(|| catalog.view(&scope));
+                let (view, allocations) =
+                    crate::decision_engine::prediction::builtin::allocation_counter::count(|| catalog.view(&scope));
                 assert_eq!(allocations, 0, "view allocations at inventory size {size}");
                 assert_eq!(view.entries().len(), size);
             }

@@ -28,19 +28,23 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::evaluate::{EvaluateError, EvaluationOptions, EvaluationReport, evaluate, write_report};
-use super::ids::DecisionId;
-use super::store::{CausalDecisionStore, DecisionScope, DecisionView, Retention, StoreError, StoreMode, TimeWindow};
-use super::v1_compat::{ImportSummary, import_v1_feedback};
+use crate::causal_tree::evaluate::{EvaluateError, EvaluationOptions, EvaluationReport, evaluate, write_report};
+use crate::causal_tree::ids::DecisionId;
+use crate::causal_tree::store::{
+    CausalDecisionStore, DecisionScope, DecisionView, Retention, StoreError, StoreMode, TimeWindow,
+};
+use crate::causal_tree::v1_compat::{ImportSummary, import_v1_feedback};
 use crate::config::Config;
-use crate::decision::factory::{
+use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::decision_engine::prediction::factory::{
     AttemptOutcome, DecisionBackendFactory, FactoryBuildError, FactoryDeps, HealthView, ServedBy,
 };
-use crate::decision::{
-    BackendKind, BackendLocality, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, OptionId, QuestionId,
-    RequestLimits, RequestParts, StructuredValue,
+use crate::decision_engine::prediction::{
+    DecisionQuestion, DecisionRequest, GlobalQuestion, OptionId, QuestionId, RequestLimits, RequestParts,
+    StructuredValue,
 };
 use crate::observability::causal_event::{CausalEventSink, CausalLineage};
+use crate::security::runtime_key::DecisionKey;
 
 /// Builds the decision backend factory of a configuration: the caller's
 /// transports, catalog and event sink (the CLI's, and the Gateway's from
@@ -102,7 +106,7 @@ pub(crate) trait DecisionPlaneBuilder: Send + Sync {
 /// The validated facts consumed by the administration test view.
 /// Factory-local routing evidence remains owned by the prediction producer.
 pub(crate) struct AdminPrediction {
-    served: crate::decision::ValidatedDecision,
+    served: crate::decision_engine::prediction::ValidatedDecision,
     served_by: ServedBy,
     sent: bool,
     attempts: Vec<AttemptView>,
@@ -110,7 +114,7 @@ pub(crate) struct AdminPrediction {
 
 impl AdminPrediction {
     pub(crate) fn from_validated_parts(
-        served: crate::decision::ValidatedDecision,
+        served: crate::decision_engine::prediction::ValidatedDecision,
         served_by: ServedBy,
         attempts: impl Iterator<Item = (BackendKind, AttemptOutcome, Duration)>,
     ) -> Self {
@@ -248,8 +252,8 @@ pub(crate) struct PolicyView {
     pub(crate) extra_token_ratio_limit: f32,
 }
 
-impl From<&super::config::CausalPolicy> for PolicyView {
-    fn from(policy: &super::config::CausalPolicy) -> Self {
+impl From<&crate::causal_tree::config::CausalPolicy> for PolicyView {
+    fn from(policy: &crate::causal_tree::config::CausalPolicy) -> Self {
         Self {
             max_candidates: policy.max_candidates,
             max_decision_hops: policy.max_decision_hops,
@@ -376,8 +380,8 @@ pub(crate) struct ChildOutcomeSummary {
     pub(crate) completeness: String,
 }
 
-impl From<super::store::ChildOutcomeView> for ChildOutcomeSummary {
-    fn from(value: super::store::ChildOutcomeView) -> Self {
+impl From<crate::causal_tree::store::ChildOutcomeView> for ChildOutcomeSummary {
+    fn from(value: crate::causal_tree::store::ChildOutcomeView) -> Self {
         Self {
             child_decision_id: value.child_decision_id,
             settlement_id: value.settlement_id,
@@ -397,8 +401,8 @@ pub(crate) struct DistributionView {
     pub(crate) features: Option<std::collections::BTreeMap<String, f64>>,
 }
 
-impl From<&super::store::RecordedDistributions> for DistributionView {
-    fn from(source: &super::store::RecordedDistributions) -> Self {
+impl From<&crate::causal_tree::store::RecordedDistributions> for DistributionView {
+    fn from(source: &crate::causal_tree::store::RecordedDistributions) -> Self {
         fn allowed(
             values: &std::collections::BTreeMap<String, f64>,
             labels: impl Iterator<Item = &'static str>,
@@ -574,7 +578,7 @@ pub(crate) struct InspectView {
 
 impl From<DecisionView> for InspectView {
     fn from(view: DecisionView) -> Self {
-        let candidate = |candidate: &super::store::RecordedCandidate| CandidateView {
+        let candidate = |candidate: &crate::causal_tree::store::RecordedCandidate| CandidateView {
             id: candidate.id.clone(),
             action: candidate.action.clone(),
             target: candidate.target.clone(),
@@ -657,7 +661,7 @@ fn builtin_view() -> BackendView {
         kind: BackendKind::Builtin.as_str(),
         locality: BackendLocality::Builtin.as_str(),
         provider: None,
-        model: crate::decision::builtin::weights::MODEL_VERSION.to_string(),
+        model: crate::tools::capability::turn_state::MODEL_VERSION.to_string(),
         circuit: "closed",
         health: "healthy",
         last_failure: None,
@@ -848,7 +852,7 @@ impl DecisionAdmin {
         let migration = crate::config::files::with_consistent_config_snapshot(path, || {
             let mut root = crate::config::files::read_merged_toml_with_gate_once(path)?;
             let locate = |key: &[&str]| crate::config::deprecations::file_holding(path, key);
-            Ok(super::config::migrate_legacy(&mut root, &locate))
+            Ok(crate::causal_tree::config::migrate_legacy(&mut root, &locate))
         });
         match migration {
             Ok(Ok(report)) => LegacyKeysView {
@@ -1061,14 +1065,17 @@ impl DecisionAdmin {
             .collect())
     }
 
-    pub(crate) fn saved_reports(&self, owner: &str) -> Result<super::report_catalog::SavedReports, AdminError> {
+    pub(crate) fn saved_reports(
+        &self,
+        owner: &str,
+    ) -> Result<crate::causal_tree::report_catalog::SavedReports, AdminError> {
         if !self.config.causal_tree.enabled {
-            return Ok(super::report_catalog::SavedReports::default());
+            return Ok(crate::causal_tree::report_catalog::SavedReports::default());
         }
         let Some(key) = self.key() else {
-            return Ok(super::report_catalog::SavedReports::default());
+            return Ok(crate::causal_tree::report_catalog::SavedReports::default());
         };
-        super::report_catalog::list_owned_reports(&self.config.workspace_dir, owner, &key)
+        crate::causal_tree::report_catalog::list_owned_reports(&self.config.workspace_dir, owner, &key)
             .map_err(|error| AdminError::Fixture(error.to_string()))
     }
 
@@ -1108,7 +1115,12 @@ impl DecisionAdmin {
                 let key = self.key().ok_or_else(|| {
                     AdminError::Fixture("a durable decision key is required to bind an owner report".to_owned())
                 })?;
-                super::report_catalog::write_owned_report(&self.config.workspace_dir, owner, &key, &report)?
+                crate::causal_tree::report_catalog::write_owned_report(
+                    &self.config.workspace_dir,
+                    owner,
+                    &key,
+                    &report,
+                )?
             } else {
                 write_report(&self.config.workspace_dir, &report)?
             };
@@ -1198,7 +1210,11 @@ pub(crate) const fn test_target(kind: Option<BackendKind>) -> TestTarget {
 // not a journal concern.
 /// Key creation includes filesystem synchronization, just like store opening.
 pub(crate) async fn load_key(config: crate::config::Config) -> Option<Arc<crate::security::runtime_key::DecisionKey>> {
-    match tokio::task::spawn_blocking(move || crate::decision::factory::FactoryDeps::load_key(&config)).await {
+    match tokio::task::spawn_blocking(move || {
+        crate::decision_engine::prediction::factory::FactoryDeps::load_key(&config)
+    })
+    .await
+    {
         Ok(key) => key,
         Err(error) => {
             tracing::warn!(%error, "decision key preparation failed");
@@ -1215,11 +1231,13 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::decision::backend::DecisionBackend;
-    use crate::decision::factory::SlotLimits;
-    use crate::decision::outbound::{GuardedBody, OutboundSecrets};
-    use crate::decision::validate::ModelVersionPolicy;
-    use crate::decision::{BackendIdentity, DecisionError, DecisionResponse};
+    use crate::cost::decision_attempt::BackendIdentity;
+    use crate::cost::decision_attempt::error::DecisionError;
+    use crate::decision_engine::prediction::DecisionResponse;
+    use crate::decision_engine::prediction::backend::DecisionBackend;
+    use crate::decision_engine::prediction::factory::SlotLimits;
+    use crate::decision_engine::prediction::outbound::{GuardedBody, OutboundSecrets};
+    use crate::decision_engine::prediction::validate::ModelVersionPolicy;
     use crate::observability::causal_event::testing::RecordingSink;
 
     /// A remote backend that counts every call it gets.
@@ -1355,7 +1373,7 @@ mod tests {
                 FactoryDeps {
                     catalog: &catalog,
                     key,
-                    transports: &crate::decision::compatible_http::HttpDecisionTransports,
+                    transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
                     config_generation: 0,
                     events: Arc::new(RecordingSink::default()),
                 },

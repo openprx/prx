@@ -13,7 +13,7 @@ pub(super) fn mock_decision_backend_is_compiled_only_for_tests() {
     let mut sites = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if relative == "src/decision/mock.rs" {
+        if relative == "src/decision_engine/prediction/mock.rs" {
             continue;
         }
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
@@ -22,15 +22,15 @@ pub(super) fn mock_decision_backend_is_compiled_only_for_tests() {
                 sites.push(format!("{relative}: {needle}"));
             }
         }
-        if production.contains("decision::mock") {
-            sites.push(format!("{relative}: decision::mock"));
+        if production.contains("prediction::mock") {
+            sites.push(format!("{relative}: prediction::mock"));
         }
     }
     assert!(
         sites.is_empty(),
         "the scripted decision backend is test-only (AG-05); production code names it at {sites:?}"
     );
-    let module = read_source(&repository_root().join("src/decision/mod.rs"));
+    let module = read_source(&repository_root().join("src/decision_engine/prediction/mod.rs"));
     let lines: Vec<String> = module.lines().map(normalize_line).collect();
     let declarations: Vec<usize> = lines
         .iter()
@@ -41,7 +41,7 @@ pub(super) fn mock_decision_backend_is_compiled_only_for_tests() {
     assert_eq!(
         declarations.len(),
         1,
-        "src/decision/mod.rs declares `mod mock` exactly once"
+        "src/decision_engine/prediction/mod.rs declares `mod mock` exactly once"
     );
     assert!(
         declarations[0] > 0 && lines[declarations[0] - 1] == "#[cfg(any(test, feature = \"test-mock\"))]",
@@ -79,7 +79,7 @@ pub(super) fn decision_answers_never_become_chat_messages() {
     for path in rust_source_files() {
         let relative = relative_path(&path);
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
-        if relative.starts_with("src/decision/") {
+        if relative.starts_with("src/decision_engine/prediction/") {
             if contains_identifier(&production, "ChatMessage") {
                 violations.push(format!("{relative}: the decision module names ChatMessage"));
             }
@@ -98,11 +98,13 @@ pub(super) fn decision_answers_never_become_chat_messages() {
         }
     }
     let wire = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
-        &repository_root().join("src/decision/wire.rs"),
+        &repository_root().join("src/decision_engine/prediction/wire.rs"),
     )));
     for field in ["explanation", "reason", "reasoning", "rationale"] {
         if contains_identifier(&wire, field) {
-            violations.push(format!("src/decision/wire.rs: declares or reads `{field}`"));
+            violations.push(format!(
+                "src/decision_engine/prediction/wire.rs: declares or reads `{field}`"
+            ));
         }
     }
     assert!(
@@ -113,11 +115,11 @@ pub(super) fn decision_answers_never_become_chat_messages() {
 
 /// AG-22. The path from backend bytes to a validated decision never repairs
 /// a value: no normalizing, rescaling or clamping call anywhere in
-/// `src/decision/**` (D-057 L-7: every decision file, not only the codec and
+/// `src/decision_engine/prediction/**` (D-057 L-7: every decision file, not only the codec and
 /// the validator). The property corpus in
 /// `tests/proptest_decision_validate.rs` proves the bits are kept.
 ///
-/// The scan is textual, so a helper outside `src/decision/` escapes it. That
+/// The scan is textual, so a helper outside `src/decision_engine/prediction/` escapes it. That
 /// is allowed only for code that *classifies request text*, never for code
 /// that changes a decision value (D-061 amendment 2). The one such helper,
 /// `crate::util::is_combining_mark`, reads a Unicode character class for the
@@ -131,7 +133,7 @@ pub(super) fn the_decision_validator_never_repairs_a_value() {
     let mut scanned = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/") {
+        if !relative.starts_with("src/decision_engine/prediction/") {
             continue;
         }
         scanned += 1;
@@ -158,15 +160,15 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "causal_tree::",
     // The configuration names a backend kind and checks an endpoint's
     // spelling (CDP-03); neither opens a connection.
-    "decision::BackendKind",
-    "decision::loopback::",
-    "decision::model_pin::is_unpinned_model",
-    "decision::CandidateKey",
-    "decision::DecisionAnswer",
-    "decision::DecisionError",
-    "decision::DecisionKey",
-    "decision::DecisionRequest",
-    "decision::KeyDomain",
+    "decision_engine::prediction::BackendKind",
+    "decision_engine::prediction::loopback::",
+    "decision_engine::prediction::model_pin::is_unpinned_model",
+    "decision_engine::prediction::CandidateKey",
+    "decision_engine::prediction::DecisionAnswer",
+    "decision_engine::prediction::DecisionError",
+    "decision_engine::prediction::DecisionKey",
+    "decision_engine::prediction::DecisionRequest",
+    "decision_engine::prediction::KeyDomain",
     // The runtime key (moved from `decision::key`) and its directory checks.
     "security::runtime_key::DecisionKey",
     "security::runtime_key::KeyDomain",
@@ -181,11 +183,11 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     // The store's directory passes the key's directory checks (D-091 F-1).
     "security::runtime_key::check_decision_dir",
     "security::runtime_key::prepare_decision_dir",
-    "decision::QuestionId",
-    "decision::StructuredValue",
-    "decision::ValidatedDecision",
-    "decision::builtin::weights::FRESH_ARTIFACT_MS",
-    "decision::builtin::weights::STALE_ARTIFACT_MS",
+    "decision_engine::prediction::QuestionId",
+    "decision_engine::prediction::StructuredValue",
+    "decision_engine::prediction::ValidatedDecision",
+    "decision_engine::prediction::builtin::weights::FRESH_ARTIFACT_MS",
+    "decision_engine::prediction::builtin::weights::STALE_ARTIFACT_MS",
     "observability::Observer",
     "observability::ObserverEvent",
     "observability::ObserverMetric",
@@ -196,27 +198,27 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     // stay outside the domain), asks it the neutral fixture, and shows
     // provider labels redacted. None of these opens a connection.
     "config::Config",
-    "decision::telemetry::CausalEvent",
-    "decision::telemetry::CausalEventFields",
-    "decision::telemetry::CausalEventKind",
-    "decision::telemetry::CausalEventSink",
-    "decision::telemetry::CausalLineage",
-    "decision::telemetry::IncompleteReason",
-    "decision::factory::AttemptOutcome",
+    "decision_engine::prediction::telemetry::CausalEvent",
+    "decision_engine::prediction::telemetry::CausalEventFields",
+    "decision_engine::prediction::telemetry::CausalEventKind",
+    "decision_engine::prediction::telemetry::CausalEventSink",
+    "decision_engine::prediction::telemetry::CausalLineage",
+    "decision_engine::prediction::telemetry::IncompleteReason",
+    "decision_engine::prediction::factory::AttemptOutcome",
     // The one reading of the configured backend (CDP-14's live-test target).
-    "decision::factory::configured_selection",
-    "decision::factory::DecisionBackendFactory",
-    "decision::factory::FactoryBuildError",
-    "decision::factory::FactoryDeps",
-    "decision::factory::HealthView",
-    "decision::factory::ServedBy",
-    "decision::BackendLocality",
-    "decision::DecisionQuestion",
-    "decision::GlobalQuestion",
-    "decision::OptionId",
-    "decision::RequestLimits",
-    "decision::RequestParts",
-    "decision::builtin::weights::MODEL_VERSION",
+    "decision_engine::prediction::factory::configured_selection",
+    "decision_engine::prediction::factory::DecisionBackendFactory",
+    "decision_engine::prediction::factory::FactoryBuildError",
+    "decision_engine::prediction::factory::FactoryDeps",
+    "decision_engine::prediction::factory::HealthView",
+    "decision_engine::prediction::factory::ServedBy",
+    "decision_engine::prediction::BackendLocality",
+    "decision_engine::prediction::DecisionQuestion",
+    "decision_engine::prediction::GlobalQuestion",
+    "decision_engine::prediction::OptionId",
+    "decision_engine::prediction::RequestLimits",
+    "decision_engine::prediction::RequestParts",
+    "decision_engine::prediction::builtin::weights::MODEL_VERSION",
     "providers::redact_endpoint_userinfo",
     "runtime::sqlite_pool::install_bounded_busy_handler",
     "security::redaction::redact_json_value",
@@ -245,6 +247,32 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "observability::causal_event::CausalEventSink",
     "observability::causal_event::CausalLineage",
     "observability::causal_event::IncompleteReason",
+    // 05a2 core move (R21): the causal-domain modules that moved into the
+    // engine. They stay inside the scan (see `CAUSAL_ENGINE_MODULES`).
+    "decision_engine::admission_probe::",
+    "decision_engine::candidate::",
+    "decision_engine::candidate_generator::",
+    "decision_engine::decision_score::",
+    "decision_engine::prediction_port::",
+    "decision_engine::projection::",
+    "decision_engine::questions::",
+    "decision_engine::state::",
+    "decision_engine::cost_model::CostEstimateSource",
+    "cost::decision_attempt::error::DecisionError",
+];
+
+/// The causal-domain files that moved into `src/decision_engine/` (R21).
+/// AG-01 keeps scanning them at their new paths.
+const CAUSAL_ENGINE_MODULES: &[&str] = &[
+    "src/decision_engine/admission_probe.rs",
+    "src/decision_engine/candidate.rs",
+    "src/decision_engine/candidate_generator.rs",
+    "src/decision_engine/decision_score.rs",
+    "src/decision_engine/prediction_port.rs",
+    "src/decision_engine/projection.rs",
+    "src/decision_engine/questions.rs",
+    "src/decision_engine/state.rs",
+    "src/decision_engine/state/canonical.rs",
 ];
 
 // CDP-18's admission and enumeration ports read immutable catalog and policy
@@ -272,35 +300,36 @@ const CAUSAL_GENERATOR_CRATE_PATHS: &[&str] = &[
 // CDP-19 constructs a sealed, provider-neutral request from typed protocol
 // values. This allowance belongs only to the question compiler.
 const CAUSAL_QUESTION_CRATE_PATHS: &[&str] = &[
-    "decision::CandidateQuestion",
-    "decision::DecisionError",
-    "decision::DecisionKey",
-    "decision::DecisionQuestion",
-    "decision::DecisionRequest",
-    "decision::GlobalQuestion",
-    "decision::OmissionReason",
-    "decision::OptionId",
-    "decision::ProjectionAudit",
-    "decision::QuestionId",
-    "decision::RequestLimits",
-    "decision::RequestParts",
-    "decision::RequestRule",
-    "decision::StructuredValue",
+    "decision_engine::prediction::CandidateQuestion",
+    "decision_engine::prediction::DecisionError",
+    "decision_engine::prediction::DecisionKey",
+    "decision_engine::prediction::DecisionQuestion",
+    "decision_engine::prediction::DecisionRequest",
+    "decision_engine::prediction::GlobalQuestion",
+    "decision_engine::prediction::OmissionReason",
+    "decision_engine::prediction::OptionId",
+    "decision_engine::prediction::ProjectionAudit",
+    "decision_engine::prediction::QuestionId",
+    "decision_engine::prediction::RequestLimits",
+    "decision_engine::prediction::RequestParts",
+    "decision_engine::prediction::RequestRule",
+    "decision_engine::prediction::StructuredValue",
+    "cost::decision_attempt::error::RequestRule",
 ];
 
 // CDP-20's prediction reader stays protocol-only; it cannot import a
 // backend, transport or live catalog.
 const CAUSAL_SCORE_CRATE_PATHS: &[&str] = &[
-    "decision::CandidateQuestion",
-    "decision::OmissionReason",
-    "decision::ScoreAnswer",
+    "decision_engine::prediction::CandidateQuestion",
+    "decision_engine::prediction::OmissionReason",
+    "decision_engine::prediction::ScoreAnswer",
 ];
 
 // The engine is the one causal-domain caller of the factory. Its selection
 // inputs are a validated result and an immutable catalog view, not a client.
 const CAUSAL_ENGINE_CRATE_PATHS: &[&str] = &[
     "capability::CapabilityAvailabilityLevel",
-    "decision::factory::PredictionResult",
+    "decision_engine::prediction::factory::PredictionResult",
     "security::AutonomyLevel",
     "security::SecurityPolicy",
     "tools::capability::catalog::CatalogView",
@@ -324,8 +353,8 @@ const CAUSAL_OUTCOME_CRATE_PATHS: &[&str] = &[
     "agent::terminal::TurnTerminalStatus",
     "cost::types::CostSettlement",
     "cost::tracker::ceil_micro_usd",
-    "decision::factory::FallbackReason",
-    "decision::PROTOCOL_VERSION",
+    "decision_engine::prediction::factory::FallbackReason",
+    "decision_engine::prediction::PROTOCOL_VERSION",
     "llm::route_decision::AttemptStatus",
     "llm::route_decision::ExecutionStatus",
     "llm::route_decision::MeteredTokenUsageRecord",
@@ -348,7 +377,10 @@ pub(super) fn decision_domain_has_no_constant_timeout_or_approval_grant_construc
     let mut scanned = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/") && !relative.starts_with("src/causal_tree/") {
+        if !relative.starts_with("src/decision_engine/prediction/")
+            && !relative.starts_with("src/causal_tree/")
+            && !CAUSAL_ENGINE_MODULES.contains(&relative.as_str())
+        {
             continue;
         }
         scanned += 1;
@@ -437,9 +469,13 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
         .collect();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        // The decision journal moved out of the causal domain (R16) and keeps
-        // its purity guard.
-        if !relative.starts_with("src/causal_tree/") && !relative.starts_with("src/runtime/decision_journal") {
+        // The decision journal moved out of the causal domain (R16) and the
+        // engine core moved into `src/decision_engine/` (R21); both keep
+        // their purity guard.
+        if !relative.starts_with("src/causal_tree/")
+            && !relative.starts_with("src/runtime/decision_journal")
+            && !CAUSAL_ENGINE_MODULES.contains(&relative.as_str())
+        {
             continue;
         }
         scanned += 1;
@@ -458,10 +494,14 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
             }
             let file_paths = match relative.as_str() {
                 "src/causal_tree/gates.rs" => CAUSAL_GATE_CRATE_PATHS,
-                "src/causal_tree/candidate_generator.rs" => CAUSAL_GENERATOR_CRATE_PATHS,
-                "src/causal_tree/questions.rs" => CAUSAL_QUESTION_CRATE_PATHS,
-                "src/causal_tree/decision_score.rs" => CAUSAL_SCORE_CRATE_PATHS,
+                "src/decision_engine/candidate_generator.rs" => CAUSAL_GENERATOR_CRATE_PATHS,
+                "src/decision_engine/questions.rs" => CAUSAL_QUESTION_CRATE_PATHS,
+                "src/decision_engine/decision_score.rs" => CAUSAL_SCORE_CRATE_PATHS,
                 "src/causal_tree/decision_engine.rs" => CAUSAL_ENGINE_CRATE_PATHS,
+                "src/decision_engine/prediction_port.rs" => &[
+                    "decision_engine::prediction::factory::PredictionResult",
+                    "tools::capability::catalog::CatalogView",
+                ],
                 "src/causal_tree/directive.rs" => CAUSAL_DIRECTIVE_CRATE_PATHS,
                 "src/causal_tree/outcome.rs" => CAUSAL_OUTCOME_CRATE_PATHS,
                 "src/causal_tree/admin.rs" => &[

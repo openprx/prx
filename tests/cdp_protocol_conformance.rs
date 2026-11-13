@@ -28,15 +28,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use openprx::decision::openrouter;
-use openprx::decision::wire::{ResponseEnvelope, SystemOneCodec};
-use openprx::decision::{
-    BackendIdentity, BackendKind, CandidateKey, CandidateQuestion, ChoiceAnswer, DecisionAnswer, DecisionError,
-    DecisionKey, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionResponseValidator, DecisionUsage,
-    GlobalQuestion, ModelVersionPolicy, NoulAnswer, NoulCriteria, OmissionReason, OptionId, PROTOCOL_VERSION,
-    Primitive, Probability, QuestionId, RequestLimits, RequestParts, RequestRule, ScoreAnswer, StructuredLimits,
-    StructuredValue, ValidatedDecision, ValidationContext, ValidationRule,
+use openprx::config::schema::causal_tree::BackendKind;
+use openprx::cost::decision_attempt::error::{DecisionError, RequestRule, ValidationRule};
+use openprx::cost::decision_attempt::{BackendIdentity, DecisionUsage};
+use openprx::decision_engine::prediction::openrouter;
+use openprx::decision_engine::prediction::wire::{ResponseEnvelope, SystemOneCodec};
+use openprx::decision_engine::prediction::{
+    CandidateKey, CandidateQuestion, ChoiceAnswer, DecisionAnswer, DecisionQuestion, DecisionRequest, DecisionResponse,
+    DecisionResponseValidator, GlobalQuestion, ModelVersionPolicy, NoulAnswer, NoulCriteria, OmissionReason, OptionId,
+    PROTOCOL_VERSION, Primitive, Probability, QuestionId, RequestLimits, RequestParts, ScoreAnswer, StructuredLimits,
+    StructuredValue, ValidatedDecision, ValidationContext,
 };
+use openprx::security::runtime_key::DecisionKey;
 use serde_json::{Value, json};
 use sha2::Digest as _;
 
@@ -639,7 +642,9 @@ fn single(question: DecisionQuestion) -> BTreeMap<QuestionId, DecisionQuestion> 
 /// string state; PRX states are objects, so the probe text is wrapped.
 #[test]
 fn max_choices_and_levels_accepted_one_more_rejected() {
-    use openprx::decision::protocol::{MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, MIN_CHOICE_OPTIONS, MIN_SCORE_LEVELS};
+    use openprx::decision_engine::prediction::protocol::{
+        MAX_CHOICE_OPTIONS, MAX_SCORE_LEVELS, MIN_CHOICE_OPTIONS, MIN_SCORE_LEVELS,
+    };
     let workspace = workspace();
     let probe_state = || json!({ "probe": "limit probe" });
     let attempt = |question: DecisionQuestion| {
@@ -1875,7 +1880,7 @@ fn malformed_diagnostics_on_the_wire_are_ignored() {
 #[cfg(feature = "test-mock")]
 mod mock {
     use super::*;
-    use openprx::decision::mock::{MockDecisionBackend, MockOutcome, MockStep};
+    use openprx::decision_engine::prediction::mock::{MockDecisionBackend, MockOutcome, MockStep};
 
     /// The mock plays its script through the real codec and validator,
     /// honours the deadline, counts calls, and is never reached by a request

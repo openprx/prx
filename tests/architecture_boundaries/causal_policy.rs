@@ -233,10 +233,13 @@ const DECISION_PROVIDER_PATHS: &[&str] = &[
     "providers::redact_endpoint_userinfo",
     "providers::sanitize_api_error",
     "providers::traits::retry_after_ms_from_headers",
+    // The literal-loopback endpoint check, moved from `decision::loopback`
+    // to its neutral home (05aS-HOME); a predicate, not a chat provider.
+    "providers::loopback",
 ];
 
 /// AG-03 (CDP-PLAN 1.5, SP-CDP-A 5.6; D-079 L-10): no file under
-/// `src/decision/` uses a chat provider. Every path it names under
+/// `src/decision_engine/prediction/` uses a chat provider. Every path it names under
 /// `crate::providers` is in [`DECISION_PROVIDER_PATHS`], through `use` trees,
 /// aliases and qualified paths alike; a glob or the bare module is refused.
 /// The `Provider` identifier, the chat provider factories and
@@ -259,11 +262,11 @@ pub(super) fn decision_code_never_uses_a_chat_provider() {
     let mut violations = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/") {
+        if !relative.starts_with("src/decision_engine/prediction/") {
             continue;
         }
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));
-        for (_, named) in crate_rooted_paths(&production, relative == "src/decision/mod.rs") {
+        for (_, named) in crate_rooted_paths(&production, false) {
             if named != "providers" && !named.starts_with("providers::") {
                 continue;
             }

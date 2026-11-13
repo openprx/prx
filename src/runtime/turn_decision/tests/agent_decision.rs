@@ -22,7 +22,7 @@ async fn record_builder_records_the_prediction_free_opening_and_rejects_a_broken
         .await
         .expect("test: prediction-free opening");
     let context = Arc::get_mut(&mut issued).expect("test: sole context owner");
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     assert!(matches!(
         DecisionRecordBuilder::build_enabled_chain(context, &key, false),
         Err(RecordBuildError::Binding)

@@ -4,10 +4,10 @@
 //! policy-internal reasons stay on the generic sentence. A new [`RefusalReason`]
 //! variant is a compile error here until it is classified.
 
-use super::branch::CausalCandidate;
-use super::candidate_generator::CandidateSet;
-use super::decision_engine::EngineDecision;
-use super::gates::GateOutcome;
+use crate::causal_tree::candidate_generator::CandidateSet;
+use crate::causal_tree::decision_engine::EngineDecision;
+use crate::causal_tree::gates::GateOutcome;
+use crate::decision_engine::candidate::CausalCandidate;
 use crate::tools::capability::contract::CausalActionKind;
 
 /// User-facing sentence for every refusal. Configuration hints follow it.

@@ -2,12 +2,14 @@
 
 //! Explicit controlled predictions for turn mechanics; registry, gates and bars stay real.
 use super::*;
-use crate::decision::backend::DecisionBackend;
-use crate::decision::factory::SlotLimits;
-use crate::decision::outbound::{GuardedBody, OutboundSecrets};
-use crate::decision::protocol::{BackendIdentity, BackendKind, BackendLocality, DecisionResponse};
-use crate::decision::validate::ModelVersionPolicy;
-use crate::decision::wire::{ResponseEnvelope, SystemOneCodec};
+use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::cost::decision_attempt::BackendIdentity;
+use crate::decision_engine::prediction::backend::DecisionBackend;
+use crate::decision_engine::prediction::factory::SlotLimits;
+use crate::decision_engine::prediction::outbound::{GuardedBody, OutboundSecrets};
+use crate::decision_engine::prediction::protocol::DecisionResponse;
+use crate::decision_engine::prediction::validate::ModelVersionPolicy;
+use crate::decision_engine::prediction::wire::{ResponseEnvelope, SystemOneCodec};
 
 struct OrdinaryFixtureBackend {
     identity: BackendIdentity,
@@ -30,7 +32,7 @@ impl DecisionBackend for OrdinaryFixtureBackend {
     }
     async fn evaluate_with_accounting(
         &self,
-        request: &crate::decision::protocol::DecisionRequest,
+        request: &crate::decision_engine::prediction::protocol::DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
         _accounting: Option<&dyn crate::cost::decision_attempt::DecisionAttemptAccounting>,
@@ -40,7 +42,7 @@ impl DecisionBackend for OrdinaryFixtureBackend {
     }
     async fn evaluate(
         &self,
-        request: &crate::decision::protocol::DecisionRequest,
+        request: &crate::decision_engine::prediction::protocol::DecisionRequest,
         body: &GuardedBody,
         deadline: Instant,
     ) -> Result<DecisionResponse, crate::cost::decision_attempt::DecisionError> {
@@ -49,10 +51,13 @@ impl DecisionBackend for OrdinaryFixtureBackend {
             return Err(DecisionError::Timeout);
         }
         let wire: serde_json::Value = serde_json::from_slice(body.bytes()).map_err(|_| DecisionError::Unavailable)?;
-        let builtin = crate::decision::builtin::BuiltinDecisionBackend::answer(request)?;
+        let builtin = crate::decision_engine::prediction::builtin::BuiltinDecisionBackend::answer(request)?;
         let selected = |question| -> Result<&str, DecisionError> {
-            match builtin.answers.get(&crate::decision::QuestionId::global(question)) {
-                Some(crate::decision::DecisionAnswer::Choice(choice)) => Ok(choice.chosen.as_str()),
+            match builtin
+                .answers
+                .get(&crate::decision_engine::prediction::QuestionId::global(question))
+            {
+                Some(crate::decision_engine::prediction::DecisionAnswer::Choice(choice)) => Ok(choice.chosen.as_str()),
                 _ => Err(DecisionError::Unavailable),
             }
         };
@@ -74,8 +79,8 @@ impl DecisionBackend for OrdinaryFixtureBackend {
             }
         } else if self.follow_builtin {
             (
-                selected(crate::decision::GlobalQuestion::NextAction)?,
-                selected(crate::decision::GlobalQuestion::CapabilityTarget)?,
+                selected(crate::decision_engine::prediction::GlobalQuestion::NextAction)?,
+                selected(crate::decision_engine::prediction::GlobalQuestion::CapabilityTarget)?,
             )
         } else {
             (self.action, self.family)

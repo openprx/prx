@@ -38,7 +38,7 @@ impl OwnedReceipt {
                 // model, and tokens, and the reserved hold closes at zero.
                 UsagePrice::Subscription => (None, 0),
                 UsagePrice::Missing
-                    if super::super::turn_cost::provider_is_zero_price_exempt(
+                    if crate::cost::estimate::provider_is_zero_price_exempt(
                         &crate::providers::ProviderId::of(&self.provider),
                         super::effective_api_url(&self.config, &self.provider),
                     ) =>

@@ -1,7 +1,7 @@
 //! Immediate, confirmed predecessor observations for a serial child task.
 //! This is live runtime evidence, not a history read or new execution authority.
 use super::AgentDecisionError;
-use crate::causal_tree::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
+use crate::decision_engine::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use anyhow::{Context, ensure};
@@ -288,7 +288,7 @@ pub(super) fn initial_observations(
 #[cfg(test)]
 mod tests {
     use super::{SegmentObservation, initial_observations, project_trace};
-    use crate::causal_tree::state::{ObservedStepKind, ObservedStepStatus};
+    use crate::decision_engine::state::{ObservedStepKind, ObservedStepStatus};
     use crate::runtime::decision_journal::store::{RecordedOutcomeAttempt, RecordedToolCall};
     use crate::runtime::envelope::RuntimeEnvelope;
     use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;

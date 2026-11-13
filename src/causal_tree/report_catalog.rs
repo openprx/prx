@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::evaluate::{EvaluateError, EvaluationReport};
+use crate::causal_tree::evaluate::{EvaluateError, EvaluationReport};
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 
 #[derive(Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub(crate) fn write_owned_report(
             &[b"content", &tag, report.report_id.as_bytes(), &bytes],
         ),
     };
-    let path = super::evaluate::write_report(workspace, report)?;
+    let path = crate::causal_tree::evaluate::write_report(workspace, report)?;
     let receipt_path = path.with_extension("ownership.json");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);

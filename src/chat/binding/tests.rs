@@ -667,7 +667,7 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
         let mut trusted = without_plan.trusted.parts().clone();
         trusted.constraints.retain(|code| code.as_str() != "intercepts_writes");
         without_plan.trusted = crate::tools::capability::turn_state::TrustedState::from_runtime(trusted);
-        let key = crate::causal_tree::state::fixtures::key();
+        let key = crate::decision_engine::state::fixtures::key();
         assert_ne!(
             actual
                 .material_fingerprint(&key)

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::turn_request::TurnDecision;
-use crate::decision::factory::{BackendSpec, DecisionTransports};
+use crate::decision_engine::prediction::factory::{BackendSpec, DecisionTransports};
 use crate::observability::causal_event::{CausalEvent, CausalEventSink};
 use crate::runtime::turn_decision::{
     AgentTurnKind, TurnDecisionContext, TurnDecisionService, TurnServiceBuild, build_turn_decision_service,
@@ -25,7 +25,10 @@ impl DecisionTransports for NoExternalTransport {
     fn build(
         &self,
         _: &BackendSpec<'_>,
-    ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::cost::decision_attempt::DecisionError> {
+    ) -> Result<
+        Box<dyn crate::decision_engine::prediction::backend::DecisionBackend>,
+        crate::cost::decision_attempt::DecisionError,
+    > {
         Err(crate::cost::decision_attempt::DecisionError::Unavailable)
     }
 }
@@ -685,7 +688,7 @@ impl AdmittedTurn {
                 surface_policy: crate::runtime::turn_publication::surface_policy(surface, &config.tool_tiering),
                 provider_catalog: &provider_catalog,
                 transports: if configured_native_tools.is_some() {
-                    &crate::decision::compatible_http::HttpDecisionTransports
+                    &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports
                 } else {
                     &NoExternalTransport
                 },

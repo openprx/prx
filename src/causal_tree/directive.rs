@@ -1,12 +1,12 @@
 //! Convert a gated selection into a narrow runtime execution directive.
 
-use super::branch::CandidateId;
+use crate::decision_engine::candidate::CandidateId;
 use crate::tools::capability::contract::{CapabilityId, CausalActionKind};
 
-use super::candidate_generator::CandidateSet;
-use super::decision_engine::EngineDecision;
-use super::decision_select::Selection;
-use super::gates::GateOutcome;
+use crate::causal_tree::candidate_generator::CandidateSet;
+use crate::causal_tree::decision_engine::EngineDecision;
+use crate::causal_tree::decision_select::Selection;
+use crate::causal_tree::gates::GateOutcome;
 
 use crate::tools::capability::child::ChildCapabilityManifest;
 

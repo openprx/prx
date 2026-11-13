@@ -2632,7 +2632,7 @@ mod tests {
         let valid = json!({"type": "object", "properties": {}});
         assert!(SchemaCleanr::validate(&valid).is_ok());
         let (result, allocations) =
-            crate::decision::builtin::allocation_counter::count(|| SchemaCleanr::validate(&valid));
+            crate::decision_engine::prediction::builtin::allocation_counter::count(|| SchemaCleanr::validate(&valid));
         assert!(result.is_ok());
         assert_eq!(allocations, 0);
 

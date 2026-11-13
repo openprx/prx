@@ -1532,10 +1532,10 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
         },
     );
     let config = Arc::new(config);
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let cancellation = tokio_util::sync::CancellationToken::new();
     let advisory_with = |attempts: &Arc<std::sync::atomic::AtomicUsize>| {
-        let factory = crate::decision::factory::DecisionBackendFactory::from_slots(
+        let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
             vec![Box::new(RecordingBackend {
                 identity: crate::cost::decision_attempt::BackendIdentity {
                     kind: crate::config::schema::causal_tree::BackendKind::Mock,
@@ -1547,8 +1547,8 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
                 request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
             })],
             Arc::clone(&key),
-            crate::decision::outbound::OutboundSecrets::default(),
-            crate::decision::factory::SlotLimits::default(),
+            crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
+            crate::decision_engine::prediction::factory::SlotLimits::default(),
         );
         DecisionAdvisory::new(Arc::clone(&config), Some(factory))
     };

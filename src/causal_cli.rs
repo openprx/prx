@@ -22,8 +22,8 @@ use crate::config::Config;
 use crate::config::manage::mutation::causal::{CausalMutation, PolicyPatch};
 use crate::config::schema::causal_tree::BackendKind;
 use crate::config::schema::causal_tree::CredentialRefSetting;
-use crate::decision::compatible_http::HttpDecisionTransports;
-use crate::decision::factory::{DecisionBackendFactory, FactoryBuildError, FactoryDeps};
+use crate::decision_engine::prediction::compatible_http::HttpDecisionTransports;
+use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryBuildError, FactoryDeps};
 use crate::observability::causal_event::{CausalEventSink, ObserverCausalSink};
 use crate::providers::catalog::CatalogView;
 use crate::security::decision_id::DecisionId;
@@ -802,7 +802,9 @@ struct HttpPlane {
     events: Arc<dyn CausalEventSink>,
 }
 
-fn admin_prediction(result: crate::decision::factory::PredictionResult) -> crate::causal_tree::admin::AdminPrediction {
+fn admin_prediction(
+    result: crate::decision_engine::prediction::factory::PredictionResult,
+) -> crate::causal_tree::admin::AdminPrediction {
     crate::causal_tree::admin::AdminPrediction::from_validated_parts(
         result.served,
         result.served_by,
@@ -854,7 +856,7 @@ impl DecisionPlaneBuilder for HttpPlane {
         factory: &'a DecisionBackendFactory,
         config: &'a Config,
         key: Arc<crate::security::runtime_key::DecisionKey>,
-        request: &'a crate::decision::DecisionRequest,
+        request: &'a crate::decision_engine::prediction::DecisionRequest,
         lineage: &'a crate::observability::causal_event::CausalLineage,
     ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, crate::causal_tree::admin::AdminPrediction> {
         Box::pin(async move {
@@ -944,7 +946,7 @@ async fn admin_accounting_scope(
             &config.model_routes,
             &catalog,
         );
-        let reservation = crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+        let reservation = crate::cost::estimate::DecisionTokenReservation::from_effective_compaction(
             &effective.config,
             config.causal_tree.policy.extra_token_ratio_limit,
         )?;
@@ -1380,7 +1382,7 @@ mod tests {
             &config.model_routes,
         );
         let expected_tokens = u64::try_from(
-            crate::runtime::turn_decision::DecisionTokenReservation::from_effective_compaction(
+            crate::cost::estimate::DecisionTokenReservation::from_effective_compaction(
                 &effective.config,
                 config.causal_tree.policy.extra_token_ratio_limit,
             )

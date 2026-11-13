@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::decision::*;
+use crate::decision_engine::prediction::*;
 use observe::{ObserveQueue, SqliteTelemetryWriter, TelemetryWriter};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -814,4 +814,175 @@ fn access_spies_observe_actual_store_and_credential_sites() {
     );
     assert_eq!(spy.counts.stores.load(Ordering::SeqCst), 1);
     assert_eq!(spy.counts.credentials.load(Ordering::SeqCst), 1);
+}
+
+/// R21: the core move changes module paths only. The legacy bridge path
+/// names the very candidate-set type the engine generates (authenticated
+/// replay reads it unchanged), and the advisory driver's analysis equals the
+/// analysis composed by hand from the moved modules (generator, derived
+/// state, question compiler, builtin prediction, turn analysis), repeatably.
+#[tokio::test]
+async fn analysis_is_identical_before_and_after_core_move() {
+    use crate::causal_tree::gates::GateInputs;
+    use crate::causal_tree::hard_gates_probe::HardGatesProbe;
+    use crate::decision_engine::admission_probe::{AdmissionProbe, AdvisoryProbe};
+    use crate::decision_engine::candidate_generator::{
+        CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
+    };
+    use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
+    use crate::decision_engine::prediction_port::{PredictionPort, derive_state};
+    use crate::decision_engine::questions::{CompilerPolicy, QuestionCompiler};
+    use crate::runtime::decision_advisory::DecisionAdvisory;
+    use crate::runtime::decision_advisory::tests::{analysis_input, enabled_config};
+    use crate::tools::capability::catalog::CatalogScope;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    // Type identity across the forwarding bridge: no conversion exists.
+    fn legacy_reader_sees_engine_set(set: crate::causal_tree::candidate_generator::CandidateSet) -> CandidateSet {
+        set
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = enabled_config(temp.path());
+    let key = crate::decision_engine::state::fixtures::key();
+    let cancellation = CancellationToken::new();
+    let builtin = || {
+        DecisionBackendFactory::from_config(
+            &config,
+            FactoryDeps {
+                catalog: &crate::providers::catalog::CatalogView::from_config(&config),
+                key: Some(Arc::clone(&key)),
+                transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
+                config_generation: 1,
+                events: Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
+            },
+        )
+        .expect("test: builtin factory")
+    };
+    let advisory = DecisionAdvisory::new(Arc::clone(&config), Some(builtin()));
+    let input = analysis_input(&config, &key, advisory.request_limits());
+    let decision_id = input.decision_id.to_string();
+    let mut again = analysis_input(&config, &key, advisory.request_limits());
+    again.decision_id = input.decision_id;
+
+    // Hand composition over the moved modules, from the same input.
+    let view = input
+        .catalog
+        .view(&CatalogScope::default())
+        .with_surface(&input.publication_policy);
+    let calls = BTreeMap::new();
+    let replayed = BTreeSet::new();
+    let gates: GateInputs<'_> =
+        crate::runtime::decision_advisory::gate_inputs(&input.facts, &calls, BTreeMap::new(), &replayed);
+    let observed_latency = BTreeMap::new();
+    let cost_model =
+        crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &config, &observed_latency);
+    let discovered = DiscoveredRefs::empty();
+    let policy = CandidatePolicy {
+        key: &key,
+        max_candidates: usize::from(config.causal_tree.policy.max_candidates),
+        can_deliver_text: true,
+        may_delegate: false,
+        delegation_target: None,
+        cost_model: &cost_model,
+        discovered_refs: &discovered,
+    };
+    let probe = HardGatesProbe {
+        state: &input.state,
+        catalog: &view,
+        gates: &gates,
+    };
+    let candidates = legacy_reader_sees_engine_set(
+        CausalCandidateGenerator::generate(
+            &input.state,
+            &view,
+            &policy,
+            &AdvisoryProbe {
+                inner: &probe as &dyn AdmissionProbe,
+            },
+        )
+        .expect("test: candidates"),
+    );
+    let CandidateSet::Legal { candidates: legal, .. } = &candidates else {
+        panic!("test: the fixture has a legal candidate set");
+    };
+    let keys = legal
+        .iter()
+        .map(|candidate| candidate.candidate_id().key())
+        .collect::<Vec<_>>();
+    assert!(
+        !keys.is_empty(),
+        "the fixture analyses at least the terminal candidates"
+    );
+    let mut state = input.state.clone();
+    state.derived = derive_state(&candidates, &view).expect("test: derived state");
+    let factory = builtin();
+    let compiled = QuestionCompiler::compile(
+        &state,
+        &candidates,
+        &CompilerPolicy {
+            key: &key,
+            model: factory.request_model().or_else(|| Some(input.model.model())),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            limits: input.request_limits,
+        },
+    )
+    .expect("test: compiled request");
+    let lineage = crate::observability::causal_event::CausalLineage {
+        workspace_id: Arc::clone(&state.trusted.parts().workspace_id),
+        owner_id: state.trusted.parts().owner_id.clone(),
+        session_key: state.trusted.parts().session_key.clone(),
+        run_id: state.trusted.parts().run_id.clone(),
+        task_id: state.trusted.parts().task_id.clone(),
+        source_event_id: state.trusted.parts().source_event_id.clone(),
+        causation_event_id: state.trusted.parts().causation_event_id.clone(),
+        decision_id: None,
+    };
+    let accounting: &dyn crate::cost::decision_attempt::DecisionAttemptAccounting = input.accounting.as_ref();
+    let prediction = factory
+        .prediction_port(Some(accounting))
+        .predict(compiled.request(), &lineage)
+        .await
+        .expect("test: builtin prediction");
+    let mut answers = BTreeMap::new();
+    for question in GlobalQuestion::ALL
+        .into_iter()
+        .map(QuestionId::global)
+        .chain(keys.iter().flat_map(|candidate| {
+            CandidateQuestion::ALL
+                .into_iter()
+                .map(move |q| QuestionId::candidate(candidate, q))
+        }))
+    {
+        if let Some(answer) = prediction.served.answer(&question) {
+            answers.insert(question, answer.clone());
+        }
+    }
+    let engine = causal_adapter::CausalEngine {
+        observations: ObserveQueue::disabled(),
+    };
+    let composed = turn::analyze(
+        &engine,
+        &config.decision_engine,
+        IntentInput {
+            decision_id: &decision_id,
+            answers: &answers,
+            candidates: &keys,
+        },
+        &cancellation,
+    )
+    .await
+    .expect("test: composed analysis");
+
+    let driven = advisory
+        .analyze(input, &cancellation)
+        .await
+        .expect("test: driver analysis");
+    let repeated = DecisionAdvisory::new(Arc::clone(&config), Some(builtin()))
+        .analyze(again, &cancellation)
+        .await
+        .expect("test: repeated driver analysis");
+    assert_eq!(driven, composed, "the driver composes exactly the moved modules");
+    assert_eq!(driven, repeated, "the analysis is repeatable");
 }

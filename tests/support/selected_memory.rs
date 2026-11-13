@@ -3,9 +3,9 @@
 use anyhow::{Context, Result, ensure};
 use axum::response::IntoResponse;
 use futures::FutureExt;
-use openprx::decision::protocol::{BackendKind, BackendLocality};
-use openprx::decision::telemetry::{CausalEvent, CausalEventKind, CausalLineage, ServedLabel};
+use openprx::config::schema::causal_tree::{BackendKind, BackendLocality};
 use openprx::memory::{Memory, MemoryCategory, MemoryStoreMetadata, SqliteMemory};
+use openprx::observability::causal_event::{CausalEvent, CausalEventKind, CausalLineage, ServedLabel};
 use openprx::observability::{Observer, ObserverEvent, ObserverMetric};
 use serde_json::{Value, json};
 use std::io::Write;

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::causal_tree::state::{ObservedState, RawRoutingInput};
+use crate::decision_engine::state::{ObservedState, RawRoutingInput};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::turn_decision::{AdmittedDecisionResume, SendLimits};
 use crate::security::decision_id::DecisionId;

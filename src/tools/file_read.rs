@@ -383,8 +383,9 @@ mod tests {
                 availability.level >= crate::capability::CapabilityAvailabilityLevel::Configured
                     || availability.reason.trim().is_empty()
             );
-            let (_, allocations) =
-                crate::decision::builtin::allocation_counter::count(|| tool.catalog_availability_is_configured());
+            let (_, allocations) = crate::decision_engine::prediction::builtin::allocation_counter::count(|| {
+                tool.catalog_availability_is_configured()
+            });
             assert_eq!(allocations, 0);
             let owned = tool.catalog_specs();
             let borrowed = tool.immutable_catalog_specs().expect("immutable file read spec");

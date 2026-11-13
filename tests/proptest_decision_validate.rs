@@ -35,15 +35,18 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use openprx::decision::protocol::MAX_CHOICE_OPTIONS;
-use openprx::decision::validate::{PROBABILITY_SUM_TOLERANCE, WIRE_ROUNDING_ERROR};
-use openprx::decision::wire::{ResponseEnvelope, SystemOneCodec};
-use openprx::decision::{
-    BackendIdentity, BackendKind, CandidateKey, CandidateQuestion, ChoiceAnswer, DecisionAnswer, DecisionError,
-    DecisionKey, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionResponseValidator, DecisionUsage,
-    GlobalQuestion, ModelVersionPolicy, NoulAnswer, OptionId, Probability, QuestionId, RequestLimits, RequestParts,
-    ScoreAnswer, StructuredValue, ValidationContext, ValidationRule,
+use openprx::config::schema::causal_tree::BackendKind;
+use openprx::cost::decision_attempt::error::{DecisionError, ValidationRule};
+use openprx::cost::decision_attempt::{BackendIdentity, DecisionUsage};
+use openprx::decision_engine::prediction::protocol::MAX_CHOICE_OPTIONS;
+use openprx::decision_engine::prediction::validate::{PROBABILITY_SUM_TOLERANCE, WIRE_ROUNDING_ERROR};
+use openprx::decision_engine::prediction::wire::{ResponseEnvelope, SystemOneCodec};
+use openprx::decision_engine::prediction::{
+    CandidateKey, CandidateQuestion, ChoiceAnswer, DecisionAnswer, DecisionQuestion, DecisionRequest, DecisionResponse,
+    DecisionResponseValidator, GlobalQuestion, ModelVersionPolicy, NoulAnswer, OptionId, Probability, QuestionId,
+    RequestLimits, RequestParts, ScoreAnswer, StructuredValue, ValidationContext,
 };
+use openprx::security::runtime_key::DecisionKey;
 use proptest::prelude::*;
 use serde_json::json;
 

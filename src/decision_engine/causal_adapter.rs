@@ -3,7 +3,7 @@ use super::{
     contract::{DecisionEngine, EngineError, IntentAnalysis, IntentInput, IntentValue, ObserveAdmission, TurnOutcome},
     observe::ObserveQueue,
 };
-use crate::decision::{CandidateQuestion, DecisionAnswer, GlobalQuestion, QuestionId};
+use crate::decision_engine::prediction::{CandidateQuestion, DecisionAnswer, GlobalQuestion, QuestionId};
 pub struct CausalEngine {
     pub observations: ObserveQueue,
 }

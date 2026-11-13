@@ -1,5 +1,5 @@
 //! Owned observation and structured prediction contracts.
-use crate::decision::{CandidateKey, DecisionAnswer, QuestionId};
+use crate::decision_engine::prediction::{CandidateKey, DecisionAnswer, QuestionId};
 use std::collections::BTreeMap;
 
 pub struct IntentInput<'a> {

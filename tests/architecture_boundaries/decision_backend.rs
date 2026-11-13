@@ -30,7 +30,7 @@ fn identifier_count_in_use_declarations(compact: &str, name: &str) -> usize {
 /// outbound guard, the breaker and validation exists.
 ///
 /// - `DecisionResponseValidator::validate` and `BuiltinDecisionBackend::answer`
-///   are named only in `src/decision/factory.rs`.
+///   are named only in `src/decision_engine/prediction/factory.rs`.
 /// - `DecisionTransports` is named elsewhere only to import it, implement it
 ///   (`.. DecisionTransports for ..`), or as the turn service's single borrowed
 ///   constructor input. Only the factory invokes `build` on it.
@@ -38,7 +38,7 @@ fn identifier_count_in_use_declarations(compact: &str, name: &str) -> usize {
 ///   `.evaluate(` only on `self` (a backend's own health probe).
 #[test]
 pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend() {
-    const FACTORY: &str = "src/decision/factory.rs";
+    const FACTORY: &str = "src/decision_engine/prediction/factory.rs";
     let mut violations = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
@@ -70,7 +70,10 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
         }
         // Only the factory encodes a request and guards its body (D-082
         // N-2): a backend sends the body it is handed.
-        if !matches!(relative.as_str(), "src/decision/outbound.rs" | "src/decision/wire.rs") {
+        if !matches!(
+            relative.as_str(),
+            "src/decision_engine/prediction/outbound.rs" | "src/decision_engine/prediction/wire.rs"
+        ) {
             for name in ["check_outbound", "encode_request"] {
                 if identifier_count(&compact, name) > 0 {
                     violations.push(format!("{relative}: {name}"));
@@ -78,7 +81,9 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
             }
         }
         // A concrete backend is built only by its transport.
-        if relative != "src/decision/compatible_http.rs" && identifier_count(&compact, "CompatibleHttpBackend") > 0 {
+        if relative != "src/decision_engine/prediction/compatible_http.rs"
+            && identifier_count(&compact, "CompatibleHttpBackend") > 0
+        {
             violations.push(format!("{relative}: CompatibleHttpBackend"));
         }
         // A transport is asked to build only by the factory, however it is
@@ -117,7 +122,7 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
 /// AG-17 (CDP-PLAN 1.5 and 1.7; SP-CDP-A 5.3 and 5.8): whether a decision
 /// endpoint is loopback is decided in one place, `providers::loopback`, from
 /// the host as written. Configuration validation, the factory's locality and
-/// the HTTP client share it. Elsewhere in `src/decision/**` and in
+/// the HTTP client share it. Elsewhere in `src/decision_engine/prediction/**` and in
 /// `src/config/schema/causal_tree.rs` (+ `causal_tree/`) and `src/providers/loopback.rs`:
 ///
 /// - no parsed host is consulted (`host_str`, which normalizes `127.1` and
@@ -130,17 +135,26 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
 pub(super) fn loopback_is_decided_only_by_the_shared_predicate() {
     const RULES: [(&str, &[&str]); 4] = [
         ("host_str", &["src/providers/loopback.rs"]),
-        ("Ipv4Addr", &["src/providers/loopback.rs", "src/decision/http.rs"]),
-        ("Ipv6Addr", &["src/providers/loopback.rs", "src/decision/http.rs"]),
+        (
+            "Ipv4Addr",
+            &["src/providers/loopback.rs", "src/decision_engine/prediction/http.rs"],
+        ),
+        (
+            "Ipv6Addr",
+            &["src/providers/loopback.rs", "src/decision_engine/prediction/http.rs"],
+        ),
         (
             "is_loopback",
-            &["src/providers/loopback.rs", "src/decision/compatible_http.rs"],
+            &[
+                "src/providers/loopback.rs",
+                "src/decision_engine/prediction/compatible_http.rs",
+            ],
         ),
     ];
     let mut violations = Vec::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/")
+        if !relative.starts_with("src/decision_engine/prediction/")
             && !relative.starts_with("src/config/schema/causal_tree")
             && relative != "src/providers/loopback.rs"
         {
@@ -160,13 +174,13 @@ pub(super) fn loopback_is_decided_only_by_the_shared_predicate() {
 }
 
 /// AG-21 (SP-CDP-A 5.8): every decision HTTP client comes from
-/// `src/decision/http.rs`, which never follows a redirect, ignores every
+/// `src/decision_engine/prediction/http.rs`, which never follows a redirect, ignores every
 /// proxy and resolves `localhost` itself for loopback, and is HTTPS only
 /// for remote. No decision file builds another client or turns a
 /// certificate check off.
 #[test]
 pub(super) fn decision_http_clients_come_only_from_the_pinned_builder() {
-    const HTTP: &str = "src/decision/http.rs";
+    const HTTP: &str = "src/decision_engine/prediction/http.rs";
     const PINNED: [&str; 5] = [
         "redirect::Policy::none()",
         ".no_proxy()",
@@ -195,7 +209,7 @@ pub(super) fn decision_http_clients_come_only_from_the_pinned_builder() {
     }
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/decision/") {
+        if !relative.starts_with("src/decision_engine/prediction/") {
             continue;
         }
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(&path)));

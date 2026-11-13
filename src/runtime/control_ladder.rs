@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn published_disabled_service_keeps_exact_generation_and_store_state() {
         let status = super::super::turn_decision::DecisionPlaneStatus {
-            backend: crate::decision::factory::BackendPlaneStatus {
+            backend: crate::decision_engine::prediction::factory::BackendPlaneStatus {
                 enabled: false,
                 config_generation: 23,
                 order: Vec::new(),

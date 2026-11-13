@@ -1091,7 +1091,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         // Recheck the actual selected parent capability against the real
         // narrower child seal. Full runtime mode cannot widen that scope.
         use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
-        let crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } =
+        let crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } =
             &context.engine.candidates
         else {
             anyhow::bail!("real parent has no legal candidate set");

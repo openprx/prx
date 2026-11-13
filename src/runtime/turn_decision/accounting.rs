@@ -1,7 +1,7 @@
 //! The turn's physical-send accounting scope, created at opening.
 use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
-use crate::decision::KeyDomain;
 use crate::runtime::decision_accounting::AccountingScope;
+use crate::security::runtime_key::KeyDomain;
 use std::{sync::Arc, time::Instant};
 
 /// The turn's one accounting scope, created at opening (R9). The scope is
@@ -33,7 +33,7 @@ pub(super) fn opening_scope(
     ))
 }
 
-fn accounting_scope_id(key: &crate::decision::DecisionKey, proof: &dyn TurnSourceProof) -> [u8; 32] {
+fn accounting_scope_id(key: &crate::security::runtime_key::DecisionKey, proof: &dyn TurnSourceProof) -> [u8; 32] {
     key.hmac(
         KeyDomain::TerminalClaim,
         &[

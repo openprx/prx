@@ -76,7 +76,7 @@ fn fresh_bitmap_matches_old_alias_union_view_and_dynamic_support() -> anyhow::Re
         allowed_tools: Some(BTreeSet::from(["prx_root_0_alias".into()])),
         ..SurfacePolicy::default()
     };
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     for allow in [Vec::new(), vec!["prx_shared".into()], vec!["prx_root_0_alias".into()]] {
         for visible_alias_only in [false, true] {
             let base = catalog.view(&scope);
@@ -147,7 +147,7 @@ fn fresh_bitmap_matches_old_alias_union_view_and_dynamic_support() -> anyhow::Re
 
 #[test]
 fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<()> {
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let mut lengths = Vec::new();
     for count in [1, 17, 65] {
         let registry: Vec<Box<dyn Tool>> = (0..count)
@@ -161,7 +161,7 @@ fn model_policy_digest_binds_presence_across_catalog_sizes() -> anyhow::Result<(
             .collect();
         let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
         let view = catalog.view(&CatalogScope::default());
-        let mut state = crate::causal_tree::state::fixtures::state(&key, "prx input");
+        let mut state = crate::decision_engine::state::fixtures::state(&key, "prx input");
         let before = state.material_fingerprint(&key)?;
         let mut trusted = state.trusted.parts().clone();
         trusted.model_admission = Some(ModelAdmission::fresh(
@@ -209,7 +209,7 @@ fn model_admission_dyn_equality_compares_each_original_field() -> anyhow::Result
     })];
     let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
     let view = catalog.view(&CatalogScope::default());
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let issued = ModelAdmission::fresh(&registry, &view, "prx-model", &[], "prx-policy", &key);
     let same = ModelAdmission::fresh(&registry, &view, "prx-model", &[], "prx-policy", &key);
     let left: &dyn ModelAdmissionView = issued.as_ref();
@@ -285,7 +285,7 @@ fn model_admission_absent_slots_and_invalid_present_slots_remain_distinct() -> a
         .collect();
     let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())?;
     let view = catalog.view(&CatalogScope::default());
-    let key = crate::causal_tree::state::fixtures::key();
+    let key = crate::decision_engine::state::fixtures::key();
     let allowed = ModelAdmission::fresh(
         &registry,
         &view,

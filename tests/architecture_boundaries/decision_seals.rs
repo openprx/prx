@@ -24,8 +24,8 @@ const TRUST_BEARING_CALLERS: &[&str] = &[
 const TRUST_BEARING_CONSTRUCTORS: [&str; 3] = ["from_runtime", "from_runtime_records", "recorded_by_runtime"];
 const TRUST_BEARING_DEFINITIONS: [(&str, &str); 3] = [
     ("from_runtime", "src/tools/capability/turn_state.rs"),
-    ("from_runtime_records", "src/causal_tree/state.rs"),
-    ("recorded_by_runtime", "src/causal_tree/state.rs"),
+    ("from_runtime_records", "src/decision_engine/state.rs"),
+    ("recorded_by_runtime", "src/decision_engine/state.rs"),
 ];
 
 /// AG-28 (CDP-PLAN 1.9, scope amended by D-066 N-3 and its amendment).
@@ -167,8 +167,8 @@ pub(super) fn only_reviewed_production_sites_seal_decision_requests() {
         found,
         BTreeMap::from([
             ("src/causal_tree/admin.rs".to_string(), (1, 0, 0)),
-            ("src/causal_tree/questions.rs".to_string(), (0, 0, 1)),
-            ("src/decision/factory.rs".to_string(), (1, 0, 0)),
+            ("src/decision_engine/questions.rs".to_string(), (0, 0, 1)),
+            ("src/decision_engine/prediction/factory.rs".to_string(), (1, 0, 0)),
         ]),
         "AG-29 decision request constructors changed; review redacted or neutral state provenance"
     );
@@ -259,7 +259,7 @@ fn decision_compiler_source_errors(source: &str) -> Vec<&'static str> {
 
 #[test]
 pub(super) fn decision_compiler_uses_typed_ids_and_only_redacted_state() {
-    let source = read_source(&repository_root().join("src/causal_tree/questions.rs"));
+    let source = read_source(&repository_root().join("src/decision_engine/questions.rs"));
     assert_eq!(decision_compiler_source_errors(&source), Vec::<&str>::new());
     let planted_id = format!("{source}\nfn planted() {{ let _ = QuestionId::parse(user_text); }}");
     assert!(
@@ -319,9 +319,12 @@ pub(super) fn decision_compiler_uses_typed_ids_and_only_redacted_state() {
 #[test]
 pub(super) fn validation_requires_the_sealed_request_manifest() {
     let owners: [(&str, &[&str]); 3] = [
-        ("ValidatedDecision", &["src/decision/validate.rs"]),
+        ("ValidatedDecision", &["src/decision_engine/prediction/validate.rs"]),
         ("DecisionRequest", &[]),
-        ("DecisionRequestManifest", &["src/decision/protocol.rs"]),
+        (
+            "DecisionRequestManifest",
+            &["src/decision_engine/prediction/protocol.rs"],
+        ),
     ];
     let mut sites = BTreeMap::<&str, Vec<String>>::new();
     for path in rust_source_files() {
@@ -342,7 +345,7 @@ pub(super) fn validation_requires_the_sealed_request_manifest() {
     }
 
     let validator = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
-        &repository_root().join("src/decision/validate.rs"),
+        &repository_root().join("src/decision_engine/prediction/validate.rs"),
     )));
     let body = function_body(&validator, "validate");
     let header: String = body[..body.find('{').expect("validate has a body")]
@@ -363,7 +366,7 @@ pub(super) fn validation_requires_the_sealed_request_manifest() {
     // `protocol.rs` and takes no `&mut self`, and no production code holds a
     // `&mut` to one.
     let protocol = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
-        &repository_root().join("src/decision/protocol.rs"),
+        &repository_root().join("src/decision_engine/prediction/protocol.rs"),
     )));
     for name in ["validate_parts", "from_validated_parts"] {
         let declaration = format!("fn {name}(");
@@ -422,11 +425,11 @@ pub(super) fn validation_requires_the_sealed_request_manifest() {
         }
     }
     let expected: BTreeSet<String> = [
-        "src/decision/protocol.rs: impl DecisionRequest",
-        "src/decision/protocol.rs: impl DecisionRequestManifest",
-        "src/decision/protocol.rs: impl Eq for DecisionRequest",
-        "src/decision/protocol.rs: impl PartialEq for DecisionRequest",
-        "src/decision/protocol.rs: impl fmt::Debug for DecisionRequest",
+        "src/decision_engine/prediction/protocol.rs: impl DecisionRequest",
+        "src/decision_engine/prediction/protocol.rs: impl DecisionRequestManifest",
+        "src/decision_engine/prediction/protocol.rs: impl Eq for DecisionRequest",
+        "src/decision_engine/prediction/protocol.rs: impl PartialEq for DecisionRequest",
+        "src/decision_engine/prediction/protocol.rs: impl fmt::Debug for DecisionRequest",
     ]
     .iter()
     .map(ToString::to_string)

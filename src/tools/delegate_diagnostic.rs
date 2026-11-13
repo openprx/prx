@@ -1,10 +1,8 @@
 #![cfg(all(test, unix))]
 //! Opt-in, bounded, fixed-field evidence for one neutral delegate fixture.
-use crate::causal_tree::{
-    candidate_generator::CandidateSet,
-    decision_select::Selection,
-    gates::{GateOutcome, GateReport},
-};
+use crate::causal_tree::decision_select::Selection;
+use crate::causal_tree::gates::{GateOutcome, GateReport};
+use crate::decision_engine::candidate_generator::CandidateSet;
 use anyhow::Context;
 use futures::FutureExt;
 use serde_json::{Value, json};
@@ -204,7 +202,7 @@ pub(super) fn admission(
             let selection = json!({"kind":"commit","action":candidate_id.action().as_str()});
             let prediction = if let Some(prediction) = &hop.prediction {
                 anyhow::ensure!(prediction.attempts.len() <= 32, "prediction diagnostic bound");
-                use crate::decision::factory::{AttemptOutcome, FallbackReason, ServedBy};
+                use crate::decision_engine::prediction::factory::{AttemptOutcome, FallbackReason, ServedBy};
                 let served = match prediction.served_by {
                     ServedBy::Primary => "primary",
                     ServedBy::Fallback => "fallback",

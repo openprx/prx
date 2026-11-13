@@ -101,10 +101,13 @@ impl DecisionBackend for ReadBackend {
         // Only model answers change. The factory still binds the real compiled
         // request, validates every answer, and runs the ordinary hard gates.
         let mut response = BuiltinDecisionBackend::answer(request)?;
-        let has_tool_candidate = crate::decision::builtin::features::extract(request.state().as_json())
-            .candidates
-            .iter()
-            .any(|candidate| candidate.action == Some(crate::decision::builtin::features::Action::UseTool));
+        let has_tool_candidate =
+            crate::decision_engine::prediction::builtin::features::extract(request.state().as_json())
+                .candidates
+                .iter()
+                .any(|candidate| {
+                    candidate.action == Some(crate::decision_engine::prediction::builtin::features::Action::UseTool)
+                });
         response.backend = "mock".into();
         response.resolved_model = self.identity.configured_model.to_string();
         for (id, answer) in &mut response.answers {

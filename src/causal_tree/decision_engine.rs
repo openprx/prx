@@ -4,44 +4,27 @@
 //! turn opens prediction-free with one committed Answer candidate. The hop
 //! record stays for the decision-record writers, terminal replay and legacy
 //! recovery until Part 2. Advisory prediction runs in
-//! `runtime::decision_advisory` through [`PredictionPort`].
+//! `runtime::decision_advisory` through
+//! `decision_engine::prediction_port::PredictionPort`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Instant;
 
-use super::branch::{CandidateId, CandidateSpec, CausalCandidate};
-use super::candidate_generator::CandidateSet;
-use super::decision_score::CandidateScore;
-use super::decision_select::Selection;
-use super::gates::{GateError, GateOutcome, GateReport};
-use super::ids::DecisionId;
-use super::questions::CompileError;
-use super::state::{CausalState, DerivedCandidate, DerivedState, DuplicateCandidate, SideEffectMode, TrustedParts};
-use crate::cost::decision_attempt::DecisionError;
-use crate::decision::factory::PredictionResult;
-use crate::observability::causal_event::CausalLineage;
+use crate::causal_tree::candidate_generator::CandidateSet;
+use crate::causal_tree::decision_select::Selection;
+use crate::causal_tree::gates::{GateError, GateOutcome, GateReport};
+use crate::causal_tree::ids::DecisionId;
+use crate::decision_engine::candidate::{CandidateId, CandidateSpec, CausalCandidate};
+use crate::decision_engine::decision_score::CandidateScore;
+use crate::decision_engine::prediction::factory::PredictionResult;
+use crate::decision_engine::questions::CompileError;
+use crate::decision_engine::state::{CausalState, DuplicateCandidate};
 use crate::security::{AutonomyLevel, SecurityPolicy};
-use crate::tools::capability::catalog::CatalogView;
 use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest, ChildManifestError};
 use crate::tools::capability::contract::{
     ApprovalRequirement, CapabilityRef, CapabilityTarget, CausalActionKind, CostEstimate, SideEffectClass,
 };
-
-/// Borrowed prediction port owned by the engine domain. Its producer keeps
-/// physical accounting and transport outside the engine; no boxed future is
-/// introduced on builtin/cache or physical paths by this contract.
-pub(crate) mod prediction_sealed {
-    pub(crate) trait Producer {}
-}
-
-pub(crate) trait PredictionPort: prediction_sealed::Producer + Clone + Send + Sync {
-    fn predict<'a>(
-        &'a self,
-        request: &'a crate::decision::DecisionRequest,
-        lineage: &'a CausalLineage,
-    ) -> impl std::future::Future<Output = Result<PredictionResult, DecisionError>> + Send + 'a;
-}
+use crate::tools::capability::turn_state::{SideEffectMode, TrustedParts};
 
 pub(crate) struct EngineDecision {
     pub decision_id: DecisionId,
@@ -161,54 +144,4 @@ pub(crate) fn authority_within_policy(
         && parent.authority.max_cost_cents <= policy.max_cost_per_day_cents
         && u64::from(parent.authority.max_cost_cents).saturating_mul(10_000) <= trusted.budgets.micro_usd
         && parent.authority.remaining_depth <= max_depth
-}
-
-/// The derived state of an admitted candidate set: what the question
-/// compiler projects and checks against the set before sealing a request.
-pub(crate) fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Result<DerivedState, DuplicateCandidate> {
-    let CandidateSet::Legal {
-        candidates,
-        exact_mentions,
-        report,
-        ..
-    } = set
-    else {
-        return DerivedState::new(Vec::new());
-    };
-    DerivedState::new(
-        candidates
-            .iter()
-            .map(|candidate| DerivedCandidate {
-                candidate: candidate.clone(),
-                summary: if candidate.action() == CausalActionKind::UseTool
-                    && candidate.target() == crate::tools::capability::contract::CapabilityTarget::Filesystem
-                    && candidate.required_capabilities().len() > 1
-                {
-                    let names = candidate
-                        .required_capabilities()
-                        .iter()
-                        .filter_map(|reference| catalog.entry_any(&reference.id))
-                        .map(|entry| entry.public_name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    Arc::from(format!("Native workspace file operations: {names}"))
-                } else {
-                    Arc::from(
-                        candidate
-                            .required_capabilities()
-                            .first()
-                            .and_then(|reference| catalog.entry_any(&reference.id))
-                            .map_or("Fixed terminal", |entry| entry.summary.as_str()),
-                    )
-                },
-                exact_mention: exact_mentions.contains(candidate.candidate_id()),
-                available: true,
-                effective_approval_required: match report.outcomes.get(candidate.candidate_id()) {
-                    Some(GateOutcome::Passed) => Some(false),
-                    Some(GateOutcome::ApprovalOnly { .. } | GateOutcome::ApprovalDeferred) => Some(true),
-                    _ => None,
-                },
-            })
-            .collect(),
-    )
 }

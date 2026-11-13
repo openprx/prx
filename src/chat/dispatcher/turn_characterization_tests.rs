@@ -339,7 +339,10 @@ fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDe
         .prediction
         .as_ref()
         .expect("step 7.1 must execute the enabled decision plane");
-    assert_eq!(prediction.served_by, crate::decision::factory::ServedBy::Builtin);
+    assert_eq!(
+        prediction.served_by,
+        crate::decision_engine::prediction::factory::ServedBy::Builtin
+    );
     assert_eq!(
         prediction.reason, None,
         "step 7.1 must use the enabled builtin path, not disabled-mode fallback"
@@ -534,7 +537,7 @@ async fn admit_chat_fixture_with_mode(
                     crate::config::schema::causal_tree::BackendKind::CompatibleHttp
                 )
             ) {
-                &crate::decision::compatible_http::HttpDecisionTransports
+                &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports
             } else {
                 &crate::agent::test_admission::NoExternalTransport
             },

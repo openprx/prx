@@ -12,21 +12,22 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::causal_tree::admission_probe::{AdmissionProbe, AdvisoryProbe, HardGatesProbe};
-use crate::causal_tree::branch::{CandidateId, Ns8};
-use crate::causal_tree::candidate_generator::{
-    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
-};
-use crate::causal_tree::decision_engine::PredictionPort;
 use crate::causal_tree::gates::GateInputs;
-use crate::causal_tree::questions::{CompilerPolicy, QuestionCompiler};
-use crate::causal_tree::state::{CausalState, DerivedState, HopLineage};
+use crate::causal_tree::hard_gates_probe::HardGatesProbe;
 use crate::config::Config;
 use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode, effective_engine_backend};
 use crate::cost::decision_attempt::DecisionAttemptAccounting;
-use crate::decision::factory::DecisionBackendFactory;
-use crate::decision::{CandidateQuestion, GlobalQuestion, QuestionId, RequestLimits};
+use crate::decision_engine::admission_probe::{AdmissionProbe, AdvisoryProbe};
+use crate::decision_engine::candidate::{CandidateId, Ns8};
+use crate::decision_engine::candidate_generator::{
+    CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
+};
 use crate::decision_engine::observe::{ObserveQueue, SqliteTelemetryWriter};
+use crate::decision_engine::prediction::factory::DecisionBackendFactory;
+use crate::decision_engine::prediction::{CandidateQuestion, GlobalQuestion, QuestionId, RequestLimits};
+use crate::decision_engine::prediction_port::PredictionPort;
+use crate::decision_engine::questions::{CompilerPolicy, QuestionCompiler};
+use crate::decision_engine::state::{CausalState, DerivedState, HopLineage};
 use crate::decision_engine::{DecisionEngine, IntentAnalysis, IntentInput, TurnOutcome};
 use crate::observability::causal_event::CausalLineage;
 use crate::providers::catalog::ResolvedModel;
@@ -369,7 +370,7 @@ impl DecisionAdvisory {
         let gates = gate_inputs(&input.facts, &calls, approvals, &replayed);
         let observed_latency = BTreeMap::new();
         let cost_model =
-            crate::runtime::turn_cost::RuntimeCostModel::new(&input.model, &self.config, &observed_latency);
+            crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &self.config, &observed_latency);
         let discovered = DiscoveredRefs::empty();
         let policy = CandidatePolicy {
             key: &input.state_key,
@@ -408,7 +409,8 @@ impl DecisionAdvisory {
             // The compiler projects and checks the derived candidates of the
             // exact set it seals, as the retired hop did before compiling.
             let mut state = input.state.clone();
-            state.derived = crate::causal_tree::decision_engine::derive_state(&candidates, &view).map_err(|_| ())?;
+            state.derived =
+                crate::decision_engine::prediction_port::derive_state(&candidates, &view).map_err(|_| ())?;
             let compiled = QuestionCompiler::compile(
                 &state,
                 &candidates,

@@ -11,6 +11,7 @@ pub(crate) use ordinary_child_fixture::{
     with_inherited_scored_prediction, with_scored_prediction, with_scored_publication,
 };
 
+use crate::cost::estimate::{DecisionReserveUnavailable, DecisionTokenReservation};
 #[cfg(test)]
 use crate::tools::capability::turn_state::ConstraintCode;
 
@@ -65,10 +66,10 @@ use super::turn_source::TurnSourceProof;
 #[cfg(test)]
 use crate::agent::entry::AgentTurnProof;
 use crate::capability::CapabilityAvailabilityLevel;
-use crate::causal_tree::branch::{CandidateSpec, CausalCandidate};
-use crate::causal_tree::candidate_generator::CandidateSet;
-use crate::causal_tree::candidate_generator::DiscoveredRefs;
 use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, EngineError, RetrievalIssueError};
+use crate::decision_engine::candidate::{CandidateSpec, CausalCandidate};
+use crate::decision_engine::candidate_generator::CandidateSet;
+use crate::decision_engine::candidate_generator::DiscoveredRefs;
 #[cfg(test)]
 use crate::tools::capability::contract::CapabilityTarget;
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, CausalActionKind};
@@ -76,13 +77,13 @@ use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, Causa
 use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective};
 use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
 use crate::causal_tree::outcome::{DecisionRecordBuilder, OutcomeCorrelator, RecordBuildError, TerminalFacts};
-use crate::causal_tree::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
-#[cfg(test)]
-use crate::causal_tree::state::{ObservedStepKind, ObservedStepStatus};
 use crate::config::ConfigGeneration;
-use crate::decision::factory::{
+use crate::decision_engine::prediction::factory::{
     BackendPlaneStatus, DecisionBackendFactory, DecisionTransports, FactoryBuildError, FactoryDeps,
 };
+use crate::decision_engine::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
+#[cfg(test)]
+use crate::decision_engine::state::{ObservedStepKind, ObservedStepStatus};
 use crate::memory::Memory;
 use crate::observability::causal_event::{
     CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage,
@@ -200,7 +201,7 @@ impl TurnDecisionService {
         self.factory.prediction_port_calls()
             + self.advisory.factory().map_or(
                 0,
-                crate::decision::factory::DecisionBackendFactory::prediction_port_calls,
+                crate::decision_engine::prediction::factory::DecisionBackendFactory::prediction_port_calls,
             )
     }
 
@@ -353,7 +354,7 @@ fn pinned_policy_version(
         .collect();
     let encoded = serde_json::to_vec(&(
         "cdp-policy-semantics-v1",
-        super::turn_cost::LATENCY_DEFAULT_VERSION,
+        crate::decision_engine::cost_model::LATENCY_DEFAULT_VERSION,
         &config.causal_tree,
         (
             &security.autonomy,
@@ -505,20 +506,6 @@ pub(crate) enum TurnModelError {
     #[error("selected provider identity or credential reference changed before decision")]
     SelectionDrift,
 }
-
-/// A marginal slice of the resolved Agent input window held for causal
-/// decision work. The main turn must use `main_input_limit` at every
-/// preflight and immediately before each provider request; merely computing
-/// this value does not reserve context in a provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DecisionTokenReservation {
-    pub(crate) decision_tokens: usize,
-    pub(crate) main_input_limit: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("resolved Agent context window has no safe decision reserve")]
-pub(crate) struct DecisionReserveUnavailable;
 
 /// Budget facts for one authenticated Agent turn. The effective route window
 /// and remaining money come from pinned runtime state, never an input object
@@ -968,69 +955,6 @@ pub(crate) enum AgentRetrievalError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Selected(#[from] RetrievalIssueError),
-}
-
-impl DecisionTokenReservation {
-    /// Use the selected route's effective compaction window, after its
-    /// response reserve. The eighth-window slice funds the complete bounded
-    /// structured question set; a sixteenth/4096 slice was smaller than real
-    /// default-registry Jev requests. The marginal slice is also capped by the
-    /// configured ratio to that baseline window. Very small windows and a
-    /// ratio that cannot fund one token fail closed instead of silently
-    /// authorizing a zero-token decision budget.
-    pub(crate) fn from_effective_compaction(
-        config: &crate::config::AgentCompactionConfig,
-        extra_token_ratio_limit: f32,
-    ) -> Result<Self, DecisionReserveUnavailable> {
-        let available = config
-            .max_context_tokens
-            .checked_sub(config.reserve_tokens)
-            .ok_or(DecisionReserveUnavailable)?;
-        if !extra_token_ratio_limit.is_finite() || extra_token_ratio_limit < 0.0 {
-            return Err(DecisionReserveUnavailable);
-        }
-        let ratio_limit = ((available as f64) * f64::from(extra_token_ratio_limit)).floor();
-        let ratio_limit = if ratio_limit >= usize::MAX as f64 {
-            usize::MAX
-        } else {
-            ratio_limit as usize
-        };
-        let decision_tokens = (available / 8).min(8192).min(ratio_limit);
-        let main_input_limit = available
-            .checked_sub(decision_tokens)
-            .ok_or(DecisionReserveUnavailable)?;
-        if decision_tokens == 0 || main_input_limit == 0 {
-            return Err(DecisionReserveUnavailable);
-        }
-        Ok(Self {
-            decision_tokens,
-            main_input_limit,
-        })
-    }
-
-    /// Carry this turn's slice through the existing compaction preflight.
-    /// The returned clone must be used for every iteration of that turn; the
-    /// source-owned turn origin checks bind the selected route and generation.
-    /// This arithmetic only binds the window and response reserve.
-    pub(crate) fn reserved_compaction(
-        self,
-        effective: &crate::config::AgentCompactionConfig,
-        extra_token_ratio_limit: f32,
-    ) -> Result<crate::config::AgentCompactionConfig, DecisionReserveUnavailable> {
-        let expected = Self::from_effective_compaction(effective, extra_token_ratio_limit)?;
-        if self != expected {
-            return Err(DecisionReserveUnavailable);
-        }
-        let mut reserved = effective.clone();
-        reserved.reserve_tokens = reserved
-            .reserve_tokens
-            .checked_add(self.decision_tokens)
-            .ok_or(DecisionReserveUnavailable)?;
-        if reserved.max_context_tokens.checked_sub(reserved.reserve_tokens) != Some(self.main_input_limit) {
-            return Err(DecisionReserveUnavailable);
-        }
-        Ok(reserved)
-    }
 }
 
 impl TurnDecisionContext {

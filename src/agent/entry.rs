@@ -1249,7 +1249,7 @@ mod agent_turn_origin_tests {
         assert_eq!(proof_a.routing_input(), proof_b.routing_input());
         assert_eq!(proof_a.owner_id(), proof_b.owner_id());
         assert_ne!(proof_a.session_key(), proof_b.session_key());
-        let mut trusted = crate::causal_tree::state::fixtures::trusted();
+        let mut trusted = crate::decision_engine::state::fixtures::trusted();
         trusted.surface = crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop;
         trusted.channel = None;
         trusted.workspace_id = Arc::from(proof_a.workspace_id());

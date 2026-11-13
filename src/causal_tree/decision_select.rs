@@ -4,7 +4,7 @@
 //! prediction-free and commits its single Answer candidate. The type stays
 //! for the decision-record writers and terminal replay until Part 2.
 
-use super::branch::CandidateId;
+use crate::decision_engine::candidate::CandidateId;
 
 /// The committed working candidate of a hop.
 #[derive(Debug, Clone, PartialEq)]

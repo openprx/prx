@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::ids::DecisionId;
-use super::store::{
+use crate::causal_tree::ids::DecisionId;
+use crate::causal_tree::store::{
     CausalDecisionStore, DecisionRecord, Enqueue, ImportProgress, RecordLineage, RecordedCandidate,
     RecordedDistributions, RecordedShadow, StoreError,
 };
@@ -562,7 +562,7 @@ mod tests {
                 &DecisionScope::LocalOperator {
                     workspace_id: store.workspace_id().unwrap(),
                 },
-                super::super::store::TimeWindow {
+                crate::causal_tree::store::TimeWindow {
                     from_ms: 0,
                     to_ms: i64::MAX,
                 },
@@ -657,7 +657,7 @@ mod tests {
         feedback(temp.path(), "2026-09-01.jsonl", &line("r-1", "DirectAnswer"));
         let store = CausalDecisionStore::open_shared(
             temp.path(),
-            super::super::store::Retention::days(30, 30),
+            crate::causal_tree::store::Retention::days(30, 30),
             Arc::new(RecordingSink::default()),
             StoreMode::ReadOnly,
         )

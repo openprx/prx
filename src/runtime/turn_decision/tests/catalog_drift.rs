@@ -104,26 +104,30 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
         let specs_allocations: u64 = service
             .registry
             .iter()
-            .map(|tool| crate::decision::builtin::allocation_counter::count(|| tool.catalog_specs()).1)
+            .map(|tool| {
+                crate::decision_engine::prediction::builtin::allocation_counter::count(|| tool.catalog_specs()).1
+            })
             .sum();
         let (_, descriptor_allocations) =
-            crate::decision::builtin::allocation_counter::count(|| service.execution.current_descriptors());
+            crate::decision_engine::prediction::builtin::allocation_counter::count(|| {
+                service.execution.current_descriptors()
+            });
         let (parity, parity_allocations) =
-            crate::decision::builtin::allocation_counter::count(|| service.check_live_parity());
+            crate::decision_engine::prediction::builtin::allocation_counter::count(|| service.check_live_parity());
         parity.expect("fixture catalog parity");
         let model = service.resolve_agent_model(&proof).expect("fixture model");
         let catalog = service.catalog.view(&CatalogScope::default());
-        let (_, cost_allocations) = crate::decision::builtin::allocation_counter::count(|| {
-            super::super::super::turn_cost::build_cost_model(&catalog, &model, &config.cost, &BTreeMap::new())
+        let (_, cost_allocations) = crate::decision_engine::prediction::builtin::allocation_counter::count(|| {
+            crate::decision_engine::cost_model::build_cost_model(&catalog, &model, &config.cost, &BTreeMap::new())
         });
-        let (result, allocations) = crate::decision::builtin::allocation_counter::count_future(
+        let (result, allocations) = crate::decision_engine::prediction::builtin::allocation_counter::count_future(
             service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation),
         )
         .await;
         let context = result.expect("builtin service decision");
         let candidates = match &context.engine().candidates {
-            crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates.len(),
-            crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals.len(),
+            crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates.len(),
+            crate::decision_engine::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals.len(),
         };
         assert_eq!(transports.0.load(Ordering::SeqCst), 0);
         measurements.push((
@@ -216,7 +220,7 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         .await
         .expect("enabled synthetic service");
         let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof(&generation, memory).await;
-        let (result, allocations) = crate::decision::builtin::allocation_counter::count_future(
+        let (result, allocations) = crate::decision_engine::prediction::builtin::allocation_counter::count_future(
             service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new()),
         )
         .await;
@@ -236,7 +240,7 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         assert!(
             context.audit_hops().any(|hop| matches!(
                 &hop.candidates,
-                crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. }
+                crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. }
                     if candidates.iter().any(|candidate| {
                         candidate.action() == crate::tools::capability::contract::CausalActionKind::Discover
                             && candidate.target() == crate::tools::capability::contract::CapabilityTarget::NativeTool
@@ -259,23 +263,25 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
             .expect("fixed direct read capability");
         assert!(context.audit_hops().any(|hop| matches!(
             &hop.candidates,
-            crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. }
+            crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. }
                 if candidates.iter().any(|candidate| {
                     candidate.action() == crate::tools::capability::contract::CausalActionKind::UseTool
                         && candidate.required_capabilities() == [expected.clone()]
                 })
         )));
         let candidates = match &context.engine().candidates {
-            crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates.len(),
-            crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals.len(),
+            crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates.len(),
+            crate::decision_engine::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals.len(),
         };
         assert_eq!(transports.0.load(Ordering::SeqCst), 0);
         let candidate_shape: Vec<_> = context
             .audit_hops()
             .map(|hop| {
                 let admitted = match &hop.candidates {
-                    crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
-                    crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals,
+                    crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates,
+                    crate::decision_engine::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => {
+                        terminals
+                    }
                 };
                 admitted
                     .iter()

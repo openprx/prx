@@ -16,21 +16,23 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
-use crate::decision::backend::DecisionBackend;
-use crate::decision::builtin::BuiltinDecisionBackend;
-use crate::decision::factory::BackendSpec;
-use crate::decision::factory::SlotLimits;
-use crate::decision::outbound::{GuardedBody, OutboundSecrets};
-use crate::decision::protocol::{
-    BackendIdentity, BackendKind, BackendLocality, DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion,
-    Probability, QuestionId,
+use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::cost::decision_attempt::BackendIdentity;
+use crate::cost::decision_attempt::error::DecisionError;
+use crate::decision_engine::prediction::backend::DecisionBackend;
+use crate::decision_engine::prediction::builtin::BuiltinDecisionBackend;
+use crate::decision_engine::prediction::factory::BackendSpec;
+use crate::decision_engine::prediction::factory::SlotLimits;
+use crate::decision_engine::prediction::outbound::{GuardedBody, OutboundSecrets};
+use crate::decision_engine::prediction::protocol::{
+    DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion, Probability, QuestionId,
 };
-use crate::decision::validate::ModelVersionPolicy;
-use crate::decision::{DecisionError, KeyDomain};
+use crate::decision_engine::prediction::validate::ModelVersionPolicy;
 use crate::memory::{MemoryFabric, NoneMemory};
 use crate::observability::causal_event::CausalEvent;
 use crate::observability::causal_event::testing::RecordingSink;
 use crate::security::SecurityPolicy;
+use crate::security::runtime_key::KeyDomain;
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, TracingToolExecutionAudit,
 };
@@ -51,7 +53,7 @@ impl DecisionTransports for CountingTransports {
     fn build(
         &self,
         _spec: &BackendSpec<'_>,
-    ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, DecisionError> {
+    ) -> Result<Box<dyn crate::decision_engine::prediction::backend::DecisionBackend>, DecisionError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Err(DecisionError::Unavailable)
     }

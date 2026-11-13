@@ -1,16 +1,17 @@
 //! External callers cannot fund physical decision IO without a real sealed owner.
 //! Original16 transport oracles are mapped to private `causal_cli::backend_transport_tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-use openprx::decision::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
-use openprx::decision::telemetry::{CausalEvent, CausalEventSink, CausalLineage};
-use openprx::decision::{
-    DecisionError, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId, RequestLimits,
-    RequestParts, StructuredValue,
+use openprx::cost::decision_attempt::error::DecisionError;
+use openprx::decision_engine::prediction::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
+use openprx::decision_engine::prediction::{
+    DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId, RequestLimits, RequestParts, StructuredValue,
 };
+use openprx::observability::causal_event::{CausalEvent, CausalEventSink, CausalLineage};
 use openprx::providers::{
     ProviderId,
     catalog::{CatalogView, CuratedModel, ModelOperation},
 };
+use openprx::security::runtime_key::DecisionKey;
 use std::{
     collections::BTreeMap,
     sync::Arc,
@@ -51,7 +52,7 @@ async fn plane() -> Plane {
         FactoryDeps {
             catalog: &catalog,
             key: Some(Arc::clone(&key)),
-            transports: &openprx::decision::compatible_http::HttpDecisionTransports,
+            transports: &openprx::decision_engine::prediction::compatible_http::HttpDecisionTransports,
             config_generation: 1,
             events: Arc::new(NoEvents),
         },

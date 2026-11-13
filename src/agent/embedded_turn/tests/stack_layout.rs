@@ -8,7 +8,7 @@ use super::*;
 use crate::agent::dispatcher::XmlToolDispatcher;
 use crate::agent::embedded_source::EmbeddedAgentBinding;
 use crate::config::ConfigGeneration;
-use crate::decision::builtin::allocation_counter::count;
+use crate::decision_engine::prediction::builtin::allocation_counter::count;
 use crate::memory::{Memory, SqliteMemory};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatRequest, ChatResponse, Provider};

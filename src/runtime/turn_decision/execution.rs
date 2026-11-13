@@ -14,9 +14,9 @@ use super::{
     TurnServiceBuildError, TurnSourceProof, TurnSurfaceKind, effective_agent_exclusions, pinned_policy_version,
     validate_agent_retrieval_provenance,
 };
-use crate::causal_tree::candidate_generator::CandidateSet;
 use crate::causal_tree::directive::{DirectiveContext, directive_from_selection};
 use crate::causal_tree::gates::{GateOutcome, HardGates};
+use crate::decision_engine::candidate_generator::CandidateSet;
 use crate::tools::ToolSpec;
 
 impl TurnDecisionService {
@@ -294,7 +294,7 @@ impl OrdinaryChildPublication {
             FactoryDeps {
                 catalog: &parent.provider_catalog,
                 key: None,
-                transports: &crate::decision::compatible_http::HttpDecisionTransports,
+                transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
                 config_generation: parent.generation.id.0,
                 events: Arc::clone(&parent.events),
             },
