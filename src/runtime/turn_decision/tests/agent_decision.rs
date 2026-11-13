@@ -943,5 +943,74 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
             "test: original typed refusal is retained: {error:#}"
         );
     }
+    struct NoDispatch(AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for NoDispatch {
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("test: refused turn must not reach provider")
+        }
+    }
+    let provider = NoDispatch(AtomicUsize::new(0));
+    let mut history = vec![crate::providers::ChatMessage::user("Explain `2 + 2`.")];
+    let error = tokio::time::timeout(
+        Duration::from_secs(20),
+        crate::agent::turn_engine::run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                advice: None,
+                channel_name: "cli",
+                scope: None,
+                mode: crate::agent::turn_contracts::ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: crate::agent::turn_request::TurnDecision {
+                    service: &service,
+                    context,
+                    proof: &proof,
+                },
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: Arc::clone(&service.registry),
+                observer: &crate::observability::NoopObserver,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_owned()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: None,
+                memory: crate::agent::turn_request::ToolLoopMemory::none(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        ),
+    )
+    .await
+    .expect("test: refusal deadline")
+    .expect_err("test: NoLegalPath refuses before dispatch");
+    assert!(
+        matches!(
+            error.downcast_ref::<DirectiveError>(),
+            Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
+        ),
+        "test: run_turn retains typed refusal: {error:#}"
+    );
+    assert_eq!(
+        provider.0.load(Ordering::SeqCst),
+        0,
+        "test: no-legal-Answer dispatches zero provider requests"
+    );
     context.terminal_execution_trace();
 }
