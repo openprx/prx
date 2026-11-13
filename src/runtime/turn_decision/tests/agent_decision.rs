@@ -662,17 +662,10 @@ async fn enabled_engine_without_recording_runs_generator_gates_and_builtin() {
         .await
         .expect("source-bound builtin decision");
     assert!(matches!(result.directive(), TurnExecutionDirective::AnswerDirectly));
-    let error = service
+    let selection = service
         .agent_execution_specs(&proof, &result)
-        .err()
-        .expect("test: abstained Answer does not publish executable specs");
-    assert!(
-        matches!(
-            error.downcast_ref::<DirectiveError>(),
-            Some(DirectiveError::NonExecutableSelection { kind: "answer" })
-        ),
-        "test: confidence fallback retains its typed selection: {error:#}"
-    );
+        .expect("test: confidence Answer uses ordinary model publication");
+    assert!(selection.specs.is_empty(), "test: fallback Answer offers no tools");
     assert!(matches!(
         &result.engine().candidates,
         crate::causal_tree::candidate_generator::CandidateSet::Legal { .. }
@@ -878,19 +871,77 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
         ));
         assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
         assert!(context.execution_refs().is_empty());
-        let error = service
+        let selection = service
             .agent_execution_specs(&proof, &context)
-            .err()
-            .expect("test: fallback Answer cannot publish executable specs");
-        assert!(
-            matches!(
-                error.downcast_ref::<DirectiveError>(),
-                Some(DirectiveError::NonExecutableSelection { kind: "answer" })
-            ),
-            "test: fallback preserves typed Answer refusal: {error:#}"
-        );
+            .expect("test: fallback Answer uses ordinary model publication");
+        assert!(selection.specs.is_empty(), "test: fallback Answer offers no tools");
         context.terminal_execution_trace();
     }
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn clarify_without_gate_passed_answer_is_typed_refusal() {
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let mut config = crate::config::Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    config.workspace_dir = workspace.path().to_path_buf();
+    config.causal_tree.enabled = false;
+    let generation = crate::config::new_shared(config.clone()).pin();
+    let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
+    let proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
+        &generation,
+        "ollama",
+        "prx-local-model",
+        "Explain `2 + 2`.",
+    );
+    let mut context = service
+        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+        .await
+        .expect("test: builtin admission");
+    let context = Arc::get_mut(&mut context).expect("test: sole context owner");
+    context.engine.selection = crate::causal_tree::decision_select::Selection::Abstain {
+        action: CausalActionKind::Clarify,
+        reason_code: "decision_failed",
+    };
+    context.directive = TurnExecutionDirective::AnswerDirectly;
+    let CandidateSet::Legal { candidates, .. } = &context.engine.candidates else {
+        panic!("test: legal candidate set");
+    };
+    let answer = candidates
+        .iter()
+        .find(|candidate| candidate.action() == CausalActionKind::Answer)
+        .expect("test: real root includes Answer");
+    context.engine.pre_commit.outcomes.insert(
+        answer.candidate_id().clone(),
+        GateOutcome::Blocked {
+            gate: 1,
+            reason_code: "test_answer_blocked",
+        },
+    );
+    for no_legal_path in [false, true] {
+        if no_legal_path {
+            context.engine.candidates = CandidateSet::NoLegalPath {
+                reason: crate::causal_tree::candidate_generator::NoLegalReason::NoLegalCandidate,
+                terminals: Vec::new(),
+                approval_only: Vec::new(),
+                report: context.engine.pre_commit.clone(),
+            };
+        }
+        let error = service
+            .agent_execution_specs(&proof, context)
+            .err()
+            .expect("test: absent legal Answer cannot degrade Clarify");
+        assert!(
+            matches!(
+                error.downcast_ref::<DirectiveError>(),
+                Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
+            ),
+            "test: original typed refusal is retained: {error:#}"
+        );
+    }
+    context.terminal_execution_trace();
 }

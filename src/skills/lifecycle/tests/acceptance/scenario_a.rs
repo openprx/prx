@@ -457,36 +457,26 @@ async fn a_wall_stall_past_the_latency_budget_still_answers() {
 }
 
 #[tokio::test]
-async fn advancing_the_logical_latency_budget_refuses_clarify_without_provider_or_tools() {
+async fn advancing_the_logical_latency_budget_degrades_clarify_to_plain_answer() {
     let world = World::new().await;
     let config = world.production_config(SkillsLifecycleModeConfig::Auto, &[]);
     let remaining =
         crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: initial budget");
-    let error = world
+    let reply = world
         .run_plain_after_logical_budget(&config)
         .await
-        .expect_err("test: engine Clarify is a typed refusal under R177-6 rev 2");
-    assert!(
-        matches!(
-            error.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
-            Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind: "clarify" })
-        ),
-        "test: refusal must preserve the clarify selection kind: {error:#}"
-    );
-    assert_eq!(
-        world.loopback.requests(),
-        0,
-        "test: Clarify refuses before any serving-provider dispatch"
-    );
+        .expect("test: Clarify degrades to serving answer");
+    assert_eq!(reply, "plain answer", "test: serving reply is published");
+    assert_eq!(world.loopback.requests(), 1, "test: exactly one serving request");
     assert_eq!(
         crate::cost::tracker::settle_metered_call_count(&world.ws),
-        0,
-        "test: no physical call can be settled for a refused selection"
+        1,
+        "test: answer call is settled"
     );
-    assert_eq!(
-        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: refused budget"),
-        remaining,
-        "test: Clarify preserves the same unspent serving budget as Abstain"
+    assert!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: budget")
+            <= remaining,
+        "test: normal answer budget accounting"
     );
     let decisions = rusqlite::Connection::open_with_flags(
         world.ws.join("self/causal_tree/decisions.db"),
@@ -494,6 +484,8 @@ async fn advancing_the_logical_latency_budget_refuses_clarify_without_provider_o
     )
     .expect("test: actual decision ledger");
     let (rows, executed): (i64, i64) = decisions.query_row("SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(tool_calls_json, '[]') IN ('[]', 'null') THEN 0 ELSE 1 END), 0) FROM outcomes", [], |row| Ok((row.get(0)?, row.get(1)?))).expect("test: actual terminal accounting");
-    assert!(rows > 0, "test: refused turn must retain its terminal accounting row");
+    assert!(rows > 0, "test: degraded turn retains its terminal accounting row");
+    let retained: i64 = decisions.query_row("SELECT COUNT(*) FROM outcomes JOIN decisions USING(decision_id) WHERE directive_kind = 'clarify' AND abstention_reason = 'deadline_exceeded'", [], |row| row.get(0)).expect("test: abstention accounting");
+    assert!(retained > 0, "test: outcome retains clarify and original reason");
     assert_eq!(executed, 0, "test: no tool execution may appear in the refused outcome");
 }

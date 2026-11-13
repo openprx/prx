@@ -1243,3 +1243,71 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
     joined??;
     Ok(())
 }
+
+#[tokio::test]
+async fn enabled_interactive_backend_failure_publishes_provider_reply() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+    let workspace = tempfile::tempdir().expect("test: chat workspace");
+    let workspace = workspace.path();
+    let (actions, mut receiver) = mpsc::channel::<Action>(128);
+    let mut config = enabled_builtin_admission_config(workspace);
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+    config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
+    config.causal_tree.backend.model = "prx-decision-probe".into();
+    config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: decision model"));
+    let provider = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
+        chunks: vec!["ok".to_owned()],
+        reasoning: String::new(),
+        usage: reported_usage(1, 1),
+    }]));
+    let port: Arc<dyn Provider> = provider.clone();
+    let cancellation = CancellationToken::new();
+    let admitted = admit_chat_fixture_with_config(
+        port.clone(),
+        None,
+        config,
+        ("ollama", "prx-local-model", None),
+        ("engine-off-chat", "hello"),
+        actions.clone(),
+        cancellation.clone(),
+    )
+    .await;
+    let history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
+    drive_start_turn_stream(
+        Some(admitted.binding),
+        None,
+        port,
+        history.clone(),
+        history,
+        "prx-local-model".into(),
+        0.0,
+        None,
+        cancellation,
+        "engine-off-chat".into(),
+        actions,
+        Some(admitted.registry),
+        Some(admitted.service),
+        admitted.context,
+        admitted.fabric,
+        None,
+        crate::agent::turn_contracts::ChatMode::Edit,
+        Arc::new(crate::observability::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),
+    )
+    .await;
+    let mut completed = 0;
+    while let Ok(action) = receiver.try_recv() {
+        match action {
+            Action::StreamFailed { err, .. } => panic!("test: engine-off chat failed: {err}"),
+            Action::StreamCompleted { final_text, .. } => {
+                assert_eq!(final_text, "ok", "test: provider reply");
+                completed += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(completed, 1, "test: chat completed");
+    assert_eq!(provider.histories().len(), 1, "test: provider called once");
+    }).await.expect("test: interactive failure turn deadline");
+}

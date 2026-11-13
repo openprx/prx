@@ -905,6 +905,16 @@ impl TurnDecisionService {
             crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
             crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
 
+            crate::causal_tree::decision_select::Selection::Abstain {
+                action:
+                    crate::causal_tree::branch::CausalActionKind::Answer
+                    | crate::causal_tree::branch::CausalActionKind::Clarify,
+                ..
+            } if super::admitted_fallback_answer(&context.engine).is_some() => {
+                super::admitted_fallback_answer(&context.engine)
+                    .context("admitted fallback answer disappeared")?
+                    .candidate_id()
+            }
             crate::causal_tree::decision_select::Selection::Abstain { action, .. } => {
                 let error = anyhow::Error::new(super::DirectiveError::NonExecutableSelection { kind: action.as_str() });
                 return Err(match context.refusal_reply() {

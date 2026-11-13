@@ -13,7 +13,7 @@ pub(super) fn embedded_user_input_cannot_bypass_reserved_marker_neutralization()
     let source = read_source(&repository_root().join(path));
     let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
     let body = compact_rust_tokens(&function_body(&production, "run_work"));
-    // Close-path neutralization is cfg(test) after the engine-off switch;
+    // The close path was deleted after the engine-off switch;
     // production keeps the live delegation site.
     assert_eq!(body.matches("inbound_user_message(input)").count(), 1);
     assert_eq!(body.matches("inbound_user_message_owned(enriched)").count(), 1);

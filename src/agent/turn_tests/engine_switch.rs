@@ -1232,3 +1232,132 @@ fn recorded_pre_switch_directive_replays_unchanged() {
         "a RequestApproval hop must not close on a Clarify reply"
     );
 }
+
+async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure: bool) {
+    let workspace = tempfile::tempdir().expect("test: plain workspace");
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.path().to_owned();
+    config.decision_engine.enabled = enabled;
+    config.causal_tree.enabled = true;
+    config.causal_tree.backend.kind =
+        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+    if interactive_failure {
+        config.causal_tree.backend.kind =
+            crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
+        config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
+        config.causal_tree.backend.model = "prx-decision-probe".into();
+        config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: model"));
+    }
+    let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+        name: "project_tool".into(),
+        execution_order: Arc::clone(&dispatches),
+    })]);
+    let registry = if enabled { registry } else { Arc::new(Vec::new()) };
+    let admitted = AdmittedTurn::with_config(config, input, Arc::clone(&registry)).await;
+    if enabled {
+        assert!(
+            matches!(
+                admitted.decision().context.engine().selection,
+                crate::causal_tree::decision_select::Selection::Abstain {
+                    action: crate::causal_tree::branch::CausalActionKind::Answer
+                        | crate::causal_tree::branch::CausalActionKind::Clarify,
+                    ..
+                }
+            ),
+            "test: exercise an actual abstention"
+        );
+    }
+    let published = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = EngineOffProvider {
+        calls: Arc::clone(&calls),
+        published: Arc::clone(&published),
+        responses: Mutex::new(
+            vec![ChatResponse {
+                text: Some("plain answer".into()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            }]
+            .into(),
+        ),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(input)];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_turn(
+            &mut history,
+            TurnRequest {
+                advice: None,
+                channel_name: "wacli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admitted.decision(),
+            },
+            TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: registry,
+                observer: &crate::observability::NoopObserver,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admitted.adapter()),
+                memory: admitted.memory_runtime(),
+            },
+            TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        ),
+    )
+    .await
+    .expect("test: plain turn deadline")
+    .expect("test: plain turn completes");
+    assert_eq!(result.0.into_text(), "plain answer", "test: serving reply is published");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "test: exactly one serving request"
+    );
+    assert!(
+        published.lock().expect("test: surface").is_empty(),
+        "test: fallback offers zero tools"
+    );
+    assert!(
+        dispatches.lock().expect("test: executions").is_empty(),
+        "test: fallback executes zero tools"
+    );
+
+    if !enabled {
+        spy.assert_constructs_nothing("blank Direct input");
+    }
+}
+
+#[tokio::test]
+async fn enabled_builtin_low_confidence_run_turn_publishes_plain_answer() {
+    run_plain_fallback_cell(true, "Explain `2 + 2`.", false).await;
+}
+
+#[tokio::test]
+async fn enabled_backend_failure_run_turn_publishes_plain_answer() {
+    run_plain_fallback_cell(true, "Say hello.", true).await;
+}
+
+#[tokio::test]
+async fn disabled_blank_direct_run_turn_calls_provider_without_prediction() {
+    run_plain_fallback_cell(false, "  ", false).await;
+}

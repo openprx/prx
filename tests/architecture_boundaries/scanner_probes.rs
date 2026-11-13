@@ -818,8 +818,7 @@ fn mutation_proof_embedded_input_guard() {
     let needle = "crate::agent::turn_contracts::inbound_user_message(input)";
     let replacement = "ChatMessage::user(input)";
     assert!(source.contains(needle), "reviewed mutation site disappeared: {path}");
-    // Close-path neutralization is cfg(test); replacen(1) would only hit that
-    // site and strip_cfg_test_items would hide the mutation.
+    // The close path was deleted; mutate the remaining live delegation site.
     assert!(scanner_fails_with(
         scanner,
         vec![(path.into(), source.replace(needle, replacement))]

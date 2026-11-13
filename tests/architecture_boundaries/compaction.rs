@@ -441,8 +441,8 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
         let source_kind = classify_compaction_argument(&production, &expression, at);
         classified.push(format!("{relative}::{function}::{anchor} -> {source_kind:?}"));
     }
-    // Decision-owned windows: initial admission is production. Router
-    // readmission (`router_history_hop_inner`) is engine-on / cfg(test).
+    // Decision-owned windows retain initial admission; router readmission
+    // (`router_history_hop_inner`) was deleted.
     let relative = "src/runtime/turn_decision.rs";
     let function = "agent_budget_snapshot";
     let resolver =

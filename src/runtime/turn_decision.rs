@@ -856,6 +856,19 @@ pub(super) const fn sealed_direct_delegator(decision: &EngineDecision) -> bool {
     decision.prediction.is_none() && decision.outgoing_child.is_some()
 }
 
+// Abstention remains the accounting selection; only a gate-passed Answer may
+// supply the serving path, without tool authority.
+fn admitted_fallback_answer(decision: &EngineDecision) -> Option<&crate::causal_tree::branch::CausalCandidate> {
+    let CandidateSet::Legal { candidates, .. } = &decision.candidates else {
+        return None;
+    };
+    candidates.iter().find(|candidate| {
+        candidate.action() == CausalActionKind::Answer
+            && candidate.required_capabilities().is_empty()
+            && decision.pre_commit.outcomes.get(candidate.candidate_id()) == Some(&GateOutcome::Passed)
+    })
+}
+
 fn direct_answer_refs(
     decision: &EngineDecision,
     catalog: &CatalogView<'_>,
@@ -866,7 +879,7 @@ fn direct_answer_refs(
     let fallback_answer = matches!(
         decision.selection,
         crate::causal_tree::decision_select::Selection::Abstain {
-            action: CausalActionKind::Answer,
+            action: CausalActionKind::Answer | CausalActionKind::Clarify,
             ..
         }
     );
@@ -2449,7 +2462,21 @@ impl TurnDecisionService {
                 approval_expires_at: chrono::Utc::now(),
                 discovery_limit: 1,
             };
-            let directive = directive_from_selection(&decision, &context)?;
+            let directive = if let crate::causal_tree::decision_select::Selection::Abstain {
+                action: CausalActionKind::Clarify,
+                reason_code,
+                ..
+            } = &decision.selection
+            {
+                if admitted_fallback_answer(&decision).is_some() {
+                    tracing::warn!(reason_code = %reason_code, "decision Clarify degrades to plain answer");
+                    TurnExecutionDirective::AnswerDirectly
+                } else {
+                    directive_from_selection(&decision, &context)?
+                }
+            } else {
+                directive_from_selection(&decision, &context)?
+            };
             let prior_evidence = decision.state.evidence_fingerprint(&self.state_key);
             let mut discovery_change = None;
             let mut retrieval_progress = None;
