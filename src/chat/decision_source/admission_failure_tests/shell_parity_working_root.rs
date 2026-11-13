@@ -294,7 +294,7 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
                 )?;
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let context = publication
-                    .decide_agent_initial(
+                    .open_issued_turn_context(
                         proof.as_ref(),
                         crate::runtime::turn_decision::AgentTurnKind::Repl,
                         &cancellation,
