@@ -16,8 +16,10 @@ use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet};
 #[cfg(any(test, not(unix)))]
+use std::fs;
+use std::fs::File;
+#[cfg(any(test, not(unix)))]
 use std::fs::OpenOptions;
-use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

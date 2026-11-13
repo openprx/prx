@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub(super) enum StateDirectoryError {
     #[error("cost state directory {path} has unsafe mode {mode:#o}; run chmod 700 {path}")]
-    Mode { path: PathBuf, mode: u32 },
+    Mode { path: PathBuf, mode: rustix::fs::RawMode },
     #[error(
         "cost state directory {path} is owned by uid {owner}, expected effective uid {effective}; run chown {effective} {path} or run as the owner"
     )]

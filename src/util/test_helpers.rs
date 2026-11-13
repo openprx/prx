@@ -9,7 +9,13 @@ pub(crate) fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
     let child_flag = child_flag.to_owned();
     std::thread::spawn(move || {
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
-        let mut output = tempfile::tempfile().expect("test: child output file");
+        let directory = tempfile::tempdir().expect("test: child output directory");
+        let mut output = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("output"))
+            .expect("test: child output file");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -37,6 +43,11 @@ pub(crate) fn run_in_isolated_process(test: &str, child_flag: &str) -> bool {
         assert!(
             bytes.len() as u64 <= MAX_OUTPUT_BYTES,
             "isolated test exceeded output bound"
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("test result: ok. 1 passed;"),
+            "isolated runner must execute exactly one passing test: {}",
+            String::from_utf8_lossy(&bytes)
         );
         assert!(
             status.success(),
