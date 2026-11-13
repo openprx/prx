@@ -754,6 +754,12 @@ impl Drop for HarnessGuard {
 /// Returns the complete accumulated buffer on success. On timeout panics
 /// with the captured buffer so the failure message is actionable.
 fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Duration) -> String {
+    read_until_all_with_dsr(session, &[needle], total)
+}
+
+/// Wait for every needle in one accumulated capture, under a single deadline.
+fn read_until_all_with_dsr(session: &mut TrackedSession, needles: &[&str], total: Duration) -> String {
+    assert!(!needles.is_empty(), "test: PTY wait requires at least one needle");
     let deadline = Instant::now() + total;
     let mut accum: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
@@ -765,12 +771,18 @@ fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Durati
             Ok(0) => {
                 // EOF
                 let s = String::from_utf8_lossy(&accum).into_owned();
-                if s.contains(needle) {
+                if needles.iter().all(|needle| s.contains(needle)) {
                     return s;
                 }
+                let needle = missing_pty_needle(&s, needles);
                 panic!("PTY hit EOF before `{needle}` appeared. Captured:\n----\n{s}\n----");
             }
             Ok(n) => {
+                const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+                assert!(
+                    accum.len() + n <= MAX_CAPTURE_BYTES,
+                    "test: PTY output exceeded the capture limit while waiting for {needles:?}"
+                );
                 accum.extend_from_slice(&buf[..n]);
                 // Reply to every DSR query we've seen but not yet acked.
                 while let Some(pos) = window(&accum, DSR_QUERY) {
@@ -784,13 +796,14 @@ fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Durati
                     }
                 }
                 let view = String::from_utf8_lossy(&accum);
-                if view.contains(needle) {
+                if needles.iter().all(|needle| view.contains(needle)) {
                     return view.into_owned();
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if exited {
                     let s = String::from_utf8_lossy(&accum).into_owned();
+                    let needle = missing_pty_needle(&s, needles);
                     panic!("the chat process exited before `{needle}` appeared. Captured:\n----\n{s}\n----");
                 }
                 // No data right now: check the process is still there (one
@@ -800,17 +813,27 @@ fn read_until_with_dsr(session: &mut TrackedSession, needle: &str, total: Durati
             }
             Err(e) => {
                 let s = String::from_utf8_lossy(&accum).into_owned();
+                let needle = missing_pty_needle(&s, needles);
                 panic!("PTY read error before `{needle}`: {e}. Captured:\n----\n{s}\n----");
             }
         }
         if Instant::now() >= deadline {
             let s = String::from_utf8_lossy(&accum).into_owned();
+            let needle = missing_pty_needle(&s, needles);
             panic!(
                 "timeout waiting for `{needle}` after {total:?}. Captured ({} bytes):\n----\n{s}\n----",
                 accum.len()
             );
         }
     }
+}
+
+fn missing_pty_needle<'a>(capture: &str, needles: &[&'a str]) -> &'a str {
+    needles
+        .iter()
+        .copied()
+        .find(|needle| !capture.contains(needle))
+        .unwrap_or("<all needles present>")
 }
 
 /// Reply once per `ESC[6n` occurrence seen in `chunk`, using a cross-chunk
@@ -1006,7 +1029,7 @@ fn test_chat_banner_visible() {
     let session = sg.session();
 
     // Banner format: "prx <ver> · mock/mock" (src/chat/mod.rs:634).
-    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
     assert!(
         captured.contains("prx "),
         "banner should start with `prx `, got:\n{captured}"
@@ -1569,8 +1592,8 @@ fn test_chat_wide_characters_response_no_extra_spaces() {
     drain_with_dsr(session, Duration::from_millis(200));
 
     session.send("hi\r").expect("send hi");
-    // Wait until the first wide CJK character appears in the output.
-    let captured = read_until_with_dsr(session, "\u{ac00}", TURN_TIMEOUT);
+    // Wait for the response suffix so a partial CJK prefix cannot end the capture.
+    let captured = read_until_with_dsr(session, "PRX", TURN_TIMEOUT);
 
     // Strip ANSI escape sequences from the captured buffer so we compare
     // plain text only. The DSR reply (`ESC[1;1R`) and reedline SGR codes
@@ -1907,7 +1930,7 @@ fn test_chat_s4_a_0_ratatui_banner_visible_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
     assert!(
         captured.contains("prx "),
         "banner must start with `prx `, got:\n{captured}"
@@ -2003,7 +2026,7 @@ fn test_chat_ratatui_resume_picker_selects_saved_session() {
     );
 
     session.send("/cost\r").expect("send /cost");
-    let cost = read_until_with_dsr(session, "Turns:", TURN_TIMEOUT);
+    let cost = read_until_with_dsr(session, "Turns:        4", TURN_TIMEOUT);
     assert!(
         cost.contains("Turns:        4"),
         "selected alpha session should have four persisted turns; captured:\n{cost}"
@@ -2058,7 +2081,7 @@ fn test_chat_s4_a_6_pure_snapshot_renders_banner_via_real_path() {
     let (mut sg, _guard) = spawn_chat(&[], &[("PRX_TUI", "1")]);
     let session = sg.session();
 
-    let captured = read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    let captured = read_until_all_with_dsr(session, &["prx ", "mock/mock"], STARTUP_TIMEOUT);
     assert!(
         captured.contains("prx "),
         "banner must start with `prx `, got:\n{captured}"
@@ -2167,7 +2190,7 @@ fn test_chat_s4_a_6_pure_snapshot_wide_characters_no_extra_spaces_via_real_path(
     drain_with_dsr(session, Duration::from_millis(300));
 
     session.send("hi\r").expect("send hi");
-    let captured = read_until_with_dsr(session, "\u{ac00}", TURN_TIMEOUT);
+    let captured = read_until_with_dsr(session, "S4A6", TURN_TIMEOUT);
     // Strip ANSI escapes, then assert the wide chars are contiguous.
     let ansi_re = regex::Regex::new(r"\x1b\[[^a-zA-Z]*[a-zA-Z]").expect("ansi regex");
     let plain = ansi_re.replace_all(&captured, "").to_string();
@@ -2290,7 +2313,11 @@ fn b2_sessions_spawn_batch_fans_out_three_subtasks_via_real_path() {
     read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
 
     session.send("/sessions\r").expect("send /sessions");
-    let listed = read_until_with_dsr(session, "b2 fan-out three", TURN_TIMEOUT);
+    let listed = read_until_all_with_dsr(
+        session,
+        &["b2 fan-out one", "b2 fan-out two", "b2 fan-out three"],
+        TURN_TIMEOUT,
+    );
     for task in ["b2 fan-out one", "b2 fan-out two", "b2 fan-out three"] {
         assert!(
             listed.contains(task),
@@ -2334,7 +2361,7 @@ fn s5_release_p0_1_gemini_cancel_midstream_via_real_path() {
     std::thread::sleep(Duration::from_millis(250));
 
     session.send("/cost\r").expect("send /cost after cancellation");
-    let cancelled = read_until_with_dsr(session, "Turns:", TURN_TIMEOUT);
+    let cancelled = read_until_with_dsr(session, "Turns:        0", TURN_TIMEOUT);
     assert!(
         cancelled.contains("Turns:        0"),
         "the cancelled partial turn must not be committed as a completed user/assistant pair; captured:\n{cancelled}"

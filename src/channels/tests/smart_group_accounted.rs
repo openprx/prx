@@ -242,12 +242,20 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let clock = crate::causal_tree::logical_clock::ManualClock::new();
     if matches!(plan, ClockPlan::LogicalExpiry) {
-        clock.arm_site("auxiliary_deadline", Duration::ZERO, Duration::from_millis(600));
+        clock.arm_site("auxiliary_deadline", Duration::ZERO, Duration::from_millis(5_100));
     }
     crate::causal_tree::logical_clock::scope(clock, async move {
         let outcome = std::panic::AssertUnwindSafe(async {
             let provider = format!("custom:{endpoint}");
             let mut config = Config::default();
+            assert_eq!(
+                config.causal_tree.policy.extra_latency_budget_ms, 500,
+                "test: the production source-decision deadline must remain 500 ms"
+            );
+            // Real loopback and SQLite need the same fixture budget as Signal vision.
+            config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+            config.causal_tree.backend.timeout_ms = 5_000;
+            config.causal_tree.rehearsal.timeout_ms = 5_000;
             config.workspace_dir = workspace.path().to_owned();
             config.config_path = workspace.path().join("config.toml");
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;
@@ -341,7 +349,7 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
             message.is_group_hint = true;
 
             let turn = cleanup.scope(channel_turn(ctx.clone(), message, CancellationToken::new()));
-            tokio::time::timeout(Duration::from_secs(5), turn)
+            tokio::time::timeout(Duration::from_secs(15), turn)
                 .await
                 .expect("admitted smart-group turn must finish");
 

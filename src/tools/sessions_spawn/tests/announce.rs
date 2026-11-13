@@ -438,7 +438,7 @@ async fn a_kill_notice_to_a_denied_recipient_is_withheld_and_recorded_on_the_run
         kill.error
     );
 
-    // The awaited kill has completed notice delivery or refusal before returning.
+    // `sessions_spawn/actions.rs::execute_kill` awaits `deliver_or_withhold_notice` before returning.
     assert!(
         wacli_sent.lock().await.is_empty(),
         "a send_deny hit must stop the kill notice from reaching the channel"
