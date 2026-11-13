@@ -1246,6 +1246,8 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    // Pin confidence abstention even when the catalog makes Answer the clear winner.
+    config.causal_tree.policy.commit_threshold = 1.0;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let dispatches = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
