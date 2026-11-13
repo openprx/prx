@@ -198,8 +198,8 @@ pub struct SqliteMemory {
     recovery_key_load_sites: Arc<parking_lot::Mutex<Vec<recovery_authority::RecoveryKeyLoadSite>>>,
     #[cfg(test)]
     recovery_key_load_probe: Arc<parking_lot::Mutex<Option<recovery_authority::RecoveryKeyLoadProbe>>>,
-    /// Set once when key material is unavailable; never cleared or retried.
-    recovery_unavailable: Arc<std::sync::OnceLock<()>>,
+    /// First activation refusal when key material is unavailable; never cleared or retried.
+    recovery_unavailable: Arc<std::sync::OnceLock<String>>,
     /// The one shared, once-only "unavailable" warning for this handle.
     recovery_warned: Arc<std::sync::OnceLock<()>>,
     /// Capsule keys that failed to load. Remembered so no capsule retries them.

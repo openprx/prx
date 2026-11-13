@@ -46,6 +46,80 @@ fn key_path(memory: &SqliteMemory, id: &str) -> anyhow::Result<std::path::PathBu
 }
 
 #[test]
+fn recovery_activation_names_unsafe_ancestor() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (directory, memory) = store()?;
+    let ancestor = directory.path().canonicalize()?;
+    std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o775))?;
+    let error = memory
+        .activate_recovery_authority()
+        .expect_err("test: writable ancestor must refuse activation");
+    let owner = rustix::process::geteuid().as_raw();
+    let expected = format!(
+        "unsafe recovery ancestor {} (mode 775, owner {owner}, euid {owner}): must be owned by you or root and not group/other-writable",
+        ancestor.display()
+    );
+    assert!(
+        format!("{error:#}").contains(&expected),
+        "test: refusal must identify the unsafe ancestor and its permissions: {error:#}"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_activation_preserves_first_refusal() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (directory, memory) = store()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775))?;
+    let cloned = memory.clone();
+    let first = memory
+        .activate_recovery_authority()
+        .expect_err("test: writable ancestor must refuse activation");
+    // Repair the filesystem to prove this handle retains the original refusal.
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let second = cloned
+        .activate_recovery_authority()
+        .expect_err("test: refusal must remain sticky across clones");
+    assert!(
+        crate::memory::recovery_authority::is_key_unavailable(&second),
+        "test: sticky refusal must retain its error class"
+    );
+    assert!(
+        format!("{second:#}").contains(&format!("activation was refused earlier: {first:#}")),
+        "test: later activation must include the complete first refusal: {second:#}"
+    );
+    assert_eq!(
+        memory
+            .recovery_activation_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "test: sticky refusal must prevent another activation attempt"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_activation_names_unsafe_memory_directory() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (_directory, memory) = store()?;
+    let path = memory.db_path.parent().context("test: memory directory")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750))?;
+    let error = memory
+        .activate_recovery_authority()
+        .expect_err("test: non-private memory directory must refuse activation");
+    let owner = rustix::process::geteuid().as_raw();
+    let expected = format!(
+        "unsafe memory directory {} (mode 750, owner {owner}, euid {owner}): must be yours and 0700",
+        path.display()
+    );
+    assert!(
+        format!("{error:#}").contains(&expected),
+        "test: refusal must identify the memory directory and its permissions: {error:#}"
+    );
+    Ok(())
+}
+
+#[test]
 #[serial_test::serial(recovery_authority)]
 fn recovery_mac_bytes_are_unchanged() -> anyhow::Result<()> {
     let (_dir, memory) = store()?;
@@ -598,6 +672,10 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
         "activation retried"
     );
     let output = String::from_utf8(logs.0.lock().clone())?;
+    anyhow::ensure!(
+        output.contains("reason=") && output.contains("corrupt established recovery key"),
+        "test: warning must include the structured key refusal reason: {output}"
+    );
     anyhow::ensure!(
         output
             .matches("recovery authority unavailable; activation will not be retried")
