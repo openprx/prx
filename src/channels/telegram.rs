@@ -2731,14 +2731,20 @@ mod tests {
     /// Most request bytes the leak-test fixture reads from one connection.
     const LEAK_FIXTURE_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
-    /// A loopback origin this test owned a moment ago and nothing listens on now.
-    async fn closed_loopback_base() -> String {
+    /// A loopback origin whose listener stays owned by the returned task, which
+    /// closes every accepted connection at once. Every request therefore fails
+    /// at the transport, and no other process can take the port meanwhile.
+    async fn closing_loopback_base() -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test: bind an ephemeral loopback port");
         let addr = listener.local_addr().expect("test: read the bound loopback address");
-        drop(listener);
-        format!("http://{addr}")
+        let closer = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}"), closer)
     }
 
     /// Whether `request` holds a complete HTTP request head and declared body.
@@ -2812,14 +2818,14 @@ mod tests {
 
     #[tokio::test]
     async fn transport_errors_do_not_carry_the_bot_token() {
-        let base = closed_loopback_base().await;
+        let (base, closer) = closing_loopback_base().await;
         let ch = TelegramChannel::new(LEAK_TEST_TOKEN.into(), vec!["*".into()], false).with_api_base(&base);
         let url = ch.api_url("getUpdates");
 
         let raw = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.http_client().post(&url).send())
             .await
             .expect("test: a refused loopback connection must fail within the deadline")
-            .expect_err("test: the fixture port was closed before the request");
+            .expect_err("test: the fixture closes every connection, so the request must fail");
         assert!(
             raw.to_string().contains(LEAK_TEST_TOKEN),
             "test premise: an unstripped reqwest error names its URL, token included; \
@@ -2831,19 +2837,19 @@ mod tests {
         // health-check log lines and returned errors.
         let username_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_bot_username())
             .await
-            .expect("test: getMe against a closed port must fail within the deadline")
+            .expect("test: getMe against a closing listener must fail within the deadline")
             .expect_err("test: getMe cannot succeed without a server");
         assert_error_hides_the_token("fetch_bot_username", &username_err);
 
         let send_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.send_text_chunks("hello", "123456", None))
             .await
-            .expect("test: sendMessage against a closed port must fail within the deadline")
+            .expect("test: sendMessage against a closing listener must fail within the deadline")
             .expect_err("test: sendMessage cannot succeed without a server");
         assert_error_hides_the_token("send_text_chunks", &send_err);
 
         let poll_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.fetch_updates(0))
             .await
-            .expect("test: getUpdates against a closed port must fail within the deadline")
+            .expect("test: getUpdates against a closing listener must fail within the deadline")
             .expect_err("test: getUpdates cannot succeed without a server");
         assert_error_hides_the_token("fetch_updates", &poll_err);
         assert!(
@@ -2853,9 +2859,11 @@ mod tests {
 
         let health_err = tokio::time::timeout(LEAK_TEST_DEADLINE, ch.probe_health())
             .await
-            .expect("test: the health probe against a closed port must fail within the deadline")
+            .expect("test: the health probe against a closing listener must fail within the deadline")
             .expect_err("test: the health probe cannot succeed without a server");
         assert_error_hides_the_token("probe_health", &health_err);
+
+        closer.abort();
     }
 
     #[tokio::test]
