@@ -1029,6 +1029,16 @@ impl TurnDecisionContext {
         &self.engine
     }
 
+    pub(crate) fn is_plain_answer_abstention(&self) -> bool {
+        matches!(
+            self.engine.selection,
+            crate::causal_tree::decision_select::Selection::Abstain {
+                action: CausalActionKind::Answer | CausalActionKind::Clarify,
+                ..
+            }
+        )
+    }
+
     pub(crate) const fn directive(&self) -> &TurnExecutionDirective {
         &self.directive
     }

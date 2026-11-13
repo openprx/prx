@@ -666,6 +666,10 @@ impl TurnDecisionService {
         context: &TurnDecisionContext,
         name: &str,
     ) -> anyhow::Result<ToolSpec> {
+        anyhow::ensure!(
+            !context.is_plain_answer_abstention(),
+            "plain answer abstention has no runtime tool dependencies"
+        );
         anyhow::ensure!(proof.tool_calls_allowed(), "source configuration forbids tool calls");
         anyhow::ensure!(
             matches!(name, "transcript_history_lookup" | "stay_silent" | "skill_read"),

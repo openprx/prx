@@ -1250,10 +1250,10 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
     }
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let dispatches = Arc::new(Mutex::new(Vec::new()));
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+    let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
         name: "project_tool".into(),
         execution_order: Arc::clone(&dispatches),
-    })]);
+    }) as Box<dyn Tool>]);
     let registry = if enabled { registry } else { Arc::new(Vec::new()) };
     let admitted = AdmittedTurn::with_config(config, input, Arc::clone(&registry)).await;
     if enabled {
@@ -1294,7 +1294,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
                 scope: None,
                 mode: ChatMode::default(),
                 silent: true,
-                expose_stay_silent: false,
+                expose_stay_silent: enabled,
                 multimodal: &crate::config::MultimodalConfig::default(),
                 schedule: TurnSchedule {
                     read_only_tool_concurrency_window: 1,

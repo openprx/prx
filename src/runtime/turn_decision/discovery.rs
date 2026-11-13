@@ -152,10 +152,12 @@ impl TurnDecisionService {
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Option<ToolSpec>> {
-        if !matches!(
-            context.directive(),
-            TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
-        ) || context.execution_closed.load(Ordering::Acquire)
+        if context.is_plain_answer_abstention()
+            || !matches!(
+                context.directive(),
+                TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
+            )
+            || context.execution_closed.load(Ordering::Acquire)
             || !proof.tool_calls_allowed()
             || !self.model_can_call_tools(proof)
         {
