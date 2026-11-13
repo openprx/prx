@@ -4961,5 +4961,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "compatible_secret_url_tests.rs"]
 mod secret_url_tests;

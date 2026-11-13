@@ -972,5 +972,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "model_discovery_secret_url_tests.rs"]
 mod secret_url_tests;
