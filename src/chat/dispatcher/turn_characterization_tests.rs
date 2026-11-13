@@ -387,6 +387,7 @@ async fn run_chat_fixture(
 }
 
 pub(super) struct ChatFixtureAdmission {
+    decisions: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     pub(super) binding: Arc<crate::chat::decision_source::ChatTurnBinding>,
     pub(super) registry: Arc<Vec<Box<dyn Tool>>>,
     pub(super) service: Arc<ToolExecutionService>,
@@ -584,6 +585,7 @@ async fn admit_chat_fixture_with_mode(
     let context = crate::tools::ToolExecutionContext::new(binding.envelope().clone(), "private");
 
     ChatFixtureAdmission {
+        decisions,
         binding,
         registry,
         service,
@@ -1249,7 +1251,7 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     tokio::time::timeout(Duration::from_secs(20), async {
     let workspace = tempfile::tempdir().expect("test: chat workspace");
     let workspace = workspace.path();
-    let (actions, mut receiver) = mpsc::channel::<Action>(128);
+    let (actions, _receiver) = mpsc::channel::<Action>(128);
     let mut config = enabled_builtin_admission_config(workspace);
     config.decision_engine.enabled = true;
     config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
@@ -1273,41 +1275,31 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
         cancellation.clone(),
     )
     .await;
-    let history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
-    drive_start_turn_stream(
-        Some(admitted.binding),
-        None,
-        port,
-        history.clone(),
-        history,
-        "prx-local-model".into(),
-        0.0,
-        None,
-        cancellation,
-        "engine-off-chat".into(),
-        actions,
-        Some(admitted.registry),
-        Some(admitted.service),
-        admitted.context,
-        admitted.fabric,
-        None,
-        crate::agent::turn_contracts::ChatMode::Edit,
-        Arc::new(crate::observability::NoopObserver),
-        Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),
-    )
-    .await;
-    let mut completed = 0;
-    while let Ok(action) = receiver.try_recv() {
-        match action {
-            Action::StreamFailed { err, .. } => panic!("test: engine-off chat failed: {err}"),
-            Action::StreamCompleted { final_text, .. } => {
-                assert_eq!(final_text, "ok", "test: provider reply");
-                completed += 1;
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(completed, 1, "test: chat completed");
-    assert_eq!(provider.histories().len(), 1, "test: provider called once");
+    let context = admitted.decisions.open_issued_turn_context(admitted.binding.as_ref(), crate::runtime::turn_decision::AgentTurnKind::Repl, &cancellation).await.expect("test: interactive decision");
+    assert!(matches!(context.engine().selection, crate::causal_tree::decision_select::Selection::Abstain { action: crate::causal_tree::branch::CausalActionKind::Clarify, reason_code: "decision_failed" }), "test: actual failed backend selects interactive Clarify: {:?}", context.engine().selection);
+    let specs = admitted.decisions.agent_execution_specs(admitted.binding.as_ref(), &context).expect("test: Clarify can answer");
+    assert!(specs.specs.is_empty(), "test: degraded interactive answer offers no tools");
+    let mut history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
+    let (reply, trace) = crate::agent::turn_engine::run_turn(
+        &mut history,
+        crate::agent::turn_request::TurnRequest {
+            advice: None, channel_name: "terminal", scope: None,
+            mode: crate::agent::turn_contracts::ChatMode::Edit, silent: true,
+            expose_stay_silent: false, multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: crate::agent::turn_request::TurnSchedule { read_only_tool_concurrency_window: 1, priority_scheduling_enabled: false, low_priority_tool_names: Vec::new() },
+            compaction: None,
+            decision: crate::agent::turn_request::TurnDecision { service: &admitted.decisions, context: &context, proof: admitted.binding.as_ref() },
+        },
+        crate::agent::turn_request::TurnServices {
+            provider: port.as_ref(), provider_name: "ollama", model: "prx-local-model", temperature: 0.0,
+            tools_registry: admitted.registry, observer: &NoopObserver, hooks: &HookManager::new(workspace.to_owned()),
+            approval: None, approval_resolver: None, runtime_adapter: None,
+            memory: crate::agent::turn_request::ToolLoopMemory::none(),
+        },
+        crate::agent::turn_request::TurnDelivery { cancellation: None, on_delta: None, on_tool_call: None },
+    ).await.expect("test: interactive degraded turn completes");
+    assert_eq!(reply.into_text(), "ok", "test: serving model reply is published");
+    assert!(trace.execution_trace.as_ref().is_none_or(|trace| trace.calls.is_empty()), "test: no tools execute");
+    assert_eq!(provider.histories().len(), 1, "test: exactly one serving request");
     }).await.expect("test: interactive failure turn deadline");
 }
