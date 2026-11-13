@@ -247,6 +247,9 @@ impl CausalCandidateGenerator {
                         );
                         let admission = probe.check_one(&candidate).admission;
                         trace_rejected(&candidate, &admission, &mut generation_rejections);
+                        // Advisory: every structural exact match takes the
+                        // `Passed` arm; the outcome stays an annotation.
+                        let admission = if probe.filters() { admission } else { Admission::Passed };
                         match admission {
                             Admission::Passed if resume_target.is_none() && is_native_file_entry(entry) => {
                                 named_files.push(candidate);
@@ -283,13 +286,17 @@ impl CausalCandidateGenerator {
                         let group = native_file_group(&named_files, first.candidate_id().namespace());
                         let outcome = probe.check_one(&group).admission;
                         trace_rejected(&group, &outcome, &mut generation_rejections);
-                        selected = Some(if outcome == Admission::Passed {
+                        // Advisory: always the structural group.
+                        selected = Some(if !probe.filters() || outcome == Admission::Passed {
                             group
                         } else {
                             first.clone()
                         });
                     }
-                    if selected.is_none()
+                    // Advisory: `approval_only` is never populated, so the
+                    // unbound-approval mentions are never fed from admission.
+                    if probe.filters()
+                        && selected.is_none()
                         && approval_only_unbound
                         && let Some(candidate) = &approval_only
                     {
@@ -406,12 +413,14 @@ impl CausalCandidateGenerator {
                             probe,
                             &mut generation_rejections,
                         )? {
-                            let outcome = probe.check_one(&candidate).admission;
-                            let eligible = outcome == Admission::Passed;
+                            // Advisory: every structurally returned family
+                            // candidate is eligible and no diagnostic is pushed.
+                            let outcome = probe.filters().then(|| probe.check_one(&candidate).admission);
+                            let eligible = outcome.as_ref().is_none_or(|outcome| *outcome == Admission::Passed);
                             if eligible && discovery_anchor.is_none() {
                                 discovery_anchor = Some(candidate);
                             } else if !eligible
-                                && matches!(outcome, Admission::ApprovalOnly { .. })
+                                && matches!(outcome, Some(Admission::ApprovalOnly { .. }))
                                 && state.routing_input.supports_selected_read_query()
                             {
                                 // Preserve the exact family candidate only as an
@@ -480,7 +489,9 @@ impl CausalCandidateGenerator {
         // A duplicate id is a generator bug and is rejected by the probe.
         let initial = probe.check_all(&proposed)?;
         let mut approval_only = Vec::new();
-        for candidate in proposed.iter().filter(|_| !terminal_only) {
+        // Advisory: the initial apply only annotates; no `RequestApproval` is
+        // synthesised and `proposed` is unchanged.
+        for candidate in proposed.iter().filter(|_| !terminal_only && probe.filters()) {
             if let Some(Admission::ApprovalOnly { op_ids }) = initial.outcomes.get(candidate.candidate_id()) {
                 if state.trusted.parts().delivery.approval_channel && !op_ids.is_empty() {
                     // No current producer binds tool arguments, a Discover
@@ -518,12 +529,15 @@ impl CausalCandidateGenerator {
         for (id, outcome) in generation_rejections {
             report.outcomes.entry(id).or_insert(outcome);
         }
-        let mut legal = Vec::new();
-        for candidate in proposed {
-            if matches!(report.outcomes.get(candidate.candidate_id()), Some(Admission::Passed)) {
-                legal.push(candidate);
-            }
-        }
+        // Advisory: every proposed candidate is retained with its annotation.
+        let legal = if probe.filters() {
+            proposed
+                .into_iter()
+                .filter(|candidate| matches!(report.outcomes.get(candidate.candidate_id()), Some(Admission::Passed)))
+                .collect::<Vec<_>>()
+        } else {
+            proposed
+        };
         let nonterminal = legal.iter().any(|candidate| {
             !matches!(
                 candidate.action(),
@@ -533,6 +547,8 @@ impl CausalCandidateGenerator {
         if !nonterminal {
             // Generic supervised calls need arguments before exact OpIds can
             // be derived. CDPB-08 owns the non-executable proposal path.
+            // Advisory (`legal == proposed`): reached only for structural
+            // reasons, when nothing but terminals was proposed.
             return Ok(CandidateSet::NoLegalPath {
                 terminals: legal,
                 report,
@@ -573,7 +589,7 @@ impl CausalCandidateGenerator {
     }
 }
 
-fn select_family_candidate<'a>(
+pub(super) fn select_family_candidate<'a>(
     action: CausalActionKind,
     family: CapabilityTarget,
     entries: impl IntoIterator<Item = &'a CapabilityEntry>,
@@ -611,7 +627,10 @@ fn select_family_candidate<'a>(
         // G9 will reject a write effect under a read-only turn. This
         // transient probe cannot become Passed or ApprovalOnly, so avoid
         // constructing and pricing it during family fallback selection.
-        if state.trusted.parts().side_effect_mode == SideEffectMode::ReadOnly
+        // Advisory: no skip; the candidate is constructed and annotated
+        // with the real G9 outcome, keeping its structural priority.
+        if probe.filters()
+            && state.trusted.parts().side_effect_mode == SideEffectMode::ReadOnly
             && entry.effect > SideEffectClass::ReadOnly
         {
             continue;
@@ -619,17 +638,19 @@ fn select_family_candidate<'a>(
         // These borrowed facts can only reject a transient family probe.
         // Keep the full gates authoritative for every proposed candidate and
         // never interpret a model bitmap from a different catalog layout.
+        // Advisory: no skip; the real G2 outcome is kept as annotation.
         let trusted = state.trusted.parts();
-        if catalog.surface_excludes(entry)
-            || trusted
-                .exclusions
-                .iter()
-                .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
-            || trusted.model_admission.as_ref().is_some_and(|policy| {
-                policy.matches_layout(catalog.generation().0, catalog.model_admission_layout())
-                    && policy.excludes(catalog.model_admission_entry(entry))
-            })
-            || trusted.channel.is_some() && !entry.channel_eligible
+        if probe.filters()
+            && (catalog.surface_excludes(entry)
+                || trusted
+                    .exclusions
+                    .iter()
+                    .any(|name| name.as_ref() == entry.public_name || name.as_ref() == entry.root)
+                || trusted.model_admission.as_ref().is_some_and(|policy| {
+                    policy.matches_layout(catalog.generation().0, catalog.model_admission_layout())
+                        && policy.excludes(catalog.model_admission_entry(entry))
+                })
+                || trusted.channel.is_some() && !entry.channel_eligible)
         {
             continue;
         }
@@ -647,6 +668,9 @@ fn select_family_candidate<'a>(
         let candidate = from_entry(action, family, entry, policy, namespace);
         let outcome = probe.check_one(&candidate).admission;
         trace_rejected(&candidate, &outcome, generation_rejections);
+        // Advisory: the first structurally eligible candidate is selected
+        // under the structural rules below; `approval_only` stays unused.
+        let outcome = if probe.filters() { outcome } else { Admission::Passed };
         match outcome {
             Admission::Passed if native_file => file_members.push(candidate),
             Admission::Passed if !prefer_discovered || selected => return Ok(Some(candidate)),
@@ -664,7 +688,8 @@ fn select_family_candidate<'a>(
         let group = native_file_group(&file_members, None);
         let outcome = probe.check_one(&group).admission;
         trace_rejected(&group, &outcome, generation_rejections);
-        return Ok(Some(if outcome == Admission::Passed {
+        // Advisory: the group is always used.
+        return Ok(Some(if !probe.filters() || outcome == Admission::Passed {
             group
         } else {
             first.clone()

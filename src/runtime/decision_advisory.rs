@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::causal_tree::admission_probe::{AdmissionProbe, HardGatesProbe};
+use crate::causal_tree::admission_probe::{AdmissionProbe, AdvisoryProbe, HardGatesProbe};
 use crate::causal_tree::branch::{CandidateId, Ns8};
 use crate::causal_tree::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
@@ -366,11 +366,6 @@ impl DecisionAdvisory {
         );
         let replayed = BTreeSet::new();
         let gates = gate_inputs(&input.facts, &calls, approvals, &replayed);
-        let probe = HardGatesProbe {
-            state: &input.state,
-            catalog: &view,
-            gates: &gates,
-        };
         let observed_latency = BTreeMap::new();
         let cost_model =
             crate::runtime::turn_cost::RuntimeCostModel::new(&input.model, &self.config, &observed_latency);
@@ -384,11 +379,21 @@ impl DecisionAdvisory {
             cost_model: &cost_model,
             discovered_refs: &discovered,
         };
-        // P1-6: the execution probe filters the analysed set until 05a1; the
-        // advice never reaches execution.
-        let candidates =
-            CausalCandidateGenerator::generate(&input.state, &view, &policy, &probe as &dyn AdmissionProbe)
-                .map_err(|_| ())?;
+        // R13: the execution probe only annotates the analysed set; no
+        // admission outcome filters it, and the advice never reaches execution.
+        // The probes borrow `dyn AdmissionProbe` (not `Sync`), so they end
+        // before the prediction is awaited.
+        let candidates = {
+            let probe = HardGatesProbe {
+                state: &input.state,
+                catalog: &view,
+                gates: &gates,
+            };
+            let advisory = AdvisoryProbe {
+                inner: &probe as &dyn AdmissionProbe,
+            };
+            CausalCandidateGenerator::generate(&input.state, &view, &policy, &advisory).map_err(|_| ())?
+        };
         let keys = match &candidates {
             CandidateSet::Legal { candidates, .. } => candidates
                 .iter()

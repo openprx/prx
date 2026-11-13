@@ -397,3 +397,97 @@ fn pre_mode_status_reports_effective_cap_zero() {
     config.decision_engine.mode = DecisionMode::Both;
     assert_eq!(crate::decision_engine::status::snapshot(&config).telemetry_cap, 1000);
 }
+
+/// R13: from an `AdvisoryInput` alone (no turn service) the driver generates
+/// through `AdvisoryProbe`, so a candidate the hard gates block (a write tool
+/// in a read-only turn, G9) still reaches the `IntentAnalysis`.
+#[tokio::test]
+async fn engine_driver_generates_with_advisory_probe() {
+    use crate::tools::traits::Tool;
+    let temp = tempfile::tempdir().unwrap();
+    let config = enabled_config(temp.path());
+    let key = crate::causal_tree::state::fixtures::key();
+    let cancellation = CancellationToken::new();
+    let builtin = DecisionBackendFactory::from_config(
+        &config,
+        crate::decision::factory::FactoryDeps {
+            catalog: &crate::providers::catalog::CatalogView::from_config(&config),
+            key: Some(Arc::clone(&key)),
+            transports: &crate::decision::compatible_http::HttpDecisionTransports,
+            config_generation: 1,
+            events: Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+        },
+    )
+    .expect("test: builtin factory");
+    let advisory = DecisionAdvisory::new(Arc::clone(&config), Some(builtin));
+    let mut input = analysis_input(&config, &key, advisory.request_limits());
+    let surface = SurfacePolicy {
+        direct_names: BTreeSet::from(["file_write".into()]),
+        ..SurfacePolicy::default()
+    };
+    let security = Arc::new(crate::security::SecurityPolicy::default());
+    let registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::file_write::FileWriteTool::new(security))];
+    let catalog =
+        Arc::new(CapabilityCatalog::build(&registry, &Default::default(), &surface).expect("test: write-tool catalog"));
+    let mut trusted = input.state.trusted.parts().clone();
+    trusted.catalog_generation = *catalog.generation();
+    trusted.side_effect_mode = crate::causal_tree::state::SideEffectMode::ReadOnly;
+    trusted.channel = None;
+    trusted.exclusions.clear();
+    input.state.trusted = TrustedState::from_runtime(trusted);
+    input.catalog_generation = *catalog.generation();
+    input.catalog = catalog;
+    input.publication_policy = surface;
+
+    // The keys each probe admits into the analysed set.
+    let view = input.catalog_view();
+    let (calls, approvals) = (BTreeMap::new(), BTreeMap::new());
+    let replayed = BTreeSet::new();
+    let gates = gate_inputs(&input.facts, &calls, approvals, &replayed);
+    let probe = HardGatesProbe {
+        state: &input.state,
+        catalog: &view,
+        gates: &gates,
+    };
+    let observed_latency = BTreeMap::new();
+    let cost_model = crate::runtime::turn_cost::RuntimeCostModel::new(&input.model, &config, &observed_latency);
+    let discovered = DiscoveredRefs::empty();
+    let policy = CandidatePolicy {
+        key: &key,
+        max_candidates: usize::from(config.causal_tree.policy.max_candidates),
+        can_deliver_text: true,
+        may_delegate: false,
+        delegation_target: None,
+        cost_model: &cost_model,
+        discovered_refs: &discovered,
+    };
+    let keys = |set: CandidateSet| match set {
+        CandidateSet::Legal { candidates, .. } => candidates
+            .iter()
+            .map(|candidate| candidate.candidate_id().as_str().to_owned())
+            .collect::<BTreeSet<_>>(),
+        CandidateSet::NoLegalPath { .. } => BTreeSet::new(),
+    };
+    let execution = keys(CausalCandidateGenerator::generate(&input.state, &view, &policy, &probe).unwrap());
+    let advised = keys(
+        CausalCandidateGenerator::generate(&input.state, &view, &policy, &AdvisoryProbe { inner: &probe }).unwrap(),
+    );
+    let blocked: Vec<_> = advised.difference(&execution).cloned().collect();
+    assert!(
+        blocked.iter().any(|id| id.starts_with("use_tool-")),
+        "the read-only turn blocks the write tool: {advised:?} vs {execution:?}"
+    );
+    drop(view);
+
+    let analysis = advisory
+        .analyze(input, &cancellation)
+        .await
+        .expect("test: analysis without a turn service");
+    for id in &blocked {
+        assert!(
+            analysis.candidates.contains_key(id),
+            "blocked candidate {id} reaches the analysis: {:?}",
+            analysis.candidates.keys()
+        );
+    }
+}

@@ -3,7 +3,9 @@
 //! The generator asks an [`AdmissionProbe`] whether a structural candidate is
 //! admitted; it never reads gate inputs itself. [`HardGatesProbe`] is the
 //! execution-owned implementation over the legacy hard gates (Part 2 removes
-//! it together with `gates`).
+//! it together with `gates`). [`AdvisoryProbe`] wraps an execution probe for
+//! the advisory engine: it reports the same outcomes but `filters()` is false,
+//! so admission only annotates the analysed candidates and never removes one.
 
 use std::collections::BTreeMap;
 
@@ -53,6 +55,30 @@ pub(crate) enum GenerationError {
 pub(crate) trait AdmissionProbe {
     fn check_one(&self, candidate: &CausalCandidate) -> ProbeOutcome;
     fn check_all(&self, candidates: &[CausalCandidate]) -> Result<ProbeReport, GenerationError>;
+    /// Whether an admission outcome may exclude, close, substitute or
+    /// de-prioritise a candidate. `false` keeps every outcome as annotation.
+    fn filters(&self) -> bool;
+}
+
+/// The advisory admission: the outcomes of the wrapped execution probe, used
+/// only as annotations (`filters() == false`). The advice therefore describes
+/// the real hard-gate outcome of every structural candidate.
+pub(crate) struct AdvisoryProbe<'a> {
+    pub inner: &'a dyn AdmissionProbe,
+}
+
+impl AdmissionProbe for AdvisoryProbe<'_> {
+    fn check_one(&self, candidate: &CausalCandidate) -> ProbeOutcome {
+        self.inner.check_one(candidate)
+    }
+
+    fn check_all(&self, candidates: &[CausalCandidate]) -> Result<ProbeReport, GenerationError> {
+        self.inner.check_all(candidates)
+    }
+
+    fn filters(&self) -> bool {
+        false
+    }
 }
 
 /// The execution admission: the hard gates over one pinned state, catalog
@@ -73,6 +99,10 @@ impl AdmissionProbe for HardGatesProbe<'_, '_, '_> {
 
     fn check_all(&self, candidates: &[CausalCandidate]) -> Result<ProbeReport, GenerationError> {
         Ok(HardGates::apply(self.state, self.catalog, candidates, self.gates)?)
+    }
+
+    fn filters(&self) -> bool {
+        true
     }
 }
 
