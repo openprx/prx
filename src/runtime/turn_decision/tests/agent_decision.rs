@@ -883,134 +883,143 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
 
 #[tokio::test]
 async fn clarify_without_gate_passed_answer_is_typed_refusal() {
-    let workspace = tempfile::tempdir().expect("test workspace");
-    let mut config = crate::config::Config::default();
-    config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
-    config.workspace_dir = workspace.path().to_path_buf();
-    config.causal_tree.enabled = false;
-    let generation = crate::config::new_shared(config.clone()).pin();
-    let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
-    let proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
-        &generation,
-        "ollama",
-        "prx-local-model",
-        "Explain `2 + 2`.",
-    );
-    let mut issued = service
-        .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
-        .await
-        .expect("test: builtin admission");
-    let context = Arc::get_mut(&mut issued).expect("test: sole context owner");
-    context.engine.selection = crate::causal_tree::decision_select::Selection::Abstain {
-        action: CausalActionKind::Clarify,
-        reason_code: "decision_failed",
-    };
-    context.directive = TurnExecutionDirective::AnswerDirectly;
-    let CandidateSet::Legal { candidates, .. } = &context.engine.candidates else {
-        panic!("test: legal candidate set");
-    };
-    let answer = candidates
-        .iter()
-        .find(|candidate| candidate.action() == CausalActionKind::Answer)
-        .expect("test: real root includes Answer");
-    context.engine.pre_commit.outcomes.insert(
-        answer.candidate_id().clone(),
-        GateOutcome::Blocked {
-            gate: 1,
-            reason_code: "test_answer_blocked",
-        },
-    );
-    for no_legal_path in [false, true] {
-        if no_legal_path {
-            context.engine.candidates = CandidateSet::NoLegalPath {
-                reason: crate::causal_tree::candidate_generator::NoLegalReason::NoLegalCandidate,
-                terminals: Vec::new(),
-                approval_only: Vec::new(),
-                report: context.engine.pre_commit.clone(),
-            };
-        }
-        let error = service
-            .agent_execution_specs(&proof, context)
-            .err()
-            .expect("test: absent legal Answer cannot degrade Clarify");
-        assert!(
-            matches!(
-                error.downcast_ref::<DirectiveError>(),
-                Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
-            ),
-            "test: original typed refusal is retained: {error:#}"
-        );
-    }
-    struct NoDispatch(AtomicUsize);
-    #[async_trait::async_trait]
-    impl crate::providers::Provider for NoDispatch {
-        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("test: refused turn must not reach provider")
-        }
-    }
-    let provider = NoDispatch(AtomicUsize::new(0));
-    let mut history = vec![crate::providers::ChatMessage::user("Explain `2 + 2`.")];
-    let error = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(20),
-        crate::agent::turn_engine::run_turn(
-            &mut history,
-            crate::agent::turn_request::TurnRequest {
-                advice: None,
-                channel_name: "cli",
-                scope: None,
-                mode: crate::agent::turn_contracts::ChatMode::default(),
-                silent: true,
-                expose_stay_silent: false,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: crate::agent::turn_request::TurnSchedule {
-                    read_only_tool_concurrency_window: 1,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
+            let workspace = tempfile::tempdir().expect("test workspace");
+            let mut config = crate::config::Config::default();
+            config.decision_engine.enabled = true;
+            config.causal_tree.backend.kind =
+                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
+            config.workspace_dir = workspace.path().to_path_buf();
+            config.causal_tree.enabled = false;
+            let generation = crate::config::new_shared(config.clone()).pin();
+            let service = disabled_agent_service(&generation, &ProviderCatalogView::from_config(&config)).await;
+            let proof = crate::agent::entry::test_cli_agent_turn_proof_with_input(
+                &generation,
+                "ollama",
+                "prx-local-model",
+                "Explain `2 + 2`.",
+            );
+            let mut issued = service
+                .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
+                .await
+                .expect("test: builtin admission");
+            let context = Arc::get_mut(&mut issued).expect("test: sole context owner");
+            context.engine.selection = crate::causal_tree::decision_select::Selection::Abstain {
+                action: CausalActionKind::Clarify,
+                reason_code: "decision_failed",
+            };
+            context.directive = TurnExecutionDirective::AnswerDirectly;
+            let CandidateSet::Legal { candidates, .. } = &context.engine.candidates else {
+                panic!("test: legal candidate set");
+            };
+            let answer = candidates
+                .iter()
+                .find(|candidate| candidate.action() == CausalActionKind::Answer)
+                .expect("test: real root includes Answer");
+            context.engine.pre_commit.outcomes.insert(
+                answer.candidate_id().clone(),
+                GateOutcome::Blocked {
+                    gate: 1,
+                    reason_code: "test_answer_blocked",
                 },
-                compaction: None,
-                decision: crate::agent::turn_request::TurnDecision {
-                    service: &service,
-                    context: &issued,
-                    proof: &proof,
-                },
-            },
-            crate::agent::turn_request::TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: Arc::clone(&service.registry),
-                observer: &crate::observability::NoopObserver,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_owned()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: None,
-                memory: crate::agent::turn_request::ToolLoopMemory::none(),
-            },
-            crate::agent::turn_request::TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        ),
+            );
+            for no_legal_path in [false, true] {
+                if no_legal_path {
+                    context.engine.candidates = CandidateSet::NoLegalPath {
+                        reason: crate::causal_tree::candidate_generator::NoLegalReason::NoLegalCandidate,
+                        terminals: Vec::new(),
+                        approval_only: Vec::new(),
+                        report: context.engine.pre_commit.clone(),
+                    };
+                }
+                let error = service
+                    .agent_execution_specs(&proof, context)
+                    .err()
+                    .expect("test: absent legal Answer cannot degrade Clarify");
+                assert!(
+                    matches!(
+                        error.downcast_ref::<DirectiveError>(),
+                        Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
+                    ),
+                    "test: original typed refusal is retained: {error:#}"
+                );
+            }
+            struct NoDispatch(AtomicUsize);
+            #[async_trait::async_trait]
+            impl crate::providers::Provider for NoDispatch {
+                async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    anyhow::bail!("test: refused turn must not reach provider")
+                }
+            }
+            let provider = NoDispatch(AtomicUsize::new(0));
+            let mut history = vec![crate::providers::ChatMessage::user("Explain `2 + 2`.")];
+            let error = tokio::time::timeout(
+                Duration::from_secs(20),
+                crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+                    crate::agent::turn_engine::run_turn(
+                        &mut history,
+                        crate::agent::turn_request::TurnRequest {
+                            advice: None,
+                            channel_name: "cli",
+                            scope: None,
+                            mode: crate::agent::turn_contracts::ChatMode::default(),
+                            silent: true,
+                            expose_stay_silent: false,
+                            multimodal: &crate::config::MultimodalConfig::default(),
+                            schedule: crate::agent::turn_request::TurnSchedule {
+                                read_only_tool_concurrency_window: 1,
+                                priority_scheduling_enabled: false,
+                                low_priority_tool_names: Vec::new(),
+                            },
+                            compaction: None,
+                            decision: crate::agent::turn_request::TurnDecision {
+                                service: &service,
+                                context: &issued,
+                                proof: &proof,
+                            },
+                        },
+                        crate::agent::turn_request::TurnServices {
+                            provider: &provider,
+                            provider_name: "ollama",
+                            model: "prx-local-model",
+                            temperature: 0.0,
+                            tools_registry: Arc::clone(&service.registry),
+                            observer: &crate::observability::NoopObserver,
+                            hooks: &crate::hooks::HookManager::new(workspace.path().to_owned()),
+                            approval: None,
+                            approval_resolver: None,
+                            runtime_adapter: None,
+                            memory: crate::agent::turn_request::ToolLoopMemory::none(),
+                        },
+                        crate::agent::turn_request::TurnDelivery {
+                            cancellation: None,
+                            on_delta: None,
+                            on_tool_call: None,
+                        },
+                    )
+                }),
+            )
+            .await
+            .expect("test: refusal deadline")
+            .expect_err("test: NoLegalPath refuses before dispatch");
+            assert!(
+                matches!(
+                    error.downcast_ref::<DirectiveError>(),
+                    Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
+                ),
+                "test: run_turn retains typed refusal: {error:#}"
+            );
+            assert_eq!(
+                provider.0.load(Ordering::SeqCst),
+                0,
+                "test: no-legal-Answer dispatches zero provider requests"
+            );
+            issued.terminal_execution_trace();
+        }),
     )
     .await
-    .expect("test: refusal deadline")
-    .expect_err("test: NoLegalPath refuses before dispatch");
-    assert!(
-        matches!(
-            error.downcast_ref::<DirectiveError>(),
-            Some(DirectiveError::NonExecutableSelection { kind: "clarify" })
-        ),
-        "test: run_turn retains typed refusal: {error:#}"
-    );
-    assert_eq!(
-        provider.0.load(Ordering::SeqCst),
-        0,
-        "test: no-legal-Answer dispatches zero provider requests"
-    );
-    issued.terminal_execution_trace();
+    .expect("test: no-legal-Answer scenario deadline");
 }

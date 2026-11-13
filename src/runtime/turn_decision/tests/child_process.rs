@@ -1149,10 +1149,24 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         );
     } else {
         let answer = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly);
-        assert!(
-            service.agent_execution_specs(&proof, &context).is_err(),
-            "test: policy refusal exposes no selected executable delegation"
-        );
+        if answer {
+            let selected = service
+                .agent_execution_specs(&proof, &context)
+                .expect("test: confidence Answer remains executable without delegation");
+            assert!(
+                selected.specs.is_empty(),
+                "test: fallback Answer grants no tool schemas"
+            );
+            assert!(
+                context.execution_refs().is_empty(),
+                "test: fallback Answer grants no capability refs"
+            );
+        } else {
+            assert!(
+                service.agent_execution_specs(&proof, &context).is_err(),
+                "test: policy refusal exposes no selected executable delegation"
+            );
+        }
         assert!(service.issue_child_grant(&proof, &context).is_err());
         assert_eq!(
             match service.verified_delegation_scope(&context) {

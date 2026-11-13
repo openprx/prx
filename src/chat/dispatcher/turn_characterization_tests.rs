@@ -1248,7 +1248,7 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
 
 #[tokio::test]
 async fn enabled_interactive_backend_failure_publishes_provider_reply() {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(20), crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
     let workspace = tempfile::tempdir().expect("test: chat workspace");
     let workspace = workspace.path();
     let (actions, _receiver) = mpsc::channel::<Action>(128);
@@ -1265,7 +1265,7 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     }]));
     let port: Arc<dyn Provider> = provider.clone();
     let cancellation = CancellationToken::new();
-    let admitted = admit_chat_fixture_with_config(
+    let admitted = crate::agent::turn_tests::reachability::boxed_root_probe(|| admit_chat_fixture_with_config(
         port.clone(),
         None,
         config,
@@ -1273,14 +1273,14 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
         ("engine-off-chat", "hello"),
         actions.clone(),
         cancellation.clone(),
-    )
+    ))
     .await;
     let context = admitted.decisions.open_issued_turn_context(admitted.binding.as_ref(), crate::runtime::turn_decision::AgentTurnKind::Repl, &cancellation).await.expect("test: interactive decision");
     assert!(matches!(context.engine().selection, crate::causal_tree::decision_select::Selection::Abstain { action: crate::causal_tree::branch::CausalActionKind::Clarify, reason_code: "decision_failed" }), "test: actual failed backend selects interactive Clarify: {:?}", context.engine().selection);
     let specs = admitted.decisions.agent_execution_specs(admitted.binding.as_ref(), &context).expect("test: Clarify can answer");
     assert!(specs.specs.is_empty(), "test: degraded interactive answer offers no tools");
     let mut history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
-    let (reply, trace) = crate::agent::turn_engine::run_turn(
+    let (reply, trace) = crate::agent::turn_tests::reachability::boxed_root_probe(|| crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
             advice: None, channel_name: "terminal", scope: None,
@@ -1297,9 +1297,9 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
             memory: crate::agent::turn_request::ToolLoopMemory::none(),
         },
         crate::agent::turn_request::TurnDelivery { cancellation: None, on_delta: None, on_tool_call: None },
-    ).await.expect("test: interactive degraded turn completes");
+    )).await.expect("test: interactive degraded turn completes");
     assert_eq!(reply.into_text(), "ok", "test: serving model reply is published");
     assert!(trace.execution_trace.as_ref().is_none_or(|trace| trace.calls.is_empty()), "test: no tools execute");
     assert_eq!(provider.histories().len(), 1, "test: exactly one serving request");
-    }).await.expect("test: interactive failure turn deadline");
+    })).await.expect("test: interactive failure turn deadline");
 }

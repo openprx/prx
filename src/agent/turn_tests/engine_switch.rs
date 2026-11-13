@@ -981,7 +981,11 @@ fn engine_off_config(workspace: &std::path::Path) -> crate::config::Config {
     config
 }
 
-async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::config::Config) {
+async fn drive_agent_entry(workspace: &std::path::Path, config: crate::config::Config) {
+    drive_agent_entry_with_input(workspace, config, "hello").await;
+}
+
+async fn drive_agent_entry_with_input(workspace: &std::path::Path, mut config: crate::config::Config, input: &str) {
     config.workspace_dir = workspace.to_owned();
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: agent sqlite"));
@@ -1014,7 +1018,7 @@ async fn drive_agent_entry(workspace: &std::path::Path, mut config: crate::confi
         .build()
         .expect("test: agent entry");
     assert_eq!(
-        agent.turn("hello").await.expect("test: entry completes"),
+        agent.turn(input).await.expect("test: entry completes"),
         "ok",
         "test: real provider response"
     );
@@ -1255,7 +1259,10 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
         execution_order: Arc::clone(&dispatches),
     }) as Box<dyn Tool>]);
     let registry = if enabled { registry } else { Arc::new(Vec::new()) };
-    let admitted = AdmittedTurn::with_config(config, input, Arc::clone(&registry)).await;
+    let admitted = crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+        AdmittedTurn::with_config(config, input, Arc::clone(&registry))
+    })
+    .await;
     if enabled {
         assert!(
             matches!(
@@ -1286,43 +1293,45 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(input)];
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        run_turn(
-            &mut history,
-            TurnRequest {
-                advice: None,
-                channel_name: "wacli",
-                scope: None,
-                mode: ChatMode::default(),
-                silent: true,
-                expose_stay_silent: enabled,
-                multimodal: &crate::config::MultimodalConfig::default(),
-                schedule: TurnSchedule {
-                    read_only_tool_concurrency_window: 1,
-                    priority_scheduling_enabled: false,
-                    low_priority_tool_names: Vec::new(),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+            run_turn(
+                &mut history,
+                TurnRequest {
+                    advice: None,
+                    channel_name: "wacli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: enabled,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: TurnSchedule {
+                        read_only_tool_concurrency_window: 1,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: None,
+                    decision: admitted.decision(),
                 },
-                compaction: None,
-                decision: admitted.decision(),
-            },
-            TurnServices {
-                provider: &provider,
-                provider_name: "ollama",
-                model: "prx-local-model",
-                temperature: 0.0,
-                tools_registry: registry,
-                observer: &crate::observability::NoopObserver,
-                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                approval: None,
-                approval_resolver: None,
-                runtime_adapter: Some(admitted.adapter()),
-                memory: admitted.memory_runtime(),
-            },
-            TurnDelivery {
-                cancellation: None,
-                on_delta: None,
-                on_tool_call: None,
-            },
-        ),
+                TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: registry,
+                    observer: &crate::observability::NoopObserver,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admitted.adapter()),
+                    memory: admitted.memory_runtime(),
+                },
+                TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+        }),
     )
     .await
     .expect("test: plain turn deadline")
@@ -1349,15 +1358,47 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
 
 #[tokio::test]
 async fn enabled_builtin_low_confidence_run_turn_publishes_plain_answer() {
-    run_plain_fallback_cell(true, "Explain `2 + 2`.", false).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+            run_plain_fallback_cell(true, "Explain `2 + 2`.", false)
+        }),
+    )
+    .await
+    .expect("test: complete turn deadline");
 }
 
 #[tokio::test]
 async fn enabled_backend_failure_run_turn_publishes_plain_answer() {
-    run_plain_fallback_cell(true, "Say hello.", true).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(true, "Say hello.", true)),
+    )
+    .await
+    .expect("test: complete turn deadline");
 }
 
 #[tokio::test]
 async fn disabled_blank_direct_run_turn_calls_provider_without_prediction() {
-    run_plain_fallback_cell(false, "  ", false).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(false, "  ", false)),
+    )
+    .await
+    .expect("test: complete turn deadline");
+}
+
+#[tokio::test]
+async fn disabled_whitespace_agent_entry_is_direct_without_prediction() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
+            let workspace = tempfile::tempdir().expect("test: whitespace entry workspace");
+            let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
+            drive_agent_entry_with_input(workspace.path(), engine_off_config(workspace.path()), "  ").await;
+            spy.assert_constructs_nothing("whitespace Agent entry");
+        }),
+    )
+    .await
+    .expect("test: whitespace Agent entry deadline");
 }
