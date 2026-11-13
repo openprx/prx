@@ -245,14 +245,8 @@ impl DecisionSettlementRef {
             Arc::ptr_eq(&self.memory, &fabric.memory()),
             "decision terminal memory does not match the pinned service"
         );
-        let trusted = self
-            .context
-            .audit_hops()
-            .last()
-            .context("decision has no final hop")?
-            .state
-            .trusted
-            .parts();
+        // The pinned trusted scope captured at opening (R22), not a decision hop.
+        let trusted = &self.context.runtime().trusted;
         anyhow::ensure!(self.decision_id == self.context.decision_id(), "decision link changed");
         anyhow::ensure!(
             workspace_dir == self.workspace_dir && cost_config == &self.cost_config,
@@ -730,7 +724,7 @@ async fn finalize_turn_impl(
             workspace_dir,
             cost_config,
         )?;
-        let prepared_parameters = commit.decision.context.prepared_main_parameters();
+        let prepared_parameters = commit.decision.context.runtime().prepared_main_parameters();
         if !prepared_parameters.is_empty()
             && let Some(outcome) = commit.provider_outcome.as_mut()
         {
@@ -852,8 +846,8 @@ async fn finalize_turn_impl(
                 "workspace_id": trusted.workspace_id,
                 "source_event_id": trusted.source_event_id,
                 "catalog_generation": trusted.catalog_generation.to_hex(),
-                "model_catalog_revision": decision.context.model_catalog().map(|catalog| catalog.revision.as_str()),
-                "model_catalog_content_sha256": decision.context.model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
+                "model_catalog_revision": decision.context.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
+                "model_catalog_content_sha256": decision.context.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
                 "policy_version": trusted.policy_version,
                 "status": commit.status,
                 "scope": terminal_semantic_scope(&commit.scope),
@@ -1040,8 +1034,8 @@ async fn finalize_turn_impl(
         let payload = TurnTerminalPayload {
             terminal_id: &commit.terminal_id,
             decision_id: decision_id.as_deref(),
-            model_catalog_revision: commit.decision.context.model_catalog().map(|catalog| catalog.revision.as_str()),
-            model_catalog_content_sha256: commit.decision.context.model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
+            model_catalog_revision: commit.decision.context.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
+            model_catalog_content_sha256: commit.decision.context.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
             status: commit.status,
             history: &commit.history,
             history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
@@ -1135,7 +1129,7 @@ async fn finalize_turn_impl(
             commit.provider_outcome.as_ref(),
         );
         if !awaiting_approval {
-            commit.decision.context.retire_recursive_allowance();
+            commit.decision.context.runtime().retire_recursive_allowance();
         }
         release_skill_lifecycle(
             workspace_dir,
@@ -1540,7 +1534,7 @@ mod tests {
             .expect("test: terminal fixture admission must complete its real I/O")
             .expect("test: bind_terminal_fixture_mode fixture operation");
             if capture_parameters {
-                context.capture_main_parameters(true);
+                context.runtime().capture_main_parameters(true);
             }
 
             if enabled {

@@ -63,7 +63,7 @@ pub(super) async fn recovery_builder_repair_writes_outcome_through_passed_writer
         .scope(publish_plane_on(workspace, Arc::clone(&memory)))
         .await
         .expect("test: plane-on builder publish");
-    let recovery = service.recovery_scope();
+    let recovery = service.runtime_holder().recovery_scope();
     let store = recovery.legacy_store().expect("test: builder recovery store");
     assert_eq!(store.reader().counts().expect("test: outcomes before").outcomes, 0);
     recovery

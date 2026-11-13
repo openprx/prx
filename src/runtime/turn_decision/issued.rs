@@ -43,7 +43,7 @@ impl TurnDecisionService {
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         // Admission, including a pause before any child publication, owns the
         // original run allowance. The context lease cleans up failed issuance.
-        self.issue_recursive_allowance(proof, &context);
+        context.runtime().issue_recursive_allowance(proof);
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
         }

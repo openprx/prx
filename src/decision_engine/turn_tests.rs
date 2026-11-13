@@ -295,7 +295,7 @@ fn rendered_brief_is_bounded_redacted_deterministic() {
     );
     let brief = render::render_decision_brief(&analysis, 50, 1);
     assert_eq!(brief, render::render_decision_brief(&analysis, 50, 1));
-    assert!(crate::agent::context_budget::count_tokens(&brief) <= 50);
+    assert!(crate::tokens::count::count_tokens(&brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert!(brief.contains("question_"));
     assert_eq!(render::render_decision_brief(&analysis, 0, 0), "");
@@ -591,7 +591,7 @@ async fn pre_mode_brief_is_bounded_redacted_and_deterministic() {
     let brief = system
         .get(system.len() - expected_brief.len()..)
         .expect("pre_mode_brief_is_bounded_redacted_and_deterministic: brief suffix missing");
-    assert!(crate::agent::context_budget::count_tokens(brief) <= 50);
+    assert!(crate::tokens::count::count_tokens(brief) <= 50);
     assert!(!brief.contains("sk-test-private-credential-value"));
     assert_eq!(first.requests, second.requests);
     assert_eq!(first.dispatches, 1);

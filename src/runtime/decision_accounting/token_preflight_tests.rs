@@ -1,9 +1,8 @@
 #![cfg(test)]
 
 use super::{input_token_preflight, input_token_upper_bound};
-use crate::agent::context_budget::{
-    TokenMeasurement, TokenMeasurementSource, count_tokens_with_source, estimate_request_tokens,
-};
+use crate::agent::context_budget::estimate_request_tokens;
+use crate::tokens::count::{TokenMeasurement, TokenMeasurementSource, count_tokens_with_source};
 
 fn estimate(text: &str) -> usize {
     estimate_request_tokens(count_tokens_with_source(text), TokenMeasurement::NONE)

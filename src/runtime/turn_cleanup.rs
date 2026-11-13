@@ -156,7 +156,7 @@ impl CleanupTracker {
         state
             .prepared_stores
             .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
-        Self::retain_recovery_locked(&mut state, service.recovery_scope());
+        Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
         if service.has_decision_work() {
             state.services.push(service);
         }
@@ -173,7 +173,7 @@ impl CleanupTracker {
         state
             .prepared_stores
             .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
-        Self::retain_recovery_locked(&mut state, service.recovery_scope());
+        Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
         if service.has_decision_work() {
             state.services.push(service);
         }
@@ -188,7 +188,7 @@ impl CleanupTracker {
         state.services.retain(|retained| !Arc::ptr_eq(retained, service));
         state
             .recovery_scopes
-            .retain(|scope| !Arc::ptr_eq(scope, &service.recovery_scope()));
+            .retain(|scope| !Arc::ptr_eq(scope, &service.runtime_holder().recovery_scope()));
         Ok(ticket)
     }
 

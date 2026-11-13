@@ -301,27 +301,30 @@ impl OrdinaryChildPublication {
         )?
         .with_unproven_budget_gate();
         Ok(Arc::new(TurnDecisionService {
-            recovery: Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
-                Arc::clone(&parent.memory),
-                parent.generation.effective.workspace_dir.clone(),
-                TurnSurfaceKind::Worker,
+            runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
+                Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
+                    Arc::clone(&parent.memory),
+                    parent.generation.effective.workspace_dir.clone(),
+                    TurnSurfaceKind::Worker,
+                )),
+                Some(self.allocate_child_budget()?.1.money()),
+                None,
+                &parent.generation.effective,
+                &parent.security,
             )),
             advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
                 Arc::clone(&parent.generation.effective),
                 None,
             ),
             child_recovery: Default::default(),
-            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
             ordinary_parent: task.is_none().then(|| self.clone()),
-            ordinary_money: Some(self.allocate_child_budget()?.1.money()),
             operator_task: None,
             operator_process: None,
             ordinary_task: task,
             ordinary_process: None,
-            parent_grant: None,
             service_id: uuid::Uuid::now_v7(),
             surface: TurnSurfaceKind::Worker,
             generation: Arc::clone(&parent.generation),
@@ -578,20 +581,12 @@ impl TurnDecisionService {
             catalog: Arc::clone(&self.catalog),
             scope: execution_context.envelope.clone(),
         });
-        // Incoming child authority comes only from the authenticated source and is
-        // overwritten unconditionally, so a caller cannot carry or strip it.
-        let child_origin = proof.child_scope().is_some()
-            || proof.ordinary_task_authority_id().is_some()
-            || proof.ordinary_process_authority_id().is_some();
-        execution_context.child_scope = proof.child_scope().cloned();
-        execution_context.child_pin = child_origin.then(|| {
-            Arc::new(crate::tools::capability::child::ChildDispatchPin {
-                catalog: Arc::clone(&self.catalog),
-                key: Arc::clone(&self.state_key),
-                owner: proof.owner_id().to_owned(),
-                workspace: proof.workspace_id().to_owned(),
-            })
-        });
+        crate::runtime::child_source::turn_scope::carry_child_authority(
+            &mut execution_context,
+            proof,
+            &self.catalog,
+            &self.state_key,
+        );
         // Approval routing belongs to the ingress builder, including an explicit None.
         execution_context.owner_filesystem = context.owner_filesystem.clone();
         execution_context.set_h2_origin(proof.h2_entry_origin().cloned());
@@ -613,8 +608,9 @@ impl TurnDecisionService {
             let scope = self.verified_delegation_scope(context)?;
             let (issued, parent) = scope.gate_inputs();
             // Retain the accounting owner before the parent model can spend.
-            let allowance = self
-                .issue_recursive_allowance(proof, context)
+            let allowance = context
+                .runtime()
+                .issue_recursive_allowance(proof)
                 .context("ordinary parent budget owner missing")?;
             let authority = crate::runtime::child_source::ParentAuthority::for_run(
                 proof.run_id(),

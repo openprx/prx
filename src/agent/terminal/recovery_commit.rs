@@ -113,7 +113,7 @@ pub(super) async fn finalize_recovery_terminal(
         );
     }
 
-    let prepared_parameters = commit.decision.context.prepared_main_parameters();
+    let prepared_parameters = commit.decision.context.runtime().prepared_main_parameters();
     let redacted_usage = usage_settlement
         .as_ref()
         .map(crate::security::redaction::redact_json_structure)
@@ -277,11 +277,13 @@ pub(super) async fn finalize_recovery_terminal(
         model_catalog_revision: commit
             .decision
             .context
+            .runtime()
             .model_catalog()
             .map(|catalog| catalog.revision.as_str()),
         model_catalog_content_sha256: commit
             .decision
             .context
+            .runtime()
             .model_catalog()
             .map(crate::providers::catalog::ReleaseCatalog::content_sha256),
         status: commit.status,
@@ -576,7 +578,7 @@ pub(super) async fn finalize_recovery_terminal(
         commit.provider_outcome.as_ref(),
     );
     if !awaiting {
-        commit.decision.context.retire_recursive_allowance();
+        commit.decision.context.runtime().retire_recursive_allowance();
     }
     super::release_skill_lifecycle(
         workspace_dir,
@@ -690,8 +692,8 @@ fn claim_semantic(
             "workspace_id": trusted.workspace_id,
             "source_event_id": trusted.source_event_id,
             "catalog_generation": trusted.catalog_generation.to_hex(),
-            "model_catalog_revision": commit.decision.context.model_catalog().map(|catalog| catalog.revision.as_str()),
-            "model_catalog_content_sha256": commit.decision.context.model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
+            "model_catalog_revision": commit.decision.context.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
+            "model_catalog_content_sha256": commit.decision.context.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
             "policy_version": trusted.policy_version,
             "status": commit.status,
             "scope": terminal_semantic_scope(&commit.scope),
@@ -777,6 +779,7 @@ pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalD
         .as_ref()
         .expect("test: issued decision")
         .context
+        .runtime()
         .capture_main_parameters(true)
         .scope(async {
             crate::providers::parameter_capture::record(crate::providers::catalog::parameters::ResolvedParameters {
@@ -791,6 +794,7 @@ pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalD
         .as_ref()
         .expect("test: issued decision")
         .context
+        .runtime()
         .prepared_main_parameters();
     draft
         .provider_outcome
@@ -806,7 +810,7 @@ pub(crate) fn claim_semantic_for_test(
     recorded: bool,
     key_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
-    let prepared_parameters = commit.decision.context.prepared_main_parameters();
+    let prepared_parameters = commit.decision.context.runtime().prepared_main_parameters();
     let trace = recorded.then(|| commit.decision.context.terminal_execution_trace());
     Ok(claim_semantic(
         commit,

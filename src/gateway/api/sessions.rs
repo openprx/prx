@@ -453,7 +453,11 @@ async fn recover_console_history(
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Console terminal owner missing"))?;
                 let service = runtime.decision_slot.publish(runtime, state).await?;
-                service.recovery_scope().rejoin_terminal(terminal_id, owner).await?;
+                service
+                    .runtime_holder()
+                    .recovery_scope()
+                    .rejoin_terminal(terminal_id, owner)
+                    .await?;
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -3518,7 +3522,7 @@ mod tests {
                     "the base-window mutation must retain enough payload segments to fail"
                 );
                 assert!(
-                    crate::agent::context_budget::count_tokens(&payload) > 31_000,
+                    crate::tokens::count::count_tokens(&payload) > 31_000,
                     "the paired payload must overrun the narrow main-turn window"
                 );
                 let principal = super::super::ApiPrincipal::of_token("prx-test-token");

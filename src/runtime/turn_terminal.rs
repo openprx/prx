@@ -696,6 +696,7 @@ async fn finalize_and_rejoin(
     stage.next(super::turn_cleanup::diagnostic::StageName::TerminalRejoin);
     if recorded {
         service
+            .runtime_holder()
             .recovery_scope()
             .rejoin_terminal(&receipt.terminal_id, owner)
             .await?;

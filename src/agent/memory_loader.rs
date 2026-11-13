@@ -80,7 +80,7 @@ pub(crate) async fn load_selected_memory(
         "redacted custom retrieval context exceeds bounds"
     );
     anyhow::ensure!(
-        crate::agent::context_budget::count_tokens_with_source(&context).tokens <= 2048,
+        crate::tokens::count::count_tokens_with_source(&context).tokens <= 2048,
         "selected custom retrieval context exceeds token bounds"
     );
     anyhow::ensure!(

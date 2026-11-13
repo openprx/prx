@@ -300,8 +300,8 @@ async fn a_request_above_the_retry_share_can_use_the_existing_owner_allowance() 
     };
     let receipt = scope.begin_physical(attempt()).await?;
     let input_tokens = crate::agent::context_budget::estimate_request_tokens(
-        crate::agent::context_budget::count_tokens_with_source(std::str::from_utf8(&body)?),
-        crate::agent::context_budget::TokenMeasurement::NONE,
+        crate::tokens::count::count_tokens_with_source(std::str::from_utf8(&body)?),
+        crate::tokens::count::TokenMeasurement::NONE,
     );
     let input_tokens = u64::try_from(input_tokens)?;
     assert!(input_tokens >= budgets.tokens / 2 && input_tokens < budgets.tokens);

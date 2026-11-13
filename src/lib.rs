@@ -152,6 +152,7 @@ pub mod self_system;
 pub mod service;
 pub mod session_worker;
 pub mod skills;
+pub(crate) mod tokens;
 pub mod tools;
 pub mod tunnel;
 pub(crate) mod util;

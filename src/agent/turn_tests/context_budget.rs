@@ -21,6 +21,7 @@ use crate::agent::turn_tests::{
 use crate::memory::{Memory, SqliteMemory};
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::tokens::count::count_tokens;
 use crate::tools::Tool;
 use std::sync::Arc;
 use tempfile::TempDir;

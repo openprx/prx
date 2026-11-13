@@ -1,4 +1,4 @@
-//! The turn's physical-send accounting scope, created at opening.
+//! The turn's physical-send charging scope, created at opening.
 use super::{TurnBudgets, TurnDecisionService, TurnSourceProof, validate_agent_turn_origin};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::security::runtime_key::KeyDomain;
@@ -8,7 +8,7 @@ use std::{sync::Arc, time::Instant};
 /// bound to the source run exactly as the retired prediction hop bound it.
 /// `None` when the turn cannot be charged: an enabled plane without durable
 /// recording, an unverifiable origin, or no cleanup owner.
-pub(super) fn opening_scope(
+pub(super) fn accounting_scope(
     service: &TurnDecisionService,
     proof: &dyn TurnSourceProof,
     budgets: TurnBudgets,
@@ -29,7 +29,7 @@ pub(super) fn opening_scope(
             budgets,
             deadline,
         )
-        .with_money(service.recursive_money(proof)),
+        .with_money(service.runtime.recursive_money(proof)),
     ))
 }
 

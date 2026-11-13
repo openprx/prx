@@ -371,6 +371,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                     drain_legacy_fixture_decisions(&service).await;
                 }
                 let rejoin = service
+                    .runtime_holder()
                     .recovery_scope()
                     .rejoin_terminal("prx-first-run", source.owner_id.as_deref().unwrap())
                     .await;
@@ -993,6 +994,7 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
             memory.replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())?;
 
             let error = service
+                .runtime_holder()
                 .recovery_scope()
                 .rejoin_terminal("prx-first-run", source.owner_id.as_deref().expect("source owner"))
                 .await
@@ -1012,6 +1014,7 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
             drain.await;
             holder.join().expect("writer holder exits");
             service
+                .runtime_holder()
                 .recovery_scope()
                 .rejoin_terminal("prx-first-run", source.owner_id.as_deref().expect("source owner"))
                 .await

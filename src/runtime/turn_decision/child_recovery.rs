@@ -87,7 +87,7 @@ impl TurnDecisionService {
     ) -> anyhow::Result<ChildRecoveryReport> {
         let mut report = ChildRecoveryReport::default();
         if let Some(skipped) = child_recovery_gate(
-            &self.recovery,
+            &self.runtime.recovery_scope(),
             self.generation.effective.causal_tree.enabled,
             self.recordable,
             self.durable_key,
@@ -95,7 +95,7 @@ impl TurnDecisionService {
             return Ok(skipped);
         }
         anyhow::ensure!(
-            self.parent_grant.is_none(),
+            self.runtime.parent_grant().is_none(),
             "child repair requires the published ingress owner"
         );
         anyhow::ensure!(

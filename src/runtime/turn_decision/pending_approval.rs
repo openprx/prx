@@ -849,7 +849,7 @@ impl ApprovalRuntime for TurnDecisionService {
     }
 
     fn retire_pending(&self, record: &PendingRecord) {
-        self.recursive_allowances.retire_pending(
+        self.runtime.recursive_allowances().retire_pending(
             &record.subject.workspace_id,
             &record.subject.owner_id,
             record.subject.session_key.as_deref().unwrap_or_default(),

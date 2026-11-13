@@ -332,7 +332,7 @@ async fn run_turn_unguarded(
         event_fabric,
         request_event_scope,
     } = memory_runtime;
-    let parameter_capture = context.capture_main_parameters(event_fabric.is_some());
+    let parameter_capture = context.runtime().capture_main_parameters(event_fabric.is_some());
     let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
         build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
             scope: scope_ctx,

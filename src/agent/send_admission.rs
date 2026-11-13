@@ -52,7 +52,7 @@ impl Drop for HookReset {
 
 /// Live remaining G6 tokens of one turn. Shared by send and dispatch admission.
 pub(crate) fn live_g6_tokens(context: &TurnDecisionContext) -> u64 {
-    context.remaining_g6_tokens().min(send_token_cap())
+    context.runtime().remaining_g6_tokens().min(send_token_cap())
 }
 
 #[cfg(test)]
@@ -78,6 +78,7 @@ pub(crate) fn call_token_budget(
         .send_limits(proof)
         .context("called-tool budget cannot be established")?;
     let spend = service
+        .runtime_holder()
         .spend_ceiling(proof)
         .context("called-tool spend ceiling cannot be established")?;
     let context = Arc::clone(context);

@@ -20,11 +20,10 @@ pub(crate) mod evidence_fixture;
 #[cfg(test)]
 pub(crate) mod selected_loader_fixture;
 
-mod accounting;
 mod auxiliary;
 mod build_error;
 mod issued;
-mod request_parameters;
+mod opening;
 mod store_preparation;
 
 pub(crate) use build_error::TurnServiceBuildError;
@@ -38,7 +37,6 @@ mod delegation;
 mod discovery;
 use super::child_source::recursive_allowance;
 mod execution;
-mod recursive_budget;
 pub(super) mod segment_observation;
 pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, OrdinaryProcessLaunch};
 mod owner_filesystem;
@@ -141,20 +139,19 @@ impl ChildExecutionPolicy {
 }
 
 pub(crate) struct TurnDecisionService {
-    recovery: Arc<super::ingress_recovery::RecoveryScope>,
+    /// Publication-scoped runtime holder (recovery, recursive allowances,
+    /// child funding, spend inputs) shared with every opened turn.
+    runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
     advisory: crate::runtime::decision_advisory::DecisionAdvisory,
     child_recovery: child_recovery::ChildRecoveryState,
-    recursive_allowances: recursive_allowance::RunAllowances,
     memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
     loop_runtime: Option<TurnLoopRuntime>,
     publication_policy: SurfacePolicy,
     ordinary_parent: Option<OrdinaryChildPublication>,
-    ordinary_money: Option<Arc<std::sync::atomic::AtomicU64>>,
     operator_task: Option<Arc<super::operator_spawn::task::OperatorTaskAuthority>>,
     operator_process: Option<Arc<super::child_source::operator_process::OperatorProcessAuthority>>,
     ordinary_task: Option<Arc<super::child_source::ordinary_task::OrdinaryTaskAuthority>>,
     ordinary_process: Option<Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>>,
-    parent_grant: Option<Arc<super::child_source::IssuedChildGrant>>,
     service_id: uuid::Uuid,
     surface: TurnSurfaceKind,
     generation: Arc<ConfigGeneration>,
@@ -313,7 +310,7 @@ impl TurnDecisionService {
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
         let decision_drained = self.drain_decision_work(deadline).await;
-        self.recovery.drain(deadline).await && decision_drained
+        self.runtime.recovery_scope().drain(deadline).await && decision_drained
     }
 }
 
@@ -544,17 +541,13 @@ pub(crate) enum AgentTurnKind {
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
     _event_memory: Arc<super::causal_events::routes::EventMemory>,
-    model_catalog: Option<Arc<crate::providers::catalog::ReleaseCatalog>>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
-    accounting: Option<Arc<crate::runtime::decision_accounting::AccountingScope>>,
     resume: Option<Arc<pending_approval::AdmittedDecisionResume>>,
     /// The execution-owned runtime context of this turn (R60).
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     source_actor: (Arc<str>, Arc<str>),
     service_id: uuid::Uuid,
     record_admitted: AtomicBool,
-    recursive_allowance: std::sync::OnceLock<recursive_allowance::ContextAllowance>,
-    main_parameters: std::sync::OnceLock<crate::providers::parameter_capture::Capture>,
     execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     execution_closed: Arc<AtomicBool>,
 
@@ -959,17 +952,8 @@ pub(crate) enum AgentRetrievalError {
 
 impl TurnDecisionContext {
     /// The execution-owned runtime context of this turn.
-    pub(crate) fn runtime(&self) -> &crate::runtime::turn_context::TurnRuntimeContext {
+    pub(crate) fn runtime(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeContext> {
         &self.runtime
-    }
-
-    /// Remaining G6 tokens: the decision slice after every narrowing the engine
-    /// and the live decision-attempt accounting have already applied.
-    pub(crate) fn remaining_g6_tokens(&self) -> u64 {
-        let trusted = self.engine.state.trusted.parts().budgets.tokens;
-        self.accounting
-            .as_ref()
-            .map_or(trusted, |scope| trusted.min(scope.remaining_budgets().tokens))
     }
 }
 
@@ -1059,7 +1043,7 @@ impl TurnDecisionService {
             Arc::clone(&self.memory),
             SettlementIssueToken(()),
         )
-        .with_parent_grant(self.parent_grant.clone())
+        .with_parent_grant(self.runtime.parent_grant().cloned())
         .with_operator_parent(
             self.operator_task
                 .as_ref()
@@ -1072,9 +1056,9 @@ impl TurnDecisionService {
         ))
     }
 
-    /// Recovery retains its own pins and queues independently of this service.
-    pub(crate) fn recovery_scope(&self) -> Arc<super::ingress_recovery::RecoveryScope> {
-        Arc::clone(&self.recovery)
+    /// The publication-scoped runtime holder shared with every opened turn.
+    pub(crate) const fn runtime_holder(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeHolder> {
+        &self.runtime
     }
 
     pub(super) fn has_decision_work(&self) -> bool {
@@ -1090,7 +1074,10 @@ impl TurnDecisionService {
 
     #[cfg(test)]
     pub(crate) async fn rejoin_terminal(&self, terminal_id: &str, owner_id: &str) -> anyhow::Result<Enqueue> {
-        self.recovery_scope().rejoin_terminal(terminal_id, owner_id).await
+        self.runtime
+            .recovery_scope()
+            .rejoin_terminal(terminal_id, owner_id)
+            .await
     }
 
     /// Inspect the attached generation without probing a backend or opening
@@ -1327,7 +1314,7 @@ impl TurnDecisionService {
         });
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
-        let accounting = accounting::opening_scope(self, proof, budgets, deadline);
+        let accounting = opening::accounting_scope(self, proof, budgets, deadline);
         let resume = resume.map(Arc::new);
         let runtime = Arc::new(crate::runtime::turn_context::TurnRuntimeContext {
             decision_id,
@@ -1337,7 +1324,7 @@ impl TurnDecisionService {
             has_conversation_history: proof.has_conversation_history(),
             observed,
             budgets,
-            accounting: accounting.clone(),
+            accounting,
             send_limits: limits,
             catalog: Arc::clone(&self.catalog),
             publication_policy: self.publication_policy.clone(),
@@ -1346,19 +1333,19 @@ impl TurnDecisionService {
             resume: resume.clone(),
             resume_evidence: resume_evidence.map(Arc::new),
             state_key: Arc::clone(&self.state_key),
+            holder: Arc::clone(&self.runtime),
+            model_catalog: self.provider_catalog.release_pin(),
+            main_parameters: std::sync::OnceLock::new(),
+            recursive_allowance: self.runtime.recursive_allowances().retain(proof),
         });
         Ok(Arc::new(TurnDecisionContext {
             _event_memory: event_memory,
-            model_catalog: self.provider_catalog.release_pin(),
             runtime,
             resume,
-            accounting,
             owner_filesystem,
             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
             service_id: self.service_id,
             record_admitted: AtomicBool::new(false),
-            recursive_allowance: self.recursive_allowances.retain(proof),
-            main_parameters: Default::default(),
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
             collected_approval_result: std::sync::OnceLock::new(),
@@ -1389,7 +1376,11 @@ impl TurnDecisionService {
             .effective
             .sessions_spawn
             .allow_recursive_delegation
-            .then(|| self.recursive_allowances.inherit_resume(proof, admitted.original_run()));
+            .then(|| {
+                self.runtime
+                    .recursive_allowances()
+                    .inherit_resume(proof, admitted.original_run())
+            });
         let opened = self
             .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
             .await?;
@@ -1411,6 +1402,7 @@ impl TurnDecisionService {
             DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
         let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
         let remaining = self
+            .runtime
             .spend_ceiling(proof)?
             .live()
             .map_err(AgentDecisionBudgetError::Spend)?;
@@ -1467,12 +1459,12 @@ impl TurnDecisionService {
     }
 
     fn child_scope(&self) -> Option<&Arc<crate::tools::capability::child::VerifiedChildScope>> {
-        self.parent_grant
-            .as_ref()
-            .map(|grant| grant.scope())
-            .or_else(|| self.ordinary_parent.as_ref().map(OrdinaryChildPublication::scope))
-            .or_else(|| self.ordinary_task.as_ref().map(|task| task.publication().scope()))
-            .or_else(|| self.ordinary_process.as_ref().map(|process| &process.snapshots().scope))
+        crate::runtime::child_source::turn_scope::issued_child_scope(
+            self.runtime.parent_grant().map(AsRef::as_ref),
+            self.ordinary_parent.as_ref(),
+            self.ordinary_task.as_deref(),
+            self.ordinary_process.as_deref(),
+        )
     }
 
     pub(crate) fn resolve_agent_model(&self, proof: &dyn TurnSourceProof) -> Result<ResolvedModel, TurnModelError> {
@@ -1668,20 +1660,23 @@ pub(crate) async fn build_turn_decision_service(
         || Arc::clone(&build.events),
         |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
     );
-    let recovery = super::ingress_recovery::RecoveryScope::prepare(
+    let runtime = crate::runtime::turn_context::TurnRuntimeHolder::prepare(
         &build.generation,
         Arc::clone(&build.memory),
         surface,
-        build.parent_grant.as_deref(),
-        &recovery_owner,
-        workspace_key.clone(),
-        match &opened {
-            Some((store, events)) => {
-                super::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))
-                    .map_err(TurnServiceBuildError::RecoveryPreparation)?
-            }
-            None => super::ingress_recovery::PreparedAdvisory::default(),
+        build.parent_grant.clone(),
+        crate::runtime::turn_context::RecoveryPreparation {
+            owner: recovery_owner,
+            workspace_key: workspace_key.clone(),
+            advisory: match &opened {
+                Some((store, events)) => {
+                    super::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))
+                        .map_err(TurnServiceBuildError::RecoveryPreparation)?
+                }
+                None => super::ingress_recovery::PreparedAdvisory::default(),
+            },
         },
+        &build.security,
     )
     .await
     .map_err(TurnServiceBuildError::RecoveryPreparation)?;
@@ -1740,23 +1735,20 @@ pub(crate) async fn build_turn_decision_service(
     };
     let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
-        recovery,
+        runtime: Arc::new(runtime),
         advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
             Arc::clone(&build.generation.effective),
             advisory_factory,
         ),
         child_recovery: Default::default(),
-        recursive_allowances: Default::default(),
         memory_loader: None,
         loop_runtime: None,
         publication_policy: build.surface_policy,
         ordinary_parent: None,
-        ordinary_money: None,
         operator_task: None,
         operator_process: None,
         ordinary_task: None,
         ordinary_process: None,
-        parent_grant: build.parent_grant,
         service_id: uuid::Uuid::now_v7(),
         surface,
         generation: build.generation,

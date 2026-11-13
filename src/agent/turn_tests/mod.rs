@@ -484,11 +484,8 @@ pub(super) fn context_budget_fixture_history(target_tokens: usize) -> Vec<ChatMe
         let message = ChatMessage::user(format!("turn {index} {}", "measured context ".repeat(40)));
         let added = estimate_history_tokens_with_source(std::slice::from_ref(&message));
         measurement.tokens = measurement.tokens.saturating_add(added.tokens);
-        if matches!(
-            added.source,
-            crate::agent::context_budget::TokenMeasurementSource::Heuristic
-        ) {
-            measurement.source = crate::agent::context_budget::TokenMeasurementSource::Heuristic;
+        if matches!(added.source, crate::tokens::count::TokenMeasurementSource::Heuristic) {
+            measurement.source = crate::tokens::count::TokenMeasurementSource::Heuristic;
         }
         history.push(message);
         index = index.saturating_add(1);

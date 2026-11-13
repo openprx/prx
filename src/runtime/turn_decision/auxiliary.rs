@@ -3,6 +3,7 @@ use super::{TurnDecisionContext, TurnDecisionService, TurnSourceProof};
 use crate::providers::catalog::ResolvedModel;
 use crate::providers::catalog::{Requirement, UnknownPolicy};
 use crate::runtime::auxiliary_call::{AuxiliaryAccounting, AuxiliaryPurpose};
+use crate::runtime::child_source::recursive_allowance::RecursiveAllowance;
 use std::sync::Arc;
 
 impl TurnDecisionService {
@@ -159,7 +160,7 @@ impl TurnDecisionService {
         );
         let cleanup = crate::runtime::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("auxiliary call has no cleanup owner"))?;
-        let scope = context.accounting.as_ref().map_or_else(
+        let scope = context.runtime().accounting.as_ref().map_or_else(
             || {
                 let scope_id = self.state_key.hmac(
                     crate::security::runtime_key::KeyDomain::TerminalClaim,
@@ -184,10 +185,10 @@ impl TurnDecisionService {
                     )
                     .with_money(
                         context
-                            .recursive_allowance
-                            .get()
-                            .and_then(|owner| owner.funded_money())
-                            .or_else(|| self.recursive_money(proof)),
+                            .runtime()
+                            .recursive_allowance()
+                            .and_then(RecursiveAllowance::funded_money)
+                            .or_else(|| self.runtime.recursive_money(proof)),
                     ),
                 )
             },

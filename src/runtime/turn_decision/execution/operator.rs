@@ -194,27 +194,30 @@ impl OperatorChildPublication {
             },
         )?;
         let service = Arc::new(TurnDecisionService {
-            recovery: Arc::new(crate::runtime::ingress_recovery::RecoveryScope {
-                surface: TurnSurfaceKind::Worker,
-                parent_authority_id: None,
-                ..parent.recovery.as_ref().clone()
-            }),
+            runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
+                Arc::new(crate::runtime::ingress_recovery::RecoveryScope {
+                    surface: TurnSurfaceKind::Worker,
+                    parent_authority_id: None,
+                    ..parent.runtime.recovery_scope().as_ref().clone()
+                }),
+                Some(task.allowance().money()),
+                None,
+                &parent.generation.effective,
+                &parent.security,
+            )),
             advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
                 Arc::clone(&parent.generation.effective),
                 None,
             ),
             child_recovery: Default::default(),
-            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
             operator_task: Some(Arc::clone(&task)),
             operator_process: None,
             ordinary_parent: None,
-            ordinary_money: Some(task.allowance().money()),
             ordinary_task: None,
             ordinary_process: None,
-            parent_grant: None,
             service_id: uuid::Uuid::now_v7(),
             surface: TurnSurfaceKind::Worker,
             generation: Arc::clone(&parent.generation),

@@ -818,6 +818,7 @@ impl ChatTurnBinding {
             if self.settlement_ref(terminal_id)?.is_some_and(|link| link.is_recorded()) {
                 decided
                     .service
+                    .runtime_holder()
                     .recovery_scope()
                     .rejoin_terminal(terminal_id, &self.owner_id)
                     .await?;

@@ -1,5 +1,5 @@
 #![cfg(test)]
-use crate::agent::context_budget::token_timing::TokenTiming;
+use crate::tokens::count::token_timing::TokenTiming;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;

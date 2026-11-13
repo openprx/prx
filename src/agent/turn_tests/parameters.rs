@@ -90,7 +90,7 @@ async fn admitted_turn_retains_the_actual_serialized_parameters() {
     assert_eq!(body.pointer("/options/temperature").unwrap().clone(), 2.0);
     assert_eq!(trace.prepared_parameters.len(), 1);
     assert_eq!(
-        admission.decision().context.prepared_main_parameters(),
+        admission.decision().context.runtime().prepared_main_parameters(),
         trace.prepared_parameters,
         "the actual engine request must also be retained by its issued terminal owner"
     );
@@ -146,7 +146,7 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
                 crate::agent::turn_tests::admission::registry_with_search(Vec::new()),
                 Arc::clone(&memory), ("ollama", "llama3.2"),
             ).await;
-            let capture = admission.decision().context.capture_main_parameters(true);
+            let capture = admission.decision().context.runtime().capture_main_parameters(true);
             let body = json!({"model":"llama3.2","messages":[{"role":"user","content":"prx prepared request"}],"options":{"temperature":3.0}});
             let mut encoded = None;
             {
@@ -159,7 +159,7 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
                 // No transport or successful provider response is fabricated.
             }
             drop(capture);
-            let prepared = admission.decision().context.prepared_main_parameters();
+            let prepared = admission.decision().context.runtime().prepared_main_parameters();
             let runtime = admission.memory_runtime();
             let fabric = runtime.event_fabric.unwrap();
             let scope = runtime.request_event_scope.unwrap();
@@ -176,7 +176,7 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             let receipt = crate::agent::terminal::finalize_turn(&fabric, draft, &cost, workspace.path()).await?;
             let rejoined = decision
                 .service
-                .recovery_scope()
+                .runtime_holder().recovery_scope()
                 .rejoin_terminal(&receipt.terminal_id, receipt.terminal_event.owner_id.as_deref().unwrap())
                 .await?;
             let events = memory.list_message_events_since(&admission.principal(), 0, 100).await?;

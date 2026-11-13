@@ -10,6 +10,7 @@ pub(crate) mod operator_process_input;
 pub(crate) mod ordinary_process;
 pub(crate) mod ordinary_task;
 pub(crate) mod parent;
+pub(crate) mod turn_scope;
 
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEvent, MessageEventScope, MessageEventSource};
 use anyhow::Context;

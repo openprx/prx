@@ -386,7 +386,13 @@ async fn disabled_terminal_validates_source_without_decision_store_writes() {
     assert!(!fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
     assert!(!fixture.workspace.path().join("self/causal_tree/decisions.db").exists());
     // Plane off still enables recovery when recording and sqlite authority are ready.
-    assert!(fixture.service.recovery_scope().ingress_recovery_enabled());
+    assert!(
+        fixture
+            .service
+            .runtime_holder()
+            .recovery_scope()
+            .ingress_recovery_enabled()
+    );
     fixture.assert_no_outcome().await;
 }
 

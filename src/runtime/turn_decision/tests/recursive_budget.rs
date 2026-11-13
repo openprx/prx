@@ -196,7 +196,8 @@ async fn authenticated_resume_without_original_allowance_cannot_mint_a_child_slo
     );
     let resumed = turn
         .service
-        .recursive_allowances
+        .runtime_holder()
+        .recursive_allowances()
         .inherit_resume(turn.proof, "prx_missing_original_run");
     assert!(
         resumed.funded_money().is_none(),

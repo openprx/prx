@@ -241,29 +241,32 @@ impl TurnDecisionService {
         .with_unproven_budget_gate();
         let store = CausalDecisionStore::open_unshared_read_only(&config.workspace_dir);
         let service = Arc::new(Self {
-            recovery: Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
-                Arc::clone(&build.memory),
-                config.workspace_dir.clone(),
-                TurnSurfaceKind::Worker,
+            runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
+                Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
+                    Arc::clone(&build.memory),
+                    config.workspace_dir.clone(),
+                    TurnSurfaceKind::Worker,
+                )),
+                Some(Arc::new(std::sync::atomic::AtomicU64::new(
+                    u64::from(child.authority.max_cost_cents) * 10_000,
+                ))),
+                None,
+                &snapshots.generation.effective,
+                &build.security,
             )),
             advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
                 Arc::clone(&snapshots.generation.effective),
                 None,
             ),
             child_recovery: Default::default(),
-            recursive_allowances: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: build.surface_policy,
             ordinary_parent: None,
-            ordinary_money: Some(Arc::new(std::sync::atomic::AtomicU64::new(
-                u64::from(child.authority.max_cost_cents) * 10_000,
-            ))),
             operator_task: None,
             operator_process: None,
             ordinary_task: None,
             ordinary_process: Some(Arc::clone(&authority)),
-            parent_grant: None,
             service_id: uuid::Uuid::now_v7(),
             surface: TurnSurfaceKind::Worker,
             generation: Arc::clone(&snapshots.generation),

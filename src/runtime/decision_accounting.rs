@@ -35,7 +35,7 @@ mod cl100k_prefix_bound;
 /// Initialize local CPU-heavy accounting tables at runtime construction,
 /// before a source starts its fixed admission clock.
 pub(crate) fn initialize_tokenizers() {
-    let _ = crate::agent::context_budget::count_tokens_with_source("");
+    let _ = crate::tokens::count::count_tokens_with_source("");
     cl100k_prefix_bound::initialize();
 }
 
@@ -395,7 +395,7 @@ impl AccountingScope {
                     #[cfg(test)]
                     let token_timing = diagnostic_timing
                         .as_ref()
-                        .map(|_| crate::agent::context_budget::token_timing::Scope::new());
+                        .map(|_| crate::tokens::count::token_timing::Scope::new());
                     let allowance = preparation_remaining
                         .tokens
                         .load(Ordering::Acquire)
@@ -904,7 +904,8 @@ mod transport_tests;
 // span; the fallback uses the existing scaled character heuristic. Keep the
 // full serialized body. An inconclusive upper bound MUST run the old proxy.
 fn input_token_upper_bound(text: &str) -> usize {
-    use crate::agent::context_budget::{TokenMeasurement, TokenMeasurementSource, estimate_request_tokens};
+    use crate::agent::context_budget::estimate_request_tokens;
+    use crate::tokens::count::{TokenMeasurement, TokenMeasurementSource};
     text.len().max(estimate_request_tokens(
         TokenMeasurement {
             tokens: text.chars().count().div_ceil(4),
@@ -980,11 +981,8 @@ fn input_token_preflight(
 }
 
 fn estimate_input_tokens(text: &str) -> usize {
-    let measured = crate::agent::context_budget::count_tokens_with_source(text);
-    crate::agent::context_budget::estimate_request_tokens(
-        measured,
-        crate::agent::context_budget::TokenMeasurement::NONE,
-    )
+    let measured = crate::tokens::count::count_tokens_with_source(text);
+    crate::agent::context_budget::estimate_request_tokens(measured, crate::tokens::count::TokenMeasurement::NONE)
 }
 
 /// Request-local preparation carries no token, money, or send authority.

@@ -54,14 +54,14 @@ fn write_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeToolPayloadMeasurement {
     pub bytes: usize,
-    pub measurement: crate::agent::context_budget::TokenMeasurement,
+    pub measurement: crate::tokens::count::TokenMeasurement,
 }
 
 impl NativeToolPayloadMeasurement {
     /// A request that publishes no native tool schema at all.
     pub(crate) const NONE: Self = Self {
         bytes: 0,
-        measurement: crate::agent::context_budget::TokenMeasurement::NONE,
+        measurement: crate::tokens::count::TokenMeasurement::NONE,
     };
 }
 
@@ -109,7 +109,7 @@ pub(crate) fn measure_native_tool_payload_for(
     // Array punctuation: two brackets plus one separator between entries.
     let mut bytes = tool_specs.len().saturating_add(1);
     let mut tokens = 0usize;
-    let mut source = crate::agent::context_budget::TokenMeasurementSource::Cl100kProxy;
+    let mut source = crate::tokens::count::TokenMeasurementSource::Cl100kProxy;
     for spec in tool_specs {
         let parameters = dialect
             .wire_schema(&spec.name, &spec.parameters)
@@ -130,19 +130,16 @@ pub(crate) fn measure_native_tool_payload_for(
             continue;
         };
         bytes = bytes.saturating_add(serialized.len());
-        let measured = crate::agent::context_budget::count_tokens_with_source(&serialized);
-        if matches!(
-            measured.source,
-            crate::agent::context_budget::TokenMeasurementSource::Heuristic
-        ) {
-            source = crate::agent::context_budget::TokenMeasurementSource::Heuristic;
+        let measured = crate::tokens::count::count_tokens_with_source(&serialized);
+        if matches!(measured.source, crate::tokens::count::TokenMeasurementSource::Heuristic) {
+            source = crate::tokens::count::TokenMeasurementSource::Heuristic;
         }
         tokens = tokens.saturating_add(measured.tokens);
     }
 
     NativeToolPayloadMeasurement {
         bytes,
-        measurement: crate::agent::context_budget::TokenMeasurement { tokens, source },
+        measurement: crate::tokens::count::TokenMeasurement { tokens, source },
     }
 }
 
@@ -159,14 +156,14 @@ pub(crate) fn measure_native_tool_payload_for(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RequestToolMeasurement {
     pub native_payload: NativeToolPayloadMeasurement,
-    pub instructions: crate::agent::context_budget::TokenMeasurement,
+    pub instructions: crate::tokens::count::TokenMeasurement,
 }
 
 impl RequestToolMeasurement {
     /// A request that publishes no tool at all.
     pub(crate) const NONE: Self = Self {
         native_payload: NativeToolPayloadMeasurement::NONE,
-        instructions: crate::agent::context_budget::TokenMeasurement::NONE,
+        instructions: crate::tokens::count::TokenMeasurement::NONE,
     };
 }
 
@@ -206,9 +203,9 @@ pub(crate) fn measure_request_tool_surface_for(
     };
     let rendered = render_tool_instructions(native_tools, tool_specs);
     let instructions = if rendered.is_empty() {
-        crate::agent::context_budget::TokenMeasurement::NONE
+        crate::tokens::count::TokenMeasurement::NONE
     } else {
-        crate::agent::context_budget::count_tokens_with_source(&rendered)
+        crate::tokens::count::count_tokens_with_source(&rendered)
     };
     RequestToolMeasurement {
         native_payload,

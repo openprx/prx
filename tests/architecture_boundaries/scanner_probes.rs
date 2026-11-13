@@ -20,7 +20,9 @@ use super::decision_backend::{
     only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend,
     the_decision_store_database_is_opened_only_by_the_store,
 };
-use super::decision_engine::shared_types_are_not_engine_owned;
+use super::decision_engine::{
+    decision_engine_never_imports_agent_or_tool_execution, shared_types_are_not_engine_owned,
+};
 use super::decision_seals::{
     decision_compiler_uses_typed_ids_and_only_redacted_state, only_reviewed_production_sites_seal_decision_requests,
     trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
@@ -738,6 +740,30 @@ planted_violation_probes! {
     probe_neutral_home_groups_engine_import: shared_types_are_not_engine_owned,
         "src/config/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "use crate::{decision_engine::render, tools};\n";
+    probe_engine_imports_agent: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::agent::context_budget::estimate_history_tokens;\n";
+    probe_engine_imports_chat: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn d0_planted_chat() { let _ = crate::chat::binding::ChatTurnBinding::new; }\n";
+    probe_engine_imports_channels: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::{channels::traits::Channel, tools};\n";
+    probe_engine_imports_gateway: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_gateway() -> usize { crate::gateway::MAX_BODY_SIZE }\n";
+    probe_engine_imports_runtime: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use super::super::runtime::turn_context::TurnRuntimeContext;\n";
+    probe_engine_imports_tools_execution: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::tools::{capability::catalog::CatalogView, execution::ToolExecutionService};\n";
+    probe_engine_imports_tools_sessions_spawn: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::tools::sessions_spawn::SessionsSpawnTool as Spawn;\n";
+    probe_engine_imports_tools_delegate: decision_engine_never_imports_agent_or_tool_execution,
+        "src/decision_engine/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn d0_planted_delegate() { let _ = crate::tools::delegate::DelegateTool::new; }\n";
     probe_causal_policy_assignment: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_threshold(config: &mut Config) {\n    config.causal_tree.policy.commit_threshold = 0.1;\n}\n";

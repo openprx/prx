@@ -1437,8 +1437,8 @@ pub(crate) async fn recovery_ready(recovery: Arc<RecoveryScope>) -> anyhow::Resu
 /// Called after real publication and again before source-bound admission, so a
 /// cold startup can consume final evidence that pre-proof reception could not.
 pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
-    recovery_ready(service.recovery_scope()).await?;
-    if !service.recovery_scope().ingress_recovery_enabled() {
+    recovery_ready(service.runtime_holder().recovery_scope()).await?;
+    if !service.runtime_holder().recovery_scope().ingress_recovery_enabled() {
         return Ok(());
     }
     let active = {
@@ -1451,10 +1451,11 @@ pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionSe
         let Some((scope, surface)) = recorder.source.get() else {
             continue;
         };
-        if service
-            .recovery_scope()
-            .accepts_ingress_recovery(&recorder.memory, &scope.workspace_id, *surface)
-        {
+        if service.runtime_holder().recovery_scope().accepts_ingress_recovery(
+            &recorder.memory,
+            &scope.workspace_id,
+            *surface,
+        ) {
             let service = {
                 let mut registry = services().lock();
                 registry.retain(|item| item.strong_count() > 0);
@@ -1508,7 +1509,7 @@ fn services() -> &'static parking_lot::Mutex<Vec<std::sync::Weak<super::turn_dec
     SERVICES.get_or_init(Default::default)
 }
 pub(crate) fn register_service(service: &Arc<super::turn_decision::TurnDecisionService>) -> anyhow::Result<()> {
-    if !service.recovery_scope().ingress_recovery_enabled() {
+    if !service.runtime_holder().recovery_scope().ingress_recovery_enabled() {
         return Ok(());
     }
     let mut registry = services().lock();

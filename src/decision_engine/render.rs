@@ -1,7 +1,7 @@
 //! Deterministic advisory text; it carries no execution authority.
 use super::{IntentAnalysis, IntentValue};
-use crate::agent::context_budget::count_tokens_with_source;
 use crate::security::redaction::redact_provider_text;
+use crate::tokens::count::count_tokens_with_source;
 
 /// Render structured values only, redacting before enforcing the token budget.
 /// Whole rows are omitted rather than cutting a redaction marker or UTF-8 text.
