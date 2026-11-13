@@ -5,6 +5,9 @@ slow-timeout = { period = "60s", terminate-after = 1 }
 fail-fast = false
 status-level = "slow"
 final-status-level = "slow"
+# The lib archive is built with --lib only; the signed-carry library test resolves the real
+# prx binary at <target>/debug/prx, which CI builds in a separate step before archiving.
+archive.include = [{ path = "debug/prx", relative-to = "target", on-missing = "warn" }]
 
 [profile.ci]
 # QA runners have a 4-CPU quota; run at most 4 tests at once so wall-clock

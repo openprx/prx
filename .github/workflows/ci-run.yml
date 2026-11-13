@@ -260,9 +260,9 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    # Archive the real prx binary for the signed-carry library test without linking an integration test.
+                    # The lib archive carries the prebuilt prx binary through .config/nextest.toml archive.include.
                     - name: lib
-                      targets: "--lib --bins"
+                      targets: --lib
                     - name: rest
                       targets: "--bins --test '*'"
         env:
@@ -308,7 +308,8 @@ jobs:
                   fi
                   version="$(cargo nextest --version)"
                   grep -q "^cargo-nextest 0.9.151 " <<<"$version"
-            # Build the prx binary first so its link never overlaps the all-features lib test link (hosted runner OOM, exit 143).
+            # The signed-carry library test runs the real prx binary. Build it on its own so it never compiles
+            # beside the all-features lib test crate (hosted runner OOM, exit 143); archive.include ships it.
             - name: Build the binaries before the lib test archive
               if: matrix.name == 'lib'
               run: cargo build --locked --all-features --profile test --bins
@@ -351,9 +352,9 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - { name: lib-1, archive: lib, targets: "--lib --bins", part: "1/3" }
-                    - { name: lib-2, archive: lib, targets: "--lib --bins", part: "2/3" }
-                    - { name: lib-3, archive: lib, targets: "--lib --bins", part: "3/3" }
+                    - { name: lib-1, archive: lib, targets: --lib, part: "1/3" }
+                    - { name: lib-2, archive: lib, targets: --lib, part: "2/3" }
+                    - { name: lib-3, archive: lib, targets: --lib, part: "3/3" }
                     - { name: rest-1, archive: rest, targets: "--bins --test '*'", part: "1/3" }
                     - { name: rest-2, archive: rest, targets: "--bins --test '*'", part: "2/3" }
                     - { name: rest-3, archive: rest, targets: "--bins --test '*'", part: "3/3" }
