@@ -898,11 +898,11 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
         "prx-local-model",
         "Explain `2 + 2`.",
     );
-    let mut context = service
+    let mut issued = service
         .open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &CancellationToken::new())
         .await
         .expect("test: builtin admission");
-    let context = Arc::get_mut(&mut context).expect("test: sole context owner");
+    let context = Arc::get_mut(&mut issued).expect("test: sole context owner");
     context.engine.selection = crate::causal_tree::decision_select::Selection::Abstain {
         action: CausalActionKind::Clarify,
         reason_code: "decision_failed",
@@ -973,7 +973,7 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
                 compaction: None,
                 decision: crate::agent::turn_request::TurnDecision {
                     service: &service,
-                    context,
+                    context: &issued,
                     proof: &proof,
                 },
             },
@@ -1012,5 +1012,5 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
         0,
         "test: no-legal-Answer dispatches zero provider requests"
     );
-    context.terminal_execution_trace();
+    issued.terminal_execution_trace();
 }
