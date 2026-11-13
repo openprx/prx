@@ -6,6 +6,9 @@ use std::fs;
 const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     // Exact environment probe: bounded output, deadline, owned child and reap.
     "src/tools/shell_parity_tests.rs::run_exact_environment_probe::let mut child = command.spawn().expect(\"test: isolated environment probe\");",
+    // Test-only: re-execute exactly one library test to isolate process umask
+    // and tracing, with a child deadline, kill-on-drop, and bounded output read.
+    "src/util/test_helpers.rs::run_in_isolated_process::.spawn()",
     // Oversized terminal restart fixture: real HTTP, acknowledged child, kill and reap.
     "src/gateway/tests/oversized_restart.rs::spawn_webhook_child::.spawn()",
     // Linux-only opt-in regression: a real setsid descendant proves the cgroup

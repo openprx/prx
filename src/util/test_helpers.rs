@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Shared, bounded re-execution of a single library test.
 use std::io::Read as _;
 
