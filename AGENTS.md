@@ -330,7 +330,7 @@ cargo test --lib <module::path>                 # named tests + the touched modu
 cargo test --test architecture_boundaries
 ```
 
-Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). No break-the-fix checks; the real test on QA after landing is the end-to-end proof.
+Add the module's real-component tests (a real process and real wire bytes; never a shared store or synthetic bytes). No break-the-fix checks; the real test on QA after landing is the end-to-end proof. A test that needs the real `prx` binary is an integration test under `tests/` (it gets `CARGO_BIN_EXE_prx`); a lib unit test must not depend on the binary artifact, because building both in one CI archive exhausts the hosted runner's memory.
 
 Do not run the full suite, mutation batches, stress loops or a full CI run locally. PR CI is the only full gate.
 
