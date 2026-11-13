@@ -1249,12 +1249,9 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
     // Pin confidence abstention even when the catalog makes Answer the clear winner.
     config.causal_tree.policy.commit_threshold = 1.0;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
-    let dispatches = Arc::new(Mutex::new(Vec::new()));
-    let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
-        name: "project_tool".into(),
-        execution_order: Arc::clone(&dispatches),
-    }) as Box<dyn Tool>]);
-    let registry = if enabled { registry } else { Arc::new(Vec::new()) };
+    // No metadata discovery: this cell must exercise confidence abstention,
+    // rather than the separate committed Answer after a successful catalog read.
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
     let admitted = if enabled {
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: enabled entry memory"));
@@ -1279,6 +1276,19 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
             ),
             "test: exercise actual Builtin Answer abstention: {:?}",
             admitted.decision().context.engine().selection
+        );
+    }
+    if enabled {
+        assert_eq!(
+            admitted
+                .decision()
+                .context
+                .engine()
+                .prediction
+                .as_ref()
+                .map(|prediction| prediction.served_by),
+            Some(crate::decision::factory::ServedBy::Builtin),
+            "test: actual Builtin prediction runs"
         );
     }
     let published = Arc::new(Mutex::new(Vec::new()));
@@ -1354,7 +1364,11 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
         "test: fallback offers zero tools"
     );
     assert!(
-        dispatches.lock().expect("test: executions").is_empty(),
+        result
+            .1
+            .execution_trace
+            .as_ref()
+            .is_none_or(|trace| trace.calls.is_empty()),
         "test: fallback executes zero tools"
     );
 

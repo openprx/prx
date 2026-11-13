@@ -875,6 +875,13 @@ async fn r3_o9_o14_and_quoted_shell_fallbacks_publish_no_execution_refs() {
             .agent_execution_specs(&proof, &context)
             .expect("test: fallback Answer uses ordinary model publication");
         assert!(selection.specs.is_empty(), "test: fallback Answer offers no tools");
+        assert!(
+            service
+                .agent_capability_search_spec(&proof, &context)
+                .expect("test: fallback has no search-control publication")
+                .is_none(),
+            "test: registered tools cannot widen a confidence fallback through search"
+        );
         context.terminal_execution_trace();
     }
     assert_eq!(transports.0.load(Ordering::SeqCst), 0);
