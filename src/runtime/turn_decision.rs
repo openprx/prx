@@ -1029,7 +1029,7 @@ impl TurnDecisionContext {
         &self.engine
     }
 
-    pub(crate) fn is_plain_answer_abstention(&self) -> bool {
+    pub(crate) const fn is_plain_answer_abstention(&self) -> bool {
         matches!(
             self.engine.selection,
             crate::causal_tree::decision_select::Selection::Abstain {
