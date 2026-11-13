@@ -130,7 +130,11 @@ async fn only_a_services_selector_explicitly_selects_a_service() {
             .explicitly_selects_service("tool.http_request"),
         "the environment scope selects nothing"
     );
-    for selector in ["tool.http_request", "  Tool.HTTP_Request  ", "provider.openai, tool.http_request"] {
+    for selector in [
+        "tool.http_request",
+        "  Tool.HTTP_Request  ",
+        "provider.openai, tool.http_request",
+    ] {
         assert!(
             proxy_with_scope(ProxyScope::Services, &[selector]).explicitly_selects_service("tool.http_request"),
             "services selector `{selector}` must select tool.http_request"
