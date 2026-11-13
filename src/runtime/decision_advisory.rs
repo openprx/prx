@@ -207,7 +207,21 @@ pub(crate) struct DecisionAdvisory {
     /// Admission before the store is open (P1-10): one opener task and one
     /// bounded queue, created by the first observation.
     pending: Arc<parking_lot::Mutex<PendingTelemetry>>,
+    /// Completion of the single opener task, kept for the advisory's whole
+    /// life: every drain joins a clone, so a drain that times out leaves it
+    /// owned here and a later drain waits for the same task (P1-10).
+    opener: parking_lot::Mutex<Option<OpenerJoin>>,
 }
+
+/// Why the opener task ended without moving the pre-open queue.
+#[derive(Clone, Copy, Debug)]
+enum OpenerFailure {
+    Panicked,
+    Cancelled,
+}
+
+/// The shared, typed completion of the opener task.
+type OpenerJoin = futures::future::Shared<futures::future::BoxFuture<'static, Result<(), OpenerFailure>>>;
 
 /// Observation admission before the telemetry store is open.
 enum PendingTelemetry {
@@ -219,10 +233,10 @@ enum PendingTelemetry {
     Opening {
         outcomes: tokio::sync::mpsc::Sender<TurnOutcome>,
         dropped: u64,
-        opener: Option<tokio::task::JoinHandle<()>>,
     },
     /// The opener moved the queue and its drops into the open store's
-    /// [`ObserveQueue`]; observations go there directly.
+    /// [`ObserveQueue`], under the same lock that sets this state;
+    /// observations go there directly.
     Opened,
 }
 
@@ -233,6 +247,7 @@ impl DecisionAdvisory {
             factory,
             telemetry: Arc::new(tokio::sync::OnceCell::new()),
             pending: Arc::new(parking_lot::Mutex::new(PendingTelemetry::Idle)),
+            opener: parking_lot::Mutex::new(None),
         }
     }
 
@@ -277,66 +292,78 @@ impl DecisionAdvisory {
         cell: &'a tokio::sync::OnceCell<AdvisoryRuntime>,
         config: &Config,
     ) -> &'a AdvisoryRuntime {
-        cell.get_or_init(|| async {
-            let engine_config = &config.decision_engine;
-            let cap = crate::decision_engine::status::effective_telemetry_cap(engine_config);
-            let queue_size = engine_config.observe_queue as usize;
-            let path = config.workspace_dir.join("decision-engine.sqlite");
-            let cancellation = CancellationToken::new();
-            let worker_cancellation = cancellation.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                ObserveQueue::start(queue_size, cap as usize, worker_cancellation, || {
-                    Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
-                })
+        cell.get_or_init(|| Self::start_runtime(config)).await
+    }
+
+    /// Open the store and start its worker; an unavailable store yields a
+    /// disabled queue.
+    async fn start_runtime(config: &Config) -> AdvisoryRuntime {
+        let engine_config = &config.decision_engine;
+        let cap = crate::decision_engine::status::effective_telemetry_cap(engine_config);
+        let queue_size = engine_config.observe_queue as usize;
+        let path = config.workspace_dir.join("decision-engine.sqlite");
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            ObserveQueue::start(queue_size, cap as usize, worker_cancellation, || {
+                Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
             })
-            .await;
-            let (observations, worker) = match opened {
-                Ok(Ok(started)) => started,
-                _ => {
-                    tracing::warn!("decision engine telemetry unavailable");
-                    (ObserveQueue::disabled(), None)
-                }
-            };
-            observations.register_status(&config.workspace_dir);
-            #[cfg(test)]
-            crate::decision_engine::access_spy::record_constructor(&config.workspace_dir);
-            AdvisoryRuntime {
-                engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
-                cancellation,
-                worker: tokio::sync::Mutex::new(worker),
-            }
         })
-        .await
+        .await;
+        let (observations, worker) = match opened {
+            Ok(Ok(started)) => started,
+            _ => {
+                tracing::warn!("decision engine telemetry unavailable");
+                (ObserveQueue::disabled(), None)
+            }
+        };
+        observations.register_status(&config.workspace_dir);
+        #[cfg(test)]
+        crate::decision_engine::access_spy::record_constructor(&config.workspace_dir);
+        AdvisoryRuntime {
+            engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
+            cancellation,
+            worker: tokio::sync::Mutex::new(worker),
+        }
     }
 
     /// Close observation admission and wait for the telemetry worker until
-    /// `deadline`. `false` means the worker is still running.
+    /// `deadline`. `false` means the opener or the worker is still running,
+    /// or the opener ended without moving the pre-open queue.
+    ///
+    /// Whenever an opener exists, drain joins it before it cancels the
+    /// writer, whatever the admission state: the opener moves every queued
+    /// outcome and the drop count into the store before it ends. The join is
+    /// a clone of the advisory-owned completion, so a timeout detaches
+    /// nothing and a later drain waits for the same task.
     pub(crate) async fn drain(&self, deadline: std::time::Instant) -> bool {
-        let opener = match &mut *self.pending.lock() {
-            PendingTelemetry::Opening { opener, .. } => opener.take(),
-            PendingTelemetry::Idle | PendingTelemetry::Opened => None,
-        };
-        if let Some(handle) = opener {
-            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handle).await {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let opener = self.opener.lock().clone();
+        let mut transferred = true;
+        if let Some(join) = opener {
+            match tokio::time::timeout_at(deadline, join).await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "decision engine telemetry opening failed"),
+                Ok(Err(failure)) => {
+                    tracing::warn!(?failure, "decision engine telemetry opening failed");
+                    transferred = false;
+                }
                 Err(_) => return false,
             }
         }
         let Some(runtime) = self.telemetry.get() else {
-            return true;
+            return transferred;
         };
         runtime.cancellation.cancel();
         let mut worker = runtime.worker.lock().await;
         if let Some(completion) = worker.as_mut() {
-            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
+            match tokio::time::timeout_at(deadline, completion).await {
                 Ok(Ok(())) => {
                     worker.take();
                 }
                 _ => return false,
             }
         }
-        true
+        transferred
     }
 
     /// Drain at shutdown. A late telemetry drain warns exactly once; catalog
@@ -570,17 +597,18 @@ impl DecisionAdvisory {
                 return;
             }
             let (outcomes, receiver) = tokio::sync::mpsc::channel(bound);
-            let opener = tokio::spawn(Self::open_and_take_over(
+            // The completion slot is held from the spawn until it is filled,
+            // so no drain can see a running opener without its completion.
+            let mut slot = self.opener.lock();
+            let handle = tokio::spawn(Self::open_and_take_over(
                 Arc::clone(&self.telemetry),
                 Arc::clone(&self.config),
                 Arc::clone(&self.pending),
                 receiver,
             ));
-            *pending = PendingTelemetry::Opening {
-                outcomes,
-                dropped: 0,
-                opener: Some(opener),
-            };
+            *slot = Some(opener_join(handle));
+            drop(slot);
+            *pending = PendingTelemetry::Opening { outcomes, dropped: 0 };
         }
         match &mut *pending {
             PendingTelemetry::Opening { outcomes, dropped, .. } => {
@@ -597,7 +625,9 @@ impl DecisionAdvisory {
     }
 
     /// The single opener task: open the store, then move the queued outcomes
-    /// and the pre-open drop count into its [`ObserveQueue`].
+    /// and the pre-open drop count into its [`ObserveQueue`]. The whole move
+    /// and the switch to `Opened` happen under one admission lock, so no
+    /// state observes `Opened` before the move is complete.
     async fn open_and_take_over(
         cell: Arc<tokio::sync::OnceCell<AdvisoryRuntime>>,
         config: Arc<Config>,
@@ -605,23 +635,42 @@ impl DecisionAdvisory {
         mut receiver: tokio::sync::mpsc::Receiver<TurnOutcome>,
     ) {
         let runtime = Self::open_telemetry(&cell, &config).await;
-        let dropped = match std::mem::replace(&mut *pending.lock(), PendingTelemetry::Opened) {
-            PendingTelemetry::Opening { dropped, .. } => dropped,
-            PendingTelemetry::Idle | PendingTelemetry::Opened => 0,
-        };
-        // Every queued send completed under the lock taken above, and later
-        // observations see the open store, so this drains the whole queue.
+        let mut admission = pending.lock();
+        // Every queued send completes under this lock, and later observations
+        // see the open store, so this drains the whole queue.
         receiver.close();
         while let Ok(outcome) = receiver.try_recv() {
             runtime.engine.observe(outcome);
         }
+        let dropped = match &*admission {
+            PendingTelemetry::Opening { dropped, .. } => *dropped,
+            PendingTelemetry::Idle | PendingTelemetry::Opened => 0,
+        };
         runtime
             .engine
             .observations
             .counters
             .dropped
             .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        *admission = PendingTelemetry::Opened;
     }
+}
+
+/// The shared completion of the opener task. A panicked or cancelled task
+/// never moved the queue, which drain reports instead of success.
+fn opener_join(handle: tokio::task::JoinHandle<()>) -> OpenerJoin {
+    use futures::FutureExt as _;
+    async move {
+        handle.await.map_err(|error| {
+            if error.is_panic() {
+                OpenerFailure::Panicked
+            } else {
+                OpenerFailure::Cancelled
+            }
+        })
+    }
+    .boxed()
+    .shared()
 }
 
 /// The largest observation queue bound ([`ObserveQueue::start`] and the

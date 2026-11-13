@@ -705,15 +705,10 @@ async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
     assert!(!temp.path().join("decision-engine.sqlite").exists());
     {
         let pending = advisory.pending.lock();
-        let PendingTelemetry::Opening {
-            outcomes,
-            dropped,
-            opener,
-        } = &*pending
-        else {
+        let PendingTelemetry::Opening { outcomes, dropped } = &*pending else {
             panic!("the first observation starts the opener");
         };
-        assert!(opener.is_some(), "one opener task is running");
+        assert!(advisory.opener.lock().is_some(), "one opener task is running");
         assert_eq!(outcomes.max_capacity(), BOUND as usize, "the ObserveQueue bound");
         assert_eq!(outcomes.capacity(), 0, "the queue holds exactly its bound");
         assert_eq!(*dropped, OBSERVED - u64::from(BOUND), "the overflow is counted");
@@ -742,4 +737,107 @@ async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
         BOUND as usize,
         "every queued outcome is flushed"
     );
+}
+
+/// P1-10 r3: drain during the pre-open handover. The store's opening is held
+/// by a pre-initialising task so every outcome queues before the store
+/// exists; then a thread holds the admission lock so the opener has the open
+/// store but cannot move the queue (the stall between open and transfer).
+/// Drains inside that window report failure without cancelling the writer,
+/// also after a timed-out drain; once the transfer runs, drain succeeds and
+/// every queued outcome is either stored or counted as dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn drain_during_the_pre_open_handover_waits_for_the_transfer() {
+    const BOUND: u32 = 4;
+    const OBSERVED: u64 = 7;
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = (*enabled_config(temp.path())).clone();
+    config.decision_engine.mode = DecisionMode::Both;
+    config.decision_engine.observe_queue = BOUND;
+    let config = Arc::new(config);
+    let advisory = DecisionAdvisory::new(Arc::clone(&config), None);
+
+    // Stall the opening: the cell's initialiser waits for `open_gate`.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (open_tx, open_rx) = tokio::sync::oneshot::channel::<()>();
+    let cell = Arc::clone(&advisory.telemetry);
+    let init_config = Arc::clone(&config);
+    let initialiser = tokio::spawn(async move {
+        cell.get_or_init(|| async move {
+            entered_tx.send(()).unwrap();
+            open_rx.await.unwrap();
+            DecisionAdvisory::start_runtime(&init_config).await
+        })
+        .await;
+    });
+    entered_rx.await.unwrap();
+
+    for index in 0..OBSERVED {
+        advisory
+            .observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true)
+            .await;
+    }
+    {
+        let pending = advisory.pending.lock();
+        let PendingTelemetry::Opening { dropped, .. } = &*pending else {
+            panic!("every outcome is admitted before the store is open");
+        };
+        assert_eq!(*dropped, OBSERVED - u64::from(BOUND));
+    }
+    assert!(advisory.opener.lock().is_some());
+
+    // Hold the admission lock: the opener can open but not transfer.
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let admission = Arc::clone(&advisory.pending);
+    let holder = std::thread::spawn(move || {
+        let _guard = admission.lock();
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    held_rx.await.unwrap();
+    open_tx.send(()).unwrap();
+    initialiser.await.unwrap();
+    assert!(advisory.initialized(), "the store is open, the transfer is stalled");
+    let runtime = advisory.telemetry.get().unwrap();
+
+    assert!(
+        !advisory
+            .drain(std::time::Instant::now() + std::time::Duration::from_millis(100))
+            .await,
+        "drain cannot succeed before the queued outcomes are transferred"
+    );
+    assert!(
+        !runtime.cancellation.is_cancelled(),
+        "the writer stays open while the transfer is pending"
+    );
+    assert!(
+        !advisory
+            .drain(std::time::Instant::now() + std::time::Duration::from_millis(100))
+            .await,
+        "a drain after a timed-out drain still waits for the same opener"
+    );
+    assert!(!runtime.cancellation.is_cancelled());
+    assert!(advisory.opener.lock().is_some(), "a timeout detaches nothing");
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(
+        advisory
+            .drain(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await,
+        "drain succeeds once the transfer and the worker are done"
+    );
+    assert!(matches!(*advisory.pending.lock(), PendingTelemetry::Opened));
+    assert!(runtime.cancellation.is_cancelled());
+    let dropped = runtime
+        .engine
+        .observations
+        .counters
+        .dropped
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
+    let stored = store.outcomes().unwrap().len() as u64;
+    assert_eq!(stored + dropped, OBSERVED, "no queued outcome is lost");
+    assert_eq!(stored, u64::from(BOUND), "every queued outcome is stored");
 }
