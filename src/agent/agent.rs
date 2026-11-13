@@ -1223,6 +1223,12 @@ mod tests {
                     assert!(user.content.contains("[End untrusted custom memory context]\n"));
                     assert!(user.content.contains("PRX_CUSTOM_PRESENTATION"));
                 }
+                if user.content == "unclear request" {
+                    assert!(
+                        request.tools.is_none_or(<[_]>::is_empty),
+                        "test: degraded Clarify answer offers zero tools"
+                    );
+                }
                 self.0.chat_traced(request, model, temperature).await
             }
         }
@@ -1280,28 +1286,33 @@ mod tests {
         let mut agent = builder.build().unwrap();
         // Q56: durable Builtin covers selected retrieval from the original scoped seed.
         // The default Builtin must admit a plain first message without invoking
-        // the custom Memory loader. The Q54 Mock's explicit `other` choice is
-        // retained only for an empty, genuinely undecidable negative control.
+        // the custom Memory loader. The Q54 Mock's explicit `other` choice
+        // selects Clarify; with a gate-passed Answer it degrades to one plain,
+        // tool-free answer (R177-6) that still never runs the selected loader.
+        // The no-legal-Answer refusal is pinned by
+        // `clarify_without_gate_passed_answer_is_typed_refusal`.
         if record_decisions {
             assert_eq!(agent.turn("hello").await.unwrap(), "done");
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
-            models.lock().unwrap().clear();
         } else {
-            let error = agent
-                .turn("unclear request")
-                .await
-                .expect_err("test: explicit prediction abstention has no executable selection");
-            assert!(
-                matches!(
-                    error.downcast_ref::<crate::causal_tree::directive::DirectiveError>(),
-                    Some(crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind: "clarify" })
-                ),
-                "test: explicit prediction failure: {error}"
+            assert_eq!(
+                agent
+                    .turn("unclear request")
+                    .await
+                    .expect("test: Clarify with a gate-passed Answer degrades to a plain answer"),
+                "done"
             );
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert!(models.lock().unwrap().is_empty());
         }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "test: plain answer never runs the loader"
+        );
+        assert_eq!(
+            *models.lock().unwrap(),
+            ["prx-local-model"],
+            "test: exactly one serving request"
+        );
+        models.lock().unwrap().clear();
         agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
         let reply = agent.turn("memory_search: Explain `2 + 2`.").await.unwrap();
         if record_decisions {

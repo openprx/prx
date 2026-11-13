@@ -1906,13 +1906,28 @@ fn post_route_admission_rejection_requeues_input_and_defers_next_pop() {
     );
 
     let mut defer_visible_input_pop_once = false;
-    requeue_post_route_admission_rejected_input(&mut backlog, &mut defer_visible_input_pop_once, popped);
+    requeue_post_route_admission_rejected_input(
+        &mut backlog,
+        &mut scheduler,
+        &mut defer_visible_input_pop_once,
+        popped,
+    );
 
     assert_eq!(backlog.len(), 1, "post-route rejection must requeue the popped input");
     assert_eq!(
         backlog.front().and_then(|queued| queued.turn_task_id),
         Some(task_id),
         "requeued input keeps the original scheduler task id"
+    );
+    assert_eq!(
+        scheduler.task(task_id).expect("requeued task").state,
+        crate::chat::turn_scheduler::TurnTaskState::Queued,
+        "requeued input is queued again in the scheduler"
+    );
+    assert_eq!(
+        scheduler.status().queued,
+        1,
+        "queue status counts the requeued input it lists"
     );
     assert!(
         provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2)
@@ -1931,6 +1946,20 @@ fn post_route_admission_rejection_requeues_input_and_defers_next_pop() {
     assert!(
         !consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once),
         "defer gate is one-shot after the event-pump wait"
+    );
+    let repopped = pop_next_visible_input_task_with_scheduler(
+        &mut backlog,
+        &mut scheduler,
+        &workers,
+        crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+        2,
+    )
+    .expect("the requeued input pops again");
+    assert_eq!(repopped.turn_task_id, Some(task_id));
+    assert_eq!(
+        scheduler.task(task_id).expect("re-dispatched task").state,
+        crate::chat::turn_scheduler::TurnTaskState::Dispatched,
+        "the second dequeue is a valid queued -> dispatched transition"
     );
 }
 

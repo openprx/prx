@@ -2818,9 +2818,11 @@ pub(crate) mod tests {
     }
 
     /// Logical decision time still expires: a clock fixture is not permission
-    /// to execute after the production admission budget has been spent.
+    /// to execute after the production admission budget has been spent. The
+    /// expired child selects Clarify, which degrades to one tool-free answer
+    /// (R177-6): its provider sees no tools and a named tool never executes.
     #[tokio::test]
-    async fn delegate_child_logical_deadline_still_refuses_provider_calls() {
+    async fn delegate_child_logical_deadline_still_refuses_tool_execution() {
         let clock = crate::causal_tree::logical_clock::ManualClock::new();
         let control = crate::agent::agent::native_decision_fixture::ChildResponseControl::AdvanceClock(
             Arc::clone(&clock),
@@ -2843,20 +2845,36 @@ pub(crate) mod tests {
         )
         .await;
         assert!(
-            !result.success,
-            "test: expired Clarify selection must refuse child execution"
-        );
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("decision selection clarify is not executable")),
-            "test: refused child preserves its Clarify reason: {:?}",
+            result.success,
+            "test: expired Clarify degrades to a plain child answer: {:?}",
             result.error
         );
+        // The fixture model names dynamic_alias on its first reply even though
+        // nothing was offered; the refusal then reaches the second request.
+        assert_eq!(requests.len(), 2, "test: one refused call, then the final reply");
+        for request in &requests {
+            assert!(
+                request
+                    .get("tools")
+                    .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
+                "test: the expired child offers no tools: {request}"
+            );
+        }
+        let tool_replies: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request["messages"].as_array())
+            .flatten()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
         assert!(
-            requests.is_empty(),
-            "expired child admission must not reach the provider"
+            !tool_replies.is_empty() && tool_replies.iter().all(|content| *content != "dynamic_alias"),
+            "test: the named tool is refused, never executed: {tool_replies:?}"
+        );
+        assert!(
+            result.output.ends_with("\ndone"),
+            "test: the child returns its plain reply: {}",
+            result.output
         );
     }
 

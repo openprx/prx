@@ -227,9 +227,21 @@ pub(super) fn is_persistence_dependent_command(input: &str) -> bool {
 
 pub(super) fn requeue_post_route_admission_rejected_input(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     defer_visible_input_pop_once: &mut bool,
     input: DequeuedInputMessage,
 ) {
+    // The input waits in the backlog again: its task must be queued again, or
+    // `/queue` omits it and its next dequeue cannot mark it dispatched.
+    if let Some(id) = input.turn_task_id
+        && let Err(error) = scheduler.return_dispatched_to_queue(id)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "TurnScheduler chat-loop requeue mirror failed"
+        );
+    }
     backlog.push_front(QueuedInputMessage {
         priority: input.priority,
         turn_task_id: input.turn_task_id,

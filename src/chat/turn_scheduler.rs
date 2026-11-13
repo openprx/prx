@@ -200,6 +200,24 @@ impl TurnScheduler {
         }
     }
 
+    /// A dispatched input that admission sent back to the backlog is queued
+    /// again, so queue status counts it and its next dequeue is valid.
+    pub fn return_dispatched_to_queue(&mut self, id: TurnTaskId) -> Result<(), TurnSchedulerError> {
+        let task = self.task_mut(id)?;
+        match task.state {
+            TurnTaskState::Dispatched => {
+                task.state = TurnTaskState::Queued;
+                task.result_summary = Some("returned to queue before admission".to_string());
+                Ok(())
+            }
+            state => Err(TurnSchedulerError::InvalidState {
+                id,
+                expected: "dispatched",
+                actual: state,
+            }),
+        }
+    }
+
     pub fn mark_dispatched_to_chat_loop(&mut self, id: TurnTaskId) -> Result<(), TurnSchedulerError> {
         let task = self.task_mut(id)?;
         match task.state {

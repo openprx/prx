@@ -3065,6 +3065,7 @@ Retry with a compatible model: /provider {shown} <model>",
             }
             requeue_post_route_admission_rejected_input(
                 &mut input_backlog,
+                &mut turn_scheduler,
                 &mut defer_visible_input_pop_once,
                 DequeuedInputMessage {
                     priority: input_priority,

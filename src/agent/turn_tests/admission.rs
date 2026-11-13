@@ -444,10 +444,13 @@ impl AdmittedTurn {
             Vec::new(),
         )
         .await;
-        if admitted
-            .service
-            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
-            .is_err()
+        // An Answer/Clarify abstention may publish tool-free fallback specs
+        // (R177-6); that is a plain answer, not a reached Execute.
+        if admitted.context.is_plain_answer_abstention()
+            || admitted
+                .service
+                .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+                .is_err()
         {
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine
@@ -522,10 +525,13 @@ impl AdmittedTurn {
             Vec::new(),
         )
         .await;
-        if admitted
-            .service
-            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
-            .is_err()
+        // An Answer/Clarify abstention may publish tool-free fallback specs
+        // (R177-6); that is a plain answer, not a reached Execute.
+        if admitted.context.is_plain_answer_abstention()
+            || admitted
+                .service
+                .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+                .is_err()
         {
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine

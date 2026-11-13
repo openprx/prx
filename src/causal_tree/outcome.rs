@@ -615,8 +615,11 @@ impl TerminalFacts {
         self
     }
 
-    /// A serving reply without any tool activity may account for a Clarify
-    /// degradation while its recorded decision remains Clarify.
+    /// A serving reply without any tool execution may account for a Clarify
+    /// degradation while its recorded decision remains Clarify. The fallback
+    /// publishes no tools, but the model may still name one; such an attempt is
+    /// refused before any capability binds (unbound and denied, no recorded
+    /// call) and executes nothing, so it does not disqualify the plain reply.
     fn confirms_plain_answer(&self) -> bool {
         !self.collected_pending
             && !self.collected_declined
@@ -640,14 +643,13 @@ impl TerminalFacts {
                         .is_some_and(|attempt| attempt.status == "success")
                     && !trace.authorized_silent
                     && trace.calls.is_empty()
-                    && trace.started_attempts == 0
+                    && trace.started_attempts == trace.unbound_attempts
+                    && trace.denied_attempts == trace.unbound_attempts
                     && trace.successful_attempts == 0
                     && trace.selected_successful_attempts == 0
                     && trace.pending_attempts == 0
-                    && trace.unbound_attempts == 0
                     && trace.failed_attempts == 0
                     && trace.cancelled_attempts == 0
-                    && trace.denied_attempts == 0
                     && trace.awaiting_approval_attempts == 0
                     && trace.unavailable_attempts.is_none_or(|count| count == 0)
             })
@@ -1810,12 +1812,33 @@ mod tests {
         incomplete.provider_attempts_incomplete = true;
         let mut tool = settled.clone();
         tool.started_attempts = 1;
+        let mut refused = settled.clone();
+        refused.started_attempts = 1;
+        refused.unbound_attempts = 1;
+        refused.denied_attempts = 1;
+        assert!(
+            recovered_facts(TurnTerminalStatus::Completed, Some(refused.clone()), true).confirms_plain_answer(),
+            "test: a refused call to an unpublished tool executes nothing"
+        );
+        let mut bound_denied = refused.clone();
+        bound_denied.calls.push(crate::causal_tree::store::RecordedToolCall {
+            capability_id: "fixture_capability".to_owned(),
+            status: "denied".to_owned(),
+        });
+        let mut unbound_failed = refused.clone();
+        unbound_failed.denied_attempts = 0;
+        unbound_failed.failed_attempts = 1;
+        let mut unbound_and_bound = refused;
+        unbound_and_bound.started_attempts = 2;
         let mut silent = settled;
         silent.authorized_silent = true;
         for (kind, trace) in [
             ("pending provider", pending),
             ("incomplete attempts", incomplete),
             ("tool activity", tool),
+            ("bound denied call", bound_denied),
+            ("unbound call that was not refused", unbound_failed),
+            ("bound attempt beside a refused one", unbound_and_bound),
             ("authorized silence", silent),
         ] {
             assert!(
