@@ -33,6 +33,27 @@ impl DecisionTransports for NoExternalTransport {
     }
 }
 
+/// The default fixture transport: a backend whose endpoint is a literal
+/// loopback address (a fixture endpoint the test owns) is built with the
+/// production HTTP transport; nothing else leaves the process.
+pub(crate) struct LoopbackOnlyTransport;
+
+impl DecisionTransports for LoopbackOnlyTransport {
+    fn build(
+        &self,
+        spec: &BackendSpec<'_>,
+    ) -> Result<
+        Box<dyn crate::decision_engine::prediction::backend::DecisionBackend>,
+        crate::cost::decision_attempt::DecisionError,
+    > {
+        if spec.locality == crate::config::schema::causal_tree::BackendLocality::Loopback {
+            crate::decision_engine::prediction::compatible_http::HttpDecisionTransports.build(spec)
+        } else {
+            NoExternalTransport.build(spec)
+        }
+    }
+}
+
 pub(crate) struct SilentEvents;
 
 impl CausalEventSink for SilentEvents {
@@ -690,7 +711,7 @@ impl AdmittedTurn {
                 transports: if configured_native_tools.is_some() {
                     &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports
                 } else {
-                    &NoExternalTransport
+                    &LoopbackOnlyTransport
                 },
                 events: Arc::new(SilentEvents),
                 memory: Arc::clone(&memory),

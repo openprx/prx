@@ -1546,23 +1546,18 @@ async fn opened_turn_refs(
 #[tokio::test]
 async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
     use crate::decision_engine::IntentValue;
-    use crate::runtime::decision_advisory::DecisionAdvisory;
-    use crate::runtime::decision_advisory::tests::{RecordingBackend, price_mock_model};
     let mut served = Vec::new();
     for prefer in [None, Some("refuse"), Some("clarify")] {
         let workspace = tempfile::tempdir().expect("test: advice workspace");
         let mut config = engine_off_config(workspace.path());
         config.tool_tiering.always_include.push("project_tool".into());
-        if prefer.is_some() {
+        let endpoint = match prefer {
+            None => None,
+            Some(prefer) => Some(ScriptedDecisionEndpoint::start(prefer).await),
+        };
+        if let Some(endpoint) = &endpoint {
             config.decision_engine.enabled = true;
-            config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
-                kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
-                    crate::config::schema::causal_tree::BackendKind::Mock,
-                ),
-                model: "recording-model".into(),
-                ..Default::default()
-            });
-            price_mock_model(&mut config, "recording-model");
+            endpoint.configure(&mut config);
         }
         let dispatches = Arc::new(Mutex::new(Vec::new()));
         let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
@@ -1581,31 +1576,35 @@ async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
             )
             .await
             .expect("test: production turn opening");
-        let advice = match prefer {
-            None => None,
-            Some(prefer) => {
-                let key = crate::decision_engine::state::fixtures::key();
-                let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
-                    vec![Box::new(RecordingBackend {
-                        identity: crate::cost::decision_attempt::BackendIdentity {
-                            kind: crate::config::schema::causal_tree::BackendKind::Mock,
-                            provider: None,
-                            configured_model: Arc::from("recording-model"),
-                        },
-                        key: Arc::clone(&key),
-                        attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                        request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                        prefer,
-                    })],
-                    Arc::clone(&key),
-                    crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
-                    crate::decision_engine::prediction::factory::SlotLimits::default(),
+        let advice = match (prefer, &endpoint) {
+            (Some(prefer), Some(endpoint)) => {
+                // The publication's own advisory driver, whose factory
+                // `from_config` built from the configured backend.
+                let runtime = context.runtime();
+                let scope = Arc::clone(
+                    runtime
+                        .accounting
+                        .as_ref()
+                        .expect("test: a production-opened turn has an accounting scope"),
                 );
-                let advisory = DecisionAdvisory::new(Arc::new(config.clone()), Some(factory));
-                let analysis = advisory
-                    .analyze_turn(context.runtime(), &cancellation)
+                let before = scope.remaining_budgets();
+                let analysis = decision
+                    .service
+                    .advisory()
+                    .analyze_turn(runtime, &cancellation)
                     .await
-                    .expect("test: the backend's prediction is analysed");
+                    .expect("test: the configured backend's prediction is analysed");
+                assert_eq!(endpoint.requests(), 1, "{prefer}: one request reached the endpoint");
+                let after = scope.remaining_budgets();
+                assert_eq!(
+                    before.tokens - after.tokens,
+                    1_200,
+                    "{prefer}: the attempt's reported tokens are charged to the turn"
+                );
+                assert!(
+                    after.micro_usd < before.micro_usd,
+                    "{prefer}: the attempt's cost is charged to the turn"
+                );
                 let Some(IntentValue::Choice {
                     probabilities,
                     confidence,
@@ -1617,6 +1616,7 @@ async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
                 assert_eq!(*confidence, 1.0, "{prefer} with full confidence");
                 Some(analysis)
             }
+            _ => None,
         };
         let published = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1677,6 +1677,9 @@ async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
         )
         .await
         .expect("test: the turn is served");
+        if let Some(endpoint) = endpoint {
+            endpoint.stop().await;
+        }
         served.push((
             outcome.into_text(),
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1838,29 +1841,23 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
 }
 
 /// P1-01: a configured non-builtin backend runs on a turn opened by the
-/// production path with a valid configuration. The analysis is bounded in
+/// production path with a valid configuration. The publication builds the
+/// configured compatible-HTTP backend through `from_config`; a bounded
+/// loopback endpoint the test owns answers it. The analysis is bounded in
 /// tokens (the G6 slice is at most 8,192), one physical attempt is charged to
 /// the turn's own accounting scope, and the first send stays admissible.
 #[tokio::test]
 async fn configured_backend_runs_on_a_production_opened_turn() {
-    use crate::runtime::decision_advisory::DecisionAdvisory;
-    use crate::runtime::decision_advisory::tests::{RecordingBackend, price_mock_model};
     let workspace = tempfile::tempdir().expect("test: production-opened workspace");
+    let endpoint = ScriptedDecisionEndpoint::start("answer").await;
     let mut config = engine_off_config(workspace.path());
     config.decision_engine.enabled = true;
-    config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
-        kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Mock,
-        ),
-        model: "recording-model".into(),
-        ..Default::default()
-    });
-    price_mock_model(&mut config, "recording-model");
+    endpoint.configure(&mut config);
     config.agent.compaction.max_context_tokens = 131_072;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 4_096;
     config.causal_tree.policy.extra_token_ratio_limit = 1.0;
-    let admitted = AdmittedTurn::with_config(config.clone(), "analyse the opened turn", Arc::new(Vec::new())).await;
+    let admitted = AdmittedTurn::with_config(config, "analyse the opened turn", Arc::new(Vec::new())).await;
     let decision = admitted.decision();
     let cancellation = tokio_util::sync::CancellationToken::new();
     let context = decision
@@ -1881,32 +1878,9 @@ async fn configured_backend_runs_on_a_production_opened_turn() {
     );
     let before = (runtime.remaining_g6_tokens(), runtime.remaining_micro_usd());
     assert_eq!(before.0, 8_192, "the G6 slice is the token bound of the analysis");
-    let key = crate::decision_engine::state::fixtures::key();
-    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
-        vec![Box::new(RecordingBackend {
-            identity: crate::cost::decision_attempt::BackendIdentity {
-                kind: crate::config::schema::causal_tree::BackendKind::Mock,
-                provider: None,
-                configured_model: Arc::from("recording-model"),
-            },
-            key: Arc::clone(&key),
-            attempts: Arc::clone(&attempts),
-            request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            prefer: "answer",
-        })],
-        Arc::clone(&key),
-        crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
-        crate::decision_engine::prediction::factory::SlotLimits::default(),
-    );
-    let advisory = DecisionAdvisory::new(Arc::new(config), Some(factory));
-    let analysis = advisory.analyze_turn(runtime, &cancellation).await;
+    let analysis = decision.service.advisory().analyze_turn(runtime, &cancellation).await;
     assert!(analysis.is_some(), "the configured backend's analysis runs");
-    assert_eq!(
-        attempts.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "one physical attempt on the configured backend"
-    );
+    assert_eq!(endpoint.requests(), 1, "one physical attempt on the configured backend");
     let after = scope.remaining_budgets();
     assert_eq!(
         before.0 - runtime.remaining_g6_tokens(),
@@ -1918,4 +1892,114 @@ async fn configured_backend_runs_on_a_production_opened_turn() {
         crate::cost::estimate::candidate_tokens(0) <= runtime.remaining_g6_tokens(),
         "the first send's G6 admission still fits"
     );
+    endpoint.stop().await;
+}
+
+/// A bounded loopback System One endpoint for the configured
+/// compatible-HTTP backend. It answers each real compiled request with
+/// [`scripted_answers`](crate::runtime::decision_advisory::tests::scripted_answers)
+/// predicting `prefer` with full confidence (usage: 1,000 input and 200
+/// output tokens) and counts the requests it received. Request bodies are
+/// capped, and `stop` ends the listener within a bounded wait.
+struct ScriptedDecisionEndpoint {
+    endpoint: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    stop: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl ScriptedDecisionEndpoint {
+    const MODEL: &'static str = "prx-scripted-decision";
+
+    async fn start(prefer: &'static str) -> Self {
+        use axum::response::IntoResponse;
+        async fn reply(
+            axum::extract::State((prefer, requests)): axum::extract::State<(
+                &'static str,
+                Arc<std::sync::atomic::AtomicUsize>,
+            )>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match crate::runtime::decision_advisory::tests::scripted_answers(&body, prefer) {
+                Ok(answer) => axum::Json(answer).into_response(),
+                Err(_) => axum::http::StatusCode::BAD_REQUEST.into_response(),
+            }
+        }
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test: loopback decision listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("test: loopback decision address")
+        );
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let shutdown = stop.clone();
+        let app = axum::Router::new()
+            .route("/v1/systemone", axum::routing::post(reply))
+            .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+            .with_state((prefer, Arc::clone(&requests)));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        });
+        Self {
+            endpoint,
+            requests,
+            stop,
+            task,
+        }
+    }
+
+    /// Configure the engine backend as this endpoint: a fixed loopback
+    /// compatible-HTTP backend with a declared decision model, priced at one
+    /// micro-USD per token.
+    fn configure(&self, config: &mut crate::config::Config) {
+        let backend = crate::config::schema::causal_tree::DecisionBackendConfig {
+            kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
+                crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+            ),
+            endpoint: self.endpoint.clone(),
+            model: Self::MODEL.into(),
+            ..Default::default()
+        };
+        let provider = crate::config::schema::causal_tree::configured_selection(&backend)
+            .expect("test: a fixed compatible backend is a configured selection")
+            .provider;
+        config.decision_engine.backend = Some(backend);
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": provider,
+                "model": Self::MODEL,
+                "operations": ["decision_endpoint"],
+            }))
+            .expect("test: decision model declaration"),
+        );
+        config.cost.prices.insert(
+            crate::config::schema::usage_pricing_key(&provider, Self::MODEL),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 1.0,
+                cache_write: 1.0,
+                cache_read: 1.0,
+            },
+        );
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn stop(self) {
+        self.stop.cancel();
+        let mut task = self.task;
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
 }
