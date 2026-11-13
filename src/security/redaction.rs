@@ -976,9 +976,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    /// RED before PMM-H (D-099 7c): a secret inside a URL path was shown as
-    /// `[REDACTED]`, which `holds_redacted_url_part` did not recognise.
-
     #[test]
     fn secret_url_error_report_redacts_complete_chain() {
         for key in ["key", "sig"] {
@@ -996,6 +993,9 @@ mod tests {
             );
         }
     }
+
+    /// RED before PMM-H (D-099 7c): a secret inside a URL path was shown as
+    /// `[REDACTED]`, which `holds_redacted_url_part` did not recognise.
     #[test]
     fn a_secret_in_a_url_path_reads_as_the_url_mask() {
         let token = "sk-proj-abcdefghijklmnopqrstuvwxyz0123";

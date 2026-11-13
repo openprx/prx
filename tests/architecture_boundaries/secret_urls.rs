@@ -1,27 +1,15 @@
 use super::helpers::{
-    assert_inventory, blank_comments, blank_comments_and_literals, enclosing_function, is_test_code_file,
-    log_macro_arguments, normalize_line, read_source, relative_path, rust_source_files, strip_cfg_test_items,
-    test_module_files,
+    assert_inventory, blank_comments, blank_comments_and_literals, byte_aligned_structure, enclosing_function,
+    is_test_code_file, log_macro_arguments, normalize_line, read_source, relative_path, rust_source_files,
+    strip_cfg_test_items, test_module_files,
 };
-
-/// Byte-aligned structural text: the shared lexer preserves character offsets.
-fn structural(source: &str) -> String {
-    blank_comments_and_literals(source)
-        .chars()
-        .zip(source.chars())
-        .map(|(masked, raw)| {
-            if masked == ' ' {
-                " ".repeat(raw.len_utf8())
-            } else {
-                masked.to_string()
-            }
-        })
-        .collect()
-}
 
 /// Balanced call arguments, ignoring delimiters inside literals.
 fn calls(source: &str, needle: &str) -> Vec<(usize, String)> {
-    let mask = structural(source);
+    if !source.contains(needle) {
+        return Vec::new();
+    }
+    let mask = byte_aligned_structure(source);
     let mut found = Vec::new();
     for (start, _) in mask.match_indices(needle) {
         let open = start + needle.len() - 1;
@@ -72,10 +60,11 @@ fn builders(source: &str) -> Vec<(usize, String)> {
 
 // Each builder's mitigation is documented beside its reviewed inventory entry.
 const BUILDERS: &[&str] = &[
-    // Non-stream send and warmup strip reqwest errors before propagation.
+    // Non-stream sends strip reqwest errors before propagation.
     "src/providers/gemini.rs::build_generate_content_url::format!(\"{base_url}?key={}\", auth.credential())",
     // StreamError::from removes URLs before streaming sinks.
     "src/providers/gemini.rs::build_stream_url::format!(\"{base}?alt=sse&key={}\", auth.credential())",
+    // Warmup strips both send and status errors before propagation.
     "src/providers/gemini.rs::warmup::format!( \"https://generativelanguage.googleapis.com/v1beta/models?key={}\", auth.credential() )",
     // Both blocking send and status errors pass without_url.
     "src/providers/model_discovery.rs::fetch_gemini_models::.query(&[(\"key\", api_key), (\"pageSize\", \"200\")])",
@@ -136,9 +125,11 @@ fn carrier_offenders(relative: &str, source: &str) -> Vec<String> {
                 || compact.starts_with(
                     ".and_then(reqwest::blocking::Response::error_for_status).map_err(reqwest::Error::without_url)",
                 )
-                || compact.starts_with(".await.map_err(webhook_failure_text)")
-                || compact.starts_with(".await.map_err(Self::transport_error)")
-                || compact.starts_with(".await.map_err(transport_error)");
+                || (relative == "src/channels/dingtalk.rs"
+                    && compact.starts_with(".await.map_err(webhook_failure_text)"))
+                || (relative == "src/channels/telegram.rs"
+                    && (compact.starts_with(".await.map_err(Self::transport_error)")
+                        || compact.starts_with(".await.map_err(transport_error)")));
             let handled_arm = chain.find("Err(").is_some_and(|at| {
                 let arm = &chain[at + 4..];
                 let Some((binding, rest)) = arm.split_once(')') else {
@@ -158,7 +149,8 @@ fn carrier_offenders(relative: &str, source: &str) -> Vec<String> {
                     || rest.starts_with(&format!("let _ = tx.send(Err(StreamError::from({binding}))"))
                     || rest.starts_with(&format!("let _ = tx.send(Err({binding}.into()))"))
                     || rest.starts_with(&format!("StreamError::from({binding})"))
-                    || rest.starts_with(&format!("Self::transport_error({binding})"))
+                    || (relative == "src/channels/telegram.rs"
+                        && rest.starts_with(&format!("Self::transport_error({binding})")))
             });
             if !same_chain && !handled_arm {
                 offenders.push(site(relative, source, offset, needle));
@@ -338,5 +330,21 @@ fn comment_blanker_preserves_url_and_raw_literals() {
     assert!(
         !blanked.contains("outer") && !blanked.contains("?key="),
         "test: comments survived blanking"
+    );
+}
+
+#[test]
+fn log_scanner_preserves_captures_and_ignores_literal_delimiters() {
+    let production = r##"fn probe() {
+        tracing::info!(r#"opening ({wss_url}"#);
+        warn!("Unicode Ω (, {sse_url}");
+        let decoy = r#"info!("{webhook_url}")"#;
+        info!("safe {}", ws_target_label(&wss_url));
+    }"##;
+    let offenders = raw_url_logs("src/channels/probe.rs", production);
+    assert_eq!(
+        offenders.len(),
+        2,
+        "test: literal punctuation must not hide captures or create fake log calls: {offenders:?}"
     );
 }

@@ -721,11 +721,12 @@ pub(super) fn blank_comments(source: &str) -> String {
 /// (empty for a positional argument or the format string), and a shorthand
 /// field (`provider,`) has the identifier as both name and value.
 pub(super) fn log_macro_arguments(production: &str) -> Vec<(usize, String, String)> {
-    let bytes = production.as_bytes();
+    let structure = byte_aligned_structure(production);
+    let bytes = structure.as_bytes();
     let mut arguments = Vec::new();
     for level in ["trace!(", "debug!(", "info!(", "warn!(", "error!("] {
         let mut search = 0usize;
-        while let Some(found) = production[search..].find(level) {
+        while let Some(found) = structure[search..].find(level) {
             let start = search + found;
             search = start + level.len();
             if start > 0 && is_identifier_byte(bytes[start - 1]) {
@@ -772,4 +773,20 @@ pub(super) fn log_macro_arguments(production: &str) -> Vec<(usize, String, Strin
     }
     arguments.sort_by_key(|(offset, _, _)| *offset);
     arguments
+}
+
+/// Preserve byte offsets while masking comments and literals. The shared lexer
+/// preserves character offsets, so a masked Unicode character needs padding.
+pub(super) fn byte_aligned_structure(source: &str) -> String {
+    let mut output = String::new();
+    for (masked, raw) in blank_comments_and_literals(source).chars().zip(source.chars()) {
+        if masked == ' ' {
+            for _ in 0..raw.len_utf8() {
+                output.push(' ');
+            }
+        } else {
+            output.push(masked);
+        }
+    }
+    output
 }
