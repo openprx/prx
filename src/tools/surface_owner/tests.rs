@@ -119,6 +119,7 @@ fn facts_for(policy: Arc<SecurityPolicy>) -> AdmissionFactsV1 {
         model_can_chat: true,
         model_can_call_tools: true,
         child_scope: None,
+        child_discovery: false,
     }
 }
 

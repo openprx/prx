@@ -209,6 +209,11 @@ pub(crate) struct AuxiliaryAccounting {
     purpose: AuxiliaryPurpose,
     execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
     parameters: crate::providers::parameter_capture::Capture,
+    /// The first serving send's admission `(tokens, micro_usd)` that this
+    /// call must leave in the shared scope, even if it retains its whole
+    /// reservation (P1-03): a failed or uncertain auxiliary call never
+    /// starves the main model.
+    protected: (u64, u64),
 }
 impl AuxiliaryAccounting {
     pub(super) fn new(
@@ -219,6 +224,7 @@ impl AuxiliaryAccounting {
         scope: Arc<super::decision_accounting::AccountingScope>,
         purpose: AuxiliaryPurpose,
         execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
+        protected: (u64, u64),
     ) -> anyhow::Result<Arc<Self>> {
         let targets = provider
             .accounting_targets(selected.model())
@@ -233,6 +239,7 @@ impl AuxiliaryAccounting {
             purpose,
             execution_trace,
             parameters: crate::providers::parameter_capture::Capture::new(true),
+            protected,
         }))
     }
     pub(crate) const fn selected_model(&self) -> &crate::providers::catalog::ResolvedModel {
@@ -300,18 +307,37 @@ impl crate::providers::attempt_accounting::AttemptAccounting for AuxiliaryAccoun
                 request.credential().unwrap_or("").as_bytes(),
             ],
         );
+        // Reserve at most the live remaining budget minus the protected first
+        // send, so the main model keeps its admission whatever this call
+        // retains.
+        let remaining = self.scope.remaining_budgets();
+        let per_call = crate::tools::capability::turn_state::TurnBudgets {
+            tokens: remaining
+                .tokens
+                .checked_sub(self.protected.0)
+                .filter(|tokens| *tokens > 0)
+                .ok_or(AccountingRefusal)?,
+            micro_usd: remaining
+                .micro_usd
+                .checked_sub(self.protected.1)
+                .ok_or(AccountingRefusal)?,
+            latency_ms: u64::MAX,
+        };
         let receipt = self
             .scope
-            .begin_physical(super::decision_accounting::PhysicalEstimate {
-                purpose: self.purpose.label(),
-                provider,
-                model,
-                body: request.body(),
-                transport_binding: &binding,
-                request_id: self.purpose.label(),
-                deadline: self.scope.deadline(),
-                remaining_attempts: 1,
-            })
+            .begin_physical_within(
+                super::decision_accounting::PhysicalEstimate {
+                    purpose: self.purpose.label(),
+                    provider,
+                    model,
+                    body: request.body(),
+                    transport_binding: &binding,
+                    request_id: self.purpose.label(),
+                    deadline: self.scope.deadline(),
+                    remaining_attempts: 1,
+                },
+                per_call,
+            )
             .await?;
         Ok(receipt.into_provider_receipt())
     }

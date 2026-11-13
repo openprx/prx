@@ -334,6 +334,7 @@ pub(crate) fn analysis_input(
             model_can_chat: true,
             model_can_call_tools: true,
             child_scope: None,
+            child_discovery: false,
         },
         resume_evidence: None,
         state_key: Arc::clone(key),
@@ -373,6 +374,13 @@ async fn decision_advisory_runs_without_turn_decision_service() {
     let key = crate::decision_engine::state::fixtures::key();
     let cancellation = CancellationToken::new();
     for model in ["recording-model", "typesafe/jev-1.13"] {
+        // Each model runs as its own turn in its own workspace: the fixture
+        // scope id is fixed, so a shared workspace cost journal would charge
+        // both attempts to one turn's money limit.
+        let model_workspace = tempfile::tempdir().unwrap();
+        let mut model_config = (*config).clone();
+        model_config.workspace_dir = model_workspace.path().into();
+        let model_config = Arc::new(model_config);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let request_bytes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let factory = DecisionBackendFactory::from_slots(
@@ -391,9 +399,9 @@ async fn decision_advisory_runs_without_turn_decision_service() {
             crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
             crate::decision_engine::prediction::factory::SlotLimits::default(),
         );
-        let advisory = DecisionAdvisory::new(Arc::clone(&config), Some(factory));
+        let advisory = DecisionAdvisory::new(Arc::clone(&model_config), Some(factory));
         let limits = advisory.request_limits();
-        let input = analysis_input(&config, &key, limits);
+        let input = analysis_input(&model_config, &key, limits);
         let scope = Arc::clone(&input.accounting);
         let before = scope.remaining_budgets();
         let analysis = advisory.analyze(input, &cancellation).await;
@@ -401,7 +409,8 @@ async fn decision_advisory_runs_without_turn_decision_service() {
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "{model}: cache miss"
+            "{model}: cache miss; analysis: {analysis:?}; factory: {:?}",
+            advisory.factory().map(DecisionBackendFactory::status)
         );
         // The attempt is charged to the input's scope: the reported 1,200
         // tokens at 0.25 micro-USD per token settle at 300 micro-USD.

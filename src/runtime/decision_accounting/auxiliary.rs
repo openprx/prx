@@ -169,6 +169,10 @@ fn bind_auxiliary_accounting(
         !service.generation.effective.causal_tree.enabled || (service.durable_key && service.recordable),
         "enabled auxiliary accounting requires durable source recording"
     );
+    // Never pay for an auxiliary call of a turn whose main send will be
+    // refused as unpriced (G6): the refusal runs before any paid call. The
+    // call then reserves only what the first serving send leaves (P1-03).
+    let protected = crate::agent::send_admission::protected_first_send(service, proof)?;
     let cleanup = crate::runtime::turn_cleanup::current_tracker()
         .ok_or_else(|| anyhow::anyhow!("auxiliary call has no cleanup owner"))?;
     let scope = context.runtime().accounting.as_ref().map_or_else(
@@ -213,5 +217,6 @@ fn bind_auxiliary_accounting(
         scope,
         purpose,
         context.execution_trace.get_or_init(Default::default).clone(),
+        protected,
     )
 }

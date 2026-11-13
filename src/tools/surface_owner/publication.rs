@@ -268,12 +268,16 @@ impl PublicationRules<'_, '_> {
                 let minted_delegator =
                     delegate && outgoing_child && self.trusted.surface != TurnSurfaceKind::Interactive;
                 // A child's sealed manifest is the tool set its parent chose
-                // for it (the retired child hop's selection, R9): its members
-                // are published like Direct entries, under the same rules.
-                let manifest_member = self
-                    .facts
-                    .child_scope()
-                    .is_some_and(|(manifest, _)| manifest.allowed.contains(&reference));
+                // for it (the retired child hop's selection, R9). A child with
+                // its own discovery control reaches deferred members through
+                // capability_search like any turn (R28); a child without one
+                // could never reach them, so its members are published like
+                // Direct entries, under the same rules.
+                let manifest_member = !self.facts.child_discovery
+                    && self
+                        .facts
+                        .child_scope()
+                        .is_some_and(|(manifest, _)| manifest.allowed.contains(&reference));
                 if !directly_exposed && !minted_delegator && !manifest_member {
                     return None;
                 }

@@ -99,6 +99,7 @@ async fn every_auxiliary_purpose_retains_prepared_parameters_after_success_or_fa
                 accounting_scope,
                 purpose,
                 Default::default(),
+                (0, 0),
             )?;
             let route = RouteDecision::single_candidate_for_context(
                 "openai",

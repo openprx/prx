@@ -24,6 +24,10 @@ pub(crate) struct AdmissionFactsV1 {
     pub(crate) model_can_call_tools: bool,
     /// The restriction inherited by the current worker, never an outgoing one.
     pub(crate) child_scope: Option<(Arc<ChildCapabilityManifest>, Arc<CapabilityConstraints>)>,
+    /// Whether a child turn's own executor carries the live discovery
+    /// control. With it, the child reaches its deferred manifest members
+    /// through `capability_search` (R28); without it, they are published.
+    pub(crate) child_discovery: bool,
 }
 
 impl AdmissionFactsV1 {

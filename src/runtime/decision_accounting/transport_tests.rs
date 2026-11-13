@@ -501,6 +501,7 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
                     Arc::clone(&scope),
                     AuxiliaryPurpose::SignalVision,
                     Default::default(),
+                    (0, 0),
                 )?;
                 let messages = [ChatMessage::user("Explain 2 + 2.")];
                 let result = crate::providers::attempt_accounting::chat_traced(

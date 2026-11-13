@@ -457,6 +457,9 @@ pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<
     let content = String::from_utf8(file.bytes().to_vec())
         .map_err(|_| LifecycleError::ResourceUnavailable(format!("{} is not valid UTF-8", file.path())))?;
     if let Some(task) = task_id {
+        // Loading a managed skill is the model's selection of it: there is
+        // no prediction hop that selects skills before the turn.
+        capture_selection(&store, task, &pin, &request.correlation);
         capture_hydration(&store, task, &pin, file.path(), file.bytes(), &request.correlation);
     }
     let untrusted_origin = verified.bundle.file(UNTRUSTED_ORIGIN_MARKER).is_some();
@@ -468,6 +471,14 @@ pub fn read_managed_resource(request: &ManagedReadRequest<'_>) -> Result<Option<
         content,
         untrusted_origin,
     }))
+}
+
+fn capture_selection(store: &SkillLifecycleStore, task: &str, pin: &PinnedSkillRevision, correlation: &Correlation) {
+    if let Err(error) = store.record_selection_once(task, pin, correlation) {
+        tracing::warn!(%error, task, "failed to record a skill selection receipt");
+        // Lock-free, so it still works when the failure was a lock timeout.
+        store.mark_dropped_evidence(task);
+    }
 }
 
 fn capture_hydration(

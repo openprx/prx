@@ -65,8 +65,6 @@ use crate::config::ConfigGeneration;
 use crate::decision_engine::prediction::factory::DecisionTransports;
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
 use crate::decision_engine::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
-#[cfg(test)]
-use crate::decision_engine::state::{ObservedStepKind, ObservedStepStatus};
 use crate::memory::Memory;
 use crate::observability::causal_event::CausalEventSink;
 use crate::providers::catalog::{CatalogView as ProviderCatalogView, ResolvedModel};
@@ -911,6 +909,8 @@ impl TurnDecisionService {
                 let (manifest, constraints) = scope.gate_inputs();
                 (Arc::new(manifest.clone()), Arc::new(constraints.clone()))
             }),
+            child_discovery: proof.child_scope().is_some()
+                && self.execution.current_descriptor("capability_search").is_some(),
         };
         // The published surface is an execution rule over the pinned scope,
         // the admission facts and the catalog (R28).

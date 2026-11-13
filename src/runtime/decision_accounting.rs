@@ -308,7 +308,7 @@ impl AccountingScope {
     /// `begin_physical` with a per-call bound no larger than this scope's
     /// own budgets: the attempt still charges the shared owner, but it may
     /// reserve at most `per_call` tokens and micro-USD.
-    async fn begin_physical_within(
+    pub(super) async fn begin_physical_within(
         &self,
         attempt: PhysicalEstimate<'_>,
         per_call: TurnBudgets,

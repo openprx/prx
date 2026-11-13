@@ -105,6 +105,71 @@ pub(crate) fn call_token_budget(
     ))
 }
 
+/// The first serving send's protected admission `(tokens, micro_usd)` for a
+/// paid auxiliary call (Signal vision, the smart-group classifier): the G6
+/// answer estimate and the price of the largest prompt the send may carry
+/// plus its response reserve (P1-03).
+///
+/// Refuses first, as [`admit_provider_send`] would, when the served model has
+/// no usable price, so a turn whose main send will be refused never pays for
+/// an auxiliary call.
+pub(crate) fn protected_first_send(service: &TurnDecisionService, proof: &dyn TurnSourceProof) -> Result<(u64, u64)> {
+    let limits = service
+        .send_limits(proof)
+        .context("provider send budget cannot be established")?;
+    let invalid = matches!(
+        crate::llm::route_decision::usage_cost_resolution(
+            limits.model.provider_label(),
+            limits.model.model(),
+            0,
+            0,
+            0,
+            0,
+            &limits.cost,
+        ),
+        crate::llm::route_decision::UsagePrice::Invalid
+    );
+    let refusal = unpriced_refusal(&limits.model, &limits.cost)
+        .or_else(|| invalid.then_some(crate::agent::refusal::RefusalReason::Budget));
+    if let Some(reason) = refusal {
+        return Err(ProviderSendRefused {
+            reason,
+            diagnostic: "provider send refused: the served model has no usable price".to_owned(),
+        }
+        .into());
+    }
+    let estimate = crate::cost::estimate::estimate_request_cost(
+        &limits.model,
+        &limits.cost,
+        u64::try_from(limits.main_input_limit).unwrap_or(u64::MAX),
+        u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
+    )
+    .ok_or_else(|| ProviderSendRefused {
+        reason: crate::agent::refusal::RefusalReason::Budget,
+        diagnostic: "provider send refused: the request cost cannot be estimated".to_owned(),
+    })?;
+    Ok((crate::cost::estimate::candidate_tokens(0), estimate.micro_usd))
+}
+
+/// The refusal reason when `cost` holds an invalid price row, or `model` has
+/// no price row and is not zero-price exempt.
+fn unpriced_refusal(
+    model: &crate::providers::catalog::ResolvedModel,
+    cost: &crate::config::schema::CostConfig,
+) -> Option<crate::agent::refusal::RefusalReason> {
+    use crate::agent::refusal::RefusalReason;
+    use crate::llm::route_decision::UsagePrice;
+    if !cost.prices.values().all(|price| price.is_finite_nonnegative()) {
+        return Some(RefusalReason::InvalidPrice);
+    }
+    let missing = matches!(
+        crate::llm::route_decision::usage_cost_resolution(model.provider_label(), model.model(), 0, 0, 0, 0, cost),
+        UsagePrice::Missing
+    );
+    (missing && !crate::cost::estimate::zero_price_exempt(model))
+        .then(|| crate::agent::refusal::unpriced_reason(model.provider_label(), model.model()))
+}
+
 /// Refuses the send unless it fits G6 and the remaining spend. Nothing is sent
 /// or debited here; decision-attempt token reservation and settlement are
 /// unchanged.
@@ -164,26 +229,7 @@ pub(crate) fn admit_provider_send(
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
     )
     .ok_or_else(|| {
-        use crate::agent::refusal::RefusalReason;
-        let reason = if !cost.prices.values().all(|price| price.is_finite_nonnegative()) {
-            RefusalReason::InvalidPrice
-        } else if matches!(
-            crate::llm::route_decision::usage_cost_resolution(
-                limits.model.provider_label(),
-                limits.model.model(),
-                0,
-                0,
-                0,
-                0,
-                &cost,
-            ),
-            crate::llm::route_decision::UsagePrice::Missing
-        ) && !crate::cost::estimate::zero_price_exempt(&limits.model)
-        {
-            crate::agent::refusal::unpriced_reason(limits.model.provider_label(), limits.model.model())
-        } else {
-            RefusalReason::Budget
-        };
+        let reason = unpriced_refusal(&limits.model, &cost).unwrap_or(crate::agent::refusal::RefusalReason::Budget);
         ProviderSendRefused {
             reason,
             diagnostic: "provider send refused: the request cost cannot be estimated".to_owned(),
