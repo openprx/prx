@@ -468,14 +468,24 @@ async fn advancing_the_logical_latency_budget_degrades_clarify_to_plain_answer()
         .expect("test: Clarify degrades to serving answer");
     assert_eq!(reply, "plain answer", "test: serving reply is published");
     assert_eq!(world.loopback.requests(), 1, "test: exactly one serving request");
+    let costs =
+        crate::cost::tracker::workspace_cost_report(&world.ws).expect("test: durable serving settlement is readable");
+    assert_eq!(costs.all_time.requests, 1, "test: exactly one answer call is settled");
     assert_eq!(
-        crate::cost::tracker::settle_metered_call_count(&world.ws),
-        1,
-        "test: answer call is settled"
+        costs.all_time.total_tokens, 2,
+        "test: reported serving usage is retained"
     );
     assert!(
-        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: budget")
-            <= remaining,
+        costs.all_time.cost_usd > 0.0,
+        "test: the serving reply is charged normally"
+    );
+    assert_eq!(costs.reserved_requests, 0, "test: no unused reservation remains");
+    assert_eq!(
+        costs.unsettled_dispatched_requests, 0,
+        "test: the dispatched call is settled"
+    );
+    assert!(
+        crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, &world.ws).expect("test: budget") < remaining,
         "test: normal answer budget accounting"
     );
     let decisions = rusqlite::Connection::open_with_flags(
@@ -487,5 +497,8 @@ async fn advancing_the_logical_latency_budget_degrades_clarify_to_plain_answer()
     assert!(rows > 0, "test: degraded turn retains its terminal accounting row");
     let retained: i64 = decisions.query_row("SELECT COUNT(*) FROM outcomes JOIN decisions USING(decision_id) WHERE directive_kind = 'clarify' AND abstention_reason = 'deadline_exceeded'", [], |row| row.get(0)).expect("test: abstention accounting");
     assert!(retained > 0, "test: outcome retains clarify and original reason");
-    assert_eq!(executed, 0, "test: no tool execution may appear in the refused outcome");
+    assert_eq!(
+        executed, 0,
+        "test: no tool execution may appear in the degraded outcome"
+    );
 }
