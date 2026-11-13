@@ -1,16 +1,16 @@
 use super::delegation;
 use super::{
     AllowedToolProxy, AnnounceOrigin, DEFAULT_SUB_AGENT_SYSTEM_PROMPT, HistoryEntry, MemoryScope, OutboundNotice,
-    PROCESS_OWNER_PANICKED_PREFIX, ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome,
-    SPAWN_EXECUTION_CONTEXT, STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun,
-    SubAgentStatus, TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_owner_failure_if_unfinalized,
-    commit_process_terminal_state, current_spawn_execution_context, deliver_or_withhold_notice,
-    exited_without_result_reason, format_announce_message, new_process_mode_run, normalize_process_memory_strategy,
-    parse_memory_scope, parse_spawn_scope, process_terminal, record_spawn_request_event, record_spawn_result_event,
-    refresh_tools_for_explicit_allowlist, register_killable_process_run, resolve_child_provider_api_key,
-    resolve_tools_for_agent, run_sub_agent_process, run_sub_agent_task, running_run_count, spawn_completion_note,
-    spawn_event_scope, spawn_lineage, spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason,
-    task_terminal, termination_cause, watch_process_mode_monitor, watch_task_mode_monitor,
+    ProcessFinalization, ProcessModeRunSeed, ProcessRunControl, ProcessWorkerOutcome, SPAWN_EXECUTION_CONTEXT,
+    STEER_CHANNEL_CAPACITY, SessionsSpawnTool, SpawnExecutionContext, SpawnScope, SubAgentRun, SubAgentStatus,
+    TaskRunControl, TerminationCause, boxed_spawn_field, commit_process_terminal_state,
+    current_spawn_execution_context, deliver_or_withhold_notice, exited_without_result_reason, format_announce_message,
+    new_process_mode_run, normalize_process_memory_strategy, parse_memory_scope, parse_spawn_scope, process_terminal,
+    record_spawn_request_event, record_spawn_result_event, refresh_tools_for_explicit_allowlist,
+    register_killable_process_run, resolve_child_provider_api_key, resolve_tools_for_agent, run_sub_agent_process,
+    run_sub_agent_task, running_run_count, spawn_completion_note, spawn_event_scope, spawn_lineage,
+    spawn_session_scope_key, sub_agent_reported_failure, task_failure_reason, task_terminal, termination_cause,
+    watch_process_mode_monitor, watch_task_mode_monitor,
 };
 use crate::providers;
 use crate::security::SideEffectGate;
@@ -18,7 +18,6 @@ use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::tools::traits::{Tool, ToolResult};
 use anyhow::Context as _;
 use chrono::Utc;
-use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -1005,323 +1004,307 @@ impl SessionsSpawnTool {
                 SPAWN_EXECUTION_CONTEXT.scope(
                     process_execution_ctx,
                     crate::agent::idle::scope_beat(Some(Arc::clone(&monitor_progress)), async move {
-                        let failure_active_runs = active_runs.clone();
-                        let failure_run_id = rid.clone();
-                        let monitor_result = std::panic::AssertUnwindSafe(async {
-                            tracing::info!(run_id = %rid, "Sub-agent process starting");
+                        tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                            let mut worker_result = run_sub_agent_process(
-                                &rid,
-                                &task_owned,
-                                &provider_name,
-                                &model,
-                                api_key.as_deref(),
-                                route_hint.as_deref(),
-                                route_source_provider.as_deref(),
-                                route_credential.as_ref(),
-                                route_uses_root_connection,
-                                direct_uses_root_connection,
-                                temperature,
-                                temperature_override,
-                                &workspace_root,
-                                &worker_workspace_root,
-                                identity_dir.as_deref(),
-                                process_system_prompt.as_deref(),
-                                &allowed_tools,
-                                keep_workspace,
-                                process_scope.as_ref(),
-                                process_spawn_depth,
-                                &process_session_scope_key,
-                                process_parent_run_id.as_deref(),
-                                process_agent_id.as_deref(),
-                                &process_lineage,
-                                &process_memory_strategy,
-                                &process_memory_backend,
-                                &process_config_dir,
-                                &process_config_generation,
-                                process_event_recording,
-                                &process_compaction_config,
-                                &process_channel_exclusions,
-                                monitor_process_control.as_ref(),
-                                process_steer_rx,
-                                history_arc,
-                                Arc::clone(&monitor_progress),
-                                process_provider_selection.as_ref(),
-                                process_memory_fabric.as_ref(),
-                                monitor_recovery.as_deref(),
-                                process_source_launch,
-                                process_batch_id.as_deref(),
-                                process_worker_mailbox.as_ref(),
-                                #[cfg(test)]
-                                test_worker_executable.as_ref(),
-                            )
-                            .await;
-
-                            let recovered_usage = if matches!(
-                                &worker_result,
-                                Ok(ProcessWorkerOutcome::Terminated(_) | ProcessWorkerOutcome::ExitedWithoutResult(_))
-                            ) {
-                                let context = current_spawn_execution_context();
-                                if let Some(grant) = context.as_ref().and_then(|value| value.incoming_grant.as_ref()) {
-                                    let recovery = async {
-                                        let fabric = process_memory_fabric.as_ref().context("worker recovery storage missing")?;
-                                        let input = context.as_ref().and_then(|value| value.input_receipt.as_deref())
-                                            .context("worker recovery input missing")?;
-                                        if let Some(completion) = process_terminal::recover_completion(fabric, grant, input).await? {
-                                            Ok::<_, anyhow::Error>((Some(completion), None))
-                                        } else {
-                                            let usage = process_terminal::recover_usage(fabric, grant, input).await?;
-                                            Ok((None, Some(usage)))
-                                        }
-                                    }.await;
-                                    match recovery {
-                                        Ok((completion, usage)) => {
-                                            if let Some(completion) = completion {
-                                                worker_result = Ok(ProcessWorkerOutcome::VerifiedFinished(completion));
-                                            }
-                                            usage
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(run_id = %rid, error = %error,
-                                                "worker interruption settlement remains unconfirmed");
-                                            return;
-                                        }
-                                    }
-                                } else { None }
-                            } else { None };
-                            let (status, mut result_text, mut token_usage_records, finalization) = match worker_result {
-                                Ok(ProcessWorkerOutcome::VerifiedFinished(completion)) => {
-                                    *monitor_verified_terminal.lock() = Some(completion.clone());
-                                    let (result, usage) = completion.into_parts();
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (
-                                            SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                            format!("Sub-agent error: {error}"),
-                                        )
-                                    };
-                                    (status, text, usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
-                                    *monitor_ordinary_terminal.lock() = Some(completion.clone());
-                                    let result = completion.result;
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
-                                    };
-                                    (status, text, completion.usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion)) => {
-                                    *monitor_operator_terminal.lock() = Some(completion.clone());
-                                    let result = completion.result;
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
-                                    };
-                                    (status, text, completion.usage, ProcessFinalization::Natural)
-                                }
-                                Ok(ProcessWorkerOutcome::VerifiedStartupFailure(result)) => {
-                                    let error = result.error.context("verified startup failure detail missing");
-                                    let error = match error {
-                                        Ok(error) => error,
-                                        Err(error) => {
-                                            tracing::error!(run_id = %rid, error = %error, "verified startup result invalid");
-                                            return;
-                                        }
-                                    };
-                                    (
-                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                        format!("Sub-agent startup error: {error}"),
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::UnverifiedStartupFailure(_)) => {
-                                    tracing::error!(run_id = %rid, "unverified startup failure escaped process owner");
-                                    return;
-                                }
-                                Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
-                                    let token_usage_records = result
-                                        .tokens_used
-                                        .as_ref()
-                                        .and_then(|usage| {
-                                            crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                                                &provider_name,
-                                                &model,
-                                                usage,
-                                                &process_cost_config,
-                                            )
-                                        })
-                                        .into_iter()
-                                        .collect::<Vec<_>>();
-                                    (
-                                        SubAgentStatus::Completed(result.output.clone()),
-                                        result.output,
-                                        token_usage_records,
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::Finished(result)) => {
-                                    let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                                    let msg = format!("Sub-agent error: {error}");
-                                    // `result.error` is a field of the JSON the
-                                    // worker itself printed, so it is the run's
-                                    // account of the run — quarantined here so
-                                    // it cannot pass for a runtime wording in
-                                    // `termination_cause`. The announcement
-                                    // above still shows the raw account.
-                                    (
-                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::Terminated(reason)) => {
-                                    let msg = format!("Sub-agent process terminated: {reason}");
-                                    (
-                                        SubAgentStatus::Failed(reason),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::Terminated,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::OrdinaryInterrupted { detail, usage }) => {
-                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
-                                        exited_without_result_reason(&detail), usage.unfinished_segments);
-                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
-                                        usage.records, ProcessFinalization::Unconfirmed)
-                                }
-                                Ok(ProcessWorkerOutcome::OperatorInterrupted { detail, usage }) => {
-                                    let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
-                                        exited_without_result_reason(&detail), usage.unfinished_segments);
-                                    (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
-                                        usage.records, ProcessFinalization::Unconfirmed)
-                                }
-                                Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
-                                    // MUTATION GUARD: folding this back into the
-                                    // generic parse-error path loses the only
-                                    // wording an operator can act on, and folding it
-                                    // into "keep waiting" would leave the run
-                                    // `Running` for as long as the process lives.
-                                    let error = exited_without_result_reason(&detail);
-                                    let msg = format!("Sub-agent process error: {error}");
-                                    (
-                                        SubAgentStatus::Failed(error),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::Natural,
-                                    )
-                                }
-                                Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
-                                    let msg = format!("Sub-agent process termination failed: {error}");
-                                    (
-                                        SubAgentStatus::Failed(error),
-                                        msg,
-                                        Vec::new(),
-                                        ProcessFinalization::TerminationFailed,
-                                    )
-                                }
-                                Err(error) => {
-                                    let detail = super::failure::llm_visible_error(&format!("{error:#}"));
-                                    let msg = format!("Sub-agent process error: {detail}");
-                                    (
-                                        SubAgentStatus::Failed(detail),
-                                        msg,
-                                        Vec::new(),
-                                        if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
-                                            .is_some_and(|context| context.incoming_grant.is_some()) {
-                                            ProcessFinalization::Unconfirmed
-                                        } else { ProcessFinalization::Natural },
-                                    )
-                                }
-                            };
-
-                            if let Some(recovered) = recovered_usage {
-                                token_usage_records.extend(recovered.records);
-                                result_text.push_str(&format!(
-                                    "; provider usage may be incomplete ({} recorded segments lack terminals)",
-                                    recovered.unfinished_segments,
-                                ));
-                            }
-
-                            let announce = format_announce_message(&rid, &status, &result_text);
-                            if let Err(error) = commit_process_terminal_state(
-                                &active_runs,
-                                &rid,
-                                status.clone(),
-                                token_usage_records,
-                                monitor_process_control.as_ref(),
-                                finalization,
-                                None,
-                                #[cfg(test)]
-                                None,
-                            )
-                            .await {
-                                tracing::error!(run_id = %rid, error = %error, "process terminal registry commit remains unconfirmed");
-                                return;
-                            }
-                            if finalization == ProcessFinalization::Unconfirmed {
-                                return;
-                            }
-                            record_spawn_result_event(
-                                process_memory_fabric.as_ref(),
-                                process_result_scope,
-                                &result_text,
-                                &status,
-                                &process_lineage,
-                                (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
-                            )
-                            .await;
-
-                            if !announce_result {
-                                tracing::debug!(
-                                    run_id = %rid,
-                                    "Sub-agent process result withheld from the channel (announce=false); \
-                                     it is delivered to whoever joins this run's batch"
-                                );
-                            } else if let Some(target) = recipient {
-                                // Not a mirror of the task-mode block any more:
-                                // the same function, so the gate this path gets
-                                // is literally the gate the task-mode tests
-                                // exercise. Driving a real process-mode
-                                // announcement from a unit test is impossible
-                                // (the worker re-execs `current_exe`, which under
-                                // `cargo test` is the test binary), so sharing the
-                                // implementation is what covers it.
-                                deliver_or_withhold_notice(
-                                    &process_announce_security,
-                                    process_announce_origin.as_ref(),
-                                    channel.as_ref(),
-                                    &process_announce_history,
-                                    &rid,
-                                    &target,
-                                    &announce,
-                                    OutboundNotice::ProcessRunResult,
-                                )
-                                .await;
-                            }
-
-                            tracing::info!(run_id = %rid, "Sub-agent process finished");
-                        })
-                        .catch_unwind()
+                        let mut worker_result = run_sub_agent_process(
+                            &rid,
+                            &task_owned,
+                            &provider_name,
+                            &model,
+                            api_key.as_deref(),
+                            route_hint.as_deref(),
+                            route_source_provider.as_deref(),
+                            route_credential.as_ref(),
+                            route_uses_root_connection,
+                            direct_uses_root_connection,
+                            temperature,
+                            temperature_override,
+                            &workspace_root,
+                            &worker_workspace_root,
+                            identity_dir.as_deref(),
+                            process_system_prompt.as_deref(),
+                            &allowed_tools,
+                            keep_workspace,
+                            process_scope.as_ref(),
+                            process_spawn_depth,
+                            &process_session_scope_key,
+                            process_parent_run_id.as_deref(),
+                            process_agent_id.as_deref(),
+                            &process_lineage,
+                            &process_memory_strategy,
+                            &process_memory_backend,
+                            &process_config_dir,
+                            &process_config_generation,
+                            process_event_recording,
+                            &process_compaction_config,
+                            &process_channel_exclusions,
+                            monitor_process_control.as_ref(),
+                            process_steer_rx,
+                            history_arc,
+                            Arc::clone(&monitor_progress),
+                            process_provider_selection.as_ref(),
+                            process_memory_fabric.as_ref(),
+                            monitor_recovery.as_deref(),
+                            process_source_launch,
+                            process_batch_id.as_deref(),
+                            process_worker_mailbox.as_ref(),
+                            #[cfg(test)]
+                            test_worker_executable.as_ref(),
+                        )
                         .await;
 
-                        if monitor_result.is_err() {
-                            commit_process_owner_failure_if_unfinalized(
-                                &failure_active_runs,
-                                &failure_run_id,
-                                monitor_process_control.as_ref(),
-                                PROCESS_OWNER_PANICKED_PREFIX.to_string(),
+                        let recovered_usage = if matches!(
+                            &worker_result,
+                            Ok(ProcessWorkerOutcome::Terminated(_) | ProcessWorkerOutcome::ExitedWithoutResult(_))
+                        ) {
+                            let context = current_spawn_execution_context();
+                            if let Some(grant) = context.as_ref().and_then(|value| value.incoming_grant.as_ref()) {
+                                let recovery = async {
+                                    let fabric = process_memory_fabric.as_ref().context("worker recovery storage missing")?;
+                                    let input = context.as_ref().and_then(|value| value.input_receipt.as_deref())
+                                        .context("worker recovery input missing")?;
+                                    if let Some(completion) = process_terminal::recover_completion(fabric, grant, input).await? {
+                                        Ok::<_, anyhow::Error>((Some(completion), None))
+                                    } else {
+                                        let usage = process_terminal::recover_usage(fabric, grant, input).await?;
+                                        Ok((None, Some(usage)))
+                                    }
+                                }.await;
+                                match recovery {
+                                    Ok((completion, usage)) => {
+                                        if let Some(completion) = completion {
+                                            worker_result = Ok(ProcessWorkerOutcome::VerifiedFinished(completion));
+                                        }
+                                        usage
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(run_id = %rid, error = %error,
+                                            "worker interruption settlement remains unconfirmed");
+                                        return;
+                                    }
+                                }
+                            } else { None }
+                        } else { None };
+                        let (status, mut result_text, mut token_usage_records, finalization) = match worker_result {
+                            Ok(ProcessWorkerOutcome::VerifiedFinished(completion)) => {
+                                *monitor_verified_terminal.lock() = Some(completion.clone());
+                                let (result, usage) = completion.into_parts();
+                                let (status, text) = if result.success {
+                                    (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                } else {
+                                    let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
+                                    (
+                                        SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
+                                        format!("Sub-agent error: {error}"),
+                                    )
+                                };
+                                (status, text, usage, ProcessFinalization::Natural)
+                            }
+                            Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
+                                *monitor_ordinary_terminal.lock() = Some(completion.clone());
+                                let result = completion.result;
+                                let (status, text) = if result.success {
+                                    (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                } else {
+                                    let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
+                                    (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
+                                };
+                                (status, text, completion.usage, ProcessFinalization::Natural)
+                            }
+                            Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(completion)) => {
+                                *monitor_operator_terminal.lock() = Some(completion.clone());
+                                let result = completion.result;
+                                let (status, text) = if result.success {
+                                    (SubAgentStatus::Completed(result.output.clone()), result.output)
+                                } else {
+                                    let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
+                                    (SubAgentStatus::Failed(sub_agent_reported_failure(&error)), format!("Sub-agent error: {error}"))
+                                };
+                                (status, text, completion.usage, ProcessFinalization::Natural)
+                            }
+                            Ok(ProcessWorkerOutcome::VerifiedStartupFailure(result)) => {
+                                let error = result.error.context("verified startup failure detail missing");
+                                let error = match error {
+                                    Ok(error) => error,
+                                    Err(error) => {
+                                        tracing::error!(run_id = %rid, error = %error, "verified startup result invalid");
+                                        return;
+                                    }
+                                };
+                                (
+                                    SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
+                                    format!("Sub-agent startup error: {error}"),
+                                    Vec::new(),
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::UnverifiedStartupFailure(_)) => {
+                                tracing::error!(run_id = %rid, "unverified startup failure escaped process owner");
+                                return;
+                            }
+                            Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
+                                let token_usage_records = result
+                                    .tokens_used
+                                    .as_ref()
+                                    .and_then(|usage| {
+                                        crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                                            &provider_name,
+                                            &model,
+                                            usage,
+                                            &process_cost_config,
+                                        )
+                                    })
+                                    .into_iter()
+                                    .collect::<Vec<_>>();
+                                (
+                                    SubAgentStatus::Completed(result.output.clone()),
+                                    result.output,
+                                    token_usage_records,
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::Finished(result)) => {
+                                let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                                let msg = format!("Sub-agent error: {error}");
+                                // `result.error` is a field of the JSON the
+                                // worker itself printed, so it is the run's
+                                // account of the run — quarantined here so
+                                // it cannot pass for a runtime wording in
+                                // `termination_cause`. The announcement
+                                // above still shows the raw account.
+                                (
+                                    SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::Terminated(reason)) => {
+                                let msg = format!("Sub-agent process terminated: {reason}");
+                                (
+                                    SubAgentStatus::Failed(reason),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Terminated,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::OrdinaryInterrupted { detail, usage }) => {
+                                let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
+                                    exited_without_result_reason(&detail), usage.unfinished_segments);
+                                (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
+                                    usage.records, ProcessFinalization::Unconfirmed)
+                            }
+                            Ok(ProcessWorkerOutcome::OperatorInterrupted { detail, usage }) => {
+                                let error = format!("{}; cleanup and provider usage remain unconfirmed; {} visible segments lack a terminal",
+                                    exited_without_result_reason(&detail), usage.unfinished_segments);
+                                (SubAgentStatus::Failed(error.clone()), format!("Sub-agent process error: {error}"),
+                                    usage.records, ProcessFinalization::Unconfirmed)
+                            }
+                            Ok(ProcessWorkerOutcome::ExitedWithoutResult(detail)) => {
+                                // MUTATION GUARD: folding this back into the
+                                // generic parse-error path loses the only
+                                // wording an operator can act on, and folding it
+                                // into "keep waiting" would leave the run
+                                // `Running` for as long as the process lives.
+                                let error = exited_without_result_reason(&detail);
+                                let msg = format!("Sub-agent process error: {error}");
+                                (
+                                    SubAgentStatus::Failed(error),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::Natural,
+                                )
+                            }
+                            Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
+                                let msg = format!("Sub-agent process termination failed: {error}");
+                                (
+                                    SubAgentStatus::Failed(error),
+                                    msg,
+                                    Vec::new(),
+                                    ProcessFinalization::TerminationFailed,
+                                )
+                            }
+                            Err(error) => {
+                                let detail = super::failure::llm_visible_error(&format!("{error:#}"));
+                                let msg = format!("Sub-agent process error: {detail}");
+                                (
+                                    SubAgentStatus::Failed(detail),
+                                    msg,
+                                    Vec::new(),
+                                    if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
+                                        .is_some_and(|context| context.incoming_grant.is_some()) {
+                                        ProcessFinalization::Unconfirmed
+                                    } else { ProcessFinalization::Natural },
+                                )
+                            }
+                        };
+
+                        if let Some(recovered) = recovered_usage {
+                            token_usage_records.extend(recovered.records);
+                            result_text.push_str(&format!(
+                                "; provider usage may be incomplete ({} recorded segments lack terminals)",
+                                recovered.unfinished_segments,
+                            ));
+                        }
+
+                        let announce = format_announce_message(&rid, &status, &result_text);
+                        if let Err(error) = commit_process_terminal_state(
+                            &active_runs,
+                            &rid,
+                            status.clone(),
+                            token_usage_records,
+                            monitor_process_control.as_ref(),
+                            finalization,
+                            None,
+                            #[cfg(test)]
+                            None,
+                        )
+                        .await {
+                            tracing::error!(run_id = %rid, error = %error, "process terminal registry commit remains unconfirmed");
+                            return;
+                        }
+                        if finalization == ProcessFinalization::Unconfirmed {
+                            return;
+                        }
+                        record_spawn_result_event(
+                            process_memory_fabric.as_ref(),
+                            process_result_scope,
+                            &result_text,
+                            &status,
+                            &process_lineage,
+                            (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                        )
+                        .await;
+
+                        if !announce_result {
+                            tracing::debug!(
+                                run_id = %rid,
+                                "Sub-agent process result withheld from the channel (announce=false); \
+                                 it is delivered to whoever joins this run's batch"
+                            );
+                        } else if let Some(target) = recipient {
+                            // Not a mirror of the task-mode block any more:
+                            // the same function, so the gate this path gets
+                            // is literally the gate the task-mode tests
+                            // exercise. Driving a real process-mode
+                            // announcement from a unit test is impossible
+                            // (the worker re-execs `current_exe`, which under
+                            // `cargo test` is the test binary), so sharing the
+                            // implementation is what covers it.
+                            deliver_or_withhold_notice(
+                                &process_announce_security,
+                                process_announce_origin.as_ref(),
+                                channel.as_ref(),
+                                &process_announce_history,
+                                &rid,
+                                &target,
+                                &announce,
+                                OutboundNotice::ProcessRunResult,
                             )
                             .await;
                         }
+
+                        tracing::info!(run_id = %rid, "Sub-agent process finished");
                     }),
                 ),
             ));

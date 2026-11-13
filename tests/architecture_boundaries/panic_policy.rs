@@ -189,6 +189,56 @@ pub(super) fn production_has_no_panic_shortcuts() {
     assert_inventory("panic-free production", actual, &[]);
 }
 
+fn catches_unwind(source: &str) -> bool {
+    source
+        .replace("r#", "")
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == "catch_unwind")
+}
+
+#[test]
+pub(super) fn production_has_no_catch_unwind() {
+    let modules = test_module_files();
+    let mut actual = Vec::new();
+    for path in rust_source_files() {
+        let relative = relative_path(&path);
+        let raw = read_source(&path);
+        if is_test_code_file(&relative, &raw, &modules) {
+            continue;
+        }
+        let production = production_text(&blank_comments_and_literals(&raw));
+        if catches_unwind(&production) {
+            actual.push(relative);
+        }
+    }
+    assert_inventory("production catch_unwind", actual, &[]);
+}
+
+#[test]
+fn catch_unwind_probe_detects_production_and_exempts_tests() {
+    for source in [
+        "fn probe() { std::panic::catch_unwind(work); }",
+        "async fn probe() { work.catch_unwind().await; }",
+        "fn probe() { let catcher = std::panic::r#catch_unwind; }",
+    ] {
+        assert!(
+            catches_unwind(&production_text(&blank_comments_and_literals(source))),
+            "test: planted production catch must fail the inventory: {source}"
+        );
+    }
+    for source in [
+        "#[cfg(test)] mod tests { fn probe() { std::panic::catch_unwind(work); } }",
+        "#[cfg(test)] async fn probe() { work.catch_unwind().await; }",
+        "#![cfg(all(test, unix))] fn probe() { work.catch_unwind(); }",
+        "fn probe() { /* catch_unwind */ let label = \"catch_unwind\"; }",
+    ] {
+        assert!(
+            !catches_unwind(&production_text(&blank_comments_and_literals(source))),
+            "test: test-only code and literal decoys must be exempt: {source}"
+        );
+    }
+}
+
 // Ratchet for part B. No new file may acquire catch_unwind. Remove entries
 // as their last use disappears; never add an entry to bypass this guard.
 const CATCH_UNWIND_FILES: &[&str] = &[
@@ -246,8 +296,6 @@ const CATCH_UNWIND_FILES: &[&str] = &[
     "src/runtime/turn_decision/tests/performance/witness_mutations.rs",
     "src/tools/delegate.rs",
     "src/tools/delegate_diagnostic.rs",
-    "src/tools/sessions_spawn/process_mode.rs",
-    "src/tools/sessions_spawn/spawn.rs",
     "src/tools/sessions_spawn/tests/lineage.rs",
     "src/tools/sessions_spawn/tests/owned_child.rs",
 ];

@@ -1,8 +1,8 @@
 use super::{
     HistoryEntry, OwnedProcessGroup, OwnedProcessPhase, PROCESS_MEMORY_STRATEGY_HYBRID,
-    PROCESS_MEMORY_STRATEGY_ISOLATED, PROCESS_MEMORY_STRATEGY_SHARED, PROCESS_OWNER_PANICKED_PREFIX, ProcessRunControl,
-    ProcessWorkerOutcome, SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV, SpawnLineage, SpawnScope,
-    WorkerSteerPipe, build_session_worker_cli_args, build_session_worker_manifest, cleanup_owned_child_after_panic,
+    PROCESS_MEMORY_STRATEGY_ISOLATED, PROCESS_MEMORY_STRATEGY_SHARED, ProcessRunControl, ProcessWorkerOutcome,
+    SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV, SpawnLineage, SpawnScope, WorkerSteerPipe,
+    build_session_worker_cli_args, build_session_worker_manifest, cleanup_owned_child_after_panic,
     cleanup_process_worker_workspace, copy_dir_recursive, current_spawn_execution_context, describe_worker_exit,
     normalize_process_memory_strategy, private_worker_memory_db_path, process_terminal, recover_operator_interruption,
     recover_ordinary_interruption, run_spawned_child_lifecycle, session_worker_signing_key,
@@ -16,7 +16,6 @@ use crate::config::AgentCompactionConfig;
 use crate::memory::{MemoryEventRecording, MemoryFabric};
 use crate::providers;
 use anyhow::Context as _;
-use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -417,7 +416,7 @@ pub(super) async fn run_sub_agent_process(
         process_group.termination_calls = Some(Arc::clone(&control.termination_calls));
         process_group.protocol_diagnostic = Some(Arc::clone(&control.diagnostic));
     }
-    let owned_phase = std::panic::AssertUnwindSafe(async {
+    let owned_phase = async {
         if let Some(recovery) = recovery {
             recovery
                 .persist_launch(child.id().context("worker process id unavailable before launch")?)
@@ -498,15 +497,14 @@ pub(super) async fn run_sub_agent_process(
             protocol,
         )
         .await
-    })
-    .catch_unwind()
+    }
     .await;
     // Confirm the leader's reap only on branches with actual cleanup evidence.
     // Failed cleanup keeps the process ledger row and workspace available for
     // recovery; a returned lifecycle result alone is not acknowledgement.
     let owned_phase = match owned_phase {
-        Ok(Ok(phase)) => phase,
-        Ok(Err(error)) => {
+        Ok(phase) => phase,
+        Err(error) => {
             let cleanup = cleanup_owned_child_after_panic(
                 &mut child,
                 &mut process_group,
@@ -553,50 +551,6 @@ pub(super) async fn run_sub_agent_process(
             }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Err(error);
-        }
-        Err(_) => {
-            let cleanup = cleanup_owned_child_after_panic(
-                &mut child,
-                &mut process_group,
-                #[cfg(test)]
-                false,
-            )
-            .await;
-            #[cfg(test)]
-            if let Some(control) = protocol {
-                let mut diagnostic = control.diagnostic.lock();
-                diagnostic.lifecycle_class = Some("monitor_panic");
-                diagnostic.panic_cleanup_class = Some(match &cleanup {
-                    Ok(()) => "cleanup_returned_ok",
-                    Err(error) => test_worker_cleanup_error_class(error),
-                });
-            }
-            cleanup.map_err(|error| anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; cleanup failed: {error:#}"))?;
-            worker_registration.mark_reaped();
-            if let Some(binding) = mailbox_binding.as_mut() {
-                binding.joined();
-            }
-            #[cfg(test)]
-            if let Some(control) = protocol {
-                control.diagnostic.lock().registration_marked_reaped = true;
-            }
-            #[cfg(unix)]
-            prepared_manifest
-                .close()
-                .with_context(|| {
-                    format!(
-                        "close worker manifest snapshot in `{}`",
-                        manifest.workspace_dir.display()
-                    )
-                })
-                .map_err(|cleanup_error| {
-                    anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; snapshot cleanup failed: {cleanup_error:#}")
-                })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
-            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
-            anyhow::bail!("{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child");
         }
     };
     let (status, stdout, stderr) = match owned_phase {

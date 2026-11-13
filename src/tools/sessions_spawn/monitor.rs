@@ -198,10 +198,9 @@ pub(crate) async fn attach_test_task_mode_owner(
 
 /// Process-mode counterpart of [`watch_task_mode_monitor`].
 ///
-/// Routes through [`commit_process_owner_failure_if_unfinalized`] so the run's
-/// `ProcessRunControl` is finalized together with the status — a caller parked
-/// on finalization must not be stranded by the very cancellation that ended the
-/// monitor.
+/// Recovers verified terminal state after joining the monitor. If settlement
+/// remains unconfirmed, publishes a failed status and unconfirmed finalization
+/// so callers waiting on the owner are released.
 pub(super) fn watch_process_mode_monitor(
     handle: tokio::task::JoinHandle<()>,
     active_runs: Arc<RwLock<Vec<SubAgentRun>>>,

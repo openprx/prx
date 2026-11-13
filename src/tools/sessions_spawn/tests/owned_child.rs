@@ -492,33 +492,6 @@ async fn injected_panic_cleanup_try_wait_error_keeps_owner_pending() {
 }
 
 #[tokio::test]
-async fn owner_panic_commits_failed_registry_state_before_finalization() {
-    let control = ProcessRunControl::new();
-    let mut run = restore_test_run("process-run", SubAgentStatus::Running);
-    run.process_control = Some(control.clone());
-    let runs = Arc::new(RwLock::new(vec![run]));
-
-    let panic_result = std::panic::AssertUnwindSafe(async {
-        panic!("simulated process owner panic");
-    })
-    .catch_unwind()
-    .await;
-    assert!(panic_result.is_err());
-    commit_process_owner_failure_if_unfinalized(
-        &runs,
-        "process-run",
-        control.as_ref(),
-        "process owner panicked".to_string(),
-    )
-    .await;
-
-    let runs = runs.read().await;
-    assert!(matches!(runs[0].status, SubAgentStatus::Failed(ref error) if error == "process owner panicked"));
-    assert_eq!(control.finalization(), Some(ProcessFinalization::TerminationFailed));
-    assert_eq!(running_run_count(&runs), 0);
-}
-
-#[tokio::test]
 async fn terminal_commit_does_not_release_slot_before_control_finalization() {
     let control = ProcessRunControl::new();
     let mut run = restore_test_run("process-run", SubAgentStatus::Running);

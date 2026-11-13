@@ -107,32 +107,6 @@ pub(super) async fn commit_process_terminal_state(
     Ok(())
 }
 
-pub(super) async fn commit_process_owner_failure_if_unfinalized(
-    active_runs: &Arc<RwLock<Vec<SubAgentRun>>>,
-    run_id: &str,
-    process_control: &ProcessRunControl,
-    error: String,
-) {
-    if process_control.finalization().is_some() {
-        return;
-    }
-    if let Err(commit_error) = commit_process_terminal_state(
-        active_runs,
-        run_id,
-        SubAgentStatus::Failed(error),
-        Vec::new(),
-        process_control,
-        ProcessFinalization::TerminationFailed,
-        None,
-        #[cfg(test)]
-        None,
-    )
-    .await
-    {
-        tracing::error!(run_id, error = %commit_error, "process failure terminal remains unconfirmed");
-    }
-}
-
 /// Make a process-mode run answer a kill aimed at its **own** registry row.
 ///
 /// A task-mode run publishes an abort handle on its row, so

@@ -55,7 +55,7 @@ use super::memory::{
     every_memory_read_principal_built_from_a_context_carries_the_owner_scope,
     the_owner_isolation_bit_is_never_asserted_by_memory_production_code,
 };
-use super::panic_policy::production_has_no_panic_shortcuts;
+use super::panic_policy::{production_has_no_catch_unwind, production_has_no_panic_shortcuts};
 use super::process::{
     every_production_process_command_is_inventoried, git_is_named_only_in_the_reviewed_places,
     git_runs_only_through_the_hardened_launch, native_working_root_selection_sites_are_explicit,
@@ -293,6 +293,10 @@ macro_rules! planted_violation_probes {
 }
 
 planted_violation_probes! {
+    probe_production_catch_unwind: production_has_no_catch_unwind,
+        "src/panic_catch_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn probe() { std::panic::catch_unwind(|| ()); }\n";
+
     probe_native_working_root_selection: native_working_root_selection_sites_are_explicit,
         "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "fn d0_root(config: Config) { let _ = config.runtime.workdir.unwrap_or(config.workspace_dir); }\n";
