@@ -1280,19 +1280,21 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     let specs = admitted.decisions.agent_execution_specs(admitted.binding.as_ref(), &context).expect("test: Clarify can answer");
     assert!(specs.specs.is_empty(), "test: degraded interactive answer offers no tools");
     let mut history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
+    let multimodal = crate::config::MultimodalConfig::default();
+    let hooks = crate::hooks::HookManager::new(workspace.to_owned());
     let (reply, trace) = crate::agent::turn_tests::reachability::boxed_root_probe(|| crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {
             advice: None, channel_name: "terminal", scope: None,
             mode: crate::agent::turn_contracts::ChatMode::Edit, silent: true,
-            expose_stay_silent: false, multimodal: &crate::config::MultimodalConfig::default(),
+            expose_stay_silent: false, multimodal: &multimodal,
             schedule: crate::agent::turn_request::TurnSchedule { read_only_tool_concurrency_window: 1, priority_scheduling_enabled: false, low_priority_tool_names: Vec::new() },
             compaction: None,
             decision: crate::agent::turn_request::TurnDecision { service: &admitted.decisions, context: &context, proof: admitted.binding.as_ref() },
         },
         crate::agent::turn_request::TurnServices {
             provider: port.as_ref(), provider_name: "ollama", model: "prx-local-model", temperature: 0.0,
-            tools_registry: admitted.registry, observer: &NoopObserver, hooks: &HookManager::new(workspace.to_owned()),
+            tools_registry: admitted.registry, observer: &NoopObserver, hooks: &hooks,
             approval: None, approval_resolver: None, runtime_adapter: None,
             memory: crate::agent::turn_request::ToolLoopMemory::none(),
         },

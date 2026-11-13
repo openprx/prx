@@ -1291,6 +1291,8 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
         ),
     };
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(input)];
+    let multimodal = crate::config::MultimodalConfig::default();
+    let hooks = crate::hooks::HookManager::new(workspace.path().to_path_buf());
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         crate::agent::turn_tests::reachability::boxed_root_probe(|| {
@@ -1303,7 +1305,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
                     mode: ChatMode::default(),
                     silent: true,
                     expose_stay_silent: enabled,
-                    multimodal: &crate::config::MultimodalConfig::default(),
+                    multimodal: &multimodal,
                     schedule: TurnSchedule {
                         read_only_tool_concurrency_window: 1,
                         priority_scheduling_enabled: false,
@@ -1319,7 +1321,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str, interactive_failure
                     temperature: 0.0,
                     tools_registry: registry,
                     observer: &crate::observability::NoopObserver,
-                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    hooks: &hooks,
                     approval: None,
                     approval_resolver: None,
                     runtime_adapter: Some(admitted.adapter()),

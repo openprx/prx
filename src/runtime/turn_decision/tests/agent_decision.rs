@@ -956,6 +956,8 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
             }
             let provider = NoDispatch(AtomicUsize::new(0));
             let mut history = vec![crate::providers::ChatMessage::user("Explain `2 + 2`.")];
+            let multimodal = crate::config::MultimodalConfig::default();
+            let hooks = crate::hooks::HookManager::new(workspace.path().to_owned());
             let error = tokio::time::timeout(
                 Duration::from_secs(20),
                 crate::agent::turn_tests::reachability::boxed_root_probe(|| {
@@ -968,7 +970,7 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
                             mode: crate::agent::turn_contracts::ChatMode::default(),
                             silent: true,
                             expose_stay_silent: false,
-                            multimodal: &crate::config::MultimodalConfig::default(),
+                            multimodal: &multimodal,
                             schedule: crate::agent::turn_request::TurnSchedule {
                                 read_only_tool_concurrency_window: 1,
                                 priority_scheduling_enabled: false,
@@ -988,7 +990,7 @@ async fn clarify_without_gate_passed_answer_is_typed_refusal() {
                             temperature: 0.0,
                             tools_registry: Arc::clone(&service.registry),
                             observer: &crate::observability::NoopObserver,
-                            hooks: &crate::hooks::HookManager::new(workspace.path().to_owned()),
+                            hooks: &hooks,
                             approval: None,
                             approval_resolver: None,
                             runtime_adapter: None,
