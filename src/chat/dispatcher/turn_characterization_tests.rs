@@ -1269,8 +1269,19 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
             let mut prefix = [0_u8; MAX_REQUEST_PREFIX];
             stream.read_exact(&mut prefix).await.expect("test: bounded prediction prefix");
             assert_eq!(&prefix, b"POST ", "test: real prediction request reaches the failure peer");
-            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await.expect("test: real failure response");
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await.expect("test: real invalid decision response");
+            stream.shutdown().await.expect("test: response half-close");
+            const MAX_REQUEST_BYTES: usize = 128 * 1024;
+            const DRAIN_CHUNK_BYTES: usize = 1024;
+            let mut drained = MAX_REQUEST_PREFIX;
+            let mut chunk = [0_u8; DRAIN_CHUNK_BYTES];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("test: bounded request drain");
+                if read == 0 { break; }
+                drained += read;
+                assert!(drained <= MAX_REQUEST_BYTES, "test: prediction request stays within the fixture bound");
+            }
         }).await.expect("test: prediction failure peer deadline");
     });
     config.causal_tree.policy.extra_latency_budget_ms = 5_000;
@@ -1278,6 +1289,9 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     config.causal_tree.backend.endpoint = endpoint.clone();
     config.causal_tree.backend.model = "prx-decision-probe".into();
     config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":format!("custom:{endpoint}"), "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: decision model"));
+    config.cost.prices.insert(format!("custom:{endpoint}/prx-decision-probe"), crate::config::schema::ModelPricing {
+        input: 0.1, output: 0.2, cache_write: 0.3, cache_read: 0.1,
+    });
     let provider = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
         chunks: vec!["ok".to_owned()],
         reasoning: String::new(),
@@ -1297,6 +1311,10 @@ async fn enabled_interactive_backend_failure_publishes_provider_reply() {
     .await;
     let decisions = Arc::clone(admitted.binding.decision_routing().expect("test: interactive routing").service);
     let context = decisions.open_issued_turn_context(admitted.binding.as_ref(), crate::runtime::turn_decision::AgentTurnKind::Repl, &cancellation).await.expect("test: interactive decision");
+    let prediction = context.engine().prediction.as_ref().expect("test: configured prediction attempted");
+    assert!(prediction.attempts.iter().any(|attempt| matches!(&attempt.outcome,
+        crate::decision::factory::AttemptOutcome::Failed(error) if error.is_semantic_validation_failure())),
+        "test: real backend semantic failure is retained: {:?}", prediction.attempts);
     assert!(matches!(context.engine().selection, crate::causal_tree::decision_select::Selection::Abstain { action: crate::causal_tree::branch::CausalActionKind::Clarify, reason_code: "decision_failed" }), "test: actual failed backend selects interactive Clarify: {:?}", context.engine().selection);
     let specs = decisions.agent_execution_specs(admitted.binding.as_ref(), &context).expect("test: Clarify can answer");
     assert!(specs.specs.is_empty(), "test: degraded interactive answer offers no tools");
