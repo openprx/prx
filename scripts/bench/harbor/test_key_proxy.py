@@ -1,4 +1,5 @@
 """Real sockets on 127.0.0.1: a fake plain-HTTP upstream behind the real proxy."""
+import asyncio
 import http.client
 import http.server
 import json
@@ -16,6 +17,8 @@ KEY = 'prx-fixture-upstream-key-not-exported'
 CHAT = '/api/v1/chat/completions'
 READ_CAP = 1024 * 1024
 READ_DEADLINE = 10
+LOOPBACK = [(socket.AF_INET, ('127.0.0.1', 9))]
+API_BASE = 'http://127.0.0.1:{}/api/v1'
 
 
 def read_bounded(source, cap=READ_CAP, seconds=READ_DEADLINE):
@@ -23,25 +26,52 @@ def read_bounded(source, cap=READ_CAP, seconds=READ_DEADLINE):
 
     Returns (data, complete): `complete` is False when the peer cut the
     connection or broke the framing instead of ending the stream cleanly.
+
+    The deadline is enforced by an independent watchdog that shuts the socket
+    down at the absolute deadline, so it also covers the chunk-header and
+    trailer parsing inside read1(), which can issue several blocking reads
+    that a per-call socket timeout would each grant afresh.
     """
-    end = time.monotonic() + seconds
     data = bytearray()
     is_socket = isinstance(source, socket.socket)
     sock = source if is_socket else source.test_sock
+    expired = threading.Event()
+
+    def cut():
+        expired.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(seconds, cut)
+    watchdog.daemon = True
+    watchdog.start()
+    end = time.monotonic() + seconds
     try:
         while True:
             remaining = end - time.monotonic()
-            if remaining <= 0:
+            if expired.is_set() or remaining <= 0:
                 raise AssertionError('read exceeded its absolute deadline')
             if len(data) > cap:
                 raise AssertionError('read exceeded its byte cap')
             sock.settimeout(remaining)
-            chunk = source.recv(65536) if is_socket else source.read1(65536)
+            try:
+                chunk = source.recv(65536) if is_socket else source.read1(65536)
+            except (ConnectionError, http.client.HTTPException, OSError) as error:
+                # The socket timeout is the remaining deadline, so a timeout is the deadline.
+                if expired.is_set() or isinstance(error, TimeoutError):
+                    raise AssertionError('read exceeded its absolute deadline') from None
+                raise
             if not chunk:
+                if expired.is_set():
+                    raise AssertionError('read exceeded its absolute deadline')
                 return bytes(data), True
             data.extend(chunk)
     except (ConnectionError, http.client.HTTPException):
         return bytes(data), False
+    finally:
+        watchdog.cancel()
 
 
 class Upstream(http.server.BaseHTTPRequestHandler):
@@ -124,9 +154,11 @@ class KeyProxyTests(unittest.TestCase):
         self.proxy = self.make_proxy()
 
     def make_proxy(self, upstream=None, **options):
-        port = self.upstream.server_address[1]
-        proxy = KeyProxy(upstream or f'http://127.0.0.1:{port}/api/v1', KEY, '127.0.0.1',
-                         **{'allow_http_upstream': True, 'max_body': 1024, **options})
+        upstream = upstream or API_BASE.format(self.upstream.server_address[1])
+        # A literal address: resolving it never waits on DNS.
+        addresses = key_proxy.resolve(*key_proxy.upstream_endpoint(upstream, True))
+        proxy = KeyProxy(upstream, KEY, '127.0.0.1',
+                         **{'addresses': addresses, 'allow_http_upstream': True, 'max_body': 1024, **options})
         proxy.start()
         self.addCleanup(proxy.stop)
         return proxy
@@ -496,15 +528,119 @@ class KeyProxyTests(unittest.TestCase):
                          'https://127.0.0.1/', 'https://127.0.0.1/v1?x=1', 'ftp://127.0.0.1/v1',
                          'https://127.0.0.1/v1/../x', 'https://127.0.0.1/v1/%2e%2e', 'https://127.0.0.1//v1'):
             with self.subTest(upstream=upstream), self.assertRaises(ValueError):
-                KeyProxy(upstream, KEY, '127.0.0.1')
+                KeyProxy(upstream, KEY, '127.0.0.1', addresses=LOOPBACK)
         with self.assertRaises(ValueError) as caught:
-            KeyProxy('https://127.0.0.1/v1', 'line\r\nbreak-fixture', '127.0.0.1')
+            KeyProxy('https://127.0.0.1/v1', 'line\r\nbreak-fixture', '127.0.0.1', addresses=LOOPBACK)
         self.assertNotIn('break-fixture', str(caught.exception))
 
     def test_holds_key_matches_full_key_and_eight_byte_prefix(self):
         self.assertTrue(holds_key(b'api_key = "' + KEY.encode() + b'"', KEY))
         self.assertTrue(holds_key(b'x ' + KEY.encode()[:8] + b' y', KEY))
         self.assertFalse(holds_key(b'api_key = "per-trial-token"', KEY))
+
+
+class ReadBoundedTests(unittest.TestCase):
+    def pair(self):
+        near, far = socket.socketpair()
+        self.addCleanup(near.close)
+        self.addCleanup(far.close)
+        return near, far
+
+    def test_silent_socket_hits_the_absolute_deadline(self):
+        near, _ = self.pair()
+        started = time.monotonic()
+        with self.assertRaises(AssertionError):
+            read_bounded(near, seconds=0.3)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_stall_inside_chunk_header_parsing_hits_the_absolute_deadline(self):
+        near, far = self.pair()
+        far.sendall(b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3')
+        response = http.client.HTTPResponse(near)
+        response.begin()
+        response.test_sock = near
+        started = time.monotonic()
+        with self.assertRaises(AssertionError):
+            read_bounded(response, seconds=0.3)
+        self.assertLess(time.monotonic() - started, 2, 'the watchdog must cut a stall inside read1()')
+
+
+class ResolveOffLoopTests(unittest.TestCase):
+    """Upstream DNS runs off the event loop, under a startup deadline, and is cancellable."""
+
+    def setUp(self):
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)  # frees every blocked resolver thread at test end
+        self.calls = []
+
+    def blocked(self, host, port):
+        self.calls.append((host, port))
+        self.release.wait(timeout=30)
+        return LOOPBACK
+
+    async def open(self, resolver, **options):
+        return await key_proxy.open_proxy('http://upstream.invalid:8080/api/v1', KEY, '127.0.0.1',
+                                          resolver=resolver, allow_http_upstream=True, **options)
+
+    def test_blocked_resolver_fails_within_deadline_and_the_loop_stays_responsive(self):
+        async def scenario():
+            ticks = []
+
+            async def heartbeat():
+                while True:
+                    ticks.append(time.monotonic())
+                    await asyncio.sleep(0.01)
+
+            beat = asyncio.ensure_future(heartbeat())
+            started = time.monotonic()
+            try:
+                with self.assertRaises(OSError) as caught:
+                    await self.open(self.blocked, resolve_deadline=0.3)
+            finally:
+                beat.cancel()
+            return time.monotonic() - started, ticks, str(caught.exception)
+
+        elapsed, ticks, message = asyncio.run(asyncio.wait_for(scenario(), 10))
+        self.assertLess(elapsed, 2, 'startup must fail within its deadline')
+        self.assertGreater(len(ticks), 10, 'the event loop must keep running while the resolver is stuck')
+        self.assertLess(max(b - a for a, b in zip(ticks, ticks[1:])), 0.25, 'the loop must never stall')
+        self.assertIn('did not finish', message)
+        self.assertNotIn(KEY, message)
+        self.assertEqual(self.calls, [('upstream.invalid', 8080)])
+
+    def test_cancellation_during_a_blocked_resolve_returns_promptly(self):
+        async def scenario():
+            task = asyncio.ensure_future(self.open(self.blocked, resolve_deadline=30))
+            while not self.calls:
+                await asyncio.sleep(0.01)
+            started = time.monotonic()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return time.monotonic() - started
+
+        self.assertLess(asyncio.run(asyncio.wait_for(scenario(), 10)), 1)
+
+    def test_resolver_failure_is_a_key_free_startup_error(self):
+        def failing(host, port):
+            raise socket.gaierror(-2, 'Name or service not known ' + KEY)
+
+        with self.assertRaises(OSError) as caught:
+            asyncio.run(self.open(failing))
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertIn('gaierror', str(caught.exception))
+
+    def test_normal_path_connects_only_to_the_resolved_addresses(self):
+        resolved = [(socket.AF_INET, ('127.0.0.1', 4321))]
+        proxy = asyncio.run(self.open(lambda host, port: resolved))
+        self.addCleanup(proxy.stop)
+        self.assertEqual(proxy.addresses, resolved)
+        self.assertEqual(proxy.host, 'upstream.invalid')
+        self.assertFalse(proxy._started)
+
+    def test_empty_resolution_is_refused(self):
+        with self.assertRaises(OSError):
+            asyncio.run(self.open(lambda host, port: []))
 
 
 if __name__ == '__main__':

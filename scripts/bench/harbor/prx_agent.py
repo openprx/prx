@@ -21,7 +21,7 @@ import tempfile
 
 from harbor.agents.installed.base import BaseInstalledAgent
 
-from key_proxy import CONTAINER_HOST, KeyProxy, holds_key, primary_ipv4
+from key_proxy import CONTAINER_HOST, holds_key, open_proxy, primary_ipv4
 from profile import PRICES, check, identity, read_bounded, render
 from record import AGENT_KEYS, agent_metadata, build_agent, endpoint, sha256, unavailable, per_attempt_models
 
@@ -154,10 +154,10 @@ class PrxAgent(BaseInstalledAgent):
         api_url = None
         container_provider = self.provider
         if self.provider in BUILTIN_UPSTREAMS:
-            proxy = self._proxy(BUILTIN_UPSTREAMS[self.provider], key)
+            proxy = await self._proxy(BUILTIN_UPSTREAMS[self.provider], key)
             api_url = proxy.container_base_url()
         elif self.provider.startswith("custom:https://"):
-            proxy = self._proxy(self.provider[7:], key)
+            proxy = await self._proxy(self.provider[7:], key)
             container_provider = "custom:" + proxy.container_base_url()
         try:
             if proxy is not None:
@@ -169,9 +169,11 @@ class PrxAgent(BaseInstalledAgent):
             if proxy is not None and not proxy.stop():
                 raise RuntimeError("key proxy did not stop cleanly")
 
-    def _proxy(self, upstream, key):
+    async def _proxy(self, upstream, key):
+        # DNS runs off the event loop under a startup deadline; failure here
+        # fails the trial before anything is started.
         peers = [peer for peer in str(self.proxy_peers).split(",") if peer.strip()] if self.proxy_peers else None
-        return KeyProxy(upstream, key, self.proxy_bind or primary_ipv4(), allowed_peers=peers)
+        return await open_proxy(upstream, key, self.proxy_bind or primary_ipv4(), allowed_peers=peers)
 
     async def _trial(self, instruction, environment, key, proxy, container_provider, api_url):
         credential = proxy.token if proxy is not None else secrets.token_urlsafe(32)
