@@ -194,7 +194,13 @@ pub(crate) async fn send_json<T: Serialize + ?Sized>(
     kind: PhysicalKind,
 ) -> anyhow::Result<Response> {
     let Ok(owner) = ACCOUNTING.try_with(Arc::clone) else {
-        return Ok(Response::Live(builder.json(request).send().await?));
+        return Ok(Response::Live(
+            builder
+                .json(request)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?,
+        ));
     };
     let body = serde_json::to_vec(request)?;
     let mut receipt = owner
@@ -223,7 +229,8 @@ pub(crate) async fn send_json<T: Serialize + ?Sized>(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let status = response.status();
         let retry_after_ms = super::traits::retry_after_ms_from_headers(response.headers());
         let mut body = Vec::new();

@@ -2255,7 +2255,10 @@ impl Channel for SignalChannel {
         // Native daemon mode: always use SSE — no REST polling endpoint available.
         if self.is_native {
             let sse_url = format!("{}/api/v1/events", self.http_url);
-            tracing::info!("Signal native: listening via SSE on {sse_url}");
+            tracing::info!(
+                "Signal native: listening via SSE on {}",
+                crate::providers::redact_endpoint_userinfo(&sse_url)
+            );
             return self.listen_sse(&sse_url, tx).await;
         }
 

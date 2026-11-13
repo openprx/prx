@@ -1,9 +1,9 @@
 use super::decision_seals::braced_block;
+use super::helpers::log_macro_arguments;
 use super::helpers::{
     assert_inventory, blank_comments_and_literals, enclosing_function, function_body, read_source, repository_root,
     strip_cfg_test_items,
 };
-use super::loop_requests::is_identifier_byte;
 use super::scanner_probes::scanner_fails_with;
 use std::fs;
 /// The files whose log lines name providers or `<provider>/<model>` targets
@@ -86,64 +86,6 @@ const LABEL_BINDINGS: &[&str] = &[
     "selected_provider",
     "chosen_provider",
 ];
-
-/// Every argument of every `tracing` event macro in `production` as
-/// `(offset, field, value)`: `field` is the name of a `name = value` field
-/// (empty for a positional argument or the format string), and a shorthand
-/// field (`provider,`) has the identifier as both name and value.
-fn log_macro_arguments(production: &str) -> Vec<(usize, String, String)> {
-    let bytes = production.as_bytes();
-    let mut arguments = Vec::new();
-    for level in ["trace!(", "debug!(", "info!(", "warn!(", "error!("] {
-        let mut search = 0usize;
-        while let Some(found) = production[search..].find(level) {
-            let start = search + found;
-            search = start + level.len();
-            if start > 0 && is_identifier_byte(bytes[start - 1]) {
-                continue;
-            }
-            let open = start + level.len() - 1;
-            let mut depth = 0i32;
-            let mut segment_start = open + 1;
-            for index in open..bytes.len() {
-                match bytes[index] {
-                    b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' | b',' if depth == 1 => {
-                        let segment = production[segment_start..index].trim();
-                        if !segment.is_empty() {
-                            let (field, value) = match segment.split_once('=') {
-                                Some((name, value))
-                                    if !value.starts_with('=')
-                                        && !name.trim().is_empty()
-                                        && name.trim().bytes().all(|byte| is_identifier_byte(byte) || byte == b'.') =>
-                                {
-                                    (name.trim().to_string(), value.trim().to_string())
-                                }
-                                _ => {
-                                    let bare = segment.trim_start_matches(['%', '?']);
-                                    if bare.bytes().all(is_identifier_byte) {
-                                        (bare.to_string(), bare.to_string())
-                                    } else {
-                                        (String::new(), segment.to_string())
-                                    }
-                                }
-                            };
-                            arguments.push((segment_start, field, value));
-                        }
-                        segment_start = index + 1;
-                        if bytes[index] != b',' {
-                            break;
-                        }
-                    }
-                    b')' | b']' | b'}' => depth -= 1,
-                    _ => {}
-                }
-            }
-        }
-    }
-    arguments.sort_by_key(|(offset, _, _)| *offset);
-    arguments
-}
 
 /// Whether a log value shows a label only in its redacted form.
 fn log_value_is_redacted(value: &str) -> bool {

@@ -631,7 +631,7 @@ impl Provider for OpenRouterProvider {
             {
                 Ok(response) => response,
                 Err(err) => {
-                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    let _ = tx.send(Err(StreamError::from(err))).await;
                     return;
                 }
             };

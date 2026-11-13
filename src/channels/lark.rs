@@ -328,7 +328,7 @@ impl LarkChannel {
                     .and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
+        tracing::info!("Lark: connecting to {}", ws_target_label(&wss_url));
 
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(2 * 1024 * 1024);
@@ -1048,6 +1048,17 @@ const fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
     !mentions.is_empty()
 }
 
+fn ws_target_label(url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return "<unparsable url>".to_string();
+    };
+    let Some(host) = url.host() else {
+        return "<unparsable url>".to_string();
+    };
+    let port = url.port().map(|port| format!(":{port}")).unwrap_or_default();
+    format!("{}://{host}{port}", url.scheme())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1072,6 +1083,19 @@ mod tests {
         )
     }
 
+    #[test]
+    fn secret_url_ws_target_label_omits_capabilities() {
+        assert_eq!(
+            ws_target_label("wss://user:password@example.com:8443/private?ticket=PRX_MARKER"),
+            "wss://example.com:8443",
+            "test: WS log must contain origin only"
+        );
+        assert_eq!(
+            ws_target_label("invalid URL"),
+            "<unparsable url>",
+            "test: parse failure must use static text"
+        );
+    }
     #[test]
     fn lark_channel_name() {
         let ch = make_channel();

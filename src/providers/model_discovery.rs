@@ -273,7 +273,7 @@ pub(crate) fn fetch_openai_compatible_models(
     let client = build_model_fetch_client()?;
     let mut request = client.get(endpoint);
     // An `api_url` may carry `user:password@`; errors name the endpoint only.
-    let shown_endpoint = crate::providers::redact_endpoint_userinfo(endpoint);
+    let shown_endpoint = crate::security::redaction::redact_url_components(endpoint);
 
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
@@ -284,7 +284,7 @@ pub(crate) fn fetch_openai_compatible_models(
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| anyhow::anyhow!("{}", crate::providers::redact_endpoint_userinfo(&error.to_string())))
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("model fetch failed: GET {shown_endpoint}"))?
         .json()
         .context("failed to parse model list response")?;
@@ -302,6 +302,7 @@ pub(crate) fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<Disco
     let payload: Value = request
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)
         .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
         .json()
         .context("failed to parse OpenRouter model list response")?;
@@ -325,6 +326,7 @@ pub(crate) fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<Discov
 
     let response = request
         .send()
+        .map_err(reqwest::Error::without_url)
         .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
 
     let status = response.status();
@@ -351,6 +353,7 @@ pub(crate) fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<Discovere
         .query(&[("key", api_key), ("pageSize", "200")])
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)
         .context("model fetch failed: GET Gemini models")?
         .json()
         .context("failed to parse Gemini model list response")?;
@@ -364,6 +367,7 @@ pub(crate) fn fetch_ollama_models() -> Result<Vec<DiscoveredModel>> {
         .get("http://localhost:11434/api/tags")
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(reqwest::Error::without_url)
         .context("model fetch failed: GET http://localhost:11434/api/tags")?
         .json()
         .context("failed to parse Ollama model list response")?;
@@ -966,3 +970,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod secret_url_tests;

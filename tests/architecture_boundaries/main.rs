@@ -26,6 +26,7 @@ mod providers;
 mod removed_modules;
 mod scanner_meta;
 mod scanner_probes;
+mod secret_urls;
 mod strip_tests;
 mod structure;
 mod token_count;

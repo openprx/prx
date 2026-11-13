@@ -665,7 +665,8 @@ impl GeminiProvider {
         let response = self
             .build_generate_content_request(auth, &url, &request, model)?
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -999,7 +1000,13 @@ impl Provider for GeminiProvider {
                 "https://generativelanguage.googleapis.com/v1beta/models".to_string()
             };
 
-            self.http_client().get(&url).send().await?.error_for_status()?;
+            self.http_client()
+                .get(&url)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?;
         }
         Ok(())
     }
@@ -1082,7 +1089,7 @@ impl Provider for GeminiProvider {
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    let _ = tx.send(Err(StreamError::from(e))).await;
                     return;
                 }
             };
@@ -1102,7 +1109,7 @@ impl Provider for GeminiProvider {
                 let bytes = match bytes_res {
                     Ok(b) => b,
                     Err(e) => {
-                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        let _ = tx.send(Err(StreamError::from(e))).await;
                         return;
                     }
                 };
