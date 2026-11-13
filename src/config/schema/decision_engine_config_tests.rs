@@ -313,7 +313,16 @@ fn explicit_empty_engine_backend_uses_defaults_not_legacy() {
     assert!(crate::config::schema::causal_tree::configured_selection(effective).is_none());
     let factory = factory_for(&config);
     assert_eq!(factory.status().order, [], "no remote construction");
-    assert_eq!(factory.status().excluded, []);
+    // Only the `auto` default's unconfigured loopback probe is planned; the
+    // legacy remote slot is absent.
+    assert_eq!(
+        factory.status().excluded,
+        [(
+            crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+            crate::config::schema::causal_tree::BackendLocality::Loopback,
+            crate::decision_engine::prediction::factory::Exclusion::NotConfigured,
+        )]
+    );
 }
 
 #[test]

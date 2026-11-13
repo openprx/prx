@@ -1797,7 +1797,7 @@ mod tests {
 
     /// `disabled_builds_builtin_only_order_and_no_transport` and V2.09
     /// (`default_config_performs_no_decision_network_io`): with the plane
-    /// explicitly disabled, the CDP-31 enabled default with no endpoint, or
+    /// explicitly disabled, the default (engine switch off, R55), or
     /// `auto` without an endpoint, no transport is built and the builtin serves.
     #[tokio::test]
     async fn disabled_builds_builtin_only_order_and_no_transport() {
@@ -1810,7 +1810,8 @@ mod tests {
         disabled.decision_engine.enabled = false;
         let auto_without_endpoint = config(&temp, |_| {});
         for (config, reason) in [
-            (&default, None),
+            // R55: the engine switch (default off) disables the factory.
+            (&default, Some(FallbackReason::Disabled)),
             (&disabled, Some(FallbackReason::Disabled)),
             (&auto_without_endpoint, None),
         ] {
@@ -2216,7 +2217,7 @@ mod tests {
     fn a_disabled_plane_creates_no_key() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
-        disabled.decision_engine.enabled = false;
+        disabled.causal_tree.enabled = false;
         assert!(FactoryDeps::load_key(&disabled).is_none());
         assert!(!temp.path().join("self").exists(), "no key file was written");
         let enabled = config(&temp, compatible(LOOPBACK, false));

@@ -1389,6 +1389,8 @@ mod tests {
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_path_buf();
         config.causal_tree.enabled = true;
+        // R55: the engine switch is on, so the plane's own exclusion is reported.
+        config.decision_engine.enabled = true;
         let admin = DecisionAdmin::new(config, Arc::new(ExcludedPlane), Arc::new(RecordingSink::default()));
         let view = admin
             .test(TestRequest {

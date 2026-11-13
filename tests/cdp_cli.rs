@@ -526,7 +526,10 @@ fn a_disabled_plane_never_opens_the_credential_store() {
     let config_path = dir.join("config.toml");
     let mut root: toml::Value =
         toml::from_str(&std::fs::read_to_string(&config_path).expect("test: read")).expect("test: toml");
+    // R55: the engine switch, not `[causal_tree].enabled`, gates the factory
+    // and every credential read; turn both off.
     root["causal_tree"]["enabled"] = toml::Value::Boolean(false);
+    root["decision_engine"]["enabled"] = toml::Value::Boolean(false);
     root["causal_tree"]["backend"]
         .as_table_mut()
         .expect("test: backend table")

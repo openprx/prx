@@ -34,7 +34,7 @@ impl Tool for NamedTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({"type": "object"})
+        json!({"type": "object", "properties": {}})
     }
 
     async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
@@ -609,7 +609,7 @@ fn advisory_ordering_and_limits_match_structural_order() {
         .filter(|fixture| fixture.blocker != Blocker::Surface)
     {
         let number = fixture.number;
-        let mut full = Vec::new();
+        let mut full_working = None;
         with_ten_fixture(&fixture, 12, |state, view, _, policy, gates| {
             let hard = HardGatesProbe {
                 state,
@@ -627,7 +627,7 @@ fn advisory_ordering_and_limits_match_structural_order() {
                 legacy.iter().all(|id| rest.any(|advised| advised == id)),
                 "fixture {number}: {legacy:?} is ordered within {first:?}"
             );
-            full = first;
+            full_working = advisory_set_first_working(state, view, policy, &advisory);
         });
         with_ten_fixture(&fixture, 3, |state, view, _, policy, gates| {
             let hard = HardGatesProbe {
@@ -639,16 +639,57 @@ fn advisory_ordering_and_limits_match_structural_order() {
             let limited = ids(&set);
             assert!(limited.len() <= 3, "fixture {number}: candidate limit");
             // Refuse and Clarify keep their reserved space; the one working
-            // slot goes to the first candidate in structural order.
+            // slot goes to the first candidate in structural order. Each
+            // fixture run mints its own key, so candidates are compared by
+            // action and capability ids, not by their keyed namespace.
             let working =
                 |id: &&CandidateId| !matches!(id.action(), CausalActionKind::Refuse | CausalActionKind::Clarify);
+            let first_working = kept_and_report(&set)
+                .0
+                .iter()
+                .find(|candidate| working(&candidate.candidate_id()))
+                .map(|candidate| structural_key(candidate));
             assert_eq!(
-                limited.iter().find(working),
-                full.iter().find(working),
+                first_working,
+                full_working.clone(),
                 "fixture {number}: structural priority under the limit"
             );
         });
     }
+}
+
+/// A key-independent identity: the action and the required capability ids.
+fn structural_key(
+    candidate: &crate::decision_engine::candidate::CausalCandidate,
+) -> (CausalActionKind, Vec<crate::tools::capability::contract::CapabilityId>) {
+    (
+        candidate.candidate_id().action(),
+        candidate
+            .required_capabilities()
+            .iter()
+            .map(|reference| reference.id.clone())
+            .collect(),
+    )
+}
+
+/// The first non-Refuse/Clarify candidate of the advisory set, structurally.
+fn advisory_set_first_working(
+    state: &CausalState,
+    view: &CatalogView<'_>,
+    policy: &CandidatePolicy<'_>,
+    advisory: &AdvisoryProbe<'_>,
+) -> Option<(CausalActionKind, Vec<crate::tools::capability::contract::CapabilityId>)> {
+    let set = CausalCandidateGenerator::generate(state, view, policy, advisory).unwrap();
+    kept_and_report(&set)
+        .0
+        .iter()
+        .find(|candidate| {
+            !matches!(
+                candidate.candidate_id().action(),
+                CausalActionKind::Refuse | CausalActionKind::Clarify
+            )
+        })
+        .map(structural_key)
 }
 
 /// R14 extension of `hard_gates_probe_reproduces_pre_separation_candidate_sets`:
