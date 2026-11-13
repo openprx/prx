@@ -131,7 +131,7 @@ impl SegmentObservation {
         {
             None
         } else {
-            project_trace(&trace, &event_id).ok()
+            project_trace(&trace).ok()
         };
         Ok(Self {
             envelope: envelope.clone(),
@@ -229,7 +229,6 @@ impl SegmentObservation {
 
 fn project_trace(
     trace: &crate::tools::capability::execution_trace::ExecutionTraceSnapshot,
-    event: &Arc<str>,
 ) -> anyhow::Result<Vec<ObservedStep>> {
     let providers = trace.provider_attempts.as_deref().unwrap_or_default();
     ensure!(
@@ -246,12 +245,7 @@ fn project_trace(
             _ => anyhow::bail!("tool observation is not complete"),
         };
         // A capability label is not a current candidate or exact call digest.
-        steps.push(ObservedStep::recorded_by_runtime(
-            ObservedStepKind::Tool,
-            status,
-            None,
-            Some(Arc::clone(event)),
-        ));
+        steps.push(ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, status, None));
     }
     for attempt in providers {
         let status = match attempt.status.as_str() {
@@ -264,7 +258,6 @@ fn project_trace(
             ObservedStepKind::Provider,
             status,
             None,
-            Some(Arc::clone(event)),
         ));
     }
     Ok(steps)
@@ -324,8 +317,7 @@ mod tests {
             ]),
             ..ExecutionTraceSnapshot::default()
         };
-        let event: Arc<str> = Arc::from("segment-terminal");
-        let steps = project_trace(&trace, &event)?;
+        let steps = project_trace(&trace)?;
         assert_eq!(
             steps
                 .iter()
@@ -337,11 +329,7 @@ mod tests {
                 (ObservedStepKind::Provider, ObservedStepStatus::Ok),
             ]
         );
-        assert!(
-            steps
-                .iter()
-                .all(|step| step.candidate().is_none() && step.event_id().as_deref() == Some("segment-terminal"))
-        );
+        assert!(steps.iter().all(|step| step.candidate().is_none()));
         Ok(())
     }
 
@@ -371,7 +359,7 @@ mod tests {
             }],
             ..ExecutionTraceSnapshot::default()
         };
-        assert!(project_trace(&trace, &Arc::from("segment-terminal")).is_err());
+        assert!(project_trace(&trace).is_err());
     }
 
     #[test]
@@ -380,7 +368,7 @@ mod tests {
             provider_requests: 1,
             ..ExecutionTraceSnapshot::default()
         };
-        assert!(project_trace(&trace, &Arc::from("segment-terminal")).is_err());
+        assert!(project_trace(&trace).is_err());
     }
 
     #[test]

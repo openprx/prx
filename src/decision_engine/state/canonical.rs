@@ -11,8 +11,6 @@ struct CanonicalState<'a> {
     goal: &'a str,
     has_conversation_history: bool,
     observed: CanonicalObserved<'a>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    record: Option<CanonicalRecord<'a>>,
     routing_input: &'a str,
     trusted: CanonicalTrusted<'a>,
 }
@@ -73,21 +71,6 @@ struct CanonicalCandidate<'a> {
     summary: &'a str,
 }
 
-#[derive(Serialize)]
-struct CanonicalRecord<'a> {
-    /// Empty since R9, like `CanonicalObserved::artifacts`.
-    artifact_ages_ms: [(); 0],
-    artifact_event_ids: [(); 0],
-    built_at_ms: u64,
-    causation_event_id: Option<&'a str>,
-    hop: u8,
-    prior_decision_id: Option<String>,
-    run_id: Option<&'a str>,
-    source_event_id: Option<&'a str>,
-    step_event_ids: Vec<Option<&'a str>>,
-    task_id: Option<&'a str>,
-}
-
 fn borrowed_set<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut values: Vec<_> = items.collect();
     values.sort_unstable();
@@ -95,7 +78,7 @@ fn borrowed_set<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     values
 }
 
-pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, serde_json::Error> {
+pub(super) fn serialize(state: &CausalState) -> Result<String, serde_json::Error> {
     let trusted = state.trusted.parts();
     let canonical = CanonicalState {
         derived: state
@@ -152,23 +135,6 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
             exact_call_observations: state.observed.exact_call_observations().map(AsRef::as_ref),
             retry_count: state.observed.retry_count(),
         },
-        record: record.then(|| CanonicalRecord {
-            artifact_ages_ms: [],
-            artifact_event_ids: [],
-            built_at_ms: state.built_at_ms,
-            causation_event_id: trusted.causation_event_id.as_deref(),
-            hop: state.lineage.hop(),
-            prior_decision_id: state.lineage.prior_decision_id().map(|id| id.to_string()),
-            run_id: trusted.run_id.as_deref(),
-            source_event_id: trusted.source_event_id.as_deref(),
-            step_event_ids: state
-                .observed
-                .completed_steps()
-                .iter()
-                .map(|step| step.event_id().as_deref())
-                .collect(),
-            task_id: trusted.task_id.as_deref(),
-        }),
         routing_input: state.routing_input.as_str(),
         trusted: CanonicalTrusted {
             approval_grants: borrowed_set(trusted.approval_grants.iter().map(AsRef::as_ref)),

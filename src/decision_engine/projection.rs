@@ -720,7 +720,7 @@ mod tests {
         let mut turn = state(&key, &"word ".repeat(2_000));
         turn.observed = ObservedState::from_runtime_records(
             (0..40)
-                .map(|_| ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, ObservedStepStatus::Ok, None, None))
+                .map(|_| ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, ObservedStepStatus::Ok, None))
                 .collect(),
             0,
         );
@@ -860,7 +860,6 @@ mod tests {
                         kinds[*kind],
                         statuses[*status],
                         executed.and_then(|index| ids.get(index).cloned()),
-                        None,
                     )
                 })
                 .collect();

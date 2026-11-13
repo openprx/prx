@@ -704,20 +704,12 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
             routing.context.execution_refs(),
             routing.context.engine.fallback_cause,
         );
-        let original = [
-            routing
-                .context
-                .engine
-                .state
-                .material_fingerprint(&child_service.state_key)
-                .expect("test: canonical state serializes"),
-            routing
-                .context
-                .engine
-                .state
-                .record_fingerprint(&child_service.state_key)
-                .expect("test: canonical state serializes"),
-        ];
+        let original = routing
+            .context
+            .engine
+            .state
+            .material_fingerprint(&child_service.state_key)
+            .expect("test: canonical state serializes");
         assert!(
             routing
                 .context
@@ -731,14 +723,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         no_facts.observed = no_facts.observed.clone().with_exact_call_observations(None);
         assert_eq!(
             original,
-            [
-                no_facts
-                    .material_fingerprint(&child_service.state_key)
-                    .expect("test: canonical state serializes"),
-                no_facts
-                    .record_fingerprint(&child_service.state_key)
-                    .expect("test: canonical state serializes")
-            ]
+            no_facts
+                .material_fingerprint(&child_service.state_key)
+                .expect("test: canonical state serializes")
         );
         let legacy =
             serde_json::to_string(&crate::tools::capability::execution_trace::ExecutionTraceSnapshot::default())?;

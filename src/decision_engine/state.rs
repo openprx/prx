@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -23,9 +23,6 @@ use crate::tools::capability::{
 mod canonical_tests;
 #[cfg(test)]
 mod exact_calls_tests;
-use crate::decision_engine::prediction::{DecisionAnswer, QuestionId};
-#[cfg(test)]
-use crate::decision_engine::prediction::{DecisionRequest, ValidatedDecision};
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 /// The kind of a completed step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,7 +80,6 @@ pub(crate) struct ObservedStep {
     kind: ObservedStepKind,
     status: ObservedStepStatus,
     candidate: Option<CandidateId>,
-    event_id: Option<Arc<str>>,
 }
 
 impl ObservedStep {
@@ -92,13 +88,11 @@ impl ObservedStep {
         kind: ObservedStepKind,
         status: ObservedStepStatus,
         candidate: Option<CandidateId>,
-        event_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             kind,
             status,
             candidate,
-            event_id,
         }
     }
 
@@ -115,11 +109,6 @@ impl ObservedStep {
     /// The candidate it executed, if it executed one.
     pub(crate) const fn candidate(&self) -> Option<&CandidateId> {
         self.candidate.as_ref()
-    }
-
-    /// The event that recorded it.
-    pub(crate) const fn event_id(&self) -> &Option<Arc<str>> {
-        &self.event_id
     }
 }
 
@@ -180,58 +169,6 @@ impl ObservedState {
             .filter(|step| step.kind != ObservedStepKind::RouterHistory && step.status == ObservedStepStatus::Failed)
             .filter_map(ObservedStep::candidate)
             .collect()
-    }
-}
-
-/// Validated predictions of one decision (CDP 5.2). Built only from a
-/// [`crate::decision_engine::prediction::ValidatedDecision`] that answers the given request; nothing maps a
-/// predicted value into the trusted or observed state, and the state
-/// fingerprints never read it (V3.14). CDP-21 stores it on the hop's state
-/// and CDP-22's `DecisionRecordBuilder` reads it into the decision record.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PredictedState {
-    request_id: Arc<str>,
-    answers: BTreeMap<QuestionId, DecisionAnswer>,
-}
-
-/// A validated decision offered for another request (R-CDP16 L-8).
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the decision answers another request")]
-pub(crate) struct ForeignDecision;
-
-#[cfg(test)]
-impl PredictedState {
-    /// The answers of `decision` to the questions of `request`.
-    ///
-    /// # Errors
-    /// [`ForeignDecision`] when `decision` answers another request.
-    pub(crate) fn from_validated(
-        decision: &ValidatedDecision,
-        request: &DecisionRequest,
-    ) -> Result<Self, ForeignDecision> {
-        if decision.request_id() != request.request_id() {
-            return Err(ForeignDecision);
-        }
-        let answers = request
-            .questions()
-            .keys()
-            .filter_map(|id| decision.answer(id).map(|answer| (id.clone(), answer.clone())))
-            .collect();
-        Ok(Self {
-            request_id: Arc::from(decision.request_id()),
-            answers,
-        })
-    }
-
-    /// The id of the request the predictions answer.
-    pub(crate) fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    /// The prediction for question `id`.
-    pub(crate) fn answer(&self, id: &QuestionId) -> Option<&DecisionAnswer> {
-        self.answers.get(id)
     }
 }
 
@@ -369,7 +306,6 @@ impl HopLineage {
 pub(crate) struct CausalState {
     pub(crate) trusted: TrustedState,
     pub(crate) observed: ObservedState,
-    pub(crate) predicted: Option<PredictedState>,
     pub(crate) derived: DerivedState,
     /// Whether the admitted source belongs to a conversation with an earlier turn.
     pub(crate) has_conversation_history: bool,
@@ -407,14 +343,7 @@ impl CausalState {
     /// Lowercase hex of
     /// `HMAC(DecisionKey, StateFingerprint, "material" ‖ canonical JSON)`.
     pub(crate) fn material_fingerprint(&self, key: &DecisionKey) -> Result<String, serde_json::Error> {
-        fingerprint_from_canonical(key, b"material", self.canonical(false))
-    }
-
-    /// The keyed fingerprint of the full record: the material inputs plus
-    /// the lineage, the event ids and the times.
-    #[cfg(test)]
-    pub(crate) fn record_fingerprint(&self, key: &DecisionKey) -> Result<String, serde_json::Error> {
-        fingerprint_from_canonical(key, b"record", self.canonical(true))
+        fingerprint_from_canonical(key, b"material", self.canonical())
     }
 
     /// Canonical JSON of the fingerprinted inputs: object keys in a fixed
@@ -422,8 +351,8 @@ impl CausalState {
     /// candidates) deduplicated and sorted so neither their listing order
     /// nor a repeat matters, sequences (steps) in order, no
     /// floats.
-    fn canonical(&self, record: bool) -> Result<String, serde_json::Error> {
-        canonical::serialize(self, record)
+    fn canonical(&self) -> Result<String, serde_json::Error> {
+        canonical::serialize(self)
     }
 
     /// The derived candidates ordered by candidate id (ids are distinct).
@@ -529,17 +458,12 @@ pub(crate) mod fixtures {
     }
 
     pub(crate) fn step(kind: ObservedStepKind, status: ObservedStepStatus) -> ObservedStep {
-        ObservedStep::recorded_by_runtime(kind, status, None, Some(Arc::from("event-step-1")))
+        ObservedStep::recorded_by_runtime(kind, status, None)
     }
 
     /// A step that executed `candidate`.
     pub(crate) fn executed(status: ObservedStepStatus, candidate: &CandidateId) -> ObservedStep {
-        ObservedStep::recorded_by_runtime(
-            ObservedStepKind::Tool,
-            status,
-            Some(candidate.clone()),
-            Some(Arc::from("event-step-1")),
-        )
+        ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, status, Some(candidate.clone()))
     }
 
     pub(crate) fn observed() -> ObservedState {
@@ -550,7 +474,6 @@ pub(crate) mod fixtures {
         CausalState {
             trusted: TrustedState::from_runtime(trusted()),
             observed: observed(),
-            predicted: None,
             derived: derived(candidates(key)),
             has_conversation_history: false,
             routing_input: RawRoutingInput::new(turn.to_string()),
@@ -564,16 +487,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod turn_state_tests {
-    use std::time::{Duration, Instant};
-
     use super::fixtures::{candidate, candidates, derived, executed, key, observed, state, step};
     use super::*;
-    use crate::config::schema::causal_tree::BackendKind;
-    use crate::cost::decision_attempt::{BackendIdentity, DecisionUsage};
-    use crate::decision_engine::prediction::{
-        ChoiceAnswer, DecisionQuestion, DecisionResponse, DecisionResponseValidator, GlobalQuestion,
-        ModelVersionPolicy, OptionId, Probability, RequestLimits, RequestParts, StructuredValue, ValidationContext,
-    };
     use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
 
     fn with_trusted(state: &CausalState, edit: impl FnOnce(&mut TrustedParts)) -> CausalState {
@@ -586,7 +501,7 @@ mod turn_state_tests {
 
     /// R-CDP16 M-1: lineage and time are not material. A state that differs
     /// only in the run and task ids, the event ids and the build time has
-    /// the same material fingerprint and a different record fingerprint.
+    /// the same material fingerprint.
     #[test]
     fn lineage_and_time_are_not_material() {
         let key = key();
@@ -594,9 +509,7 @@ mod turn_state_tests {
         let material = base
             .material_fingerprint(&key)
             .expect("test: canonical state serializes");
-        let record = base.record_fingerprint(&key).expect("test: canonical state serializes");
         assert_eq!(material.len(), 64);
-        assert_ne!(material, record);
 
         let mut later = with_trusted(&base, |parts| {
             parts.run_id = Some(Arc::from("run-2"));
@@ -605,12 +518,7 @@ mod turn_state_tests {
             parts.causation_event_id = Some(Arc::from("event-8"));
         });
         later.built_at_ms = 99_000;
-        let renamed = ObservedStep::recorded_by_runtime(
-            ObservedStepKind::Tool,
-            ObservedStepStatus::Ok,
-            None,
-            Some(Arc::from("event-step-9")),
-        );
+        let renamed = ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, ObservedStepStatus::Ok, None);
         later.observed = ObservedState::from_runtime_records(vec![renamed], 0);
         assert_eq!(
             later
@@ -618,13 +526,6 @@ mod turn_state_tests {
                 .expect("test: canonical state serializes"),
             material,
             "not material"
-        );
-        assert_ne!(
-            later
-                .record_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            record,
-            "but recorded"
         );
     }
 
@@ -705,12 +606,6 @@ mod turn_state_tests {
             base.material_fingerprint(&key)
                 .expect("test: canonical state serializes")
         );
-        assert_eq!(
-            shuffled
-                .record_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            base.record_fingerprint(&key).expect("test: canonical state serializes")
-        );
     }
 
     /// R-CDP16 L-2: a failure comes only from a completed step with status
@@ -775,113 +670,6 @@ mod turn_state_tests {
         let key = key();
         let first = state(&key, "hello");
         assert_eq!((first.lineage.hop(), first.lineage.prior_decision_id()), (0, None));
-    }
-
-    fn sealed(key: &DecisionKey, material: &str) -> (DecisionRequest, QuestionId, DecisionAnswer) {
-        let criteria: BTreeMap<OptionId, StructuredValue> = ["owner_id", "approval_pending", "catalog_generation"]
-            .into_iter()
-            .map(|code| {
-                (
-                    OptionId::code(code),
-                    StructuredValue::try_from(json!({"set": code, "to": "attacker"})).expect("test: structured"),
-                )
-            })
-            .collect();
-        let id = QuestionId::global(GlobalQuestion::NextAction);
-        let request = DecisionRequest::seal(
-            RequestParts {
-                state: StructuredValue::try_from(json!({"owner_id": "attacker"})).expect("test: state"),
-                questions: BTreeMap::from([(
-                    id.clone(),
-                    DecisionQuestion::Choice {
-                        instructions: StructuredValue::try_from(json!("Which trusted field?")).expect("test: text"),
-                        criteria,
-                    },
-                )]),
-                model: None,
-                state_fingerprint: material.to_string(),
-                candidate_set_hash: "c".to_string(),
-                policy_version: Arc::from("policy-1"),
-                catalog_generation: "g".to_string(),
-                omitted_questions: Vec::new(),
-                approval_pending: false,
-            },
-            key,
-            Instant::now() + Duration::from_mins(1),
-            &RequestLimits::default(),
-        )
-        .expect("test: seal");
-        let probability = |value| Probability::new(value).expect("test: probability");
-        let answer = DecisionAnswer::Choice(ChoiceAnswer {
-            chosen: OptionId::code("owner_id"),
-            probabilities: BTreeMap::from([
-                (OptionId::code("approval_pending"), probability(0.1)),
-                (OptionId::code("catalog_generation"), probability(0.1)),
-                (OptionId::code("owner_id"), probability(0.8)),
-            ]),
-            confidence: probability(0.9),
-        });
-        (request, id, answer)
-    }
-
-    fn validated(request: &DecisionRequest, id: &QuestionId, answer: &DecisionAnswer) -> ValidatedDecision {
-        let response = DecisionResponse {
-            backend: "builtin".to_string(),
-            resolved_model: "m".to_string(),
-            answers: BTreeMap::from([(id.clone(), answer.clone())]),
-            usage: DecisionUsage::default(),
-            provider_request_id: None,
-            elapsed_ms: 1,
-            raw_bytes: 0,
-            response_sha256: [0; 32],
-        };
-        let context = ValidationContext {
-            received_at: Instant::now(),
-            max_response_bytes: 1 << 20,
-            version_policy: ModelVersionPolicy::Unpinned,
-            local_backend: BackendIdentity {
-                kind: BackendKind::Builtin,
-                provider: None,
-                configured_model: Arc::from("builtin-v1"),
-            },
-        };
-        DecisionResponseValidator::validate(request, response, &context).expect("test: validate")
-    }
-
-    /// V3.14 `backend_cannot_set_trusted_state`: a validated decision whose
-    /// options are named like trusted fields becomes predicted state only;
-    /// the trusted parts and both fingerprints are unchanged. R-CDP16 L-8:
-    /// a decision for another request is refused.
-    #[test]
-    fn backend_cannot_set_trusted_state() {
-        let key = key();
-        let mut turn = state(&key, "hello");
-        let trusted_before = turn.trusted.clone();
-        let material_before = turn
-            .material_fingerprint(&key)
-            .expect("test: canonical state serializes");
-        let record_before = turn.record_fingerprint(&key).expect("test: canonical state serializes");
-
-        let (request, id, answer) = sealed(&key, &material_before);
-        let decision = validated(&request, &id, &answer);
-        turn.predicted = Some(PredictedState::from_validated(&decision, &request).expect("test: same request"));
-        let predicted = turn.predicted.as_ref().expect("test: predicted");
-        assert_eq!(predicted.answer(&id), Some(&answer));
-        assert_eq!(predicted.request_id(), request.request_id());
-        assert_eq!(turn.trusted, trusted_before);
-        assert_eq!(
-            turn.material_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            material_before
-        );
-        assert_eq!(
-            turn.record_fingerprint(&key).expect("test: canonical state serializes"),
-            record_before
-        );
-
-        let (other, _, _) = sealed(&key, &material_before);
-        assert_ne!(other.request_id(), request.request_id());
-        assert_eq!(PredictedState::from_validated(&decision, &other), Err(ForeignDecision));
     }
 
     /// D-057 M-5 and R-CDP16 M-4: `Debug` of a state prints no raw text: not

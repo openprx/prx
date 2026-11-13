@@ -223,7 +223,6 @@ pub(crate) fn analysis_input(
     let state = CausalState {
         trusted: TrustedState::from_runtime(trusted),
         observed: Default::default(),
-        predicted: None,
         derived: DerivedState::default(),
         has_conversation_history: false,
         routing_input: crate::decision_engine::state::RawRoutingInput::new("hello".into()),

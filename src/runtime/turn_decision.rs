@@ -878,7 +878,6 @@ impl TurnDecisionService {
         let state = CausalState {
             trusted,
             observed: observed.clone(),
-            predicted: None,
             derived: DerivedState::default(),
             has_conversation_history: proof.has_conversation_history(),
             routing_input: routing_input.clone(),

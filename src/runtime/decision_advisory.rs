@@ -170,7 +170,6 @@ pub(crate) fn build_state(runtime: &TurnRuntimeContext) -> CausalState {
     CausalState {
         trusted: TrustedState::from_runtime(runtime.trusted.clone()),
         observed: runtime.observed.clone(),
-        predicted: None,
         derived: DerivedState::default(),
         has_conversation_history: runtime.has_conversation_history,
         routing_input: runtime.routing_input.clone(),

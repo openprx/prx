@@ -4,24 +4,13 @@ use crate::tools::capability::turn_state::exact_calls::*;
 use std::sync::Arc;
 
 #[test]
-fn absent_observations_keep_legacy_canonical_and_present_facts_bind_both_fingerprints() {
+fn absent_observations_keep_legacy_canonical_and_present_facts_bind_the_fingerprint() {
     let key = crate::decision_engine::state::fixtures::key();
     let mut state = crate::decision_engine::state::fixtures::state(&key, "prx observation");
-    let original = [
-        state.canonical(false).expect("test: canonical state serializes"),
-        state.canonical(true).expect("test: canonical state serializes"),
-    ];
+    let original = state.canonical().expect("test: canonical state serializes");
     state.observed = state.observed.clone().with_exact_call_observations(None);
-    assert_eq!(
-        [
-            state.canonical(false).expect("test: canonical state serializes"),
-            state.canonical(true).expect("test: canonical state serializes")
-        ],
-        original
-    );
-    for value in &original {
-        assert!(!value.contains("exact_call_observations"));
-    }
+    assert_eq!(state.canonical().expect("test: canonical state serializes"), original);
+    assert!(!original.contains("exact_call_observations"));
     let facts = ExactCallObservations {
         version: 1,
         incomplete: false,
@@ -37,14 +26,9 @@ fn absent_observations_keep_legacy_canonical_and_present_facts_bind_both_fingerp
         .observed
         .clone()
         .with_exact_call_observations(Some(Arc::new(facts.clone())));
-    let before = [
-        state
-            .material_fingerprint(&key)
-            .expect("test: canonical state serializes"),
-        state
-            .record_fingerprint(&key)
-            .expect("test: canonical state serializes"),
-    ];
+    let before = state
+        .material_fingerprint(&key)
+        .expect("test: canonical state serializes");
     let mut changed = facts;
     changed.calls.first_mut().expect("actual fact").fingerprint = [8; 32];
     state.observed = state
@@ -55,12 +39,6 @@ fn absent_observations_keep_legacy_canonical_and_present_facts_bind_both_fingerp
         state
             .material_fingerprint(&key)
             .expect("test: canonical state serializes"),
-        before.first().expect("material").as_str()
-    );
-    assert_ne!(
-        state
-            .record_fingerprint(&key)
-            .expect("test: canonical state serializes"),
-        before.get(1).expect("record").as_str()
+        before
     );
 }
