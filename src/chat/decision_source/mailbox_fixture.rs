@@ -40,7 +40,7 @@ pub(crate) async fn spawn(
         ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let context = binding.decide(&service, &cancellation).await?;
+    let context = binding.issue_decision(&service, &cancellation, false).await?;
     let specs = service.agent_execution_specs(binding.as_ref(), context)?;
     anyhow::ensure!(
         specs.specs.iter().any(|spec| spec.name == "sessions_spawn"),
