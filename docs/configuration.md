@@ -25,9 +25,12 @@ For decision admission, backend gates, inspection and rollback, see the
 When `[decision_engine] enabled = false`, `prx causal status` reports
 `engine_disabled` for a configured backend excluded by that switch. The separate
 `key_available` field still reports the workspace key's actual availability.
-Engine-on `clarify` degrades to one plain answer with no selected tools only when
-a legal Answer passed its gate; the control tools stay available. Otherwise it
-retains the typed refusal.
+The engine only advises. Every turn opens without a prediction hop, whether the
+engine is on or off: the serving model chooses tools from the published surface,
+and an enabled engine adds at most a brief. The engine never selects, delegates,
+retrieves, clarifies or refuses on its own, so a `refuse` or `clarify` prediction
+does not change the turn. Its analysis is charged to the turn's own budget and is
+skipped when that budget is tight; the request is never refused because of it.
 `prx init --decision-enable` enables causal recovery; advisory inference separately
 requires `[decision_engine] enabled = true`.
 

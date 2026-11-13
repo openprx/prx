@@ -47,6 +47,7 @@ fn changed(current: Option<&Config>, candidate: &Config) -> bool {
     current.is_none_or(|current| {
         current.causal_tree != candidate.causal_tree
             || current.decision_engine.enabled != candidate.decision_engine.enabled
+            || current.decision_engine.backend != candidate.decision_engine.backend
             || super::rendering_changed(&current.providers, &candidate.providers)
     })
 }
@@ -109,7 +110,10 @@ pub(crate) fn check_decision_plane(current: Option<&Config>, candidate: &Config)
     let Err(refusal) = check_section(candidate) else {
         return Ok(None);
     };
-    let Some(current) = current.filter(|current| current.causal_tree == candidate.causal_tree) else {
+    let Some(current) = current.filter(|current| {
+        current.causal_tree == candidate.causal_tree
+            && current.decision_engine.backend == candidate.decision_engine.backend
+    }) else {
         return Err(refusal);
     };
     // An unreadable credential store fails the current configuration too,

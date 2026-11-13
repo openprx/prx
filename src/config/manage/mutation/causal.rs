@@ -154,7 +154,7 @@ fn is_decision_credential(id: &str) -> bool {
 ///
 /// When the credential store cannot be read.
 pub fn orphaned_decision_credentials(config: &Config) -> Result<Vec<CredentialStatus>, CredentialReferenceError> {
-    let referenced = match &config.causal_tree.backend.credential_ref {
+    let referenced = match &crate::config::schema::decision_engine::effective_engine_backend(config).credential_ref {
         CredentialRefSetting::Profile(id) => Some(id.as_str()),
         CredentialRefSetting::Unset | CredentialRefSetting::None => None,
     };
@@ -306,13 +306,13 @@ impl CausalConfigService {
             })
             .into());
         }
-        let Some(selection) = crate::config::schema::causal_tree::configured_selection(&desired.causal_tree.backend)
-        else {
+        let backend = crate::config::schema::decision_engine::effective_engine_backend(&desired);
+        let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) else {
             return Err(CausalMutationError::Invalid(
                 "no decision backend that takes a credential is configured".to_string(),
             ));
         };
-        let previous = match &desired.causal_tree.backend.credential_ref {
+        let previous = match &backend.credential_ref {
             CredentialRefSetting::Profile(id) if is_decision_credential(id) => Some(id.clone()),
             _ => None,
         };
@@ -382,7 +382,10 @@ pub fn paired(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMuta
     let turns_remote = mutations
         .iter()
         .any(|mutation| matches!(mutation, CausalMutation::SetRemote(_)));
-    if to_builtin && !turns_remote && config.causal_tree.backend.remote_enabled {
+    if to_builtin
+        && !turns_remote
+        && crate::config::schema::decision_engine::effective_engine_backend(config).remote_enabled
+    {
         std::iter::once(CausalMutation::SetRemote(false))
             .chain(mutations)
             .collect()
@@ -392,7 +395,29 @@ pub fn paired(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMuta
 }
 
 /// Apply one mutation to `config`.
+///
+/// A backend change starts from the effective engine backend (R55) and
+/// leaves `[decision_engine.backend]` and the legacy `[causal_tree.backend]`
+/// identical, so the change is the one the engine builds from.
 fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), CausalMutationError> {
+    let backend_change = matches!(
+        mutation,
+        CausalMutation::ResetBackendToAuto
+            | CausalMutation::SetRemote(_)
+            | CausalMutation::SetCredentialRef(_)
+            | CausalMutation::SetBackend { .. }
+    );
+    if backend_change {
+        config.causal_tree.backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
+    }
+    apply_section(config, mutation)?;
+    if backend_change {
+        config.decision_engine.backend = Some(config.causal_tree.backend.clone());
+    }
+    Ok(())
+}
+
+fn apply_section(config: &mut Config, mutation: &CausalMutation) -> Result<(), CausalMutationError> {
     let section = &mut config.causal_tree;
     match mutation {
         CausalMutation::SetEnabled(enabled) => section.enabled = *enabled,
@@ -491,12 +516,13 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
         CausalMutation::ResetPolicyToDefaults => section.policy = CausalPolicy::default(),
         CausalMutation::ApplyCalibration { report_id } => {
             let proposal = read_proposal(&config.workspace_dir, report_id)?;
+            let backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
             let section = &mut config.causal_tree;
             let (kind, model) =
                 CalibrationProfile::measured(&proposal.profile).map_err(CausalMutationError::Calibration)?;
-            let pinned = section.backend.kind == BackendSelection::Fixed(kind)
-                && section.backend.model.trim() == model
-                && section.backend.endpoint.trim() == proposal.endpoint.trim()
+            let pinned = backend.kind == BackendSelection::Fixed(kind)
+                && backend.model.trim() == model
+                && backend.endpoint.trim() == proposal.endpoint.trim()
                 && !crate::providers::model_pin::is_unpinned_model(&model);
             if !pinned {
                 return Err(CausalMutationError::Calibration(
@@ -510,7 +536,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             // serving the same model does not inherit it (D-094 C-7).
             section.policy.calibration_profile = Some(CalibrationProfile {
                 kind,
-                endpoint: section.backend.endpoint.trim().to_string(),
+                endpoint: backend.endpoint.trim().to_string(),
                 model,
             });
         }

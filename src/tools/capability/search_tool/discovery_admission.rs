@@ -214,10 +214,16 @@ pub(crate) fn capability_search_spec(
     {
         return Ok(None);
     }
-    let descriptor = port
-        .execution()
-        .current_descriptor("capability_search")
-        .ok_or(SearchControlUnavailable::MissingBackend)?;
+    let Some(descriptor) = port.execution().current_descriptor("capability_search") else {
+        // A child runs on its own task registry, which owns no discovery
+        // control unless its parent passed one down. Its manifest no longer
+        // hides the parent's catalog in Full (R51), so the absence is the
+        // child's structure, not a stale root registry.
+        if proof.child_scope().is_some() {
+            return Ok(None);
+        }
+        return Err(SearchControlUnavailable::MissingBackend.into());
+    };
     let spec = ToolSpec {
         name: descriptor.public_name,
         description: descriptor.description,

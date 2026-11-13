@@ -267,7 +267,21 @@ impl PublicationRules<'_, '_> {
                 let directly_exposed = matches!(entry.exposure, Exposure::Direct);
                 let minted_delegator =
                     delegate && outgoing_child && self.trusted.surface != TurnSurfaceKind::Interactive;
-                if !directly_exposed && !minted_delegator {
+                // A child's sealed manifest is the tool set its parent chose
+                // for it (the retired child hop's selection, R9): its members
+                // are published like Direct entries, under the same rules.
+                let manifest_member = self
+                    .facts
+                    .child_scope()
+                    .is_some_and(|(manifest, _)| manifest.allowed.contains(&reference));
+                if !directly_exposed && !minted_delegator && !manifest_member {
+                    return None;
+                }
+                // A child nests only through a sealed outgoing manifest
+                // (V-16). This is structural integrity, not a permission
+                // limit, so it holds in Full too (R51): without the
+                // manifest the delegator could never bind.
+                if delegate && !outgoing_child && self.facts.child_scope().is_some() {
                     return None;
                 }
                 if self.restricts(entry, true) {

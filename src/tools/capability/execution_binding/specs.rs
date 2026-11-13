@@ -152,21 +152,24 @@ pub(crate) fn prompt_skills(
     proof: &dyn TurnSourceProof,
 ) -> anyhow::Result<Vec<crate::skills::Skill>> {
     execution_specs(port, proof)?;
-    if runtime_dependency_spec(port, proof, "skill_read").is_err() {
-        if port
-            .catalog_view()
-            .iter_entries()
-            .any(|entry| entry.skill_metadata.is_some())
-        {
-            tracing::warn!("skill metadata suppressed because live skill_read is unavailable");
-        }
-        return Ok(Vec::new());
+    // The published surface's skills come first: the turn admitted their
+    // documents itself, so they need no loader (the retired hop's selected
+    // refs, R9). Installed metadata that is only discoverable is advertised
+    // through the live skill_read loader.
+    let mut refs: BTreeSet<CapabilityRef> = port.execution_refs().clone();
+    if runtime_dependency_spec(port, proof, "skill_read").is_ok() {
+        refs.extend(
+            discovery_entries(port, proof)?
+                .into_values()
+                .filter(|entry| entry.searchable)
+                .map(|entry| entry.reference),
+        );
+    } else if port.catalog_view().iter_entries().any(|entry| {
+        entry.skill_metadata.is_some() && !refs.contains(&crate::tools::surface_owner::publication::entry_ref(entry))
+    }) {
+        tracing::warn!("discoverable skill metadata suppressed because live skill_read is unavailable");
     }
-    let refs: Vec<_> = discovery_entries(port, proof)?
-        .into_values()
-        .filter(|entry| entry.searchable)
-        .map(|entry| entry.reference)
-        .collect();
+    let refs: Vec<CapabilityRef> = refs.into_iter().collect();
     let entries = port.catalog().resolve(&refs)?;
     let mut skills: Vec<crate::skills::Skill> = Vec::new();
     for entry in entries {
