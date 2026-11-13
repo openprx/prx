@@ -53,7 +53,7 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
             }
         }
         let named = identifier_count(&compact, "DecisionTransports");
-        let service_field = if relative == "src/runtime/turn_decision.rs" {
+        let service_field = if relative == "src/runtime/turn_publication/builder.rs" {
             let count = compact.matches("pub transports: &'a dyn DecisionTransports,").count();
             if count != 1 {
                 violations.push(format!("{relative}: expected one borrowed constructor transport field"));

@@ -3,8 +3,8 @@
 //! depend on the engine.
 
 use super::helpers::{
-    blank_comments_and_literals, is_ident_char, is_test_code_file, read_source, relative_path, rust_source_files,
-    strip_cfg_test_items, test_module_files,
+    blank_comments_and_literals, is_ident_char, is_test_code_file, module_resolved_paths, module_segments, read_source,
+    relative_path, rust_source_files, strip_cfg_test_items, test_module_files,
 };
 
 /// The neutral homes (R15-R17, R52, OV-14). There is no exception for
@@ -114,106 +114,6 @@ const FORBIDDEN_ENGINE_IMPORTS: [&str; 8] = [
     "tools::delegate",
 ];
 
-/// The end of the use tree or path that starts at `text[0]`: the first `;`,
-/// `)` or `,`/`}` outside any brace group, or a character that cannot be part
-/// of a path (`(`, `<`, `!`, `=`, ...).
-fn path_tree_end(text: &str) -> usize {
-    let mut depth = 0_usize;
-    for (offset, character) in text.char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' if depth == 0 => return offset,
-            '}' => depth -= 1,
-            ',' if depth == 0 => return offset,
-            ':' | ',' | '*' => {}
-            _ if is_ident_char(character) => {}
-            _ if depth > 0 => {}
-            _ => return offset,
-        }
-    }
-    text.len()
-}
-
-/// Expand a compact use tree (`tools::{execution, capability::catalog}`) into
-/// every path it names.
-fn expand_tree(prefix: &str, tree: &str, paths: &mut Vec<String>) {
-    let Some(open) = tree.find('{') else {
-        // Whitespace is removed, so an `as` alias only extends the last
-        // segment; the forbidden-root match is on leading segments.
-        paths.push(format!("{prefix}{}", tree.trim_end_matches("::")));
-        return;
-    };
-    let head = &tree[..open];
-    let mut depth = 0_usize;
-    let mut start = open + 1;
-    let body_end = tree.rfind('}').unwrap_or(tree.len());
-    let mut entries = Vec::new();
-    for (offset, character) in tree[open + 1..body_end].char_indices() {
-        let at = open + 1 + offset;
-        match character {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                entries.push(&tree[start..at]);
-                start = at + 1;
-            }
-            _ => {}
-        }
-    }
-    entries.push(&tree[start..body_end]);
-    for entry in entries.into_iter().filter(|entry| !entry.is_empty()) {
-        expand_tree(&format!("{prefix}{head}"), entry, paths);
-    }
-}
-
-/// The crate-rooted module path of a production file under `src/`.
-fn module_segments(relative: &str) -> Vec<String> {
-    let trimmed = relative.trim_start_matches("src/").trim_end_matches(".rs");
-    let mut segments: Vec<String> = trimmed.split('/').map(str::to_owned).collect();
-    if segments.last().is_some_and(|last| last == "mod") {
-        segments.pop();
-    }
-    segments
-}
-
-/// Every crate-rooted path named in `compact` (whitespace removed): explicit
-/// `crate::` paths and `super::` chains that climb to the crate root.
-fn crate_rooted_paths(compact: &str, module: &[String]) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut index = 0;
-    while index < compact.len() {
-        let rest = &compact[index..];
-        let preceded_by_ident = compact[..index].chars().next_back().is_some_and(is_ident_char);
-        if !preceded_by_ident && rest.starts_with("crate::") {
-            let tree = &rest["crate::".len()..];
-            expand_tree("", &tree[..path_tree_end(tree)], &mut paths);
-            index += "crate::".len();
-            continue;
-        }
-        if !preceded_by_ident && rest.starts_with("super::") && !compact[..index].ends_with("::") {
-            let mut climbs = 0_usize;
-            let mut tail = rest;
-            while let Some(next) = tail.strip_prefix("super::") {
-                climbs += 1;
-                tail = next;
-            }
-            if let Some(remaining) = module.len().checked_sub(climbs) {
-                let base = module[..remaining].join("::");
-                let prefix = if base.is_empty() {
-                    String::new()
-                } else {
-                    format!("{base}::")
-                };
-                expand_tree(&prefix, &tail[..path_tree_end(tail)], &mut paths);
-            }
-            index += "super::".len() * climbs;
-            continue;
-        }
-        index += rest.chars().next().map_or(1, char::len_utf8);
-    }
-    paths
-}
-
 /// Whether a crate-rooted `path` is (or is inside) one of the forbidden roots.
 fn is_forbidden_engine_import(path: &str) -> bool {
     FORBIDDEN_ENGINE_IMPORTS.iter().any(|root| {
@@ -248,7 +148,7 @@ pub(super) fn decision_engine_never_imports_agent_or_tool_execution() {
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
         let compact: String = production.split_whitespace().collect();
         let module = module_segments(&relative);
-        for named in crate_rooted_paths(&compact, &module) {
+        for named in module_resolved_paths(&compact, &module) {
             if is_forbidden_engine_import(&named) {
                 violations.push(format!("{relative}: crate::{named}"));
             }

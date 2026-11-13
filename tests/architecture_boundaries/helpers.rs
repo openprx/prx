@@ -711,3 +711,106 @@ fn use_tree_paths(text: &str, at: usize, prefix: &str, paths: &mut Vec<String>) 
     paths.push(path);
     index
 }
+
+/// R8: the module-resolving path scanner of the engine boundary (R41) shares
+/// this home with `crate_rooted_paths`; it resolves every `super::` chain
+/// against the file's own module path.
+/// The end of the use tree or path that starts at `text[0]`: the first `;`,
+/// `)` or `,`/`}` outside any brace group, or a character that cannot be part
+/// of a path (`(`, `<`, `!`, `=`, ...).
+fn path_tree_end(text: &str) -> usize {
+    let mut depth = 0_usize;
+    for (offset, character) in text.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' if depth == 0 => return offset,
+            '}' => depth -= 1,
+            ',' if depth == 0 => return offset,
+            ':' | ',' | '*' => {}
+            _ if is_ident_char(character) => {}
+            _ if depth > 0 => {}
+            _ => return offset,
+        }
+    }
+    text.len()
+}
+
+/// Expand a compact use tree (`tools::{execution, capability::catalog}`) into
+/// every path it names.
+fn expand_tree(prefix: &str, tree: &str, paths: &mut Vec<String>) {
+    let Some(open) = tree.find('{') else {
+        // Whitespace is removed, so an `as` alias only extends the last
+        // segment; the forbidden-root match is on leading segments.
+        paths.push(format!("{prefix}{}", tree.trim_end_matches("::")));
+        return;
+    };
+    let head = &tree[..open];
+    let mut depth = 0_usize;
+    let mut start = open + 1;
+    let body_end = tree.rfind('}').unwrap_or(tree.len());
+    let mut entries = Vec::new();
+    for (offset, character) in tree[open + 1..body_end].char_indices() {
+        let at = open + 1 + offset;
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                entries.push(&tree[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&tree[start..body_end]);
+    for entry in entries.into_iter().filter(|entry| !entry.is_empty()) {
+        expand_tree(&format!("{prefix}{head}"), entry, paths);
+    }
+}
+
+/// The crate-rooted module path of a production file under `src/`.
+pub(super) fn module_segments(relative: &str) -> Vec<String> {
+    let trimmed = relative.trim_start_matches("src/").trim_end_matches(".rs");
+    let mut segments: Vec<String> = trimmed.split('/').map(str::to_owned).collect();
+    if segments.last().is_some_and(|last| last == "mod") {
+        segments.pop();
+    }
+    segments
+}
+
+/// Every crate-rooted path named in `compact` (whitespace removed): explicit
+/// `crate::` paths and `super::` chains that climb to the crate root.
+pub(super) fn module_resolved_paths(compact: &str, module: &[String]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < compact.len() {
+        let rest = &compact[index..];
+        let preceded_by_ident = compact[..index].chars().next_back().is_some_and(is_ident_char);
+        if !preceded_by_ident && rest.starts_with("crate::") {
+            let tree = &rest["crate::".len()..];
+            expand_tree("", &tree[..path_tree_end(tree)], &mut paths);
+            index += "crate::".len();
+            continue;
+        }
+        if !preceded_by_ident && rest.starts_with("super::") && !compact[..index].ends_with("::") {
+            let mut climbs = 0_usize;
+            let mut tail = rest;
+            while let Some(next) = tail.strip_prefix("super::") {
+                climbs += 1;
+                tail = next;
+            }
+            if let Some(remaining) = module.len().checked_sub(climbs) {
+                let base = module[..remaining].join("::");
+                let prefix = if base.is_empty() {
+                    String::new()
+                } else {
+                    format!("{base}::")
+                };
+                expand_tree(&prefix, &tail[..path_tree_end(tail)], &mut paths);
+            }
+            index += "super::".len() * climbs;
+            continue;
+        }
+        index += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    paths
+}

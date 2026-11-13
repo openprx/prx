@@ -5,7 +5,8 @@ fn token_counting_is_not_feature_gated() {
     let forbidden = ["llm", "-router"].concat();
     for relative in [
         "src/agent/context_budget.rs",
-        "src/agent/context_budget/token_timing.rs",
+        "src/tokens/count.rs",
+        "src/tokens/count/token_timing.rs",
         "src/agent/turn_tests/context_budget.rs",
         "src/runtime/decision_accounting/token_preflight_tests.rs",
     ] {

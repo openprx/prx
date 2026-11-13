@@ -364,10 +364,6 @@ const CAUSAL_OUTCOME_CRATE_PATHS: &[&str] = &[
     "runtime::turn_decision::TurnDecisionContext",
 ];
 
-// The directive carries a sealed child capability manifest to the runtime;
-// only this conversion module may name the manifest and its constraints.
-const CAUSAL_DIRECTIVE_CRATE_PATHS: &[&str] = &["tools::capability::child::ChildCapabilityManifest"];
-
 /// AG-24 and AG-26: decisions may use an absolute deadline and may describe
 /// an approval scope, but they cannot create a nested duration timeout or an
 /// authenticated approval response/grant. Test-only fixtures are excluded.
@@ -502,7 +498,6 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
                     "decision_engine::prediction::factory::PredictionResult",
                     "tools::capability::catalog::CatalogView",
                 ],
-                "src/causal_tree/directive.rs" => CAUSAL_DIRECTIVE_CRATE_PATHS,
                 "src/causal_tree/outcome.rs" => CAUSAL_OUTCOME_CRATE_PATHS,
                 "src/causal_tree/admin.rs" => &[
                     "config::files::with_consistent_config_snapshot",
