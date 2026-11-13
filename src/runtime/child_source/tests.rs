@@ -238,9 +238,9 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
             );
 
             // The test now holds no decision service: only the publication,
-            // the pinned runtime context, the binding and the executor.
-            drop(decision);
-            drop(other_decision);
+            // the pinned runtime context, the binding and the executor. The
+            // borrowed `TurnDecision` views are no longer used, so moving the
+            // admitted turn out below ends them.
             let OrdinaryParent { admitted, calls, drift } = parent;
             drop(admitted);
             publication.verify_live()?;

@@ -99,14 +99,11 @@ mod tests {
             }
             assert!(!service.advisory().initialized());
             assert!(!dir.path().join("decision-engine.sqlite").exists());
-            service
-                .advisory()
-                .observe(
-                    || context.terminal_execution_trace(),
-                    binding.decision_advice().map(|a| a.decision_id),
-                    true,
-                )
-                .await;
+            service.advisory().observe(
+                || context.terminal_execution_trace(),
+                binding.decision_advice().map(|a| a.decision_id),
+                true,
+            );
             // P1-04: the store is opened in the background, never on the
             // turn's path; shutdown drain waits for that opening.
             assert!(

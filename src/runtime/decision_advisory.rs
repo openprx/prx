@@ -274,7 +274,7 @@ impl DecisionAdvisory {
     }
 
     #[cfg(test)]
-    pub(crate) fn factory(&self) -> Option<&DecisionBackendFactory> {
+    pub(crate) const fn factory(&self) -> Option<&DecisionBackendFactory> {
         self.factory.as_ref()
     }
 
@@ -559,7 +559,9 @@ impl DecisionAdvisory {
     /// queue at once (P1-04). Before the store is open, the outcome waits in
     /// one queue with the same bound while a single background task opens
     /// the store; an outcome that does not fit is dropped and counted (P1-10).
-    pub(crate) async fn observe(
+    /// It is synchronous, so a caller cannot wait on it; it must run inside a
+    /// Tokio runtime because the first pre-open outcome spawns the opener.
+    pub(crate) fn observe(
         &self,
         trace: impl FnOnce() -> ExecutionTraceSnapshot,
         decision_id: Option<String>,

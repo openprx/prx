@@ -804,7 +804,7 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                     .unwrap()
                     .is_none()
             );
-            assert!(appended_names(&turn).is_empty());
+            assert_eq!(appended_names(&turn), Vec::<String>::new());
             if plan {
                 assert!(proof.intercepts_writes());
                 assert!(
@@ -828,7 +828,7 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                         .is_none()
                 );
                 assert_eq!(context.execution_refs(), &original_refs);
-                assert!(appended_names(&turn).is_empty());
+                assert_eq!(appended_names(&turn), Vec::<String>::new());
                 let event = memory
                     .find_owned_message_event(proof.workspace_id(), proof.owner_id(), proof.source_event_id().unwrap())
                     .await
@@ -845,7 +845,7 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
             let hits = model_search(&port, "skills_list", 1).await;
             assert_eq!(hits.len(), usize::from(!exclude_target));
             // A returned schema is still only an offer until admission.
-            assert!(appended_names(&turn).is_empty());
+            assert_eq!(appended_names(&turn), Vec::<String>::new());
             if !exclude_target {
                 assert_eq!(
                     *hits.first().unwrap().get("schema").unwrap().get("name").unwrap(),
@@ -988,13 +988,13 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
             assert_eq!(hits.len(), expected, "{query}");
         }
         // The search itself declares nothing: the current request is unchanged.
-        assert!(appended_names(&turn).is_empty());
+        assert_eq!(appended_names(&turn), Vec::<String>::new());
         // An exclusion (here the inherited channel exclusion) blocks the hit.
         assert_eq!(
             service.admit_offered_discoveries(proof, context, |name, _| name == "skills_list" || name == "shell"),
             0
         );
-        assert!(appended_names(&turn).is_empty());
+        assert_eq!(appended_names(&turn), Vec::<String>::new());
         // Without the exclusion, every hit that passes the gates is declared.
         let admitted = service.admit_offered_discoveries(proof, context, |_, _| false);
         let appended = appended_names(&turn);

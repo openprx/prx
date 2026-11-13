@@ -728,7 +728,7 @@ pub(crate) struct ResumeEvidenceWitness(());
 
 impl AdmittedDecisionResume {
     /// The prepared command's tool: the only tool a resume turn publishes.
-    pub(crate) fn prepared_tool_name(&self) -> &str {
+    pub(crate) const fn prepared_tool_name(&self) -> &str {
         self.prepared.command.name.as_str()
     }
 

@@ -24,7 +24,7 @@ impl AdmissionProbe for HardGatesProbe<'_, '_, '_> {
     }
 
     fn check_all(&self, candidates: &[CausalCandidate]) -> Result<ProbeReport, GenerationError> {
-        Ok(HardGates::apply(self.state, self.catalog, candidates, self.gates)?)
+        HardGates::apply(self.state, self.catalog, candidates, self.gates)
     }
 
     fn filters(&self) -> bool {

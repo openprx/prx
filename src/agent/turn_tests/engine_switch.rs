@@ -1921,10 +1921,10 @@ impl ScriptedDecisionEndpoint {
             axum::Json(body): axum::Json<serde_json::Value>,
         ) -> axum::response::Response {
             requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match crate::runtime::decision_advisory::tests::scripted_answers(&body, prefer) {
-                Ok(answer) => axum::Json(answer).into_response(),
-                Err(_) => axum::http::StatusCode::BAD_REQUEST.into_response(),
-            }
+            crate::runtime::decision_advisory::tests::scripted_answers(&body, prefer).map_or_else(
+                |_| axum::http::StatusCode::BAD_REQUEST.into_response(),
+                |answer| axum::Json(answer).into_response(),
+            )
         }
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await

@@ -89,12 +89,13 @@ pub(crate) async fn reconcile_child_telemetry(
     deadline: Instant,
 ) -> anyhow::Result<ChildRecoveryReport> {
     let mut report = ChildRecoveryReport::default();
-    if let Some(skipped) = child_recovery_gate(
+    let gate = child_recovery_gate(
         &service.runtime.recovery_scope(),
         service.generation.effective.causal_tree.enabled,
         service.recordable,
         service.durable_key,
-    ) {
+    );
+    if let Some(skipped) = gate {
         return Ok(skipped);
     }
     anyhow::ensure!(

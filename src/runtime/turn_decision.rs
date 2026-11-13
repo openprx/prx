@@ -125,7 +125,7 @@ pub(crate) struct TurnDecisionService {
 impl TurnDecisionService {
     /// The turn's advisory decision driver.
     #[must_use]
-    pub(crate) fn advisory(&self) -> &crate::runtime::decision_advisory::DecisionAdvisory {
+    pub(crate) const fn advisory(&self) -> &crate::runtime::decision_advisory::DecisionAdvisory {
         &self.advisory
     }
 
@@ -502,7 +502,7 @@ impl TurnDecisionContext {
         Some(candidate_id.target().as_str())
     }
 
-    pub(crate) fn terminal_outcome_action(&self) -> Option<crate::tools::capability::contract::CausalActionKind> {
+    pub(crate) const fn terminal_outcome_action(&self) -> Option<crate::tools::capability::contract::CausalActionKind> {
         use crate::tools::capability::contract::CausalActionKind;
         // Every turn opens through the prediction-free path (R9): the
         // committed selection is always the answer candidate.
@@ -637,7 +637,7 @@ pub(crate) enum AgentRetrievalError {
 
 impl TurnDecisionContext {
     /// The execution-owned runtime context of this turn.
-    pub(crate) fn runtime(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeContext> {
+    pub(crate) const fn runtime(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeContext> {
         &self.runtime
     }
 }

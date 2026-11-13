@@ -30,7 +30,7 @@ pub(crate) struct JournalAttachment {
 
 /// Inspect the attached generation without probing a backend or opening a
 /// new store. Admin and control-ladder readers can use this snapshot.
-pub(crate) fn plane_status(backend: BackendPlaneStatus, journal: JournalAttachment) -> DecisionPlaneStatus {
+pub(crate) const fn plane_status(backend: BackendPlaneStatus, journal: JournalAttachment) -> DecisionPlaneStatus {
     DecisionPlaneStatus {
         backend,
         catalog_generation: journal.catalog_generation,

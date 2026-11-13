@@ -312,8 +312,8 @@ fn explicit_empty_engine_backend_uses_defaults_not_legacy() {
     );
     assert!(crate::config::schema::causal_tree::configured_selection(effective).is_none());
     let factory = factory_for(&config);
-    assert!(factory.status().order.is_empty(), "no remote construction");
-    assert!(factory.status().excluded.is_empty());
+    assert_eq!(factory.status().order, [], "no remote construction");
+    assert_eq!(factory.status().excluded, []);
 }
 
 #[test]

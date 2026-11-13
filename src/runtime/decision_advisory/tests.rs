@@ -478,6 +478,8 @@ async fn forced_drop_is_reported_only_for_its_workspace() {
             ..Default::default()
         })
     };
+    // Both queues stay alive (and registered) while the status is read.
+    assert_eq!(queues.len(), 2);
     assert_eq!(status(a.path()).dropped, 1);
     assert_eq!(status(b.path()).dropped, 0);
     for release in releases {
@@ -656,9 +658,7 @@ async fn observation_never_waits_for_the_telemetry_open() {
     let mut config = (*enabled_config(temp.path())).clone();
     config.decision_engine.mode = DecisionMode::Both;
     let advisory = DecisionAdvisory::new(Arc::new(config), None);
-    advisory
-        .observe(ExecutionTraceSnapshot::default, Some("decision-1".into()), true)
-        .await;
+    advisory.observe(ExecutionTraceSnapshot::default, Some("decision-1".into()), true);
     assert!(!advisory.initialized(), "observe returned before any telemetry open");
     assert!(!temp.path().join("decision-engine.sqlite").exists());
     assert!(
@@ -680,12 +680,11 @@ async fn observation_never_waits_for_the_telemetry_open() {
 /// waits. On a current-thread runtime the single opener task cannot run while
 /// the test does not yield, so it stays stalled for every observation below:
 /// the queue holds exactly the `observe_queue` bound, the overflow is
-/// counted, and each observation completes on its first poll. Once the
+/// counted, and each observation returns without yielding. Once the
 /// opener runs, the queued outcomes reach the store and the overflow reaches
 /// the store's existing drop accounting.
 #[tokio::test(flavor = "current_thread")]
 async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
-    use futures::FutureExt as _;
     const BOUND: u32 = 4;
     const OBSERVED: u64 = 11;
     let temp = tempfile::tempdir().unwrap();
@@ -693,14 +692,10 @@ async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
     config.decision_engine.mode = DecisionMode::Both;
     config.decision_engine.observe_queue = BOUND;
     let advisory = DecisionAdvisory::new(Arc::new(config), None);
+    // `observe` is synchronous: each observation returns without yielding,
+    // so the opener cannot run in between.
     for index in 0..OBSERVED {
-        assert!(
-            advisory
-                .observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true)
-                .now_or_never()
-                .is_some(),
-            "observation {index} completes without waiting for the opener"
-        );
+        advisory.observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true);
     }
     assert!(!advisory.initialized(), "the opener has not run");
     assert!(!temp.path().join("decision-engine.sqlite").exists());
@@ -774,9 +769,7 @@ async fn drain_during_the_pre_open_handover_waits_for_the_transfer() {
     entered_rx.await.unwrap();
 
     for index in 0..OBSERVED {
-        advisory
-            .observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true)
-            .await;
+        advisory.observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true);
     }
     {
         let pending = advisory.pending.lock();

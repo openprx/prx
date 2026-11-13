@@ -148,14 +148,11 @@ pub(crate) async fn run_turn(
         inner,
     )
     .await;
-    advisory_service
-        .advisory()
-        .observe(
-            || advisory_context.terminal_execution_trace(),
-            advisory_id,
-            result.is_ok(),
-        )
-        .await;
+    advisory_service.advisory().observe(
+        || advisory_context.terminal_execution_trace(),
+        advisory_id,
+        result.is_ok(),
+    );
     result
 }
 

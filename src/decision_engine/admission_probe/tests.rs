@@ -193,7 +193,7 @@ fn exact_call_scope_is_independent_of_approval_outcome() {
                         catalog: view,
                         gates,
                     };
-                    for (id, _) in gates.call_fingerprints.iter() {
+                    for id in gates.call_fingerprints.keys() {
                         let entry = view
                             .entries()
                             .iter()
@@ -472,7 +472,7 @@ fn with_ten_fixture(
         } else {
             BTreeSet::new()
         },
-        ..build_surface.clone()
+        ..build_surface
     };
     let view = catalog.view(&CatalogScope::default()).with_surface(&surface);
     check(&state, &view, &unrestricted, &policy, &gates);
