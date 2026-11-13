@@ -180,3 +180,39 @@ async fn rehomed_security_items_preserve_refusal() -> anyhow::Result<()> {
     ));
     Ok(())
 }
+
+/// R22: a child turn's recursive money is funded only through the incoming
+/// parent grant. The funded owner is the grant's recursive child allowance,
+/// the turn's spend ceiling never exceeds it, and an exhausted grant leaves
+/// the child nothing to spend.
+#[tokio::test]
+async fn child_turn_context_funds_recursive_money_only_through_the_parent_grant() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let child = crate::agent::turn_tests::engine_switch::admit_bound_child_segment().await;
+    let result = (|| -> anyhow::Result<()> {
+        let routing = child.turn.routing();
+        let holder = &routing.runtime.holder;
+        let grant = holder
+            .parent_grant()
+            .context("a bound child publication holds its parent grant")?;
+        let granted = grant
+            .recursive_child_allowance()
+            .and_then(|owner| owner.funded_money())
+            .context("the parent grant funds a recursive child allowance")?;
+        let funded = holder
+            .recursive_money(routing.proof)
+            .context("the child turn's recursive money")?;
+        assert!(
+            Arc::ptr_eq(&funded, &granted),
+            "recursive money is the parent grant's allowance"
+        );
+        assert!(holder.spend_ceiling(routing.proof)?.live()? <= granted.load(Ordering::Acquire));
+        let saved = granted.swap(0, Ordering::AcqRel);
+        let exhausted = holder.spend_ceiling(routing.proof)?.live()?;
+        granted.store(saved, Ordering::Release);
+        assert_eq!(exhausted, 0, "an exhausted grant leaves nothing to spend");
+        Ok(())
+    })();
+    child.shutdown().await;
+    result
+}

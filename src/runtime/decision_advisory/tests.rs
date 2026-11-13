@@ -131,6 +131,97 @@ pub(crate) struct RecordingBackend {
     pub(crate) key: Arc<DecisionKey>,
     pub(crate) attempts: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) request_bytes: Arc<parking_lot::Mutex<Vec<usize>>>,
+    /// The candidate action the scripted answers predict with full
+    /// confidence (`"answer"`, `"refuse"`, `"clarify"`, ...).
+    pub(crate) prefer: &'static str,
+}
+
+/// Wire answers to every question of a real compiled request that predict
+/// `prefer` with full confidence: the next-action choice picks it when it is
+/// an option, every candidate of that action applies, succeeds and has the
+/// highest gain, every other candidate does not apply and has no gain.
+pub(crate) fn scripted_answers(body: &serde_json::Value, prefer: &str) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context as _;
+    use serde_json::{Value, json};
+    let candidates = body
+        .pointer("/state/candidates")
+        .and_then(Value::as_array)
+        .context("candidate projection")?;
+    let preferred = |instruction: &str| {
+        candidates.iter().enumerate().any(|(index, candidate)| {
+            instruction.contains(&format!("$.candidates[{index}]"))
+                && candidate.get("action").and_then(Value::as_str) == Some(prefer)
+        })
+    };
+    let names_candidate = |instruction: &str| instruction.contains("$.candidates[");
+    let questions = body
+        .get("questions")
+        .and_then(Value::as_object)
+        .context("wire questions")?;
+    let mut answers = serde_json::Map::new();
+    for (id, question) in questions {
+        let instruction = question
+            .get("instructions")
+            .and_then(Value::as_str)
+            .context("question instructions")?;
+        let answer = match question.get("type").and_then(Value::as_str) {
+            Some("choice") => {
+                let options = question
+                    .get("criteria")
+                    .and_then(Value::as_object)
+                    .context("choice criteria")?;
+                let chosen = [prefer, "none", "other"]
+                    .into_iter()
+                    .find(|option| options.contains_key(*option))
+                    .or_else(|| options.keys().next().map(String::as_str))
+                    .context("choice option")?;
+                let probabilities: serde_json::Map<String, Value> = options
+                    .keys()
+                    .map(|option| (option.clone(), json!(if option == chosen { 1.0 } else { 0.0 })))
+                    .collect();
+                json!({"type":"choice","choice":chosen,"probabilities":probabilities,"confidence":1.0})
+            }
+            Some("noul") => {
+                let yes = if names_candidate(instruction) {
+                    preferred(instruction)
+                } else {
+                    instruction.starts_with("Is the observed evidence sufficient")
+                };
+                json!({"type":"noul","noul":if yes {1.0} else {0.0}})
+            }
+            Some("score") => {
+                let levels = question
+                    .get("criteria")
+                    .and_then(Value::as_array)
+                    .context("score criteria")?;
+                let last = levels.len().checked_sub(1).context("score legend")?;
+                let high = if instruction.contains("risk") {
+                    false
+                } else {
+                    !names_candidate(instruction) || preferred(instruction)
+                };
+                let selected = if high { last } else { 0 };
+                let legend: serde_json::Map<String, Value> = levels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, level)| (index.to_string(), level.clone()))
+                    .collect();
+                let probabilities: serde_json::Map<String, Value> = levels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (index.to_string(), json!(if index == selected { 1.0 } else { 0.0 })))
+                    .collect();
+                json!({"type":"score","score":selected,"legend":legend,"probabilities":probabilities,"confidence":1.0})
+            }
+            _ => anyhow::bail!("unexpected decision primitive"),
+        };
+        answers.insert(id.clone(), answer);
+    }
+    Ok(json!({
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "answers": answers,
+        "usage": {"input_tokens": 1_000, "output_tokens": 200},
+    }))
 }
 
 #[async_trait::async_trait]
@@ -182,8 +273,7 @@ impl crate::decision_engine::prediction::backend::DecisionBackend for RecordingB
     {
         use crate::cost::decision_attempt::DecisionError;
         let wire: serde_json::Value = serde_json::from_slice(body.bytes()).map_err(|_| DecisionError::Unavailable)?;
-        let answer = crate::agent::agent::native_decision_fixture::decision_answers_for_exact(&wire, "answer", "none")
-            .map_err(|_| DecisionError::Unavailable)?;
+        let answer = scripted_answers(&wire, self.prefer).map_err(|_| DecisionError::Unavailable)?;
         let bytes = serde_json::to_vec(&answer).map_err(|_| DecisionError::Unavailable)?;
         crate::decision_engine::prediction::wire::SystemOneCodec::new(request, &self.key)?.decode_response(
             &bytes,
@@ -294,6 +384,7 @@ async fn decision_advisory_runs_without_turn_decision_service() {
                 key: Arc::clone(&key),
                 attempts: Arc::clone(&attempts),
                 request_bytes: Arc::clone(&request_bytes),
+                prefer: "answer",
             })],
             Arc::clone(&key),
             crate::decision_engine::prediction::outbound::OutboundSecrets::default(),

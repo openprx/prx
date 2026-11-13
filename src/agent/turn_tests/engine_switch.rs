@@ -1459,12 +1459,14 @@ async fn open_agent_turn(enabled: bool, configure: impl FnOnce(&mut crate::confi
 
 const BRIEF_MARKER: &str = "Decision advice (advisory only):";
 
-/// R9 (P1-I1): engine-on equals engine-off plus the advisory brief. With a
-/// zero-cost (builtin) backend the provider sees the same tool list and tool
-/// fingerprint, the same tool executes once, and the same reply is published;
-/// only the brief differs. A policy that forced the retired hop to abstain
-/// (refuse or clarify) no longer changes anything: one provider request, one
-/// execution, a published reply.
+/// R9 (P1-I1): engine-on equals engine-off plus the advisory brief. Both
+/// open identical turns (the same execution refs and published surface);
+/// with a zero-cost (builtin) backend the provider sees the same tool list
+/// and tool fingerprint, the same tool executes once, and the same reply is
+/// published; only the brief differs. Refuse/Clarify predictions are covered
+/// by `high_confidence_refuse_or_clarify_advice_never_changes_the_turn`.
+/// Historical resume is waived (owner rule, P1-08/P1-09), so no resume turn
+/// is opened here.
 #[tokio::test]
 async fn engine_on_and_off_open_identical_turns() {
     let off = Box::pin(open_agent_turn(false, |_| {})).await;
@@ -1493,15 +1495,202 @@ async fn engine_on_and_off_open_identical_turns() {
         "engine-on adds only the brief"
     );
 
-    // Pin the policy that made the retired hop abstain on every input.
-    let abstaining = Box::pin(open_agent_turn(true, |config| {
-        config.causal_tree.policy.commit_threshold = 1.0;
-    }))
-    .await;
-    assert_eq!(abstaining.reply, off.reply, "an abstaining backend never refuses");
-    assert_eq!(abstaining.provider_requests, off.provider_requests);
-    assert_eq!(abstaining.executions, off.executions);
-    assert_eq!(abstaining.tools, off.tools);
+    // The opened turns themselves are identical.
+    let (off_refs, off_published) = opened_turn_refs(false).await;
+    let (on_refs, on_published) = opened_turn_refs(true).await;
+    assert!(
+        off_refs
+            .iter()
+            .any(|reference| reference.id.as_str().contains("project_tool")),
+        "the fixture tool is an execution ref: {off_refs:?}"
+    );
+    assert_eq!(on_refs, off_refs, "same execution refs");
+    assert_eq!(on_published, off_published, "same published surface");
+}
+
+/// The execution refs and published surface of one turn opened through the
+/// production path with the engine `enabled` or not.
+async fn opened_turn_refs(
+    enabled: bool,
+) -> (
+    std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef>,
+    std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef>,
+) {
+    let workspace = tempfile::tempdir().expect("test: opened-turn workspace");
+    let mut config = engine_off_config(workspace.path());
+    config.decision_engine.enabled = enabled;
+    config.tool_tiering.always_include.push("project_tool".into());
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+        name: "project_tool".to_owned(),
+        execution_order: Arc::new(Mutex::new(Vec::new())),
+    }) as Box<dyn Tool>]);
+    let admitted = AdmittedTurn::with_config(config, "run the project tool", registry).await;
+    let decision = admitted.decision();
+    let context = decision
+        .service
+        .open_turn_context(
+            decision.proof,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("test: production turn opening");
+    (context.execution_refs().clone(), context.runtime().published.clone())
+}
+
+/// R9 (P1-I1): a backend that predicts Refuse or Clarify with full
+/// confidence (a real scripted prediction through the advisory driver, not
+/// a policy knob) changes nothing but the advice: the turn sends exactly one
+/// provider request with the same tools and publishes the same reply as the
+/// engine-off turn.
+#[tokio::test]
+async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
+    use crate::decision_engine::IntentValue;
+    use crate::runtime::decision_advisory::DecisionAdvisory;
+    use crate::runtime::decision_advisory::tests::{RecordingBackend, price_mock_model};
+    let mut served = Vec::new();
+    for prefer in [None, Some("refuse"), Some("clarify")] {
+        let workspace = tempfile::tempdir().expect("test: advice workspace");
+        let mut config = engine_off_config(workspace.path());
+        config.tool_tiering.always_include.push("project_tool".into());
+        if prefer.is_some() {
+            config.decision_engine.enabled = true;
+            config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
+                kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
+                    crate::config::schema::causal_tree::BackendKind::Mock,
+                ),
+                model: "recording-model".into(),
+                ..Default::default()
+            });
+            price_mock_model(&mut config, "recording-model");
+        }
+        let dispatches = Arc::new(Mutex::new(Vec::new()));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(RecordingTool {
+            name: "project_tool".to_owned(),
+            execution_order: Arc::clone(&dispatches),
+        }) as Box<dyn Tool>]);
+        let admitted = AdmittedTurn::with_config(config.clone(), "run the project tool", Arc::clone(&registry)).await;
+        let decision = admitted.decision();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = decision
+            .service
+            .open_turn_context(
+                decision.proof,
+                crate::runtime::turn_context::AgentTurnKind::SingleShot,
+                &cancellation,
+            )
+            .await
+            .expect("test: production turn opening");
+        let advice = match prefer {
+            None => None,
+            Some(prefer) => {
+                let key = crate::decision_engine::state::fixtures::key();
+                let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
+                    vec![Box::new(RecordingBackend {
+                        identity: crate::cost::decision_attempt::BackendIdentity {
+                            kind: crate::config::schema::causal_tree::BackendKind::Mock,
+                            provider: None,
+                            configured_model: Arc::from("recording-model"),
+                        },
+                        key: Arc::clone(&key),
+                        attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                        request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                        prefer,
+                    })],
+                    Arc::clone(&key),
+                    crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
+                    crate::decision_engine::prediction::factory::SlotLimits::default(),
+                );
+                let advisory = DecisionAdvisory::new(Arc::new(config.clone()), Some(factory));
+                let analysis = advisory
+                    .analyze_turn(context.runtime(), &cancellation)
+                    .await
+                    .expect("test: the backend's prediction is analysed");
+                let Some(IntentValue::Choice {
+                    probabilities,
+                    confidence,
+                }) = analysis.global.get("next_action")
+                else {
+                    panic!("{prefer}: no next-action prediction: {:?}", analysis.global);
+                };
+                assert_eq!(probabilities.get(prefer), Some(&1.0), "{prefer} is predicted");
+                assert_eq!(*confidence, 1.0, "{prefer} with full confidence");
+                Some(analysis)
+            }
+        };
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = EngineOffProvider {
+            calls: Arc::clone(&calls),
+            published: Arc::clone(&published),
+            responses: Mutex::new(
+                vec![ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                }]
+                .into(),
+            ),
+        };
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("run the project tool")];
+        let (outcome, _) = run_turn(
+            &mut history,
+            TurnRequest {
+                advice,
+                channel_name: "wacli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: false,
+                expose_stay_silent: false,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: TurnSchedule {
+                    read_only_tool_concurrency_window: 1,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: TurnDecision {
+                    service: decision.service,
+                    context: &context,
+                    runtime: context.runtime(),
+                    proof: decision.proof,
+                },
+            },
+            TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry: registry,
+                observer: &crate::observability::NoopObserver,
+                hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admitted.adapter()),
+                memory: admitted.memory_runtime(),
+            },
+            TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .expect("test: the turn is served");
+        served.push((
+            outcome.into_text(),
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            published.lock().expect("test: published tools").clone(),
+            dispatches.lock().expect("test: dispatches").clone(),
+        ));
+    }
+    let (off, advised) = served.split_first().expect("test: engine-off turn");
+    assert_eq!(off.0, "done", "the engine-off reply is published");
+    assert_eq!(off.1, 1, "one provider request");
+    assert!(off.2.iter().any(|name| name == "project_tool"), "the tool is offered");
+    for on in advised {
+        assert_eq!(on, off, "Refuse/Clarify advice changes nothing but the brief");
+    }
 }
 
 /// R9.5 / P1-I3: a priced analysis that does not fit the turn's remaining
@@ -1537,6 +1726,7 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
                 key: Arc::clone(&key),
                 attempts: Arc::clone(attempts),
                 request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                prefer: "answer",
             })],
             Arc::clone(&key),
             crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
@@ -1703,6 +1893,7 @@ async fn configured_backend_runs_on_a_production_opened_turn() {
             key: Arc::clone(&key),
             attempts: Arc::clone(&attempts),
             request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            prefer: "answer",
         })],
         Arc::clone(&key),
         crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
