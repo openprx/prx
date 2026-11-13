@@ -221,6 +221,9 @@ async fn run_tool_call_loop_persists_large_tool_output_documents() {
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the turn publishes its configured
+    // Direct tools, so the fixture tool is configured Direct.
+    config.tool_tiering.always_include.push("large_output".to_owned());
     // All targeted fixture tools use native adapters with no filesystem/memory category.
     // Driver validates an actual use_tool/native_tool candidate in the compiled request.
     let driver = crate::agent::agent::native_decision_fixture::Driver::start("native_tool")
@@ -246,7 +249,9 @@ async fn run_tool_call_loop_persists_large_tool_output_documents() {
                             &provider,
                         )
                         .await;
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        // Every registered business tool is configured Direct, so nothing is
+                        // left to search and the turn carries no search control.
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
 
                         let result = run_turn(
                             &mut history,
@@ -477,14 +482,36 @@ async fn run_tool_call_loop_keeps_stateful_tools_strictly_serial() {
         .await;
 }
 
+/// Admits a prediction-free turn (R9, R28) whose configured Direct tool is
+/// `direct`: the turn publishes it at opening, and every other registered
+/// extended tool stays deferred behind capability_search.
+async fn admitted_with_direct(
+    workspace: &std::path::Path,
+    input: &str,
+    registry: &Arc<Vec<Box<dyn Tool>>>,
+    direct: &str,
+) -> crate::agent::turn_tests::admission::AdmittedTurn {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = workspace.to_path_buf();
+    config.tool_tiering.always_include.push(direct.to_owned());
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: Direct fixture memory"));
+    crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_memory(
+        config,
+        input,
+        Arc::clone(registry),
+        memory,
+    )
+    .await
+}
+
 #[tokio::test]
-async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
+async fn tool_loop_refreshes_only_published_dynamic_capabilities() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         let skill_refreshes = Arc::new(AtomicUsize::new(0));
         let mcp_refreshes = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(RefreshCountingTool {
-                name: "skill_read",
+                name: "pdf_probe",
                 category: ToolCategory::System,
                 refreshes: Arc::clone(&skill_refreshes),
             }),
@@ -495,7 +522,7 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
             }),
         ];
         let provider = ScriptedProvider::from_text_responses(vec!["done"]);
-        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let routing_input = "use pdf_probe to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user(format!(
@@ -506,20 +533,15 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         let workspace = TempDir::new().expect("surface fixture workspace");
         let expected_specs = tool_specs_of(&tools_registry)
             .into_iter()
-            .filter(|spec| spec.name == "skill_read")
+            .filter(|spec| spec.name == "pdf_probe")
             .collect::<Vec<_>>();
         assert_eq!(
             expected_specs.len(),
             1,
-            "selected fixture capability must be registered"
+            "configured Direct fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
-            workspace.path(),
-            routing_input,
-            Arc::clone(&tools_registry),
-        )
-        .await;
+        let admission = admitted_with_direct(workspace.path(), routing_input, &tools_registry, "pdf_probe").await;
         admission.assert_selected_specs(&expected_specs);
 
         let result = run_turn(
@@ -564,18 +586,22 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         .unwrap();
 
         assert_eq!(result, "done");
-        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            skill_refreshes.load(Ordering::SeqCst),
+            1,
+            "the published Direct tool is refreshed"
+        );
         assert_eq!(
             mcp_refreshes.load(Ordering::SeqCst),
             0,
-            "an unrelated skill/PDF turn must not cold-start MCP"
+            "a deferred capability is not published, so a PDF turn never cold-starts MCP"
         );
 
         let skill_refreshes = Arc::new(AtomicUsize::new(0));
         let mcp_refreshes = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(RefreshCountingTool {
-                name: "skill_read",
+                name: "pdf_probe",
                 category: ToolCategory::System,
                 refreshes: Arc::clone(&skill_refreshes),
             }),
@@ -592,20 +618,15 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         let workspace = TempDir::new().expect("surface fixture workspace");
         let expected_specs = tool_specs_of(&tools_registry)
             .into_iter()
-            .filter(|spec| spec.name == "mcp_status")
+            .filter(|spec| spec.name == "pdf_probe")
             .collect::<Vec<_>>();
         assert_eq!(
             expected_specs.len(),
             1,
-            "selected fixture capability must be registered"
+            "configured Direct fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
-            workspace.path(),
-            routing_input,
-            Arc::clone(&tools_registry),
-        )
-        .await;
+        let admission = admitted_with_direct(workspace.path(), routing_input, &tools_registry, "pdf_probe").await;
         admission.assert_selected_specs(&expected_specs);
 
         let result = run_turn(
@@ -650,11 +671,15 @@ async fn tool_loop_refreshes_only_intent_selected_dynamic_capabilities() {
         .unwrap();
 
         assert_eq!(result, "done");
-        assert_eq!(skill_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            skill_refreshes.load(Ordering::SeqCst),
+            1,
+            "the published surface is the configured one, whatever the input names"
+        );
         assert_eq!(
             mcp_refreshes.load(Ordering::SeqCst),
-            1,
-            "an explicit MCP/browser turn must still refresh MCP before schema exposure"
+            0,
+            "prediction-free opening (R9, R28): naming a deferred capability neither publishes nor refreshes it"
         );
     })
     .await;
@@ -669,7 +694,7 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
         };
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(RefreshCountingTool {
-                name: "skill_read",
+                name: "pdf_probe",
                 category: ToolCategory::System,
                 refreshes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -679,26 +704,21 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
                 refreshes: Arc::new(AtomicUsize::new(0)),
             }),
         ];
-        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let routing_input = "use pdf_probe to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
         let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
         let workspace = TempDir::new().expect("surface fixture workspace");
         let expected_specs = tool_specs_of(&tools_registry)
             .into_iter()
-            .filter(|spec| spec.name == "skill_read")
+            .filter(|spec| spec.name == "pdf_probe")
             .collect::<Vec<_>>();
         assert_eq!(
             expected_specs.len(),
             1,
-            "selected fixture capability must be registered"
+            "configured Direct fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
-            workspace.path(),
-            routing_input,
-            Arc::clone(&tools_registry),
-        )
-        .await;
+        let admission = admitted_with_direct(workspace.path(), routing_input, &tools_registry, "pdf_probe").await;
         admission.assert_selected_specs(&expected_specs);
 
         let result = run_turn(
@@ -749,13 +769,13 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
             .find(|message| message.role == "system")
             .expect("request should contain a system message");
         assert_eq!(system.content.matches("## Runtime Capabilities").count(), 1);
-        assert!(system.content.contains("`skill_read`"));
+        assert!(system.content.contains("`pdf_probe`"));
         assert!(!system.content.contains("`mcp_status`"));
         assert_eq!(system.content.matches("## Tool Use Protocol").count(), 1);
-        assert!(system.content.contains("**skill_read**"));
+        assert!(system.content.contains("**pdf_probe**"));
         assert!(
             !system.content.contains("**mcp_status**"),
-            "prompt-guided instructions must not advertise a tool excluded by turn intent"
+            "prompt-guided instructions must not advertise a tool the turn did not publish"
         );
     })
     .await;
@@ -770,7 +790,7 @@ async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
         ]);
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(RefreshCountingTool {
-                name: "skill_read",
+                name: "pdf_probe",
                 category: ToolCategory::System,
                 refreshes: Arc::new(AtomicUsize::new(0)),
             }),
@@ -780,26 +800,21 @@ async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
                 refreshes: Arc::new(AtomicUsize::new(0)),
             }),
         ];
-        let routing_input = "use skill_read to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
+        let routing_input = "use pdf_probe to inspect the PDF skill. Do not use browser, MCP, HTTP, plugins, or WASM.";
         let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
         let workspace = TempDir::new().expect("surface fixture workspace");
         let expected_specs = tool_specs_of(&tools_registry)
             .into_iter()
-            .filter(|spec| spec.name == "skill_read")
+            .filter(|spec| spec.name == "pdf_probe")
             .collect::<Vec<_>>();
         assert_eq!(
             expected_specs.len(),
             1,
-            "selected fixture capability must be registered"
+            "configured Direct fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
-            workspace.path(),
-            routing_input,
-            Arc::clone(&tools_registry),
-        )
-        .await;
+        let admission = admitted_with_direct(workspace.path(), routing_input, &tools_registry, "pdf_probe").await;
         admission.assert_selected_specs(&expected_specs);
 
         let result = run_turn(
@@ -861,30 +876,25 @@ async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
             "done",
         ]);
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RefreshCountingTool {
-            name: "skill_read",
+            name: "pdf_probe",
             category: ToolCategory::System,
             refreshes: Arc::new(AtomicUsize::new(0)),
         })];
-        let routing_input = "use skill_read to inspect the PDF skill";
+        let routing_input = "use pdf_probe to inspect the PDF skill";
         let mut history = vec![ChatMessage::system("base-system"), ChatMessage::user(routing_input)];
 
         let workspace = TempDir::new().expect("surface fixture workspace");
         let expected_specs = tool_specs_of(&tools_registry)
             .into_iter()
-            .filter(|spec| spec.name == "skill_read")
+            .filter(|spec| spec.name == "pdf_probe")
             .collect::<Vec<_>>();
         assert_eq!(
             expected_specs.len(),
             1,
-            "selected fixture capability must be registered"
+            "configured Direct fixture capability must be registered"
         );
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
-        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_tools(
-            workspace.path(),
-            routing_input,
-            Arc::clone(&tools_registry),
-        )
-        .await;
+        let admission = admitted_with_direct(workspace.path(), routing_input, &tools_registry, "pdf_probe").await;
         admission.assert_selected_specs(&expected_specs);
 
         let result = run_turn(
@@ -1108,6 +1118,11 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut mechanics_config = crate::config::Config::default();
     mechanics_config.workspace_dir = workspace.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+    mechanics_config
+        .tool_tiering
+        .always_include
+        .push("delay_progress".to_owned());
     let mechanics_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("mechanics memory"));
     // All targeted fixture tools use native adapters with no filesystem/memory category.
     // Driver validates an actual use_tool/native_tool candidate in the compiled request.
@@ -1168,7 +1183,9 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
                             admission_started,
                             "real admission I/O must finish before virtual watchdog time advances"
                         );
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        // Every registered business tool is configured Direct, so nothing is
+                        // left to search and the turn carries no search control.
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
                         let guard = crate::agent::idle::IdleGuard {
@@ -1292,6 +1309,11 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut mechanics_config = crate::config::Config::default();
     mechanics_config.workspace_dir = workspace.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+    mechanics_config
+        .tool_tiering
+        .always_include
+        .push("delay_progress".to_owned());
     let mechanics_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("mechanics memory"));
     // All targeted fixture tools use native adapters with no filesystem/memory category.
     // Driver validates an actual use_tool/native_tool candidate in the compiled request.
@@ -1353,7 +1375,9 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
                             admission_started,
                             "real admission I/O must finish before virtual watchdog time advances"
                         );
-                        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+                        // Every registered business tool is configured Direct, so nothing is
+                        // left to search and the turn carries no search control.
+                        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
                         let observer = NoopObserver;
 
                         let guard = crate::agent::idle::IdleGuard {

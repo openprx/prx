@@ -173,7 +173,11 @@ fn child_dispatch(
 ) -> ToolExecutionContext {
     let owner = bound.envelope.resolved_owner_id();
     let workspace = bound.envelope.workspace_id.clone();
-    let mut context = ToolExecutionContext::new(bound.envelope.clone(), bound.chat_type.clone());
+    let mut envelope = bound.envelope.clone();
+    // Child admission binds the envelope's own owner to the pin, never a
+    // projection; the child envelope carries it explicitly.
+    envelope.owner_id = Some(owner.clone());
+    let mut context = ToolExecutionContext::new(envelope, bound.chat_type.clone());
     context.child_scope = Some(Arc::clone(publication.scope()));
     context.child_pin = Some(publication.dispatch_pin(&owner, &workspace));
     context
@@ -254,9 +258,16 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
 
             // Membership: Supervised refuses a tool outside the manifest with
             // no dispatch; Full has no manifest limit (R51) and executes once.
-            let status = dispatch(&execution, child_dispatch(&bound, &publication)).await;
+            let outcome = execution
+                .execute(
+                    ToolExecutionCommand::new(PROBE, serde_json::json!({"value": 1})),
+                    child_dispatch(&bound, &publication),
+                    None,
+                )
+                .await;
+            let status = outcome.status;
             if level == AutonomyLevel::Full {
-                assert_eq!(status, ToolExecutionStatus::Succeeded);
+                assert_eq!(status, ToolExecutionStatus::Succeeded, "{}", outcome.model_content);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             } else {
                 assert_ne!(status, ToolExecutionStatus::Succeeded);
@@ -281,10 +292,16 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
             assert_eq!(calls.load(Ordering::SeqCst), executed);
 
             // Parity: a live executor that drifted from the pinned catalog is
-            // refused in both levels, before and at dispatch.
+            // refused in both levels, before and at dispatch. The task-scope
+            // check covers the sealed manifest's refs only; the drifted probe
+            // is outside the manifest, so that check alone stays valid and
+            // the live-catalog check and dispatch are what refuse it.
             drift.fetch_add(1, Ordering::SeqCst);
             assert!(publication.verify_live().is_err());
-            assert!(publication.verify_task_scope().is_err());
+            assert!(
+                publication.verify_task_scope().is_ok(),
+                "the sealed manifest itself did not drift"
+            );
             let status = dispatch(&execution, child_dispatch(&bound, &publication)).await;
             assert_ne!(status, ToolExecutionStatus::Succeeded);
             assert_eq!(calls.load(Ordering::SeqCst), executed);

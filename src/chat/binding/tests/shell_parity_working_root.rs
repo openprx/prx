@@ -298,15 +298,25 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
                     &cancellation,
                 )
                 .await?;
+            // Prediction-free opening (R9): the Chat turn publishes its
+            // configured Direct surface; the model's sessions_spawn call binds
+            // that one published definition.
             let selected = publication.agent_execution_specs(proof.as_ref(), &context)?;
+            let spawn_spec: Vec<_> = selected
+                .specs
+                .iter()
+                .filter(|spec| spec.name == "sessions_spawn")
+                .cloned()
+                .collect();
             anyhow::ensure!(
-                selected.specs.len() == 1 && selected.specs.first().is_some_and(|spec| spec.name == "sessions_spawn"),
-                "test: actual Chat decision must select sessions_spawn"
+                spawn_spec.len() == 1,
+                "test: the Chat turn must publish sessions_spawn: {:?}",
+                selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>()
             );
             let original =
                 crate::tools::ToolExecutionContext::new(proof.envelope().clone(), "private").with_chat_id(session_key);
             let (execution, bound) =
-                publication.bind_agent_execution(proof.as_ref(), &context, &original, &selected.specs)?;
+                publication.bind_agent_execution(proof.as_ref(), &context, &original, &spawn_spec)?;
             anyhow::ensure!(
                 bound.child_grant.is_some(),
                 "test: real parent-issued child grant required"

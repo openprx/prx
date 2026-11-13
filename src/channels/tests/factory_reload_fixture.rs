@@ -617,16 +617,14 @@ pub(super) async fn run() {
             let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind, protocol_version, abstention_reason FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
             let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, u32>(3)?, row.get::<_, Option<String>>(4)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
             assert!(!rows.is_empty() && rows.len() <= 32, "bounded complete per-input decision evidence");
+            // Prediction-free opening (R9): each input persists its one
+            // Answer row; no backend-produced prediction row precedes it.
             assert!(
-                rows.iter().all(|(_, _, backend, protocol, abstention)| {
-                    backend == "builtin"
-                        || (backend == "none" && *protocol == 0 && abstention.as_deref() == Some("hop_stopped"))
-                }),
-                "generation {phase} persisted configured-backend decision rows: {rows:?}"
-            );
-            assert!(
-                rows.iter().any(|(_, _, backend, _, _)| backend == "builtin"),
-                "generation {phase} omitted its builtin decision row: {rows:?}"
+                rows.len() == 1
+                    && rows
+                        .iter()
+                        .all(|(_, _, backend, protocol, abstention)| backend == "none" && *protocol == 0 && abstention.is_none()),
+                "generation {phase} persisted a prediction row: {rows:?}"
             );
             assert!(rows.iter().any(|(candidates, selected, _, _, _)| {
                 let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");

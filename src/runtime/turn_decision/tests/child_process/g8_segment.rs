@@ -659,21 +659,34 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         assert!(execution_context.child_scope.is_some() && execution_context.child_pin.is_some());
         let mut unscoped = execution_context.clone();
         unscoped.child_scope = None;
-        // Stale is decided before resolution, approval or any backend entry.
-        for (context, name) in [
-            (execution_context.clone(), HIDDEN_CHILD_CAPABILITY),
-            (unscoped, "file_read"),
-        ] {
-            let outcome = child_service
-                .execution
-                .execute(
-                    crate::tools::ToolExecutionCommand::new(name, serde_json::json!({})),
-                    context,
-                    None,
-                )
-                .await;
-            assert_eq!(outcome.status, ToolExecutionStatus::StaleCapability, "{name}");
-        }
+        // A Full child has no manifest membership limit (R51), so the
+        // capability outside its manifest is refused by the child's call
+        // budget, which has no share for it; an unscoped call is stale. Both
+        // are decided before resolution, approval or any backend entry.
+        let outside = child_service
+            .execution
+            .execute(
+                crate::tools::ToolExecutionCommand::new(HIDDEN_CHILD_CAPABILITY, serde_json::json!({})),
+                execution_context.clone(),
+                None,
+            )
+            .await;
+        assert_eq!(outside.status, ToolExecutionStatus::Denied, "{}", outside.model_content);
+        assert!(outside.model_content.contains("has no call budget"), "{}", outside.model_content);
+        let outcome = child_service
+            .execution
+            .execute(
+                crate::tools::ToolExecutionCommand::new("file_read", serde_json::json!({})),
+                unscoped,
+                None,
+            )
+            .await;
+        assert_eq!(
+            outcome.status,
+            ToolExecutionStatus::StaleCapability,
+            "file_read: {}",
+            outcome.model_content
+        );
         // Neither the outside capability nor the in-manifest one reached a backend.
         assert_eq!(hidden_calls.load(Ordering::SeqCst), 0);
         assert_eq!(physical_calls.load(Ordering::SeqCst), 0);
@@ -698,7 +711,8 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
                         .execution_refs()
                         .iter()
                         .any(|reference| reference.id == entry.id))
-                && routing.context.engine.prediction.is_some(),
+                // Prediction-free opening (R9): no prediction at opening.
+                && routing.context.engine.prediction.is_none(),
             "test: engine-enabled child publishes its admitted execution: selection={:?}; published={:?}; fallback={:?}",
             routing.context.engine.selection,
             routing.context.execution_refs(),

@@ -342,6 +342,8 @@ async fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
     config.causal_tree.enabled = true;
+    // R55: the configured engine is the decision_engine switch.
+    config.decision_engine.enabled = true;
     let generation = crate::config::new_shared(config.clone()).pin();
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
     let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(

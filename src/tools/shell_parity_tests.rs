@@ -317,7 +317,7 @@ async fn supervised_approval_does_not_enable_git() {
 }
 
 #[tokio::test]
-async fn full_parent_supervised_child_keeps_native_restrictions_after_approval() {
+async fn full_parent_attenuated_child_runs_native_tools_at_full() {
     use super::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
     use super::capability::child::{
         AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest, ChildDispatchPin, VerifiedChildScope,
@@ -378,31 +378,33 @@ async fn full_parent_supervised_child_keeps_native_restrictions_after_approval()
         owner: "prx_user".into(),
         workspace: "workspace-a".into(),
     }));
+    // R51: Full autonomy has no permission limits. Under a Full service an
+    // attenuated (Supervised) child manifest does not tighten the call, so
+    // the native restrictions below Full do not apply: git is not refused
+    // before spawn, and a file outside the root is written.
     let git = dispatch(&parent_service, child.clone(), "shell", json!({"command":"git status"})).await;
-    assert_eq!(
-        git.status,
-        ToolExecutionStatus::Failed,
-        "test: child approved shell reaches refusal"
-    );
     assert!(
-        git.process.as_ref().is_some_and(|process| !process.started
-            && process
+        git.process.as_ref().is_some_and(|process| process.started
+            && !process
                 .diagnostic
                 .as_deref()
                 .is_some_and(|error| error.contains("refusing to run git through the shell"))),
-        "test: child GitRefused before spawn: {git:?}"
+        "test: Full child shell runs git: {git:?}"
     );
     let path = outside.path().join("child.txt");
     let write = dispatch(
         &parent_service,
         child,
         "file_write",
-        json!({"path":path,"content":"blocked"}),
+        json!({"path":path,"content":"written"}),
     )
     .await
     .result
     .expect("test: child file reached backend");
-    assert!(!write.success && !path.exists(), "test: child out-of-root file denied");
+    assert!(
+        write.success && path.exists(),
+        "test: Full child out-of-root file written: {write:?}"
+    );
 }
 
 #[tokio::test]

@@ -1109,101 +1109,67 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         );
         assert!(manifest.allowed.len() < parent.allowed.len());
 
-        // Recheck the actual selected parent capability against the real
-        // narrower child seal. Full runtime mode cannot widen that scope.
-        use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
-        let crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } =
-            &context.engine.candidates
-        else {
-            anyhow::bail!("real parent has no legal candidate set");
-        };
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.action() == crate::tools::capability::contract::CausalActionKind::Delegate)
-            .expect("actual delegate candidate");
-        let calls = BTreeMap::new();
-        let seen = BTreeSet::new();
-        let mut gates = GateInputs {
-            policy: &service.security,
-            owner_id: proof.owner_id(),
-            sender: proof.policy_sender(),
-            policy_channel: proof.policy_channel(),
-            chat_type: proof.policy_chat_type(),
-            model_ref: &context.engine.state.trusted.parts().resolved_model,
-            model_can_chat: true,
-            model_can_call_tools: service.model_can_call_tools(&proof),
-            decision_endpoint_ready: true,
-            child_scope: None,
-            verified_approval_calls: BTreeMap::new(),
-            call_fingerprints: &calls,
-            failed_call_counts: BTreeMap::new(),
-            replayed_non_idempotent: &seen,
-            retry_limit: Some(0),
-        };
-        let view = service.catalog_view();
-        assert_eq!(
-            HardGates::check_one(&context.engine.state, &view, candidate, &gates),
-            GateOutcome::Passed
-        );
-        gates.child_scope = Some((manifest, parent));
-        assert_eq!(
-            HardGates::check_one(&context.engine.state, &view, candidate, &gates),
-            GateOutcome::Blocked {
-                gate: 1,
-                reason_code: "scope"
-            }
-        );
-        gates.child_scope = None;
-        // Negative gate projection only: no resume receipt or approval is
-        // minted. An exact-resume restriction cannot borrow Full policy
-        // to admit this otherwise legal, unapproved executable candidate.
-        let mut resumed = context.engine.state.clone();
-        let mut trusted = resumed.trusted.parts().clone();
-        trusted
-            .constraints
-            .push(crate::tools::capability::turn_state::ConstraintCode::new(
-                "resume_exact_call",
-            ));
-        resumed.trusted = TrustedState::from_runtime(trusted);
-        assert_eq!(
-            HardGates::check_one(&resumed, &view, candidate, &gates),
-            GateOutcome::Blocked {
-                gate: 9,
-                reason_code: "resume_scope"
-            }
-        );
+        // Prediction-free opening (R9): no Delegate candidate is generated,
+        // so there is no hop candidate to re-gate. The narrower child seal
+        // above is what bounds the child.
     } else {
         let answer = context.is_run();
         if answer {
             let selected = service
                 .agent_execution_specs(&proof, &context)
-                .expect("test: confidence Answer remains executable without delegation");
-            assert!(
-                selected.specs.is_empty(),
-                "test: fallback Answer grants no tool schemas"
-            );
-            assert!(
-                context.execution_refs().is_empty(),
-                "test: fallback Answer grants no capability refs"
-            );
+                .expect("test: the Answer turn remains executable");
+            if level == crate::security::AutonomyLevel::Supervised {
+                // Prediction-free opening (R9): Supervised publishes the
+                // configured Direct spawn; its approval is enforced when it
+                // is called.
+                assert_eq!(
+                    selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+                    ["sessions_spawn"],
+                    "test: Supervised publishes only the configured Direct spawn"
+                );
+            } else {
+                assert!(
+                    selected.specs.is_empty(),
+                    "test: fallback Answer grants no tool schemas"
+                );
+                assert!(
+                    context.execution_refs().is_empty(),
+                    "test: fallback Answer grants no capability refs"
+                );
+            }
         } else {
             assert!(
                 service.agent_execution_specs(&proof, &context).is_err(),
                 "test: policy refusal exposes no selected executable delegation"
             );
         }
-        assert!(service.issue_child_grant(&proof, &context).is_err());
-        assert_eq!(
-            match service.verified_delegation_scope(&context) {
-                Ok(_) => panic!("unapproved turn has no executable delegation scope"),
-                Err(error) => error.to_string(),
-            },
-            if answer {
-                "answer surface has no admitted delegator"
-            } else {
-                "selected decision is not delegation"
-            }
-        );
+        if level == crate::security::AutonomyLevel::Supervised {
+            // Prediction-free opening (R9): the published Direct spawn is the
+            // turn's admitted delegator, so the sealed child grant is issued
+            // at opening. It stays at the Supervised level, model-only and
+            // owner-bound; the spawn call itself still waits at the approval
+            // gate, and admission launches no worker (below).
+            let grant = service.issue_child_grant(&proof, &context)?;
+            let (manifest, parent) = grant.scope().gate_inputs();
+            manifest.verify(parent)?;
+            assert_eq!(manifest.authority.level, crate::security::AutonomyLevel::Supervised);
+            assert_eq!(manifest.authority.owner, proof.owner_id());
+            assert!(manifest.allowed.is_empty(), "the model-only child inherits no tools");
+            assert_eq!(grant.parent().source_event_id(), proof.source_event_id());
+        } else {
+            assert!(service.issue_child_grant(&proof, &context).is_err());
+            assert_eq!(
+                match service.verified_delegation_scope(&context) {
+                    Ok(_) => panic!("unapproved turn has no executable delegation scope"),
+                    Err(error) => error.to_string(),
+                },
+                if answer {
+                    "answer surface has no admitted delegator"
+                } else {
+                    "selected decision is not delegation"
+                }
+            );
+        }
         if level == crate::security::AutonomyLevel::ReadOnly {
             assert!(context.engine.outgoing_child.is_none());
         } else {

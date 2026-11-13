@@ -225,50 +225,9 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         )
         .await;
         let context = result.expect("builtin service decision");
-        let seed = service
-            .catalog
-            .view(&CatalogScope::default())
-            .entries()
-            .iter()
-            .find(|entry| entry.public_name == "prx_perf_0000")
-            .map(|entry| CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            })
-            .expect("fixed searchable discovery seed");
-        assert!(
-            context.audit_hops().any(|hop| matches!(
-                &hop.candidates,
-                crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. }
-                    if candidates.iter().any(|candidate| {
-                        candidate.action() == crate::tools::capability::contract::CausalActionKind::Discover
-                            && candidate.target() == crate::tools::capability::contract::CapabilityTarget::NativeTool
-                            && candidate.required_capabilities() == std::slice::from_ref(&seed)
-                    })
-            )),
-            "each measured context must contain its genuine fixed seed Discover reference"
-        );
-        let expected = service
-            .catalog
-            .view(&CatalogScope::default())
-            .entries()
-            .iter()
-            .find(|entry| entry.public_name == "file_read")
-            .map(|entry| CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            })
-            .expect("fixed direct read capability");
-        assert!(context.audit_hops().any(|hop| matches!(
-            &hop.candidates,
-            crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. }
-                if candidates.iter().any(|candidate| {
-                    candidate.action() == crate::tools::capability::contract::CausalActionKind::UseTool
-                        && candidate.required_capabilities() == [expected.clone()]
-                })
-        )));
+        // Prediction-free opening (R9): no Discover or UseTool candidate is
+        // generated for the catalog; what stays measured is that the opening's
+        // candidates, path and terminal do not grow with the catalog.
         let candidates = match &context.engine().candidates {
             crate::decision_engine::candidate_generator::CandidateSet::Legal { candidates, .. } => candidates.len(),
             crate::decision_engine::candidate_generator::CandidateSet::NoLegalPath { terminals, .. } => terminals.len(),

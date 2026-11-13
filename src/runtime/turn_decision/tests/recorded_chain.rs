@@ -673,8 +673,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 + rejoin_context.hop_ids().len()
                 + late_context.hop_ids().len()
         )
-        .expect("bounded hop count")
-            + 5
+        .expect("bounded hop count"),
+        "one row per recorded hop (the five synthetic latency rows went with the deleted latency reader)"
     );
     let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
         workspace_id: service.store.workspace_id().expect("store scope"),

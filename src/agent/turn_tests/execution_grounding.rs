@@ -134,13 +134,17 @@ async fn exercise_grounding_request(
                         &provider,
                     )
                     .await;
-                    assert_eq!(
-                        matches!(
+                    // Prediction-free opening (R9): the engine never commits a
+                    // tool for the turn, whether or not the request asks for
+                    // execution. The execution requirement is the completion
+                    // review's own assessment below.
+                    assert!(
+                        !matches!(
                             admission.decision().context.engine().selection,
                             crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
                                 if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::UseTool
                         ),
-                        explicit_execution
+                        "prediction-free opening commits no tool (explicit execution: {explicit_execution})"
                     );
                     // An old successful-looking assistant message must not count as this turn's execution.
                     let mut history = vec![

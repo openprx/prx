@@ -750,6 +750,8 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         let mut config = crate::config::Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
+        // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+        config.tool_tiering.always_include.push("web_fetch".to_owned());
         let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_memory(
             config,
             input,
@@ -757,7 +759,9 @@ async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
             Arc::clone(&memory),
         )
         .await;
-        admission.assert_core_specs(&tool_specs_of(&tools_registry));
+        // Every registered business tool is configured Direct, so nothing is
+        // left to search and the turn carries no search control.
+        admission.assert_core_specs(&business_tool_specs_of(&tools_registry));
 
         let result = run_turn(
             &mut history,
@@ -1310,6 +1314,8 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
             let mut config = crate::config::Config::default();
             config.workspace_dir = tmp.path().to_path_buf();
+            // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+            config.tool_tiering.always_include.push("wide_schema_probe".to_owned());
             config.decision_engine.enabled = true;
             config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
                 crate::config::schema::causal_tree::BackendKind::Builtin,
@@ -1321,7 +1327,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
                 Arc::clone(&memory),
             )
             .await;
-            let expected_specs = tool_specs_of(&tools_registry);
+            // Every registered business tool is configured Direct, so nothing is
+            // left to search and the turn carries no search control.
+            let expected_specs = business_tool_specs_of(&tools_registry);
             admission.assert_core_specs(&expected_specs);
             let runtime = admission.memory_runtime();
 
@@ -1376,9 +1384,9 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             let raw = event.raw_payload_json.as_deref().expect("request context payload");
             let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
 
-            // Finding 80 keeps the gated search control beside the exact business
-            // schema on this structural terminal hop, and both must be measured.
-            assert_eq!(payload["tool_snapshot"]["count"], 2);
+            // The one Direct business schema is the whole surface (no search
+            // control: nothing is left to search), and it must be measured.
+            assert_eq!(payload["tool_snapshot"]["count"], expected_specs.len());
             assert_eq!(payload["tool_snapshot"]["sha256"].as_str().map(str::len), Some(64));
 
             let estimate = &payload["request_estimate"];
@@ -1491,6 +1499,8 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+    config.tool_tiering.always_include.push("plain_probe".to_owned());
     let discovered = std::iter::once("mcp_call".to_owned())
         .chain((0..MCP_ALIAS_FIXTURE_ALIASES).map(|index| format!("mcp__fixture__alias_{index}")))
         .collect::<Vec<_>>();
@@ -1657,6 +1667,8 @@ async fn a_capability_search_hit_is_declared_on_the_next_request_and_not_the_cur
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+    config.tool_tiering.always_include.push("plain_probe".to_owned());
     let rounds = vec![
         ChatResponse {
             text: None,
@@ -1844,6 +1856,8 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
     let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
+    // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
+    config.tool_tiering.always_include.push("delay_progress".to_owned());
     let discovered = ["mcp_probe", "automation_probe", "extra_probe"]
         .into_iter()
         .map(str::to_owned)

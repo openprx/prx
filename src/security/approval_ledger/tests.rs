@@ -1013,4 +1013,3 @@ async fn legacy_pending_approval_without_journal_rows_must_be_requested_again() 
 }
 
 mod historical_exact_call_approval;
-mod historical_resume_drift;

@@ -120,18 +120,6 @@ impl AdmittedTurn {
         .await
     }
 
-    pub(crate) async fn with_prediction_tools(
-        workspace: &Path,
-        input: &str,
-        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
-    ) -> Self {
-        let mut config = crate::config::Config::default();
-        config.workspace_dir = workspace.to_path_buf();
-        let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(workspace).expect("test: prediction fixture memory"));
-        Self::with_prediction_memory(config, input, registry, memory).await
-    }
-
     pub(crate) async fn with_prediction_memory(
         mut config: crate::config::Config,
         input: &str,

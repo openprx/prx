@@ -14,7 +14,11 @@ fn autonomy_service(fixture: &Fixture, name: &'static str, autonomy: AutonomyLev
     service
 }
 
-fn issued_binding(fixture: &Fixture, name: &'static str, envelope: RuntimeEnvelope) -> ExecutionBinding {
+pub(in crate::tools::execution::tests) fn issued_binding(
+    fixture: &Fixture,
+    name: &'static str,
+    envelope: RuntimeEnvelope,
+) -> ExecutionBinding {
     let tool = RecordingTool {
         root_name: name,
         aliases: vec![],

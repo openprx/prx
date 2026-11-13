@@ -205,7 +205,7 @@ impl SelectedMemoryFormatter for SelectedContextFormatter {
     }
 }
 
-async fn build_selected_memory_agent(
+fn build_selected_memory_agent(
     provider: RecordingProvider,
     content: &str,
 ) -> (selected_memory::AgentFixture, selected_memory::Driver) {
@@ -244,9 +244,7 @@ async fn build_selected_memory_agent(
         .unwrap(),
     );
     let memory = Arc::new(openprx::memory::SqliteMemory::new(workspace.as_path()).unwrap());
-    let driver = selected_memory::Driver::start(Arc::clone(&memory), workspace.clone(), content)
-        .await
-        .unwrap();
+    let driver = selected_memory::Driver::start(Arc::clone(&memory), &workspace, content);
     let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let shared: Arc<dyn Memory> = memory;
         let tool = openprx::tools::memory_search::MemorySearchTool::new(
@@ -540,92 +538,104 @@ async fn e2e_multi_turn_history_fidelity() {
 /// is formatted into the user message before it reaches the provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
-    let (provider, recorded) = RecordingProvider::new(vec![text_response("enriched response")]);
+    let (provider, recorded) = RecordingProvider::new(vec![text_response("ready"), text_response("enriched response")]);
 
-    let (mut agent, driver) = build_selected_memory_agent(provider, "hello user_name: test_user").await;
-    driver
-        .run(async {
-            let response = agent.turn("hello").await.unwrap();
-            assert_eq!(response, "enriched response");
+    let (mut agent, driver) = build_selected_memory_agent(provider, "hello user_name: test_user");
+    // The warm-up turn opens the Agent's own session; the fact is then stored
+    // in that session, where the next turn's scoped recall reads.
+    assert_eq!(agent.turn(selected_memory::WARM_UP_INPUT).await.unwrap(), "ready");
+    driver.seed_agent_session().await.unwrap();
+    let response = agent.turn("hello").await.unwrap();
+    assert_eq!(response, "enriched response");
 
-            // Provider received enriched message
-            let requests = recorded.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-            assert!(
-                user_msg.content.starts_with("[Memory context]"),
-                "User message should start with memory context, got: {}",
-                user_msg.content,
-            );
-            assert!(
-                user_msg.content.contains("user_name: test_user"),
-                "User message should contain memory key-value pair",
-            );
-            assert!(
-                user_msg.content.ends_with("hello"),
-                "User message should end with original text, got: {}",
-                user_msg.content,
-            );
+    // Provider received enriched message
+    let requests = recorded.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let user_msg = requests[1].iter().rev().find(|m| m.role == "user").unwrap();
+    // The warm-up exchange is this session's recent context, so its section
+    // comes first; the recalled memory section follows it, before the input.
+    assert!(
+        user_msg.content.starts_with("[Current session context]") && user_msg.content.contains("\n[Memory context]\n"),
+        "User message should carry the session and memory context, got: {}",
+        user_msg.content,
+    );
+    assert!(
+        user_msg.content.contains("user_name: test_user"),
+        "User message should contain memory key-value pair",
+    );
+    assert!(
+        user_msg.content.ends_with("hello"),
+        "User message should end with original text, got: {}",
+        user_msg.content,
+    );
 
-            // Agent history also stores enriched message
-            let history = agent.history();
-            match &history[1] {
-                ConversationMessage::Chat(c) => {
-                    assert_eq!(c.role, "user");
-                    assert!(c.content.starts_with("[Memory context]"));
-                    assert!(c.content.ends_with("hello"));
-                }
-                other => panic!("Expected Chat variant for user message, got: {other:?}"),
-            }
-        })
-        .await;
+    // Agent history also stores enriched message (after the warm-up pair)
+    let history = agent.history();
+    match &history[3] {
+        ConversationMessage::Chat(c) => {
+            assert_eq!(c.role, "user");
+            assert!(c.content.contains("\n[Memory context]\n"));
+            assert!(c.content.ends_with("hello"));
+        }
+        other => panic!("Expected Chat variant for user message, got: {other:?}"),
+    }
 }
 
 /// Validates multi-turn conversation with memory enrichment: every user
 /// message is enriched, and the provider sees the full enriched history.
 #[tokio::test]
 async fn e2e_multi_turn_with_memory_enrichment() {
-    let (provider, recorded) = RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
+    let (provider, recorded) = RecordingProvider::new(vec![
+        text_response("ready"),
+        text_response("answer 1"),
+        text_response("answer 2"),
+    ]);
 
-    let (mut agent, driver) = build_selected_memory_agent(provider, "first second question project: openprx").await;
-    driver
-        .run(async {
-            let r1 = agent.turn("first question").await.unwrap();
-            assert_eq!(r1, "answer 1");
+    let (mut agent, driver) = build_selected_memory_agent(provider, "first second question project: openprx");
+    // The warm-up turn opens the Agent's own session; the fact is then stored
+    // in that session, where every following turn's scoped recall reads.
+    assert_eq!(agent.turn(selected_memory::WARM_UP_INPUT).await.unwrap(), "ready");
+    driver.seed_agent_session().await.unwrap();
+    let r1 = agent.turn("first question").await.unwrap();
+    assert_eq!(r1, "answer 1");
 
-            let r2 = agent.turn("second question").await.unwrap();
-            assert_eq!(r2, "answer 2");
+    let r2 = agent.turn("second question").await.unwrap();
+    assert_eq!(r2, "answer 2");
 
-            let requests = recorded.lock().unwrap();
-            assert_eq!(requests.len(), 2);
+    let requests = recorded.lock().unwrap();
+    assert_eq!(requests.len(), 3);
 
-            // Turn 1: user message is enriched
-            let req1_user = requests[0].iter().find(|m| m.role == "user").unwrap();
-            assert!(req1_user.content.contains("[Memory context]"));
-            assert!(req1_user.content.contains("project: openprx"));
-            assert!(req1_user.content.ends_with("first question"));
+    // Turn 1: user message is enriched
+    let req1_user = requests[1].iter().rev().find(|m| m.role == "user").unwrap();
+    assert!(req1_user.content.contains("[Memory context]"));
+    assert!(req1_user.content.contains("project: openprx"));
+    assert!(req1_user.content.ends_with("first question"));
 
-            // Turn 2: both user messages enriched, assistant from turn 1 present
-            let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
-            assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
+    // Turn 2: both user messages enriched, assistant from turn 1 present
+    let req2_users: Vec<&ChatMessage> = requests[2].iter().filter(|m| m.role == "user").collect();
+    assert_eq!(
+        req2_users.len(),
+        3,
+        "Request 2 should have the warm-up and both user messages"
+    );
+    assert_eq!(req2_users[0].content, selected_memory::WARM_UP_INPUT);
 
-            // Turn 1 user message still enriched in history
-            assert!(req2_users[0].content.contains("[Memory context]"));
-            assert!(req2_users[0].content.ends_with("first question"));
+    // Turn 1 user message still enriched in history
+    assert!(req2_users[1].content.contains("[Memory context]"));
+    assert!(req2_users[1].content.ends_with("first question"));
 
-            // Turn 2 user message also enriched
-            assert!(req2_users[1].content.contains("[Memory context]"));
-            assert!(req2_users[1].content.ends_with("second question"));
+    // Turn 2 user message also enriched
+    assert!(req2_users[2].content.contains("[Memory context]"));
+    assert!(req2_users[2].content.ends_with("second question"));
 
-            // Assistant response from turn 1 preserved
-            let req2_assts: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "assistant").collect();
-            assert_eq!(req2_assts.len(), 1);
-            assert_eq!(req2_assts[0].content, "answer 1");
+    // Assistant response from turn 1 preserved (after the warm-up reply)
+    let req2_assts: Vec<&ChatMessage> = requests[2].iter().filter(|m| m.role == "assistant").collect();
+    assert_eq!(req2_assts.len(), 2);
+    assert_eq!(req2_assts[0].content, "ready");
+    assert_eq!(req2_assts[1].content, "answer 1");
 
-            // History: system + 2*(enriched_user + assistant) = 5
-            assert_eq!(agent.history().len(), 5);
-        })
-        .await;
+    // History: system + 3*(user + assistant) = 7
+    assert_eq!(agent.history().len(), 7);
 }
 
 /// Without selected memory, the formatter is not called and raw input passes through unchanged.

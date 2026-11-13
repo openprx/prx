@@ -587,13 +587,18 @@ async fn full_autonomy_has_no_permission_limits() {
         context.envelope = envelope;
         context.set_h2_origin(Some(origin));
         let grant = fixture();
+        // The controlled H2 profile admits only experiment actions, and an
+        // experiment action needs the turn's admitted descriptor.
+        context.execution_admission = Some(
+            admission_matrix::approval::issued_binding(&grant, "skills_manage", context.envelope.clone()).admission(),
+        );
         let mut service = grant.service("skills_manage", vec![], ToolExecutionDecision::Ask, approved(), true);
         service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
             autonomy,
             ..SecurityPolicy::default()
         })));
         service.approval = Arc::new(DenyApprovalStrategy);
-        let arguments = serde_json::json!({"value": 1, "action": "lifecycle_publish", "proposal_id": "prop-1"});
+        let arguments = serde_json::json!({"value": 1, "action": "lifecycle_experiment_admit", "request": {}});
         assert!(crate::security::approval_operation::requires_explicit_grant(
             "skills_manage",
             &arguments

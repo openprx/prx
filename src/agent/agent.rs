@@ -1328,63 +1328,27 @@ mod tests {
                     100,
                 )
                 .unwrap();
-            // Q90 replaces the Q56 every-receipt Builtin oracle with this exact linked pair.
+            // Prediction-free opening (R9): the source's one owned receipt is
+            // the Answer row, with no predicted retrieval before it.
             type Receipt = (crate::runtime::decision_journal::store::DecisionView, String, bool);
             fn valid_receipts(receipts: &[Receipt]) -> bool {
-                if receipts.len() != 2 {
-                    return false;
-                }
-                let Some((predicted, generation, projection)) =
-                    receipts.iter().find(|(d, _, _)| d.backend_kind == "builtin")
-                else {
+                let [(answer, generation, projection)] = receipts else {
                     return false;
                 };
-                let Some((terminal, terminal_generation, terminal_projection)) =
-                    receipts.iter().find(|(d, _, _)| d.backend_kind == "none")
-                else {
-                    return false;
-                };
-                let distribution_valid = |values: &std::collections::BTreeMap<String, f64>| {
-                    !values.is_empty()
-                        && values
-                            .values()
-                            .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
-                };
-                receipts
-                    .iter()
-                    .all(|(d, _, _)| d.has_owner && d.enabled_snapshot && !d.legacy_v1 && !d.distributions.legacy_v1)
+                answer.has_owner
+                    && answer.enabled_snapshot
+                    && !answer.legacy_v1
+                    && !answer.distributions.legacy_v1
                     && !generation.is_empty()
-                    && generation == terminal_generation
-                    && predicted.session_key == terminal.session_key
-                    && predicted.run_id == terminal.run_id
-                    && predicted.backend_locality == "builtin"
-                    && predicted.prior_decision_id.is_none()
-                    && predicted.directive_kind == "retrieve"
-                    && predicted.abstention_reason.as_deref() == Some("retrieve_evidence")
-                    && predicted
-                        .selected()
-                        .is_some_and(|candidate| candidate.action == "retrieve" && candidate.target == "memory")
-                    && distribution_valid(&predicted.distributions.next_action)
-                    && distribution_valid(&predicted.distributions.capability_target)
-                    && distribution_valid(&predicted.distributions.features)
-                    && *projection
-                    && terminal.prior_decision_id.as_ref() == Some(&predicted.decision_id)
-                    && terminal.directive_kind == "answer"
-                    && terminal.abstention_reason.as_deref() == Some("hop_stopped")
-                    && terminal
-                        .selected()
-                        .is_some_and(|candidate| candidate.action == "answer")
-                    && terminal.backend_locality == "none"
-                    && terminal.configured_model == "none"
-                    && terminal.backend_endpoint.is_none()
-                    && terminal.attempts.is_empty()
-                    && terminal.fallback_order.is_empty()
-                    && terminal.distributions.next_action.is_empty()
-                    && terminal.distributions.capability_target.is_empty()
-                    && terminal.distributions.features.is_empty()
-                    && terminal.error_class.is_none()
-                    && !terminal.cache_hit
-                    && !*terminal_projection
+                    && answer.prior_decision_id.is_none()
+                    && answer.directive_kind == "answer"
+                    && answer.selected().is_some_and(|candidate| candidate.action == "answer")
+                    && answer.backend_kind == "none"
+                    && answer.attempts.is_empty()
+                    && answer.distributions.next_action.is_empty()
+                    && answer.error_class.is_none()
+                    && !answer.cache_hit
+                    && !*projection
             }
             let mut matching_receipts = Vec::new();
             let mut diagnostics = Vec::new();
@@ -1418,55 +1382,26 @@ mod tests {
             );
             assert!(
                 valid_receipts(&matching_receipts),
-                "Q90 requires the exact owned predicted retrieval and linked prediction-free terminal"
+                "one owned prediction-free Answer receipt for the source"
             );
             // Negative checks mutate only copies of the actual owned receipts, never the store.
-            let builtin = matching_receipts
-                .iter()
-                .find(|(d, _, _)| d.backend_kind == "builtin")
-                .unwrap();
-            let terminal = matching_receipts
-                .iter()
-                .find(|(d, _, _)| d.backend_kind == "none")
-                .unwrap();
+            let answer = matching_receipts.first().unwrap();
             assert!(
-                !valid_receipts(std::slice::from_ref(terminal)),
-                "missing prior Builtin must fail"
+                !valid_receipts(&[answer.clone(), answer.clone()]),
+                "a second receipt must fail"
             );
-            assert!(
-                !valid_receipts(&[builtin.clone(), terminal.clone(), terminal.clone()]),
-                "third receipt must fail"
-            );
-            let mut altered = terminal.clone();
-            altered.0.prior_decision_id = None;
-            assert!(
-                !valid_receipts(&[builtin.clone(), altered]),
-                "unlinked terminal must fail"
-            );
-            let mut altered = terminal.clone();
+            let mut altered = answer.clone();
+            altered.0.prior_decision_id = Some(answer.0.decision_id.clone());
+            assert!(!valid_receipts(&[altered]), "a linked prior decision must fail");
+            let mut altered = answer.clone();
             altered.0.backend_kind = "remote".into();
-            assert!(
-                !valid_receipts(&[builtin.clone(), altered]),
-                "alternate backend must fail"
-            );
-            let mut altered = terminal.clone();
+            assert!(!valid_receipts(&[altered]), "a backend-produced row must fail");
+            let mut altered = answer.clone();
             altered.2 = true;
-            assert!(
-                !valid_receipts(&[builtin.clone(), altered]),
-                "terminal prediction projection must fail"
-            );
-            let mut altered = terminal.clone();
-            altered.1.push_str("-different");
-            assert!(
-                !valid_receipts(&[builtin.clone(), altered]),
-                "different catalog generation must fail"
-            );
-            let mut altered = builtin.clone();
-            altered.0.backend_locality = "remote".into();
-            assert!(
-                !valid_receipts(&[altered, terminal.clone()]),
-                "predicted Builtin with non-Builtin locality must fail"
-            );
+            assert!(!valid_receipts(&[altered]), "a prediction projection must fail");
+            let mut altered = answer.clone();
+            altered.1.clear();
+            assert!(!valid_receipts(&[altered]), "an empty catalog generation must fail");
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2625,9 +2560,27 @@ mod tests {
             crate::security::AutonomyLevel::Supervised,
             crate::security::AutonomyLevel::ReadOnly,
         ] {
-            let (result, executions, _, _) = run_bounded_native_fixture(autonomy, true).await;
+            let (result, executions, _, history) = run_bounded_native_fixture(autonomy, true).await;
             assert_eq!(executions, 0, "unapproved acting tool must never execute");
-            assert!(!matches!(result, Ok(ref reply) if reply == "done"));
+            // Prediction-free opening (R9): no engine refusal ends the turn
+            // early. The gate refuses the call itself, the refusal is the
+            // call's result, and the model answers after it.
+            let denial = history
+                .iter()
+                .find_map(|message| match message {
+                    ConversationMessage::ToolResults(results) => results
+                        .iter()
+                        .find(|result| result.tool_call_id == "tc1")
+                        .map(|result| result.content.clone()),
+                    _ => None,
+                })
+                .expect("the refused call is reported to the model");
+            assert_ne!(
+                denial.trim(),
+                "ok",
+                "{autonomy:?}: the refused call never produced the tool output"
+            );
+            assert_eq!(result.unwrap(), "done");
         }
     }
 
@@ -2947,34 +2900,21 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let retrieval = reader
-            .replay_record(&scope, &answer.decision.prior_decision_id.unwrap())
-            .unwrap()
-            .unwrap();
+        // Prediction-free opening (R9): the turn's one decision row is the
+        // Answer; no predicted retrieval precedes it. Recall ran on the turn
+        // path itself (the formatter count above).
         assert_eq!(answer.decision.directive_kind, "answer");
-        assert!(answer.decision.enabled_snapshot && retrieval.decision.enabled_snapshot);
-        assert_eq!(retrieval.decision.directive_kind, "retrieve");
-        let selected = retrieval.decision.selected().unwrap();
-        assert_eq!(selected.action, "retrieve");
-        assert_eq!(selected.target, "memory");
+        assert!(answer.decision.enabled_snapshot);
+        assert!(
+            answer.decision.prior_decision_id.is_none(),
+            "no predicted retrieval precedes the Answer"
+        );
         assert_eq!(
             answer.decision.session_key.as_deref(),
             Some(terminal.session_key.as_deref().unwrap())
         );
-        assert_eq!(
-            retrieval
-                .decision
-                .candidates
-                .iter()
-                .filter(|candidate| Some(candidate.id.as_str()) == retrieval.decision.selected_candidate_id.as_deref())
-                .count(),
-            1
-        );
         assert_eq!(answer.source_event_id.as_deref(), Some(inputs[0].event_id.as_str()));
         assert_eq!(answer.decision.run_id, terminal.run_id);
-        assert_eq!(retrieval.decision.session_key, answer.decision.session_key);
-        assert_eq!(retrieval.source_event_id, answer.source_event_id);
-        assert_eq!(retrieval.decision.run_id, answer.decision.run_id);
         // Replay records deliberately exclude appended outcomes; read those
         // through the same canonical owner scope and actual decision identity.
         let settled = reader.get(&scope, &answer.decision.decision_id).unwrap().unwrap();

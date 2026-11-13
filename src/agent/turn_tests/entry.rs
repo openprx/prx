@@ -111,12 +111,9 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
     ];
     let mut config = crate::config::Config::default();
     config.workspace_dir = tmp.path().to_path_buf();
-    let expected_specs = tools_registry
-        .iter()
-        .filter(|tool| tool.name() == "skill_read")
-        .map(|tool| tool.spec())
-        .collect::<Vec<_>>();
-    assert_eq!(expected_specs.len(), 1);
+    // Prediction-free opening (R9, R28): neither extended tool is published
+    // at opening, whatever the raw text or the recalled preamble names; both
+    // are reached only through capability_search.
     let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_prediction_memory(
         config,
         raw_turn_text,
@@ -124,7 +121,7 @@ async fn cli_turn_capability_refreshes(raw_turn_text: &str) -> (usize, usize) {
         Arc::clone(&mem),
     )
     .await;
-    admission.assert_selected_specs(&expected_specs);
+    admission.assert_selected_specs(&[]);
     assert_eq!(admission.decision().proof.routing_input(), raw_turn_text);
     let memory_runtime = admission.memory_runtime();
 
@@ -195,8 +192,8 @@ async fn cli_single_shot_routes_on_the_raw_message_not_on_recalled_memory() {
         let (skill_refreshes, mcp_refreshes) = cli_turn_capability_refreshes(RAW_CLI_TURN_TEXT).await;
 
         assert_eq!(
-            skill_refreshes, 1,
-            "the raw single-shot message asks for the skill surface, so it must be published"
+            skill_refreshes, 0,
+            "prediction-free opening publishes no extended tool, so none is refreshed"
         );
         assert_eq!(
             mcp_refreshes, 0,
@@ -213,8 +210,8 @@ async fn cli_repl_routes_on_the_raw_input_not_on_recalled_memory() {
             cli_turn_capability_refreshes(&format!("and now {RAW_CLI_TURN_TEXT}")).await;
 
         assert_eq!(
-            skill_refreshes, 1,
-            "the raw REPL input asks for the skill surface, so it must be published"
+            skill_refreshes, 0,
+            "prediction-free opening publishes no extended tool, so none is refreshed"
         );
         assert_eq!(
             mcp_refreshes, 0,
@@ -234,8 +231,8 @@ async fn cron_job_turn_routes_on_the_raw_prefixed_prompt_not_on_recalled_memory(
             cli_turn_capability_refreshes(&format!("[cron:7 nightly-digest] {RAW_CLI_TURN_TEXT}")).await;
 
         assert_eq!(
-            skill_refreshes, 1,
-            "the raw cron prompt asks for the skill surface, so it must be published"
+            skill_refreshes, 0,
+            "prediction-free opening publishes no extended tool, so none is refreshed"
         );
         assert_eq!(
             mcp_refreshes, 0,
@@ -253,8 +250,8 @@ async fn xin_task_turn_routes_on_the_raw_prefixed_payload_not_on_recalled_memory
             cli_turn_capability_refreshes(&format!("[xin:task:42] {RAW_CLI_TURN_TEXT}")).await;
 
         assert_eq!(
-            skill_refreshes, 1,
-            "the raw xin payload asks for the skill surface, so it must be published"
+            skill_refreshes, 0,
+            "prediction-free opening publishes no extended tool, so none is refreshed"
         );
         assert_eq!(
             mcp_refreshes, 0,

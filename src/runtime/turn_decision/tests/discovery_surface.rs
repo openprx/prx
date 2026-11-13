@@ -24,7 +24,7 @@ struct DiscoverySurfaceTool {
 }
 
 #[tokio::test]
-async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publishing_peers() {
+async fn named_memory_recall_is_reached_by_search_without_publishing_peers() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         for excluded in [false, true] {
             let workspace = tempfile::tempdir().unwrap();
@@ -116,183 +116,32 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
                 .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
                 .await
                 .unwrap();
-            let published = service.agent_execution_specs(&proof, &context);
-            if excluded {
-                assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "memory_recall"));
-            } else {
-                assert!(
-                    publishes(&service, &context, "memory_recall"),
-                    "{:?}",
-                    context.execution_refs()
-                );
-                let specs = published.unwrap();
-                assert!(specs.specs.iter().any(|spec| spec.name == "memory_recall"));
-                assert!(
-                    specs.specs.iter().all(|spec| spec.name != "memory_get"),
-                    "discovery is one exact ref, not a family grant"
-                );
-                assert!(specs.specs.iter().all(|spec| spec.name != "memory_search"));
-                assert!(
-                    context
-                        .engine()
-                        .state
-                        .observed
-                        .completed_steps()
-                        .iter()
-                        .any(|step| step.kind() == ObservedStepKind::Discover && step.status() == ObservedStepStatus::Ok)
-                );
-                assert_eq!(context.hop_ids().len(), 2, "discover, then execute the exact ref");
-            }
-            assert_eq!(transports.0.load(Ordering::SeqCst), 0);
-            context.terminal_execution_trace();
-            service.shutdown(Instant::now() + Duration::from_secs(5)).await;
-        }
-    }).await;
-}
-
-#[tokio::test]
-async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
-        for (excluded, shell_excluded) in [(false, false), (true, false), (false, true)] {
-            let workspace = tempfile::tempdir().unwrap();
-            let mut config = crate::config::Config::default();
-    config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
-            config.workspace_dir = workspace.path().to_owned();
-            config.causal_tree.enabled = true;
-            config.causal_tree.policy.extra_latency_budget_ms = 5_000;
-            config.providers.models.push(
-                toml::from_str(
-                    "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
-                )
-                .unwrap(),
+            // Prediction-free opening (R9): naming memory_recall publishes
+            // nothing; the model's own search reaches it as one exact ref.
+            assert!(
+                !publishes(&service, &context, "memory_recall"),
+                "{:?}",
+                context.execution_refs()
             );
-            let skill_dir = workspace.path().join("skills/docx");
-            std::fs::create_dir_all(&skill_dir).unwrap();
-            std::fs::write(
-                skill_dir.join("SKILL.md"),
-                "---\nname: docx\ndescription: Create Word documents\n---\nUse the installed Node document package.\n",
-            )
-            .unwrap();
-            config.skills.open_skills_dir = Some(workspace.path().join("missing-open-skills").display().to_string());
-            config.skills.openclaw_skills_dir =
-                Some(workspace.path().join("missing-openclaw-skills").display().to_string());
-            let generation = crate::config::new_shared(config.clone()).pin();
-            let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
-            let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
-            let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
-                // Keep the real retrieval source that exposed the bounded-hop failure.
-                // Omitting it hides the Retrieve -> Discover -> hop-limit failure.
-                Box::new(crate::tools::memory_search::MemorySearchTool::new(
-                    workspace.path().to_owned(),
-                    Arc::clone(&memory),
-                    false,
-                )),
-                Box::new(crate::tools::SkillReadTool::new(
-                    workspace.path().to_owned(),
-                    config.clone(),
-                )),
-                Box::new(DiscoverySurfaceTool {
-                    name: "shell",
-                    dispatches: Arc::new(AtomicUsize::new(0)),
-                }),
-                Box::new(CapabilitySearchTool),
-            ]);
-            let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
-                Arc::clone(&registry),
-                Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
-                Arc::new(DenyApprovalStrategy),
-                Arc::new(AdapterOwnedPreparation),
-                Arc::new(TracingToolExecutionAudit),
-            ));
-            let provider_catalog = ProviderCatalogView::from_config(&config);
-            let transports = CountingTransports(AtomicUsize::new(0));
-            let service = build_publication(
-                TurnSurfaceKind::AgentLoop,
-                PublicationInputs {
-                    parent_grant: None,
-                    generation: Arc::clone(&generation),
-                    registry,
-                    execution,
-                    catalog_sources: sources(&generation, &config),
-                    surface_policy: SurfacePolicy {
-                        direct_names: BTreeSet::from(["shell".to_owned()]),
-                        excluded_names: if excluded {
-                            BTreeSet::from(["docx".to_owned()])
-                        } else if shell_excluded {
-                            BTreeSet::from(["shell".to_owned()])
-                        } else {
-                            BTreeSet::new()
-                        },
-                        ..SurfacePolicy::default()
-                    },
-                    provider_catalog: &provider_catalog,
-                    transports: &transports,
-                    events: Arc::new(SilentEvents),
-                    memory: Arc::clone(&memory),
-                    security,
-                },
-            )
-            .await
-            .unwrap();
-            let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
-                &generation,
-                Arc::clone(&memory),
-                "Use skill_read to read the installed docx skill, then follow it. Create named.docx with title Capability regression. Save a reusable implementation as named.js, generate the document, and verify the actual document text.",
-                "prx_named_skill_loader",
-                ("ollama", "prx-local-model"),
-            ).await;
-            let context = service
-                .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
-                .await
-                .unwrap();
-            let published = service.agent_execution_specs(&proof, &context);
+            let port = service.capability_search_port(&proof, &context).unwrap();
+            let hits = model_search(&port, "memory_recall", 1).await;
+            let named = |hit: &serde_json::Value| hit.pointer("/schema/name").and_then(serde_json::Value::as_str) == Some("memory_recall");
             if excluded {
-                assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "docx"));
+                assert!(hits.iter().all(|hit| !named(hit)), "an excluded capability is never offered");
+                service.admit_offered_discoveries(&proof, &context, |_, _| false);
+                let appended = service.agent_appended_execution_specs(&proof, &context).unwrap();
+                assert!(
+                    appended.specs.iter().all(|spec| spec.name != "memory_recall"),
+                    "an excluded capability is never declared"
+                );
             } else {
-                assert!(
-                    publishes(&service, &context, "docx"),
-                    "{:?}",
-                    context.execution_refs()
-                );
-                let specs = published.unwrap();
-                assert!(
-                    specs.specs.iter().all(|spec| spec.name != "shell"),
-                    "a skill selection is not a shell grant"
-                );
-                let port = service.capability_search_port(&proof, &context).unwrap();
-                let result = with_search_authority(
-                    Some(port),
-                    CapabilitySearchTool.execute(serde_json::json!({"query":"shell","limit":1})),
-                )
-                .await
-                .unwrap();
-                let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-                let hits = output.get("hits").unwrap().as_array().unwrap();
+                assert!(hits.first().is_some_and(named), "{hits:?}");
+                assert_eq!(service.admit_offered_discoveries(&proof, &context, |_, _| false), 1);
+                let appended = service.agent_appended_execution_specs(&proof, &context).unwrap();
                 assert_eq!(
-                    hits.len(),
-                    usize::from(!shell_excluded),
-                    "Skill discovery must preserve exclusions"
-                );
-                if !shell_excluded {
-                    assert_eq!(
-                        hits.first()
-                            .unwrap()
-                            .pointer("/schema/name")
-                            .and_then(serde_json::Value::as_str),
-                        Some("shell")
-                    );
-                }
-
-                assert!(specs.specs.iter().any(|spec| spec.name == "docx"));
-                assert!(
-                    specs.specs.iter().all(|spec| spec.name != "skill_read"),
-                    "publish the selected skill, not its generic loader"
-                );
-                assert!(specs.specs.iter().all(|spec| spec.name != "memory_search"));
-                assert!(
-                    context.hop_ids().len() <= 2,
-                    "selection stays within the existing hop budget"
+                    appended.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+                    ["memory_recall"],
+                    "discovery is one exact ref, not a family grant"
                 );
             }
             assert_eq!(transports.0.load(Ordering::SeqCst), 0);
@@ -439,7 +288,7 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
 }
 
 #[tokio::test]
-async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
+async fn direct_native_write_can_discover_read_peers_through_search() {
     crate::runtime::turn_decision::with_scored_prediction(async {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
@@ -488,12 +337,9 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
                 execution,
                 catalog_sources: sources(&generation, &config),
                 surface_policy: SurfacePolicy {
-                    direct_names: BTreeSet::from([
-                        "file_write".to_owned(),
-                        "file_read".to_owned(),
-                        "file_edit".to_owned(),
-                        "shell".to_owned(),
-                    ]),
+                    // Prediction-free opening (R9): the configured Direct tools
+                    // are the opening surface; the read peers stay searchable.
+                    direct_names: BTreeSet::from(["file_write".to_owned(), "shell".to_owned()]),
                     ..SurfacePolicy::default()
                 },
                 provider_catalog: &provider_catalog,
@@ -524,14 +370,10 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
         assert!(
             core.specs
                 .iter()
-                .all(|spec| spec.name != "file_read" && spec.name != "file_edit" && spec.name != "shell")
+                .all(|spec| spec.name != "file_read" && spec.name != "file_edit")
         );
         let port = service.capability_search_port(&proof, &context).unwrap();
-        for (query, expected) in [
-            ("file_read", Some("file_read")),
-            ("file_edit", Some("file_edit")),
-            ("shell", None),
-        ] {
+        for (query, expected) in [("file_read", Some("file_read")), ("file_edit", Some("file_edit"))] {
             let result = with_search_authority(
                 Some(port.clone()),
                 CapabilitySearchTool.execute(

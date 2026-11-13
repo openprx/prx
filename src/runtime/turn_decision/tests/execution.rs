@@ -108,12 +108,15 @@ async fn child_zero_budget_publishes_no_costed_direct_ref() -> anyhow::Result<()
     let runtime = turn.context.runtime();
     let mut facts = runtime.admission.clone();
     let estimate = |bytes| crate::cost::estimate::estimate_cost(&model, costs, bytes);
+    // The costed Direct ref is the configured delegator, which a child
+    // publishes only with its sealed outgoing manifest (V-16 integrity, also
+    // in Full), so both cells publish for a child holding one.
     let funded = crate::tools::surface_owner::publication::PublicationRules {
         trusted: &runtime.trusted,
         facts: &facts,
         catalog: &view,
     }
-    .direct_surface(false, &estimate);
+    .direct_surface(true, &estimate);
     assert!(
         !funded.is_empty(),
         "test: funded child publishes a real Direct capability"
@@ -131,7 +134,7 @@ async fn child_zero_budget_publishes_no_costed_direct_ref() -> anyhow::Result<()
         facts: &facts,
         catalog: &view,
     }
-    .direct_surface(false, &estimate);
+    .direct_surface(true, &estimate);
     assert!(
         exhausted.is_empty(),
         "test: zero-budget child publishes no costed Direct refs: {exhausted:?}"

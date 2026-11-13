@@ -444,11 +444,17 @@ fn selected_experience(store: &SkillLifecycleStore, run_id: &str) {
         .expect("test: selection");
 }
 
+/// A recovered completion joins its terminal once, and a second rejoin keeps
+/// the first join. Prediction-free opening (R9) makes every turn an Answer,
+/// and a completed Answer settles only with its provider facts, so the
+/// recovered marker carries them and the recovery can verify the run (the
+/// hop-only Clarify terminal without provider facts, which joined as
+/// Unknown, no longer exists).
 #[tokio::test]
-async fn rejoin_without_provider_facts_joins_the_terminal_once_as_unknown() {
+async fn rejoin_of_a_verified_recovered_completion_joins_the_terminal_once() {
     let (workspace, service, owner, run_id) = crashed_after_marker(
         crate::agent::terminal::TurnTerminalStatus::Completed,
-        false,
+        true,
         "rejoin-unknown-1",
         "  ",
         AgentTurnKind::Repl,
@@ -479,10 +485,10 @@ async fn rejoin_without_provider_facts_joins_the_terminal_once_as_unknown() {
         .clone()
         .expect("the recovered run completes its experience");
     assert_eq!(joined.terminal_receipt_id, "rejoin-unknown-1");
-    assert_eq!(first.outcome, ExperienceOutcome::Unknown);
-    assert!(
-        !first.learning_eligible(),
-        "recovery produces no qualifying evidence it cannot verify"
+    assert_eq!(
+        first.outcome,
+        ExperienceOutcome::Success,
+        "a recovered run with settled provider facts is verified"
     );
 
     // A double rejoin keeps the first join.
@@ -496,7 +502,7 @@ async fn rejoin_without_provider_facts_joins_the_terminal_once_as_unknown() {
         .expect("test: read")
         .expect("test: record");
     assert_eq!(second.terminal, first.terminal);
-    assert_eq!(second.outcome, ExperienceOutcome::Unknown);
+    assert_eq!(second.outcome, ExperienceOutcome::Success);
     assert_eq!(second.late_evidence, 0);
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 }
@@ -576,8 +582,11 @@ fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
     );
 }
 
+/// Prediction-free opening (R9): no confidence bar filters the surface. A
+/// configured Direct skill execution adapter is published, and as an
+/// execution tool it carries no prompt skill document.
 #[tokio::test]
-async fn below_bar_skill_execution_adapter_is_not_published() {
+async fn direct_skill_execution_adapter_is_published_without_a_prompt_document() {
     let turn = selected_skill_target_turn(false, true).await;
     assert!(
         turn.service
@@ -585,10 +594,9 @@ async fn below_bar_skill_execution_adapter_is_not_published() {
             .expect("execution specs")
             .specs
             .iter()
-            .all(|spec| spec.name != "skill_execute")
+            .any(|spec| spec.name == "skill_execute")
     );
-    assert_eq!(
-        selected_names(&turn).expect("native skill adapter has no prompt document"),
-        Vec::<String>::new()
-    );
+    // The installed skill is advertised for its live skill_read loader; the
+    // execution adapter adds no prompt document of its own.
+    assert_eq!(selected_names(&turn).expect("test: prompt skills"), [SKILL_NAME]);
 }

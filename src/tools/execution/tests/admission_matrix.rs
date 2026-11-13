@@ -1,7 +1,7 @@
 mod called_tokens;
 mod surface;
 use super::*;
-mod approval;
+pub(in crate::tools::execution::tests) mod approval;
 mod budget;
 mod policy;
 #[cfg(unix)]
