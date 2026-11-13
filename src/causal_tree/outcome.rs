@@ -615,6 +615,44 @@ impl TerminalFacts {
         self
     }
 
+    /// A serving reply without any tool activity may account for a Clarify
+    /// degradation while its recorded decision remains Clarify.
+    fn confirms_plain_answer(&self) -> bool {
+        !self.collected_pending
+            && !self.collected_declined
+            && !self.resume_claimed
+            && self.status == TurnTerminalStatus::Completed
+            && self.provider_outcome.as_ref().is_some_and(|outcome| {
+                matches!(
+                    outcome.status,
+                    ExecutionStatus::Success | ExecutionStatus::FallbackSuccess
+                )
+            })
+            && self.execution_trace.as_ref().is_some_and(|trace| {
+                trace.provider_requests > 0
+                    && trace.provider_pending == 0
+                    && !trace.provider_attempts_incomplete
+                    && !trace.incomplete
+                    && trace
+                        .provider_attempts
+                        .as_ref()
+                        .and_then(|attempts| attempts.last())
+                        .is_some_and(|attempt| attempt.status == "success")
+                    && !trace.authorized_silent
+                    && trace.calls.is_empty()
+                    && trace.started_attempts == 0
+                    && trace.successful_attempts == 0
+                    && trace.selected_successful_attempts == 0
+                    && trace.pending_attempts == 0
+                    && trace.unbound_attempts == 0
+                    && trace.failed_attempts == 0
+                    && trace.cancelled_attempts == 0
+                    && trace.denied_attempts == 0
+                    && trace.awaiting_approval_attempts == 0
+                    && trace.unavailable_attempts.is_none_or(|count| count == 0)
+            })
+    }
+
     /// A direct approved call has no main-provider request. Its successful
     /// trace counts only when durable replay also authenticates consumption.
     pub(crate) fn has_completed_resume_evidence(&self, run_capabilities: &[String]) -> bool {
@@ -922,6 +960,22 @@ impl OutcomeCorrelator {
                 .into_iter()
                 .find(|kind| kind.as_str() == candidate.action)
         });
+        // The signed row retains the original abstention. Account for its
+        // observed plain reply only with completed, tool-free serving evidence;
+        // this grants no capability or child authority from the Clarify row.
+        let action = if action == Some(super::branch::CausalActionKind::Clarify)
+            && decision.directive_kind == "clarify"
+            && decision.abstention_reason.is_some()
+            && decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.action == "answer" && candidate.target == "none")
+            && facts.confirms_plain_answer()
+        {
+            Some(super::branch::CausalActionKind::Answer)
+        } else {
+            action
+        };
         Self::record_for(
             decision.decision_id,
             action,
@@ -1715,6 +1769,59 @@ mod tests {
             cost: None,
             latency_ms: 0,
             execution_trace: trace,
+        }
+    }
+
+    #[test]
+    fn clarify_accounting_requires_a_completed_tool_free_serving_trace() {
+        use crate::tools::capability::execution_trace::ExecutionTrace;
+        let now = chrono::Utc::now();
+        let attempt = crate::llm::route_decision::ProviderAttempt {
+            seq: 1,
+            provider: "prx_provider".into(),
+            model: "prx_model".into(),
+            started_at: now,
+            finished_at: now,
+            status: crate::llm::route_decision::AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        };
+        let execution = ExecutionTrace::default();
+        execution
+            .begin_provider()
+            .expect("test: real serving observation")
+            .finish(Some(&[attempt]));
+        let settled = execution.seal();
+        assert!(
+            recovered_facts(TurnTerminalStatus::Completed, Some(settled.clone()), true).confirms_plain_answer(),
+            "test: a completed serving-only trace supports plain-answer accounting"
+        );
+        assert!(
+            !recovered_facts(TurnTerminalStatus::Completed, Some(settled.clone()), false).confirms_plain_answer(),
+            "test: a trace without a successful provider outcome is insufficient"
+        );
+        assert!(
+            !recovered_facts(TurnTerminalStatus::Completed, None, true).confirms_plain_answer(),
+            "test: a provider claim without an execution trace is insufficient"
+        );
+        let mut pending = settled.clone();
+        pending.provider_pending = 1;
+        let mut incomplete = settled.clone();
+        incomplete.provider_attempts_incomplete = true;
+        let mut tool = settled.clone();
+        tool.started_attempts = 1;
+        let mut silent = settled;
+        silent.authorized_silent = true;
+        for (kind, trace) in [
+            ("pending provider", pending),
+            ("incomplete attempts", incomplete),
+            ("tool activity", tool),
+            ("authorized silence", silent),
+        ] {
+            assert!(
+                !recovered_facts(TurnTerminalStatus::Completed, Some(trace), true).confirms_plain_answer(),
+                "test: {kind} must not be accounted as a plain degradation"
+            );
         }
     }
 
