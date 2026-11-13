@@ -2094,8 +2094,8 @@ tools:
 - `web_fetch` never uses a proxy. On a host whose only way out is a proxy,
   `web_fetch` cannot reach the network.
 - `http_request` uses the proxy only when the operator selects it by name:
-  `scope = "services"` with `tool.http_request` (or `tool.*`) in
-  `proxy.services`. PRX still runs every local check, but the proxy then
+  `scope = "services"` with the exact key `tool.http_request` in
+  `proxy.services`; the wildcard `tool.*` does not select it. PRX still runs every local check, but the proxy then
   resolves the name, so the proxy must enforce its own egress rules (deny
   private, loopback and metadata destinations).
 

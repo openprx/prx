@@ -1292,6 +1292,43 @@ mod tests {
         );
     }
 
+    /// Review r2 finding M1, real wire: the wildcard `tool.*` is not an
+    /// explicit selection of the tool, so the pinned client still connects
+    /// directly and the proxy sees no connection.
+    #[tokio::test]
+    async fn a_wildcard_services_selector_does_not_route_the_client_through_the_proxy() {
+        let (target_listener, target_address) = loopback_listener().await;
+        let (proxy_listener, proxy_address) = loopback_listener().await;
+        let server = tokio::spawn(async move { serve_one_request(&target_listener, OK_RESPONSE).await });
+        let wildcard = proxy_config(crate::config::ProxyScope::Services, &["tool.*"], proxy_address);
+        assert!(
+            wildcard.should_apply_to_service(PROXY_SERVICE_KEY),
+            "test setup: ordinary tool clients would use this proxy"
+        );
+        let client = test_tool(Vec::new())
+            .client_for(&proof_target(target_address), &wildcard)
+            .expect("test: the pinned client builds");
+
+        let url = format!("http://{PIN_PROOF_HOST}:{}/wildcard", target_address.port());
+        within(client.get(&url).send())
+            .await
+            .expect("test: the request must go directly to the pinned listener");
+        let head = within(server)
+            .await
+            .expect("test: server task joins")
+            .expect("test: the target served one request");
+        assert!(
+            head.starts_with("GET /wildcard HTTP/1.1\r\n"),
+            "the target must receive an origin-form request, got {head}"
+        );
+        assert!(
+            tokio::time::timeout(NO_CONNECTION_WINDOW, proxy_listener.accept())
+                .await
+                .is_err(),
+            "a wildcard selector must not connect to the proxy"
+        );
+    }
+
     /// M2: `execute_request` refuses before any connection when the host
     /// resolves to a private address, even if only one of several is private.
     #[tokio::test]
