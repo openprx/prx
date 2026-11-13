@@ -717,6 +717,14 @@ fn init_with_a_loopback_decision_backend_writes_a_valid_config() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let help = prx(temp.path(), &["init", "--help"]);
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.status.success()
+            && help_text.contains("Enable causal recovery")
+            && help_text.contains("decision_engine.enabled"),
+        "test: help names recovery and the separate advisory switch: {help_text}"
+    );
     let status = stdout_json(&causal(&target, &["status", "--json"]));
     assert_eq!(status["enabled"], true, "{status}");
     assert_eq!(

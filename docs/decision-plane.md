@@ -109,7 +109,7 @@ When a deadline interrupts scoring, an executable Commit is retained only after
 all candidates were scored and normal selection passed every execution bar.
 An unscored utility is bounded above by one, never treated as zero for the
 margin. An incomplete ranking takes the reason-aware terminal path with
-`deadline_exceeded`. The deadline is unchanged. Deadline closure is local Clarify when text is deliverable, otherwise Refuse; it does not call the serving model.
+`deadline_exceeded`. The deadline is unchanged. Deadline selection is Clarify when text is deliverable, otherwise Refuse; engine-on Clarify degrades to one plain serving reply without tools only when a legal Answer passed its gate.
 
 Exactly named native file operations can form one bounded file plan instead
 of keeping only the first name in that family. It includes only individually
@@ -700,8 +700,9 @@ discovery publication; the fallback exception grants none. Records retain the or
 abstention reason and `features.fallback = "answer_on_abstention"`. If Answer is
 unavailable, the terminal is a reason-specific Clarify on interactive and single-shot
 surfaces, or Refuse when neither text terminal is legal. Deadline exhaustion selects
-Clarify when text is deliverable, otherwise Refuse; it never calls the serving model
-after the selection budget is spent. Policy and gate failures (including missing
+Clarify when text is deliverable, otherwise Refuse; engine-on Clarify degrades to
+one plain serving reply without tools only when a legal Answer passed its gate.
+The original Clarify selection and reason remain recorded. Policy and gate failures (including missing
 approval and exhausted budgets) may Refuse. An explicit choice outside the legal set, a
 failed decision or empty input selects Clarify when legal, otherwise Refuse, without
 widening the selected surface. Catalog drift and rejected Router evidence retain a
