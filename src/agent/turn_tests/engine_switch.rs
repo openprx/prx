@@ -1483,10 +1483,25 @@ async fn engine_on_and_off_open_identical_turns() {
         systems
             .iter()
             .map(|text| {
-                text.find(BRIEF_MARKER)
-                    .map_or_else(|| text.clone(), |at| text[..at].trim_end().to_owned())
+                // The brief is one block (its rows end at a blank line); the
+                // coalesced system prompt may continue after it.
+                text.find(BRIEF_MARKER).map_or_else(
+                    || text.trim().to_owned(),
+                    |at| {
+                        let end = text[at..].find("\n\n").map_or(text.len(), |offset| at + offset);
+                        format!("{}{}", text[..at].trim_end(), &text[end..]).trim().to_owned()
+                    },
+                )
             })
             .filter(|text| !text.is_empty())
+            // Each run owns its temporary workspace; that line differs by
+            // construction, not because of the engine.
+            .map(|text| {
+                text.lines()
+                    .filter(|line| !line.starts_with("Working directory: "))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .collect()
     };
     assert_eq!(
@@ -1567,13 +1582,15 @@ async fn high_confidence_refuse_or_clarify_advice_never_changes_the_turn() {
         let admitted = AdmittedTurn::with_config(config.clone(), "run the project tool", Arc::clone(&registry)).await;
         let decision = admitted.decision();
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = decision
-            .service
-            .open_turn_context(
+        // Production entries open turns under a cleanup owner, which owns the
+        // turn's accounting scope.
+        let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+        let context = cleanup
+            .scope(decision.service.open_turn_context(
                 decision.proof,
                 crate::runtime::turn_context::AgentTurnKind::SingleShot,
                 &cancellation,
-            )
+            ))
             .await
             .expect("test: production turn opening");
         let advice = match (prefer, &endpoint) {
@@ -1860,13 +1877,15 @@ async fn configured_backend_runs_on_a_production_opened_turn() {
     let admitted = AdmittedTurn::with_config(config, "analyse the opened turn", Arc::new(Vec::new())).await;
     let decision = admitted.decision();
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let context = decision
-        .service
-        .open_turn_context(
+    // Production entries open turns under a cleanup owner, which owns the
+    // turn's accounting scope.
+    let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let context = cleanup
+        .scope(decision.service.open_turn_context(
             decision.proof,
             crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &cancellation,
-        )
+        ))
         .await
         .expect("test: production turn opening");
     let runtime = context.runtime();

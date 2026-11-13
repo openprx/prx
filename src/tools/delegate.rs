@@ -3082,7 +3082,7 @@ pub(crate) mod tests {
         // admission while leaving production budgets and real I/O intact.
         crate::runtime::logical_clock::scope_local(
             clock,
-            driver.run_factory(true, move || async move {
+            driver.run_factory(move || async move {
                 observe_owned_delegate_workspace(move |workspace| async move {
                     CONFIGURED_DELEGATE_ENDPOINT
                         .scope(
@@ -3121,7 +3121,7 @@ pub(crate) mod tests {
         let endpoint = driver.endpoint().to_owned();
         let owned = workspace.to_path_buf();
         let (result, _) = driver
-            .run_factory(true, move || async move {
+            .run_factory(move || async move {
                 let cleanup =
                     crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?;
                 let mut observed = None;
@@ -3546,14 +3546,22 @@ pub(crate) mod tests {
                 super::delegate_diagnostic::admission(admitted.decision().context, parent_provider.capabilities());
             }
             if configured_endpoint.is_some() {
+                // Prediction-free opening (R9): the configured parent publishes
+                // the delegator with its sealed outgoing child manifest, and
+                // the model chooses the call.
+                let decision = admitted.decision();
+                let published = decision
+                    .service
+                    .agent_execution_specs(decision.proof, decision.context)
+                    .expect("configured parent publication");
                 assert!(
-                    matches!(
-                        admitted.decision().context.engine().selection,
-                        crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                            if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Delegate
-                    ),
-                    "configured parent must receive actual issued delegation: {:?}",
-                    admitted.decision().context.engine().selection
+                    published.specs.iter().any(|spec| spec.name == "delegate"),
+                    "configured parent must publish the delegate tool: {:?}",
+                    published.specs.iter().map(|spec| &spec.name).collect::<Vec<_>>()
+                );
+                assert!(
+                    decision.context.engine().outgoing_child.is_some(),
+                    "configured parent must seal an outgoing child manifest"
                 );
             }
             let mut history = vec![crate::providers::ChatMessage::user(input)];

@@ -3159,7 +3159,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let tmp = tempfile::tempdir().unwrap();
                 let cleanup =
                     crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -3495,7 +3495,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let tmp = tempfile::tempdir().expect("test: tempdir");
                 let cleanup =
                     crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -3632,7 +3632,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let tmp = tempfile::tempdir().unwrap();
                 let mut config = Config::default();
                 console_provider_fixture_config(&mut config, tmp.path(), "test-model", &endpoint);
@@ -3780,7 +3780,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let tmp = tempfile::tempdir().expect("test: tempdir");
                 let session_id = "console-probe-reply";
@@ -3857,7 +3857,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let tmp = tempfile::tempdir().expect("test: tempdir");
                 let (state, runtime, _, _, proof) = console_probe_state(

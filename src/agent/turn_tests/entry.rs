@@ -425,6 +425,8 @@ async fn cli_agent_configured_scope_denies_wire_file_write() {
     )
     .await;
     let mut config = cli_agent_probe_config(tmp.path(), &probe);
+    // The configured scope is a permission limit: it applies below Full (R51).
+    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
     config.autonomy.scopes.default = crate::config::ScopeDefault::Deny;
     config.tool_tiering.always_include.push("file_write".to_string());
 
@@ -856,19 +858,16 @@ async fn cli_agent_persists_no_secret_from_a_reply() {
     let workspace = config.workspace_dir.clone();
 
     let reply = driver
-        .run(
-            true,
-            run_with_runtime_envelope(
-                config,
-                Some("Return a short PRX project greeting.".to_string()),
-                None,
-                None,
-                0.0,
-                CancellationToken::new(),
-                None,
-                None,
-            ),
-        )
+        .run(run_with_runtime_envelope(
+            config,
+            Some("Return a short PRX project greeting.".to_string()),
+            None,
+            None,
+            0.0,
+            CancellationToken::new(),
+            None,
+            None,
+        ))
         .await
         .expect("test: the single-shot agent turn completes");
 
@@ -908,19 +907,16 @@ async fn cli_agent_persists_no_secret_from_a_provider_error() {
     let workspace = config.workspace_dir.clone();
 
     let result = driver
-        .run(
-            true,
-            run_with_runtime_envelope(
-                config,
-                Some("Return a short PRX project greeting.".to_string()),
-                None,
-                None,
-                0.0,
-                CancellationToken::new(),
-                None,
-                None,
-            ),
-        )
+        .run(run_with_runtime_envelope(
+            config,
+            Some("Return a short PRX project greeting.".to_string()),
+            None,
+            None,
+            0.0,
+            CancellationToken::new(),
+            None,
+            None,
+        ))
         .await;
 
     assert!(result.is_err(), "test: a failing provider fails the single-shot turn");
@@ -959,10 +955,10 @@ fn assert_cli_redaction_answer_receipts(workspace: &std::path::Path, status: &st
         .unwrap()
         .unwrap();
     let (directive, backend) = (decision.directive_kind, decision.backend_kind);
-    assert_eq!(directive, "answer", "the actual service must select Answer");
+    assert_eq!(directive, "answer", "the actual service must record the Answer path");
     assert_eq!(
-        backend, "compatible_http",
-        "builtin fallback is not controlled-answer acceptance"
+        backend, "none",
+        "the turn opens prediction-free (R9): no backend answers at opening"
     );
 }
 

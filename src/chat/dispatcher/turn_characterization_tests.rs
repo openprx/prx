@@ -328,24 +328,15 @@ fn enabled_builtin_admission_config(workspace: &std::path::Path) -> crate::confi
     config
 }
 
-fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDecision<'_>) {
+fn assert_enabled_prediction_free_answer(decision: crate::agent::turn_request::TurnDecision<'_>) {
     assert!(
         decision.service.status().backend.enabled,
         "step 7.1 decision service must keep the causal tree enabled"
     );
-    let prediction = decision
-        .context
-        .engine()
-        .prediction
-        .as_ref()
-        .expect("step 7.1 must execute the enabled decision plane");
-    assert_eq!(
-        prediction.served_by,
-        crate::decision_engine::prediction::factory::ServedBy::Builtin
-    );
-    assert_eq!(
-        prediction.reason, None,
-        "step 7.1 must use the enabled builtin path, not disabled-mode fallback"
+    // R9: every turn opens prediction-free, enabled plane or not.
+    assert!(
+        decision.context.engine().prediction.is_none(),
+        "step 7.1 opens without a prediction hop"
     );
     assert_eq!(
         decision.context.terminal_outcome_action(),
@@ -791,7 +782,7 @@ async fn run_agent_fixture_with_history(
         (FIXTURE_PROVIDER, FIXTURE_MODEL),
     )
     .await;
-    assert_enabled_builtin_selection(admission.decision());
+    assert_enabled_prediction_free_answer(admission.decision());
     let result = crate::agent::turn_engine::run_turn(
         &mut history,
         crate::agent::turn_request::TurnRequest {

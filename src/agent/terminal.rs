@@ -2498,7 +2498,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.to_string(), "terminal draft has no service-issued decision");
+            // R29: the terminal binding is checked first, so an unissued
+            // draft is refused for its missing binding.
+            assert_eq!(error.to_string(), "terminal draft has no terminal binding");
 
             let principal = MemoryPrincipal {
                 require_owner_match: false,

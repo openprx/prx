@@ -135,7 +135,7 @@ async fn run_owned_no_tool_retry(
         .retain_evidence_at(workspace.clone());
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
                     .expect("actual retry cleanup owner");
@@ -180,7 +180,7 @@ async fn empty_assistant_response_retries_and_returns_real_answer() {
         .expect("owned actual compatible Answer endpoint");
     let endpoint = driver.endpoint().to_owned();
     let (result, history) = driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
                     .expect("actual retry cleanup owner");
@@ -527,7 +527,7 @@ async fn marker_after_a_real_tool_batch_is_stripped_without_a_retry() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -666,7 +666,7 @@ async fn a_marker_written_beside_real_tool_calls_never_reaches_history() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -806,7 +806,7 @@ async fn a_batch_whose_calls_all_failed_still_buys_the_corrective_retry() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1195,7 +1195,7 @@ async fn an_inline_marker_beside_real_tool_calls_is_stripped_without_a_retry() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())

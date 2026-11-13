@@ -225,7 +225,7 @@ async fn a_webhook_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
         .retain_evidence_at(scratch.clone());
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut config = Config::default();
             config.workspace_dir = scratch.join("workspace");
             config.config_path = scratch.join("config.toml");

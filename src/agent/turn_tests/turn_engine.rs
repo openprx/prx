@@ -434,7 +434,7 @@ async fn a_corrective_aside_stays_attributable_when_the_model_echoes_it() {
         .retain_evidence_at(tmp.clone());
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
                     .expect("actual corrective-aside cleanup owner");
@@ -1536,7 +1536,7 @@ async fn compiled_request_event_breaks_the_tool_surface_down_by_root_and_adapter
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1681,7 +1681,7 @@ async fn a_capability_search_hit_is_declared_on_the_next_request_and_not_the_cur
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1885,7 +1885,7 @@ async fn compiled_tool_snapshot_is_rendered_once_per_turn_with_a_stable_system_p
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())

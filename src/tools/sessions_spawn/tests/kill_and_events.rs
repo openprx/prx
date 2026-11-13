@@ -137,14 +137,16 @@ async fn spawn_denied_without_grant_under_supervised() {
     tool.configured_providers = providers::ConfiguredProviders::default().with_providers([tool.provider_name.as_str()]);
     tool.set_default_recipient(Some("test-recipient".to_string())).await;
 
-    // No grant injected → Medium-risk gate denies under supervised autonomy.
+    // No grant injected → the Medium-risk approval gate refuses the
+    // dispatch under supervised autonomy (the prediction-free surface
+    // publishes the tool; execution owns the approval, R28).
     let denied = execute_enabled_admitted_spawn(&tool, task)
         .await
-        .expect_err("an unapproved side-effect tool must not be offered for execution");
+        .expect_err("an unapproved side-effect tool must not execute");
     assert_eq!(
         denied.to_string(),
-        "admitted fixture did not select tool 'sessions_spawn'",
-        "the admitted surface must exclude the unapproved tool"
+        "approval required but no approval resolver is available",
+        "the unapproved spawn is refused at its approval gate"
     );
 
     // No run should have been registered.

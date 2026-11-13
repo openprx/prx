@@ -73,7 +73,7 @@ async fn run_physical_channel_probe(tmp: &TempDir, memory: Arc<dyn Memory>, chan
             .retain_evidence_at(evidence);
         let decision_endpoint = driver.endpoint().to_owned();
         driver
-            .run_factory(true, || async {
+            .run_factory(|| async {
                 let provider_name = format!("custom:{endpoint}");
                 let mut config = Config::default();
                 config.workspace_dir = tmp.path().to_owned();

@@ -55,7 +55,7 @@ async fn full_gateway_turn_runs_git_through_native_shell() {
             .expect("test: decision endpoint");
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let root = tempfile::tempdir().expect("test: workspace");
                 let mut config = Config::default();
                 config.workspace_dir = root.path().join("workspace");

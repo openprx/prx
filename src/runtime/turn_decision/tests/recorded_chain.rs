@@ -148,7 +148,8 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     )
     .await
     .expect_err("missing terminal decision must fail before persistence");
-    assert_eq!(terminal.to_string(), "terminal draft has no service-issued decision");
+    // R29: the terminal binding is checked first.
+    assert_eq!(terminal.to_string(), "terminal draft has no terminal binding");
     assert!(
         memory
             .find_message_event_by_idempotency_key(proof.workspace_id(), "turn:unlinked-terminal-1:final")

@@ -118,7 +118,7 @@ async fn exercise_grounding_request(
     };
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).unwrap();
             cleanup
                 .run(q79_boxed_fixture_work(async {
@@ -592,7 +592,7 @@ async fn proposed_real_writes_wait_for_one_source_intent_even_at_full_autonomy()
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run_factory(true, || async {
+            .run_factory(|| async {
                 let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new()).unwrap();
                 cleanup
                     .run(q79_boxed_fixture_work(async {

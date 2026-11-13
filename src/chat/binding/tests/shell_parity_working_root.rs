@@ -252,111 +252,107 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
     let scope =
         crate::runtime::turn_cleanup::CleanupScope::new(Some(&owner), tokio_util::sync::CancellationToken::new())?;
     let result = driver
-        .run(
-            true,
-            scope.run(Box::pin(async {
-                let publication = crate::runtime::turn_publication::TurnDecisionPublication {
-                    generation: generation.clone(),
-                    registry: registry.clone(),
-                    mcp_tool: None,
-                    security: security.clone(),
-                    observer: Arc::new(crate::observability::noop::NoopObserver),
-                    hooks: Arc::new(crate::hooks::HookManager::new(workspace.clone())),
-                    memory: memory.clone(),
-                    plugin_generation: 0,
-                }
-                .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
-                .await?;
-                owner.retain_service(publication.clone());
-                use crate::runtime::turn_source::TurnSourceProof as _;
-                let task = "Run shell pwd for PRX-PWD-CHILD";
-                let input = "Use sessions_spawn in process mode; the worker must run shell pwd for PRX-PWD-CHILD.";
-                let session_key = "prx_working_root_session";
-                let run_id = "prx_working_root_parent";
-                let session = crate::chat::session::ChatSession::new(provider_name, model);
-                let event = crate::chat::record_chat_user_message_event_in_generation(
-                    &fabric,
-                    &session,
-                    session_key,
-                    run_id,
-                    provider_name,
-                    model,
-                    1,
-                    input,
-                    Some(&generation),
+        .run(scope.run(Box::pin(async {
+            let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+                generation: generation.clone(),
+                registry: registry.clone(),
+                mcp_tool: None,
+                security: security.clone(),
+                observer: Arc::new(crate::observability::noop::NoopObserver),
+                hooks: Arc::new(crate::hooks::HookManager::new(workspace.clone())),
+                memory: memory.clone(),
+                plugin_generation: 0,
+            }
+            .publish(crate::tools::capability::turn_state::TurnSurfaceKind::Interactive)
+            .await?;
+            owner.retain_service(publication.clone());
+            use crate::runtime::turn_source::TurnSourceProof as _;
+            let task = "Run shell pwd for PRX-PWD-CHILD";
+            let input = "Use sessions_spawn in process mode; the worker must run shell pwd for PRX-PWD-CHILD.";
+            let session_key = "prx_working_root_session";
+            let run_id = "prx_working_root_parent";
+            let session = crate::chat::session::ChatSession::new(provider_name, model);
+            let event = crate::chat::record_chat_user_message_event_in_generation(
+                &fabric,
+                &session,
+                session_key,
+                run_id,
+                provider_name,
+                model,
+                1,
+                input,
+                Some(&generation),
+            )
+            .await?;
+            let receipt =
+                ChatSourceReceipt::issue(memory.as_ref(), &generation, session_key, run_id, input, &event).await?;
+            let proof = receipt.bind_provider(
+                &binding,
+                ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
+            )?;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let context = publication
+                .open_issued_turn_context(
+                    proof.as_ref(),
+                    crate::runtime::turn_context::AgentTurnKind::Repl,
+                    &cancellation,
                 )
                 .await?;
-                let receipt =
-                    ChatSourceReceipt::issue(memory.as_ref(), &generation, session_key, run_id, input, &event).await?;
-                let proof = receipt.bind_provider(
-                    &binding,
-                    ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
-                )?;
-                let cancellation = tokio_util::sync::CancellationToken::new();
-                let context = publication
-                    .open_issued_turn_context(
-                        proof.as_ref(),
-                        crate::runtime::turn_context::AgentTurnKind::Repl,
-                        &cancellation,
-                    )
-                    .await?;
-                let selected = publication.agent_execution_specs(proof.as_ref(), &context)?;
-                anyhow::ensure!(
-                    selected.specs.len() == 1
-                        && selected.specs.first().is_some_and(|spec| spec.name == "sessions_spawn"),
-                    "test: actual Chat decision must select sessions_spawn"
-                );
-                let original = crate::tools::ToolExecutionContext::new(proof.envelope().clone(), "private")
-                    .with_chat_id(session_key);
-                let (execution, bound) =
-                    publication.bind_agent_execution(proof.as_ref(), &context, &original, &selected.specs)?;
-                anyhow::ensure!(
-                    bound.child_grant.is_some(),
-                    "test: real parent-issued child grant required"
-                );
-                let spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
-                    proof.run_id().to_owned(),
-                    proof.session_key().to_owned(),
-                );
-                let result = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
-                    .scope(
-                        spawn_context,
-                        execution.execute(
-                            crate::tools::ToolExecutionCommand::new(
-                                "sessions_spawn",
-                                json!({"action":"spawn_batch", "mode":"process", "tasks":[task]}),
-                            ),
-                            bound,
-                            Some(cancellation),
+            let selected = publication.agent_execution_specs(proof.as_ref(), &context)?;
+            anyhow::ensure!(
+                selected.specs.len() == 1 && selected.specs.first().is_some_and(|spec| spec.name == "sessions_spawn"),
+                "test: actual Chat decision must select sessions_spawn"
+            );
+            let original =
+                crate::tools::ToolExecutionContext::new(proof.envelope().clone(), "private").with_chat_id(session_key);
+            let (execution, bound) =
+                publication.bind_agent_execution(proof.as_ref(), &context, &original, &selected.specs)?;
+            anyhow::ensure!(
+                bound.child_grant.is_some(),
+                "test: real parent-issued child grant required"
+            );
+            let spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                proof.run_id().to_owned(),
+                proof.session_key().to_owned(),
+            );
+            let result = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                .scope(
+                    spawn_context,
+                    execution.execute(
+                        crate::tools::ToolExecutionCommand::new(
+                            "sessions_spawn",
+                            json!({"action":"spawn_batch", "mode":"process", "tasks":[task]}),
                         ),
-                    )
-                    .await;
-                anyhow::ensure!(
-                    result.succeeded(),
-                    "test: actual Chat process launch rejected: {result:?}"
-                );
-                tokio::time::timeout(Duration::from_secs(60), async {
-                    loop {
-                        {
-                            let runs = runs.read().await;
-                            let run = runs.first().context("test: actual worker run")?;
-                            anyhow::ensure!(run.process_control.is_some(), "test: actual worker process required");
-                            if run.finished_at.is_some() {
-                                anyhow::ensure!(
-                                    matches!(run.status, SubAgentStatus::Completed(_)),
-                                    "test: real worker failed: {:?}",
-                                    run.status
-                                );
-                                return Ok::<_, anyhow::Error>(());
-                            }
+                        bound,
+                        Some(cancellation),
+                    ),
+                )
+                .await;
+            anyhow::ensure!(
+                result.succeeded(),
+                "test: actual Chat process launch rejected: {result:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    {
+                        let runs = runs.read().await;
+                        let run = runs.first().context("test: actual worker run")?;
+                        anyhow::ensure!(run.process_control.is_some(), "test: actual worker process required");
+                        if run.finished_at.is_some() {
+                            anyhow::ensure!(
+                                matches!(run.status, SubAgentStatus::Completed(_)),
+                                "test: real worker failed: {:?}",
+                                run.status
+                            );
+                            return Ok::<_, anyhow::Error>(());
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                })
-                .await
-                .context("test: worker completion")?
-            })),
-        )
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("test: worker completion")?
+        })))
         .await;
     // Always reap owned runs, including a failed worker carry check.
     let controls: Vec<_> = {

@@ -213,19 +213,22 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
             let other_decision = other.admitted.decision();
             let foreign = other_decision.service.terminal_binding(other_decision.context)?;
 
-            // Published from the pinned runtime context: the sealed manifest
-            // and its parent authority are the ones the turn pinned at opening.
+            // Published from the pinned runtime context: the ordinary
+            // publication re-seals the pinned manifest's refs under its
+            // run-scoped parent authority, inside the pinned parent refs.
             let outgoing = runtime
                 .outgoing_delegation
                 .as_ref()
                 .context("parent runtime context sealed no outgoing manifest")?;
             let (manifest, constraints) = publication.scope().gate_inputs();
-            let pinned_parent: crate::tools::capability::child::ParentAuthorityId = runtime.decision_id.into();
-            assert!(manifest == &outgoing.manifest, "manifest differs from the pinned one");
+            assert!(
+                manifest.allowed == outgoing.manifest.allowed,
+                "manifest refs differ from the pinned ones"
+            );
             assert!(constraints.allowed == outgoing.parent_allowed, "parent refs differ");
             assert!(
-                constraints.parent_authority_id == pinned_parent,
-                "parent authority differs"
+                manifest.authority.remaining_depth == outgoing.manifest.authority.remaining_depth,
+                "manifest depth differs from the pinned one"
             );
             assert!(
                 constraints.catalog_generation == runtime.catalog_generation,

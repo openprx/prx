@@ -321,9 +321,10 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
             .open_issued_turn_context(proof.as_ref(), AgentTurnKind::Repl, &cancel)
             .await
             .unwrap();
-        assert!(
-            predictions.load(Ordering::SeqCst) > 0,
-            "the actual controlled local backend must supply predictions"
+        assert_eq!(
+            predictions.load(Ordering::SeqCst),
+            0,
+            "the turn opens prediction-free; the backend is never asked (R9)"
         );
         let read_id = service.catalog().entry_for_public_name("file_read").unwrap().id.clone();
         assert!(

@@ -1151,7 +1151,7 @@ mod tests {
         let driver = super::native_decision_fixture::Driver::start_answer().await.unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let workspace = tempfile::tempdir().unwrap();
                 let models = Arc::new(std::sync::Mutex::new(Vec::new()));
                 let mut builder = embedded_provider_builder(workspace.path())
@@ -2383,7 +2383,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(true, async move {
+            .run(async move {
                 let workspace = tempfile::tempdir().unwrap();
                 std::fs::write(workspace.path().join("prx-native.txt"), "tool-out").unwrap();
                 let observed = Arc::new(Mutex::new(Vec::new()));
@@ -2546,7 +2546,7 @@ mod tests {
             .unwrap();
         let endpoint = driver.endpoint().to_owned();
         driver
-            .run(autonomy == crate::security::AutonomyLevel::Full, async move {
+            .run(async move {
                 let workspace = tempfile::tempdir().unwrap();
                 let executions = Arc::new(AtomicUsize::new(0));
                 let observed = Arc::new(Mutex::new(Vec::new()));

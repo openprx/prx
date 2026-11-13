@@ -95,7 +95,7 @@ async fn genuine_depth_denial_retains_parent_cleanup_ack_evidence() -> anyhow::R
     let result = Arc::new(parking_lot::Mutex::new(None));
     let calls = Arc::new(AtomicUsize::new(0));
     let turn_state = Arc::new(parking_lot::Mutex::new(None));
-    let outcome = std::panic::AssertUnwindSafe(driver.run_factory(true, || {
+    let outcome = std::panic::AssertUnwindSafe(driver.run_factory(|| {
         recorder.scope(async {
             let mut config = crate::config::Config {
                 workspace_dir: workspace.path().to_owned(),

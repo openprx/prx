@@ -647,7 +647,8 @@ impl AdmittedTurn {
         }
         let ordinary_controlled = matches!(&origin, FixtureOrigin::OrdinaryControlledChannel(_));
         if ordinary_controlled {
-            config.decision_engine.enabled = true;
+            // The engine switch is the caller's: an ordinary turn opens
+            // prediction-free either way (R9), so the fixture never forces it.
             config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
                 crate::config::schema::causal_tree::BackendKind::Builtin,
             );
@@ -1062,7 +1063,7 @@ async fn configured_mechanics_reaches_execute_when_decision_http_stalls_past_bud
         endpoint,
     } = fixture;
     driver
-        .run_factory(true, || async move {
+        .run_factory(|| async move {
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
                     .expect("mechanics cleanup owner");

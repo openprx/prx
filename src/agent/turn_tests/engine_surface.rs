@@ -62,7 +62,7 @@ async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() 
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -228,7 +228,7 @@ async fn run_tool_call_loop_persists_large_tool_output_documents() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -374,7 +374,7 @@ async fn run_tool_call_loop_keeps_stateful_tools_strictly_serial() {
         .expect("owned mechanics decision listener");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1123,7 +1123,7 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
     ));
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1308,7 +1308,7 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
     ));
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             use futures::FutureExt as _;
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())

@@ -629,7 +629,7 @@ async fn int_agent_gateway_ap01_tool_dispatch_round_trip() {
     ]));
 
     let provider = Box::new(PositiveFeedbackProvider::new(provider, true));
-    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+    native_agent::run(provider, "counter", |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(
             builder.tools(vec![Box::new(counting_tool), Box::new(EchoTool)]),
             workspace,
@@ -712,7 +712,7 @@ async fn int_agent_gateway_ap03_provider_timeout_during_tool_loop() {
 
     let attempts = Arc::clone(&provider.call_count);
     let provider = Box::new(PositiveFeedbackProvider::new(provider, false));
-    native_agent::run(provider, "echo", 1, |builder, workspace| async move {
+    native_agent::run(provider, "echo", |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(EchoTool)]), workspace);
 
         // Use a timeout to prevent the test from hanging forever.

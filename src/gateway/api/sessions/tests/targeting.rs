@@ -622,7 +622,7 @@ async fn drive(
     let registry = registry.to_vec();
     let targeted_request = agent_config.is_some();
     driver
-        .run(true, async move {
+        .run(async move {
             let tmp = tempfile::tempdir().expect("test: tempdir");
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
@@ -1474,7 +1474,7 @@ async fn agent_partition_reaches_every_writer_input() {
         .expect("test: decision fixture");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut fixture = fixture_with_decision_backend(|config| {
                 config.gateway.targeted_agents = true;
                 config.autonomy.level = AutonomyLevel::Full;
@@ -2171,7 +2171,7 @@ async fn complete_memory_family_scope_stamps() {
         .expect("test: decision fixture");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut fixture = fixture_with_scope_embedder(
                 |config| configure_stamped_scope(config, &endpoint, STORE_SCOPE_PROVIDER, &[STORE_TOOL]),
                 Arc::new(AtomicUsize::new(0)),
@@ -2536,7 +2536,7 @@ async fn documents_writes_carry_scope() {
         .expect("test: decision fixture");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut fixture = fixture_with_scope_embedder(
                 |config| configure_stamped_scope(config, &endpoint, DOC_SCOPE_PROVIDER, &[INGEST_TOOL]),
                 Arc::new(AtomicUsize::new(0)),
@@ -2831,7 +2831,7 @@ async fn topics_writes_carry_scope() {
         .expect("test: decision fixture");
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut fixture = fixture_with_scope_embedder(
                 |config| configure_stamped_scope(config, &endpoint, TOPIC_SCOPE_PROVIDER, &[STORE_TOOL]),
                 Arc::new(AtomicUsize::new(0)),

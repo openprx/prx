@@ -82,7 +82,13 @@ mod tests {
             .await;
             let service = service(&fabric, &binding).await;
             let cancellation = tokio_util::sync::CancellationToken::new();
-            let context = binding.issue_decision(&service, &cancellation, false).await.unwrap();
+            // Chat runs every turn under a cleanup owner, which owns the
+            // turn's accounting scope.
+            let cleanup = std::sync::Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+            let context = cleanup
+                .scope(binding.issue_decision(&service, &cancellation, false))
+                .await
+                .unwrap();
             let advice = binding.decision_advice();
             if enabled && mode != DecisionMode::Post {
                 let advice = advice.expect("pre/both analysis from actual chat decision");

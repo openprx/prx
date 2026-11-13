@@ -311,7 +311,7 @@ async fn agent_allows_one_thousand_tool_iterations_to_finish() {
     responses.push(text_response("Final response after iterations"));
 
     let provider = Box::new(MockProvider::new(responses));
-    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+    native_agent::run(provider, "counter", |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
 
         let result = agent

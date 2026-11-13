@@ -248,7 +248,6 @@ async fn build_selected_memory_agent(
         .await
         .unwrap();
     let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        selected_memory::configure(&mut config, &driver.endpoint).unwrap();
         let shared: Arc<dyn Memory> = memory;
         let tool = openprx::tools::memory_search::MemorySearchTool::new(
             workspace.as_path().to_owned(),
@@ -260,14 +259,14 @@ async fn build_selected_memory_agent(
             .provider(Box::new(provider))
             .tools(vec![Box::new(tool)])
             .memory(shared)
-            .observer(driver.observer.clone())
+            .observer(Arc::new(openprx::observability::NoopObserver))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .selected_memory_formatter(Box::new(SelectedContextFormatter));
         selected_memory::AgentFixture(builder.build().unwrap())
     }));
     match setup {
         Ok(agent) => (agent, driver),
-        Err(panic) => driver.run(0, async { std::panic::resume_unwind(panic) }).await,
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
@@ -352,7 +351,7 @@ async fn e2e_multi_step_tool_chain() {
         text_response("Done after 2 tool calls"),
     ]));
 
-    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+    native_agent::run(provider, "counter", |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
         let response = agent.turn("count twice").await.unwrap();
         assert!(!response.is_empty(), "Expected non-empty response after tool chain");
@@ -393,7 +392,7 @@ async fn e2e_multi_turn_conversation() {
         text_response("Third response"),
     ]));
 
-    Box::pin(answer_agent::run(provider, 3, |builder, workspace| async move {
+    Box::pin(answer_agent::run(provider, |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(EchoTool)]), workspace);
 
         let r1 = agent.turn("turn 1").await.unwrap();
@@ -452,7 +451,7 @@ async fn e2e_parallel_tool_dispatch() {
         text_response("Both tools ran"),
     ]));
 
-    native_agent::run(provider, "counter", 1, |builder, workspace| async move {
+    native_agent::run(provider, "counter", |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder.tools(vec![Box::new(counting_tool)]), workspace);
         let response = agent.turn("run both").await.unwrap();
         assert!(
@@ -479,7 +478,7 @@ async fn e2e_multi_turn_history_fidelity() {
         text_response("response 3"),
     ]);
 
-    Box::pin(answer_agent::run(Box::new(provider), 3, |builder, workspace| async move {
+    Box::pin(answer_agent::run(Box::new(provider), |builder, workspace| async move {
         let mut agent = EmbeddedAgentFixture::finish(builder, workspace);
 
         let r1 = agent.turn("msg 1").await.unwrap();
@@ -545,7 +544,7 @@ async fn e2e_memory_enrichment_injects_context() {
 
     let (mut agent, driver) = build_selected_memory_agent(provider, "hello user_name: test_user").await;
     driver
-        .run(1, async {
+        .run(async {
             let response = agent.turn("hello").await.unwrap();
             assert_eq!(response, "enriched response");
 
@@ -590,7 +589,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
 
     let (mut agent, driver) = build_selected_memory_agent(provider, "first second question project: openprx").await;
     driver
-        .run(2, async {
+        .run(async {
             let r1 = agent.turn("first question").await.unwrap();
             assert_eq!(r1, "answer 1");
 
@@ -640,26 +639,22 @@ async fn e2e_empty_memory_context_passthrough() {
     }
     let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
 
-    Box::pin(answer_agent::run(
-        Box::new(provider),
-        1,
-        |builder, workspace| async move {
-            let mut agent = EmbeddedAgentFixture::finish(
-                builder.selected_memory_formatter(Box::new(UnexpectedMemoryFormatter)),
-                workspace,
-            );
+    Box::pin(answer_agent::run(Box::new(provider), |builder, workspace| async move {
+        let mut agent = EmbeddedAgentFixture::finish(
+            builder.selected_memory_formatter(Box::new(UnexpectedMemoryFormatter)),
+            workspace,
+        );
 
-            let response = agent.turn("hello").await.unwrap();
-            assert_eq!(response, "plain response");
+        let response = agent.turn("hello").await.unwrap();
+        assert_eq!(response, "plain response");
 
-            let requests = recorded.lock().unwrap();
-            let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
-            assert_eq!(
-                user_msg.content, "hello",
-                "Empty context should not prepend anything to user message",
-            );
-        },
-    ))
+        let requests = recorded.lock().unwrap();
+        let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
+        assert_eq!(
+            user_msg.content, "hello",
+            "Empty context should not prepend anything to user message",
+        );
+    }))
     .await
     .unwrap();
 }

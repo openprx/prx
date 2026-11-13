@@ -378,7 +378,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         if !text_only {
             let input_event = events.iter().find(|event| event.role == "user" && event.content == input)
                 .expect("actual input receipt");
-            assert_decision_path(workspace.path(), &input_event.event_id, priced);
+            assert_decision_path(workspace.path(), &input_event.event_id);
         }
         let auxiliary: Vec<_> = events
             .iter()
@@ -432,7 +432,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
 }
 
 // Read-only observer of actual persisted decisions, never an authority producer.
-fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, priced: bool) {
+fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str) {
     let conn = rusqlite::Connection::open_with_flags(
         workspace.join("self/causal_tree/decisions.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -452,41 +452,16 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         .expect("actual decision rows")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("decode actual rows");
-    if priced {
-        assert_eq!(rows.len(), 2, "one actual retrieval and terminal hop");
-        assert!(rows.iter().any(|row| row.0 == "retrieve"));
-        assert!(rows.iter().any(|row| row.0 == "answer"));
-    } else {
-        assert_eq!(rows.len(), 2, "bounded discovery then refusal, without retrieval");
-        assert_eq!(rows[0].0, "discover");
-        assert!(rows.iter().all(|row| row.0 != "retrieve"));
-        let (directive, candidates, gates) = rows.get(1).expect("terminal refusal decision");
-        assert_eq!(directive, "refuse");
-        let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> =
-            serde_json::from_str(candidates).expect("actual typed kept candidate records");
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| matches!(candidate.action.as_str(), "clarify" | "refuse"))
-        );
-        let gates: Value = serde_json::from_str(gates).expect("actual gate records");
-        // Family selection discards an early blocked Retrieve before the final
-        // report. Answer is explicitly proposed and its G6 result remains in
-        // NoLegalPath.report even though candidates_json keeps only Refuse.
-        let answer = crate::decision_engine::candidate::CandidateId::new(
-            crate::tools::capability::contract::CausalActionKind::Answer,
-            crate::tools::capability::contract::CapabilityTarget::None,
-            None,
-        );
-        let rejected = gates
-            .get("pre_prediction")
-            .and_then(|pass| pass.get(answer.as_str()))
-            .expect("actual proposed Answer gate outcome");
-        assert_eq!(rejected.get("status").and_then(Value::as_str), Some("blocked"));
-        assert_eq!(rejected.get("gate").and_then(Value::as_u64), Some(6));
-        // Unpriced Answer is G6 unpriced_model. Priced overflow stays budget.
-        assert_eq!(rejected.get("reason").and_then(Value::as_str), Some("unpriced_model"));
-    }
+    // Prediction-free opening (R9): one decision row on the Answer path,
+    // whether priced or not. The engine never retrieves, discovers or
+    // refuses on its own; an unpriced turn is refused by execution's send
+    // admission (asserted by the reply and journal checks above).
+    assert_eq!(rows.len(), 1, "one prediction-free decision row");
+    assert_eq!(rows[0].0, "answer");
+    assert!(
+        rows.iter()
+            .all(|row| !matches!(row.0.as_str(), "retrieve" | "discover" | "refuse"))
+    );
 }
 
 #[tokio::test]

@@ -72,7 +72,7 @@ fn completed_child_fixture(
     boxed_child_fixture_future(move || async move {
         let outcome = {
             let probe = crate::providers::credential_probe::CredentialProbe::start_replying("r8 child completed").await;
-            with_worker_probe_manifest(tmp, probe.custom_provider(), false, |manifest| async move {
+            with_worker_probe_manifest(tmp, probe.custom_provider(), |manifest| async move {
                 let source = manifest.child_source.as_ref().context("test: child source")?;
                 let workspace = PathBuf::from(&source.parent_constraints.workspace);
                 let owner = manifest.owner_id.clone().context("test: owner")?;

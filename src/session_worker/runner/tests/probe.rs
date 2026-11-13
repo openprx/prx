@@ -30,7 +30,7 @@ pub(super) fn retain_worker_probe_directory(mut tmp: tempfile::TempDir) -> tempf
 /// against `provider_name`: a real parent config source, a shared-fabric
 /// SQLite memory and the worker workspace all live under `tmp`.
 async fn worker_probe_run(tmp: &tempfile::TempDir, provider_name: String) -> WorkerResult {
-    with_worker_probe_manifest(tmp, provider_name, false, run_prepared_worker)
+    with_worker_probe_manifest(tmp, provider_name, run_prepared_worker)
         .await
         .expect("test: the worker runs to its result")
 }
@@ -38,7 +38,6 @@ async fn worker_probe_run(tmp: &tempfile::TempDir, provider_name: String) -> Wor
 pub(crate) async fn with_worker_probe_manifest<T, F, Fut>(
     tmp: &tempfile::TempDir,
     provider_name: String,
-    generation_negative: bool,
     consume: F,
 ) -> Result<T>
 where
@@ -73,9 +72,7 @@ where
         .retain_evidence_at(diagnostics);
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(!generation_negative, || async {
-            with_prepared_worker_manifest(tmp, provider_name, Some(&endpoint), consume).await
-        })
+        .run_factory(|| async { with_prepared_worker_manifest(tmp, provider_name, Some(&endpoint), consume).await })
         .await
 }
 

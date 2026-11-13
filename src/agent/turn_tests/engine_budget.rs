@@ -473,7 +473,7 @@ async fn configured_small_native_schema_fixture() {
         .retain_evidence_at(workspace.clone());
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run_factory(true, || async {
+        .run_factory(|| async {
             let cleanup =
                 crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
                     .unwrap();

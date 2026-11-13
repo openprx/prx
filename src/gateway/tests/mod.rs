@@ -464,7 +464,7 @@ where
         .retain_evidence_at(scratch.clone());
     let endpoint = driver.endpoint().to_owned();
     driver
-        .run(true, async move {
+        .run(async move {
             let mut config = Config::default();
             config.workspace_dir = scratch.join("workspace");
             config.config_path = scratch.join("config.toml");

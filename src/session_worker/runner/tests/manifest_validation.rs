@@ -377,21 +377,16 @@ async fn worker_rejects_changed_config_generation_before_workspace_side_effects(
     let tmp = retain_worker_probe_directory(tmp);
     let config_dir = tmp.path().join("config");
     let workspace = tmp.path().join("worker");
-    let error = with_worker_probe_manifest(
-        &tmp,
-        "custom:http://127.0.0.1:1".to_owned(),
-        true,
-        |manifest| async move {
-            // The real parent has already issued this manifest against the
-            // actual config bytes. Change only those private bytes afterwards.
-            let config_path = config_dir.join("config.toml");
-            let mut config: crate::config::Config = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
-            config.default_temperature = 0.6;
-            std::fs::write(config_path, toml::to_string(&config)?)?;
-            let config_dir_arg = config_dir.to_string_lossy().to_string();
-            run_validated_manifest(manifest, None, Some(&config_dir_arg)).await
-        },
-    )
+    let error = with_worker_probe_manifest(&tmp, "custom:http://127.0.0.1:1".to_owned(), |manifest| async move {
+        // The real parent has already issued this manifest against the
+        // actual config bytes. Change only those private bytes afterwards.
+        let config_path = config_dir.join("config.toml");
+        let mut config: crate::config::Config = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+        config.default_temperature = 0.6;
+        std::fs::write(config_path, toml::to_string(&config)?)?;
+        let config_dir_arg = config_dir.to_string_lossy().to_string();
+        run_validated_manifest(manifest, None, Some(&config_dir_arg)).await
+    })
     .await
     .unwrap_err();
 
