@@ -26,6 +26,7 @@ use crate::tools::capability::turn_state::TurnBudgets;
 #[cfg(test)]
 pub(crate) mod timing;
 
+pub(crate) mod analysis_bound;
 pub(crate) mod auxiliary;
 mod output_allowance;
 mod provider_receipt;
@@ -301,6 +302,22 @@ impl AccountingScope {
             .map_or(self.deadline, |parent| self.deadline.min(parent.deadline))
     }
     pub(super) async fn begin_physical(&self, attempt: PhysicalEstimate<'_>) -> Result<OwnedReceipt, DecisionError> {
+        self.begin_physical_within(attempt, self.budgets).await
+    }
+
+    /// `begin_physical` with a per-call bound no larger than this scope's
+    /// own budgets: the attempt still charges the shared owner, but it may
+    /// reserve at most `per_call` tokens and micro-USD.
+    async fn begin_physical_within(
+        &self,
+        attempt: PhysicalEstimate<'_>,
+        per_call: TurnBudgets,
+    ) -> Result<OwnedReceipt, DecisionError> {
+        let per_call = TurnBudgets {
+            tokens: per_call.tokens.min(self.budgets.tokens),
+            micro_usd: per_call.micro_usd.min(self.budgets.micro_usd),
+            latency_ms: per_call.latency_ms.min(self.budgets.latency_ms),
+        };
         if let Some(stage) = super::experiment_stage::current() {
             stage.ensure_active().map_err(|_| DecisionError::Cancelled)?;
             // A retained envelope may have been created by another live stage.
@@ -309,12 +326,12 @@ impl AccountingScope {
                 return Err(DecisionError::BudgetExceeded);
             }
             if self.parent.is_none() && self.scope_id != stage.accounting.scope_id {
-                return stage.accounting.begin_physical_owned(attempt, self.budgets).await;
+                return stage.accounting.begin_physical_owned(attempt, per_call).await;
             }
         }
         match self.parent.as_ref() {
-            Some(parent) => parent.begin_physical_owned(attempt, self.budgets).await,
-            None => self.begin_physical_owned(attempt, self.budgets).await,
+            Some(parent) => parent.begin_physical_owned(attempt, per_call).await,
+            None => self.begin_physical_owned(attempt, per_call).await,
         }
     }
     async fn begin_physical_owned(

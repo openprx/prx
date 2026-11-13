@@ -32,6 +32,7 @@ use crate::decision_engine::{DecisionEngine, IntentAnalysis, IntentInput, TurnOu
 use crate::observability::causal_event::CausalLineage;
 use crate::providers::catalog::ResolvedModel;
 use crate::runtime::decision_accounting::AccountingScope;
+use crate::runtime::decision_accounting::analysis_bound::{AnalysisAccounting, analysis_allowance};
 use crate::runtime::turn_context::TurnRuntimeContext;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
@@ -118,7 +119,9 @@ pub(crate) struct AdvisoryInput {
     pub(crate) request_limits: RequestLimits,
     /// Remaining turn budget `(tokens, micro_usd)` when the input was built.
     pub(crate) remaining: (u64, u64),
-    /// The first serving send's minimum admission `(tokens, micro_usd)`;
+    /// The first serving send's admission `(tokens, micro_usd)` that the
+    /// analysis must leave untouched: the G6 answer estimate and the price of
+    /// the largest prompt the send may carry plus its response reserve.
     /// `None` when its price cannot be estimated.
     pub(crate) first_send_minimum: Option<(u64, u64)>,
 }
@@ -129,10 +132,12 @@ impl AdvisoryInput {
     pub(crate) fn of(runtime: &TurnRuntimeContext, request_limits: RequestLimits) -> Option<Self> {
         let accounting = Arc::clone(runtime.accounting.as_ref()?);
         let limits = &runtime.send_limits;
+        // The brief and the prompt are not built yet, so the send is priced
+        // at the largest prompt its compaction admits (P1-03).
         let first_send_minimum = crate::cost::estimate::estimate_request_cost(
             &limits.model,
             &limits.cost,
-            0,
+            u64::try_from(limits.main_input_limit).unwrap_or(u64::MAX),
             u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
         )
         .map(|estimate| (crate::cost::estimate::candidate_tokens(0), estimate.micro_usd));
@@ -175,14 +180,21 @@ pub(crate) fn build_state(runtime: &TurnRuntimeContext) -> CausalState {
     }
 }
 
-/// P1-1: a priced analysis runs only when the turn can still afford its
-/// worst case plus the first serving send's minimum admission.
-fn analysis_fits(input: &AdvisoryInput, worst_case: (u64, u64)) -> bool {
-    let Some((send_tokens, send_money)) = input.first_send_minimum else {
-        return false;
-    };
-    let (tokens, money) = input.remaining;
-    worst_case.0.saturating_add(send_tokens) <= tokens && worst_case.1.saturating_add(send_money) <= money
+/// P1-1: the bounded accounting of a priced analysis. Its worst case is the
+/// allowance it may reserve, in tokens as the attempt reserves them and
+/// priced as the attempt prices them, so worst case plus the protected first
+/// send never exceeds the remaining budget. `None` (skip) when no allowance
+/// is left or the send or the analysis cannot be priced.
+fn bounded_accounting(input: &AdvisoryInput, provider: &str, model: &str) -> Option<AnalysisAccounting> {
+    let protected = input.first_send_minimum?;
+    let allowance = analysis_allowance(input.remaining, protected, |tokens| {
+        input.accounting.worst_case_micro_usd(provider, model, tokens)
+    })?;
+    Some(AnalysisAccounting::new(
+        Arc::clone(&input.accounting),
+        protected,
+        allowance,
+    ))
 }
 
 /// Free-standing advisory driver: the only caller of the engine's prediction
@@ -191,7 +203,10 @@ pub(crate) struct DecisionAdvisory {
     config: Arc<Config>,
     /// Built only when the engine is enabled, with the turn service's state key.
     factory: Option<DecisionBackendFactory>,
-    telemetry: tokio::sync::OnceCell<AdvisoryRuntime>,
+    /// Opened by a background task, never on the turn's path (P1-04).
+    telemetry: Arc<tokio::sync::OnceCell<AdvisoryRuntime>>,
+    /// Background openings still running; shutdown drains waits for them.
+    opening: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl DecisionAdvisory {
@@ -199,7 +214,8 @@ impl DecisionAdvisory {
         Self {
             config,
             factory,
-            telemetry: tokio::sync::OnceCell::new(),
+            telemetry: Arc::new(tokio::sync::OnceCell::new()),
+            opening: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -225,48 +241,55 @@ impl DecisionAdvisory {
         }
     }
 
-    async fn telemetry(&self) -> Option<&AdvisoryRuntime> {
-        let config = self.config();
-        if !config.enabled {
-            return None;
-        }
-        Some(
-            self.telemetry
-                .get_or_init(|| async {
-                    let cap = crate::decision_engine::status::effective_telemetry_cap(config);
-                    let queue_size = config.observe_queue as usize;
-                    let path = self.config.workspace_dir.join("decision-engine.sqlite");
-                    let cancellation = CancellationToken::new();
-                    let worker_cancellation = cancellation.clone();
-                    let opened = tokio::task::spawn_blocking(move || {
-                        ObserveQueue::start(queue_size, cap as usize, worker_cancellation, || {
-                            Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
-                        })
-                    })
-                    .await;
-                    let (observations, worker) = match opened {
-                        Ok(Ok(started)) => started,
-                        _ => {
-                            tracing::warn!("decision engine telemetry unavailable");
-                            (ObserveQueue::disabled(), None)
-                        }
-                    };
-                    observations.register_status(&self.config.workspace_dir);
-                    #[cfg(test)]
-                    crate::decision_engine::access_spy::record_constructor(&self.config.workspace_dir);
-                    AdvisoryRuntime {
-                        engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
-                        cancellation,
-                        worker: tokio::sync::Mutex::new(worker),
-                    }
+    /// Open the telemetry store once. Runs only inside a background task, so
+    /// its blocking SQLite open never delays a turn.
+    async fn open_telemetry<'a>(
+        cell: &'a tokio::sync::OnceCell<AdvisoryRuntime>,
+        config: &Config,
+    ) -> &'a AdvisoryRuntime {
+        cell.get_or_init(|| async {
+            let engine_config = &config.decision_engine;
+            let cap = crate::decision_engine::status::effective_telemetry_cap(engine_config);
+            let queue_size = engine_config.observe_queue as usize;
+            let path = config.workspace_dir.join("decision-engine.sqlite");
+            let cancellation = CancellationToken::new();
+            let worker_cancellation = cancellation.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                ObserveQueue::start(queue_size, cap as usize, worker_cancellation, || {
+                    Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
                 })
-                .await,
-        )
+            })
+            .await;
+            let (observations, worker) = match opened {
+                Ok(Ok(started)) => started,
+                _ => {
+                    tracing::warn!("decision engine telemetry unavailable");
+                    (ObserveQueue::disabled(), None)
+                }
+            };
+            observations.register_status(&config.workspace_dir);
+            #[cfg(test)]
+            crate::decision_engine::access_spy::record_constructor(&config.workspace_dir);
+            AdvisoryRuntime {
+                engine: crate::decision_engine::causal_adapter::CausalEngine { observations },
+                cancellation,
+                worker: tokio::sync::Mutex::new(worker),
+            }
+        })
+        .await
     }
 
     /// Close observation admission and wait for the telemetry worker until
     /// `deadline`. `false` means the worker is still running.
     pub(crate) async fn drain(&self, deadline: std::time::Instant) -> bool {
+        let opening = std::mem::take(&mut *self.opening.lock());
+        for handle in opening {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "decision engine telemetry opening failed"),
+                Err(_) => return false,
+            }
+        }
         let Some(runtime) = self.telemetry.get() else {
             return true;
         };
@@ -327,22 +350,30 @@ impl DecisionAdvisory {
         #[cfg(test)]
         crate::decision_engine::access_spy::record_constructor(&self.config.workspace_dir);
         let backend = effective_engine_backend(&self.config);
-        if let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) {
-            // Builtin and cache hits spend nothing; a configured backend is
-            // priced at its worst case before it may run.
-            let tokens = u64::from(backend.max_request_bytes).saturating_add(u64::from(backend.max_response_bytes));
-            let worst_case = input
-                .accounting
-                .worst_case_micro_usd(&selection.provider, backend.model.trim(), tokens)
-                .map(|money| (tokens, money));
-            if !worst_case.is_some_and(|worst_case| analysis_fits(&input, worst_case)) {
-                tracing::debug!("decision engine analysis skipped: the turn budget is too tight");
-                return None;
+        // Builtin and cache hits spend nothing; a configured backend runs
+        // only inside an allowance that leaves the first send admissible.
+        let accounting = match crate::config::schema::causal_tree::configured_selection(backend) {
+            Some(selection) => {
+                let Some(bounded) = bounded_accounting(&input, &selection.provider, backend.model.trim()) else {
+                    tracing::debug!("decision engine analysis skipped: the turn budget is too tight");
+                    return None;
+                };
+                Some(bounded)
             }
-        }
+            None => None,
+        };
+        let accounting: &dyn DecisionAttemptAccounting = match accounting.as_ref() {
+            Some(bounded) => bounded,
+            None => input.accounting.as_ref(),
+        };
         let timeout = Duration::from_millis(u64::from(config.timeout_ms));
         // The engine step warns itself; a failed or late prediction warns here.
-        match tokio::time::timeout(timeout, self.analyze_within(factory, &input, timeout, cancellation)).await {
+        match tokio::time::timeout(
+            timeout,
+            self.analyze_within(factory, &input, accounting, timeout, cancellation),
+        )
+        .await
+        {
             Ok(Ok(analysis)) => analysis,
             Ok(Err(())) | Err(_) => {
                 tracing::warn!("decision engine analysis unavailable; continuing without advice");
@@ -355,6 +386,7 @@ impl DecisionAdvisory {
         &self,
         factory: &DecisionBackendFactory,
         input: &AdvisoryInput,
+        accounting: &dyn DecisionAttemptAccounting,
         timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<Option<IntentAnalysis>, ()> {
@@ -422,7 +454,6 @@ impl DecisionAdvisory {
                 },
             )
             .map_err(|_| ())?;
-            let accounting: &dyn DecisionAttemptAccounting = input.accounting.as_ref();
             let port = factory.prediction_port(Some(accounting));
             let lineage = lineage(&state);
             let prediction = tokio::select! {
@@ -464,6 +495,10 @@ impl DecisionAdvisory {
     }
 
     /// Record the turn's outcome. `trace` is read only when observation runs.
+    /// Admission never waits: an open store takes the outcome on its bounded
+    /// queue at once; before the store is open, a background task opens it
+    /// and then admits the outcome, so the turn completes without any
+    /// telemetry I/O (P1-04).
     pub(crate) async fn observe(
         &self,
         trace: impl FnOnce() -> ExecutionTraceSnapshot,
@@ -474,16 +509,29 @@ impl DecisionAdvisory {
         if !config.enabled || config.mode == DecisionMode::Pre {
             return;
         }
-        let Some(runtime) = self.telemetry().await else {
-            return;
-        };
         let tools = trace().calls.into_iter().map(|call| call.capability_id).collect();
-        match TurnOutcome::new(decision_id, tools, succeeded) {
-            Ok(outcome) => {
-                runtime.engine.observe(outcome);
+        let outcome = match TurnOutcome::new(decision_id, tools, succeeded) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!("decision engine outcome exceeds observation bounds");
+                return;
             }
-            Err(_) => tracing::warn!("decision engine outcome exceeds observation bounds"),
+        };
+        if let Some(runtime) = self.telemetry.get() {
+            runtime.engine.observe(outcome);
+            return;
         }
+        let cell = Arc::clone(&self.telemetry);
+        let engine_config = Arc::clone(&self.config);
+        let opening = tokio::spawn(async move {
+            Self::open_telemetry(&cell, &engine_config)
+                .await
+                .engine
+                .observe(outcome);
+        });
+        let mut pending = self.opening.lock();
+        pending.retain(|handle| !handle.is_finished());
+        pending.push(opening);
     }
 }
 

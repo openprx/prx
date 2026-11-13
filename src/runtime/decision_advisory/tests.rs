@@ -100,8 +100,32 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCounter {
     }
 }
 
+/// Usage every [`RecordingBackend`] attempt reports: 1,200 tokens, which a
+/// one-micro-USD-per-token price settles at 1,200 micro-USD.
+pub(crate) const RECORDED_USAGE: crate::cost::decision_attempt::DecisionUsage =
+    crate::cost::decision_attempt::DecisionUsage {
+        input_tokens: Some(1_000),
+        output_tokens: Some(200),
+        cost_micro_usd: None,
+    };
+
+/// One micro-USD per token for `mock`/`model` in every price column.
+pub(crate) fn price_mock_model(config: &mut Config, model: &str) {
+    config.cost.prices.insert(
+        crate::config::schema::usage_pricing_key("mock", model),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+}
+
 /// Answers every compiled request with a plain Answer and records what the
-/// factory hands the backend: the accounting owner and the request limits.
+/// factory hands the backend: the request limits and, like a real remote
+/// transport, one physical attempt begun on the accounting owner it is given
+/// and settled with [`RECORDED_USAGE`]. `attempts` counts begun attempts only.
 pub(crate) struct RecordingBackend {
     pub(crate) identity: crate::cost::decision_attempt::BackendIdentity,
     pub(crate) key: Arc<DecisionKey>,
@@ -128,11 +152,26 @@ impl crate::decision_engine::prediction::backend::DecisionBackend for RecordingB
         accounting: Option<&dyn DecisionAttemptAccounting>,
     ) -> Result<crate::decision_engine::prediction::DecisionResponse, crate::cost::decision_attempt::DecisionError>
     {
-        if accounting.is_some() {
-            self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        use crate::cost::decision_attempt::DecisionError;
+        const TRANSPORT_BINDING: [u8; 32] = [9; 32];
         self.request_bytes.lock().push(body.bytes().len());
-        self.evaluate(request, body, deadline).await
+        let receipt = accounting
+            .ok_or(DecisionError::BudgetExceeded)?
+            .begin(crate::cost::decision_attempt::AttemptBinding {
+                backend: &self.identity,
+                provider: "mock",
+                model: &self.identity.configured_model,
+                transport_binding: &TRANSPORT_BINDING,
+                guarded_body: body.bytes(),
+                request_id: request.request_id(),
+                deadline,
+                remaining_attempts: 1,
+            })
+            .await?;
+        self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let response = self.evaluate(request, body, deadline).await?;
+        receipt.settle(RECORDED_USAGE).await?;
+        Ok(response)
     }
     async fn evaluate(
         &self,
@@ -225,7 +264,22 @@ pub(crate) fn analysis_input(
 #[tokio::test]
 async fn decision_advisory_runs_without_turn_decision_service() {
     let temp = tempfile::tempdir().unwrap();
-    let config = enabled_config(temp.path());
+    let mut config = (*enabled_config(temp.path())).clone();
+    // Cheap enough that the whole 8,000-token fixture slice fits its money.
+    for model in ["recording-model", "typesafe/jev-1.13"] {
+        price_mock_model(&mut config, model);
+        if let Some(price) = config
+            .cost
+            .prices
+            .get_mut(&crate::config::schema::usage_pricing_key("mock", model))
+        {
+            price.cache_write = 0.0;
+            price.cache_read = 0.0;
+            price.input = 0.25;
+            price.output = 0.25;
+        }
+    }
+    let config = Arc::new(config);
     let key = crate::decision_engine::state::fixtures::key();
     let cancellation = CancellationToken::new();
     for model in ["recording-model", "typesafe/jev-1.13"] {
@@ -248,15 +302,21 @@ async fn decision_advisory_runs_without_turn_decision_service() {
         );
         let advisory = DecisionAdvisory::new(Arc::clone(&config), Some(factory));
         let limits = advisory.request_limits();
-        let analysis = advisory
-            .analyze(analysis_input(&config, &key, limits), &cancellation)
-            .await;
+        let input = analysis_input(&config, &key, limits);
+        let scope = Arc::clone(&input.accounting);
+        let before = scope.remaining_budgets();
+        let analysis = advisory.analyze(input, &cancellation).await;
         assert!(analysis.is_some(), "{model}: analysis runs without a turn service");
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "{model}: cache miss"
         );
+        // The attempt is charged to the input's scope: the reported 1,200
+        // tokens at 0.25 micro-USD per token settle at 300 micro-USD.
+        let after = scope.remaining_budgets();
+        assert_eq!(before.tokens - after.tokens, 1_200, "{model}: tokens charged");
+        assert_eq!(before.micro_usd - after.micro_usd, 300, "{model}: money charged");
         assert!(
             request_bytes
                 .lock()
@@ -493,4 +553,34 @@ async fn engine_driver_generates_with_advisory_probe() {
             analysis.candidates.keys()
         );
     }
+}
+
+/// P1-04: a turn's observation never waits for telemetry I/O. On a
+/// current-thread runtime nothing else runs while `observe` executes, so the
+/// store is provably not opened on the turn's path; the background opening
+/// admits the outcome and shutdown drain waits for it and flushes it.
+#[tokio::test(flavor = "current_thread")]
+async fn observation_never_waits_for_the_telemetry_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = (*enabled_config(temp.path())).clone();
+    config.decision_engine.mode = DecisionMode::Both;
+    let advisory = DecisionAdvisory::new(Arc::new(config), None);
+    advisory
+        .observe(ExecutionTraceSnapshot::default, Some("decision-1".into()), true)
+        .await;
+    assert!(!advisory.initialized(), "observe returned before any telemetry open");
+    assert!(!temp.path().join("decision-engine.sqlite").exists());
+    assert!(
+        advisory
+            .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        "drain waits for the background opening and the worker"
+    );
+    assert!(advisory.initialized());
+    let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
+    assert_eq!(
+        store.outcomes().unwrap().len(),
+        1,
+        "the outcome was admitted and flushed"
+    );
 }

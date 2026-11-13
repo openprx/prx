@@ -107,12 +107,14 @@ mod tests {
                     true,
                 )
                 .await;
-            assert_eq!(service.advisory().initialized(), enabled && mode != DecisionMode::Pre);
+            // P1-04: the store is opened in the background, never on the
+            // turn's path; shutdown drain waits for that opening.
             assert!(
                 service
                     .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
                     .await
             );
+            assert_eq!(service.advisory().initialized(), enabled && mode != DecisionMode::Pre);
             if enabled && mode != DecisionMode::Pre {
                 let store = crate::decision_engine::observe::SqliteTelemetryWriter::open(
                     &dir.path().join("decision-engine.sqlite"),

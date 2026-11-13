@@ -1522,15 +1522,7 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
         model: "recording-model".into(),
         ..Default::default()
     });
-    config.cost.prices.insert(
-        crate::config::schema::usage_pricing_key("mock", "recording-model"),
-        crate::config::schema::ModelPricing {
-            input: 1.0,
-            output: 1.0,
-            cache_write: 1.0,
-            cache_read: 1.0,
-        },
-    );
+    crate::runtime::decision_advisory::tests::price_mock_model(&mut config, "recording-model");
     let config = Arc::new(config);
     let key = crate::decision_engine::state::fixtures::key();
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1566,15 +1558,46 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
         "no backend attempt"
     );
 
-    // Ample: the analysis runs and is handed the turn's accounting scope.
+    // Ample: the analysis runs and is charged to the turn's accounting scope.
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let advisory = advisory_with(&attempts);
-    let ample = analysis_input(&config, &key, advisory.request_limits());
+    let mut ample = analysis_input(&config, &key, advisory.request_limits());
+    let scope = Arc::new(crate::runtime::decision_accounting::AccountingScope::new(
+        Arc::clone(&config),
+        Arc::clone(&key),
+        Arc::default(),
+        [5; 32],
+        crate::tools::capability::turn_state::TurnBudgets {
+            tokens: 8_000,
+            latency_ms: 30_000,
+            micro_usd: 1_000_000,
+        },
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ));
+    ample.accounting = Arc::clone(&scope);
+    ample.remaining = (8_000, 1_000_000);
+    ample.first_send_minimum = Some((128, 10_000));
+    let before = scope.remaining_budgets();
     assert!(advisory.analyze(ample, &cancellation).await.is_some(), "analysis runs");
     assert_eq!(
         attempts.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "one attempt charged to the turn's accounting scope"
+    );
+    let after = scope.remaining_budgets();
+    assert_eq!(
+        before.tokens - after.tokens,
+        1_200,
+        "reported tokens charged to the turn"
+    );
+    assert_eq!(
+        before.micro_usd - after.micro_usd,
+        1_200,
+        "reported cost charged to the turn"
+    );
+    assert!(
+        after.tokens >= 128 && after.micro_usd >= 10_000,
+        "the protected first send stays admissible"
     );
 
     // Served: an engine-on turn whose priced analysis cannot be afforded
@@ -1605,5 +1628,103 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     assert!(
         served.systems.iter().all(|text| !text.contains(BRIEF_MARKER)),
         "a skipped analysis adds no brief"
+    );
+
+    // Oversized brief: the builtin analysis runs, but its brief does not fit
+    // the first send's remaining G6 tokens (capped at the answer estimate),
+    // so it is dropped and the request is still served.
+    let oversized = {
+        use crate::agent::send_admission::{HookReset, TEST_TOKEN_CAP};
+        let _reset = HookReset;
+        TEST_TOKEN_CAP.set(crate::cost::estimate::candidate_tokens(0));
+        Box::pin(open_agent_turn(true, |_| {})).await
+    };
+    assert_eq!(oversized.reply, "done", "the request is served");
+    assert_eq!(oversized.provider_requests, 2, "the turn is not refused or shortened");
+    assert!(
+        oversized.systems.iter().all(|text| !text.contains(BRIEF_MARKER)),
+        "a brief larger than the first send's remaining tokens is dropped"
+    );
+}
+
+/// P1-01: a configured non-builtin backend runs on a turn opened by the
+/// production path with a valid configuration. The analysis is bounded in
+/// tokens (the G6 slice is at most 8,192), one physical attempt is charged to
+/// the turn's own accounting scope, and the first send stays admissible.
+#[tokio::test]
+async fn configured_backend_runs_on_a_production_opened_turn() {
+    use crate::runtime::decision_advisory::DecisionAdvisory;
+    use crate::runtime::decision_advisory::tests::{RecordingBackend, price_mock_model};
+    let workspace = tempfile::tempdir().expect("test: production-opened workspace");
+    let mut config = engine_off_config(workspace.path());
+    config.decision_engine.enabled = true;
+    config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
+        kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Mock,
+        ),
+        model: "recording-model".into(),
+        ..Default::default()
+    });
+    price_mock_model(&mut config, "recording-model");
+    config.agent.compaction.max_context_tokens = 131_072;
+    config.agent.compaction.max_context_tokens_explicit = true;
+    config.agent.compaction.reserve_tokens = 4_096;
+    config.causal_tree.policy.extra_token_ratio_limit = 1.0;
+    let admitted = AdmittedTurn::with_config(config.clone(), "analyse the opened turn", Arc::new(Vec::new())).await;
+    let decision = admitted.decision();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let context = decision
+        .service
+        .open_turn_context(
+            decision.proof,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
+            &cancellation,
+        )
+        .await
+        .expect("test: production turn opening");
+    let runtime = context.runtime();
+    let scope = Arc::clone(
+        runtime
+            .accounting
+            .as_ref()
+            .expect("a production-opened turn has an accounting scope"),
+    );
+    let before = (runtime.remaining_g6_tokens(), runtime.remaining_micro_usd());
+    assert_eq!(before.0, 8_192, "the G6 slice is the token bound of the analysis");
+    let key = crate::decision_engine::state::fixtures::key();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
+        vec![Box::new(RecordingBackend {
+            identity: crate::cost::decision_attempt::BackendIdentity {
+                kind: crate::config::schema::causal_tree::BackendKind::Mock,
+                provider: None,
+                configured_model: Arc::from("recording-model"),
+            },
+            key: Arc::clone(&key),
+            attempts: Arc::clone(&attempts),
+            request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        })],
+        Arc::clone(&key),
+        crate::decision_engine::prediction::outbound::OutboundSecrets::default(),
+        crate::decision_engine::prediction::factory::SlotLimits::default(),
+    );
+    let advisory = DecisionAdvisory::new(Arc::new(config), Some(factory));
+    let analysis = advisory.analyze_turn(runtime, &cancellation).await;
+    assert!(analysis.is_some(), "the configured backend's analysis runs");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one physical attempt on the configured backend"
+    );
+    let after = scope.remaining_budgets();
+    assert_eq!(
+        before.0 - runtime.remaining_g6_tokens(),
+        1_200,
+        "reported tokens charged to the turn's scope"
+    );
+    assert!(after.micro_usd < before.1, "reported cost charged to the turn's scope");
+    assert!(
+        crate::cost::estimate::candidate_tokens(0) <= runtime.remaining_g6_tokens(),
+        "the first send's G6 admission still fits"
     );
 }

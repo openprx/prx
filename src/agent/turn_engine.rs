@@ -300,7 +300,7 @@ async fn run_turn_unguarded(
         runtime_adapter,
         memory: memory_runtime,
     } = services;
-    let decision_brief = advice
+    let mut decision_brief = advice
         .as_ref()
         .map(|analysis| {
             let config = service.advisory().config();
@@ -320,7 +320,7 @@ async fn run_turn_unguarded(
             }
             fits
         });
-    let decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
+    let mut decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
     let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
         cancellation: cancellation_token,
@@ -959,6 +959,29 @@ async fn run_turn_unguarded(
         // Corrective retries, recalled pages, and middleware are all allowed to
         // contribute request-local system context, so canonicalize only the
         // prepared request after every contributor has run.
+        // P1-03: the brief never makes a send inadmissible. A brief whose
+        // prompt cost would fail this send's token or money admission is
+        // dropped for the rest of the turn; the send is then admitted (or
+        // refused) exactly as with the engine off.
+        if let Some(brief) = decision_brief.as_deref() {
+            let mut with_brief = prepared_messages.messages.clone();
+            crate::decision_engine::turn::append_brief(&mut with_brief, Some(brief));
+            coalesce_system_messages_at_front(&mut with_brief);
+            if super::send_admission::admit_provider_send(
+                service,
+                context,
+                proof,
+                &with_brief,
+                compiled_tool_context.native_tool_specs(),
+                runtime_adapter.tool_execution_context.schema_dialect,
+            )
+            .is_err()
+            {
+                tracing::debug!("decision brief dropped: the send would not be admitted with it");
+                decision_brief = None;
+                decision_brief_sha256 = None;
+            }
+        }
         crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, decision_brief.as_deref());
         coalesce_system_messages_at_front(&mut prepared_messages.messages);
         let final_system_prompt = prepared_messages

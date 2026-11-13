@@ -399,6 +399,9 @@ pub(crate) struct AgentDecisionBudget {
 
 pub(crate) struct SendLimits {
     pub(crate) response_reserve: usize,
+    /// The largest prompt a send of this turn may carry: the effective
+    /// window minus the response and decision reserves.
+    pub(crate) main_input_limit: usize,
     pub(crate) remaining_micro_usd: u64,
     pub(crate) model: ResolvedModel,
     pub(crate) cost: crate::config::schema::CostConfig,

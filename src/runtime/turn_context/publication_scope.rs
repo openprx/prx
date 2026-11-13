@@ -146,8 +146,13 @@ impl<'a> PublicationScope<'a> {
     pub(crate) fn send_limits(&self, proof: &dyn TurnSourceProof) -> Result<SendLimits, AgentDecisionBudgetError> {
         let budget = self.agent_budget_snapshot(proof)?;
         let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
+        let main_input_limit = budget
+            .main_compaction
+            .max_context_tokens
+            .saturating_sub(budget.main_compaction.reserve_tokens);
         Ok(SendLimits {
             response_reserve: effective.config.reserve_tokens,
+            main_input_limit,
             remaining_micro_usd: budget.budgets.micro_usd,
             model: self.resolve_agent_model(proof)?,
             cost: self.generation.effective.cost.clone(),
