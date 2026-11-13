@@ -29,6 +29,9 @@ pub(super) async fn operator_process_publication(
     snapshots
         .publication
         .verify_policy(&build.security, &snapshots.parent, &snapshots.catalog)?;
+    // The frozen capability set is a membership limit; Full has no permission
+    // limits (R51/OV-4), so a Full worker keeps the actual surface policy.
+    let full = build.security.autonomy == crate::security::AutonomyLevel::Full;
     let view = snapshots.catalog.view(&CatalogScope::default());
     let mut names = BTreeSet::new();
     for entry in view.iter_entries() {
@@ -47,11 +50,13 @@ pub(super) async fn operator_process_publication(
                 "operator worker capability exceeds actual surface policy"
             );
             names.insert(entry.public_name.clone());
-        } else {
+        } else if !full {
             build.surface_policy.excluded_names.insert(entry.public_name.clone());
         }
     }
-    build.surface_policy.allowed_tools = Some(names);
+    if !full {
+        build.surface_policy.allowed_tools = Some(names);
+    }
     snapshots
         .catalog
         .check_published_parity(&build.execution, snapshots.publication.allowed())?;

@@ -19,8 +19,9 @@ use anyhow::Context;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// Frozen upper bound for an operator-launched child. The child still needs its
-/// own source/lifetime admission and per-call policy/approval checks.
+/// Frozen upper bound for an operator-launched child below Full (a Full task
+/// is not limited by it, R51). The child still needs its own source/lifetime
+/// admission and per-call policy/approval checks.
 pub(crate) struct OperatorChildPublication {
     service: Arc<TurnDecisionService>,
     source: crate::runtime::turn_source::OwnedTurnSourceProof,
@@ -176,23 +177,28 @@ impl OperatorChildPublication {
             Arc::new(crate::tools::TracingToolExecutionAudit),
         ));
         let mut policy = parent.publication_policy.clone();
-        let view = parent.catalog.view(&CatalogScope::default());
-        let mut names = BTreeSet::new();
-        for entry in view.iter_entries() {
-            let reference = CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            };
-            if self.authority.constraints.allowed.contains(&reference) {
-                names.insert(entry.public_name.clone());
-            } else {
-                // Explicit exclusions also prevent root aliases from admitting
-                // a sibling Skill/Node outside the frozen capability set.
-                policy.excluded_names.insert(entry.public_name.clone());
+        // The frozen capability set is a membership limit. Full has no
+        // permission limits (R51/OV-4): a Full task publishes under the
+        // parent's surface policy; parity, budget and per-call policy stay.
+        if parent.security.autonomy != crate::security::AutonomyLevel::Full {
+            let view = parent.catalog.view(&CatalogScope::default());
+            let mut names = BTreeSet::new();
+            for entry in view.iter_entries() {
+                let reference = CapabilityRef {
+                    id: entry.id.clone(),
+                    fingerprint: entry.fingerprint,
+                    generation: entry.generation,
+                };
+                if self.authority.constraints.allowed.contains(&reference) {
+                    names.insert(entry.public_name.clone());
+                } else {
+                    // Explicit exclusions also prevent root aliases from admitting
+                    // a sibling Skill/Node outside the frozen capability set.
+                    policy.excluded_names.insert(entry.public_name.clone());
+                }
             }
+            policy.allowed_tools = Some(names);
         }
-        policy.allowed_tools = Some(names);
         parent.catalog.check_parity(&execution)?;
         let policy_version = pinned_policy_version(
             &parent.generation.effective,

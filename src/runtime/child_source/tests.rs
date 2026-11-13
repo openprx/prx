@@ -6,7 +6,9 @@
 //! production binding captures the ordinary publication. Each cell then runs
 //! with only the publication, the pinned runtime context, the terminal
 //! binding and the production executor. Operator children: a real local `/bg`
-//! admission captures the operator publication.
+//! admission captures the operator publication; the production task path
+//! (`claim` → `issue_task` → `task_service`) builds the task service whose
+//! membership, recursive-money and parity cells run per autonomy level.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -291,6 +293,8 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
     result
 }
 
+const OPERATOR_TASK: &str = "Add two integers.";
+
 async fn operator_case(level: AutonomyLevel) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let mut config = crate::config::Config::default();
@@ -299,6 +303,12 @@ async fn operator_case(level: AutonomyLevel) -> anyhow::Result<()> {
     config.default_provider = Some("ollama".into());
     config.default_model = Some("prx-local-model".into());
     config.autonomy.level = level;
+    // The probe is denied to the operator source, so below Full it is outside
+    // the frozen operator capability set. Full has no ACL limit (R51).
+    config.autonomy.scopes.rules.push(crate::config::ScopeRule {
+        tools_deny: vec![PROBE.to_owned()],
+        ..Default::default()
+    });
     config.providers.models.push(toml::from_str(
         "provider='ollama'\nmodel='prx-local-model'\noperations=['chat']\nnative_tools=true\n",
     )?);
@@ -337,7 +347,7 @@ async fn operator_case(level: AutonomyLevel) -> anyhow::Result<()> {
         .scope(Box::pin(async {
             let publication = crate::runtime::turn_publication::TurnDecisionPublication {
                 generation: Arc::clone(&generation),
-                registry,
+                registry: Arc::clone(&registry),
                 mcp_tool: None,
                 security,
                 observer: Arc::new(crate::observability::noop::NoopObserver),
@@ -345,23 +355,133 @@ async fn operator_case(level: AutonomyLevel) -> anyhow::Result<()> {
                 memory: Arc::clone(&memory),
                 plugin_generation: 0,
             };
-            let (_, source) =
-                crate::chat::binding::tests::recorded_local_operator_spawn(publication, provider, "Add two integers.")
+            let (args, source) =
+                crate::chat::binding::tests::recorded_local_operator_spawn(publication, provider, OPERATOR_TASK)
                     .await?;
             // The operator source retains its own publication; the test holds
             // no decision service. Admission holds before any change.
             source.verify_live()?;
             assert_eq!(calls.load(Ordering::SeqCst), 0);
-            // Parity drift of the live executor refuses the operator child in
-            // Full as in Supervised, without any dispatch.
-            drift.fetch_add(1, Ordering::SeqCst);
-            assert!(source.verify_live().is_err());
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            Ok(())
+            source
+                .scope(operator_task_cells(level, args, &registry, &calls, &drift))
+                .await
         }))
         .await;
     cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
     result
+}
+
+/// The operator task service, built the way production task mode builds it
+/// (`claim` → `issue_task` → `task_service`), and its first segment's
+/// production execution context.
+async fn operator_task_cells(
+    level: AutonomyLevel,
+    args: serde_json::Value,
+    registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    calls: &AtomicUsize,
+    drift: &AtomicUsize,
+) -> anyhow::Result<()> {
+    let claimed = crate::runtime::operator_spawn::claim(&args)?.context("operator source not in scope")?;
+    let binding = Arc::new(super::ChildProviderBinding::build_operator(&claimed)?);
+    let mut scope = crate::runtime::envelope::RuntimeEnvelope::sessions_spawn(
+        claimed.fabric().workspace_id(),
+        "prx_operator_session",
+        "prx_child_operator_task",
+    )
+    .message_scope();
+    claimed.bind_input_scope(&mut scope)?;
+    let receipt = super::record_child_input(
+        claimed.fabric(),
+        scope.clone(),
+        OPERATOR_TASK,
+        Some("prx-child-operator-task-input".to_owned()),
+        None,
+        None,
+    )
+    .await?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (authority, _lifetime) =
+        claimed.issue_task(binding, &scope, OPERATOR_TASK, receipt.as_deref(), &cancellation)?;
+    let service = authority
+        .publication()
+        .task_service(Arc::clone(&authority), Arc::clone(registry))?;
+    crate::runtime::turn_cleanup::current_tracker()
+        .context("operator task cleanup owner missing")?
+        .retain_child_service(Arc::clone(&service))?;
+    let mut segments = authority.segments()?;
+    let (_, context) = segments.record(OPERATOR_TASK).await?;
+
+    // Membership: below Full the source ACL keeps the probe outside the frozen
+    // operator capability set, so Supervised publishes only that set and
+    // refuses the probe with no dispatch. Full bypasses the frozen set (R51):
+    // the task publishes under the parent surface and executes the probe once.
+    let probe = service
+        .catalog()
+        .entry_for_public_name(PROBE)
+        .context("probe missing from the task catalog")?
+        .id
+        .clone();
+    let policy = service.publication_policy();
+    let unscoped = service
+        .catalog()
+        .view(&crate::tools::capability::catalog::CatalogScope::default());
+    let visible = unscoped.with_surface(policy).contains(&probe);
+    let status = service
+        .execution()
+        .execute(
+            ToolExecutionCommand::new(PROBE, serde_json::json!({"value": 1})),
+            context,
+            None,
+        )
+        .await
+        .status;
+    if level == AutonomyLevel::Full {
+        assert!(
+            policy.allowed_tools.is_none(),
+            "a Full operator task is not limited to the frozen set"
+        );
+        assert!(!policy.excluded_names.contains(PROBE));
+        assert!(visible, "Full publishes the probe");
+        assert_eq!(status, ToolExecutionStatus::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    } else {
+        assert!(
+            policy
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|names| names.contains("sessions_spawn") && !names.contains(PROBE)),
+            "Supervised publishes exactly the frozen set"
+        );
+        assert!(policy.excluded_names.contains(PROBE));
+        assert!(!visible, "Supervised does not publish the probe");
+        assert_ne!(status, ToolExecutionStatus::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    let executed = calls.load(Ordering::SeqCst);
+
+    // Recursive money is a resource bound, not a permission: an exhausted
+    // task or parent allowance funds no child share in Full as in
+    // Supervised; nothing dispatches.
+    authority.allowance().money().store(0, Ordering::Release);
+    assert!(authority.allowance().carve_child(1).is_err());
+    let parent = &authority.publication().parent_authority().allowance;
+    parent.money().store(0, Ordering::Release);
+    assert!(parent.carve_child(1).is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), executed);
+
+    // Parity: drift of the live executor refuses the operator source, the
+    // task authority and a new task service in both levels, with no dispatch.
+    drift.fetch_add(1, Ordering::SeqCst);
+    assert!(claimed.verify_live().is_err());
+    assert!(authority.verify().is_err());
+    assert!(
+        authority
+            .publication()
+            .task_service(Arc::clone(&authority), Arc::clone(registry))
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), executed);
+    Ok(())
 }
 
 #[tokio::test]
