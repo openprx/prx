@@ -43,7 +43,9 @@ impl SecurityPolicy {
         };
         let workspace = fold(&workspace_root);
         for forbidden in &self.forbidden_paths {
-            let forbidden = crate::config::expand_home(Path::new(forbidden));
+            let Ok(forbidden) = resolve_request_path(root, forbidden) else {
+                return false;
+            };
             // Preserve main's allowance for a relative workspace path when the
             // workspace itself is under a default forbidden ancestor (e.g. /tmp).
             // A working root outside that workspace receives no such exemption.
@@ -68,5 +70,34 @@ impl SecurityPolicy {
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
         resolved.starts_with(workspace)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_forbidden_prefix_uses_the_selected_root() {
+        let workspace = tempfile::tempdir().expect("test: workspace");
+        let root = tempfile::tempdir().expect("test: working root");
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().into(),
+            workspace_only: false,
+            forbidden_paths: vec!["blocked".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !policy.is_path_allowed("blocked/target"),
+            "test: preserve relative deny entries without an override"
+        );
+        assert!(
+            !policy.is_path_allowed_at(root.path(), "blocked/target"),
+            "test: relative deny entries follow the actual root"
+        );
+        assert!(
+            policy.is_path_allowed_at(root.path(), "allowed"),
+            "test: unrelated request remains allowed"
+        );
     }
 }

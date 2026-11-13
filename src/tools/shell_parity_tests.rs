@@ -548,12 +548,26 @@ async fn working_root_forbidden_file_matrix() {
             for (path, blocked) in [("blocked/target", true), ("allowed", false)] {
                 let target = root.path().join(path);
                 std::fs::write(&target, "original").expect("test: target fixture");
-                let result = direct(
-                    tool.as_ref(),
-                    level,
-                    json!({"path":path,"content":"changed","old_string":"original","new_string":"changed"}),
-                )
-                .await;
+                let mut args = json!({"path":path,"content":"changed","old_string":"original","new_string":"changed"});
+                if tool.name() != "file_read" {
+                    let operation = crate::security::approval_operation::file_operation(
+                        tool.name(),
+                        workspace.path(),
+                        &target.canonicalize().expect("test: approval target"),
+                    )
+                    .0;
+                    let grant = serde_json::to_value(crate::security::policy::ApprovalGrant::for_resource_operation(
+                        tool.name(),
+                        &operation,
+                        "PRXOperator",
+                        None,
+                    ))
+                    .expect("test: resource approval");
+                    args.as_object_mut()
+                        .expect("test: argument object")
+                        .insert(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_owned(), grant);
+                }
+                let result = direct(tool.as_ref(), level, args).await;
                 let readonly_mutation = level == AutonomyLevel::ReadOnly && tool.name() != "file_read";
                 if blocked || readonly_mutation {
                     assert!(
@@ -598,13 +612,15 @@ async fn working_root_forbidden_shell_argument_is_refused() {
     });
     let tool = shell(root.path()).with_path_policy(policy);
     for level in [AutonomyLevel::Supervised, AutonomyLevel::ReadOnly] {
-        let denied = direct(&tool, level, json!({"command":"cat blocked/target"})).await;
-        assert_eq!(
-            denied.error.as_deref(),
-            Some("forbidden path argument: blocked/target"),
-            "test: shell checks actual cwd"
-        );
-        let allowed = direct(&tool, level, json!({"command":"printf allowed"})).await;
+        for command in ["cat blocked/target", "sh -c 'cat blocked/target'"] {
+            let denied = direct(&tool, level, json!({"command":command})).await;
+            assert_eq!(
+                denied.error.as_deref(),
+                Some("forbidden path argument: blocked/target"),
+                "test: shell and nested shell checks use actual cwd"
+            );
+        }
+        let allowed = direct(&tool, level, json!({"command":"printf allowed; test -n \"$PATH\""})).await;
         assert!(
             allowed.success,
             "test: allowed shell argument remains executable: {allowed:?}"

@@ -202,7 +202,6 @@ async fn owned_filesystem_read<T: Send + 'static>(
 
 #[cfg(test)]
 mod working_root_tests {
-    use super::*;
 
     #[tokio::test]
     async fn approval_path_checks_the_execution_root() {

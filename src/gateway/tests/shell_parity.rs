@@ -201,11 +201,24 @@ async fn generation_swap_changes_git_outcome_between_calls() {
     impl crate::tools::execution::ApprovalStrategy for Approve {
         async fn resolve(
             &self,
-            _: crate::tools::execution::ToolApprovalRequest,
+            request: crate::tools::execution::ToolApprovalRequest,
         ) -> crate::tools::execution::ToolApprovalDecision {
             crate::tools::execution::ToolApprovalDecision::Approved {
                 runtime_approval_granted: true,
-                runtime_grant: None,
+                runtime_grant: Some(
+                    serde_json::to_value(crate::security::policy::ApprovalGrant::for_command(
+                        request.descriptor.public_name,
+                        request
+                            .command
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .expect("test: shell command"),
+                        "PRXOperator",
+                        None,
+                    ))
+                    .expect("test: command approval"),
+                ),
             }
         }
     }
@@ -242,9 +255,11 @@ async fn generation_swap_changes_git_outcome_between_calls() {
             let success = outcome.result.as_ref().is_some_and(|result| result.success);
             assert_eq!(success, level == crate::security::AutonomyLevel::Full, "test: existing gateway adopts generation policy");
             if level == crate::security::AutonomyLevel::Supervised {
-                assert_eq!(outcome.result.as_ref().and_then(|result| result.error.as_deref()),
+                assert!(outcome.process.as_ref().is_some_and(|process| !process.started && process.termination == crate::tools::traits::ProcessTermination::NotStarted),
+                    "test: approved supervised git is refused before spawn");
+                assert_eq!(outcome.error.as_deref(),
                     Some(crate::runtime::shell_process::ShellProcessError::GitRefused.to_string().as_str()),
-                    "test: the approved call must reach the native git refusal");
+                    "test: the approved call must reach the native git refusal: {outcome:?}");
             }
 
         }
