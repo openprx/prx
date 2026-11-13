@@ -190,11 +190,21 @@ impl ProxyConfig {
     }
 
     /// Whether the operator selected `service_key` for proxying by name:
-    /// the scope is `services` and a `proxy.services` selector matches the
-    /// key. A proxy that merely applies to everything (scope `zeroclaw`) or
-    /// that is inherited from the environment is not an explicit selection.
+    /// the scope is `services` and `proxy.services` lists the key itself
+    /// (trimmed and case-folded like every selector). A wildcard selector
+    /// such as `tool.*`, a proxy that merely applies to everything (scope
+    /// `zeroclaw`) and one inherited from the environment are not an
+    /// explicit selection.
     pub fn explicitly_selects_service(&self, service_key: &str) -> bool {
-        self.scope == ProxyScope::Services && self.should_apply_to_service(service_key)
+        if self.scope != ProxyScope::Services || !self.has_any_proxy_url() {
+            return false;
+        }
+        let service_key = service_key.trim().to_ascii_lowercase();
+        !service_key.is_empty()
+            && self
+                .normalized_services()
+                .iter()
+                .any(|selector| *selector == service_key)
     }
 
     /// The proxy settings of a client that connects to an address PRX has
@@ -202,8 +212,9 @@ impl ProxyConfig {
     /// proxy resolves the target name, so the pin would not bind the address
     /// that is finally connected to. Such a client therefore connects
     /// directly: inherited environment proxies and a general proxy are
-    /// switched off. Only an explicit selection of `service_key`
-    /// ([`Self::explicitly_selects_service`]) routes it through the proxy;
+    /// switched off. Only an exact listing of `service_key` in
+    /// `proxy.services` ([`Self::explicitly_selects_service`]; a wildcard
+    /// does not count) routes it through the proxy;
     /// the proxy must then enforce its own egress rules.
     pub fn apply_explicit_selection_to_reqwest_builder(
         &self,

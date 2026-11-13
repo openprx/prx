@@ -77,8 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly: a general proxy (`proxy.scope = "zeroclaw"`) and inherited
   `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are no longer used by them, because
   a proxy resolves the name itself. `http_request` uses the proxy only with
-  `proxy.scope = "services"` and `tool.http_request` (or `tool.*`) in
-  `proxy.services`; the proxy must then enforce its own egress rules.
+  `proxy.scope = "services"` and the exact key `tool.http_request` in
+  `proxy.services` (the wildcard `tool.*` does not select it); the proxy must then enforce its own egress rules.
   `web_fetch` never uses a proxy.
 
 - BREAKING (operators): PRX no longer writes the process environment.
