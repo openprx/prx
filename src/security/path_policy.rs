@@ -2,6 +2,11 @@
 use super::SecurityPolicy;
 use std::path::{Component, Path, PathBuf};
 
+/// Select the native execution root without changing the security workspace.
+pub(crate) fn effective_root<'a>(workdir: Option<&'a Path>, security: &'a SecurityPolicy) -> &'a Path {
+    workdir.unwrap_or(&security.workspace_dir)
+}
+
 /// Resolve a request against its actual execution root without filesystem effects.
 /// Canonical containment checks remain the caller's responsibility after resolution.
 pub(crate) fn resolve_request_path(root: &Path, request: &str) -> std::io::Result<PathBuf> {

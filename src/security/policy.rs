@@ -34,8 +34,8 @@ struct ShellLexToken {
 
 const MAX_NESTED_SHELL_VALIDATION_DEPTH: usize = 4;
 
-fn forbidden_path_argument(policy: &SecurityPolicy, command: &str) -> Option<CommandPathViolation> {
-    forbidden_path_argument_inner(policy, &policy.workspace_dir, command, 0, true)
+fn forbidden_path_argument(policy: &SecurityPolicy, root: &Path, command: &str) -> Option<CommandPathViolation> {
+    forbidden_path_argument_inner(policy, root, command, 0, true)
 }
 
 fn forbidden_path_argument_inner(
@@ -961,6 +961,7 @@ impl<'a> SideEffectGate<'a> {
 
     pub fn authorize_command_execution(
         self,
+        execution_root: Option<&Path>,
         tool_name: &str,
         command: &str,
         grant: Option<&ApprovalGrant>,
@@ -980,7 +981,7 @@ impl<'a> SideEffectGate<'a> {
             grant.is_some_and(|grant| grant.permits_command(tool_name, command, command_risk, now));
         let mut result = self
             .policy
-            .validate_command_execution(command, runtime_approval_granted);
+            .validate_command_execution(execution_root, command, runtime_approval_granted);
         // M5 replay defense: when a v2 grant actually authorized this allowed
         // command, atomically consume one use. If the grant is already exhausted
         // (single-use replayed inside the 60s window, or a concurrent caller won
@@ -1601,12 +1602,18 @@ impl SecurityPolicy {
     // only chooses whether supervised needs a grant.
 
     /// Validate full command execution policy under the active autonomy level.
+    /// `execution_root` is the shell's selected directory; None means workspace.
     pub fn validate_command_execution(
         &self,
+        execution_root: Option<&Path>,
         command: &str,
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if let Some(violation) = forbidden_path_argument(self, command) {
+        if let Some(violation) = forbidden_path_argument(
+            self,
+            crate::security::path_policy::effective_root(execution_root, self),
+            command,
+        ) {
             return Err(match violation {
                 CommandPathViolation::Forbidden(path) => format!("forbidden path argument: {path}"),
                 CommandPathViolation::Dynamic(token) => format!("forbidden dynamic path argument: {token}"),
@@ -2323,7 +2330,7 @@ mod tests {
         };
         let gate = SideEffectGate::new(&p);
         let err = gate
-            .authorize_command_execution("shell", "deploy --token=supersecret", None)
+            .authorize_command_execution(None, "shell", "deploy --token=supersecret", None)
             .unwrap_err();
         assert!(err.contains("not allowed by security policy"));
         assert!(
@@ -2378,20 +2385,20 @@ mod tests {
         };
         let gate = SideEffectGate::new(&p);
 
-        let denied = gate.authorize_command_execution("shell", "touch file.txt", None);
+        let denied = gate.authorize_command_execution(None, "shell", "touch file.txt", None);
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
         let wrong_tool = ApprovalGrant::for_tool("cron", "test", None);
-        let denied = gate.authorize_command_execution("shell", "touch file.txt", Some(&wrong_tool));
+        let denied = gate.authorize_command_execution(None, "shell", "touch file.txt", Some(&wrong_tool));
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
         let broad_tool_grant = ApprovalGrant::for_tool("shell", "test", None);
-        let denied = gate.authorize_command_execution("shell", "touch file.txt", Some(&broad_tool_grant));
+        let denied = gate.authorize_command_execution(None, "shell", "touch file.txt", Some(&broad_tool_grant));
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
         let grant = ApprovalGrant::for_command("shell", "touch file.txt", "test", None);
         assert_eq!(
-            gate.authorize_command_execution("shell", "touch file.txt", Some(&grant))
+            gate.authorize_command_execution(None, "shell", "touch file.txt", Some(&grant))
                 .unwrap(),
             CommandRiskLevel::Medium
         );
@@ -2407,12 +2414,12 @@ mod tests {
         let grant = ApprovalGrant::for_command("shell", "touch approved.txt", "test", None);
 
         assert!(
-            gate.authorize_command_execution("shell", "touch other.txt", Some(&grant))
+            gate.authorize_command_execution(None, "shell", "touch other.txt", Some(&grant))
                 .unwrap_err()
                 .contains("runtime approval grant")
         );
         assert_eq!(
-            gate.authorize_command_execution("shell", "touch approved.txt", Some(&grant))
+            gate.authorize_command_execution(None, "shell", "touch approved.txt", Some(&grant))
                 .unwrap(),
             CommandRiskLevel::Medium
         );
@@ -2821,7 +2828,7 @@ mod tests {
             guards.push(GateDepthGuard::enter());
         }
         let denied = SideEffectGate::new(&policy)
-            .authorize_command_execution("shell", "ls", None)
+            .authorize_command_execution(None, "shell", "ls", None)
             .unwrap_err();
         assert!(denied.contains("re-entrancy depth"), "{denied}");
         drop(guards);
@@ -2831,7 +2838,7 @@ mod tests {
         assert_eq!(GateDepthGuard::current_depth(), baseline);
         assert!(
             SideEffectGate::new(&policy)
-                .authorize_command_execution("shell", "ls", None)
+                .authorize_command_execution(None, "shell", "ls", None)
                 .is_ok()
         );
         assert_eq!(
@@ -2974,7 +2981,7 @@ mod tests {
         for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
             for command in ["cat </etc/passwd", "cat</etc/passwd"] {
                 let reason = gate
-                    .authorize_command_execution(tool_name, command, None)
+                    .authorize_command_execution(None, tool_name, command, None)
                     .expect_err("forbidden redirection path should be denied");
                 assert_eq!(reason, "forbidden path argument: /etc/passwd");
             }
@@ -3004,7 +3011,7 @@ mod tests {
         let gate = SideEffectGate::new(&policy);
         for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
             let reason = gate
-                .authorize_command_execution(tool_name, "FILE=/etc/passwd; eval 'cat $FILE'", None)
+                .authorize_command_execution(None, tool_name, "FILE=/etc/passwd; eval 'cat $FILE'", None)
                 .expect_err("wrapper-hidden dynamic shell path should fail closed");
             assert_eq!(reason, "forbidden dynamic path argument: $FILE");
         }
@@ -3039,7 +3046,7 @@ mod tests {
         for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
             for command in commands {
                 let reason = gate
-                    .authorize_command_execution(tool_name, command, None)
+                    .authorize_command_execution(None, tool_name, command, None)
                     .expect_err("active substitution must fail closed");
                 assert_eq!(reason, "forbidden active shell substitution");
             }
@@ -3076,7 +3083,7 @@ mod tests {
         for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
             for command in commands {
                 let reason = gate
-                    .authorize_command_execution(tool_name, command, None)
+                    .authorize_command_execution(None, tool_name, command, None)
                     .expect_err("line continuation must not split an active substitution operator");
                 assert_eq!(reason, "forbidden active shell substitution");
             }
@@ -3267,7 +3274,8 @@ mod tests {
         };
         let gate = SideEffectGate::new(&deny_policy);
         assert!(
-            gate.authorize_command_execution("shell", "touch f.txt", None).is_err(),
+            gate.authorize_command_execution(None, "shell", "touch f.txt", None)
+                .is_err(),
             "deny decision must survive audit write failure"
         );
 
@@ -3277,7 +3285,9 @@ mod tests {
         };
         let allow_gate = SideEffectGate::new(&allow_policy);
         assert!(
-            allow_gate.authorize_command_execution("shell", "ls", None).is_ok(),
+            allow_gate
+                .authorize_command_execution(None, "shell", "ls", None)
+                .is_ok(),
             "allow decision must survive audit write failure"
         );
         assert!(!tmp.path().join("not_a_dir").is_dir());
@@ -3415,12 +3425,12 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let denied = p.validate_command_execution("touch test.txt", false);
+        let denied = p.validate_command_execution(None, "touch test.txt", false);
         assert!(denied.is_err());
         // d08 message wording: medium-risk denial without a runtime grant.
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
-        let allowed = p.validate_command_execution("touch test.txt", true);
+        let allowed = p.validate_command_execution(None, "touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
     }
 
@@ -3434,11 +3444,11 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let denied = p.validate_command_execution("rm -rf tmp/test", false);
+        let denied = p.validate_command_execution(None, "rm -rf tmp/test", false);
         assert!(denied.is_err());
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
-        let allowed = p.validate_command_execution("rm -rf tmp/test", true);
+        let allowed = p.validate_command_execution(None, "rm -rf tmp/test", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
     }
 
@@ -3451,13 +3461,13 @@ mod tests {
             };
             for command in ["cat /etc/passwd", "cat </etc/passwd", "cat</etc/passwd"] {
                 let error = policy
-                    .validate_command_execution(command, true)
+                    .validate_command_execution(None, command, true)
                     .expect_err("forbidden path must be rejected");
                 assert_eq!(error, "forbidden path argument: /etc/passwd");
             }
             assert!(
                 policy
-                    .validate_command_execution("echo 'literal </etc/passwd in documentation'", true)
+                    .validate_command_execution(None, "echo 'literal </etc/passwd in documentation'", true)
                     .is_ok(),
                 "quoted redirection-like prose must remain literal"
             );
@@ -3496,23 +3506,25 @@ mod tests {
                 ),
             ] {
                 let error = policy
-                    .validate_command_execution(command, true)
+                    .validate_command_execution(None, command, true)
                     .expect_err("dynamic shell path must fail closed");
                 assert_eq!(error, expected_error);
             }
             assert!(
-                policy.validate_command_execution("echo '$HOME/.ssh'", true).is_ok(),
+                policy
+                    .validate_command_execution(None, "echo '$HOME/.ssh'", true)
+                    .is_ok(),
                 "single-quoted dollar expressions are literal"
             );
             for command in ["echo $HOME", "printf $KEY", "sleep $SECONDS"] {
                 assert!(
-                    policy.validate_command_execution(command, true).is_ok(),
+                    policy.validate_command_execution(None, command, true).is_ok(),
                     "benign no-slash dynamic argument should remain compatible: {command}"
                 );
             }
             for command in ["sh ./script.sh", "python script.py", "python ./script.py"] {
                 assert!(
-                    policy.validate_command_execution(command, true).is_ok(),
+                    policy.validate_command_execution(None, command, true).is_ok(),
                     "literal relative interpreter script should remain compatible: {command}"
                 );
             }
@@ -3534,7 +3546,7 @@ mod tests {
             ] {
                 assert_eq!(
                     policy
-                        .validate_command_execution(command, true)
+                        .validate_command_execution(None, command, true)
                         .expect_err("active substitution must fail closed"),
                     "forbidden active shell substitution"
                 );
@@ -3545,7 +3557,7 @@ mod tests {
                 "echo 'literal <(cat /etc/passwd) prose'",
             ] {
                 assert!(
-                    policy.validate_command_execution(command, true).is_ok(),
+                    policy.validate_command_execution(None, command, true).is_ok(),
                     "single-quoted substitution-like prose must remain literal: {command}"
                 );
             }
@@ -3574,14 +3586,14 @@ mod tests {
             for command in continued.into_iter().chain(direct) {
                 assert_eq!(
                     policy
-                        .validate_command_execution(command, true)
+                        .validate_command_execution(None, command, true)
                         .expect_err("continued and direct substitutions must fail closed"),
                     "forbidden active shell substitution"
                 );
             }
             for command in single_quoted {
                 assert!(
-                    policy.validate_command_execution(command, true).is_ok(),
+                    policy.validate_command_execution(None, command, true).is_ok(),
                     "single-quoted backslash-newline prose must remain literal: {command:?}"
                 );
             }
@@ -3623,7 +3635,7 @@ mod tests {
             for command in ["cat /etc/pass\\\nwd", "cat /etc/passwd"] {
                 assert_eq!(
                     policy
-                        .validate_command_execution(command, true)
+                        .validate_command_execution(None, command, true)
                         .expect_err("continued and direct forbidden paths must both fail closed"),
                     "forbidden path argument: /etc/passwd"
                 );
@@ -3640,14 +3652,14 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("touch test.txt", false);
+        let result = p.validate_command_execution(None, "touch test.txt", false);
         assert_eq!(result.unwrap(), CommandRiskLevel::Medium);
     }
 
     #[test]
     fn validate_command_rejects_background_chain_bypass() {
         let p = default_policy();
-        let result = p.validate_command_execution("ls & python3 -c 'print(1)'", false);
+        let result = p.validate_command_execution(None, "ls & python3 -c 'print(1)'", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not allowed"));
     }
@@ -4280,11 +4292,11 @@ mod tests {
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(
-            p.validate_command_execution("echo ${IFS}cat${IFS}/etc/passwd", true)
+            p.validate_command_execution(None, "echo ${IFS}cat${IFS}/etc/passwd", true)
                 .is_err()
         );
         let benign_dynamic = ["echo $", "{SAFE:-unset}"].concat();
-        assert!(p.validate_command_execution(&benign_dynamic, true).is_ok());
+        assert!(p.validate_command_execution(None, &benign_dynamic, true).is_ok());
     }
 
     #[test]

@@ -2083,6 +2083,39 @@ mod pinned_parent_process_binding_tests {
         Ok((home, generation, key))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn canonical_config_working_root_survives_signed_worker_restore() -> anyhow::Result<()> {
+        let (home, mut generation, key) = fixture()?;
+        let root = home.path().join("root");
+        std::fs::create_dir(&root)?;
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias)?;
+        let mut stored = generation.effective.as_ref().clone();
+        stored.runtime.workdir = Some(alias);
+        std::fs::write(&stored.config_path, toml::to_string(&stored)?)?;
+        let parent = Config::load_from_path(&stored.config_path, stored.workspace_dir.clone())?;
+        generation.source_revision = ConfigSourceRevision::from_config(&parent)?;
+        generation.effective = Arc::new(parent);
+        let binding = generation.bind_process(&key)?;
+        let canonical = root.canonicalize()?;
+        assert_eq!(
+            binding.working_root.as_ref(),
+            Some(&canonical),
+            "test: signed carrier uses the canonical parent value"
+        );
+        generation.verify_pinned_process_binding(&binding, &key)?;
+        let mut worker = Config::load_from_path(&stored.config_path, stored.workspace_dir)?;
+        worker.runtime.workdir = binding.working_root.clone();
+        let restored = ConfigGeneration::restore_process(worker, &binding, &key)?;
+        assert_eq!(
+            restored.effective.runtime.workdir.as_ref(),
+            Some(&canonical),
+            "test: worker and parent authenticate the same canonical root"
+        );
+        Ok(())
+    }
+
     #[test]
     fn working_root_binding_rejects_worker_widening_and_tampering() -> anyhow::Result<()> {
         let (home, mut generation, key) = fixture()?;

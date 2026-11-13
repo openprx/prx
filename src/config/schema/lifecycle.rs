@@ -156,6 +156,12 @@ impl Config {
         config.workspace_dir = workspace_dir;
         config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
         config.memory.embedding_provider_explicit = embedding_provider_explicit;
+        config.runtime.workdir = config
+            .runtime
+            .workdir
+            .as_deref()
+            .map(super::RuntimeConfig::validate_workdir)
+            .transpose()?;
         config.validate()?;
         Ok(config)
     }

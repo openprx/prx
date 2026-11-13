@@ -652,3 +652,64 @@ pub(super) fn plain_git_policy_has_only_the_reviewed_production_sites() {
         ],
     );
 }
+
+/// Root inputs and selection belong to one helper and its reviewed consumers.
+#[test]
+pub(super) fn native_working_root_selection_sites_are_explicit() {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for path in rust_source_files() {
+        let relative = relative_path(&path);
+        if !["src/tools/", "src/security/", "src/runtime/turn_decision/"]
+            .iter()
+            .any(|prefix| relative.starts_with(*prefix))
+        {
+            continue;
+        }
+        let production = production_part(&read_source(&path));
+        let lines: Vec<_> = production.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for needle in ["effective_root", ".workdir", ".working_root", "workdir.unwrap_or"] {
+                if line.contains(needle) {
+                    *counts
+                        .entry(format!("{relative}::{}::{needle}", enclosing_function(&lines, index)))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+    let actual = counts
+        .into_iter()
+        .map(|(site, count)| format!("{site}={count}"))
+        .collect();
+    assert_inventory(
+        "native working-root selection",
+        actual,
+        &[
+            "src/tools/file_read.rs::with_workdir::.working_root=1",
+            "src/tools/file_read.rs::execute_operation::.working_root=3",
+            "src/tools/file_write.rs::with_workdir::.working_root=1",
+            "src/tools/file_write.rs::execute_operation::.working_root=3",
+            "src/tools/file_edit.rs::with_workdir::.working_root=1",
+            "src/tools/file_edit.rs::execute_operation::.working_root=2",
+            "src/security/path_policy.rs::effective_root::effective_root=1",
+            "src/security/path_policy.rs::effective_root::workdir.unwrap_or=1",
+            "src/security/policy.rs::validate_command_execution::effective_root=1",
+            "src/tools/file_read.rs::working_root::effective_root=1",
+            "src/tools/file_read.rs::working_root::.working_root=1",
+            "src/tools/file_write.rs::working_root::effective_root=1",
+            "src/tools/file_write.rs::working_root::.working_root=1",
+            "src/tools/file_edit.rs::working_root::effective_root=1",
+            "src/tools/file_edit.rs::working_root::.working_root=1",
+            "src/tools/mod.rs::default_tools_with_runtime::effective_root=1",
+            "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::effective_root=1",
+            "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::.workdir=1",
+            "src/runtime/turn_decision/owner_filesystem.rs::check_shell_path_arguments::effective_root=1",
+            "src/runtime/turn_decision/owner_filesystem.rs::check_shell_path_arguments::.workdir=1",
+            "src/runtime/turn_decision/owner_filesystem.rs::scoped_file_operation::effective_root=2",
+            "src/runtime/turn_decision/owner_filesystem.rs::scoped_file_operation::.workdir=2",
+        ],
+    );
+}

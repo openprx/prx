@@ -371,7 +371,7 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    let workspace_dir = security.workspace_dir.clone();
+    let workspace_dir = crate::security::path_policy::effective_root(None, &security).to_path_buf();
     vec![
         Box::new(capability::search_tool::CapabilitySearchTool),
         Box::new(ShellTool::new(runtime, workspace_dir).with_path_policy(security.clone())),
@@ -515,26 +515,22 @@ pub fn all_tools_with_runtime_ext_and_extensions(
     extensions: Vec<Arc<dyn Tool>>,
     parent_hooks: Option<Arc<crate::hooks::HookManager>>,
 ) -> ToolsRegistryResult {
+    let working_root = crate::security::path_policy::effective_root(config.runtime.workdir.as_deref(), security);
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(
-            ShellTool::new(
-                runtime.clone(),
-                config.runtime.workdir.as_deref().unwrap_or(workspace_dir).to_path_buf(),
-            )
-            .with_env_allowlist(config.runtime.shell_env_allowlist.clone())
-            .with_path_policy(security.clone()),
+            ShellTool::new(runtime.clone(), working_root.to_path_buf())
+                .with_env_allowlist(config.runtime.shell_env_allowlist.clone())
+                .with_path_policy(security.clone()),
         ),
         Arc::new(
-            FileReadTool::new(security.clone(), config.memory.acl_enabled).with_workdir(config.runtime.workdir.clone()),
+            FileReadTool::new(security.clone(), config.memory.acl_enabled)
+                .with_workdir(Some(working_root.to_path_buf())),
         ),
-        Arc::new(FileWriteTool::new(security.clone()).with_workdir(config.runtime.workdir.clone())),
-        Arc::new(FileEditTool::new(security.clone()).with_workdir(config.runtime.workdir.clone())),
+        Arc::new(FileWriteTool::new(security.clone()).with_workdir(Some(working_root.to_path_buf()))),
+        Arc::new(FileEditTool::new(security.clone()).with_workdir(Some(working_root.to_path_buf()))),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
-            security.clone(),
-            config.runtime.workdir.as_deref().unwrap_or(workspace_dir).to_path_buf(),
-        )),
+        Arc::new(GitOperationsTool::new(security.clone(), working_root.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(SkillsListTool::new(workspace_dir.to_path_buf(), root_config.clone())),
         Arc::new(SkillReadTool::new(workspace_dir.to_path_buf(), root_config.clone())),

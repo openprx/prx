@@ -2596,7 +2596,7 @@ mod tests {
         let still_usable = ApprovalGrant::from_runtime_args("cron", &args).unwrap();
         assert!(
             crate::security::SideEffectGate::new(security.as_ref())
-                .authorize_command_execution("cron", &command, Some(&still_usable))
+                .authorize_command_execution(None, "cron", &command, Some(&still_usable))
                 .is_ok(),
             "claim conflict must not consume the single-use approval grant"
         );

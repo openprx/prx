@@ -86,6 +86,20 @@ impl TurnDecisionService {
             .await
     }
 
+    /// Reject impossible shell paths before recording or reviewing approval.
+    pub(super) fn check_shell_path_arguments(&self, command: &str) -> anyhow::Result<()> {
+        if self.security.autonomy != crate::security::AutonomyLevel::Full {
+            let root = crate::security::path_policy::effective_root(
+                self.generation.effective.runtime.workdir.as_deref(),
+                &self.security,
+            );
+            self.security
+                .validate_command_paths_at(root, command)
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
     /// The collection, runtime recorder, review and resume all resolve the same
     /// logical path through this function. Resolution creates no directories.
     pub(super) async fn scoped_file_operation(
@@ -95,20 +109,16 @@ impl TurnDecisionService {
         path: &str,
     ) -> anyhow::Result<(String, RiskLevel)> {
         anyhow::ensure!(matches!(tool, "file_write" | "file_edit"), "unsupported file mutation");
+        let root = crate::security::path_policy::effective_root(
+            if filesystem.is_some() {
+                None
+            } else {
+                self.generation.effective.runtime.workdir.as_deref()
+            },
+            &self.security,
+        );
         anyhow::ensure!(
-            self.security.is_path_allowed_at(
-                if filesystem.is_some() {
-                    &self.security.workspace_dir
-                } else {
-                    self.generation
-                        .effective
-                        .runtime
-                        .workdir
-                        .as_deref()
-                        .unwrap_or(&self.security.workspace_dir)
-                },
-                path
-            ),
+            self.security.is_path_allowed_at(root, path),
             "file approval path is outside allowed workspace"
         );
         let (operation, risk) = if let Some(filesystem) = filesystem {
@@ -135,12 +145,10 @@ impl TurnDecisionService {
             .await?
         } else {
             let target = crate::security::approval_operation::resolve_file_target(
-                self.generation
-                    .effective
-                    .runtime
-                    .workdir
-                    .as_deref()
-                    .unwrap_or(&self.security.workspace_dir),
+                crate::security::path_policy::effective_root(
+                    self.generation.effective.runtime.workdir.as_deref(),
+                    &self.security,
+                ),
                 path,
                 tool == "file_write",
             )
@@ -202,6 +210,72 @@ async fn owned_filesystem_read<T: Send + 'static>(
 
 #[cfg(test)]
 mod working_root_tests {
+
+    #[tokio::test]
+    async fn shell_approval_paths_use_the_execution_root() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let workspace = tempfile::tempdir().expect("test: workspace");
+            let root = tempfile::tempdir().expect("test: execution root");
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.path().into();
+            config.runtime.workdir = Some(root.path().into());
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+            config.autonomy.workspace_only = false;
+            config.autonomy.forbidden_paths = vec![
+                workspace.path().join("state").to_string_lossy().into_owned(),
+                root.path().join("blocked").to_string_lossy().into_owned(),
+            ];
+            config.causal_tree.enabled = false;
+            let generation = crate::config::new_shared(config.clone()).pin();
+            let catalog = crate::providers::catalog::CatalogView::from_config(&config);
+            let service = super::super::tests::disabled_agent_service(&generation, &catalog).await;
+            assert!(
+                service.check_shell_path_arguments("cat state/x").is_ok(),
+                "test: workspace deny entry must not reject a different execution target"
+            );
+            assert_eq!(
+                service
+                    .check_shell_path_arguments("cat blocked/x")
+                    .expect_err("test: forbidden shell approval")
+                    .to_string(),
+                "forbidden path argument: blocked/x",
+                "test: forbidden execution target is rejected before approval"
+            );
+            assert!(
+                crate::security::SideEffectGate::new(&service.security)
+                    .authorize_command_execution(Some(root.path()), "shell", "cat state/x", None)
+                    .is_ok(),
+                "test: command orchestration uses the supplied root"
+            );
+            assert!(
+                service
+                    .security
+                    .validate_command_execution(None, "cat state/x", false)
+                    .is_err(),
+                "test: workspace-only callers retain their original target"
+            );
+            std::fs::create_dir(root.path().join("state")).expect("test: allowed directory");
+            std::fs::write(root.path().join("state/x"), "allowed").expect("test: allowed file");
+            use crate::tools::Tool as _;
+            let tool = crate::tools::shell::ShellTool::new(
+                std::sync::Arc::new(crate::runtime::NativeRuntime::new()),
+                root.path().into(),
+            )
+            .with_path_policy(service.security.clone());
+            let result = crate::tools::effective_autonomy::scope(
+                crate::security::AutonomyLevel::Supervised,
+                tool.execute(serde_json::json!({"command":"cat state/x"})),
+            )
+            .await
+            .expect("test: shell result");
+            assert!(
+                result.success && result.output == "allowed",
+                "test: allowed proposal executes the same target: {result:?}"
+            );
+        })
+        .await
+        .expect("test: shell approval deadline");
+    }
 
     #[tokio::test]
     async fn approval_path_checks_the_execution_root() {
