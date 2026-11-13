@@ -399,6 +399,8 @@ mod tests {
     async fn lifecycle_routes_enforce_service_scope_policy_and_audit_denials() {
         let owner = ApiPrincipal::of_token(TOKEN).owner_id;
         let served = serve_config(|config| {
+            // Scope rules are permission limits: they apply below Full (R51).
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
             enable(owner.clone())(config);
             config.autonomy.scopes.rules.push(crate::config::ScopeRule {
                 user: Some(owner.clone()),

@@ -215,10 +215,11 @@ async fn policy_deny_refused_without_backend_call() {
         ("shell", serde_json::json!({"value":1,"command":"touch project.txt"})),
     ] {
         let fixture = fixture();
-        let mut service = autonomy_service(&fixture, name, AutonomyLevel::Full);
+        // A scope Deny is a permission limit: it applies below Full (R51).
+        let mut service = autonomy_service(&fixture, name, AutonomyLevel::Supervised);
         // Path/command enforcement is not provable at the service layer; this row covers scope Deny.
         service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
+            autonomy: AutonomyLevel::Supervised,
             scope_rules: vec![crate::config::ScopeRule {
                 tools_deny: vec![name.into()],
                 ..crate::config::ScopeRule::default()

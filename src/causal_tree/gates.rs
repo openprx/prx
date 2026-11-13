@@ -517,6 +517,8 @@ mod tests {
         trusted.exclusions.clear();
         state.trusted = TrustedState::from_runtime(trusted);
         let mut policy = SecurityPolicy::default();
+        // The identity ACL is a permission limit: it applies below Full (R51).
+        policy.autonomy = crate::security::AutonomyLevel::Supervised;
         policy.scope_default_allow = false;
         policy.scope_rules.push(crate::config::ScopeRule {
             user: Some("agent".into()),
@@ -1509,6 +1511,8 @@ mod tests {
         trusted.side_effect_mode = SideEffectMode::ApprovalRequired;
         state.trusted = TrustedState::from_runtime(trusted);
         let mut policy = SecurityPolicy::default();
+        // The identity ACL is a permission limit: it applies below Full (R51).
+        policy.autonomy = crate::security::AutonomyLevel::Supervised;
         policy.scope_default_allow = true;
         policy.scope_rules.push(crate::config::ScopeRule {
             user: None,

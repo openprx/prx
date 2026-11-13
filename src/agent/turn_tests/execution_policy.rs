@@ -45,6 +45,8 @@ async fn configured_cli_policy_controls_tool_service_and_preserves_actor_scope()
     let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(PolicyProbeTool(Arc::clone(&executions)))]);
     let mut policy = SecurityPolicy::default();
     policy.workspace_dir = workspace.path().to_path_buf();
+    // The identity ACL is a permission limit: it applies below Full (R51).
+    policy.autonomy = crate::security::AutonomyLevel::Supervised;
     policy.scope_default_allow = false;
     policy.scope_rules.push(crate::config::ScopeRule {
         user: Some("agent".into()),

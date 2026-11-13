@@ -2925,17 +2925,24 @@ mod tests {
     /// creator's channel, sender and chat type; an operator-created job keeps
     /// the operator's policy.
     ///
-    /// MUTATION GUARD: return `SecurityPolicy::default()` with the scheduled
-    /// context again and the webhook row goes red.
+    /// R51: Full autonomy has no permission limits, so at Full the creator's
+    /// scope rule does not stop the job; below Full it does (the policy-level
+    /// deny is pinned by `a_scheduled_scope_carries_the_configured_policy_for_its_creator`).
     #[tokio::test]
     async fn a_scheduled_run_is_held_to_its_creators_scope_rules() {
+        use crate::security::AutonomyLevel;
         const MARKER: &str = "cron-origin-shell-ran";
-        for (surface, may_run) in [(Surface::Webhook, false), (Surface::AgentCli, true)] {
+        for (surface, level, may_run) in [
+            (Surface::Webhook, AutonomyLevel::Full, true),
+            (Surface::AgentCli, AutonomyLevel::Full, true),
+            (Surface::Webhook, AutonomyLevel::Supervised, false),
+        ] {
             let tmp = TempDir::new().unwrap();
             let model =
                 ScriptedStoreModel::start_calling("shell", &serde_json::json!({"command": format!("touch {MARKER}")}))
                     .await;
             let mut config = model.config(tmp.path());
+            config.autonomy.level = level;
             config.cost.prices.insert(
                 format!(
                     "{}/cron-origin-model",
@@ -2969,7 +2976,7 @@ mod tests {
             assert_eq!(
                 config.workspace_dir.join(MARKER).exists(),
                 may_run,
-                "{surface:?}: a creator denied `shell` must not get it in its job; the operator keeps it"
+                "{surface:?} at {level:?}: a creator denied `shell` gets it only at Full (R51)"
             );
         }
     }

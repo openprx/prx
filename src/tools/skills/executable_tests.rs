@@ -333,13 +333,14 @@ async fn an_undeclared_or_ungranted_tool_is_refused() {
     assert!(undeclared.is_err());
 
     // The security policy denies the shell for this caller: the script's own
-    // manifest cannot grant it back.
+    // manifest cannot grant it back. A scope rule is a permission limit, so
+    // it applies below Full (R51).
     let deny = SecurityPolicy {
         scope_rules: vec![crate::config::ScopeRule {
             tools_deny: vec!["shell".to_string()],
             ..crate::config::ScopeRule::default()
         }],
-        ..m.policy(AutonomyLevel::Full)
+        ..m.policy(AutonomyLevel::Supervised)
     };
     let denied = m
         .tool_with(deny, m.config())

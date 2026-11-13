@@ -636,6 +636,8 @@ mod tests {
         use crate::config::ScopeRule;
         let owner = super::ApiPrincipal::of_token(super::super::test_support::TOKEN).owner_id;
         let served = serve_config(|config| {
+            // Scope rules are permission limits: they apply below Full (R51).
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
             config.autonomy.scopes.rules.push(ScopeRule {
                 user: Some(owner.clone()),
                 channel: Some("console".into()),

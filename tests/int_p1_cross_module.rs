@@ -682,10 +682,21 @@ async fn int_cs_03_decide_layers_scope_and_autonomy() {
         scope_default_allow: true,
         ..SecurityPolicy::default()
     };
+    // R51: Full autonomy has no permission limits, so the scope deny rule
+    // does not apply at Full; below Full it forces Deny.
     assert_eq!(
         scoped.decide("shell", "alice", "telegram", "direct"),
+        ToolDecision::Allow,
+        "test: a scope deny rule is not a limit under Full autonomy"
+    );
+    let supervised_scoped = SecurityPolicy {
+        autonomy: AutonomyLevel::Supervised,
+        ..scoped.clone()
+    };
+    assert_eq!(
+        supervised_scoped.decide("shell", "alice", "telegram", "direct"),
         ToolDecision::Deny,
-        "test: scope deny rule must force Deny even under Full autonomy"
+        "test: a scope deny rule forces Deny below Full"
     );
     // Same policy, different channel: no rule matches → autonomy (Full) governs.
     assert_eq!(

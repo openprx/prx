@@ -600,7 +600,12 @@ async fn full_autonomy_has_no_permission_limits() {
         ));
         let outcome = service.execute(call("skills_manage", arguments), context, None).await;
         drop((workspace, fabric, chat_binding));
-        assert_eq!(grant.calls.load(Ordering::SeqCst), expected_calls, "{autonomy:?}");
+        assert_eq!(
+            grant.calls.load(Ordering::SeqCst),
+            expected_calls,
+            "{autonomy:?}: {}",
+            outcome.model_content
+        );
         if autonomy == AutonomyLevel::Full {
             assert_eq!(outcome.decision, Some(ToolExecutionDecision::Allow));
         } else {

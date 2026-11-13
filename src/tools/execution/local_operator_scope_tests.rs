@@ -506,9 +506,11 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
         process_worker_compatible: true,
         availability: CapabilityAvailability::ready("test"),
     };
+    // At the configured Full level the creator's scope rule is not a limit
+    // (R51: Full has no permission limits).
     assert_eq!(
         policy.decide(&descriptor("shell"), &scope.context),
-        ToolExecutionDecision::Deny
+        ToolExecutionDecision::Allow
     );
     assert_eq!(
         policy.decide(&descriptor("file_write"), &scope.context),
@@ -528,6 +530,11 @@ fn a_scheduled_scope_carries_the_configured_policy_for_its_creator() {
             .decide(&descriptor("file_write"), &supervised.context),
         ToolExecutionDecision::Deny,
         "an unattended run refuses what would ask"
+    );
+    assert_eq!(
+        SecurityEffectPolicy::new(Arc::clone(&supervised.policy)).decide(&descriptor("shell"), &supervised.context),
+        ToolExecutionDecision::Deny,
+        "below Full the creator's configured scope rule denies"
     );
     assert_eq!(supervised.policy.audit_config.log_path, "cron-g-audit.log");
     assert_eq!(supervised.policy.audit_config.max_size_mb, 7);

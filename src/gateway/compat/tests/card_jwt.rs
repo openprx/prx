@@ -169,6 +169,8 @@ async fn mcp_tool_call_accepts_valid_arguments_and_authors_the_trusted_scope() {
 async fn mcp_tool_call_denied_by_policy_returns_the_schema_rejection_structure() {
     let workspace = TempDir::new().expect("test: temp workspace");
     let mut config = mcp_test_config(workspace.path());
+    // Scope rules are permission limits: they apply below Full (R51).
+    config.autonomy.level = crate::security::AutonomyLevel::Supervised;
     config.autonomy.scopes.rules = vec![crate::config::ScopeRule {
         channel: Some("mcp".to_string()),
         tools_deny: vec![MCP_FIXTURE_ACT_TOOL.to_string()],
