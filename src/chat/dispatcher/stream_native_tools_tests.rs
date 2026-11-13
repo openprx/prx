@@ -562,10 +562,9 @@ mod tests {
                 .decision_routing()
                 .expect("test: admitted routing")
                 .context
-                .is_run()
-                .expect("test: live execution"),
+                .is_run(),
             "stream fixture closed before provider execution: {:?}; {audit:?}",
-            routing.context.directive()
+            routing.context.execution_refs()
         );
         let principal = admitted.context.envelope.memory_principal();
         let ledger = admitted.fabric.memory();

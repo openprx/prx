@@ -134,6 +134,7 @@ impl TaskTerminalJournal {
         self.authority.validate(&self.fabric, &proposal)?;
         anyhow::ensure!(
             proposal.decision.is_none()
+                && proposal.binding.is_none()
                 && Some(proposal.terminal_id.as_str()) == self.scope.run_id.as_deref()
                 && proposal.scope.source == self.scope.source
                 && proposal.scope.owner_id == self.scope.owner_id
@@ -165,6 +166,7 @@ impl TaskTerminalJournal {
                 let (status, summary) = interruption.context("task ended without a terminal proposal")?;
                 state.pending = Some(TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: self.scope.run_id.clone().context("task terminal run id missing")?,
                     scope: self.scope.clone(),
                     status,

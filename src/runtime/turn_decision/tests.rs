@@ -5,7 +5,6 @@ mod agent_decision;
 mod catalog_drift;
 mod discovery_surface;
 mod enabled_service;
-pub(crate) mod exact_call_approval;
 mod execution;
 mod recorded_chain;
 mod recursive_budget;
@@ -41,13 +40,43 @@ use crate::tools::traits::{ToolResult, ToolSpec};
 use async_trait::async_trait;
 use catalog_drift::DriftingCatalogTool;
 
-struct SilentEvents;
+/// Fixtures and field access for the historical approval tests that live in
+/// `security::approval_ledger::tests` (R54).
+pub(crate) mod historical_support {
+    use std::sync::Arc;
+
+    use super::super::TurnDecisionService;
+    use crate::decision_engine::prediction::factory::DecisionBackendFactory;
+    use crate::security::runtime_key::DecisionKey;
+
+    pub(crate) use super::{CountingTransports, SilentEvents, sources};
+
+    pub(crate) fn install_factory(service: &mut TurnDecisionService, factory: DecisionBackendFactory) {
+        service.factory = factory;
+    }
+
+    pub(crate) fn state_key(service: &TurnDecisionService) -> Arc<DecisionKey> {
+        Arc::clone(&service.state_key)
+    }
+
+    pub(crate) fn recordable_and_durable(service: &TurnDecisionService) -> bool {
+        service.recordable && service.durable_key
+    }
+
+    pub(crate) fn force_recordable_durable(service: &mut TurnDecisionService, key: Arc<DecisionKey>) {
+        service.recordable = true;
+        service.durable_key = true;
+        service.state_key = key;
+    }
+}
+
+pub(crate) struct SilentEvents;
 
 impl CausalEventSink for SilentEvents {
     fn emit(&self, _event: CausalEvent) {}
 }
 
-struct CountingTransports(AtomicUsize);
+pub(crate) struct CountingTransports(pub(crate) AtomicUsize);
 
 impl DecisionTransports for CountingTransports {
     fn build(
@@ -59,7 +88,7 @@ impl DecisionTransports for CountingTransports {
     }
 }
 
-fn sources(generation: &ConfigGeneration, config: &crate::config::Config) -> CatalogSources {
+pub(crate) fn sources(generation: &ConfigGeneration, config: &crate::config::Config) -> CatalogSources {
     let hooks = crate::hooks::HookDiagnostics {
         configured: false,
         valid: true,
@@ -156,9 +185,9 @@ async fn agent_service_with_memory(
     ));
     let events: Arc<dyn CausalEventSink> = Arc::new(SilentEvents);
     let transports = CountingTransports(AtomicUsize::new(0));
-    build_turn_decision_service(
+    build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(generation),
             registry,

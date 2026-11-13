@@ -14,6 +14,13 @@ use anyhow::Context as _;
 use std::collections::BTreeMap;
 use std::sync::Weak;
 
+pub(crate) mod discovery_admission;
+pub(crate) use discovery_admission::{
+    DiscoveredToolProposal, DiscoveryState, MAX_DISCOVERED_TOOLS_PER_TURN, admit_discovered_tool,
+    admit_offered_discoveries, appended_execution_specs, capability_search_port, capability_search_spec,
+    discovery_entries, prepare_discovered_tool,
+};
+
 pub(crate) const MAX_SEARCH_HITS: usize = 5;
 pub(crate) const MAX_QUERY_BYTES: usize = 1024;
 

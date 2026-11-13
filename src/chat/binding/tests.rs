@@ -9,7 +9,7 @@ use crate::memory::{MemoryFabric, SqliteMemory};
 
 #[test]
 fn resume_admission_infrastructure_failure_offers_retry_without_error_details() {
-    use crate::runtime::turn_decision::AgentDecisionError;
+    use crate::runtime::turn_context::AgentDecisionError;
     for error in [
         AgentDecisionError::PendingApproval(std::io::Error::other("prx_private_path").into()),
         AgentDecisionError::PendingApproval(rusqlite::Error::InvalidQuery.into()),
@@ -42,7 +42,7 @@ fn failed_inbound_persistence_names_the_cause_and_hides_private_text() {
 
 #[test]
 fn resume_admission_authority_failures_share_an_opaque_refusal() {
-    use crate::runtime::turn_decision::AgentDecisionError;
+    use crate::runtime::turn_context::AgentDecisionError;
     for reason in ["owner mismatch", "scope mismatch", "already consumed"] {
         let error = anyhow::Error::new(AgentDecisionError::PendingApproval(anyhow::anyhow!(reason)))
             .context("prx_private_decision");
@@ -685,7 +685,7 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
             .unwrap();
         let trusted = actual.trusted.parts();
         assert!(
-            crate::runtime::turn_decision::validate_agent_retrieval_provenance(
+            crate::runtime::turn_context::validate_agent_retrieval_provenance(
                 binding.as_ref(),
                 trusted,
                 &trusted.resolved_model,
@@ -696,7 +696,7 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
             .is_ok()
         );
         assert!(
-            crate::runtime::turn_decision::validate_agent_retrieval_provenance(
+            crate::runtime::turn_context::validate_agent_retrieval_provenance(
                 changed_mode.as_ref(),
                 trusted,
                 &trusted.resolved_model,

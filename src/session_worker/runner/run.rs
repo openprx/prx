@@ -205,6 +205,10 @@ enum WorkerSegmentSource {
 struct WorkerChildSegments {
     source: WorkerSegmentSource,
     service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    /// The worker publication's runtime holder (R26): every segment turn must
+    /// open its runtime context from this holder. The service stays until
+    /// Part 2.
+    runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
     completion: ChildCompletionPort,
     fabric: MemoryFabric,
     owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
@@ -244,11 +248,15 @@ impl WorkerChildSegments {
             }
             WorkerSegmentSource::Operator { sequence, authority } => {
                 authority.verify()?;
-                let source = sequence.lock().await.record(input, &self.service).await?;
+                let source = sequence
+                    .lock()
+                    .await
+                    .record(input, self.service.execution_approval_ledger())
+                    .await?;
                 (source, Arc::clone(&authority.snapshots().generation.effective))
             }
         };
-        Ok(boxed_worker_segments(|| {
+        let turn = boxed_worker_segments(|| {
             crate::runtime::child_turn::ChildSegmentTurn::admit(
                 Arc::clone(&self.service),
                 source,
@@ -259,8 +267,12 @@ impl WorkerChildSegments {
                 Some(Arc::clone(&self.completion.usage)),
             )
         })
-        .await?
-        .with_child_cleanup(acknowledgement))
+        .await?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&turn.runtime().holder, &self.runtime),
+            "worker segment turn opened outside the worker publication"
+        );
+        Ok(turn.with_child_cleanup(acknowledgement))
     }
 }
 
@@ -975,7 +987,7 @@ async fn run_owned_manifest(
                 authority: Arc::clone(authority),
                 registry: Arc::clone(&tools_registry),
                 security: Arc::clone(&security),
-                runtime: crate::runtime::turn_decision::TurnLoopRuntime {
+                runtime: crate::runtime::turn_publication::PublicationLoopRuntime {
                     hooks: Arc::clone(&hooks),
                     observer: Arc::new(NoopObserver),
                 },
@@ -1004,7 +1016,7 @@ async fn run_owned_manifest(
                 authority: Arc::clone(authority),
                 registry: Arc::clone(&tools_registry),
                 security: Arc::clone(&security),
-                runtime: crate::runtime::turn_decision::TurnLoopRuntime {
+                runtime: crate::runtime::turn_publication::PublicationLoopRuntime {
                     hooks: Arc::clone(&hooks),
                     observer: Arc::new(NoopObserver),
                 },
@@ -1057,6 +1069,12 @@ async fn run_owned_manifest(
                 provider: Arc::clone(&provider),
             },
             service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
+            runtime: Arc::clone(
+                child_service
+                    .as_ref()
+                    .context("worker child service missing")?
+                    .runtime_holder(),
+            ),
             fabric: decision_fabric
                 .as_ref()
                 .context("worker decision storage missing")?
@@ -1077,6 +1095,12 @@ async fn run_owned_manifest(
                 authority: Arc::clone(authority),
             },
             service: Arc::clone(child_service.as_ref().context("ordinary worker service missing")?),
+            runtime: Arc::clone(
+                child_service
+                    .as_ref()
+                    .context("ordinary worker service missing")?
+                    .runtime_holder(),
+            ),
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("ordinary worker cleanup owner missing")?,
             completion: ChildCompletionPort {
@@ -1107,6 +1131,12 @@ async fn run_owned_manifest(
                 authority: Arc::clone(authority),
             },
             service: Arc::clone(child_service.as_ref().context("operator worker service missing")?),
+            runtime: Arc::clone(
+                child_service
+                    .as_ref()
+                    .context("operator worker service missing")?
+                    .runtime_holder(),
+            ),
             fabric: authority.source_fabric().clone(),
             owner: crate::runtime::turn_cleanup::current_tracker().context("operator worker cleanup owner missing")?,
             completion: ChildCompletionPort {
@@ -1450,6 +1480,7 @@ async fn run_owned_manifest(
             terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
                 decision: None,
+                binding: None,
                 terminal_id: manifest.run_id.clone(),
                 scope: logical_task_scope.clone(),
                 status: terminal_status,

@@ -545,7 +545,7 @@ pub struct ToolExecutionContext {
     pub(crate) approval_ledger: Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger>,
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
-    pub(crate) ordinary_child_publication: Option<crate::runtime::turn_decision::OrdinaryChildPublication>,
+    pub(crate) ordinary_child_publication: Option<crate::runtime::child_source::publication::OrdinaryChildPublication>,
     pub(crate) child_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
     /// Incoming child authority of this turn, independent of `child_grant`.
     pub(crate) child_scope: Option<Arc<super::capability::child::VerifiedChildScope>>,

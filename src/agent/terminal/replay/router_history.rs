@@ -2,8 +2,8 @@
 //! a selected-read grant, model binding, or a live execution context.
 use super::{DecisionKey, MessageEvent, TurnTerminalStatus};
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, ProviderExecutionOutcome};
+use crate::router::turn_routing::router_provider_binding;
 use crate::runtime::decision_journal::store::DecisionReplayRecord;
-use crate::runtime::turn_decision::router_provider_binding;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

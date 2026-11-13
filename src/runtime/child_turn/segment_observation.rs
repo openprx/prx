@@ -1,8 +1,8 @@
 //! Immediate, confirmed predecessor observations for a serial child task.
 //! This is live runtime evidence, not a history read or new execution authority.
-use super::AgentDecisionError;
 use crate::decision_engine::state::{ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus};
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::runtime::turn_context::AgentDecisionError;
 use crate::runtime::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use anyhow::{Context, ensure};
 use std::sync::Arc;
@@ -270,7 +270,7 @@ fn project_trace(
     Ok(steps)
 }
 
-pub(super) fn initial_observations(
+pub(in crate::runtime) fn initial_observations(
     observation: Option<&SegmentObservation>,
     deadline: Instant,
     cancellation: &CancellationToken,

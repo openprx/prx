@@ -33,7 +33,7 @@ pub(crate) fn with_first_other<'a, F: Future + 'a>(work: F) -> std::pin::Pin<Box
     })
 }
 
-pub(super) fn wrap_factory(
+pub(in crate::runtime) fn wrap_factory(
     original: DecisionBackendFactory,
     config: &crate::config::Config,
     key: Arc<DecisionKey>,

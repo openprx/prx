@@ -7,7 +7,7 @@
 use crate::config::agent_name::AgentName;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::gateway::TurnRuntimeGeneration;
-use crate::gateway::decision_source::GatewayProviderBinding;
+use crate::gateway::turn_source::GatewayProviderBinding;
 use crate::providers::Provider;
 use crate::runtime::turn_publication::TargetedSurface;
 use crate::security::AutonomyLevel;

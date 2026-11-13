@@ -1,7 +1,53 @@
 //! Publish one ingress-owned capability generation through the shared runtime.
+//!
+//! R26 (ruling R26-HOLDER): the publication builders live here. They build
+//! the publication-scoped `TurnRuntimeHolder` and the `DecisionAdvisory`;
+//! every turn then opens its own `TurnRuntimeContext` from that holder. The
+//! assembled service remains until Part 2 deletes it.
+mod approval;
+mod build_error;
+mod builder;
+mod operator_process;
+mod ordinary_process;
+
+pub(crate) use build_error::PublicationBuildError;
+pub(crate) use builder::{PublicationInputs, PublicationLoopRuntime, build_publication};
+
 use crate::tools;
 use anyhow::Result;
 use std::sync::Arc;
+
+/// Open the resume variant of a turn: admit the historical approval resume
+/// against this publication, then open the prediction-free turn carrying it
+/// in its `TurnRuntimeContext` (R26, R54).
+pub(crate) async fn open_resume_turn(
+    service: &super::turn_decision::TurnDecisionService,
+    proof: &dyn super::turn_source::TurnSourceProof,
+    kind: super::turn_context::AgentTurnKind,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Arc<super::turn_decision::TurnDecisionContext>, super::turn_context::AgentDecisionError> {
+    use super::turn_context::AgentDecisionError;
+    let admitted = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
+        admitted = crate::security::approval_ledger::historical::admit_decision_resume(service, proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
+    };
+    let _resume_allowance = service
+        .generation
+        .effective
+        .sessions_spawn
+        .allow_recursive_delegation
+        .then(|| {
+            service
+                .runtime
+                .recursive_allowances()
+                .inherit_resume(proof, admitted.original_run())
+        });
+    let opened = service
+        .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
+        .await?;
+    service.record_opened_context(proof, opened, cancellation).await
+}
 
 /// The bounded native schemas kept on ordinary model turns. These are the
 /// common file and shell operations from the standard progressive-disclosure
@@ -155,9 +201,9 @@ impl TurnDecisionPublication {
             crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(&observer)),
         );
         let provider_catalog = crate::providers::selection::catalog_for(&config);
-        let service = super::turn_decision::build_turn_decision_service(
+        let service = build_publication(
             surface,
-            super::turn_decision::TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&config_generation),
                 registry: Arc::clone(registry),
@@ -172,7 +218,7 @@ impl TurnDecisionPublication {
             },
         )
         .await?;
-        let service = service.with_loop_runtime(super::turn_decision::TurnLoopRuntime {
+        let service = service.with_loop_runtime(PublicationLoopRuntime {
             hooks: Arc::clone(hooks),
             observer: Arc::clone(observer),
         })?;
@@ -235,9 +281,9 @@ impl ChildDecisionPublication {
         let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(
             self.observer,
         ));
-        let service = super::turn_decision::build_turn_decision_service(
+        let service = build_publication(
             crate::tools::capability::turn_state::TurnSurfaceKind::Worker,
-            super::turn_decision::TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: Some(Arc::clone(&self.grant)),
                 generation: Arc::clone(&generation),
                 registry: self.registry,
@@ -274,7 +320,7 @@ pub(crate) struct OrdinaryProcessDecisionPublication {
     pub(crate) authority: Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
-    pub(crate) runtime: super::turn_decision::TurnLoopRuntime,
+    pub(crate) runtime: PublicationLoopRuntime,
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
 }
 
@@ -298,9 +344,9 @@ impl OrdinaryProcessDecisionPublication {
         let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(
             &self.runtime.observer,
         )));
-        let service = super::turn_decision::TurnDecisionService::ordinary_process_service(
+        let service = ordinary_process::ordinary_process_publication(
             Arc::clone(&self.authority),
-            super::turn_decision::TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry: self.registry,
@@ -334,7 +380,7 @@ pub(crate) struct OperatorProcessDecisionPublication {
     pub(crate) authority: Arc<super::child_source::operator_process::OperatorProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
-    pub(crate) runtime: super::turn_decision::TurnLoopRuntime,
+    pub(crate) runtime: PublicationLoopRuntime,
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
 }
 
@@ -358,9 +404,9 @@ impl OperatorProcessDecisionPublication {
         let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::clone(
             &self.runtime.observer,
         )));
-        let service = super::turn_decision::TurnDecisionService::operator_process_service(
+        let service = operator_process::operator_process_publication(
             Arc::clone(&self.authority),
-            super::turn_decision::TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry: self.registry,

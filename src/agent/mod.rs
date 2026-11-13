@@ -21,6 +21,7 @@ pub mod memory_loader;
 pub mod prompt;
 pub(crate) mod prompt_cache_metrics;
 pub(crate) mod provider_round;
+pub(crate) mod refusal;
 pub(crate) mod response_guard;
 pub(crate) mod runtime_prompt;
 pub mod sanitize;

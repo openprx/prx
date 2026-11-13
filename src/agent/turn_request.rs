@@ -191,6 +191,10 @@ impl ToolLoopMemory {
 pub(crate) struct TurnDecision<'a> {
     pub(crate) service: &'a Arc<crate::runtime::turn_decision::TurnDecisionService>,
     pub(crate) context: &'a Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    /// The turn's execution-owned runtime context (R26). It is the one the
+    /// decision context was opened with; Part 2 keeps it and drops the
+    /// service and the decision context.
+    pub(crate) runtime: &'a Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     pub(crate) proof: &'a dyn crate::runtime::turn_source::TurnSourceProof,
 }
 

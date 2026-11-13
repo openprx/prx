@@ -695,7 +695,7 @@ mod tests {
                     assert_eq!(registry.len(), 1);
                     assert_eq!(registry.first().expect("one spawn tool").name(), "sessions_spawn");
                     let runtime = crate::gateway::TurnRuntimeGeneration {
-                        provider_binding:Some(Arc::new(crate::gateway::decision_source::GatewayProviderBinding::new(Arc::clone(&provider), resolved))),
+                        provider_binding:Some(Arc::new(crate::gateway::turn_source::GatewayProviderBinding::new(Arc::clone(&provider), resolved))),
                         decision_slot:Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), 0)),
                         config_generation:Arc::clone(&generation), provider:Arc::clone(&provider),
                         model:"prx-gateway-parent".to_owned(), temperature:0.0, tools_registry:Arc::clone(&registry), mcp_tool:None,
@@ -723,7 +723,7 @@ mod tests {
                     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy())
                         .with_event_recording(config.memory.event_recording_config());
                     let event = fabric.record_inbound_user_message(envelope.message_scope(), input, None, None).await?;
-                    let receipt = crate::gateway::decision_source::GatewaySourceReceipt::issue(
+                    let receipt = crate::gateway::turn_source::GatewaySourceReceipt::issue(
                         memory.as_ref(), &generation, &envelope, input, &event,
                     ).await?;
                     let proof = receipt.bind(&runtime, &fabric_context)?;
@@ -733,7 +733,7 @@ mod tests {
                         memory:Arc::clone(&memory), plugin_generation:0,
                     }.publish(crate::tools::capability::turn_state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
-                    let context = service.open_issued_turn_context(&proof, crate::runtime::turn_decision::AgentTurnKind::SingleShot, &cancellation).await?;
+                    let context = service.open_issued_turn_context(&proof, crate::runtime::turn_context::AgentTurnKind::SingleShot, &cancellation).await?;
                     anyhow::ensure!(
                         matches!(
                             context.engine().selection,

@@ -1,11 +1,11 @@
 //! Source-bound logical task completion; model segments settle independently.
-#[cfg(test)]
-use super::Memory;
 use super::{
     Arc, Context, MemoryFabric, MessageEvent, MessageEventScope, TurnTerminalDraft, TurnTerminalPayload,
     TurnTerminalReceipt, TurnTerminalStatus, ensure_runtime_authority, redact_persisted_json, redact_persisted_text,
     terminal_semantic_scope,
 };
+#[cfg(test)]
+use crate::memory::Memory;
 
 pub(crate) struct LogicalTaskTerminalRef {
     fabric: MemoryFabric,
@@ -80,6 +80,7 @@ impl LogicalTaskTerminalRef {
                     .as_ref()
                     .is_none_or(|scope| terminal_semantic_scope(scope) == terminal_semantic_scope(&self.scope))
                 && draft.decision.is_none()
+                && draft.binding.is_none()
                 && draft.provider_outcome.is_none(),
             "logical completion differs from issued source or attempts model settlement"
         );
@@ -213,6 +214,7 @@ mod tests {
         let now = chrono::Utc::now();
         let draft = TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: "prx_task".to_owned(),
             scope,
             status: TurnTerminalStatus::Completed,

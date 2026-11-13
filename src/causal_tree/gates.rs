@@ -47,12 +47,6 @@ pub(crate) struct GateInputs<'a> {
     pub retry_limit: Option<u32>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GateScope {
-    Directive,
-    CapabilityPublication,
-}
-
 /// The same checks run before prediction, after read-only rehearsal, and
 /// immediately before committing a directive.
 pub(crate) struct HardGates;
@@ -87,7 +81,7 @@ impl HardGates {
             if outcomes
                 .insert(
                     candidate.candidate_id().clone(),
-                    Self::check(state, catalog, candidate, inputs, GateScope::Directive, remaining),
+                    Self::check(state, catalog, candidate, inputs, remaining),
                 )
                 .is_some()
             {
@@ -106,33 +100,7 @@ impl HardGates {
         candidate: &CausalCandidate,
         inputs: &GateInputs<'_>,
     ) -> GateOutcome {
-        Self::check(
-            state,
-            catalog,
-            candidate,
-            inputs,
-            GateScope::Directive,
-            state.trusted.parts().budgets,
-        )
-    }
-
-    /// G1-G5 for a discovered definition, without authorizing dispatch.
-    /// Model/structural restrictions and actual call approval/budget checks
-    /// remain with the caller and executor. Approval outcomes stay explicit.
-    pub(crate) fn check_capability_publication(
-        state: &CausalState,
-        catalog: &CatalogView<'_>,
-        candidate: &CausalCandidate,
-        inputs: &GateInputs<'_>,
-    ) -> GateOutcome {
-        Self::check(
-            state,
-            catalog,
-            candidate,
-            inputs,
-            GateScope::CapabilityPublication,
-            state.trusted.parts().budgets,
-        )
+        Self::check(state, catalog, candidate, inputs, state.trusted.parts().budgets)
     }
 
     fn check(
@@ -140,7 +108,6 @@ impl HardGates {
         catalog: &CatalogView<'_>,
         candidate: &CausalCandidate,
         inputs: &GateInputs<'_>,
-        scope: GateScope,
         remaining: crate::tools::capability::turn_state::TurnBudgets,
     ) -> GateOutcome {
         let trusted = state.trusted.parts();
@@ -316,10 +283,6 @@ impl HardGates {
             .any(|(reference, entry)| entry.is_none_or(|entry| reference.fingerprint != entry.fingerprint))
         {
             return blocked(5, "schema_changed");
-        }
-
-        if scope == GateScope::CapabilityPublication {
-            return approval_outcome(approval_required || policy_asks, grant_verified, approval_ids);
         }
 
         // G6: a missing cost estimate is unpriced configuration. A priced path

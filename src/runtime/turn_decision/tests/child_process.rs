@@ -400,9 +400,9 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         ));
         let catalog = ProviderCatalogView::from_config(&config);
         let transports = CountingTransports(AtomicUsize::new(0));
-        let mut service = build_turn_decision_service(
+        let mut service = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -455,7 +455,17 @@ async fn actual_parent_process_case(non_root_route: bool) -> anyhow::Result<()> 
         let context = service
             .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
             .await?;
-        assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
+        let spawn_entry = service
+            .catalog()
+            .entry_for_public_name("sessions_spawn")
+            .expect("test: registered spawn capability");
+        assert!(
+            context
+                .execution_refs()
+                .iter()
+                .any(|reference| reference.id == spawn_entry.id),
+            "the parent's published surface carries the spawn capability"
+        );
         assert!(context.record_admitted.load(Ordering::Acquire));
         let selected = service.agent_execution_specs(&proof, &context)?;
         assert_eq!(selected.specs.len(), 1);
@@ -996,9 +1006,9 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     ));
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -1051,10 +1061,21 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
     assert_eq!(context.catalog_generation(), *service.catalog.generation());
     assert!(context.record_admitted.load(Ordering::Acquire));
     if level == crate::security::AutonomyLevel::Full {
-        assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
+        let spawn_entry = service
+            .catalog()
+            .entry_for_public_name("sessions_spawn")
+            .expect("test: registered spawn capability");
+        assert!(
+            context
+                .execution_refs()
+                .iter()
+                .any(|reference| reference.id == spawn_entry.id),
+            "Full publishes the spawn capability on the direct surface"
+        );
+        // Every turn opens prediction-free (R9) and commits the answer candidate.
         assert_eq!(
             context.terminal_outcome_action(),
-            Some(crate::tools::capability::contract::CausalActionKind::Delegate)
+            Some(crate::tools::capability::contract::CausalActionKind::Answer)
         );
         let selected = service.agent_execution_specs(&proof, &context)?;
         assert_eq!(selected.specs.len(), 1);
@@ -1152,7 +1173,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
             }
         );
     } else {
-        let answer = matches!(context.directive(), TurnExecutionDirective::AnswerDirectly);
+        let answer = context.is_run();
         if answer {
             let selected = service
                 .agent_execution_specs(&proof, &context)
@@ -1312,9 +1333,9 @@ async fn durability_readback_body(
         Arc::new(SilentEvents),
         Arc::clone(&hold),
     )?;
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -1356,9 +1377,17 @@ async fn durability_readback_body(
     let context = service
         .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await?;
+    let spawn_id = service
+        .catalog()
+        .entry_for_public_name("sessions_spawn")
+        .map(|entry| entry.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("fixture must register the spawn capability"))?;
     anyhow::ensure!(
-        matches!(context.directive(), TurnExecutionDirective::Delegate { .. }),
-        "fixture must select a delegation"
+        context
+            .execution_refs()
+            .iter()
+            .any(|reference| reference.id == spawn_id),
+        "fixture must publish the spawn capability"
     );
     anyhow::ensure!(
         context.record_admitted.load(Ordering::Acquire),

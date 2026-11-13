@@ -697,7 +697,7 @@ async fn drive(
                         parent.provider = scripted.clone();
                         parent.model = CONSOLE_WINDOW_MODEL.to_owned();
                         parent.provider_binding =
-                            Some(Arc::new(crate::gateway::decision_source::GatewayProviderBinding::new(
+                            Some(Arc::new(crate::gateway::turn_source::GatewayProviderBinding::new(
                                 scripted.clone(),
                                 resolve("ollama"),
                             )));
@@ -724,7 +724,7 @@ async fn drive(
                                 let derived = Arc::get_mut(&mut runtime).expect("test: unshared target runtime");
                                 derived.provider = scripted.clone();
                                 derived.provider_binding =
-                                    Some(Arc::new(crate::gateway::decision_source::GatewayProviderBinding::new(
+                                    Some(Arc::new(crate::gateway::turn_source::GatewayProviderBinding::new(
                                         scripted.clone(),
                                         resolve("ollama"),
                                     )));
@@ -748,7 +748,7 @@ async fn drive(
                     let event_id = append_console_turn(&state, &envelope, "user", input, true, false)
                         .await
                         .expect("test: record the input");
-                    let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                    let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
                         state.mem.as_ref(),
                         &runtime,
                         &principal,
@@ -775,13 +775,13 @@ async fn drive(
                     let context = service
                         .open_issued_turn_context(
                             &proof,
-                            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                            crate::runtime::turn_context::AgentTurnKind::SingleShot,
                             &cancellation,
                         )
                         .await
                         .expect("test: decision");
                     assert!(
-                        context.is_run().expect("test: admitted turn"),
+                        context.is_run(),
                         "the turn must reach the tool loop, not collection or a direct reply"
                     );
                     let decision = ConsoleDecisionTurn {

@@ -279,11 +279,13 @@ async fn run_turn_unguarded(
                 low_priority_tool_names,
             },
         compaction: compaction_config,
-        decision: TurnDecision {
-            service,
-            context,
-            proof,
-        },
+        decision:
+            TurnDecision {
+                service,
+                context,
+                runtime: turn_runtime,
+                proof,
+            },
     } = request;
     let TurnServices {
         provider,
@@ -332,7 +334,11 @@ async fn run_turn_unguarded(
         event_fabric,
         request_event_scope,
     } = memory_runtime;
-    let parameter_capture = context.runtime().capture_main_parameters(event_fabric.is_some());
+    anyhow::ensure!(
+        Arc::ptr_eq(turn_runtime, context.runtime()),
+        "turn runtime context differs from the opened decision context"
+    );
+    let parameter_capture = turn_runtime.capture_main_parameters(event_fabric.is_some());
     let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
         build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
             scope: scope_ctx,
@@ -511,7 +517,7 @@ async fn run_turn_unguarded(
         },
     ));
     // V-17: a historical resume turn publishes exactly its prepared tool.
-    let safety_surface = match context.runtime().resume_tool_name() {
+    let safety_surface = match turn_runtime.resume_tool_name() {
         Some(name) => Arc::new(safety_surface.restricted_to(name)),
         None => safety_surface,
     };
@@ -1971,10 +1977,7 @@ async fn run_turn_unguarded(
             let Some(proposal) = service.admit_discovered_tool(proof, context, &call.name)? else {
                 continue;
             };
-            if matches!(
-                proposal.admission,
-                crate::causal_tree::gates::GateOutcome::Blocked { .. }
-            ) {
+            if proposal.admission.is_blocked() {
                 continue;
             }
             if !safety_surface.contains(&proposal.spec.name) {

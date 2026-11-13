@@ -103,7 +103,7 @@ async fn full_gateway_turn_runs_git_through_native_shell() {
                     root.path().into(),
                 ))]);
                 let runtime = TurnRuntimeGeneration {
-                    provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                    provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
                         provider.clone(),
                         resolved,
                     ))),

@@ -20,11 +20,9 @@ impl ChatTurnBinding {
         let decided = self
             .decision
             .get_or_try_init(|| async {
-                let kind = crate::runtime::turn_decision::AgentTurnKind::Repl;
+                let kind = crate::runtime::turn_context::AgentTurnKind::Repl;
                 let context = if resume {
-                    service
-                        .open_issued_resume_turn_context(self, kind, cancellation)
-                        .await?
+                    crate::runtime::turn_publication::open_resume_turn(service, self, kind, cancellation).await?
                 } else {
                     let opened = service.open_turn_context(self, kind, cancellation).await?;
                     service.record_opened_context(self, opened, cancellation).await?
@@ -53,6 +51,7 @@ impl ChatTurnBinding {
             .map(|decided| crate::agent::turn_request::TurnDecision {
                 service: &decided.service,
                 context: &decided.context,
+                runtime: decided.context.runtime(),
                 proof: self,
             })
     }

@@ -1,7 +1,7 @@
 //! Persist and read back the source-bound result of one bounded admission.
 use super::{
     AgentDecisionError, Arc, CancellationToken, Context, DecisionRecordBuilder, Ordering, TurnDecisionContext,
-    TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
+    TurnDecisionService, TurnSourceProof,
 };
 use crate::runtime::child_source::authority_journal;
 
@@ -28,7 +28,7 @@ impl TurnDecisionService {
     pub(in crate::runtime) async fn open_issued_segment_turn_context(
         &self,
         proof: &dyn TurnSourceProof,
-        observation: Option<&super::segment_observation::SegmentObservation>,
+        observation: Option<&crate::runtime::child_turn::segment_observation::SegmentObservation>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         let opened = self.open_segment_turn_context(proof, observation, cancellation).await?;
@@ -86,14 +86,14 @@ impl TurnDecisionService {
                 context.record_admitted.store(true, Ordering::Release);
             }
         }
-        let admits_delegation = matches!(context.directive, TurnExecutionDirective::Delegate { .. })
-            || context.execution_refs.iter().any(|reference| {
-                self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
-                    entry.fingerprint == reference.fingerprint
-                        && entry.generation == reference.generation
-                        && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
-                })
-            });
+        // A published delegator makes delegation storage reachable (R28).
+        let admits_delegation = context.execution_refs().iter().any(|reference| {
+            self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
+                entry.fingerprint == reference.fingerprint
+                    && entry.generation == reference.generation
+                    && crate::tools::surface_owner::publication::is_delegator(&entry.public_name)
+            })
+        });
         if admits_delegation {
             if self.generation.effective.causal_tree.enabled {
                 tokio::select! {

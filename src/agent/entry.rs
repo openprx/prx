@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 /// Distinct process status for a refused single-shot `prx agent` turn.
 /// `1` remains a generic command failure.
-pub const AGENT_REFUSAL_EXIT_CODE: u8 = crate::causal_tree::refusal::AGENT_REFUSAL_EXIT_CODE;
+pub const AGENT_REFUSAL_EXIT_CODE: u8 = crate::agent::refusal::AGENT_REFUSAL_EXIT_CODE;
 
 /// A single-shot CLI turn refused after its reply was written to stdout.
 /// The refusal reply is already on stdout; `Display` stays generic so the CLI
@@ -205,6 +205,12 @@ fn decision_settlement_snapshot(
     settlement: &parking_lot::Mutex<Option<crate::agent::terminal::DecisionSettlementRef>>,
 ) -> Option<crate::agent::terminal::DecisionSettlementRef> {
     settlement.lock().clone()
+}
+
+fn terminal_binding_snapshot(
+    binding: &parking_lot::Mutex<Option<crate::agent::terminal::TerminalBinding>>,
+) -> Option<crate::agent::terminal::TerminalBinding> {
+    binding.lock().clone()
 }
 
 /// A CLI Agent turn whose origin was checked by this entrypoint after inbound
@@ -1050,14 +1056,14 @@ mod agent_turn_origin_tests {
             )
             .owner_id
         );
-        crate::runtime::turn_decision::validate_agent_turn_origin(
+        crate::runtime::turn_context::validate_agent_turn_origin(
             &generation,
             crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
             &proof,
         )
         .expect("service accepts the pinned Agent origin");
         assert!(
-            crate::runtime::turn_decision::validate_agent_turn_origin(
+            crate::runtime::turn_context::validate_agent_turn_origin(
                 &generation,
                 crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
                 &proof,
@@ -1260,7 +1266,7 @@ mod agent_turn_origin_tests {
         trusted.resolved_model = Arc::from("prx:model");
         trusted.policy_version = Arc::from("policy-v1");
         trusted.exclusions.clear();
-        let verify = crate::runtime::turn_decision::validate_agent_retrieval_provenance;
+        let verify = crate::runtime::turn_context::validate_agent_retrieval_provenance;
         assert!(verify(&proof_a, &trusted, "prx:model", "policy-v1", &[], None).is_ok());
         assert!(verify(&proof_b, &trusted, "prx:model", "policy-v1", &[], None).is_err());
         trusted.owner_id = Some(Arc::from("prx_foreign_owner"));
@@ -1874,6 +1880,7 @@ pub(crate) async fn run_with_runtime_envelope(
             let decision_settlement = Arc::new(parking_lot::Mutex::new(
                 None::<crate::agent::terminal::DecisionSettlementRef>,
             ));
+            let terminal_binding = Arc::new(parking_lot::Mutex::new(None::<crate::agent::terminal::TerminalBinding>));
             let admission_proof = std::sync::OnceLock::<AgentTurnProof>::new();
             let terminal_guard = std::sync::OnceLock::<crate::runtime::turn_terminal::TurnTerminalGuard>::new();
             let mut cli_admission_guard = None;
@@ -1986,12 +1993,13 @@ pub(crate) async fn run_with_runtime_envelope(
                     let decision = service
                         .open_issued_turn_context(
                             proof,
-                            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                            crate::runtime::turn_context::AgentTurnKind::SingleShot,
                             shutdown,
                         )
                         .await?;
                     let advice = service.advisory().analyze_turn(decision.runtime(), shutdown).await;
                     *decision_settlement.lock() = Some(service.terminal_settlement_ref(Arc::clone(&decision))?);
+                    *terminal_binding.lock() = Some(service.terminal_binding(&decision)?);
                     let cleanup_ticket = if scheduled_admission.is_some() {
                         scheduled_input_guard
                             .take()
@@ -2131,6 +2139,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 decision: crate::agent::turn_request::TurnDecision {
                                     service: decision_service,
                                     context: decision_context,
+                                    runtime: decision_context.runtime(),
                                     proof: decision_proof,
                                 },
                             },
@@ -2179,6 +2188,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             &memory_fabric,
                             crate::agent::terminal::TurnTerminalDraft {
                                 decision: decision_settlement_snapshot(&decision_settlement),
+                                binding: terminal_binding_snapshot(&terminal_binding),
                                 terminal_id: turn_run_id.clone(),
                                 scope: runtime_envelope.message_scope(),
                                 status: crate::agent::terminal::TurnTerminalStatus::Failed,
@@ -2226,6 +2236,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     &memory_fabric,
                     crate::agent::terminal::TurnTerminalDraft {
                         decision: decision_settlement_snapshot(&decision_settlement),
+                        binding: terminal_binding_snapshot(&terminal_binding),
                         terminal_id: turn_run_id.clone(),
                         scope: runtime_envelope.message_scope(),
                         status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -2290,6 +2301,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         &memory_fabric,
                         crate::agent::terminal::TurnTerminalDraft {
                             decision: Some(settlement),
+                            binding: terminal_binding_snapshot(&terminal_binding),
                             terminal_id: cancel_turn_id,
                             scope: cancelled_scope,
                             status: crate::agent::terminal::TurnTerminalStatus::Cancelled,
@@ -2450,7 +2462,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     let decision = match service
                         .open_issued_turn_context(
                             &proof,
-                            crate::runtime::turn_decision::AgentTurnKind::Repl,
+                            crate::runtime::turn_context::AgentTurnKind::Repl,
                             shutdown,
                         )
                         .await
@@ -2510,6 +2522,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     advice,
                 ) = &decision_turn;
                 let decision_settlement = Some(decision_service.terminal_settlement_ref(Arc::clone(decision_context))?);
+                let terminal_binding = Some(decision_service.terminal_binding(decision_context)?);
 
                 // Auto-save conversation turns (skip short/trivial messages)
                 if config.memory.should_auto_promote_user_message(&user_input) {
@@ -2588,6 +2601,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 decision: crate::agent::turn_request::TurnDecision {
                                     service: decision_service,
                                     context: decision_context,
+                                    runtime: decision_context.runtime(),
                                     proof: decision_proof,
                                 },
                             },
@@ -2633,6 +2647,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             &memory_fabric,
                             crate::agent::terminal::TurnTerminalDraft {
                                 decision: decision_settlement.clone(),
+                                binding: terminal_binding.clone(),
                                 terminal_id: turn_run_id.clone(),
                                 scope: runtime_envelope.message_scope(),
                                 status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -2674,6 +2689,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             &memory_fabric,
                             crate::agent::terminal::TurnTerminalDraft {
                                 decision: decision_settlement.clone(),
+                                binding: terminal_binding.clone(),
                                 terminal_id: turn_run_id.clone(),
                                 scope: runtime_envelope.message_scope(),
                                 status: if cancelled {

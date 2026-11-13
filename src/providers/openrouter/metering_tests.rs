@@ -208,6 +208,7 @@ async fn priced_streamed_turn_requests_usage_and_writes_cost_ledger() -> anyhow:
             guard
                 .commit(TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: decision.proof.run_id().to_owned(),
                     scope: envelope.message_scope(),
                     status: TurnTerminalStatus::Completed,

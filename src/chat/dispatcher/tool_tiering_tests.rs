@@ -288,10 +288,9 @@ async fn offered_tools_for(
             .decision_routing()
             .expect("test: admitted routing")
             .context
-            .is_run()
-            .expect("test: live execution"),
+            .is_run(),
         "tiering fixture closed before provider execution: {:?}; {audit:?}",
-        routing.context.directive()
+        routing.context.execution_refs()
     );
     let history = vec![
         ChatMessage::system("tiering system"),
@@ -739,7 +738,6 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
             .expect("test: admitted routing")
             .context
             .is_run()
-            .expect("test: live execution")
     );
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user(CORE_TOOL)];
     drive_start_turn_stream(

@@ -1,35 +1,29 @@
 //! Filesystem preparation runs off Tokio workers and retains cleanup ownership.
 use super::{
-    Arc, CausalDecisionStore, CausalEventSink, ConfigGeneration, DecisionKey, FactoryDeps, Retention, StoreMode,
-    TurnDecisionService, TurnServiceBuildError,
+    Arc, CausalDecisionStore, CausalEventSink, ConfigGeneration, DecisionKey, FactoryDeps, PublicationBuildError,
+    Retention, StoreMode, TurnDecisionService,
 };
 use crate::runtime::{causal_events::DurableCausalEventSink, turn_cleanup};
 use tokio_util::sync::CancellationToken;
 
 impl TurnDecisionService {
-    /// Cleanup transfers temporary construction ownership to the published
-    /// service under its existing retention lock, matching both actual queues.
+    /// Delegates to the R25 owner in `runtime::ingress_recovery` (until Part 2).
     pub(crate) fn owns_prepared_queues(
         &self,
         store: Option<&Arc<CausalDecisionStore>>,
         events: Option<&Arc<DurableCausalEventSink>>,
     ) -> bool {
-        store.is_some_and(|store| Arc::ptr_eq(store, &self.store))
-            && match (self.durable_events.as_ref(), events) {
-                (Some(published), Some(prepared)) => Arc::ptr_eq(published, prepared),
-                (None, None) => true,
-                _ => false,
-            }
+        crate::runtime::ingress_recovery::owns_prepared_queues(self, store, events)
     }
 }
 
-pub(super) async fn load_key(
+pub(in crate::runtime) async fn load_key(
     generation: Arc<ConfigGeneration>,
-) -> Result<Option<Arc<DecisionKey>>, TurnServiceBuildError> {
+) -> Result<Option<Arc<DecisionKey>>, PublicationBuildError> {
     let ticket = turn_cleanup::current_tracker()
         .map(|owner| owner.register(CancellationToken::new()))
         .transpose()
-        .map_err(TurnServiceBuildError::PreparationOwner)?;
+        .map_err(PublicationBuildError::PreparationOwner)?;
     Ok(tokio::task::spawn_blocking(move || {
         crate::runtime::decision_accounting::initialize_tokenizers();
         let key = FactoryDeps::load_key(&generation.effective);
@@ -41,16 +35,16 @@ pub(super) async fn load_key(
     .await?)
 }
 
-pub(super) async fn open_store(
+pub(in crate::runtime) async fn open_store(
     generation: Arc<ConfigGeneration>,
     events: Arc<dyn CausalEventSink>,
     durable_events: Option<Arc<DurableCausalEventSink>>,
     durable_key: bool,
-) -> Result<Arc<CausalDecisionStore>, TurnServiceBuildError> {
+) -> Result<Arc<CausalDecisionStore>, PublicationBuildError> {
     let ticket = turn_cleanup::current_tracker()
         .map(|owner| owner.register(CancellationToken::new()))
         .transpose()
-        .map_err(TurnServiceBuildError::PreparationOwner)?;
+        .map_err(PublicationBuildError::PreparationOwner)?;
     let config = &generation.effective;
     Ok(crate::runtime::decision_journal::store_preparation::open_store(
         config.workspace_dir.clone(),

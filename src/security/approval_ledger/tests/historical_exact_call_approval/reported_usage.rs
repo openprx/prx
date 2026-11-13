@@ -152,6 +152,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
             decision: TurnDecision {
                 service: f.service,
                 context: f.context,
+                runtime: f.context.runtime(),
                 proof: f.proof,
             },
         },
@@ -198,6 +199,7 @@ async fn exercise_owned(f: &Fixture<'_>) {
     let receipt = guard
         .commit(crate::agent::terminal::TurnTerminalDraft {
             decision: Some(f.service.terminal_settlement_ref(Arc::clone(f.context)).unwrap()),
+            binding: Some(f.service.terminal_binding(f.context).unwrap()),
             terminal_id: f.envelope.run_id.clone().unwrap(),
             scope: f.envelope.message_scope(),
             status: crate::agent::terminal::TurnTerminalStatus::Completed,

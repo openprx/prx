@@ -44,7 +44,7 @@ where
 enum DelegateChildAuthority {
     Granted(Arc<crate::runtime::child_source::IssuedChildGrant>),
     Ordinary {
-        publication: crate::runtime::turn_decision::OrdinaryChildPublication,
+        publication: crate::runtime::child_source::publication::OrdinaryChildPublication,
         caller: crate::tools::ToolExecutionContext,
     },
 }

@@ -10,6 +10,9 @@ pub(crate) mod operator_process_input;
 pub(crate) mod ordinary_process;
 pub(crate) mod ordinary_task;
 pub(crate) mod parent;
+pub(crate) mod publication;
+#[cfg(test)]
+mod tests;
 pub(crate) mod turn_scope;
 
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEvent, MessageEventScope, MessageEventSource};
@@ -605,7 +608,7 @@ impl IssuedChildGrant {
         generation: Arc<crate::config::ConfigGeneration>,
         provider_catalog: Arc<crate::providers::catalog::CatalogView>,
         parent_record_binding: (Arc<str>, String),
-        execution_policy: super::turn_decision::ChildExecutionPolicy,
+        execution_policy: publication::ChildExecutionPolicy,
         runtime: ChildGrantRuntime,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -1247,7 +1250,7 @@ impl ChildProviderBinding {
         provider_name: &str,
         model_name: &str,
         credential: crate::providers::credentials::CredentialRef,
-        publication: Option<&super::turn_decision::OrdinaryChildPublication>,
+        publication: Option<&crate::runtime::child_source::publication::OrdinaryChildPublication>,
     ) -> anyhow::Result<Self> {
         let generation = match publication {
             Some(publication) => Arc::clone(publication.generation()),

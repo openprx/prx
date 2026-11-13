@@ -548,7 +548,7 @@ struct ConsoleDecisionTurn<'a> {
     service: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionService>,
     context: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionContext>,
     advice: Option<crate::decision_engine::IntentAnalysis>,
-    proof: &'a crate::gateway::decision_source::GatewayTurnProof,
+    proof: &'a crate::gateway::turn_source::GatewayTurnProof,
     cancellation: tokio_util::sync::CancellationToken,
     provider_trace: Option<(
         std::sync::Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
@@ -706,6 +706,7 @@ async fn run_console_runtime_turn(
             decision: crate::agent::turn_request::TurnDecision {
                 service: &decision.service,
                 context: &decision.context,
+                runtime: decision.context.runtime(),
                 proof: decision.proof,
             },
         },
@@ -1279,7 +1280,7 @@ fn parse_inbox_cursor(cursor: Option<&str>) -> Result<i64, Response> {
 struct ApprovalInboxItem {
     session_id: String,
     #[serde(flatten)]
-    view: crate::runtime::turn_decision::DecisionApprovalView,
+    view: crate::security::approval_ledger::pending::DecisionApprovalView,
 }
 
 #[derive(Serialize)]
@@ -1687,11 +1688,11 @@ enum ConsoleTurnMode {
 )]
 enum ConsoleTurnSource {
     #[cfg(test)]
-    Message(crate::gateway::decision_source::GatewayTurnProof),
+    Message(crate::gateway::turn_source::GatewayTurnProof),
     Admitted {
         mode: ConsoleTurnMode,
-        proof: crate::gateway::decision_source::GatewayTurnProof,
-        guard: crate::gateway::decision_source::GatewayAdmissionGuard,
+        proof: crate::gateway::turn_source::GatewayTurnProof,
+        guard: crate::gateway::turn_source::GatewayAdmissionGuard,
     },
 }
 
@@ -1708,8 +1709,8 @@ impl ConsolePendingInput {
         self,
         message: String,
     ) -> anyhow::Result<(
-        crate::gateway::decision_source::GatewayTurnProof,
-        crate::gateway::decision_source::GatewayAdmissionGuard,
+        crate::gateway::turn_source::GatewayTurnProof,
+        crate::gateway::turn_source::GatewayAdmissionGuard,
     )> {
         let run = self
             .envelope
@@ -1743,7 +1744,7 @@ impl ConsolePendingInput {
                     "Console input identity changed during persistence"
                 );
                 let event_id = if event.id > 0 { event.event_id.as_str() } else { "" };
-                let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
                     self.state.mem.as_ref(),
                     &self.runtime,
                     &self.principal,
@@ -1757,7 +1758,7 @@ impl ConsolePendingInput {
                         || proof.envelope().source_message_event_id.as_deref() == Some(event.event_id.as_str()),
                     "Console durable receipt lost its original input"
                 );
-                admission = Some(crate::gateway::decision_source::GatewayAdmissionGuard::new(
+                admission = Some(crate::gateway::turn_source::GatewayAdmissionGuard::new(
                     &proof,
                     fabric.clone(),
                     ticket
@@ -1823,7 +1824,7 @@ impl ConsolePendingInput {
                                     && event.owner_id.as_deref() == Some(self.principal.owner_id.as_str()),
                                 "Console recovery input identity changed"
                             );
-                            let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+                            let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
                                 self.state.mem.as_ref(),
                                 &self.runtime,
                                 &self.principal,
@@ -1841,7 +1842,7 @@ impl ConsolePendingInput {
                         if let Ok(Ok(proof)) = tokio::time::timeout(std::time::Duration::from_secs(15), recovery).await
                             && let Some(ticket) = ticket.take()
                         {
-                            admission = Some(crate::gateway::decision_source::GatewayAdmissionGuard::new(
+                            admission = Some(crate::gateway::turn_source::GatewayAdmissionGuard::new(
                                 &proof, fabric, ticket, None,
                             ));
                         }
@@ -2219,7 +2220,7 @@ async fn run_console_message_job_work(
         MemoryFabric::new(state.mem.clone(), runtime_envelope.workspace_id.clone())
             .with_event_recording(config.memory.event_recording_config())
     });
-    let mut admission_guard = crate::gateway::decision_source::GatewayAdmissionGuard::new(
+    let mut admission_guard = crate::gateway::turn_source::GatewayAdmissionGuard::new(
         &source_proof,
         admission_fabric,
         cleanup_ticket,
@@ -2254,12 +2255,11 @@ async fn run_console_message_job_work(
                         .publish(&turn_runtime, &state)
                         .await
                         .map_err(|_| "Console decision publication failed".to_owned())?;
-                    let kind = crate::runtime::turn_decision::AgentTurnKind::SingleShot;
+                    let kind = crate::runtime::turn_context::AgentTurnKind::SingleShot;
                     let context = match mode {
                         ConsoleTurnMode::Message => service.open_issued_turn_context(proof, kind, &cancellation).await,
                         ConsoleTurnMode::Resume => {
-                            service
-                                .open_issued_resume_turn_context(proof, kind, &cancellation)
+                            crate::runtime::turn_publication::open_resume_turn(&service, proof, kind, &cancellation)
                                 .await
                         }
                     }
@@ -2409,11 +2409,16 @@ async fn run_console_message_job_work(
             .service
             .terminal_settlement_ref(std::sync::Arc::clone(&decision.context))
             .map_err(|error| error.to_string())?;
+        let terminal_binding = decision
+            .service
+            .terminal_binding(&decision.context)
+            .map_err(|error| error.to_string())?;
         match crate::gateway::decision_runtime::commit_terminal(
             Some(&terminal_guard),
             &terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
                 decision: Some(settlement),
+                binding: Some(terminal_binding),
                 terminal_id,
                 scope: turn.envelope.message_scope(),
                 status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -2545,6 +2550,7 @@ async fn run_console_resume(
                     .service
                     .settlement_ref(std::sync::Arc::clone(&decision.context))?,
             ),
+            binding: Some(decision.service.terminal_binding(&decision.context)?),
             terminal_id: envelope
                 .run_id
                 .clone()
@@ -3096,7 +3102,7 @@ mod tests {
         Arc<crate::gateway::TurnRuntimeGeneration>,
         RuntimeEnvelope,
         String,
-        crate::gateway::decision_source::GatewayTurnProof,
+        crate::gateway::turn_source::GatewayTurnProof,
     ) {
         if state.mem.name() == "test" {
             state.mem =
@@ -3116,7 +3122,7 @@ mod tests {
             crate::providers::catalog::UnknownPolicy::Invocation,
         )
         .unwrap();
-        let binding = crate::gateway::decision_source::GatewayProviderBinding::new(runtime.provider.clone(), resolved);
+        let binding = crate::gateway::turn_source::GatewayProviderBinding::new(runtime.provider.clone(), resolved);
         let security = Arc::new(crate::security::SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -3133,7 +3139,7 @@ mod tests {
         let event_id = append_console_turn(state, &envelope, "user", input, true, false)
             .await
             .unwrap();
-        let proof = crate::gateway::decision_source::GatewaySourceReceipt::console_proof(
+        let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
             state.mem.as_ref(),
             &runtime,
             &principal,
@@ -3186,7 +3192,7 @@ mod tests {
                         let context = service
                             .open_issued_turn_context(
                                 &proof,
-                                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                                crate::runtime::turn_context::AgentTurnKind::SingleShot,
                                 &cancellation,
                             )
                             .await
@@ -3300,7 +3306,7 @@ mod tests {
                 let context = service
                     .open_issued_turn_context(
                         &proof,
-                        crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                        crate::runtime::turn_context::AgentTurnKind::SingleShot,
                         &cancellation,
                     )
                     .await?;
@@ -3555,7 +3561,7 @@ mod tests {
                 let context = service
                     .open_issued_turn_context(
                         &proof,
-                        crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                        crate::runtime::turn_context::AgentTurnKind::SingleShot,
                         &cancellation,
                     )
                     .await
@@ -3748,7 +3754,7 @@ mod tests {
         Arc<crate::gateway::TurnRuntimeGeneration>,
         RuntimeEnvelope,
         String,
-        crate::gateway::decision_source::GatewayTurnProof,
+        crate::gateway::turn_source::GatewayTurnProof,
     ) {
         let mut config = Config::default();
         console_provider_fixture_config(&mut config, tmp.path(), "test-model", endpoint);

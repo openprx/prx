@@ -30,8 +30,7 @@ use super::turn_failure::{classify_turn_failure, turn_error_id, turn_failure_not
 use super::{
     Arc, CancellationToken, Channel, ChannelRouteSelection, ChannelRuntimeContext, ChatKind, ChatMessage,
     DocumentIngestRuntime, Instant, MemoryFabric, MemoryWriteContext, Result, SIGNAL_IMAGE_UNCERTAINTY_FALLBACK,
-    ScopeContext, SendMessage, decision_source, decision_turn, memory, pre_gate, providers, traits,
-    truncate_with_ellipsis,
+    ScopeContext, SendMessage, decision_turn, memory, pre_gate, providers, traits, truncate_with_ellipsis, turn_source,
 };
 
 /// Authenticated pending approval id returned by the execution ledger.
@@ -359,43 +358,37 @@ pub(super) async fn run_channel_turn(
             return;
         }
     };
-    let (inbound_event, channel_source, mut admission_guard) =
-        match decision_source::ChannelSourceReceipt::record_guarded(
-            Arc::clone(&ctx),
-            Arc::clone(&config_generation),
-            msg.clone(),
-            turn_run_id.clone(),
-            input_ticket,
-        )
-        .await
-        {
-            Ok(input) => input,
-            Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => {
-                tracing::info!(
-                    outcome = "already_accepted_unconfirmed",
-                    "channel input was previously accepted; execution was not repeated"
-                );
-                if is_direct_chat
-                    && authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel).is_ok()
-                    && ensure_notice_before_channel_output(
-                        ctx.as_ref(),
-                        &config_generation,
-                        &msg,
-                        target_channel.as_ref(),
-                    )
+    let (inbound_event, channel_source, mut admission_guard) = match turn_source::ChannelSourceReceipt::record_guarded(
+        Arc::clone(&ctx),
+        Arc::clone(&config_generation),
+        msg.clone(),
+        turn_run_id.clone(),
+        input_ticket,
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err(error) if error.is::<crate::runtime::ingress_recovery::AlreadyAccepted>() => {
+            tracing::info!(
+                outcome = "already_accepted_unconfirmed",
+                "channel input was previously accepted; execution was not repeated"
+            );
+            if is_direct_chat
+                && authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel).is_ok()
+                && ensure_notice_before_channel_output(ctx.as_ref(), &config_generation, &msg, target_channel.as_ref())
                     .await
-                {
-                    if let Some(channel) = target_channel.as_ref() {
-                        let _=send_recording_activity(channel.as_ref(),&SendMessage::new("This input was already accepted. Execution was not repeated; its outcome remains unconfirmed.",&msg.reply_target).in_thread(msg.thread_ts.clone())).await;
-                    }
+            {
+                if let Some(channel) = target_channel.as_ref() {
+                    let _=send_recording_activity(channel.as_ref(),&SendMessage::new("This input was already accepted. Execution was not repeated; its outcome remains unconfirmed.",&msg.reply_target).in_thread(msg.thread_ts.clone())).await;
                 }
-                return;
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "channel input persistence is unconfirmed");
-                return;
-            }
-        };
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "channel input persistence is unconfirmed");
+            return;
+        }
+    };
 
     // ── Autosave side-effect gate (FIX-P0-10/11/12) ─────────────────────────
     // Persisting a memory entry is a distinct autonomous side effect, so it gets
@@ -569,6 +562,7 @@ pub(super) async fn run_channel_turn(
             if let Err(error) = decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: channel_source.envelope().message_scope(),
                     status: crate::agent::terminal::TurnTerminalStatus::Silent,
@@ -1335,6 +1329,7 @@ pub(super) async fn run_channel_turn(
             let terminal_committed = match decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: runtime_envelope.message_scope().with_sender("prx"),
                     status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -1481,6 +1476,7 @@ pub(super) async fn run_channel_turn(
             if let Err(error) = decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: runtime_envelope.message_scope(),
                     status: crate::agent::terminal::TurnTerminalStatus::Silent,

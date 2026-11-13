@@ -1,257 +1,228 @@
-//! Source-bound discovery offers. An offer does not grant dispatch authority.
-mod append;
-use super::{
-    Arc, BTreeMap, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, Exposure, GateInputs, Ordering,
-    TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
-};
+//! Discovery and execution-spec methods of the service (R25). Their bodies
+//! live in `tools::capability::search_tool` and
+//! `tools::capability::execution_binding::specs`, which read the turn through
+//! the [`TurnSurfacePort`] implemented here; these methods delegate until
+//! Part 2.
+use super::{Arc, BTreeSet, CapabilityRef, TurnDecisionContext, TurnDecisionService, TurnSourceProof};
+use crate::providers::catalog::ResolvedModel;
 use crate::tools::ToolSpec;
-use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, CausalActionKind};
-use crate::tools::capability::search::CatalogSearch;
-use crate::tools::capability::search_tool::CapabilitySearchPort;
-pub(super) use append::DiscoveryAdmission;
+use crate::tools::capability::admission_facts::AdmissionFactsV1;
+use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
+use crate::tools::capability::execution_binding::specs::{self, ConstrainedToolSelection};
+use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
+use crate::tools::capability::search_tool::{
+    self, CapabilitySearchPort, DiscoveredToolProposal, DiscoveryState, MAX_DISCOVERED_TOOLS_PER_TURN,
+};
+use crate::tools::capability::turn_state::TrustedParts;
+use crate::tools::execution::ToolExecutionService;
+use crate::tools::surface_owner::turn_port::TurnSurfacePort;
 
-pub(super) use crate::tools::capability::search_tool::DiscoveryOffers;
-use crate::tools::capability::search_tool::{DiscoveryEntry, DiscoveryScope};
+/// One opened turn of this service, read through the surface port.
+pub(crate) struct TurnSurfaceBinding<'a> {
+    service: &'a TurnDecisionService,
+    context: &'a TurnDecisionContext,
+}
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SearchControlUnavailable {
-    #[error(
-        "capability discovery unavailable: the published search control has no live backend; rebuild the runtime registry"
-    )]
-    MissingBackend,
+impl TurnSurfacePort for TurnSurfaceBinding<'_> {
+    fn validate_turn(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<ResolvedModel> {
+        let (service, context) = (self.service, self.context);
+        anyhow::ensure!(
+            context.service_id == service.service_id,
+            "decision belongs to another service"
+        );
+        anyhow::ensure!(
+            context.source_actor_matches(Some(proof.policy_channel()), Some(proof.policy_sender())),
+            "execution decision belongs to another ingress actor"
+        );
+        let model = service.resolve_agent_model(proof)?;
+        service.check_live_parity()?;
+        let catalog = service.catalog_view();
+        let model_ref = format!("{}:{}", model.provider_label(), model.model());
+        let exclusions = super::effective_agent_exclusions(
+            &service.generation.effective,
+            &service.registry,
+            &catalog,
+            model.model(),
+            &service.policy_version,
+            &service.state_key,
+        );
+        super::validate_agent_retrieval_provenance(
+            proof,
+            &context.runtime().trusted,
+            &model_ref,
+            &service.policy_version,
+            &exclusions.names,
+            exclusions.model_admission.as_deref(),
+        )?;
+        anyhow::ensure!(
+            context.runtime().routing_input.as_str()
+                == crate::multimodal::project_image_markers_for_routing(proof.routing_input()).as_ref(),
+            "decision input changed"
+        );
+        anyhow::ensure!(
+            context.catalog_generation() == catalog.generation(),
+            "decision catalog changed"
+        );
+        Ok(model)
+    }
+
+    fn resolve_model(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<ResolvedModel> {
+        Ok(self.service.resolve_agent_model(proof)?)
+    }
+
+    fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool {
+        self.service.model_can_call_tools(proof)
+    }
+
+    fn fresh_resume_evidence(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<Option<VerifiedResumeEvidenceV1>> {
+        self.context
+            .resume
+            .as_ref()
+            .map(|resume| resume.gate_evidence(self.service, proof))
+            .transpose()
+    }
+
+    fn catalog(&self) -> &Arc<CapabilityCatalog> {
+        &self.service.catalog
+    }
+
+    fn publication_policy(&self) -> &SurfacePolicy {
+        &self.service.publication_policy
+    }
+
+    fn execution(&self) -> &Arc<ToolExecutionService> {
+        &self.service.execution
+    }
+
+    fn config(&self) -> &crate::config::Config {
+        &self.service.generation.effective
+    }
+
+    fn trusted(&self) -> &TrustedParts {
+        &self.context.runtime().trusted
+    }
+
+    fn facts(&self) -> &AdmissionFactsV1 {
+        &self.context.runtime().admission
+    }
+
+    fn routing_input(&self) -> &str {
+        self.context.runtime().routing_input.as_str()
+    }
+
+    fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
+        &self.context.runtime().published
+    }
+
+    fn outgoing_child(&self) -> bool {
+        self.context.runtime().outgoing_delegation.is_some()
+    }
+
+    fn execution_closed(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        &self.context.execution_closed
+    }
+
+    fn discovery(&self) -> &DiscoveryState {
+        &self.context.runtime().discovery
+    }
+}
+
+impl TurnDecisionContext {
+    /// Terminal evidence only; callers must not treat these retained refs as
+    /// authority after execution_closed. Live consumers recheck every offer.
+    pub(crate) fn discovered_execution_refs(&self) -> Vec<CapabilityRef> {
+        self.runtime().discovery.executable_refs()
+    }
 }
 
 impl TurnDecisionService {
+    pub(crate) const fn surface_port<'a>(&'a self, context: &'a TurnDecisionContext) -> TurnSurfaceBinding<'a> {
+        TurnSurfaceBinding { service: self, context }
+    }
+
     pub(crate) fn capability_search_port(
         self: &Arc<Self>,
         proof: &dyn TurnSourceProof,
         context: &Arc<TurnDecisionContext>,
     ) -> anyhow::Result<CapabilitySearchPort> {
-        anyhow::ensure!(
-            self.agent_capability_search_spec(proof, context)?.is_some(),
-            "turn does not expose capability search"
-        );
-        let entries = self.discovery_entries(proof, context)?;
-        let offers = context.discovery_offers.get_or_init(Default::default);
-        Ok(CapabilitySearchPort::new(Arc::new(DiscoveryScope::published(
-            Arc::clone(&self.catalog),
-            self.publication_policy.clone(),
-            entries,
-            Arc::downgrade(offers),
-            Arc::downgrade(&context.execution_closed),
-            Arc::downgrade(&self.execution),
-        ))))
+        search_tool::capability_search_port(&self.surface_port(context), proof)
     }
 
-    pub(super) fn discovery_entries(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
-    ) -> anyhow::Result<BTreeMap<CapabilityId, DiscoveryEntry>> {
-        let families = self.discovery_families(proof, context)?;
-        let view = self
-            .catalog
-            .view(&CatalogScope::default())
-            .with_surface(&self.publication_policy);
-        let trusted = context.engine.state.trusted.parts();
-        let offered_direct = self.direct_discovery_ids(context);
-        let mut entries = BTreeMap::new();
-        for entry in view.iter_entries() {
-            let core = context.execution_refs.iter().any(|reference| {
-                reference.id == entry.id
-                    && reference.fingerprint == entry.fingerprint
-                    && reference.generation == entry.generation
-            });
-            let eligible = !matches!(
-                entry.public_name.as_str(),
-                "capability_search" | "stay_silent" | "transcript_history_lookup" | "delegate"
-            ) && (entry.supports_metadata_discovery()
-                || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
-                && (!trusted.owner_isolated()
-                    || crate::tools::capability::policy::admits_owner_isolated_identity(
-                        &entry.public_name,
-                        &entry.root,
-                    )
-                    || (trusted
-                        .constraints
-                        .iter()
-                        .any(|code| code.as_str() == "owner_private_filesystem_v1")
-                        && entry.public_name == entry.root
-                        && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
-                && entry.availability.level >= CapabilityAvailabilityLevel::Configured
-                && !trusted.excludes_entry(view.model_admission_entry(entry))
-                && !(trusted
-                    .constraints
-                    .iter()
-                    .any(|code| code.as_str() == "intercepts_writes")
-                    && entry.plan_intercepted())
-                && !(trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly
-                    && entry.effect > crate::tools::capability::contract::SideEffectClass::ReadOnly)
-                && (trusted.channel.is_none() || entry.channel_eligible)
-                && proof.child_scope().is_none_or(|scope| {
-                    scope.gate_inputs().0.allowed.iter().any(|reference| {
-                        reference.id == entry.id
-                            && reference.fingerprint == entry.fingerprint
-                            && reference.generation == entry.generation
-                    })
-                })
-                && crate::tools::execution::decide_tool_execution(
-                    &self.security,
-                    entry.policy_tool_name(),
-                    proof.policy_sender(),
-                    proof.policy_channel(),
-                    proof.policy_chat_type(),
-                ) != crate::tools::execution::ToolExecutionDecision::Deny;
-            if !eligible {
-                continue;
-            }
-            entries.insert(
-                entry.id.clone(),
-                DiscoveryEntry {
-                    reference: CapabilityRef {
-                        id: entry.id.clone(),
-                        fingerprint: entry.fingerprint,
-                        generation: entry.generation,
-                    },
-                    core,
-                    searchable: entry.supports_metadata_discovery() || offered_direct.contains(&entry.id),
-                },
-            );
-        }
-        // An explicit engine-selected family may narrow discovery. A Direct
-        // turn has no family prerequisite; an empty narrowing must not strand
-        // otherwise eligible capabilities.
-        if let Some(family) = families.first().copied() {
-            if entries
-                .iter()
-                .any(|(id, entry)| entry.searchable && view.entry_any(id).is_some_and(|item| item.family == family))
-            {
-                entries.retain(|id, entry| entry.core || view.entry_any(id).is_some_and(|item| item.family == family));
-            }
-        }
-        Ok(entries)
-    }
-
-    /// Only an explicit engine-selected family may narrow the index. Empty
-    /// families on ordinary Direct turns mean the full eligible index.
-    fn discovery_families(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
-    ) -> anyhow::Result<Vec<CapabilityTarget>> {
-        self.agent_execution_specs(proof, context)?;
-        // The retired prediction hop (R9) was the only source of a selected
-        // discovery family.
-        Ok(Vec::new())
-    }
-
-    /// Stable control definition, separate from the selected business refs and
-    /// conditional runtime dependencies. Explicit exclusions still apply.
     pub(crate) fn agent_capability_search_spec(
         &self,
         proof: &dyn TurnSourceProof,
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Option<ToolSpec>> {
-        if !matches!(
-            context.directive(),
-            TurnExecutionDirective::AnswerDirectly | TurnExecutionDirective::Execute { .. }
-        ) || context.execution_closed.load(Ordering::Acquire)
-            || !proof.tool_calls_allowed()
-            || !self.model_can_call_tools(proof)
-        {
-            return Ok(None);
-        }
-        if !self
-            .discovery_entries(proof, context)?
-            .values()
-            .any(|entry| entry.searchable)
-        {
-            return Ok(None);
-        }
-        let Some(entry) = self.catalog.entry_for_public_name("capability_search") else {
-            // Custom runtimes may intentionally publish a fixed registry with
-            // no discovery control. Its absence must not invalidate an answer
-            // or a tool already admitted through that registry.
-            tracing::warn!("deferred discovery unavailable: this catalog does not publish capability_search");
-            return Ok(None);
-        };
-        let trusted = context.engine.state.trusted.parts();
-        if self.catalog_view().surface_excludes(entry)
-            || trusted.excludes_entry(self.catalog_view().model_admission_entry(entry))
-            || (trusted.channel.is_some() && !entry.channel_eligible)
-            || matches!(entry.exposure, Exposure::Unavailable { .. })
-            || entry.availability.level < CapabilityAvailabilityLevel::Configured
-            || crate::tools::execution::decide_tool_execution(
-                &self.security,
-                entry.policy_tool_name(),
-                proof.policy_sender(),
-                proof.policy_channel(),
-                proof.policy_chat_type(),
-            ) == crate::tools::execution::ToolExecutionDecision::Deny
-        {
-            return Ok(None);
-        }
-        let descriptor = self
-            .execution
-            .current_descriptor("capability_search")
-            .ok_or(SearchControlUnavailable::MissingBackend)?;
-        let spec = ToolSpec {
-            name: descriptor.public_name,
-            description: descriptor.description,
-            parameters: descriptor.parameters,
-        };
-        anyhow::ensure!(
-            entry.generation == context.catalog_generation()
-                && crate::tools::capability::fingerprint::tool_spec_fingerprint(
-                    &spec.name,
-                    &spec.description,
-                    &spec.parameters,
-                ) == entry.fingerprint,
-            "capability search definition changed"
-        );
-        Ok(Some(spec))
+        search_tool::capability_search_spec(&self.surface_port(context), proof)
     }
 
-    /// A selected Skill needs a way to discover its execution tools after its
-    /// loader narrows the serving slice. A selected filesystem operation also
-    /// needs its read/write peers; process execution is excluded from that
-    /// family handoff. Otherwise only source-named direct peers are offered.
-    /// These IDs are search eligibility, never grants;
-    /// exclusions, read-only mode, child scope and publication gates still apply.
-    fn direct_discovery_ids(&self, context: &TurnDecisionContext) -> BTreeSet<CapabilityId> {
-        let view = self.catalog_view();
-        let selected_skill = context.execution_refs.iter().any(|reference| {
-            view.entry_any(&reference.id).is_some_and(|entry| {
-                matches!(
-                    &entry.target,
-                    crate::tools::capability::catalog::ExecutionTarget::Skill { .. }
-                )
-            })
-        });
-        let selected_filesystem = matches!(context.directive(), TurnExecutionDirective::Execute { .. })
-            && context.execution_refs.iter().any(|reference| {
-                view.entry_any(&reference.id).is_some_and(|entry| {
-                    entry.family == CapabilityTarget::Filesystem
-                        && entry.effect <= crate::tools::capability::contract::SideEffectClass::LocalWrite
-                })
-            });
-        let mut entries =
-            CatalogSearch::exact_mentions(&view, context.engine.state.routing_input.as_str(), 64).unwrap_or_default();
-        if selected_skill || selected_filesystem {
-            entries.extend(view.iter_entries().filter(|entry| {
-                matches!(entry.exposure, Exposure::Direct)
-                    && (selected_skill
-                        || entry.family == CapabilityTarget::Filesystem
-                            && entry.effect <= crate::tools::capability::contract::SideEffectClass::LocalWrite)
-            }));
-        }
-        entries
-            .into_iter()
-            .filter(|entry| {
-                matches!(entry.exposure, Exposure::Direct)
-                    && !context.execution_refs.iter().any(|reference| reference.id == entry.id)
-            })
-            .map(|entry| entry.id.clone())
-            .collect()
+    pub(crate) fn admit_discovered_tool(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        name_or_id: &str,
+    ) -> anyhow::Result<Option<DiscoveredToolProposal>> {
+        search_tool::admit_discovered_tool(&self.surface_port(context), proof, name_or_id)
+    }
+
+    pub(crate) fn prepare_discovered_tool(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        name_or_id: &str,
+    ) -> anyhow::Result<Option<DiscoveredToolProposal>> {
+        search_tool::prepare_discovered_tool(&self.surface_port(context), proof, name_or_id)
+    }
+
+    pub(crate) fn admit_offered_discoveries(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        excluded: impl Fn(&str, &str) -> bool,
+    ) -> usize {
+        self.admit_offered_discoveries_up_to(proof, context, MAX_DISCOVERED_TOOLS_PER_TURN, excluded)
+    }
+
+    pub(crate) fn admit_offered_discoveries_up_to(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        turn_cap: usize,
+        excluded: impl Fn(&str, &str) -> bool,
+    ) -> usize {
+        search_tool::admit_offered_discoveries(&self.surface_port(context), proof, turn_cap, &excluded)
+    }
+
+    pub(crate) fn agent_appended_execution_specs(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> anyhow::Result<ConstrainedToolSelection> {
+        search_tool::appended_execution_specs(&self.surface_port(context), proof)
+    }
+
+    pub(crate) fn agent_execution_specs(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> anyhow::Result<ConstrainedToolSelection> {
+        specs::execution_specs(&self.surface_port(context), proof)
+    }
+
+    pub(crate) fn agent_runtime_dependency_spec(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        name: &str,
+    ) -> anyhow::Result<ToolSpec> {
+        specs::runtime_dependency_spec(&self.surface_port(context), proof, name)
+    }
+
+    pub(crate) fn agent_prompt_skills(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+    ) -> anyhow::Result<Vec<crate::skills::Skill>> {
+        specs::prompt_skills(&self.surface_port(context), proof)
     }
 }

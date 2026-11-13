@@ -47,7 +47,7 @@ impl TurnDecisionService {
 
     /// Called only with the MAC-authenticated durable source of a verified
     /// pending approval. A display owner or model-authored source is insufficient.
-    pub(super) async fn pending_console_filesystem(
+    pub(in crate::runtime) async fn pending_console_filesystem(
         &self,
         source: &MessageEvent,
     ) -> anyhow::Result<Option<Arc<OwnerFilesystem>>> {
@@ -87,7 +87,7 @@ impl TurnDecisionService {
     }
 
     /// Reject impossible shell paths before recording or reviewing approval.
-    pub(super) fn check_shell_path_arguments(&self, command: &str) -> anyhow::Result<()> {
+    pub(in crate::runtime) fn check_shell_path_arguments(&self, command: &str) -> anyhow::Result<()> {
         if self.security.autonomy != crate::security::AutonomyLevel::Full {
             let root = crate::security::path_policy::effective_root(
                 self.generation.effective.runtime.workdir.as_deref(),
@@ -102,7 +102,7 @@ impl TurnDecisionService {
 
     /// The collection, runtime recorder, review and resume all resolve the same
     /// logical path through this function. Resolution creates no directories.
-    pub(super) async fn scoped_file_operation(
+    pub(in crate::runtime) async fn scoped_file_operation(
         &self,
         filesystem: Option<&Arc<OwnerFilesystem>>,
         tool: &str,

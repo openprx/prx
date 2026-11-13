@@ -1011,3 +1011,6 @@ async fn legacy_pending_approval_without_journal_rows_must_be_requested_again() 
         .expect_err("a store-only chain is not evidence; absence never selects the store");
     assert!(error.to_string().contains("request the approval again"), "{error:#}");
 }
+
+mod historical_exact_call_approval;
+mod historical_resume_drift;

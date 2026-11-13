@@ -389,7 +389,7 @@ where
     )
     .expect("original gateway fixture provider/model must pass PMM");
     let runtime = TurnRuntimeGeneration {
-        provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+        provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
             Arc::clone(&state.provider),
             resolved,
         ))),
@@ -513,7 +513,7 @@ where
             // Controlled trait injection: PMM selection and pointer identity are real;
             // this does not claim the production provider factory created the fixture.
             let runtime = TurnRuntimeGeneration {
-                provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
                     Arc::clone(&provider),
                     resolved,
                 ))),
@@ -809,7 +809,7 @@ fn install_webhook_turn_runtime(state: &mut AppState) {
         &config.workspace_dir,
     ));
     let runtime = TurnRuntimeGeneration {
-        provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+        provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
             Arc::clone(&state.provider),
             resolved,
         ))),
@@ -1067,7 +1067,7 @@ fn two_token_webhook_state_with(workspace: &std::path::Path, provider: Arc<dyn P
     let resolved =
         providers::selection::check_default(&manager.pin().effective, providers::catalog::UnknownPolicy::Invocation)
             .expect("test: the configured webhook model must resolve");
-    runtime.provider_binding = Some(Arc::new(decision_source::GatewayProviderBinding::new(
+    runtime.provider_binding = Some(Arc::new(turn_source::GatewayProviderBinding::new(
         Arc::clone(&provider),
         resolved,
     )));

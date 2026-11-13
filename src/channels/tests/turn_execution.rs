@@ -1211,7 +1211,7 @@ async fn channel_retry_of_accepted_input_key_is_refused_with_plane_off() {
     let ticket = cleanup
         .register(CancellationToken::new())
         .expect("test: first cleanup owner");
-    let (event, _source, guard) = decision_source::ChannelSourceReceipt::record_guarded(
+    let (event, _source, guard) = turn_source::ChannelSourceReceipt::record_guarded(
         Arc::clone(&ctx),
         Arc::clone(&generation),
         message.clone(),
@@ -1226,7 +1226,7 @@ async fn channel_retry_of_accepted_input_key_is_refused_with_plane_off() {
     let ticket = cleanup
         .register(CancellationToken::new())
         .expect("test: retry cleanup owner");
-    let retry = decision_source::ChannelSourceReceipt::record_guarded(
+    let retry = turn_source::ChannelSourceReceipt::record_guarded(
         ctx,
         generation,
         message,
@@ -1280,10 +1280,10 @@ async fn channel_admit(
     run: &str,
 ) -> anyhow::Result<(
     Option<crate::memory::MessageEvent>,
-    Arc<decision_source::ChannelSourceReceipt>,
-    decision_source::ChannelAdmissionGuard,
+    Arc<turn_source::ChannelSourceReceipt>,
+    turn_source::ChannelAdmissionGuard,
 )> {
-    decision_source::ChannelSourceReceipt::record_guarded(
+    turn_source::ChannelSourceReceipt::record_guarded(
         Arc::clone(ctx),
         Arc::clone(generation),
         evidence_message(CHANNEL_MESSAGE, content),

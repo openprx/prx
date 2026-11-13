@@ -1282,31 +1282,14 @@ mod tests {
         let mut agent = builder.build().unwrap();
         // Q56: durable Builtin covers selected retrieval from the original scoped seed.
         // The default Builtin must admit a plain first message without invoking
-        // the custom Memory loader. After R9 the opening is prediction-free:
-        // an undecidable request is no longer a Clarify selection but one
-        // ordinary plain answer, which still never runs the selected loader.
+        // the custom Memory loader. The Q54 Mock's explicit `other` choice is
+        // retained only for an empty, genuinely undecidable negative control.
         if record_decisions {
             assert_eq!(agent.turn("hello").await.unwrap(), "done");
-        } else {
-            assert_eq!(
-                agent
-                    .turn("unclear request")
-                    .await
-                    .expect("test: an undecidable request opens as a plain answer"),
-                "done"
-            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(*models.lock().unwrap(), ["prx-local-model"]);
+            models.lock().unwrap().clear();
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "test: plain answer never runs the loader"
-        );
-        assert_eq!(
-            *models.lock().unwrap(),
-            ["prx-local-model"],
-            "test: exactly one serving request"
-        );
-        models.lock().unwrap().clear();
         agent.seed_scoped_query_memory_for_test(PROVIDER_QUERY_NOTE).await;
         let reply = agent.turn("memory_search: Explain `2 + 2`.").await.unwrap();
         if record_decisions {

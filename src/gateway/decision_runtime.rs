@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 pub(super) struct GatewayDecisionSlot {
     pub(super) controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
-    pub(super) cleanup: Arc<super::decision_cleanup::CleanupTracker>,
+    pub(super) cleanup: Arc<super::turn_source::CleanupTracker>,
     service: tokio::sync::OnceCell<Arc<TurnDecisionService>>,
     security: Arc<crate::security::SecurityPolicy>,
     plugin_generation: u64,
@@ -17,7 +17,7 @@ impl GatewayDecisionSlot {
     pub(super) fn new(security: Arc<crate::security::SecurityPolicy>, plugin_generation: u64) -> Self {
         Self {
             controlled: None,
-            cleanup: Arc::new(super::decision_cleanup::CleanupTracker::default()),
+            cleanup: Arc::new(super::turn_source::CleanupTracker::default()),
             service: tokio::sync::OnceCell::new(),
             security,
             plugin_generation,

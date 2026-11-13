@@ -19,7 +19,6 @@
 pub mod activity;
 pub mod cli;
 mod decision_runtime;
-pub(crate) mod decision_source;
 mod decision_turn;
 pub mod dingtalk;
 pub mod discord;
@@ -44,6 +43,7 @@ pub mod slack;
 pub mod telegram;
 pub mod terminal;
 pub mod traits;
+pub(crate) mod turn_source;
 pub mod wacli;
 pub(crate) mod webhook_server;
 pub mod whatsapp;

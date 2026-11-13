@@ -250,7 +250,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
         current: Arc::clone(&owner.current),
         previous: Arc::clone(&previous),
         generation: TurnRuntimeGeneration {
-            provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+            provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
                 Arc::clone(&replacement_provider),
                 resolved,
             ))),

@@ -185,7 +185,7 @@ async fn open_turn_context_g6_slice_is_literal() {
         .service
         .open_turn_context(
             decision.proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -212,15 +212,12 @@ async fn issued_turn_context_cancelled_with_engine_off_returns_cancelled() {
         .service
         .open_issued_turn_context(
             decision.proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &cancellation,
         )
         .await;
     assert!(
-        matches!(
-            result,
-            Err(crate::runtime::turn_decision::AgentDecisionError::Cancelled)
-        ),
+        matches!(result, Err(crate::runtime::turn_context::AgentDecisionError::Cancelled)),
         "expected Cancelled"
     );
 }
@@ -259,7 +256,7 @@ async fn disabled_entry_turn_has_finite_call_budget() {
         .service
         .open_turn_context(
             decision.proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -268,6 +265,7 @@ async fn disabled_entry_turn_has_finite_call_budget() {
     let opened = TurnDecision {
         service: decision.service,
         context: &context,
+        runtime: context.runtime(),
         proof: decision.proof,
     };
     let published = Arc::new(Mutex::new(Vec::new()));
@@ -386,7 +384,8 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
     use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
     use crate::memory::{MemoryVisibility, MessageEventScope};
     use crate::runtime::child_source::ChildProviderBinding;
-    use crate::runtime::turn_decision::{AgentTurnKind, TurnServiceBuild, build_turn_decision_service};
+    use crate::runtime::turn_context::AgentTurnKind;
+    use crate::runtime::turn_publication::{PublicationInputs, build_publication};
     use crate::tools::capability::catalog::CatalogSources;
     use crate::tools::capability::turn_state::TurnSurfaceKind;
     use crate::tools::execution::{
@@ -525,9 +524,9 @@ async fn bound_child_context_keeps_scope_pin_and_grant() {
         blocked: None,
     };
     let provider_catalog = crate::providers::catalog::CatalogView::from_config(&generation.effective);
-    let child_service = build_turn_decision_service(
+    let child_service = build_publication(
         TurnSurfaceKind::Worker,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: Some(Arc::clone(&recursive)),
             generation: Arc::clone(&generation),
             registry: Arc::clone(&child_registry),
@@ -620,7 +619,7 @@ async fn admit_bound_child_segment_with_pricing(priced: bool) -> AdmittedBoundCh
     use crate::agent::test_admission::{AdmittedTurn, NoExternalTransport, SilentEvents, registry_with_search};
     use crate::memory::{MemoryVisibility, MessageEventScope};
     use crate::runtime::child_source::ChildProviderBinding;
-    use crate::runtime::turn_decision::{TurnServiceBuild, build_turn_decision_service};
+    use crate::runtime::turn_publication::{PublicationInputs, build_publication};
     use crate::tools::capability::catalog::CatalogSources;
     use crate::tools::capability::turn_state::TurnSurfaceKind;
     use crate::tools::execution::{
@@ -771,9 +770,9 @@ async fn admit_bound_child_segment_with_pricing(priced: bool) -> AdmittedBoundCh
         blocked: None,
     };
     let provider_catalog = crate::providers::catalog::CatalogView::from_config(&generation.effective);
-    let child_service = build_turn_decision_service(
+    let child_service = build_publication(
         TurnSurfaceKind::Worker,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: Some(Arc::clone(&recursive)),
             generation: Arc::clone(&generation),
             registry: Arc::clone(&child_registry),
@@ -844,7 +843,7 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
         .service
         .open_turn_context(
             decision.proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -852,6 +851,7 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
     let opened = TurnDecision {
         service: decision.service,
         context: &context,
+        runtime: context.runtime(),
         proof: decision.proof,
     };
     let published = Arc::new(Mutex::new(Vec::new()));

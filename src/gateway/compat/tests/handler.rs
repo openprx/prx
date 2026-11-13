@@ -995,7 +995,7 @@ async fn run_admitted_webhook_spawn(
     let event = event_fabric
         .record_inbound_user_message(envelope.message_scope(), input, None, None)
         .await?;
-    let receipt = crate::gateway::decision_source::GatewaySourceReceipt::issue(
+    let receipt = crate::gateway::turn_source::GatewaySourceReceipt::issue(
         memory.as_ref(),
         &generation,
         &envelope,
@@ -1026,7 +1026,7 @@ async fn run_admitted_webhook_spawn(
     let context = service
         .open_issued_turn_context(
             &proof,
-            crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+            crate::runtime::turn_context::AgentTurnKind::SingleShot,
             &cancellation,
         )
         .await?;

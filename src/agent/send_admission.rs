@@ -13,13 +13,13 @@ use std::sync::Arc;
 #[derive(Debug, thiserror::Error)]
 #[error("{diagnostic}")]
 pub(crate) struct ProviderSendRefused {
-    reason: crate::causal_tree::refusal::RefusalReason,
+    reason: crate::agent::refusal::RefusalReason,
     diagnostic: String,
 }
 
 impl ProviderSendRefused {
     pub(crate) fn reply(&self) -> std::borrow::Cow<'static, str> {
-        crate::causal_tree::refusal::render_refusal_reply("budget", self.reason.user_hint().as_deref())
+        crate::agent::refusal::render_refusal_reply("budget", self.reason.user_hint().as_deref())
     }
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn admit_provider_send(
     let answer = crate::cost::estimate::candidate_tokens(0);
     if answer > remaining {
         return Err(ProviderSendRefused {
-            reason: crate::causal_tree::refusal::RefusalReason::Budget,
+            reason: crate::agent::refusal::RefusalReason::Budget,
             diagnostic: format!("provider send refused: answer estimates {answer} tokens but {remaining} remain"),
         }
         .into());
@@ -164,7 +164,7 @@ pub(crate) fn admit_provider_send(
         u64::try_from(limits.response_reserve).unwrap_or(u64::MAX),
     )
     .ok_or_else(|| {
-        use crate::causal_tree::refusal::RefusalReason;
+        use crate::agent::refusal::RefusalReason;
         let reason = if !cost.prices.values().all(|price| price.is_finite_nonnegative()) {
             RefusalReason::InvalidPrice
         } else if matches!(
@@ -180,7 +180,7 @@ pub(crate) fn admit_provider_send(
             crate::llm::route_decision::UsagePrice::Missing
         ) && !crate::cost::estimate::zero_price_exempt(&limits.model)
         {
-            crate::causal_tree::refusal::unpriced_reason(limits.model.provider_label(), limits.model.model())
+            crate::agent::refusal::unpriced_reason(limits.model.provider_label(), limits.model.model())
         } else {
             RefusalReason::Budget
         };
@@ -191,7 +191,7 @@ pub(crate) fn admit_provider_send(
     })?;
     if estimate.micro_usd > ceiling {
         return Err(ProviderSendRefused {
-            reason: crate::causal_tree::refusal::RefusalReason::Budget,
+            reason: crate::agent::refusal::RefusalReason::Budget,
             diagnostic: format!(
                 "provider send refused: the estimated cost of {} micro-USD exceeds the {} remaining",
                 estimate.micro_usd, ceiling,

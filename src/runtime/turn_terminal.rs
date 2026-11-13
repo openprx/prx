@@ -1,11 +1,15 @@
 //! Exact terminal proposals retained across cancellation and future drop.
-use super::turn_decision::VerifiedDirectiveApplication;
+pub(crate) mod execution_close;
+pub(crate) mod settlement;
+pub(crate) mod silence;
+
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::decision_journal::store::{DecisionScope, Enqueue};
 use crate::runtime::turn_decision::TurnDecisionService;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use anyhow::Context;
+use settlement::VerifiedDirectiveApplication;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,8 +21,7 @@ pub(crate) struct TerminalUsageCollector {
     task_id: String,
     require_durable: bool,
     journal: Option<ProcessSegmentJournal>,
-    previous_observation:
-        parking_lot::Mutex<Option<Arc<super::turn_decision::segment_observation::SegmentObservation>>>,
+    previous_observation: parking_lot::Mutex<Option<Arc<super::child_turn::segment_observation::SegmentObservation>>>,
     records: parking_lot::Mutex<std::collections::BTreeMap<String, CollectedSegmentTerminal>>,
 }
 
@@ -96,7 +99,7 @@ impl TerminalUsageCollector {
         }
         if self.require_durable && envelope.source_message_event_id.is_some() {
             let observation =
-                super::turn_decision::segment_observation::SegmentObservation::confirmed(ConfirmedSegmentTerminal {
+                super::child_turn::segment_observation::SegmentObservation::confirmed(ConfirmedSegmentTerminal {
                     receipt,
                     context,
                     envelope,
@@ -114,7 +117,7 @@ impl TerminalUsageCollector {
         &self,
         proof: &super::turn_source::OwnedTurnSourceProof,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
-    ) -> anyhow::Result<Option<Arc<super::turn_decision::segment_observation::SegmentObservation>>> {
+    ) -> anyhow::Result<Option<Arc<super::child_turn::segment_observation::SegmentObservation>>> {
         use super::turn_source::TurnSourceProof;
         anyhow::ensure!(
             proof.workspace_id() == self.workspace
@@ -278,6 +281,7 @@ pub(crate) struct TurnTerminalGuard {
     service: Arc<TurnDecisionService>,
     context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
     settlement: crate::agent::terminal::DecisionSettlementRef,
+    binding: crate::agent::terminal::TerminalBinding,
     fabric: crate::memory::MemoryFabric,
     config: Arc<crate::config::Config>,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
@@ -307,6 +311,7 @@ impl TurnTerminalGuard {
         cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> anyhow::Result<Self> {
         let settlement = service.terminal_settlement_ref(Arc::clone(&context))?;
+        let binding = service.terminal_binding(&context)?;
         Ok(Self {
             child_cleanup: None,
             cleanup_ticket: Some(cleanup_ticket),
@@ -315,6 +320,7 @@ impl TurnTerminalGuard {
             service,
             context,
             settlement,
+            binding,
             fabric,
             config,
             envelope,
@@ -378,6 +384,7 @@ impl TurnTerminalGuard {
         });
         crate::agent::terminal::TurnTerminalDraft {
             decision: Some(self.settlement.clone()),
+            binding: Some(self.binding.clone()),
             terminal_id: self.envelope.run_id.clone().unwrap_or_default(),
             scope: self.envelope.message_scope(),
             status,
@@ -399,7 +406,7 @@ impl TurnTerminalGuard {
         &self,
         mut proposal: crate::agent::terminal::TurnTerminalDraft,
     ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
-        bind_terminal_decision(&mut proposal, &self.settlement)?;
+        bind_terminal_decision(&mut proposal, &self.settlement, &self.binding)?;
         // A failed foreground caller may have lost its return trace after a
         // real provider reply. Use the same observed evidence as abort_commit;
         // the single terminal writer still owns settlement and replay.
@@ -578,6 +585,7 @@ mod auxiliary_registration_tests {
         let now = chrono::Utc::now();
         crate::agent::terminal::TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: "prx_aux_terminal".to_owned(),
             scope,
             status: crate::agent::terminal::TurnTerminalStatus::Failed,
@@ -803,6 +811,7 @@ impl Drop for TurnTerminalGuard {
 pub(crate) fn bind_terminal_decision(
     proposal: &mut crate::agent::terminal::TurnTerminalDraft,
     owned: &crate::agent::terminal::DecisionSettlementRef,
+    binding: &crate::agent::terminal::TerminalBinding,
 ) -> anyhow::Result<()> {
     if let Some(supplied) = proposal.decision.as_ref() {
         anyhow::ensure!(
@@ -810,7 +819,15 @@ pub(crate) fn bind_terminal_decision(
             "terminal proposal decision differs from its guard"
         );
     }
+    if let Some(supplied) = proposal.binding.as_ref() {
+        anyhow::ensure!(
+            binding.same_turn(supplied),
+            "terminal proposal binding differs from its guard"
+        );
+    }
+    owned.validate_binding(binding)?;
     proposal.decision = Some(owned.clone());
+    proposal.binding = Some(binding.clone());
     Ok(())
 }
 

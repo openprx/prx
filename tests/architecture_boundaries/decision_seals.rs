@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 // evidence. Keep exact files; no other runtime module may construct state.
 const TRUST_BEARING_CALLERS: &[&str] = &[
     "src/runtime/turn_decision.rs",
-    "src/runtime/turn_decision/routing.rs",
-    "src/runtime/turn_decision/segment_observation.rs",
+    "src/router/turn_routing.rs",
+    "src/runtime/child_turn/segment_observation.rs",
 ];
 
 /// The trust-bearing constructors, named by identifiers no other code uses,

@@ -166,9 +166,10 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             let terminal_id = scope.run_id.clone().unwrap();
             let decision = admission.decision();
             let settlement = decision.service.terminal_settlement_ref(Arc::clone(decision.context))?;
+            let binding = decision.service.terminal_binding(decision.context)?;
             let now = chrono::Utc::now();
             let draft = TurnTerminalDraft {
-                decision: Some(settlement), terminal_id, scope, status,
+                decision: Some(settlement), binding: Some(binding), terminal_id, scope, status,
                 history: None, history_scope: None, provider_outcome: None,
                 telemetry: TurnTerminalTelemetry { summary: "prx prepared call interrupted".into(), started_at: now, finished_at: now },
                 delivery_intent: TurnDeliveryIntent::None,

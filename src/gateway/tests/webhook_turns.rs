@@ -275,7 +275,7 @@ async fn a_webhook_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
             // Controlled trait injection: PMM selection and pointer identity are real;
             // this does not claim the production provider factory created the fixture.
             let runtime = TurnRuntimeGeneration {
-                provider_binding: Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                provider_binding: Some(Arc::new(turn_source::GatewayProviderBinding::new(
                     Arc::clone(&provider),
                     resolved,
                 ))),

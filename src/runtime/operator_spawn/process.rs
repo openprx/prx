@@ -300,7 +300,7 @@ impl OperatorProcessLaunch {
 }
 
 pub(crate) enum ProcessSourceLaunch {
-    Ordinary(Box<crate::runtime::turn_decision::OrdinaryProcessLaunch>),
+    Ordinary(Box<crate::runtime::child_source::publication::OrdinaryProcessLaunch>),
     Operator(Box<OperatorProcessLaunch>),
 }
 impl ProcessSourceLaunch {

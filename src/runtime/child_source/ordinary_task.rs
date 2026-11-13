@@ -1,6 +1,6 @@
 //! Process-local source authority for one background task, not a durable grant.
 use super::{ChildInputReceipt, ChildProviderBinding};
-use crate::runtime::turn_decision::OrdinaryChildPublication;
+use crate::runtime::child_source::publication::OrdinaryChildPublication;
 use crate::runtime::turn_source::OwnedTurnSourceProof;
 use crate::tools::ToolExecutionContext;
 use anyhow::Context;

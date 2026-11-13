@@ -289,6 +289,7 @@ async fn persist_completed_chat(
             fabric,
             TurnTerminalDraft {
                 decision: binding.settlement_ref(run).expect("test: settlement"),
+                binding: binding.terminal_binding(run).expect("test: terminal binding"),
                 terminal_id: run.to_owned(),
                 scope: scope.clone(),
                 status: TurnTerminalStatus::Completed,

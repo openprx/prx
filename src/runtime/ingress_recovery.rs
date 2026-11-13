@@ -1540,10 +1540,27 @@ fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<toki
     Ok(gate)
 }
 
+/// Cleanup transfers temporary construction ownership to the published
+/// service under its existing retention lock, matching both actual queues.
+pub(crate) fn owns_prepared_queues(
+    service: &crate::runtime::turn_decision::TurnDecisionService,
+    store: Option<&std::sync::Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
+    events: Option<&std::sync::Arc<crate::runtime::causal_events::DurableCausalEventSink>>,
+) -> bool {
+    store.is_some_and(|store| std::sync::Arc::ptr_eq(store, &service.store))
+        && match (service.durable_events.as_ref(), events) {
+            (Some(published), Some(prepared)) => std::sync::Arc::ptr_eq(published, prepared),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 #[cfg(test)]
 mod tests;
 
 mod authority;
+pub(crate) mod child_telemetry;
+pub(crate) mod status;
 pub(crate) use authority::{LegacyUnconfirmed, SettledTerminalFacts, SkillObservation};
 
 #[cfg(test)]

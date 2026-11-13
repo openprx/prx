@@ -424,7 +424,7 @@ pub(crate) fn report_decision_service_status(service: &super::turn_decision::Tur
     }
 }
 
-fn published_decision_layer(status: super::turn_decision::DecisionPlaneStatus) -> ControlLayerTrace {
+fn published_decision_layer(status: super::ingress_recovery::status::DecisionPlaneStatus) -> ControlLayerTrace {
     let order: Vec<_> = status
         .backend
         .order
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn published_disabled_service_keeps_exact_generation_and_store_state() {
-        let status = super::super::turn_decision::DecisionPlaneStatus {
+        let status = super::super::ingress_recovery::status::DecisionPlaneStatus {
             backend: crate::decision_engine::prediction::factory::BackendPlaneStatus {
                 enabled: false,
                 config_generation: 23,

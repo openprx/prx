@@ -5,6 +5,7 @@
 //! delivery intent, while this finalizer writes idempotent history/telemetry,
 //! computes one usage settlement, and appends one `turn.finalized` commit marker.
 
+pub(crate) mod binding;
 pub(crate) mod logical;
 pub(crate) mod oversized_reply;
 pub(crate) mod recovery_commit;
@@ -12,6 +13,7 @@ mod replay;
 #[cfg(test)]
 pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
+pub use binding::TerminalBinding;
 pub(crate) use replay::{
     REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
     read_journal_replay_record, read_journal_replay_record_on, replay_requires_journal, verify_terminal_replay,
@@ -22,10 +24,11 @@ use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
-use crate::memory::{Memory, MemoryFabric, MessageEvent, MessageEventScope};
+use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::decision_journal::store::{DecisionScope, DecisionStoreReader, DecisionStoreWriter, Enqueue};
-use crate::runtime::turn_decision::{SettlementIssueToken, TurnDecisionContext};
+use crate::runtime::turn_decision::TurnDecisionContext;
+use crate::runtime::turn_terminal::settlement::SettlementIssueToken;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
@@ -71,6 +74,9 @@ pub struct TurnTerminalDraft {
     /// The owning guard fills omitted authority before sealing this draft.
     /// Direct finalization rejects an omitted link before any writes.
     pub decision: Option<DecisionSettlementRef>,
+    /// The execution-owned terminal binding; the owning guard fills it, and
+    /// direct finalization rejects a draft without one.
+    pub binding: Option<TerminalBinding>,
     pub terminal_id: String,
     pub scope: MessageEventScope,
     pub status: TurnTerminalStatus,
@@ -86,8 +92,10 @@ pub struct TurnTerminalDraft {
 /// A finalized model-turn proposal always carries service-issued authority.
 #[derive(Debug, Clone)]
 pub struct TurnTerminalCommit {
-    /// Required service-issued source binding, including disabled turns.
-    pub decision: DecisionSettlementRef,
+    /// Required execution-owned terminal binding.
+    pub binding: TerminalBinding,
+    /// Service-issued decision link of a model turn, including disabled turns.
+    pub decision: Option<DecisionSettlementRef>,
     pub terminal_id: String,
     pub scope: MessageEventScope,
     pub status: TurnTerminalStatus,
@@ -100,14 +108,31 @@ pub struct TurnTerminalCommit {
     pub delivery_intent: TurnDeliveryIntent,
 }
 
+impl TurnTerminalCommit {
+    /// The service-issued decision link a model terminal requires.
+    pub(crate) fn link(&self) -> anyhow::Result<&DecisionSettlementRef> {
+        self.decision
+            .as_ref()
+            .context("model terminal commit has no service-issued decision")
+    }
+
+    /// Whether the commit carries a durably recorded decision link.
+    pub(crate) fn is_recorded(&self) -> bool {
+        self.decision.as_ref().is_some_and(DecisionSettlementRef::is_recorded)
+    }
+}
+
 impl TryFrom<TurnTerminalDraft> for TurnTerminalCommit {
     type Error = anyhow::Error;
 
     fn try_from(draft: TurnTerminalDraft) -> anyhow::Result<Self> {
+        let binding = draft.binding.context("terminal draft has no terminal binding")?;
+        if let Some(decision) = draft.decision.as_ref() {
+            decision.validate_binding(&binding)?;
+        }
         Ok(Self {
-            decision: draft
-                .decision
-                .context("terminal draft has no service-issued decision")?,
+            binding,
+            decision: draft.decision,
             terminal_id: draft.terminal_id,
             scope: draft.scope,
             status: draft.status,
@@ -122,18 +147,14 @@ impl TryFrom<TurnTerminalDraft> for TurnTerminalCommit {
 
 #[derive(Clone)]
 pub struct DecisionSettlementRef {
-    parent_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    operator_parent: Option<Arc<crate::runtime::child_source::parent::ParentSource>>,
     decision_id: DecisionId,
     context: Arc<TurnDecisionContext>,
     recorded: Option<RecordedDecisionSettlement>,
-    workspace_dir: PathBuf,
-    cost_config: CostConfig,
-    memory: Arc<dyn Memory>,
 }
 
 #[derive(Clone)]
 struct RecordedDecisionSettlement {
+    workspace_dir: PathBuf,
     writer: DecisionStoreWriter,
     reader: DecisionStoreReader,
     store_workspace_id: Arc<str>,
@@ -169,8 +190,6 @@ impl DecisionSettlementRef {
         store_workspace_id: Arc<str>,
         key: Arc<DecisionKey>,
         workspace_dir: PathBuf,
-        cost_config: CostConfig,
-        memory: Arc<dyn Memory>,
         _token: SettlementIssueToken,
     ) -> Self {
         let child_outcome_hook: Arc<dyn ChildOutcomeHook> = Arc::new(JournalChildOutcomeHook::new(
@@ -179,101 +198,37 @@ impl DecisionSettlementRef {
             Arc::clone(&store_workspace_id),
         ));
         Self {
-            parent_grant: None,
-            operator_parent: None,
             decision_id: context.decision_id(),
             context,
             recorded: Some(RecordedDecisionSettlement {
+                workspace_dir,
                 writer,
                 reader,
                 store_workspace_id,
                 key,
                 child_outcome_hook,
             }),
-            workspace_dir,
-            cost_config,
-            memory,
         }
     }
 
     /// A disabled turn retains its source binding without any store writer,
     /// reader or replay key. It cannot claim a durable decision outcome.
-    pub(crate) fn issued_disabled(
-        context: Arc<TurnDecisionContext>,
-        workspace_dir: PathBuf,
-        cost_config: CostConfig,
-        memory: Arc<dyn Memory>,
-        _token: SettlementIssueToken,
-    ) -> Self {
+    pub(crate) fn issued_disabled(context: Arc<TurnDecisionContext>, _token: SettlementIssueToken) -> Self {
         Self {
-            parent_grant: None,
-            operator_parent: None,
             decision_id: context.decision_id(),
             context,
             recorded: None,
-            workspace_dir,
-            cost_config,
-            memory,
         }
     }
 
-    pub(crate) fn with_parent_grant(
-        mut self,
-        grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    ) -> Self {
-        self.parent_grant = grant;
-        self
-    }
-
-    pub(crate) fn with_operator_parent(
-        mut self,
-        parent: Option<Arc<crate::runtime::child_source::parent::ParentSource>>,
-    ) -> Self {
-        self.operator_parent = parent;
-        self
-    }
-
-    fn validate_terminal_scope(
-        &self,
-        fabric: &MemoryFabric,
-        scope: &MessageEventScope,
-        history_scope: Option<&MessageEventScope>,
-        workspace_dir: &Path,
-        cost_config: &CostConfig,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            Arc::ptr_eq(&self.memory, &fabric.memory()),
-            "decision terminal memory does not match the pinned service"
-        );
-        // The pinned trusted scope captured at opening (R22), not a decision hop.
-        let trusted = &self.context.runtime().trusted;
+    /// The link and the binding must belong to the same opened turn, and the
+    /// link must still name its own decision.
+    pub(crate) fn validate_binding(&self, binding: &TerminalBinding) -> anyhow::Result<()> {
         anyhow::ensure!(self.decision_id == self.context.decision_id(), "decision link changed");
         anyhow::ensure!(
-            workspace_dir == self.workspace_dir && cost_config == &self.cost_config,
-            "decision settlement workspace or cost configuration does not match the pinned turn"
+            Arc::ptr_eq(self.context.runtime(), binding.runtime()),
+            "terminal binding belongs to another turn"
         );
-        anyhow::ensure!(
-            trusted.workspace_id.as_ref() == fabric.workspace_id(),
-            "decision terminal workspace does not match the pinned turn"
-        );
-        // Both writes retain the recorded ingress identity and visibility. Sender
-        // and recipient are presentation labels and may differ for history.
-        for write_scope in [scope, history_scope.unwrap_or(scope)] {
-            anyhow::ensure!(
-                crate::runtime::turn_source::ingress_event_surface(
-                    &write_scope.source,
-                    write_scope.channel.as_deref(),
-                    &write_scope.visibility
-                ) == Some(trusted.surface)
-                    && write_scope.channel.as_deref() == Some(self.context.source_channel())
-                    && write_scope.owner_id.as_deref() == trusted.owner_id.as_deref()
-                    && write_scope.session_key.as_deref() == trusted.session_key.as_deref()
-                    && write_scope.run_id.as_deref() == trusted.run_id.as_deref()
-                    && crate::runtime::turn_source::subject_task_id(write_scope.subject.as_ref())
-                        == trusted.task_id.as_deref(),
-                "decision terminal or history scope does not match the pinned turn"
-            );
-        }
         Ok(())
     }
 
@@ -304,7 +259,7 @@ impl DecisionSettlementRef {
         for (position, id) in self.context.hop_ids().iter().enumerate() {
             let view = if REPLAY_EVIDENCE_AUTHORITY {
                 read_journal_replay_record(
-                    &self.workspace_dir,
+                    &recorded.workspace_dir,
                     &recorded.key,
                     &recorded.store_workspace_id,
                     &owner_id,
@@ -717,25 +672,25 @@ async fn finalize_turn_impl(
         ensure_runtime_authority(&commit.scope, "start").await?;
         let mut execution_trace = None;
         let mut prepared_replay = None;
-        commit.decision.validate_terminal_scope(
+        let link = commit.link()?.clone();
+        link.validate_binding(&commit.binding)?;
+        commit.binding.validate_terminal_scope(
             fabric,
             &commit.scope,
             commit.history_scope.as_ref(),
             workspace_dir,
             cost_config,
         )?;
-        let prepared_parameters = commit.decision.context.runtime().prepared_main_parameters();
+        let prepared_parameters = commit.binding.runtime().prepared_main_parameters();
         if !prepared_parameters.is_empty()
             && let Some(outcome) = commit.provider_outcome.as_mut()
         {
             outcome.prepared_parameters.clone_from(&prepared_parameters);
         }
-        commit
-            .decision
-            .context
+        link.context
             .validate_silent_terminal(commit.status, commit.provider_outcome.as_ref())?;
-        if commit.decision.is_recorded() {
-            let decision = &commit.decision;
+        if link.is_recorded() {
+            let decision = &link;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             decision.validate_durable_chain().await?;
             let mut prepared = replay::PreparedReplay::capture(decision, &commit).await?;
@@ -924,7 +879,7 @@ async fn finalize_turn_impl(
         // persistence redactor changes text. Only bounded digests are retained.
         let reply_reference = if fabric.records_recovery_terminal() {
             commit.history.as_ref().map(|history| {
-                let model = &commit.decision.context.audit_hops().last()
+                let model = &link.context.audit_hops().last()
                     .context("decision has no final hop")?.state.trusted.parts().resolved_model_id;
                 oversized_reply::ReplyReference::new(&history.assistant_content, model)
             }).transpose()?
@@ -1027,15 +982,12 @@ async fn finalize_turn_impl(
             crate::llm::route_decision::record_provider_outcome_events(fabric, commit.scope.clone(), outcome).await?;
         }
 
-        let decision_id = commit
-            .decision
-            .is_recorded()
-            .then(|| commit.decision.decision_id.to_string());
+        let decision_id = link.is_recorded().then(|| link.decision_id.to_string());
         let payload = TurnTerminalPayload {
             terminal_id: &commit.terminal_id,
             decision_id: decision_id.as_deref(),
-            model_catalog_revision: commit.decision.context.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
-            model_catalog_content_sha256: commit.decision.context.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
+            model_catalog_revision: commit.binding.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
+            model_catalog_content_sha256: commit.binding.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
             status: commit.status,
             history: &commit.history,
             history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
@@ -1055,7 +1007,7 @@ async fn finalize_turn_impl(
         // text): every string in it passes the same redactor.
         let mut payload_value = redact_persisted_json(serde_json::to_value(&payload)?);
         if let Some(prepared) = prepared_replay {
-            let decision = &commit.decision;
+            let decision = &link;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             prepared.seal(&recorded.key, &mut payload_value, assistant_event.as_ref())?;
         }
@@ -1075,8 +1027,8 @@ async fn finalize_turn_impl(
             .await?;
 
         let mut journal_selected = None;
-        if commit.decision.is_recorded() {
-            let decision = &commit.decision;
+        if link.is_recorded() {
+            let decision = &link;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             let owner_id = terminal_event
                 .owner_id
@@ -1122,14 +1074,14 @@ async fn finalize_turn_impl(
         // finalization joins and releases as well. Restart recovery
         // (`rejoin_terminal`, `rejoin_ingress_terminal`) reaches the same
         // lifecycle call-in from its own owner with the facts it can verify.
-        let awaiting_approval = skill_awaiting_approval(&commit.decision, execution_trace.as_ref());
+        let awaiting_approval = skill_awaiting_approval(&link, execution_trace.as_ref());
         let observations = skill_observations(
-            &commit.decision,
+            &link,
             execution_trace.as_ref(),
             commit.provider_outcome.as_ref(),
         );
         if !awaiting_approval {
-            commit.decision.context.runtime().retire_recursive_allowance();
+            commit.binding.runtime().retire_recursive_allowance();
         }
         release_skill_lifecycle(
             workspace_dir,
@@ -1153,8 +1105,8 @@ async fn finalize_turn_impl(
         if stop_after_marker {
             return Ok(receipt);
         }
-        if commit.decision.is_recorded() {
-            let decision = &commit.decision;
+        if link.is_recorded() {
+            let decision = &link;
             let recorded = decision.recorded.as_ref().context("recorded decision is missing")?;
             let facts = TerminalFacts::from_receipt(&decision.context, &receipt)?;
             let queued = OutcomeCorrelator::settle(&recorded.writer, &decision.context, &facts)? == Enqueue::Queued;
@@ -1242,6 +1194,7 @@ mod tests {
         let started_at = chrono::Utc::now();
         TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: terminal_id.to_string(),
             scope: MessageEventScope::new("agent", MemoryVisibility::Workspace)
                 .with_channel("test")
@@ -1525,7 +1478,7 @@ mod tests {
                     crate::runtime::logical_clock::ManualClock::new(),
                     service.open_issued_turn_context(
                         &proof,
-                        crate::runtime::turn_decision::AgentTurnKind::Repl,
+                        crate::runtime::turn_context::AgentTurnKind::Repl,
                         &cancellation,
                     ),
                 ),
@@ -1615,6 +1568,7 @@ mod tests {
                         decision: crate::agent::turn_request::TurnDecision {
                             service: &service,
                             context: &context,
+                            runtime: context.runtime(),
                             proof: &proof,
                         },
                     },
@@ -1672,6 +1626,7 @@ mod tests {
                 actual.fallback_reason.clone_from(&original.fallback_reason);
                 draft.provider_outcome = Some(actual);
             }
+            let binding = service.terminal_binding(&context).unwrap();
             let decision = service.terminal_settlement_ref(context).unwrap();
             if decision.is_recorded() {
                 decision.validate_durable_chain().await.unwrap();
@@ -1683,6 +1638,7 @@ mod tests {
                 .with_run_id(proof.run_id());
             draft.scope.causation_event_id = proof.source_event_id().map(str::to_owned);
             draft.decision = Some(decision);
+            draft.binding = Some(binding);
             // The decision writer can enqueue causal events after its own commit.
             // Establish fixture baselines only after both queues acknowledge.
             assert!(service.drain_writes(Instant::now() + Duration::from_secs(5)).await);
@@ -2287,6 +2243,7 @@ mod tests {
         );
         let mut commit = TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: "run-a".to_string(),
             scope,
             status: TurnTerminalStatus::Completed,
@@ -2386,6 +2343,7 @@ mod tests {
             });
             let mut commit = TurnTerminalDraft {
                 decision: None,
+                binding: None,
                 terminal_id: terminal_id.clone(),
                 scope,
                 status,
@@ -2518,6 +2476,7 @@ mod tests {
                 &fabric,
                 TurnTerminalDraft {
                     decision: None,
+                    binding: None,
                     terminal_id: terminal_id.clone(),
                     scope,
                     status: TurnTerminalStatus::Completed,
@@ -2605,6 +2564,7 @@ mod tests {
         );
         let mut commit = TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: "run-priced".to_string(),
             scope,
             status: TurnTerminalStatus::Completed,

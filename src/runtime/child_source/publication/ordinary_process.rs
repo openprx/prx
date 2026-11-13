@@ -1,12 +1,11 @@
 //! Export ordinary provenance only from a still-live selected spawn call.
-use super::{
-    Arc, CatalogScope, CausalDecisionStore, Context, DecisionBackendFactory, FactoryDeps, OrdinaryChildPublication,
-    TurnDecisionService, TurnLoopRuntime, TurnServiceBuild, TurnSourceProof, TurnSurfaceKind, pinned_policy_version,
-};
+use super::OrdinaryChildPublication;
 use crate::runtime::child_source::{ChildInputReceipt, ChildProviderBinding};
+use crate::runtime::turn_source::TurnSourceProof;
 use crate::session_worker::protocol::{
     WorkerManifest, WorkerOrdinarySource, WorkerProviderSelection, WorkerRecordedInput,
 };
+use std::sync::Arc;
 
 /// Captured while the selected parent call is live; consumed by its sole
 /// process owner. It carries no transport key and cannot admit execution.
@@ -189,103 +188,5 @@ impl OrdinaryProcessLaunch {
         worker.route_credential = route.map(|_| resolved.credential().reference().clone());
         worker.ordinary_source = Some(source);
         Ok(())
-    }
-}
-
-impl TurnDecisionService {
-    /// Bind the restored source to this process's actual executor and runtime
-    /// extensions. The signed catalog alone cannot authorize execution.
-    pub(crate) fn ordinary_process_service(
-        authority: Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>,
-        build: TurnServiceBuild<'_>,
-        runtime: TurnLoopRuntime,
-    ) -> anyhow::Result<Arc<Self>> {
-        authority.verify()?;
-        let snapshots = authority.snapshots();
-        anyhow::ensure!(
-            build.parent_grant.is_none()
-                && Arc::ptr_eq(&build.generation, &snapshots.generation)
-                && Arc::ptr_eq(&build.memory, &authority.source_fabric().memory())
-                && build.catalog_sources.config_generation_id == snapshots.generation.id.0.to_string(),
-            "ordinary worker service differs from restored source"
-        );
-        let (child, parent) = snapshots.scope.gate_inputs();
-        let view = snapshots
-            .catalog
-            .view(&CatalogScope::default())
-            .with_surface(&build.surface_policy);
-        for reference in &child.allowed {
-            let entry = view
-                .entry_any(&reference.id)
-                .context("ordinary worker capability missing")?;
-            anyhow::ensure!(
-                !view.surface_excludes(entry),
-                "ordinary worker capability exceeds executor policy"
-            );
-        }
-        snapshots
-            .catalog
-            .check_child_parity(&build.execution, &snapshots.scope)?;
-        let config = &snapshots.generation.effective;
-        let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &parent.key)?;
-        let factory = DecisionBackendFactory::from_config(
-            config,
-            FactoryDeps {
-                catalog: &snapshots.provider_catalog,
-                key: None,
-                transports: build.transports,
-                config_generation: snapshots.generation.id.0,
-                events: Arc::clone(&build.events),
-            },
-        )?
-        .with_unproven_budget_gate();
-        let store = CausalDecisionStore::open_unshared_read_only(&config.workspace_dir);
-        let service = Arc::new(Self {
-            runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
-                Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
-                    Arc::clone(&build.memory),
-                    config.workspace_dir.clone(),
-                    TurnSurfaceKind::Worker,
-                )),
-                Some(Arc::new(std::sync::atomic::AtomicU64::new(
-                    u64::from(child.authority.max_cost_cents) * 10_000,
-                ))),
-                None,
-                &snapshots.generation.effective,
-                &build.security,
-            )),
-            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
-                Arc::clone(&snapshots.generation.effective),
-                None,
-            ),
-            child_recovery: Default::default(),
-            memory_loader: None,
-            loop_runtime: Some(runtime),
-            publication_policy: build.surface_policy,
-            ordinary_parent: None,
-            operator_task: None,
-            operator_process: None,
-            ordinary_task: None,
-            ordinary_process: Some(Arc::clone(&authority)),
-            service_id: uuid::Uuid::now_v7(),
-            surface: TurnSurfaceKind::Worker,
-            generation: Arc::clone(&snapshots.generation),
-            catalog: Arc::clone(&snapshots.catalog),
-            provider_catalog: snapshots.provider_catalog.as_ref().clone(),
-            factory,
-            events: build.events,
-            state_key: Arc::clone(&parent.key),
-            policy_version,
-            durable_key: false,
-            recordable: false,
-            registry: build.registry,
-            execution: build.execution,
-            memory: build.memory,
-            security: build.security,
-            store,
-            durable_events: None,
-        });
-        service.check_live_parity()?;
-        Ok(service)
     }
 }

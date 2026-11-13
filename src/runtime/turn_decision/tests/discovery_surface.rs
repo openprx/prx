@@ -5,6 +5,17 @@
 use super::*;
 use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
 
+/// Whether the turn's execution-owned published surface carries the named
+/// catalog capability.
+fn publishes(service: &TurnDecisionService, context: &TurnDecisionContext, name: &str) -> bool {
+    service.catalog().entry_for_public_name(name).is_some_and(|entry| {
+        context
+            .execution_refs()
+            .iter()
+            .any(|reference| reference.id == entry.id)
+    })
+}
+
 struct DiscoverySurfaceTool {
     name: &'static str,
     dispatches: Arc<AtomicUsize>,
@@ -67,9 +78,9 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
             ));
             let provider_catalog = ProviderCatalogView::from_config(&config);
             let transports = CountingTransports(AtomicUsize::new(0));
-            let service = build_turn_decision_service(
+            let service = build_publication(
                 TurnSurfaceKind::AgentLoop,
-                TurnServiceBuild {
+                PublicationInputs {
                     parent_grant: None,
                     generation: Arc::clone(&generation),
                     registry,
@@ -108,9 +119,9 @@ async fn named_memory_recall_becomes_ready_after_selected_discovery_without_publ
                 assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "memory_recall"));
             } else {
                 assert!(
-                    matches!(context.directive(), TurnExecutionDirective::Execute { .. }),
+                    publishes(&service, &context, "memory_recall"),
                     "{:?}",
-                    context.directive()
+                    context.execution_refs()
                 );
                 let specs = published.unwrap();
                 assert!(specs.specs.iter().any(|spec| spec.name == "memory_recall"));
@@ -194,9 +205,9 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
             ));
             let provider_catalog = ProviderCatalogView::from_config(&config);
             let transports = CountingTransports(AtomicUsize::new(0));
-            let service = build_turn_decision_service(
+            let service = build_publication(
                 TurnSurfaceKind::AgentLoop,
-                TurnServiceBuild {
+                PublicationInputs {
                     parent_grant: None,
                     generation: Arc::clone(&generation),
                     registry,
@@ -238,9 +249,9 @@ async fn named_skill_and_loader_select_the_skill_without_competing_targets() {
                 assert!(published.is_err() || published.unwrap().specs.iter().all(|spec| spec.name != "docx"));
             } else {
                 assert!(
-                    matches!(context.directive(), TurnExecutionDirective::Execute { .. }),
+                    publishes(&service, &context, "docx"),
                     "{:?}",
-                    context.directive()
+                    context.execution_refs()
                 );
                 let specs = published.unwrap();
                 assert!(
@@ -354,9 +365,9 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
-    let service = build_turn_decision_service(
+    let service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -387,7 +398,7 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
         .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
         .await
         .unwrap();
-    assert!(matches!(context.directive(), TurnExecutionDirective::AnswerDirectly));
+    assert!(context.is_run());
     let selected = service.agent_execution_specs(&proof, &context).unwrap();
     assert_eq!(
         selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
@@ -466,9 +477,9 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
         let provider_catalog = ProviderCatalogView::from_config(&config);
         let transports = CountingTransports(AtomicUsize::new(0));
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
-        let service = build_turn_decision_service(
+        let service = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -505,7 +516,7 @@ async fn selected_native_write_can_discover_read_peer_without_offering_shell() {
             .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .unwrap();
-        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
+        assert!(publishes(&service, &context, "file_write"));
         let core = service.agent_execution_specs(&proof, &context).unwrap();
         assert!(core.specs.iter().any(|spec| spec.name == "file_write"));
         assert!(

@@ -154,7 +154,7 @@ impl OperatorTaskAuthority {
         &self.source.fabric
     }
 
-    pub(crate) fn publication(&self) -> &crate::runtime::turn_decision::OperatorChildPublication {
+    pub(crate) fn publication(&self) -> &crate::runtime::child_source::publication::OperatorChildPublication {
         &self.source.publication
     }
 

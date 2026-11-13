@@ -80,9 +80,9 @@ where
                 ));
                 let catalog = ProviderCatalogView::from_config(&config);
                 let transports = crate::decision_engine::prediction::compatible_http::HttpDecisionTransports;
-                let mut service = build_turn_decision_service(
+                let mut service = build_publication(
                     TurnSurfaceKind::AgentLoop,
-                    TurnServiceBuild {
+                    PublicationInputs {
                         parent_grant: None,
                         generation: Arc::clone(&generation),
                         registry,
@@ -124,10 +124,18 @@ where
                 let context = service
                     .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
                     .await?;
+                let spawn_id = service
+                    .catalog()
+                    .entry_for_public_name("sessions_spawn")
+                    .map(|entry| entry.id.clone())
+                    .expect("test: registered spawn capability");
                 assert!(
-                    matches!(context.directive(), TurnExecutionDirective::Delegate { .. }),
-                    "test: parent manifest requires admitted delegation: {:?}",
-                    context.engine.selection
+                    context
+                        .execution_refs()
+                        .iter()
+                        .any(|reference| reference.id == spawn_id),
+                    "test: parent manifest requires the published spawn capability: {:?}",
+                    context.execution_refs()
                 );
                 assert!(context.record_admitted.load(Ordering::Acquire));
                 let selected = service.agent_execution_specs(&proof, &context)?;

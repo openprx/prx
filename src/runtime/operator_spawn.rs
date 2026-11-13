@@ -18,7 +18,7 @@ pub(crate) struct OperatorSpawnSource {
     resolved: crate::providers::catalog::ResolvedModel,
     route: Option<crate::providers::catalog::RouteTarget>,
     security: Arc<crate::security::SecurityPolicy>,
-    publication: crate::runtime::turn_decision::OperatorChildPublication,
+    publication: crate::runtime::child_source::publication::OperatorChildPublication,
     task: String,
     claimed: AtomicBool,
     child_issued: AtomicBool,
@@ -43,6 +43,7 @@ impl OperatorSpawnSource {
         task: String,
         security: Arc<crate::security::SecurityPolicy>,
         publication: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             proof.surface() == crate::tools::capability::turn_state::TurnSurfaceKind::Interactive
@@ -56,8 +57,9 @@ impl OperatorSpawnSource {
                 && !task.is_empty(),
             "operator source identity differs"
         );
-        let publication = crate::runtime::turn_decision::OperatorChildPublication::capture(
+        let publication = crate::runtime::child_source::publication::OperatorChildPublication::capture(
             publication,
+            runtime,
             proof,
             &generation,
             &fabric.memory(),

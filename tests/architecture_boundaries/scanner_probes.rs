@@ -571,7 +571,7 @@ planted_violation_probes! {
         "fn d0_planted_finalize() { let _ = crate::agent::terminal::finalize_turn; }\n";
     probe_causal_outcome_service_builder: the_causal_domain_imports_no_backend_and_no_network,
         "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn d0_planted_service() { let _ = crate::runtime::turn_decision::build_turn_decision_service; }\n";
+        "fn d0_planted_service() { let _ = crate::runtime::turn_publication::build_publication; }\n";
     probe_causal_outcome_memory_io: the_causal_domain_imports_no_backend_and_no_network,
         "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn d0_planted_memory() { let _ = crate::memory::MemoryFabric::new; }\n";

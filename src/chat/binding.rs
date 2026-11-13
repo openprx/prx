@@ -74,7 +74,7 @@ fn persistence_cause_is_public(text: &str) -> bool {
 /// failures include owner/scope/consumption checks and retain the same refusal.
 /// Never render an error's text: its sources may contain private identifiers.
 pub(super) fn resume_admission_failure_reply(error: &anyhow::Error) -> &'static str {
-    use crate::runtime::turn_decision::AgentDecisionError;
+    use crate::runtime::turn_context::AgentDecisionError;
     let infrastructure = error.chain().any(|cause| {
         cause.is::<std::io::Error>()
             || cause.is::<rusqlite::Error>()
@@ -491,6 +491,7 @@ impl ChatOperatorSpawn {
                 None,
             )
         };
+        let runtime = Arc::clone(publication.runtime_holder());
         let source = crate::runtime::operator_spawn::OperatorSpawnSource::new(
             binding.as_ref(),
             Arc::clone(generation),
@@ -499,6 +500,7 @@ impl ChatOperatorSpawn {
             self.task.clone(),
             security,
             publication,
+            runtime,
         )?;
         if let Some(guard) = admission_guard {
             guard.handoff();
@@ -809,6 +811,20 @@ impl ChatTurnBinding {
         ))
     }
 
+    pub(super) fn terminal_binding(
+        &self,
+        terminal_id: &str,
+    ) -> anyhow::Result<Option<crate::agent::terminal::TerminalBinding>> {
+        let Some(decided) = self.decision.get() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.envelope.run_id.as_deref() == Some(terminal_id),
+            "chat terminal id differs from its source"
+        );
+        Ok(Some(decided.service.terminal_binding(&decided.context)?))
+    }
+
     pub(super) async fn rejoin_recovery_terminal(&self, terminal_id: &str) -> anyhow::Result<()> {
         if let Some(decided) = self.decision.get() {
             anyhow::ensure!(
@@ -935,6 +951,7 @@ impl ChatTurnBinding {
             fabric,
             TurnTerminalDraft {
                 decision: self.settlement_ref(terminal_id)?,
+                binding: self.terminal_binding(terminal_id)?,
                 terminal_id: terminal_id.to_owned(),
                 history_scope: Some(scope.clone().with_sender("prx_runtime").with_recipient("local-user")),
                 scope,

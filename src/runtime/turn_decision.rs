@@ -5,13 +5,13 @@
 //! and node state, so a source-generation mismatch rejects the service.
 
 #[cfg(test)]
-mod ordinary_child_fixture;
+pub(in crate::runtime) mod ordinary_child_fixture;
 #[cfg(test)]
 pub(crate) use ordinary_child_fixture::{
     with_inherited_scored_prediction, with_scored_prediction, with_scored_publication,
 };
 
-use crate::cost::estimate::{DecisionReserveUnavailable, DecisionTokenReservation};
+use crate::cost::estimate::DecisionReserveUnavailable;
 #[cfg(test)]
 use crate::tools::capability::turn_state::ConstraintCode;
 
@@ -20,38 +20,25 @@ pub(crate) mod evidence_fixture;
 #[cfg(test)]
 pub(crate) mod selected_loader_fixture;
 
-mod auxiliary;
-mod build_error;
 mod issued;
 mod opening;
-mod store_preparation;
+pub(in crate::runtime) mod store_preparation;
 
-pub(crate) use build_error::TurnServiceBuildError;
-
-mod approval;
-mod call_approval;
-mod child_recovery;
+use super::turn_publication::{PublicationBuildError, PublicationLoopRuntime};
 #[cfg(test)]
-pub(crate) use child_recovery::child_recovery_gate;
+use super::turn_publication::{PublicationInputs, build_publication};
+
+mod call_approval;
+#[cfg(test)]
+pub(crate) use crate::runtime::ingress_recovery::child_telemetry::child_recovery_gate;
 mod delegation;
 mod discovery;
-use super::child_source::recursive_allowance;
 mod execution;
-pub(super) mod segment_observation;
-pub(crate) use execution::{OperatorChildPublication, OrdinaryChildPublication, OrdinaryProcessLaunch};
+use super::child_source::publication::OrdinaryChildPublication;
+use super::child_turn::segment_observation;
 mod owner_filesystem;
 mod pending_approval;
-pub(crate) use pending_approval::AdmittedDecisionResume;
-pub(crate) use pending_approval::DecisionApprovalView;
-pub(crate) use pending_approval::ResumeEvidenceWitness;
-#[path = "turn_decision/routing/replay_facts.rs"]
-mod router_replay_facts;
-pub(crate) use router_replay_facts::provider_binding as router_provider_binding;
-#[cfg(feature = "llm-router")]
-mod routing;
-
-#[cfg(feature = "llm-router")]
-pub(crate) use routing::commit_training_owned;
+use crate::security::approval_ledger::historical::AdmittedDecisionResume;
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,37 +51,35 @@ use super::turn_source::TurnSourceProof;
 #[cfg(test)]
 use crate::agent::entry::AgentTurnProof;
 use crate::capability::CapabilityAvailabilityLevel;
-use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, EngineError, RetrievalIssueError};
-use crate::decision_engine::candidate::{CandidateSpec, CausalCandidate};
-use crate::decision_engine::candidate_generator::CandidateSet;
+use crate::causal_tree::decision_engine::{DiscoveryIssueError, EngineDecision, RetrievalIssueError};
 use crate::decision_engine::candidate_generator::DiscoveredRefs;
-#[cfg(test)]
-use crate::tools::capability::contract::CapabilityTarget;
-use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, CausalActionKind};
-
-use crate::causal_tree::directive::{DirectiveError, TurnExecutionDirective};
-use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
-use crate::causal_tree::outcome::{DecisionRecordBuilder, OutcomeCorrelator, RecordBuildError, TerminalFacts};
-use crate::config::ConfigGeneration;
-use crate::decision_engine::prediction::factory::{
-    BackendPlaneStatus, DecisionBackendFactory, DecisionTransports, FactoryBuildError, FactoryDeps,
+use crate::runtime::turn_context::{
+    AgentDecisionError, AgentTurnKind, TurnOriginMismatch, validate_agent_retrieval_provenance,
+    validate_agent_turn_origin,
 };
+use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
+
+use crate::causal_tree::outcome::DecisionRecordBuilder;
+use crate::config::ConfigGeneration;
+#[cfg(test)]
+use crate::decision_engine::prediction::factory::DecisionTransports;
+use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
 use crate::decision_engine::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
 #[cfg(test)]
 use crate::decision_engine::state::{ObservedStepKind, ObservedStepStatus};
 use crate::memory::Memory;
-use crate::observability::causal_event::{
-    CausalEvent, CausalEventFields, CausalEventKind, CausalEventSink, CausalLineage,
-};
-use crate::providers::catalog::{CatalogView as ProviderCatalogView, Requirement, ResolvedModel, UnknownPolicy};
-use crate::runtime::decision_journal::store::{
-    CausalDecisionStore, DecisionScope, Enqueue, Retention, StoreError, StoreMode,
-};
+use crate::observability::causal_event::CausalEventSink;
+use crate::providers::catalog::{CatalogView as ProviderCatalogView, ResolvedModel};
+use crate::runtime::decision_journal::store::{CausalDecisionStore, Retention, StoreMode};
+#[cfg(test)]
+use crate::runtime::decision_journal::store::{DecisionScope, Enqueue};
 use crate::security::SecurityPolicy;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
+#[cfg(test)]
+use crate::tools::capability::catalog::CatalogSources;
 use crate::tools::capability::catalog::{
-    CapabilityCatalog, CatalogError, CatalogScope, CatalogSources, CatalogView, Exposure, ParityError, SurfacePolicy,
+    CapabilityCatalog, CatalogScope, CatalogView, Exposure, ParityError, SurfacePolicy,
 };
 use crate::tools::capability::turn_state::{
     DeliveryConstraints, TrustedParts, TrustedState, TurnBudgets, TurnSurfaceKind,
@@ -102,73 +87,39 @@ use crate::tools::capability::turn_state::{
 use crate::tools::execution::ToolExecutionService;
 use crate::tools::traits::Tool;
 
-/// Runtime-owned snapshots that must all describe the same generation.
-/// A caller supplies the finalized registry and its execution service,
-/// rather than letting the decision plane infer capabilities from config.
-pub(crate) struct TurnServiceBuild<'a> {
-    pub parent_grant: Option<Arc<super::child_source::IssuedChildGrant>>,
-    pub generation: Arc<ConfigGeneration>,
-    pub registry: Arc<Vec<Box<dyn Tool>>>,
-    pub execution: Arc<ToolExecutionService>,
-    pub catalog_sources: CatalogSources,
-    pub surface_policy: SurfacePolicy,
-    pub provider_catalog: &'a ProviderCatalogView,
-    pub transports: &'a dyn DecisionTransports,
-    pub events: Arc<dyn CausalEventSink>,
-    pub memory: Arc<dyn Memory>,
-    pub security: Arc<SecurityPolicy>,
-}
-
-/// Actual ingress runtime instances associated with the published catalog.
-#[derive(Clone)]
-pub(crate) struct TurnLoopRuntime {
-    pub(crate) hooks: Arc<crate::hooks::HookManager>,
-    pub(crate) observer: Arc<dyn crate::observability::Observer>,
-}
-
-/// Proof that child execution retains the exact policy of an admitted service.
-/// Only this module and its delegation producer can construct its fields.
-pub(super) struct ChildExecutionPolicy {
-    security: Arc<SecurityPolicy>,
-}
-
-impl ChildExecutionPolicy {
-    pub(super) fn matches(&self, security: &Arc<SecurityPolicy>) -> bool {
-        Arc::ptr_eq(&self.security, security)
-    }
-}
-
 pub(crate) struct TurnDecisionService {
     /// Publication-scoped runtime holder (recovery, recursive allowances,
     /// child funding, spend inputs) shared with every opened turn.
-    runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
-    advisory: crate::runtime::decision_advisory::DecisionAdvisory,
-    child_recovery: child_recovery::ChildRecoveryState,
-    memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
-    loop_runtime: Option<TurnLoopRuntime>,
-    publication_policy: SurfacePolicy,
-    ordinary_parent: Option<OrdinaryChildPublication>,
-    operator_task: Option<Arc<super::operator_spawn::task::OperatorTaskAuthority>>,
-    operator_process: Option<Arc<super::child_source::operator_process::OperatorProcessAuthority>>,
-    ordinary_task: Option<Arc<super::child_source::ordinary_task::OrdinaryTaskAuthority>>,
-    ordinary_process: Option<Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>>,
-    service_id: uuid::Uuid,
-    surface: TurnSurfaceKind,
-    generation: Arc<ConfigGeneration>,
-    catalog: Arc<CapabilityCatalog>,
-    provider_catalog: ProviderCatalogView,
-    factory: DecisionBackendFactory,
-    events: Arc<dyn CausalEventSink>,
-    state_key: Arc<DecisionKey>,
-    policy_version: Arc<str>,
-    durable_key: bool,
-    recordable: bool,
-    registry: Arc<Vec<Box<dyn Tool>>>,
-    execution: Arc<ToolExecutionService>,
-    memory: Arc<dyn Memory>,
-    security: Arc<SecurityPolicy>,
-    store: Arc<CausalDecisionStore>,
-    durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
+    pub(in crate::runtime) runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
+    pub(in crate::runtime) advisory: crate::runtime::decision_advisory::DecisionAdvisory,
+    pub(in crate::runtime) child_recovery: crate::runtime::ingress_recovery::child_telemetry::ChildRecoveryState,
+    pub(in crate::runtime) memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
+    pub(in crate::runtime) loop_runtime: Option<PublicationLoopRuntime>,
+    pub(in crate::runtime) publication_policy: SurfacePolicy,
+    pub(in crate::runtime) ordinary_parent: Option<OrdinaryChildPublication>,
+    pub(in crate::runtime) operator_task: Option<Arc<super::operator_spawn::task::OperatorTaskAuthority>>,
+    pub(in crate::runtime) operator_process:
+        Option<Arc<super::child_source::operator_process::OperatorProcessAuthority>>,
+    pub(in crate::runtime) ordinary_task: Option<Arc<super::child_source::ordinary_task::OrdinaryTaskAuthority>>,
+    pub(in crate::runtime) ordinary_process:
+        Option<Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>>,
+    pub(in crate::runtime) service_id: uuid::Uuid,
+    pub(in crate::runtime) surface: TurnSurfaceKind,
+    pub(in crate::runtime) generation: Arc<ConfigGeneration>,
+    pub(in crate::runtime) catalog: Arc<CapabilityCatalog>,
+    pub(in crate::runtime) provider_catalog: ProviderCatalogView,
+    pub(in crate::runtime) factory: DecisionBackendFactory,
+    pub(in crate::runtime) events: Arc<dyn CausalEventSink>,
+    pub(in crate::runtime) state_key: Arc<DecisionKey>,
+    pub(in crate::runtime) policy_version: Arc<str>,
+    pub(in crate::runtime) durable_key: bool,
+    pub(in crate::runtime) recordable: bool,
+    pub(in crate::runtime) registry: Arc<Vec<Box<dyn Tool>>>,
+    pub(in crate::runtime) execution: Arc<ToolExecutionService>,
+    pub(in crate::runtime) memory: Arc<dyn Memory>,
+    pub(in crate::runtime) security: Arc<SecurityPolicy>,
+    pub(in crate::runtime) store: Arc<CausalDecisionStore>,
+    pub(in crate::runtime) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 impl TurnDecisionService {
@@ -178,19 +129,42 @@ impl TurnDecisionService {
         &self.advisory
     }
 
+    /// The publication-scoped model, limits and parity owner (R25); the
+    /// service lends its fields until the Part-2 builders own them.
+    pub(crate) fn publication_scope(&self) -> crate::runtime::turn_context::publication_scope::PublicationScope<'_> {
+        crate::runtime::turn_context::publication_scope::PublicationScope {
+            generation: &self.generation,
+            surface: self.surface,
+            provider_catalog: &self.provider_catalog,
+            catalog: &self.catalog,
+            publication_policy: &self.publication_policy,
+            execution: &self.execution,
+            memory: &self.memory,
+            security: &self.security,
+            memory_loader: self.memory_loader.as_deref(),
+            state_key: &self.state_key,
+            holder: &self.runtime,
+            ordinary_parent: self.ordinary_parent.as_ref(),
+            ordinary_task: self.ordinary_task.as_deref(),
+            operator_task: self.operator_task.as_deref(),
+            operator_process: self.operator_process.as_deref(),
+            ordinary_process: self.ordinary_process.as_deref(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn memory(&self) -> &Arc<dyn Memory> {
-        &self.memory
+        self.publication_scope().memory()
     }
 
     #[must_use]
     pub(crate) fn execution(&self) -> &ToolExecutionService {
-        self.execution.as_ref()
+        self.publication_scope().execution()
     }
 
     #[must_use]
     pub(crate) fn catalog(&self) -> &CapabilityCatalog {
-        self.catalog.as_ref()
+        self.publication_scope().catalog()
     }
 
     #[cfg(test)]
@@ -209,12 +183,12 @@ impl TurnDecisionService {
 
     #[must_use]
     pub(crate) fn security(&self) -> &SecurityPolicy {
-        self.security.as_ref()
+        self.publication_scope().security()
     }
 
     #[must_use]
     pub(crate) fn tool_tiering(&self) -> &crate::config::ToolTieringConfig {
-        &self.generation.effective.tool_tiering
+        self.publication_scope().tool_tiering()
     }
 
     #[must_use]
@@ -222,56 +196,30 @@ impl TurnDecisionService {
         matches!(self.surface, TurnSurfaceKind::Channel)
     }
 
-    /// Bind runtime adapter ceilings to the provider catalog pinned by this
-    /// exact configuration generation.
     pub(crate) fn effective_provider_capabilities(
         &self,
         provider: &str,
         model: &str,
         adapter: crate::providers::ProviderCapabilities,
     ) -> crate::providers::ProviderCapabilities {
-        self.provider_catalog
+        self.publication_scope()
             .effective_provider_capabilities(provider, model, adapter)
     }
 
-    /// Resolve model limits against the provider catalog pinned to this
-    /// configuration generation. Runtime surfaces must not reconstruct a
-    /// release-only view after admission has already selected stronger
-    /// operator or discovery evidence.
     pub(crate) fn effective_compaction(
         &self,
         provider: &str,
         model: &str,
     ) -> crate::providers::context_window::EffectiveCompactionConfig {
-        let config = &self.generation.effective;
-        crate::providers::context_window::resolve_effective_compaction_config_with_catalog(
-            &config.agent.compaction,
-            provider,
-            model,
-            crate::providers::context_window::ContextWindowSources::from_config(config),
-            &config.model_routes,
-            &self.provider_catalog,
-        )
+        self.publication_scope().effective_compaction(provider, model)
     }
 }
 
-/// Read-only status of the exact generation attached to a runtime surface.
-/// The factory's configured slots are distinct from the catalog and store
-/// attachment. `backend.enabled` reports configuration, not remote admission;
-/// callers must also inspect exclusions and recordability. None of these
-/// fields confers execution authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecisionPlaneStatus {
-    pub(crate) backend: BackendPlaneStatus,
-    pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) store_mode: StoreMode,
-    pub(crate) durable_key: bool,
-    pub(crate) recordable: bool,
-}
+use crate::runtime::ingress_recovery::status::DecisionPlaneStatus;
 
 impl TurnDecisionService {
     /// Attach runtime instances before the service is shared with any caller.
-    pub(crate) fn with_loop_runtime(mut self: Arc<Self>, runtime: TurnLoopRuntime) -> anyhow::Result<Arc<Self>> {
+    pub(crate) fn with_loop_runtime(mut self: Arc<Self>, runtime: PublicationLoopRuntime) -> anyhow::Result<Arc<Self>> {
         let service = Arc::get_mut(&mut self).context("decision service already published")?;
         anyhow::ensure!(service.loop_runtime.is_none(), "decision loop runtime already attached");
         service.loop_runtime = Some(runtime);
@@ -295,7 +243,7 @@ impl TurnDecisionService {
         Ok(self)
     }
 
-    fn catalog_view(&self) -> CatalogView<'_> {
+    pub(in crate::runtime) fn catalog_view(&self) -> CatalogView<'_> {
         self.catalog
             .view(&CatalogScope::default())
             .with_surface(&self.publication_policy)
@@ -317,7 +265,7 @@ impl TurnDecisionService {
 /// The version binds the code's gate semantics to the exact policy snapshots
 /// this service publishes. Maps are sorted before encoding; dynamic spend,
 /// grants and child state belong to the turn snapshot instead.
-fn pinned_policy_version(
+pub(in crate::runtime) fn pinned_policy_version(
     config: &crate::config::Config,
     security: &SecurityPolicy,
     surface: &SurfacePolicy,
@@ -429,69 +377,6 @@ fn effective_agent_exclusions(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("turn origin does not match the pinned decision service")]
-pub(crate) struct TurnOriginMismatch;
-
-/// A source-owned proof is still checked against this service's pinned
-/// generation and surface. Neither a public envelope nor a caller-supplied
-/// generation number can replace the proof.
-pub(crate) fn validate_agent_turn_origin(
-    generation: &ConfigGeneration,
-    surface: TurnSurfaceKind,
-    proof: &dyn TurnSourceProof,
-) -> Result<(), TurnOriginMismatch> {
-    if surface != proof.surface()
-        || (surface == TurnSurfaceKind::Worker
-            && proof.child_scope().is_none()
-            && proof.operator_task_authority_id().is_none()
-            && proof.operator_process_authority_id().is_none())
-        || (surface != TurnSurfaceKind::Worker && proof.child_scope().is_some())
-        || proof.config_generation_id() != generation.id.0
-        || proof.config_source_revision() != generation.source_revision.fingerprint_sha256
-        || proof.workspace_id() != generation.effective.workspace_dir.to_string_lossy()
-    {
-        return Err(TurnOriginMismatch);
-    }
-    Ok(())
-}
-
-/// Join a selected decision to the exact source-owned CLI turn before any
-/// content read. Matching text and catalog generation do not establish the
-/// owner, session, run, or event that supplied the decision's policy inputs.
-pub(crate) fn validate_agent_retrieval_provenance(
-    proof: &dyn TurnSourceProof,
-    trusted: &TrustedParts,
-    model_ref: &str,
-    policy_version: &str,
-    exclusions: &[Arc<str>],
-    model_admission: Option<&dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>,
-) -> Result<(), TurnOriginMismatch> {
-    if trusted.owner_isolated() != proof.owner_isolated()
-        || trusted.surface != proof.surface()
-        || trusted.channel.is_some()
-        || trusted.workspace_id.as_ref() != proof.workspace_id()
-        || trusted.owner_id.as_deref() != Some(proof.owner_id())
-        || trusted.session_key.as_deref() != Some(proof.session_key())
-        || trusted.run_id.as_deref() != Some(proof.run_id())
-        || trusted.task_id.as_deref() != proof.task_id()
-        || trusted.source_event_id.as_deref() != proof.source_event_id()
-        || trusted.resolved_model.as_ref() != model_ref
-        || trusted.policy_version.as_ref() != policy_version
-        || trusted.exclusions != exclusions
-        || trusted.model_admission.as_deref().map(|policy| policy.digest())
-            != model_admission.map(|policy| policy.digest())
-        || trusted
-            .constraints
-            .iter()
-            .any(|code| code.as_str() == "intercepts_writes")
-            != proof.intercepts_writes()
-    {
-        return Err(TurnOriginMismatch);
-    }
-    Ok(())
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TurnModelError {
     #[error(transparent)]
@@ -531,208 +416,29 @@ pub(crate) enum AgentDecisionBudgetError {
     ChildFunding,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentTurnKind {
-    SingleShot,
-    Repl,
-}
-
 /// The immutable result of one source-bound decision chain. Only the service
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
     _event_memory: Arc<super::causal_events::routes::EventMemory>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
-    resume: Option<Arc<pending_approval::AdmittedDecisionResume>>,
+    resume: Option<Arc<AdmittedDecisionResume>>,
     /// The execution-owned runtime context of this turn (R60).
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     source_actor: (Arc<str>, Arc<str>),
-    service_id: uuid::Uuid,
-    record_admitted: AtomicBool,
-    execution_trace: std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
-    execution_closed: Arc<AtomicBool>,
+    pub(in crate::runtime) service_id: uuid::Uuid,
+    pub(in crate::runtime) record_admitted: AtomicBool,
+    pub(in crate::runtime) execution_trace:
+        std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
+    pub(in crate::runtime) execution_closed: Arc<AtomicBool>,
 
-    collected_approval_result: std::sync::OnceLock<Box<pending_approval::CollectedApprovalResult>>,
-    discovery_offers: std::sync::OnceLock<Arc<parking_lot::Mutex<discovery::DiscoveryOffers>>>,
-    discovery_admissions: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<String, discovery::DiscoveryAdmission>>>,
-    engine: EngineDecision,
+    collected_approval_result:
+        std::sync::OnceLock<Box<crate::security::approval_ledger::historical::CollectedApprovalResult>>,
+    pub(in crate::runtime) engine: EngineDecision,
     /// Completed dependent hops retained for the recorder. Nothing is
     /// written until the whole chain returns successfully.
     prior_hops: Vec<EngineDecision>,
-    directive: TurnExecutionDirective,
     main_compaction: crate::config::AgentCompactionConfig,
     hop_ids: Vec<DecisionId>,
-    execution_refs: BTreeSet<CapabilityRef>,
-}
-
-/// Ids of the discovery admissions that can run without an approval. One that
-/// still waits for approval may never have been attempted, so it says nothing
-/// about whether a run could have called it.
-fn unprompted_admission_ids(
-    admissions: &BTreeMap<String, discovery::DiscoveryAdmission>,
-) -> impl Iterator<Item = String> {
-    admissions
-        .values()
-        .filter(|admission| !admission.requires_approval)
-        .map(|admission| admission.reference.id.as_str().to_owned())
-}
-
-/// Applied-event admission issued by the owning service after terminal commit
-/// or reconstructed from an authenticated historical terminal replay.
-pub(super) struct VerifiedDirectiveApplication {
-    event: CausalEvent,
-    idempotency_key: String,
-    original_generation: Option<(u64, Arc<str>)>,
-}
-
-impl VerifiedDirectiveApplication {
-    /// Reconstruct admission from authenticated source and decision evidence.
-    pub(super) fn from_replay(replay: &crate::agent::terminal::VerifiedTerminalReplay) -> anyhow::Result<Self> {
-        let source = replay.source();
-        let decision = replay.decision();
-        let original_generation = (
-            source
-                .config_generation_id
-                .context("original source generation is missing")?,
-            Arc::from(
-                source
-                    .config_source_revision
-                    .as_deref()
-                    .context("original source revision is missing")?,
-            ),
-        );
-        Ok(Self {
-            event: CausalEvent {
-                kind: CausalEventKind::DirectiveApplied,
-                lineage: CausalLineage {
-                    workspace_id: Arc::from(source.workspace_id.as_str()),
-                    owner_id: source.owner_id.as_deref().map(Arc::from),
-                    session_key: source.session_key.as_deref().map(Arc::from),
-                    run_id: source.run_id.as_deref().map(Arc::from),
-                    source_event_id: Some(Arc::from(source.event_id.as_str())),
-                    causation_event_id: Some(Arc::from(replay.terminal_event_id())),
-                    decision_id: Some(Arc::from(decision.decision_id.to_string())),
-                    ..CausalLineage::default()
-                },
-                fields: CausalEventFields {
-                    item_count: Some(1),
-                    ..CausalEventFields::default()
-                },
-            },
-            idempotency_key: format!("causal:{}:directive-applied", decision.decision_id),
-            original_generation: Some(original_generation),
-        })
-    }
-
-    #[cfg(test)]
-    pub(super) const fn fixture(event: CausalEvent, idempotency_key: String) -> Self {
-        Self {
-            event,
-            idempotency_key,
-            original_generation: None,
-        }
-    }
-
-    pub(super) fn into_parts(self) -> (CausalEvent, String, Option<(u64, Arc<str>)>) {
-        (self.event, self.idempotency_key, self.original_generation)
-    }
-}
-
-/// The bounded direct core available while the serving model decides whether
-/// to answer or call a tool. These references are publication authority only:
-/// binding and dispatch recheck the live catalog, source, schema, security and
-/// approval policy. Delegators additionally require the sealed child manifest
-/// retained by this exact decision.
-fn exact_delegator_ref(decision: &EngineDecision, reference: &CapabilityRef) -> bool {
-    let (candidates, exact_mentions) = match &decision.candidates {
-        CandidateSet::Legal {
-            candidates,
-            exact_mentions,
-            ..
-        } => (candidates, exact_mentions),
-        CandidateSet::NoLegalPath { .. } => return false,
-    };
-    candidates.iter().any(|candidate| {
-        candidate.action() == CausalActionKind::Delegate
-            && exact_mentions.contains(candidate.candidate_id())
-            && candidate.required_capabilities() == std::slice::from_ref(reference)
-    })
-}
-
-pub(super) const fn sealed_direct_delegator(decision: &EngineDecision) -> bool {
-    decision.prediction.is_none() && decision.outgoing_child.is_some()
-}
-
-fn direct_answer_refs(
-    decision: &EngineDecision,
-    catalog: &CatalogView<'_>,
-    gates: &GateInputs<'_>,
-    selected_discovery_refs: &BTreeSet<CapabilityRef>,
-    estimate: &dyn Fn(usize) -> Option<crate::tools::capability::contract::CostEstimate>,
-) -> BTreeSet<CapabilityRef> {
-    if !gates.model_can_call_tools {
-        return BTreeSet::new();
-    }
-    let trusted = decision.state.trusted.parts();
-    catalog
-        .iter_entries()
-        .filter_map(|entry| {
-            let delegation = matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn");
-            let reference = CapabilityRef {
-                id: entry.id.clone(),
-                fingerprint: entry.fingerprint,
-                generation: entry.generation,
-            };
-            let directly_exposed = matches!(entry.exposure, Exposure::Direct);
-            let exact_delegation = delegation && exact_delegator_ref(decision, &reference);
-            // Direct-surface mint already sealed a child manifest for a named
-            // or Direct delegator. Publish that entry so the serving model can
-            // call it without a hop-derived Delegate candidate.
-            let minted_delegator =
-                delegation && sealed_direct_delegator(decision) && trusted.surface != TurnSurfaceKind::Interactive;
-            // A selected local search is already a bounded, turn-scoped
-            // relevance decision. Carry that exact schema into the serving
-            // model's final snapshot when the following hop answers, while
-            // retaining the same publication gates as the direct core.
-            let selected_discovery = !delegation
-                && matches!(entry.exposure, Exposure::Searchable)
-                && selected_discovery_refs.contains(&reference);
-            if !directly_exposed && !exact_delegation && !selected_discovery && !minted_delegator {
-                return None;
-            }
-            if delegation && decision.outgoing_child.is_none() && !directly_exposed {
-                return None;
-            }
-            if trusted.constraints.iter().any(|code| {
-                matches!(code.as_str(), "resume_exact_call" | "tools_off")
-                    || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
-            }) || trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly
-                && entry.effect > crate::tools::capability::contract::SideEffectClass::ReadOnly
-            {
-                return None;
-            }
-            let candidate = CausalCandidate::new(
-                if delegation {
-                    CausalActionKind::Delegate
-                } else {
-                    CausalActionKind::UseTool
-                },
-                entry.family,
-                CandidateSpec {
-                    namespace: None,
-                    required_capabilities: vec![reference.clone()],
-                    side_effect: entry.effect,
-                    approval: entry.approval.clone(),
-                    estimated_cost: gates.child_scope.and_then(|_| estimate(entry.schema_bytes)),
-                    estimated_latency_ms: None,
-                },
-            );
-            let publication = HardGates::check_capability_publication(&decision.state, catalog, &candidate, gates);
-            if matches!(publication, GateOutcome::Blocked { .. }) {
-                return None;
-            }
-            Some(reference)
-        })
-        .collect()
 }
 
 impl TurnDecisionContext {
@@ -751,37 +457,21 @@ impl TurnDecisionContext {
         status: crate::agent::terminal::TurnTerminalStatus,
         outcome: Option<&crate::llm::route_decision::ProviderExecutionOutcome>,
     ) -> anyhow::Result<()> {
-        if let Some(trace) = self.execution_trace.get() {
-            trace.validate_terminal_status(status, outcome)
-        } else {
-            anyhow::ensure!(
-                status != crate::agent::terminal::TurnTerminalStatus::Silent,
-                "silent terminal has no actual execution trace"
-            );
-            Ok(())
-        }
+        crate::agent::terminal::binding::validate_silent_terminal(self.execution_trace.get(), status, outcome)
     }
 
+    /// Delegates to the R25 owner in `runtime::turn_terminal::execution_close` (until Part 2).
     pub(crate) fn terminal_execution_trace(&self) -> crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
-        self.execution_closed.store(true, Ordering::Release);
-        if let Some(offers) = self.discovery_offers.get() {
-            offers.lock().clear();
-        }
-        if let Some(admissions) = self.discovery_admissions.get() {
-            // Wait for an admission that entered before closure, so terminal
-            // evidence sees its final metadata. Later admissions check closed.
-            drop(admissions.lock());
-        }
-        self.execution_trace.get_or_init(Default::default).seal()
+        crate::runtime::turn_terminal::execution_close::terminal_execution_trace(
+            &self.execution_closed,
+            &self.runtime.discovery,
+            &self.execution_trace,
+        )
     }
 
     #[cfg(test)]
     pub(crate) const fn engine(&self) -> &EngineDecision {
         &self.engine
-    }
-
-    pub(crate) const fn directive(&self) -> &TurnExecutionDirective {
-        &self.directive
     }
 
     pub(crate) const fn main_compaction(&self) -> &crate::config::AgentCompactionConfig {
@@ -811,16 +501,9 @@ impl TurnDecisionContext {
 
     pub(crate) fn terminal_outcome_action(&self) -> Option<crate::tools::capability::contract::CausalActionKind> {
         use crate::tools::capability::contract::CausalActionKind;
-        match &self.directive {
-            TurnExecutionDirective::AnswerDirectly => Some(CausalActionKind::Answer),
-            TurnExecutionDirective::Execute { .. } => self
-                .execution_trace
-                .get()
-                .is_some_and(crate::tools::capability::execution_trace::ExecutionTrace::is_sealed)
-                .then_some(CausalActionKind::UseTool),
-            TurnExecutionDirective::Delegate { .. } => Some(CausalActionKind::Delegate),
-            _ => None,
-        }
+        // Every turn opens through the prediction-free path (R9): the
+        // committed selection is always the answer candidate.
+        Some(CausalActionKind::Answer)
     }
 
     pub(crate) const fn catalog_generation(&self) -> CatalogGeneration {
@@ -849,8 +532,8 @@ impl TurnDecisionContext {
             .filter(|event| event.event_type == "approval.collection.declined")
     }
 
-    pub(crate) const fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
-        &self.execution_refs
+    pub(crate) fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
+        &self.runtime.published
     }
 
     /// Canonical ids of every capability this turn could execute: the issued
@@ -859,18 +542,17 @@ impl TurnDecisionContext {
     /// that was never there.
     pub(crate) fn executable_capability_ids(&self) -> BTreeSet<String> {
         let mut ids: BTreeSet<String> = self
-            .execution_refs
+            .runtime
+            .published
             .iter()
             .map(|reference| reference.id.as_str().to_owned())
             .collect();
-        if let Some(admissions) = self.discovery_admissions.get() {
-            ids.extend(unprompted_admission_ids(&admissions.lock()));
-        }
+        ids.extend(self.runtime.discovery.unprompted_ids());
         ids
     }
 
-    pub(crate) fn is_run(&self) -> Result<bool, DirectiveError> {
-        Ok(!self.execution_closed.load(Ordering::Acquire))
+    pub(crate) fn is_run(&self) -> bool {
+        crate::runtime::decision_accounting::is_run(self)
     }
 
     pub(crate) const fn pending_approval_id(&self) -> Option<DecisionId> {
@@ -878,53 +560,53 @@ impl TurnDecisionContext {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AgentDecisionError {
-    #[error("decision cancelled")]
-    Cancelled,
-    #[error(transparent)]
-    Model(#[from] TurnModelError),
-    #[error(transparent)]
-    Budget(#[from] AgentDecisionBudgetError),
-    #[error(transparent)]
-    Parity(#[from] ParityError),
-    #[error(transparent)]
-    Engine(#[from] EngineError),
-    #[error(transparent)]
-    Directive(#[from] DirectiveError),
-    #[error("decision deadline cannot be represented")]
-    Deadline,
-    #[error(transparent)]
-    Retrieval(#[from] AgentRetrievalError),
-    #[error(transparent)]
-    Discovery(#[from] AgentDiscoveryError),
-    #[error(transparent)]
-    Record(#[from] RecordBuildError),
-    #[error("recordable decision store has no writer")]
-    RecordWriterUnavailable,
-    #[error("decision evidence could not be durably recorded")]
-    DecisionEvidence(#[source] anyhow::Error),
-    #[error("delegation parent could not be durably verified")]
-    DelegationStorage(#[source] anyhow::Error),
-    #[error("ordinary delegation scope could not be verified")]
-    DelegationScope(#[source] anyhow::Error),
-    #[error("decision event memory could not be bound to its source")]
-    EventMemory(#[source] anyhow::Error),
-    #[error("durable ingress recovery is not ready")]
-    IngressRecovery(#[source] anyhow::Error),
+/// Delegation to the R25 owner in `runtime::ingress_recovery` (until Part 2).
+impl TurnDecisionService {
+    pub(crate) async fn reconcile_child_telemetry(
+        &self,
+        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
+        lifetime: &Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
+        owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
+        deadline: Instant,
+    ) -> anyhow::Result<crate::runtime::ingress_recovery::child_telemetry::ChildRecoveryReport> {
+        crate::runtime::ingress_recovery::child_telemetry::reconcile_child_telemetry(
+            self, scope, lifetime, owner, deadline,
+        )
+        .await
+    }
+}
 
-    #[error("previous segment observation could not be verified")]
-    SegmentObservation(#[source] anyhow::Error),
-    #[error("pending approval could not be persisted")]
-    PendingApproval(#[source] anyhow::Error),
+/// Delegations to the R25 owner in `runtime::decision_accounting` (until Part 2).
+impl TurnDecisionService {
+    pub(crate) fn auxiliary_accounting(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        purpose: crate::runtime::auxiliary_call::AuxiliaryPurpose,
+    ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>> {
+        crate::runtime::decision_accounting::auxiliary::auxiliary_accounting(self, proof, context, purpose)
+    }
+
+    pub(crate) fn smart_group_accounting(
+        &self,
+        proof: &dyn TurnSourceProof,
+        context: &TurnDecisionContext,
+        classifier_provider: &str,
+        classifier_model: &str,
+    ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>> {
+        crate::runtime::decision_accounting::auxiliary::smart_group_accounting(
+            self,
+            proof,
+            context,
+            classifier_provider,
+            classifier_model,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("decision context is not recordable by this pinned service")]
 pub(crate) struct SettlementRefUnavailable;
-
-/// Only this module can authorize construction of a terminal decision link.
-pub(crate) struct SettlementIssueToken(());
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AgentDiscoveryError {
@@ -960,38 +642,21 @@ impl TurnDecisionContext {
 impl TurnDecisionService {
     /// Disabled decisions still constrain execution, but cannot authorize a
     /// decision-store write. Enabled decisions retain strict receipt checks.
+    /// Body in `runtime::turn_terminal::settlement` (R25); delegates until Part 2.
     pub(crate) fn terminal_settlement_ref(
         &self,
         context: Arc<TurnDecisionContext>,
     ) -> Result<crate::agent::terminal::DecisionSettlementRef, SettlementRefUnavailable> {
-        if context.service_id != self.service_id {
-            return Err(SettlementRefUnavailable);
-        }
-        if !self.generation.effective.causal_tree.enabled {
-            let trusted = context
-                .audit_hops()
-                .last()
-                .ok_or(SettlementRefUnavailable)?
-                .state
-                .trusted
-                .parts();
-            if trusted.surface != self.surface
-                || trusted.workspace_id.as_ref() != self.generation.effective.workspace_dir.to_string_lossy()
-                || trusted.catalog_generation != *self.catalog.generation()
-                || trusted.policy_version != self.policy_version
-                || context.hop_ids().last().copied() != Some(context.decision_id())
-            {
-                return Err(SettlementRefUnavailable);
-            }
-            return Ok(crate::agent::terminal::DecisionSettlementRef::issued_disabled(
-                context,
-                self.generation.effective.workspace_dir.clone(),
-                self.generation.effective.cost.clone(),
-                Arc::clone(&self.memory),
-                SettlementIssueToken(()),
-            ));
-        }
-        self.settlement_ref(context)
+        super::turn_terminal::settlement::terminal_settlement_ref(self, context)
+    }
+
+    /// The execution-owned terminal binding of a turn this service opened
+    /// (R29). Body in `runtime::turn_terminal::settlement`.
+    pub(crate) fn terminal_binding(
+        &self,
+        context: &TurnDecisionContext,
+    ) -> Result<crate::agent::terminal::TerminalBinding, SettlementRefUnavailable> {
+        super::turn_terminal::settlement::terminal_binding(self, context)
     }
 
     /// Issue a terminal link only after this service returned a recordable
@@ -1000,60 +665,7 @@ impl TurnDecisionService {
         &self,
         context: Arc<TurnDecisionContext>,
     ) -> Result<crate::agent::terminal::DecisionSettlementRef, SettlementRefUnavailable> {
-        let trusted = context
-            .audit_hops()
-            .last()
-            .ok_or(SettlementRefUnavailable)?
-            .state
-            .trusted
-            .parts();
-        if !self.generation.effective.causal_tree.enabled
-            || context.service_id != self.service_id
-            || !context.record_admitted.load(Ordering::Acquire)
-            || !self.durable_key
-            || !self.recordable
-            || !matches!(
-                self.surface,
-                TurnSurfaceKind::AgentLoop
-                    | TurnSurfaceKind::Interactive
-                    | TurnSurfaceKind::Server
-                    | TurnSurfaceKind::Cron
-                    | TurnSurfaceKind::Xin
-                    | TurnSurfaceKind::Worker
-                    | TurnSurfaceKind::Channel
-            )
-            || trusted.surface != self.surface
-            || trusted.workspace_id.as_ref() != self.generation.effective.workspace_dir.to_string_lossy()
-            || trusted.catalog_generation != *self.catalog.generation()
-            || trusted.policy_version != self.policy_version
-            || context.hop_ids().last().copied() != Some(context.decision_id())
-        {
-            return Err(SettlementRefUnavailable);
-        }
-        let writer = self.store.writer().ok_or(SettlementRefUnavailable)?;
-        let store_workspace_id = self.store.workspace_id().ok_or(SettlementRefUnavailable)?;
-        Ok(crate::agent::terminal::DecisionSettlementRef::issued(
-            context,
-            writer,
-            self.store.reader(),
-            store_workspace_id,
-            Arc::clone(&self.state_key),
-            self.generation.effective.workspace_dir.clone(),
-            self.generation.effective.cost.clone(),
-            Arc::clone(&self.memory),
-            SettlementIssueToken(()),
-        )
-        .with_parent_grant(self.runtime.parent_grant().cloned())
-        .with_operator_parent(
-            self.operator_task
-                .as_ref()
-                .map(|task| Arc::new(task.parent_source()))
-                .or_else(|| {
-                    self.operator_process
-                        .as_ref()
-                        .map(|process| Arc::new(process.snapshots().parent.clone()))
-                }),
-        ))
+        super::turn_terminal::settlement::settlement_ref(self, context)
     }
 
     /// The publication-scoped runtime holder shared with every opened turn.
@@ -1080,20 +692,20 @@ impl TurnDecisionService {
             .await
     }
 
-    /// Inspect the attached generation without probing a backend or opening
-    /// a new store. Admin and control-ladder readers can use this snapshot.
     pub(crate) fn status(&self) -> DecisionPlaneStatus {
-        DecisionPlaneStatus {
-            backend: self.factory.status(),
-            catalog_generation: *self.catalog.generation(),
-            store_mode: self.store.mode(),
-            durable_key: self.durable_key,
-            recordable: self.recordable,
-        }
+        crate::runtime::ingress_recovery::status::plane_status(
+            self.factory.status(),
+            crate::runtime::ingress_recovery::status::JournalAttachment {
+                catalog_generation: *self.catalog.generation(),
+                store_mode: self.store.mode(),
+                durable_key: self.durable_key,
+                recordable: self.recordable,
+            },
+        )
     }
 
     pub(crate) fn prompt_memory_loader(&self) -> Option<&dyn crate::agent::memory_loader::MemoryLoader> {
-        self.memory_loader.as_deref()
+        self.publication_scope().prompt_memory_loader()
     }
 
     /// Build the turn context, G6 slice and SendLimits without a prediction
@@ -1122,13 +734,13 @@ impl TurnDecisionService {
             .await
     }
 
-    async fn open_turn_context_observed(
+    pub(in crate::runtime) async fn open_turn_context_observed(
         &self,
         proof: &dyn TurnSourceProof,
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
         observation: Option<&segment_observation::SegmentObservation>,
-        resume: Option<pending_approval::AdmittedDecisionResume>,
+        resume: Option<AdmittedDecisionResume>,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
@@ -1284,11 +896,6 @@ impl TurnDecisionService {
             );
             engine.outgoing_parent_allowed = Some(issued.parent.allowed);
         }
-        let (call_fingerprints, verified_approval_calls) = resume_evidence.as_ref().map_or_else(
-            || (BTreeMap::new(), BTreeMap::new()),
-            |evidence| crate::runtime::decision_advisory::resume_gate_maps(evidence, &self.state_key),
-        );
-        let replayed_non_idempotent = BTreeSet::new();
         let admission_facts = crate::tools::capability::admission_facts::AdmissionFactsV1 {
             policy: Arc::clone(&self.security),
             owner_id: Arc::from(proof.owner_id()),
@@ -1303,15 +910,26 @@ impl TurnDecisionService {
                 (Arc::new(manifest.clone()), Arc::new(constraints.clone()))
             }),
         };
-        let gates = crate::runtime::decision_advisory::gate_inputs(
-            &admission_facts,
-            &call_fingerprints,
-            verified_approval_calls,
-            &replayed_non_idempotent,
-        );
-        let execution_refs = direct_answer_refs(&engine, &catalog, &gates, &BTreeSet::new(), &|bytes| {
+        // The published surface is an execution rule over the pinned scope,
+        // the admission facts and the catalog (R28).
+        let published = crate::tools::surface_owner::publication::PublicationRules {
+            trusted: &trusted_parts,
+            facts: &admission_facts,
+            catalog: &catalog,
+        }
+        .surface(resume_evidence.as_ref(), engine.outgoing_child.is_some(), &|bytes| {
             crate::cost::estimate::estimate_cost(&model, &self.generation.effective.cost, bytes)
         });
+        let outgoing_delegation = engine
+            .outgoing_child
+            .clone()
+            .zip(engine.outgoing_parent_allowed.clone())
+            .map(
+                |(manifest, parent_allowed)| crate::runtime::turn_context::OutgoingDelegation {
+                    manifest,
+                    parent_allowed,
+                },
+            );
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
         let accounting = opening::accounting_scope(self, proof, budgets, deadline);
@@ -1330,6 +948,9 @@ impl TurnDecisionService {
             publication_policy: self.publication_policy.clone(),
             catalog_generation: catalog.generation(),
             admission: admission_facts,
+            published,
+            discovery: crate::tools::capability::search_tool::DiscoveryState::default(),
+            outgoing_delegation,
             resume: resume.clone(),
             resume_evidence: resume_evidence.map(Arc::new),
             state_key: Arc::clone(&self.state_key),
@@ -1349,449 +970,50 @@ impl TurnDecisionService {
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
             collected_approval_result: std::sync::OnceLock::new(),
-            discovery_offers: std::sync::OnceLock::new(),
-            discovery_admissions: std::sync::OnceLock::new(),
             engine,
             hop_ids: vec![decision_id],
             prior_hops: Vec::new(),
-            directive: TurnExecutionDirective::AnswerDirectly,
             main_compaction: budget.main_compaction,
-            execution_refs,
         }))
     }
 
-    pub(crate) async fn open_issued_resume_turn_context(
-        &self,
-        proof: &dyn TurnSourceProof,
-        kind: AgentTurnKind,
-        cancellation: &CancellationToken,
-    ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        let admitted = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
-            admitted = self.admit_decision_resume(proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
-        };
-        let _resume_allowance = self
-            .generation
-            .effective
-            .sessions_spawn
-            .allow_recursive_delegation
-            .then(|| {
-                self.runtime
-                    .recursive_allowances()
-                    .inherit_resume(proof, admitted.original_run())
-            });
-        let opened = self
-            .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
-            .await?;
-        self.record_opened_context(proof, opened, cancellation).await
-    }
-
-    /// Snapshot the initial decision budget after the source proof and PMM
-    /// selection have been rechecked. Execution must recheck spend under its
-    /// own ledger lock; this read-only snapshot grants no tool authority.
     pub(crate) fn agent_budget_snapshot(
         &self,
         proof: &dyn TurnSourceProof,
     ) -> Result<AgentDecisionBudget, AgentDecisionBudgetError> {
-        let _model = self.resolve_agent_model(proof)?;
-        let config = &self.generation.effective;
-        let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
-        let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
-        let reservation =
-            DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
-        let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
-        let remaining = self
-            .runtime
-            .spend_ceiling(proof)?
-            .live()
-            .map_err(AgentDecisionBudgetError::Spend)?;
-        Ok(AgentDecisionBudget {
-            budgets: TurnBudgets {
-                tokens: u64::try_from(reservation.decision_tokens).unwrap_or(u64::MAX),
-                latency_ms: config.causal_tree.policy.extra_latency_budget_ms,
-                micro_usd: remaining,
-            },
-            main_compaction,
-        })
+        self.publication_scope().agent_budget_snapshot(proof)
     }
 
-    /// Live spend limit and price inputs for one provider send of this turn.
-    /// The spend limit is re-read from the ledger on every call so an earlier
-    /// round's charge is visible.
     pub(crate) fn send_limits(&self, proof: &dyn TurnSourceProof) -> Result<SendLimits, AgentDecisionBudgetError> {
-        let budget = self.agent_budget_snapshot(proof)?;
-        let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
-        Ok(SendLimits {
-            response_reserve: effective.config.reserve_tokens,
-            remaining_micro_usd: budget.budgets.micro_usd,
-            model: self.resolve_agent_model(proof)?,
-            cost: self.generation.effective.cost.clone(),
-        })
+        self.publication_scope().send_limits(proof)
     }
 
-    /// A published catalog cannot authorize a capability after its live
-    /// registry schema or binding has changed. Call before candidate exposure
-    /// and again immediately before committing a directive.
     pub(crate) fn check_live_parity(&self) -> Result<(), ParityError> {
-        if let Some(parent) = &self.ordinary_parent {
-            parent.verify_live().map_err(|_| ParityError)?;
-        }
-        if let Some(task) = &self.ordinary_task {
-            task.verify().map_err(|_| ParityError)?;
-        }
-        if let Some(task) = &self.operator_task {
-            task.verify().map_err(|_| ParityError)?;
-        }
-        if let Some(process) = &self.operator_process {
-            process.verify().map_err(|_| ParityError)?;
-            return self
-                .catalog
-                .check_published_parity(&self.execution, process.snapshots().publication.allowed());
-        }
-        if let Some(process) = &self.ordinary_process {
-            process.verify().map_err(|_| ParityError)?;
-        }
-        self.child_scope().map_or_else(
-            || self.catalog.check_parity(&self.execution),
-            |scope| self.catalog.check_child_parity(&self.execution, scope),
-        )
+        self.publication_scope().check_live_parity()
     }
 
-    fn child_scope(&self) -> Option<&Arc<crate::tools::capability::child::VerifiedChildScope>> {
-        crate::runtime::child_source::turn_scope::issued_child_scope(
-            self.runtime.parent_grant().map(AsRef::as_ref),
-            self.ordinary_parent.as_ref(),
-            self.ordinary_task.as_deref(),
-            self.ordinary_process.as_deref(),
-        )
+    pub(in crate::runtime) fn child_scope(&self) -> Option<&Arc<crate::tools::capability::child::VerifiedChildScope>> {
+        self.publication_scope().child_scope()
     }
 
     pub(crate) fn resolve_agent_model(&self, proof: &dyn TurnSourceProof) -> Result<ResolvedModel, TurnModelError> {
-        validate_agent_turn_origin(&self.generation, self.surface, proof)?;
-        match &self.operator_process {
-            Some(process) => process
-                .verify_source(proof)
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?,
-            None if proof.operator_process_authority_id().is_some() => {
-                return Err(TurnModelError::Origin(TurnOriginMismatch));
-            }
-            None => {}
-        }
-        match &self.operator_task {
-            Some(task) => task
-                .verify_source(proof)
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?,
-            None if proof.operator_task_authority_id().is_some() => {
-                return Err(TurnModelError::Origin(TurnOriginMismatch));
-            }
-            None => {}
-        }
-        match &self.ordinary_process {
-            Some(process) => process
-                .verify_source(proof)
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?,
-            None if proof.ordinary_process_authority_id().is_some() => {
-                return Err(TurnModelError::Origin(TurnOriginMismatch));
-            }
-            None => {}
-        }
-
-        if let Some(parent) = &self.ordinary_parent {
-            parent
-                .verify_live()
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?;
-        }
-        match &self.ordinary_task {
-            Some(task) => task
-                .verify_source(proof)
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?,
-            None if proof.ordinary_task_authority_id().is_some() => {
-                return Err(TurnModelError::Origin(TurnOriginMismatch));
-            }
-            None => {}
-        }
-        match (self.child_scope(), proof.child_scope()) {
-            (None, None) => {}
-            (Some(issued), Some(scope)) if Arc::ptr_eq(issued, scope) => {}
-            _ => return Err(TurnModelError::Origin(TurnOriginMismatch)),
-        }
-        if let Some(scope) = proof.child_scope() {
-            scope
-                .validate_runtime(
-                    &self.state_key,
-                    proof.owner_id(),
-                    proof.workspace_id(),
-                    self.catalog_view().generation(),
-                )
-                .map_err(|_| TurnModelError::Origin(TurnOriginMismatch))?;
-        }
-        let config = &self.generation.effective;
-        let pinned_route = crate::providers::selection::route_target(
-            &self.provider_catalog,
-            proof.provider_name(),
-            proof.model_name(),
-        )?;
-        if pinned_route != proof.model_binding().route() {
-            return Err(TurnModelError::RouteDrift);
-        }
-        let resolved = crate::providers::selection::check_with(
-            config,
-            &self.provider_catalog,
-            proof.provider_name(),
-            proof.model_name(),
-            self.credential_for_proof(proof),
-            &Requirement::chat(),
-            UnknownPolicy::Invocation,
-        )?;
-        if !proof.model_binding().matches(&resolved) {
-            return Err(TurnModelError::SelectionDrift);
-        }
-        Ok(resolved)
+        self.publication_scope().resolve_agent_model(proof)
     }
 
-    fn credential_for_proof(&self, proof: &dyn TurnSourceProof) -> crate::providers::credentials::CredentialRef {
-        if self.child_scope().is_some() || self.operator_task.is_some() || self.operator_process.is_some() {
-            proof.model_binding().credential_reference().clone()
-        } else {
-            crate::providers::selection::credential_for(&self.generation.effective, proof.provider_name())
-        }
+    pub(in crate::runtime) fn credential_for_proof(
+        &self,
+        proof: &dyn TurnSourceProof,
+    ) -> crate::providers::credentials::CredentialRef {
+        self.publication_scope().credential_for_proof(proof)
     }
 
-    /// G7 permits tool calls only when ingress configuration allows them
-    /// and PMM verified NativeTools for the exact model on this catalog.
-    /// An id-only invocation can still chat
-    /// under PMM's invocation policy, but cannot gain tool authority.
     pub(crate) fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool {
-        if !proof.tool_calls_allowed() || self.resolve_agent_model(proof).is_err() {
-            return false;
-        }
-        crate::runtime::turn_model::can_call_tools(
-            &self.generation.effective,
-            &self.provider_catalog,
-            proof,
-            self.credential_for_proof(proof),
-        )
+        self.publication_scope().model_can_call_tools(proof)
     }
-}
-
-/// Construct an ingress or a durably authorized child service. Ordinary
-/// in-process children derive from `OrdinaryChildPublication` instead.
-/// The factory receives the persisted workspace key or `None`; an ephemeral
-/// state key never enables a remote backend or cross-process child authority.
-pub(crate) async fn build_turn_decision_service(
-    surface: TurnSurfaceKind,
-    build: TurnServiceBuild<'_>,
-) -> Result<Arc<TurnDecisionService>, TurnServiceBuildError> {
-    if build.catalog_sources.config_generation_id != build.generation.id.0.to_string() {
-        return Err(TurnServiceBuildError::SourceGeneration);
-    }
-    match (&build.parent_grant, surface) {
-        (Some(grant), TurnSurfaceKind::Worker) if Arc::ptr_eq(grant.generation(), &build.generation) => {}
-        (None, surface) if surface != TurnSurfaceKind::Worker => {}
-        _ => return Err(TurnServiceBuildError::ChildAuthority),
-    }
-    let config = &build.generation.effective;
-    if config.causal_tree.enabled && !crate::memory::serves_tool_execution_ledger(build.memory.name()) {
-        return Err(TurnServiceBuildError::EventStoreUnsupported);
-    }
-    if config.causal_tree.enabled && !config.memory.events.record_user_messages {
-        return Err(TurnServiceBuildError::InboundEventsDisabled);
-    }
-    // `load_key` deliberately does not touch the workspace key while the
-    // plane is disabled. Its single preparation result is shared with recovery;
-    // an unavailable key leaves both the factory builtin-only and recovery unrecorded.
-    let workspace_key = store_preparation::load_key(Arc::clone(&build.generation)).await?;
-    let durable_key = config.causal_tree.enabled && workspace_key.is_some();
-    if let Some(grant) = &build.parent_grant {
-        let key = workspace_key
-            .as_ref()
-            .filter(|_| durable_key)
-            .ok_or(TurnServiceBuildError::ChildAuthority)?;
-        let (manifest, _) = grant.scope().gate_inputs();
-        grant
-            .scope()
-            .validate_runtime(
-                key,
-                &manifest.authority.owner,
-                &config.workspace_dir.to_string_lossy(),
-                grant.catalog().view(&CatalogScope::default()).generation(),
-            )
-            .map_err(|_| TurnServiceBuildError::ChildAuthority)?;
-        for reference in &manifest.allowed {
-            let view = grant.catalog().view(&CatalogScope::default());
-            let entry = view
-                .entry_any(&reference.id)
-                .ok_or(TurnServiceBuildError::ChildAuthority)?;
-            if !build
-                .surface_policy
-                .permits(&entry.public_name, &entry.root, &entry.target)
-                || build.surface_policy.excluded_names.contains(&entry.public_name)
-                || build.surface_policy.excluded_names.contains(&entry.root)
-            {
-                return Err(TurnServiceBuildError::ChildAuthority);
-            }
-        }
-        grant.catalog().check_child_parity(&build.execution, grant.scope())?;
-    }
-    let recovery_owner = super::turn_cleanup::current_tracker().unwrap_or_default();
-    let opened = if durable_key {
-        Some(
-            super::ingress_recovery::open_advisory_store(
-                &build.generation,
-                Arc::clone(&build.memory),
-                Arc::clone(&build.events),
-                &recovery_owner,
-            )
-            .await
-            .map_err(TurnServiceBuildError::RecoveryPreparation)?,
-        )
-    } else {
-        None
-    };
-    let store = match &opened {
-        Some((store, _)) => Arc::clone(store),
-        None => {
-            store_preparation::open_store(Arc::clone(&build.generation), Arc::clone(&build.events), None, false).await?
-        }
-    };
-    let durable_events = opened.as_ref().map(|(_, events)| Arc::clone(events));
-    let events: Arc<dyn CausalEventSink> = durable_events.as_ref().map_or_else(
-        || Arc::clone(&build.events),
-        |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
-    );
-    let runtime = crate::runtime::turn_context::TurnRuntimeHolder::prepare(
-        &build.generation,
-        Arc::clone(&build.memory),
-        surface,
-        build.parent_grant.clone(),
-        crate::runtime::turn_context::RecoveryPreparation {
-            owner: recovery_owner,
-            workspace_key: workspace_key.clone(),
-            advisory: match &opened {
-                Some((store, events)) => {
-                    super::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))
-                        .map_err(TurnServiceBuildError::RecoveryPreparation)?
-                }
-                None => super::ingress_recovery::PreparedAdvisory::default(),
-            },
-        },
-        &build.security,
-    )
-    .await
-    .map_err(TurnServiceBuildError::RecoveryPreparation)?;
-    let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
-    let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
-        .map_err(TurnServiceBuildError::PolicyFingerprint)?;
-    let mut catalog_sources = build.catalog_sources;
-    // Node ids and engine child seals must use the same key in this service.
-    // The source's independent key cannot assert workspace provenance.
-    catalog_sources.node_key = Some(Arc::clone(&state_key));
-    let catalog = match &build.parent_grant {
-        Some(grant) => Arc::clone(grant.catalog()),
-        None => {
-            let catalog = Arc::new(CapabilityCatalog::build(
-                build.registry.as_ref(),
-                &catalog_sources,
-                &build.surface_policy,
-            )?);
-            catalog.check_parity(&build.execution)?;
-            catalog
-        }
-    };
-
-    let factory = DecisionBackendFactory::from_config(
-        config,
-        FactoryDeps {
-            catalog: build.provider_catalog,
-            key: workspace_key,
-            transports: build.transports,
-            config_generation: build.generation.id.0,
-            events: Arc::clone(&events),
-        },
-    )?;
-    #[cfg(test)]
-    let factory = evidence_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
-    #[cfg(test)]
-    let factory = selected_loader_fixture::wrap_factory(factory, config, Arc::clone(&state_key), Arc::clone(&events));
-    #[cfg(test)]
-    let factory = ordinary_child_fixture::wrap_factory(factory, Arc::clone(&state_key), Arc::clone(&events));
-    // The advisory engine's factory is built from the effective engine
-    // backend with this service's state key, never through the plane switch
-    // (R55, R9). A disabled engine builds no factory.
-    let advisory_factory = if config.decision_engine.enabled {
-        Some(DecisionBackendFactory::from_config(
-            config,
-            FactoryDeps {
-                catalog: build.provider_catalog,
-                key: Some(Arc::clone(&state_key)),
-                transports: build.transports,
-                config_generation: build.generation.id.0,
-                events: Arc::clone(&events),
-            },
-        )?)
-    } else {
-        None
-    };
-    let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
-    Ok(Arc::new(TurnDecisionService {
-        runtime: Arc::new(runtime),
-        advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
-            Arc::clone(&build.generation.effective),
-            advisory_factory,
-        ),
-        child_recovery: Default::default(),
-        memory_loader: None,
-        loop_runtime: None,
-        publication_policy: build.surface_policy,
-        ordinary_parent: None,
-        operator_task: None,
-        operator_process: None,
-        ordinary_task: None,
-        ordinary_process: None,
-        service_id: uuid::Uuid::now_v7(),
-        surface,
-        generation: build.generation,
-        catalog,
-        provider_catalog: build.provider_catalog.clone(),
-        factory,
-        events,
-        state_key,
-        policy_version,
-        durable_key,
-        recordable,
-        registry: build.registry,
-        execution: build.execution,
-        memory: build.memory,
-        security: build.security,
-        store,
-        durable_events,
-    }))
 }
 
 #[cfg(test)]
 pub(crate) use tests::with_worker_probe_manifest;
 
 #[cfg(test)]
-mod tests;
-
-pub(crate) fn selected_custom_memory_read_scope(
-    write_scope: &crate::memory::principal::MemoryWriteContext,
-    workspace: &str,
-    owner: &str,
-) -> anyhow::Result<crate::memory::principal::MemoryWriteContext> {
-    anyhow::ensure!(
-        !workspace.is_empty()
-            && !owner.is_empty()
-            && write_scope.workspace_id.as_deref() == Some(workspace)
-            && write_scope.owner_id.as_deref().is_none_or(|present| present == owner),
-        "selected custom retrieval scope differs from its source"
-    );
-    let mut scope = write_scope.clone();
-    scope.owner_id = Some(owner.to_owned());
-    scope.require_owner_match = true;
-    Ok(scope)
-}
-
-#[cfg(test)]
-mod selected_custom_memory_scope_tests;
+pub(crate) mod tests;

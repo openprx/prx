@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-use super::turn_decision::VerifiedDirectiveApplication;
+use super::turn_terminal::settlement::VerifiedDirectiveApplication;
 use crate::config::ConfigGeneration;
 use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 use crate::observability::causal_event::{

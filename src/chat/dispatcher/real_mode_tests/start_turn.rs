@@ -785,7 +785,6 @@ async fn interactive_chat_clear_shell_request_with_empty_memory_is_not_clarified
                     .expect("test: admitted routing")
                     .context
                     .is_run()
-                    .expect("test: live execution")
             );
             Ok(())
         })

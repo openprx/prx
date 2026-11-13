@@ -85,9 +85,9 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -114,21 +114,25 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
         // or a claim about builtin multilingual semantic understanding.
         let predictions = Arc::new(AtomicUsize::new(0));
         let owning = Arc::get_mut(&mut service).unwrap();
-        owning.factory = DecisionBackendFactory::from_slots(
-            vec![Box::new(FilesystemApprovalBackend {
-                identity: BackendIdentity {
-                    kind: BackendKind::Mock,
-                    provider: None,
-                    configured_model: Arc::from("prx-local-model"),
-                },
-                family: "filesystem",
-                calls: Arc::clone(&predictions),
-            })],
-            Arc::clone(&owning.state_key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
+        let key = state_key(owning);
+        install_factory(
+            owning,
+            DecisionBackendFactory::from_slots(
+                vec![Box::new(FilesystemApprovalBackend {
+                    identity: BackendIdentity {
+                        kind: BackendKind::Mock,
+                        provider: None,
+                        configured_model: Arc::from("prx-local-model"),
+                    },
+                    family: "filesystem",
+                    calls: Arc::clone(&predictions),
+                })],
+                key,
+                OutboundSecrets::default(),
+                SlotLimits::default(),
+            ),
         );
-        assert!(service.recordable && service.durable_key);
+        assert!(recordable_and_durable(&service));
         let (proof, envelope) = recorded_approval_source(
             &generation,
             Arc::clone(&memory),
@@ -148,13 +152,21 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
             predictions.load(Ordering::SeqCst) > 0,
             "the actual controlled local backend must supply predictions"
         );
-        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
-        let selected = service.agent_execution_specs(proof.as_ref(), &context).unwrap();
+        let read_id = service.catalog().entry_for_public_name("file_read").unwrap().id.clone();
+        assert!(
+            context.execution_refs().iter().any(|reference| reference.id == read_id),
+            "the direct surface publishes the read capability"
+        );
+        let selected = crate::tools::capability::execution_binding::specs::execution_specs(
+            &service.surface_port(&context),
+            proof.as_ref(),
+        )
+        .unwrap();
         assert_eq!(
             selected.specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
             ["file_read"]
         );
-        let entry = service.catalog.entry_for_public_name(tool_name).unwrap();
+        let entry = service.catalog().entry_for_public_name(tool_name).unwrap();
         assert_eq!(entry.family, CapabilityTarget::NativeTool);
         assert!(matches!(entry.exposure, Exposure::Searchable));
         let port = service.capability_search_port(proof.as_ref(), &context).unwrap();
@@ -171,11 +183,7 @@ async fn native_discovery_execution_ledger_retains_reported_usage_in_normal_term
             .admit_discovered_tool(proof.as_ref(), &context, tool_name)
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            proposal.admission,
-            crate::causal_tree::gates::GateOutcome::ApprovalDeferred
-                | crate::causal_tree::gates::GateOutcome::ApprovalOnly { .. }
-        ));
+        assert!(proposal.admission.is_pending());
         assert!(
             service
                 .agent_appended_execution_specs(proof.as_ref(), &context)

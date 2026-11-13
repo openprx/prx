@@ -290,7 +290,7 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         .await
         .expect("test: claim winner");
     let commit: crate::agent::terminal::TurnTerminalCommit = draft.clone().try_into().expect("test: commit");
-    let recorded = commit.decision.is_recorded();
+    let recorded = commit.is_recorded();
     let payload: serde_json::Value = serde_json::from_str(&first_claim_payload(&workspace)).expect("test: claim json");
     let key_id = payload
         .get("recovery_key_id")

@@ -1,8 +1,10 @@
-//! Failures while constructing a source-bound decision service.
-use super::{CatalogError, FactoryBuildError, ParityError, StoreError};
+//! Failures while building one publication (R26).
+use crate::decision_engine::prediction::factory::FactoryBuildError;
+use crate::runtime::decision_journal::store::StoreError;
+use crate::tools::capability::catalog::{CatalogError, ParityError};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum TurnServiceBuildError {
+pub(crate) enum PublicationBuildError {
     #[error("durable recovery initialization failed")]
     RecoveryPreparation(#[source] anyhow::Error),
     #[error("child service does not match its issued parent authority")]

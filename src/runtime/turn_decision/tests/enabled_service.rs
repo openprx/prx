@@ -26,9 +26,9 @@ async fn enabled_agent_rejects_memory_without_message_events_before_key_or_store
         };
         let provider_catalog = ProviderCatalogView::from_config(&config);
         let transports = CountingTransports(AtomicUsize::new(0));
-        let result = build_turn_decision_service(
+        let result = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -43,7 +43,7 @@ async fn enabled_agent_rejects_memory_without_message_events_before_key_or_store
             },
         )
         .await;
-        assert!(matches!(result, Err(TurnServiceBuildError::EventStoreUnsupported)));
+        assert!(matches!(result, Err(PublicationBuildError::EventStoreUnsupported)));
         assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
         assert!(!workspace.path().join("self/causal_tree/decisions.db").exists());
     }
@@ -68,9 +68,9 @@ async fn enabled_agent_rejects_disabled_user_event_recording_before_key_or_store
     ));
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let result = build_turn_decision_service(
+    let result = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -85,7 +85,7 @@ async fn enabled_agent_rejects_disabled_user_event_recording_before_key_or_store
         },
     )
     .await;
-    assert!(matches!(result, Err(TurnServiceBuildError::InboundEventsDisabled)));
+    assert!(matches!(result, Err(PublicationBuildError::InboundEventsDisabled)));
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
     assert!(!workspace.path().join("self/causal_tree/decisions.db").exists());
 }
@@ -197,9 +197,9 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
     let transports = CountingTransports(AtomicUsize::new(0));
     let mut stale_sources = sources(&generation, &config);
     stale_sources.config_generation_id = "stale_generation".to_string();
-    let stale = build_turn_decision_service(
+    let stale = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -214,9 +214,9 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
         },
     )
     .await;
-    assert!(matches!(stale, Err(TurnServiceBuildError::SourceGeneration)));
+    assert!(matches!(stale, Err(PublicationBuildError::SourceGeneration)));
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
-    let bundle = TurnServiceBuild {
+    let bundle = PublicationInputs {
         parent_grant: None,
         generation: Arc::clone(&generation),
         registry: Arc::clone(&registry),
@@ -229,7 +229,7 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
         memory: Arc::new(NoneMemory::new()),
         security: Arc::new(SecurityPolicy::default()),
     };
-    let first = build_turn_decision_service(TurnSurfaceKind::AgentLoop, bundle)
+    let first = build_publication(TurnSurfaceKind::AgentLoop, bundle)
         .await
         .expect("disabled service");
     assert!(!first.durable_key);
@@ -258,9 +258,9 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
     ));
     assert_eq!(first.store.mode(), StoreMode::ReadOnly);
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
-    let second = build_turn_decision_service(
+    let second = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -308,9 +308,9 @@ async fn disabled_service_uses_an_independent_read_only_view_when_a_writer_is_sh
     .expect("writable fixture store");
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let result = build_turn_decision_service(
+    let result = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -354,9 +354,9 @@ async fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
     let events: Arc<dyn CausalEventSink> = Arc::new(SilentEvents);
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let service = build_turn_decision_service(
+    let service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,

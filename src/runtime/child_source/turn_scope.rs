@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::IssuedChildGrant;
 use super::ordinary_process::OrdinaryProcessAuthority;
 use super::ordinary_task::OrdinaryTaskAuthority;
-use crate::runtime::turn_decision::OrdinaryChildPublication;
+use crate::runtime::child_source::publication::OrdinaryChildPublication;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::ToolExecutionContext;

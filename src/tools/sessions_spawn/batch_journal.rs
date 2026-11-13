@@ -124,7 +124,7 @@ impl PreparedBatch {
     }
 
     pub(super) async fn prepare_ordinary(
-        publication: &crate::runtime::turn_decision::OrdinaryChildPublication,
+        publication: &crate::runtime::child_source::publication::OrdinaryChildPublication,
         caller: &crate::tools::ToolExecutionContext,
         batch: &str,
         members: &[(String, serde_json::Value)],

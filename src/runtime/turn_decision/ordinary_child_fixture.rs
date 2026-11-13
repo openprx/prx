@@ -175,7 +175,7 @@ pub(crate) fn with_inherited_scored_prediction<F: std::future::Future>(
     }
 }
 
-pub(super) fn wrap_factory(
+pub(in crate::runtime) fn wrap_factory(
     original: DecisionBackendFactory,
     key: Arc<DecisionKey>,
     events: Arc<dyn CausalEventSink>,

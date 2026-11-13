@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 pub(super) struct ChannelDecisionTurn {
     service: Arc<TurnDecisionService>,
-    proof: super::decision_source::ChannelTurnProof,
+    proof: super::turn_source::ChannelTurnProof,
     context: Arc<TurnDecisionContext>,
     advice: Option<crate::decision_engine::IntentAnalysis>,
     terminal: crate::runtime::turn_terminal::TurnTerminalGuard,
@@ -80,12 +80,12 @@ impl SmartGroupClassifierCall {
 impl ChannelDecisionTurn {
     pub(super) async fn admit(
         ctx: &super::ChannelRuntimeContext,
-        source: &super::decision_source::ChannelSourceReceipt,
+        source: &super::turn_source::ChannelSourceReceipt,
         generation: &Arc<crate::config::ConfigGeneration>,
         security: &Arc<crate::security::SecurityPolicy>,
         route: &super::ChannelRouteSelection,
         cancellation: &tokio_util::sync::CancellationToken,
-        admission: &mut super::decision_source::ChannelAdmissionGuard,
+        admission: &mut super::turn_source::ChannelAdmissionGuard,
     ) -> anyhow::Result<Self> {
         let envelope_for_scope = source.envelope();
         let conversation_id = envelope_for_scope.recipient.clone().unwrap_or_default();
@@ -120,7 +120,7 @@ impl ChannelDecisionTurn {
         let context = service
             .open_issued_turn_context(
                 &proof,
-                crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                crate::runtime::turn_context::AgentTurnKind::SingleShot,
                 cancellation,
             )
             .await?;
@@ -136,7 +136,7 @@ impl ChannelDecisionTurn {
             None,
         )?
         .with_provider_trace(Arc::clone(&trace), route.clone());
-        let recalled_context = if context.is_run()? {
+        let recalled_context = if context.is_run() {
             crate::agent::context_recall::scoped_recall(
                 turn_memory.as_ref(),
                 &crate::agent::context_recall::RecallScope::from_envelope(
@@ -257,6 +257,7 @@ impl ChannelDecisionTurn {
         crate::agent::turn_request::TurnDecision {
             service: &self.service,
             context: &self.context,
+            runtime: self.context.runtime(),
             proof: &self.proof,
         }
     }
@@ -294,6 +295,7 @@ impl ChannelDecisionTurn {
 
     pub(super) async fn commit(&self, mut proposal: TurnTerminalDraft) -> anyhow::Result<TurnTerminalReceipt> {
         proposal.decision = Some(self.service.terminal_settlement_ref(Arc::clone(&self.context))?);
+        proposal.binding = Some(self.service.terminal_binding(&self.context)?);
         // Terminal provenance belongs to the admitted sender; assistant history
         // has a separate projection scope and cannot replace source authority.
         if proposal.history.is_some() {

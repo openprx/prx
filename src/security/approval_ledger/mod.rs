@@ -2,6 +2,7 @@
 //! Runtime admission checks remain in the adapter; persisted authentication,
 //! review arbitration and metadata reads belong here.
 mod grant;
+pub(crate) mod historical;
 pub(crate) mod keys;
 pub(crate) mod pending;
 pub(crate) mod resolution;

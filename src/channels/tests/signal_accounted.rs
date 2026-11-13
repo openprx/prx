@@ -266,7 +266,7 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
         let mut anchor = message.clone();
         anchor.id = "prx-signal-scope-anchor".to_owned();
         anchor.content = "saved project scope anchor".to_owned();
-        let (event, source, guard) = decision_source::ChannelSourceReceipt::record_guarded(
+        let (event, source, guard) = turn_source::ChannelSourceReceipt::record_guarded(
             Arc::clone(&ctx), shared.pin(), anchor, uuid::Uuid::new_v4().to_string(),
             cleanup.register(CancellationToken::new()).expect("anchor cleanup owner"),
         ).await.expect("genuine channel source anchor");

@@ -47,17 +47,18 @@ fn verify_lineage(parent: &MessageEvent, child: &MessageEvent, task: &str) -> an
 
 pub(super) async fn prepare(
     link: &DecisionSettlementRef,
+    binding: &crate::agent::terminal::TerminalBinding,
     source: &MessageEvent,
     task: Option<&str>,
 ) -> anyhow::Result<Option<ReplayOperator>> {
-    let Some(parent) = &link.operator_parent else {
+    let Some(parent) = &binding.operator_parent else {
         return Ok(None);
     };
     anyhow::ensure!(
-        link.parent_grant.is_none(),
+        binding.parent_grant.is_none(),
         "operator replay cannot also claim model delegation"
     );
-    let event = link
+    let event = binding
         .memory
         .find_owned_message_event(
             parent.workspace_id(),

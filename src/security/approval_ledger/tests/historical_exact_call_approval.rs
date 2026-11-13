@@ -1,12 +1,49 @@
 #![cfg(test)]
 //! Filesystem discovery denial plus shared genuine-source approval regression fixtures.
 //! Controlled decision answers never manufacture a source, grant, or call digest.
-use super::*;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
 use crate::agent::turn_contracts::ChatMode;
 use crate::chat::binding::tests::recorded_approval_source;
+use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::cost::decision_attempt::BackendIdentity;
+use crate::cost::decision_attempt::error::DecisionError;
+use crate::decision_engine::prediction::backend::DecisionBackend;
+use crate::decision_engine::prediction::builtin::BuiltinDecisionBackend;
+use crate::decision_engine::prediction::factory::{DecisionBackendFactory, SlotLimits};
+use crate::decision_engine::prediction::outbound::{GuardedBody, OutboundSecrets};
+use crate::decision_engine::prediction::protocol::{
+    DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion, Probability, QuestionId,
+};
+use crate::decision_engine::prediction::validate::ModelVersionPolicy;
+use crate::memory::Memory;
+use crate::providers::catalog::CatalogView as ProviderCatalogView;
+use crate::runtime::turn_context::AgentTurnKind;
+use crate::runtime::turn_decision::tests::historical_support::{
+    CountingTransports, SilentEvents, force_recordable_durable, install_factory, recordable_and_durable, sources,
+    state_key,
+};
+use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_publication::{PublicationInputs, build_publication};
+use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::SecurityPolicy;
+use crate::tools::capability::catalog::{Exposure, SurfacePolicy};
+use crate::tools::capability::contract::CapabilityTarget;
 use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::execution::ToolExecutionContext;
+use crate::tools::execution::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
+    TracingToolExecutionAudit,
+};
 use crate::tools::file_write::FileWriteTool;
+use crate::tools::traits::{Tool, ToolResult};
 
 struct CountedFileMutation {
     inner: Box<dyn Tool>,
@@ -140,7 +177,6 @@ async fn unrelated_chat_input_cannot_create_pending_file_approval() {
     Box::pin(exact_file_without_intent(false, None)).await;
 }
 
-#[path = "exact_call_approval/reported_usage.rs"]
 mod reported_usage;
 
 #[tokio::test]
@@ -223,9 +259,9 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -251,21 +287,25 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         // or a claim about builtin multilingual semantic understanding.
         let predictions = Arc::new(AtomicUsize::new(0));
         let owning = Arc::get_mut(&mut service).unwrap();
-        owning.factory = DecisionBackendFactory::from_slots(
-            vec![Box::new(FilesystemApprovalBackend {
-                identity: BackendIdentity {
-                    kind: BackendKind::Mock,
-                    provider: None,
-                    configured_model: Arc::from("prx-local-model"),
-                },
-                family: "filesystem",
-                calls: Arc::clone(&predictions),
-            })],
-            Arc::clone(&owning.state_key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
+        let key = state_key(owning);
+        install_factory(
+            owning,
+            DecisionBackendFactory::from_slots(
+                vec![Box::new(FilesystemApprovalBackend {
+                    identity: BackendIdentity {
+                        kind: BackendKind::Mock,
+                        provider: None,
+                        configured_model: Arc::from("prx-local-model"),
+                    },
+                    family: "filesystem",
+                    calls: Arc::clone(&predictions),
+                })],
+                key,
+                OutboundSecrets::default(),
+                SlotLimits::default(),
+            ),
         );
-        assert!(service.recordable && service.durable_key);
+        assert!(recordable_and_durable(&service));
         let (proof, envelope) = recorded_approval_source(
             &generation,
             Arc::clone(&memory),
@@ -285,8 +325,16 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
             predictions.load(Ordering::SeqCst) > 0,
             "the actual controlled local backend must supply predictions"
         );
-        assert!(matches!(context.directive(), TurnExecutionDirective::Execute { .. }));
-        let selected = service.agent_execution_specs(proof.as_ref(), &context).unwrap();
+        let read_id = service.catalog().entry_for_public_name("file_read").unwrap().id.clone();
+        assert!(
+            context.execution_refs().iter().any(|reference| reference.id == read_id),
+            "the direct surface publishes the read capability"
+        );
+        let selected = crate::tools::capability::execution_binding::specs::execution_specs(
+            &service.surface_port(&context),
+            proof.as_ref(),
+        )
+        .unwrap();
         if let Some(with_ledger) = bind_ledger {
             assert!(
                 service.execution_approval_ledger().is_some(),
@@ -335,7 +383,7 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
         // admit a file mutation or authorize approval collection.
 
         assert!(selected.specs.iter().all(|spec| spec.name != tool_name));
-        let entry = service.catalog.entry_for_public_name(tool_name).unwrap();
+        let entry = service.catalog().entry_for_public_name(tool_name).unwrap();
         assert!(
             !context
                 .execution_refs()
@@ -406,10 +454,8 @@ async fn exact_file_without_intent(edit: bool, bind_ledger: Option<bool>) {
     assert!(confirmed, "approval fixture final writer cleanup must be confirmed");
 }
 
-#[path = "exact_call_approval/native_usage.rs"]
 mod native_usage;
 
-#[path = "exact_call_approval/ordinary_plane.rs"]
 mod ordinary_plane;
 
 /// R9.6 (V-17): every resume turn now opens prediction-free (directive
@@ -421,7 +467,7 @@ mod ordinary_plane;
 /// different command than the prepared one.
 #[tokio::test]
 async fn historical_resume_survives_prediction_free_opening() {
-    use crate::runtime::turn_decision::pending_approval::published_only;
+    use crate::security::approval_ledger::historical::published_only;
     use crate::tools::execution::admission::TurnSurface;
     for engine in [false, true] {
         let workspace = tempfile::tempdir().unwrap();

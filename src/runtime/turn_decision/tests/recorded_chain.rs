@@ -64,9 +64,9 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("SQLite memory"));
-    let service = build_turn_decision_service(
+    let service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -125,6 +125,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         &fabric,
         crate::agent::terminal::TurnTerminalDraft {
             decision: None,
+            binding: None,
             terminal_id: "unlinked-terminal-1".to_owned(),
             scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
                 .with_owner_id(proof.owner_id())
@@ -162,6 +163,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 .settlement_ref(Arc::clone(&context))
                 .expect("recordable service issues the terminal link"),
         ),
+        binding: Some(service.terminal_binding(&context).expect("test: terminal binding")),
         terminal_id: "linked-terminal-1".to_owned(),
         scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
             .with_owner_id(proof.owner_id())
@@ -277,6 +279,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .settlement_ref(Arc::clone(&conflicting_context))
             .expect("second decision is recordable"),
     );
+    conflicting_commit.binding = Some(
+        service
+            .terminal_binding(&conflicting_context)
+            .expect("test: terminal binding"),
+    );
     assert!(
         crate::agent::terminal::finalize_turn(&fabric, conflicting_commit, &config.cost, workspace.path())
             .await
@@ -322,6 +329,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .settlement_ref(Arc::clone(&race_a_context))
             .expect("test: first race link"),
     );
+    concurrent_a.binding = Some(
+        service
+            .terminal_binding(&race_a_context)
+            .expect("test: terminal binding"),
+    );
     concurrent_a.scope = race_scope;
 
     concurrent_a.terminal_id = "concurrent-terminal-1".to_owned();
@@ -330,6 +342,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         service
             .settlement_ref(Arc::clone(&race_b_context))
             .expect("second concurrent decision link"),
+    );
+    concurrent_b.binding = Some(
+        service
+            .terminal_binding(&race_b_context)
+            .expect("test: terminal binding"),
     );
     let priced_outcome =
         |decision_id: DecisionId, prompt_tokens: u32| crate::llm::route_decision::ProviderExecutionOutcome {
@@ -427,6 +444,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .settlement_ref(Arc::clone(&divergent_context))
             .expect("test: divergent link"),
     );
+    divergent_a.binding = Some(
+        service
+            .terminal_binding(&divergent_context)
+            .expect("test: terminal binding"),
+    );
     divergent_a.scope = divergent_scope;
     divergent_a.terminal_id = "divergent-terminal-1".to_owned();
     divergent_a.provider_outcome = Some(priced_outcome(divergent_context.decision_id(), 30));
@@ -482,6 +504,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
             .settlement_ref(Arc::clone(&scope_context))
             .expect("test: scope replay link"),
     );
+    scope_commit.binding = Some(
+        service
+            .terminal_binding(&scope_context)
+            .expect("test: terminal binding"),
+    );
     scope_commit.scope = scope_event;
     scope_commit.terminal_id = "scope-replay-terminal-1".to_owned();
     scope_commit.provider_outcome = Some(priced_outcome(scope_context.decision_id(), 50));
@@ -530,6 +557,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                     .settlement_ref(Arc::clone(&rejoin_context))
                     .expect("recordable link"),
             ),
+            binding: Some(
+                service
+                    .terminal_binding(&rejoin_context)
+                    .expect("test: terminal binding"),
+            ),
             terminal_id: "rejoin-terminal-1".to_owned(),
             scope: rejoin_event_scope,
             status: crate::agent::terminal::TurnTerminalStatus::Failed,
@@ -571,6 +603,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 .settlement_ref(Arc::clone(&late_context))
                 .expect("delayed decision link"),
         ),
+        binding: Some(service.terminal_binding(&late_context).expect("test: terminal binding")),
         terminal_id: "late-async-terminal-1".to_owned(),
         scope: late_event_scope,
         status: crate::agent::terminal::TurnTerminalStatus::Failed,
@@ -684,9 +717,9 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         Arc::new(AdapterOwnedPreparation),
         Arc::new(TracingToolExecutionAudit),
     ));
-    let reopened = build_turn_decision_service(
+    let reopened = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry: reopened_registry,
@@ -738,9 +771,9 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         Arc::new(AdapterOwnedPreparation),
         Arc::new(TracingToolExecutionAudit),
     ));
-    let foreign_service = build_turn_decision_service(
+    let foreign_service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&foreign_generation),
             registry: foreign_registry,
@@ -825,6 +858,11 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
                 reopened
                     .settlement_ref(Arc::clone(&completed_context))
                     .expect("completed link"),
+            ),
+            binding: Some(
+                reopened
+                    .terminal_binding(&completed_context)
+                    .expect("test: terminal binding"),
             ),
             terminal_id: "completed-rejoin-terminal-1".to_owned(),
             scope: completed_scope,

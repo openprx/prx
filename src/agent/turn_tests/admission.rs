@@ -8,9 +8,9 @@ use std::sync::Arc;
 use crate::agent::turn_request::TurnDecision;
 use crate::decision_engine::prediction::factory::{BackendSpec, DecisionTransports};
 use crate::observability::causal_event::{CausalEvent, CausalEventSink};
-use crate::runtime::turn_decision::{
-    AgentTurnKind, TurnDecisionContext, TurnDecisionService, TurnServiceBuild, build_turn_decision_service,
-};
+use crate::runtime::turn_context::AgentTurnKind;
+use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_publication::{PublicationInputs, build_publication};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::capability::catalog::CatalogSources;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -671,9 +671,9 @@ impl AdmittedTurn {
             blocked: None,
         };
         let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
-        let mut service = build_turn_decision_service(
+        let mut service = build_publication(
             surface,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -699,7 +699,7 @@ impl AdmittedTurn {
         )
         .await
         .expect("actual fixture decision service")
-        .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
+        .with_loop_runtime(crate::runtime::turn_publication::PublicationLoopRuntime {
             hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
@@ -725,7 +725,7 @@ impl AdmittedTurn {
                 // share /tmp or one channel session while children stay live.
                 let run_id = format!("prx_channel_parent_{}", uuid::Uuid::new_v4());
                 let source = if generation.effective.causal_tree.enabled {
-                    crate::channels::decision_source::recorded_enabled_fixture_source(
+                    crate::channels::turn_source::recorded_enabled_fixture_source(
                         &generation,
                         Arc::clone(&memory),
                         &message,
@@ -734,7 +734,7 @@ impl AdmittedTurn {
                     )
                     .await
                 } else {
-                    crate::channels::decision_source::recorded_fixture_source(
+                    crate::channels::turn_source::recorded_fixture_source(
                         &generation,
                         Arc::clone(&memory),
                         &message,
@@ -873,8 +873,28 @@ impl AdmittedTurn {
         TurnDecision {
             service: &self.service,
             context: &self.context,
+            runtime: self.context.runtime(),
             proof: self.proof.as_ref(),
         }
+    }
+
+    /// Bind the admitted turn's selected specs exactly as the production turn
+    /// engine does, requiring `name` among them.
+    pub(crate) fn bind_selected(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {
+        let selected = self.service.agent_execution_specs(self.proof.as_ref(), &self.context)?;
+        anyhow::ensure!(
+            selected.specs.iter().any(|spec| spec.name == name),
+            "admitted fixture did not select tool '{name}'"
+        );
+        self.service.bind_agent_execution(
+            self.proof.as_ref(),
+            &self.context,
+            &self.execution_context,
+            &selected.specs,
+        )
     }
 
     /// Execute one selected tool through the same sealed service binding used by
@@ -886,17 +906,7 @@ impl AdmittedTurn {
         name: &str,
         arguments: serde_json::Value,
     ) -> anyhow::Result<crate::tools::ToolResult> {
-        let selected = self.service.agent_execution_specs(self.proof.as_ref(), &self.context)?;
-        anyhow::ensure!(
-            selected.specs.iter().any(|spec| spec.name == name),
-            "admitted fixture did not select tool '{name}'"
-        );
-        let (execution, context) = self.service.bind_agent_execution(
-            self.proof.as_ref(),
-            &self.context,
-            &self.execution_context,
-            &selected.specs,
-        )?;
+        let (execution, context) = self.bind_selected(name)?;
         let outcome = execution
             .execute(
                 crate::tools::ToolExecutionCommand::new(name, arguments),

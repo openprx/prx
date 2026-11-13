@@ -313,9 +313,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
     ));
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -363,7 +363,18 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation)
         .await?;
 
-    assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
+    let spawn_id = service
+        .catalog()
+        .entry_for_public_name("sessions_spawn")
+        .map(|entry| entry.id.clone())
+        .expect("test: registered spawn capability");
+    assert!(
+        context
+            .execution_refs()
+            .iter()
+            .any(|reference| reference.id == spawn_id),
+        "the parent publishes the spawn capability"
+    );
     let grant = service.issue_child_grant(&proof, &context)?;
     // A child can only use work named in the actual admitted parent request.
     // Registering another capability on both executors never grants it.
@@ -445,9 +456,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         )
         .with_idempotency_memory(Arc::clone(&memory)),
     );
-    let mut child_service = build_turn_decision_service(
+    let mut child_service = build_publication(
         TurnSurfaceKind::Worker,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: Some(Arc::clone(&grant)),
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -488,9 +499,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
             .money()
             .store(60_000, Ordering::Release);
         let budgeted = grant.for_spawn_request(false, "ollama", "prx-local-model")?;
-        let mut budget_child = build_turn_decision_service(
+        let mut budget_child = build_publication(
             TurnSurfaceKind::Worker,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: Some(Arc::clone(&budgeted)),
                 generation: Arc::clone(&generation),
                 registry: Arc::clone(&registry),
@@ -601,9 +612,9 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .open_issued_turn_context(&restricted_proof, AgentTurnKind::Repl, &cancellation)
         .await?;
     assert!(
-        matches!(restricted_context.directive(), TurnExecutionDirective::AnswerDirectly),
-        "non-agentic plain turn did not answer: directive={:?}; selection={:?}; fallback={:?}; candidates={:?}",
-        restricted_context.directive(),
+        restricted_context.is_run(),
+        "non-agentic plain turn did not answer: published={:?}; selection={:?}; fallback={:?}; candidates={:?}",
+        restricted_context.execution_refs(),
         restricted_context.engine.selection,
         restricted_context.engine.fallback_cause,
         restricted_context.engine.candidates,
@@ -678,12 +689,19 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         .await?;
         let routing = first.routing();
         assert!(
-            routing.context.is_run().expect("test: live admitted child")
-                && matches!(routing.context.directive(), TurnExecutionDirective::Execute { .. })
+            routing.context.is_run()
+                && child_service
+                    .catalog()
+                    .entry_for_public_name("file_read")
+                    .is_some_and(|entry| routing
+                        .context
+                        .execution_refs()
+                        .iter()
+                        .any(|reference| reference.id == entry.id))
                 && routing.context.engine.prediction.is_some(),
-            "test: engine-enabled child selects its admitted execution: selection={:?}; directive={:?}; fallback={:?}",
+            "test: engine-enabled child publishes its admitted execution: selection={:?}; published={:?}; fallback={:?}",
             routing.context.engine.selection,
-            routing.context.directive(),
+            routing.context.execution_refs(),
             routing.context.engine.fallback_cause,
         );
         let original = [

@@ -153,7 +153,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         let tools_handle = spawn.tools_handle();
         let registry: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(spawn)]);
         assert!(tools_handle.set(&registry));
-        let runtime = crate::runtime::turn_decision::TurnLoopRuntime {
+        let runtime = crate::runtime::turn_publication::PublicationLoopRuntime {
             hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
             observer: Arc::new(crate::observability::noop::NoopObserver),
         };
@@ -438,7 +438,7 @@ async fn process_segment(
     config_dir: &std::path::Path,
     registry: std::sync::Arc<Vec<Box<dyn crate::tools::Tool>>>,
     runtime_security: (
-        crate::runtime::turn_decision::TurnLoopRuntime,
+        crate::runtime::turn_publication::PublicationLoopRuntime,
         std::sync::Arc<crate::security::SecurityPolicy>,
     ),
 ) -> anyhow::Result<(
@@ -460,7 +460,7 @@ async fn process_segment(
     .publish()
     .await?;
     let mut segments = authority.segments()?;
-    let source = segments.record(task, &service).await?;
+    let source = segments.record(task, service.execution_approval_ledger()).await?;
     assert!(source.1.approval_ledger.is_some(), "operator process child must opt in");
     Ok((service, source, lifetime))
 }

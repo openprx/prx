@@ -13,6 +13,7 @@ pub mod knn;
 pub mod models;
 #[cfg(feature = "llm-router")]
 pub mod scorer;
+pub(crate) mod turn_routing;
 
 #[cfg(feature = "llm-router")]
 use anyhow::Result;

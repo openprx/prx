@@ -296,7 +296,7 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
                 let context = publication
                     .open_issued_turn_context(
                         proof.as_ref(),
-                        crate::runtime::turn_decision::AgentTurnKind::Repl,
+                        crate::runtime::turn_context::AgentTurnKind::Repl,
                         &cancellation,
                     )
                     .await?;

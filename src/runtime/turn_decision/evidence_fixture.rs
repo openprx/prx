@@ -32,7 +32,7 @@ pub(crate) fn with_evidence_sufficient<F: Future>(work: F) -> impl Future<Output
     EVIDENCE_SUFFICIENT.scope((), Box::pin(work))
 }
 
-pub(super) fn wrap_factory(
+pub(in crate::runtime) fn wrap_factory(
     original: DecisionBackendFactory,
     config: &crate::config::Config,
     key: Arc<DecisionKey>,

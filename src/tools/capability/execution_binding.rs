@@ -3,6 +3,7 @@
 mod admitted_call;
 pub(crate) use admitted_call::{ExecutionAdmission, VerifiedExecutionCall};
 mod dispatch;
+pub(crate) mod specs;
 pub(crate) use dispatch::{scope_dispatch_binding, verify_current_dispatch};
 
 use super::catalog::{CapabilityCatalog, CapabilityEntry};

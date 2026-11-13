@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::{BootstrapProfile, RuntimeBootstrap};
 use crate::agent::entry::{test_cli_agent_turn_proof, test_recorded_cli_agent_turn_proof};
-use crate::runtime::turn_decision::AgentTurnKind;
+use crate::runtime::turn_context::AgentTurnKind;
 
 /// G-07 runs this exact selector in each feature configuration. In particular,
 /// this module is not gated on llm-router: the published decision service must
@@ -45,7 +45,7 @@ async fn decision_service_present_in_every_model_turn_build() {
             decision.engine().prediction.is_none(),
             "test: engine-off bootstrap never predicts"
         );
-        assert!(decision.is_run().expect("test: live issued execution"));
+        assert!(decision.is_run());
         assert_eq!(decision.hop_ids().last(), Some(&decision.decision_id()));
         assert!(service.drain_writes(Instant::now() + Duration::from_secs(2)).await);
         let key = workspace.path().join("self/causal_tree/.decision_key");

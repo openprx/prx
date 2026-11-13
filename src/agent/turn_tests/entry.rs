@@ -35,7 +35,7 @@ fn refused_single_shot_uses_distinct_nonzero_exit_code() {
     assert_eq!(agent_cli_exit_code(None), 0);
     assert_eq!(agent_cli_exit_code(Some(&anyhow::anyhow!("provider failed"))), 1);
     assert!(
-        crate::causal_tree::refusal::render_refusal_reply(
+        crate::agent::refusal::render_refusal_reply(
             "no_legal_path",
             Some(r#"Reason: model x has no price; add [cost.prices."x"]"#),
         )

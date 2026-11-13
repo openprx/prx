@@ -1,9 +1,11 @@
 //! The local terminal reviews the authenticated original sealed call.
 use super::{
-    Context, DecisionApprovalReceipt, DecisionId, KeyDomain, TurnDecisionContext, TurnDecisionService, TurnSourceProof,
-    VerifiedPendingDecisionApproval,
+    DecisionApprovalReceipt, DecisionId, TurnDecisionContext, TurnDecisionService, VerifiedPendingDecisionApproval,
 };
 use crate::runtime::h2_entry::{EntryAction, LocalControlAuthority, LocalOwnerReview, LocalOwnerReviewStamp};
+use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::runtime_key::KeyDomain;
+use anyhow::Context;
 
 impl TurnDecisionService {
     pub(crate) async fn review_h2_local(
@@ -65,7 +67,7 @@ impl TurnDecisionService {
         self.review_pending_with_local(authority.principal(), session, decision_id, approved, stamp)
             .await
     }
-    pub(super) fn verify_h2_review_requirement(
+    pub(in crate::runtime) fn verify_h2_review_requirement(
         &self,
         pending: &VerifiedPendingDecisionApproval,
         approved: bool,
@@ -134,8 +136,8 @@ impl TurnDecisionService {
         proof: &dyn TurnSourceProof,
     ) -> anyhow::Result<Option<LocalOwnerReview>> {
         let resume = context.resume.as_ref().context("controlled resume admission missing")?;
-        let approval = &resume.prepared.approval;
-        let call = &resume.prepared.command;
+        let approval = resume.approval();
+        let call = resume.prepared_command();
         let requested = call.name == "skills_manage"
             && call
                 .arguments

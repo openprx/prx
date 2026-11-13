@@ -103,6 +103,7 @@ impl Terminal<'_> {
     ) -> anyhow::Result<TurnTerminalDraft> {
         Ok(TurnTerminalDraft {
             decision: Some(self.service.terminal_settlement_ref(Arc::clone(self.decision))?),
+            binding: Some(self.service.terminal_binding(self.decision)?),
             terminal_id: self.source.run_id().to_owned(),
             scope: self.source.envelope().message_scope(),
             status,
@@ -254,7 +255,7 @@ async fn run_work(
     let issued = service
         .open_issued_turn_context(
             source.as_ref(),
-            crate::runtime::turn_decision::AgentTurnKind::Repl,
+            crate::runtime::turn_context::AgentTurnKind::Repl,
             cancellation,
         )
         .await
@@ -263,7 +264,7 @@ async fn run_work(
     let issued = service
         .open_issued_turn_context(
             source.as_ref(),
-            crate::runtime::turn_decision::AgentTurnKind::Repl,
+            crate::runtime::turn_context::AgentTurnKind::Repl,
             cancellation,
         )
         .await
@@ -446,7 +447,7 @@ async fn run_work(
         enriched.truncate(enriched.floor_char_boundary(crate::agent::context_recall::RECALL_CONTEXT_BUDGET));
     }
     if let Some(loader) = service.prompt_memory_loader().filter(|_| !recalled.ids.is_empty()) {
-        let scope = crate::runtime::turn_decision::selected_custom_memory_read_scope(
+        let scope = crate::runtime::turn_context::selected_custom_memory_read_scope(
             &source.envelope().memory_write_context(source.policy_chat_type()),
             &source.envelope().workspace_id,
             &source.envelope().resolved_owner_id(),
@@ -523,6 +524,7 @@ async fn run_work(
                 decision: crate::agent::turn_request::TurnDecision {
                     service: &service,
                     context: &decision,
+                    runtime: decision.runtime(),
                     proof: source,
                 },
             },
@@ -635,7 +637,7 @@ async fn run_work(
                         source.input_metadata()?,
                         embedding,
                     )?;
-                    let committed = crate::runtime::turn_decision::commit_training_owned(
+                    let committed = crate::router::turn_routing::commit_training_owned(
                         memory,
                         evidence,
                         deadline,

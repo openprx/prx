@@ -1,7 +1,6 @@
 //! Construct outgoing authority from exact mentions or admitted discoveries.
 use super::{
-    Arc, CapabilityRef, ChildExecutionPolicy, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService,
-    TurnExecutionDirective, TurnSourceProof,
+    Arc, CapabilityRef, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService, TurnSourceProof,
 };
 use super::{
     BTreeSet, CapabilityAvailabilityLevel, CatalogView, CausalState, DecisionId, DiscoveredRefs, TurnSurfaceKind,
@@ -99,43 +98,32 @@ impl TurnDecisionService {
                 && context.catalog_generation() == *self.catalog.generation(),
             "delegation scope is closed or belongs to another catalog"
         );
-        let manifest = match &context.directive {
-            TurnExecutionDirective::Delegate { manifest } => manifest,
-            TurnExecutionDirective::AnswerDirectly => {
-                let admitted_delegator = context.execution_refs.iter().any(|reference| {
-                    self.catalog_view().entry_any(&reference.id).is_some_and(|entry| {
-                        entry.fingerprint == reference.fingerprint
-                            && entry.generation == reference.generation
-                            && matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn")
-                            && (matches!(entry.exposure, Exposure::Direct)
-                                || super::exact_delegator_ref(&context.engine, reference)
-                                || super::sealed_direct_delegator(&context.engine)
-                                    && context.engine.state.trusted.parts().surface != TurnSurfaceKind::Interactive)
-                    })
-                });
-                let discovered_delegator = context.discovery_admission("sessions_spawn").is_some_and(|admission| {
-                    !admission.requires_approval
-                        && self
-                            .catalog_view()
-                            .entry_any(&admission.reference.id)
-                            .is_some_and(|entry| {
-                                entry.public_name == "sessions_spawn"
-                                    && entry.fingerprint == admission.reference.fingerprint
-                                    && entry.generation == admission.reference.generation
-                            })
-                });
-                anyhow::ensure!(
-                    admitted_delegator || discovered_delegator,
-                    "answer surface has no admitted delegator"
-                );
-                context
-                    .engine
-                    .outgoing_child
-                    .as_ref()
-                    .context("answer surface has no sealed child manifest")?
-            }
-            _ => anyhow::bail!("selected decision is not delegation"),
+        // Delegator admission is an execution rule (R28): a published
+        // delegator or a discovered `sessions_spawn` admitted without
+        // approval may bind the turn's sealed outgoing child manifest.
+        let runtime = context.runtime();
+        let view = self.catalog_view();
+        let rules = crate::tools::surface_owner::publication::PublicationRules {
+            trusted: &runtime.trusted,
+            facts: &runtime.admission,
+            catalog: &view,
         };
+        let outgoing = runtime.outgoing_delegation.as_ref();
+        let admitted_delegator = rules.admits_published_delegator(&runtime.published, outgoing.is_some());
+        let discovered_delegator = runtime.discovery.admission("sessions_spawn").is_some_and(|admission| {
+            !admission.requires_approval
+                && view.entry_any(&admission.reference.id).is_some_and(|entry| {
+                    entry.public_name == "sessions_spawn"
+                        && entry.fingerprint == admission.reference.fingerprint
+                        && entry.generation == admission.reference.generation
+                })
+        });
+        anyhow::ensure!(
+            admitted_delegator || discovered_delegator,
+            "answer surface has no admitted delegator"
+        );
+        let outgoing = outgoing.context("answer surface has no sealed child manifest")?;
+        let manifest = &outgoing.manifest;
         // derive_strict_subset preserves owner/level/cost and decrements depth
         // exactly once. Rebuild its original parent from the engine's retained
         // allowed refs, then reverify the seal instead of trusting wire fields.
@@ -146,11 +134,7 @@ impl TurnDecisionService {
             .context("child depth cannot reconstruct issued parent")?;
         let parent = CapabilityConstraints {
             parent_authority_id: context.decision_id().into(),
-            allowed: context
-                .engine
-                .outgoing_parent_allowed
-                .clone()
-                .context("parent capabilities missing")?,
+            allowed: outgoing.parent_allowed.clone(),
             authority,
             catalog_generation: context.catalog_generation(),
             key: Arc::clone(&self.state_key),
@@ -189,9 +173,7 @@ impl TurnDecisionService {
             Arc::clone(&self.generation),
             Arc::new(self.provider_catalog.clone()),
             (store_workspace, parent_digest),
-            ChildExecutionPolicy {
-                security: Arc::clone(&self.security),
-            },
+            crate::runtime::child_source::publication::ChildExecutionPolicy::of_service(self),
             crate::runtime::child_source::ChildGrantRuntime {
                 recursive_child_claimed: context.runtime().issue_recursive_allowance(proof),
                 decision_store: Some(Arc::clone(&self.store)),

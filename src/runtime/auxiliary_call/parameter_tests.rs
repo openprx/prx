@@ -154,6 +154,7 @@ async fn every_auxiliary_purpose_retains_prepared_parameters_after_success_or_fa
             let now = chrono::Utc::now();
             let mut draft = TurnTerminalDraft {
                 decision: None,
+                binding: None,
                 terminal_id: "prx_aux_terminal".into(),
                 scope: MessageEventScope::new("test", MemoryVisibility::Workspace)
                     .with_owner_id("prx_owner")

@@ -19,9 +19,9 @@ async fn disabled_plane_uses_existing_strategy_without_pending() {
     ));
     let catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::Interactive,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -40,9 +40,7 @@ async fn disabled_plane_uses_existing_strategy_without_pending() {
     // Isolate the plane guard from the independent durable/recordable guards.
     // A loaded key and durable source must not opt a disabled plane into review.
     let owning = Arc::get_mut(&mut service).unwrap();
-    owning.recordable = true;
-    owning.durable_key = true;
-    owning.state_key = Arc::clone(&observer.state_key);
+    force_recordable_durable(owning, Arc::clone(&observer.state_key));
     context.approval_ledger = service.execution_approval_ledger();
     assert!(
         context.approval_ledger.is_none(),

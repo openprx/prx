@@ -71,7 +71,7 @@ fn recorded_from_hop(
             // The persisted hop has already been compared with the issued
             // record. Reconstruct its configuration hint from those same
             // authenticated gate facts, never from assistant-provided text.
-            let user_hint = crate::causal_tree::refusal::RefusalReason::classify(&policy_code, hop).user_hint();
+            let user_hint = crate::causal_tree::refusal::classify(&policy_code, hop).user_hint();
             RecordedDirective::Refuse { policy_code, user_hint }
         }
         other => anyhow::bail!("unrecognized recorded directive_kind {other}"),
@@ -96,7 +96,7 @@ fn render_recorded_terminal(directive: &RecordedDirective) -> anyhow::Result<std
         RecordedDirective::Refuse { policy_code, .. } if policy_code == "approval_requires_call" => {
             Ok(std::borrow::Cow::Borrowed(APPROVAL_UNAVAILABLE_REPLY))
         }
-        RecordedDirective::Refuse { policy_code, user_hint } => Ok(crate::causal_tree::refusal::render_refusal_reply(
+        RecordedDirective::Refuse { policy_code, user_hint } => Ok(crate::agent::refusal::render_refusal_reply(
             policy_code,
             user_hint.as_deref(),
         )),
@@ -330,7 +330,8 @@ impl PreparedReplay {
             .source_event_id
             .as_deref()
             .context("decision source has no recorded event")?;
-        let source = link
+        let source = commit
+            .binding
             .memory
             .find_owned_message_event(&trusted.workspace_id, owner, source_id)
             .await?
@@ -369,7 +370,7 @@ impl PreparedReplay {
         for (position, hop) in link.context.audit_hops().enumerate() {
             let row = if REPLAY_EVIDENCE_AUTHORITY {
                 read_journal_replay_record(
-                    &link.workspace_dir,
+                    &recorded.workspace_dir,
                     &recorded.key,
                     &recorded.store_workspace_id,
                     owner,
@@ -428,7 +429,8 @@ impl PreparedReplay {
         let (recorded_directive, fixed_close) =
             last_recorded.context("decision replay chain has no recorded directive")?;
         let resume_claim = if let Some(expected) = link.context.claimed_resume_event() {
-            let stored = link
+            let stored = commit
+                .binding
                 .memory
                 .find_owned_message_event(&trusted.workspace_id, owner, &expected.event_id)
                 .await?
@@ -441,12 +443,12 @@ impl PreparedReplay {
         } else {
             None
         };
-        let parent = if let Some(grant) = &link.parent_grant {
+        let parent = if let Some(grant) = &commit.binding.parent_grant {
             let parent_id = grant.scope().gate_inputs().0.parent_authority_id.decision_grant_id();
             let (store_workspace, expected_digest) = grant.parent_record_binding();
             let row = if REPLAY_EVIDENCE_AUTHORITY {
                 read_journal_replay_record(
-                    &link.workspace_dir,
+                    &recorded.workspace_dir,
                     &recorded.key,
                     &recorded.store_workspace_id,
                     owner,
@@ -472,7 +474,8 @@ impl PreparedReplay {
                     && proof.workspace_id() == trusted.workspace_id.as_ref(),
                 "parent decision differs from issued child authority"
             );
-            let parent_source = link
+            let parent_source = commit
+                .binding
                 .memory
                 .find_owned_message_event(
                     &trusted.workspace_id,
@@ -516,7 +519,7 @@ impl PreparedReplay {
         } else {
             None
         };
-        let operator = operator::prepare(link, &source, trusted.task_id.as_deref()).await?;
+        let operator = operator::prepare(link, &commit.binding, &source, trusted.task_id.as_deref()).await?;
         let collected_pending = link
             .context
             .collected_pending_event()

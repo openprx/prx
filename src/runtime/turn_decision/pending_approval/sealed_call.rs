@@ -1,6 +1,7 @@
 //! Recoverable original calls, encrypted under a domain-separated workspace
 //! decision key. The outer pending MAC also authenticates the ciphertext.
-use super::{PendingRecord, TurnDecisionService, VerifiedPendingDecisionApproval};
+use super::{TurnDecisionService, VerifiedPendingDecisionApproval};
+use crate::security::approval_ledger::pending::PendingRecord;
 use anyhow::Context;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -37,7 +38,7 @@ impl TurnDecisionService {
     /// Input must already have passed pending/source/decision authentication.
     /// Decryption grants no authority; operation, expiry and final consumption
     /// still belong to the ordinary resume path.
-    pub(super) fn open_pending_call(
+    pub(in crate::runtime) fn open_pending_call(
         &self,
         pending: &VerifiedPendingDecisionApproval,
     ) -> anyhow::Result<crate::tools::ToolExecutionCommand> {

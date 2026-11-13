@@ -48,9 +48,9 @@ impl LinkedFixture {
             Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("owning SQLite backend"));
         let transports = CountingTransports(AtomicUsize::new(0));
         let provider_catalog = ProviderCatalogView::from_config(&config);
-        let service = build_turn_decision_service(
+        let service = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -126,6 +126,7 @@ impl LinkedFixture {
                     .terminal_settlement_ref(Arc::clone(&context))
                     .expect("actual source-bound link"),
             ),
+            binding: Some(service.terminal_binding(&context).expect("actual source-bound binding")),
             terminal_id: "prx_scope_terminal".to_owned(),
             scope: scope.clone(),
             status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -334,16 +335,38 @@ async fn linked_finalizer_accepts_own_memory_and_same_scope_presentation() {
 async fn terminal_guard_binding_restores_omitted_link_and_rejects_foreign_context() {
     let fixture = LinkedFixture::new().await;
     let owned = fixture.commit.decision.clone().expect("issued terminal link");
+    let owned_binding = fixture.commit.binding.clone().expect("issued terminal binding");
     let mut proposal = fixture.commit.clone();
     proposal.decision = None;
-    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned).expect("guard restores its own link");
+    proposal.binding = None;
+    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, &owned_binding)
+        .expect("guard restores its own link");
     assert!(proposal.decision.as_ref().expect("restored").same_context(&owned));
-    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned)
+    assert!(
+        proposal
+            .binding
+            .as_ref()
+            .expect("restored binding")
+            .same_turn(&owned_binding)
+    );
+    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, &owned_binding)
         .expect("same context remains accepted");
 
     let foreign = LinkedFixture::new().await;
     let foreign_link = foreign.commit.decision.as_ref().expect("foreign issued link");
-    assert!(crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, foreign_link).is_err());
+    let foreign_binding = foreign.commit.binding.as_ref().expect("foreign issued binding");
+    assert!(
+        crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, foreign_link, &owned_binding).is_err()
+    );
+    // R29: a foreign binding in the proposal, or a guard binding of another
+    // turn, is refused even when the decision link is the guard's own.
+    let mut foreign_bound = proposal.clone();
+    foreign_bound.binding = Some(foreign_binding.clone());
+    assert!(crate::runtime::turn_terminal::bind_terminal_decision(&mut foreign_bound, &owned, &owned_binding).is_err());
+    assert!(crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, foreign_binding).is_err());
+    let mut unbound = fixture.commit.clone();
+    unbound.binding = None;
+    assert!(crate::agent::terminal::TurnTerminalCommit::try_from(unbound).is_err());
     assert!(
         proposal
             .decision

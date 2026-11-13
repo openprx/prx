@@ -126,3 +126,57 @@ async fn turn_context_carries_parameters_catalog_budgets_and_recursive_money_wit
     runtime.retire_recursive_allowance();
     Ok(())
 }
+
+/// R24: the rehomed turn-origin, retrieval-provenance and settlement items
+/// keep refusing exactly what they refused before the move: a proof from
+/// another publication, a drifted surface or model, and a foreign context.
+#[tokio::test]
+async fn rehomed_security_items_preserve_refusal() -> anyhow::Result<()> {
+    let first_dir = tempfile::tempdir()?;
+    let second_dir = tempfile::tempdir()?;
+    let first = AdmittedTurn::empty(first_dir.path(), "hello").await;
+    let second = AdmittedTurn::empty(second_dir.path(), "hello").await;
+    let one = first.decision();
+    let two = second.decision();
+
+    // Turn origin: the pinned generation and surface admit their own proof only.
+    validate_agent_turn_origin(&one.service.generation, one.service.surface, one.proof)?;
+    assert_eq!(
+        validate_agent_turn_origin(&one.service.generation, one.service.surface, two.proof),
+        Err(TurnOriginMismatch)
+    );
+    let drifted = if one.service.surface == TurnSurfaceKind::Worker {
+        TurnSurfaceKind::Interactive
+    } else {
+        TurnSurfaceKind::Worker
+    };
+    assert_eq!(
+        validate_agent_turn_origin(&one.service.generation, drifted, one.proof),
+        Err(TurnOriginMismatch)
+    );
+
+    // Retrieval provenance: the pinned trusted scope never admits another
+    // turn's proof or a different serving model.
+    let trusted = &one.context.runtime().trusted;
+    let policy = trusted.policy_version.clone();
+    assert_eq!(
+        validate_agent_retrieval_provenance(two.proof, trusted, &trusted.resolved_model, &policy, &[], None),
+        Err(TurnOriginMismatch)
+    );
+    assert_eq!(
+        validate_agent_retrieval_provenance(one.proof, trusted, "prx-other-model", &policy, &[], None),
+        Err(TurnOriginMismatch)
+    );
+
+    // Settlement: only the token holder issues a terminal link, and never
+    // for a context another publication opened.
+    assert!(matches!(
+        one.service.terminal_settlement_ref(Arc::clone(two.context)),
+        Err(crate::runtime::turn_decision::SettlementRefUnavailable)
+    ));
+    assert!(matches!(
+        two.service.settlement_ref(Arc::clone(one.context)),
+        Err(crate::runtime::turn_decision::SettlementRefUnavailable)
+    ));
+    Ok(())
+}

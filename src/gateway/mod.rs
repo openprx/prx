@@ -28,12 +28,11 @@ mod api;
 #[cfg(test)]
 pub(crate) use api::{drive_disabled_engine_console_entry, drive_search_console_entry};
 mod compat;
-mod decision_cleanup;
 mod decision_runtime;
 mod h2_control;
 pub use h2_control::run_gateway_controlled;
-pub(crate) mod decision_source;
 mod jobs;
+pub(crate) mod turn_source;
 
 /// The reserved issuer component of every built-in (non-bearer) MCP origin.
 ///
@@ -1023,7 +1022,7 @@ pub struct AppState {
 }
 
 pub struct TurnRuntimeGeneration {
-    provider_binding: Option<Arc<decision_source::GatewayProviderBinding>>,
+    provider_binding: Option<Arc<turn_source::GatewayProviderBinding>>,
     decision_slot: Arc<decision_runtime::GatewayDecisionSlot>,
     pub config_generation: Arc<crate::config::ConfigGeneration>,
     pub provider: Arc<dyn Provider>,
@@ -1090,7 +1089,7 @@ impl crate::config::ConfigGenerationAuditSink for ConfigGenerationMessageAuditSi
 }
 
 pub struct GatewayTurnRuntimeOwner {
-    cleanup: Arc<decision_cleanup::CleanupTracker>,
+    cleanup: Arc<turn_source::CleanupTracker>,
     current: Arc<ArcSwap<TurnRuntimeGeneration>>,
     config: crate::config::SharedConfig,
     memory: Arc<dyn Memory>,
@@ -1365,7 +1364,7 @@ impl AppState {
                     &crate::providers::catalog::Requirement::chat(),
                     crate::providers::catalog::UnknownPolicy::Invocation,
                 ) {
-                    generation.provider_binding = Some(Arc::new(decision_source::GatewayProviderBinding::new(
+                    generation.provider_binding = Some(Arc::new(turn_source::GatewayProviderBinding::new(
                         Arc::clone(&generation.provider),
                         resolved,
                     )));
@@ -1633,11 +1632,11 @@ fn build_gateway_turn_provider(
 ) -> anyhow::Result<(
     Arc<dyn Provider>,
     String,
-    Option<Arc<decision_source::GatewayProviderBinding>>,
+    Option<Arc<turn_source::GatewayProviderBinding>>,
 )> {
     let (provider, resolved) = build_gateway_provider_selection(config, options)?;
     let model = resolved.model().to_owned();
-    let binding = Arc::new(decision_source::GatewayProviderBinding::new(
+    let binding = Arc::new(turn_source::GatewayProviderBinding::new(
         Arc::clone(&provider),
         resolved,
     ));
@@ -2587,7 +2586,7 @@ async fn run_gateway_chat_with_multimodal(
     })?;
     let cancellation = jobs::current_cancellation().map_or_else(CancellationToken::new, |token| token.child_token());
     let _turn_cancel_guard = cancellation.clone().drop_guard();
-    let pending_input = decision_source::GatewayPendingInput {
+    let pending_input = turn_source::GatewayPendingInput {
         generation: Arc::clone(&config_generation),
         fabric: fabric.clone(),
         envelope: runtime_envelope,
@@ -2653,7 +2652,7 @@ async fn run_gateway_chat_with_multimodal(
             let context = service
                 .open_issued_turn_context(
                     &gateway_proof,
-                    crate::runtime::turn_decision::AgentTurnKind::SingleShot,
+                    crate::runtime::turn_context::AgentTurnKind::SingleShot,
                     &cancellation,
                 )
                 .await?;
@@ -2692,6 +2691,7 @@ async fn run_gateway_chat_with_multimodal(
     };
     let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
     let settlement = service.terminal_settlement_ref(Arc::clone(&context))?;
+    let terminal_binding = service.terminal_binding(&context)?;
     let terminal_guard = decision_runtime::GatewayTerminalGuard::new(
         cleanup_ticket,
         Arc::clone(service),
@@ -2870,6 +2870,7 @@ async fn run_gateway_chat_with_multimodal(
                             decision: crate::agent::turn_request::TurnDecision {
                                 service,
                                 context: &context,
+                                runtime: context.runtime(),
                                 proof: &gateway_proof,
                             },
                         },
@@ -2951,6 +2952,7 @@ async fn run_gateway_chat_with_multimodal(
                         &fabric,
                         crate::agent::terminal::TurnTerminalDraft {
                             decision: Some(settlement.clone()),
+                            binding: Some(terminal_binding.clone()),
                             terminal_id,
                             scope: runtime_envelope.message_scope(),
                             status: if cancelled {
@@ -3007,6 +3009,7 @@ async fn run_gateway_chat_with_multimodal(
                 &fabric,
                 crate::agent::terminal::TurnTerminalDraft {
                     decision: Some(settlement.clone()),
+                    binding: Some(terminal_binding.clone()),
                     terminal_id,
                     scope: runtime_envelope.message_scope(),
                     status: crate::agent::terminal::TurnTerminalStatus::Completed,

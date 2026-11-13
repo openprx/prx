@@ -1,27 +1,48 @@
 //! Explicit operator publication; no parent model decision or durable grant.
-use super::{
-    Arc, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, ConfigGeneration, Context,
-    DecisionBackendFactory, DecisionKey, FactoryDeps, Memory, SecurityPolicy, Tool, ToolExecutionService,
-    TurnDecisionService, TurnLoopRuntime, TurnSourceProof, TurnSurfaceKind, pinned_policy_version,
-};
+use crate::capability::CapabilityAvailabilityLevel;
+use crate::config::ConfigGeneration;
+use crate::decision_engine::prediction::factory::DecisionBackendFactory;
+use crate::decision_engine::prediction::factory::FactoryDeps;
+use crate::memory::Memory;
+use crate::runtime::turn_decision::TurnDecisionService;
+use crate::runtime::turn_decision::pinned_policy_version;
+use crate::runtime::turn_publication::PublicationLoopRuntime;
+use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::SecurityPolicy;
+use crate::security::runtime_key::DecisionKey;
+use crate::tools::capability::catalog::CatalogScope;
+use crate::tools::capability::contract::CapabilityRef;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
+use crate::tools::execution::ToolExecutionService;
+use crate::tools::traits::Tool;
+use anyhow::Context;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Frozen upper bound for an operator-launched child. The child still needs its
 /// own source/lifetime admission and per-call policy/approval checks.
 pub(crate) struct OperatorChildPublication {
     service: Arc<TurnDecisionService>,
-    source: super::super::super::turn_source::OwnedTurnSourceProof,
+    source: crate::runtime::turn_source::OwnedTurnSourceProof,
     authority: crate::runtime::child_source::ParentAuthority,
 }
 
 impl OperatorChildPublication {
     pub(crate) fn capture(
         service: Arc<TurnDecisionService>,
+        runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
         source: &dyn TurnSourceProof,
         generation: &Arc<ConfigGeneration>,
         memory: &Arc<dyn Memory>,
         security: &Arc<SecurityPolicy>,
     ) -> anyhow::Result<Self> {
         service.verify_operator_spawn_source(source, generation, memory, security)?;
+        // R26: the operator child is funded from the publication's runtime
+        // holder, which pins the same generation and security policy.
+        anyhow::ensure!(
+            Arc::ptr_eq(&runtime, &service.runtime),
+            "operator runtime holder belongs to another publication"
+        );
         let allowed: BTreeSet<_> = service
             .catalog_view()
             .iter_entries()
@@ -41,11 +62,7 @@ impl OperatorChildPublication {
                 generation: entry.generation,
             })
             .collect();
-        let remaining = crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
-            &generation.effective.cost,
-            &generation.effective.workspace_dir,
-            security.max_cost_per_day_cents,
-        )?;
+        let remaining = runtime.workspace_remaining_micro_usd()?;
         let authority = crate::runtime::child_source::ParentAuthority::for_run(
             source.run_id(),
             allowed.clone(),
@@ -73,7 +90,7 @@ impl OperatorChildPublication {
     ) -> Self {
         Self {
             service,
-            source: super::super::super::turn_source::OwnedTurnSourceProof::capture(source),
+            source: crate::runtime::turn_source::OwnedTurnSourceProof::capture(source),
             authority,
         }
     }
@@ -125,7 +142,7 @@ impl OperatorChildPublication {
 }
 
 impl OperatorChildPublication {
-    pub(crate) fn loop_runtime(&self) -> anyhow::Result<&TurnLoopRuntime> {
+    pub(crate) fn loop_runtime(&self) -> anyhow::Result<&PublicationLoopRuntime> {
         self.service
             .loop_runtime
             .as_ref()

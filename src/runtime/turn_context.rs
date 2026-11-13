@@ -7,10 +7,14 @@
 //! ceiling inputs. Every [`TurnRuntimeContext`] opened by one publication
 //! shares it.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::causal_tree::decision_engine::EngineError;
+use crate::causal_tree::outcome::RecordBuildError;
+use crate::config::ConfigGeneration;
 use crate::decision_engine::state::{ObservedState, RawRoutingInput};
 use crate::providers::catalog::ReleaseCatalog;
 use crate::providers::catalog::parameters::ResolvedParameters;
@@ -19,14 +23,21 @@ use crate::runtime::child_source::IssuedChildGrant;
 use crate::runtime::child_source::recursive_allowance::{ContextAllowance, RecursiveAllowance, RunAllowances};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::ingress_recovery::RecoveryScope;
-use crate::runtime::turn_decision::{AdmittedDecisionResume, AgentDecisionBudgetError, SendLimits};
+use crate::runtime::turn_decision::{
+    AgentDecisionBudgetError, AgentDiscoveryError, AgentRetrievalError, SendLimits, TurnModelError,
+};
 use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::approval_ledger::historical::AdmittedDecisionResume;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
+use crate::tools::capability::catalog::ParityError;
 use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
-use crate::tools::capability::contract::CatalogGeneration;
+use crate::tools::capability::child::ChildCapabilityManifest;
+use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
+use crate::tools::capability::search_tool::DiscoveryState;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::capability::turn_state::{TrustedParts, TurnBudgets};
 
 /// Live spend inputs of one provider send or called tool. `live` re-reads the
@@ -153,6 +164,16 @@ impl TurnRuntimeHolder {
             .and_then(|owner| owner.funded_money())
     }
 
+    /// Remaining workspace money under the publication's pinned spend inputs
+    /// (read-only daily and monthly ledger, security ceiling).
+    pub(crate) fn workspace_remaining_micro_usd(&self) -> anyhow::Result<u64> {
+        crate::cost::tracker::remaining_micro_usd_read_only_with_security_ceiling(
+            &self.cost,
+            &self.workspace_dir,
+            self.security_cents,
+        )
+    }
+
     /// A child turn without incoming funding refuses: the workspace remaining
     /// alone never stands in for a child allowance.
     pub(crate) fn spend_ceiling(&self, proof: &dyn TurnSourceProof) -> Result<SpendCeiling, AgentDecisionBudgetError> {
@@ -171,6 +192,13 @@ impl TurnRuntimeHolder {
             manifest_micro,
         })
     }
+}
+
+/// The outgoing child manifest a turn sealed at opening, with the allowed
+/// references of the parent it was derived from.
+pub(crate) struct OutgoingDelegation {
+    pub(crate) manifest: ChildCapabilityManifest,
+    pub(crate) parent_allowed: BTreeSet<CapabilityRef>,
 }
 
 /// The execution-owned runtime context of one turn.
@@ -192,6 +220,13 @@ pub(crate) struct TurnRuntimeContext {
     pub(crate) publication_policy: SurfacePolicy,
     pub(crate) catalog_generation: CatalogGeneration,
     pub(crate) admission: AdmissionFactsV1,
+    /// The surface published at opening by the execution rules (R28):
+    /// publication authority only, rechecked at binding and dispatch.
+    pub(crate) published: BTreeSet<CapabilityRef>,
+    /// Discovery offers and admissions of this turn.
+    pub(crate) discovery: DiscoveryState,
+    /// The outgoing child manifest sealed at opening, if any.
+    pub(crate) outgoing_delegation: Option<OutgoingDelegation>,
     /// Shared handle to the same value the decision context holds.
     pub(crate) resume: Option<Arc<AdmittedDecisionResume>>,
     pub(crate) resume_evidence: Option<Arc<VerifiedResumeEvidenceV1>>,
@@ -276,5 +311,138 @@ impl TurnRuntimeContext {
     }
 }
 
+// ---- Turn-origin and agent-turn types rehomed from the decision service (R24).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("turn origin does not match the pinned decision service")]
+pub(crate) struct TurnOriginMismatch;
+
+/// A source-owned proof is still checked against this service's pinned
+/// generation and surface. Neither a public envelope nor a caller-supplied
+/// generation number can replace the proof.
+pub(crate) fn validate_agent_turn_origin(
+    generation: &ConfigGeneration,
+    surface: TurnSurfaceKind,
+    proof: &dyn TurnSourceProof,
+) -> Result<(), TurnOriginMismatch> {
+    if surface != proof.surface()
+        || (surface == TurnSurfaceKind::Worker
+            && proof.child_scope().is_none()
+            && proof.operator_task_authority_id().is_none()
+            && proof.operator_process_authority_id().is_none())
+        || (surface != TurnSurfaceKind::Worker && proof.child_scope().is_some())
+        || proof.config_generation_id() != generation.id.0
+        || proof.config_source_revision() != generation.source_revision.fingerprint_sha256
+        || proof.workspace_id() != generation.effective.workspace_dir.to_string_lossy()
+    {
+        return Err(TurnOriginMismatch);
+    }
+    Ok(())
+}
+
+/// Join a selected decision to the exact source-owned CLI turn before any
+/// content read. Matching text and catalog generation do not establish the
+/// owner, session, run, or event that supplied the decision's policy inputs.
+pub(crate) fn validate_agent_retrieval_provenance(
+    proof: &dyn TurnSourceProof,
+    trusted: &TrustedParts,
+    model_ref: &str,
+    policy_version: &str,
+    exclusions: &[Arc<str>],
+    model_admission: Option<&dyn crate::tools::capability::turn_state::model_admission::ModelAdmissionView>,
+) -> Result<(), TurnOriginMismatch> {
+    if trusted.owner_isolated() != proof.owner_isolated()
+        || trusted.surface != proof.surface()
+        || trusted.channel.is_some()
+        || trusted.workspace_id.as_ref() != proof.workspace_id()
+        || trusted.owner_id.as_deref() != Some(proof.owner_id())
+        || trusted.session_key.as_deref() != Some(proof.session_key())
+        || trusted.run_id.as_deref() != Some(proof.run_id())
+        || trusted.task_id.as_deref() != proof.task_id()
+        || trusted.source_event_id.as_deref() != proof.source_event_id()
+        || trusted.resolved_model.as_ref() != model_ref
+        || trusted.policy_version.as_ref() != policy_version
+        || trusted.exclusions != exclusions
+        || trusted.model_admission.as_deref().map(|policy| policy.digest())
+            != model_admission.map(|policy| policy.digest())
+        || trusted
+            .constraints
+            .iter()
+            .any(|code| code.as_str() == "intercepts_writes")
+            != proof.intercepts_writes()
+    {
+        return Err(TurnOriginMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentTurnKind {
+    SingleShot,
+    Repl,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AgentDecisionError {
+    #[error("decision cancelled")]
+    Cancelled,
+    #[error(transparent)]
+    Model(#[from] TurnModelError),
+    #[error(transparent)]
+    Budget(#[from] AgentDecisionBudgetError),
+    #[error(transparent)]
+    Parity(#[from] ParityError),
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    #[error("decision deadline cannot be represented")]
+    Deadline,
+    #[error(transparent)]
+    Retrieval(#[from] AgentRetrievalError),
+    #[error(transparent)]
+    Discovery(#[from] AgentDiscoveryError),
+    #[error(transparent)]
+    Record(#[from] RecordBuildError),
+    #[error("recordable decision store has no writer")]
+    RecordWriterUnavailable,
+    #[error("decision evidence could not be durably recorded")]
+    DecisionEvidence(#[source] anyhow::Error),
+    #[error("delegation parent could not be durably verified")]
+    DelegationStorage(#[source] anyhow::Error),
+    #[error("ordinary delegation scope could not be verified")]
+    DelegationScope(#[source] anyhow::Error),
+    #[error("decision event memory could not be bound to its source")]
+    EventMemory(#[source] anyhow::Error),
+    #[error("durable ingress recovery is not ready")]
+    IngressRecovery(#[source] anyhow::Error),
+
+    #[error("previous segment observation could not be verified")]
+    SegmentObservation(#[source] anyhow::Error),
+    #[error("pending approval could not be persisted")]
+    PendingApproval(#[source] anyhow::Error),
+}
+
+pub(crate) fn selected_custom_memory_read_scope(
+    write_scope: &crate::memory::principal::MemoryWriteContext,
+    workspace: &str,
+    owner: &str,
+) -> anyhow::Result<crate::memory::principal::MemoryWriteContext> {
+    anyhow::ensure!(
+        !workspace.is_empty()
+            && !owner.is_empty()
+            && write_scope.workspace_id.as_deref() == Some(workspace)
+            && write_scope.owner_id.as_deref().is_none_or(|present| present == owner),
+        "selected custom retrieval scope differs from its source"
+    );
+    let mut scope = write_scope.clone();
+    scope.owner_id = Some(owner.to_owned());
+    scope.require_owner_match = true;
+    Ok(scope)
+}
+
+#[cfg(test)]
+mod selected_custom_memory_scope_tests;
+
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod publication_scope;

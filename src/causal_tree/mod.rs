@@ -18,7 +18,6 @@ pub(crate) mod candidate_generator;
 pub use crate::config::schema::causal_tree as config;
 pub(crate) mod decision_engine;
 pub(crate) mod decision_select;
-pub(crate) mod directive;
 pub mod evaluate;
 pub(crate) mod gates;
 pub(crate) mod hard_gates_probe;

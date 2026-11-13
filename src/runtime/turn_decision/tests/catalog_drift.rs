@@ -76,9 +76,9 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
         ));
         let provider_catalog = ProviderCatalogView::from_config(&config);
         let transports = CountingTransports(AtomicUsize::new(0));
-        let service = build_turn_decision_service(
+        let service = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -201,9 +201,9 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         let transports = CountingTransports(AtomicUsize::new(0));
         let memory: Arc<dyn Memory> =
             Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("SQLite memory"));
-        let service = build_turn_decision_service(
+        let service = build_publication(
             TurnSurfaceKind::AgentLoop,
-            TurnServiceBuild {
+            PublicationInputs {
                 parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
@@ -319,14 +319,14 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
                 )
             })
             .collect();
-        let directive = std::mem::discriminant(context.directive());
+        let terminal = (context.is_run(), context.terminal_outcome_action());
         measurements.push((
             catalog_size,
             candidates,
             allocations,
             candidate_shape,
             hop_contract,
-            directive,
+            terminal,
         ));
     }
     let large = measurements.get(2).expect("warmed large catalog measurement");
@@ -334,7 +334,7 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
     assert_eq!(first.1, large.1);
     assert_eq!(first.3, large.3, "each hop must admit the same candidate bodies");
     assert_eq!(first.4, large.4, "each hop must take the same prediction and gate path");
-    assert_eq!(first.5, large.5, "the final directive must match");
+    assert_eq!(first.5, large.5, "the open execution and terminal action must match");
     eprintln!("enabled service allocation diagnostic (caller thread): {measurements:?}");
 }
 

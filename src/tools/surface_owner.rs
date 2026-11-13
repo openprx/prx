@@ -93,3 +93,9 @@ pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
     .with_catalog_identities(parts.catalog)
     .with_tool_calls(parts.tool_calls_allowed)
 }
+
+pub(crate) mod publication;
+pub(crate) mod turn_port;
+
+#[cfg(test)]
+mod tests;

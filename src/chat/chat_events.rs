@@ -172,6 +172,9 @@ pub(super) async fn finalize_chat_success_turn(
     let decision = binding
         .settlement_ref(chat_run_id)?
         .context("chat terminal decision has not been issued")?;
+    let terminal_binding = binding
+        .terminal_binding(chat_run_id)?
+        .context("chat terminal binding has not been issued")?;
     let route_scope = binding.envelope().message_scope();
 
     // `finalize_turn` redacts the reply and the provider outcome before it
@@ -191,6 +194,7 @@ pub(super) async fn finalize_chat_success_turn(
             fabric,
             crate::agent::terminal::TurnTerminalDraft {
                 decision: Some(decision),
+                binding: Some(terminal_binding),
                 terminal_id: chat_run_id.to_string(),
                 scope: route_scope,
                 status: crate::agent::terminal::TurnTerminalStatus::Completed,
@@ -237,6 +241,9 @@ pub(super) async fn finalize_chat_non_success_turn(
             .record_predecision_failure(fabric, chat_run_id, status, summary)
             .await;
     };
+    let terminal_binding = binding
+        .terminal_binding(chat_run_id)?
+        .context("chat terminal binding has not been issued")?;
     let route_scope = binding.envelope().message_scope();
 
     // `finalize_turn` redacts the provider outcome (with its error text)
@@ -249,6 +256,7 @@ pub(super) async fn finalize_chat_non_success_turn(
             fabric,
             crate::agent::terminal::TurnTerminalDraft {
                 decision: Some(decision),
+                binding: Some(terminal_binding),
                 terminal_id: chat_run_id.to_string(),
                 scope: route_scope,
                 status,

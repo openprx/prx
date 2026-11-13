@@ -512,9 +512,9 @@ async fn admit_chat_fixture_with_mode(
         blocked: None,
     };
     let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
-    let decisions = crate::runtime::turn_decision::build_turn_decision_service(
+    let decisions = crate::runtime::turn_publication::build_publication(
         crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
-        crate::runtime::turn_decision::TurnServiceBuild {
+        crate::runtime::turn_publication::PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
@@ -548,7 +548,7 @@ async fn admit_chat_fixture_with_mode(
     )
     .await
     .expect("actual chat decision service")
-    .with_loop_runtime(crate::runtime::turn_decision::TurnLoopRuntime {
+    .with_loop_runtime(crate::runtime::turn_publication::PublicationLoopRuntime {
         hooks: Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
         observer: Arc::new(crate::observability::noop::NoopObserver),
     })
@@ -689,7 +689,6 @@ async fn queued_plan_mode_change_fails_before_execution_and_commits_one_failed_t
             .expect("test: admitted routing")
             .context
             .is_run()
-            .expect("test: live execution")
     );
     drive_start_turn_stream(
         Some(Arc::clone(&admitted.binding)),

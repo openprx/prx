@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::runtime::turn_decision::ResumeEvidenceWitness;
+use crate::security::approval_ledger::historical::ResumeEvidenceWitness;
 use crate::tools::capability::contract::{CapabilityRef, CapabilityTarget};
 
 pub(crate) struct VerifiedResumeEvidenceV1 {

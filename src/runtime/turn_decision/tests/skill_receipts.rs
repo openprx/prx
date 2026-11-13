@@ -222,9 +222,9 @@ async fn selected_skill_target_turn(lifecycle: bool, execute: bool) -> SelectedS
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let transports = CountingTransports(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: memory"));
-    let mut service = build_turn_decision_service(
+    let mut service = build_publication(
         TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
+        PublicationInputs {
             parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
@@ -271,9 +271,18 @@ async fn selected_skill_target_turn(lifecycle: bool, execute: bool) -> SelectedS
         .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
         .await
         .expect("test: decision");
+    let direct = if execute { "skill_execute" } else { SKILL_NAME };
+    let direct_id = service
+        .catalog()
+        .entry_for_public_name(direct)
+        .map(|entry| entry.id.clone())
+        .expect("test: registered direct skill capability");
     assert!(
-        matches!(context.directive(), TurnExecutionDirective::Execute { .. }),
-        "the scripted backend must select the skill"
+        context
+            .execution_refs()
+            .iter()
+            .any(|reference| reference.id == direct_id),
+        "the direct surface must publish the configured skill capability"
     );
     SelectedSkillTurn {
         workspace,
@@ -397,6 +406,7 @@ async fn crashed_after_marker(
         &fabric,
         crate::agent::terminal::TurnTerminalDraft {
             decision: Some(service.settlement_ref(Arc::clone(&context)).expect("test: link")),
+            binding: Some(service.terminal_binding(&context).expect("test: binding")),
             terminal_id: terminal_id.to_owned(),
             scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
                 .with_owner_id(proof.owner_id())
@@ -549,7 +559,7 @@ fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
     let admission = |name: &str, requires_approval: bool| {
         (
             name.to_owned(),
-            discovery::DiscoveryAdmission {
+            crate::tools::capability::search_tool::discovery_admission::DiscoveryAdmission {
                 reference: CapabilityRef {
                     id: CapabilityId::new(CapabilityTarget::NativeTool, "native", name).expect("test: id"),
                     fingerprint: SchemaFingerprint([0; 32]),
@@ -561,7 +571,7 @@ fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
     };
     let admissions = BTreeMap::from([admission("free_tool", false), admission("gated_tool", true)]);
     assert_eq!(
-        unprompted_admission_ids(&admissions).collect::<Vec<_>>(),
+        crate::tools::capability::search_tool::DiscoveryState::with_admissions(admissions).unprompted_ids(),
         vec!["native_tool:native:free_tool".to_owned()]
     );
 }

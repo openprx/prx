@@ -6,6 +6,8 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 
 mod admission;
+/// Gateway ownership uses the shared runtime cleanup protocol.
+pub(super) use crate::runtime::turn_cleanup::CleanupTracker;
 pub(super) use admission::{GatewayAdmissionGuard, GatewayPendingInput};
 
 #[derive(Clone)]

@@ -1,5 +1,7 @@
 //! Source-bound decision and terminal ownership for one child execution segment.
 
+pub(in crate::runtime) mod segment_observation;
+
 use super::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use super::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use crate::agent::terminal::{
@@ -14,9 +16,13 @@ pub(crate) struct ChildSegmentTurn {
     service: Arc<TurnDecisionService>,
     proof: Arc<OwnedTurnSourceProof>,
     decision: Arc<TurnDecisionContext>,
+    /// The segment turn's execution-owned runtime context (R26); the service
+    /// and decision context stay until Part 2.
+    runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     execution: crate::tools::ToolExecutionContext,
     terminal: super::turn_terminal::TurnTerminalGuard,
     settlement: crate::agent::terminal::DecisionSettlementRef,
+    binding: crate::agent::terminal::TerminalBinding,
     provider_trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
     started_at: chrono::DateTime<chrono::Utc>,
     route: crate::llm::route_decision::RouteDecision,
@@ -46,7 +52,7 @@ impl ChildSegmentTurn {
         let previous_observation = match usage_collector.as_ref() {
             Some(collector) => {
                 if proof.source_event_id().is_some() {
-                    super::turn_decision::segment_observation::validate_envelope(&execution.envelope)?;
+                    segment_observation::validate_envelope(&execution.envelope)?;
                 }
                 collector.previous_observation(&proof, &execution.envelope)?
             }
@@ -134,6 +140,7 @@ impl ChildSegmentTurn {
         // inside that scope would make it wait for its own terminal guard.
         let provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
         let settlement = service.terminal_settlement_ref(Arc::clone(&decision))?;
+        let binding = service.terminal_binding(&decision)?;
         let terminal = super::turn_terminal::TurnTerminalGuard::new(
             owner.register(cancellation.clone())?,
             Arc::clone(&service),
@@ -145,13 +152,16 @@ impl ChildSegmentTurn {
         )?
         .with_provider_trace(Arc::clone(&provider_trace), route.clone())
         .with_usage_collector(usage_collector);
+        let runtime = Arc::clone(decision.runtime());
         Ok(Self {
             service,
             proof,
             decision,
+            runtime,
             execution,
             terminal,
             settlement,
+            binding,
             provider_trace,
             started_at: chrono::Utc::now(),
             route,
@@ -174,10 +184,16 @@ impl ChildSegmentTurn {
         self.history_commit_len = Some(history_commit_len);
     }
 
+    /// The segment turn's runtime context (R26).
+    pub(crate) const fn runtime(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeContext> {
+        &self.runtime
+    }
+
     pub(crate) fn routing(&self) -> crate::agent::turn_request::TurnDecision<'_> {
         crate::agent::turn_request::TurnDecision {
             service: &self.service,
             context: &self.decision,
+            runtime: &self.runtime,
             proof: self.proof.as_ref(),
         }
     }
@@ -239,6 +255,7 @@ impl ChildSegmentTurn {
     ) -> TurnTerminalDraft {
         TurnTerminalDraft {
             decision: Some(self.settlement.clone()),
+            binding: Some(self.binding.clone()),
             terminal_id: self.proof.run_id().to_owned(),
             scope: self.execution.envelope.message_scope(),
             status,
