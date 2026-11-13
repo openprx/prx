@@ -243,14 +243,14 @@ mod working_root_tests {
             );
             assert!(
                 crate::security::SideEffectGate::new(&service.security)
-                    .authorize_command_execution(Some(root.path()), "shell", "cat state/x", None)
+                    .authorize_command_execution_at(Some(root.path()), "shell", "cat state/x", None)
                     .is_ok(),
                 "test: command orchestration uses the supplied root"
             );
             assert!(
                 service
                     .security
-                    .validate_command_execution(None, "cat state/x", false)
+                    .validate_command_execution("cat state/x", false)
                     .is_err(),
                 "test: workspace-only callers retain their original target"
             );

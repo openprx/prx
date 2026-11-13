@@ -696,7 +696,7 @@ pub(super) fn native_working_root_selection_sites_are_explicit() {
             "src/tools/file_edit.rs::execute_operation::.working_root=2",
             "src/security/path_policy.rs::effective_root::effective_root=1",
             "src/security/path_policy.rs::effective_root::workdir.unwrap_or=1",
-            "src/security/policy.rs::validate_command_execution::effective_root=1",
+            "src/security/policy.rs::validate_command_execution_at::effective_root=1",
             "src/tools/file_read.rs::working_root::effective_root=1",
             "src/tools/file_read.rs::working_root::.working_root=1",
             "src/tools/file_write.rs::working_root::effective_root=1",
