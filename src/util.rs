@@ -93,8 +93,22 @@ mod tests {
         let link = temp.path().join("leaf");
         symlink(&target, &link).expect("test: existing leaf symlink");
         create_private_dir_all(&link).expect("test: existing leaf is left alone");
-        assert!(std::fs::symlink_metadata(&link).expect("test: leaf metadata").file_type().is_symlink(), "creation must not replace an existing symlink");
-        assert_eq!(std::fs::metadata(&target).expect("test: target metadata").permissions().mode() & 0o777, 0o775, "creation must not chmod a symlink target");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("test: leaf metadata")
+                .file_type()
+                .is_symlink(),
+            "creation must not replace an existing symlink"
+        );
+        assert_eq!(
+            std::fs::metadata(&target)
+                .expect("test: target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775,
+            "creation must not chmod a symlink target"
+        );
     }
 
     #[test]
