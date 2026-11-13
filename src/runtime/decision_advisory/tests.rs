@@ -674,3 +674,72 @@ async fn observation_never_waits_for_the_telemetry_open() {
         "the outcome was admitted and flushed"
     );
 }
+
+/// P1-10: before the telemetry store is open, admission is bounded and never
+/// waits. On a current-thread runtime the single opener task cannot run while
+/// the test does not yield, so it stays stalled for every observation below:
+/// the queue holds exactly the `observe_queue` bound, the overflow is
+/// counted, and each observation completes on its first poll. Once the
+/// opener runs, the queued outcomes reach the store and the overflow reaches
+/// the store's existing drop accounting.
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
+    use futures::FutureExt as _;
+    const BOUND: u32 = 4;
+    const OBSERVED: u64 = 11;
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = (*enabled_config(temp.path())).clone();
+    config.decision_engine.mode = DecisionMode::Both;
+    config.decision_engine.observe_queue = BOUND;
+    let advisory = DecisionAdvisory::new(Arc::new(config), None);
+    for index in 0..OBSERVED {
+        assert!(
+            advisory
+                .observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true)
+                .now_or_never()
+                .is_some(),
+            "observation {index} completes without waiting for the opener"
+        );
+    }
+    assert!(!advisory.initialized(), "the opener has not run");
+    assert!(!temp.path().join("decision-engine.sqlite").exists());
+    {
+        let pending = advisory.pending.lock();
+        let PendingTelemetry::Opening {
+            outcomes,
+            dropped,
+            opener,
+        } = &*pending
+        else {
+            panic!("the first observation starts the opener");
+        };
+        assert!(opener.is_some(), "one opener task is running");
+        assert_eq!(outcomes.max_capacity(), BOUND as usize, "the ObserveQueue bound");
+        assert_eq!(outcomes.capacity(), 0, "the queue holds exactly its bound");
+        assert_eq!(*dropped, OBSERVED - u64::from(BOUND), "the overflow is counted");
+    }
+    assert!(
+        advisory
+            .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await,
+        "drain waits for the opener and the worker"
+    );
+    assert!(matches!(*advisory.pending.lock(), PendingTelemetry::Opened));
+    let runtime = advisory.telemetry.get().unwrap();
+    assert_eq!(
+        runtime
+            .engine
+            .observations
+            .counters
+            .dropped
+            .load(std::sync::atomic::Ordering::SeqCst),
+        OBSERVED - u64::from(BOUND),
+        "the overflow is in the existing drop accounting"
+    );
+    let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
+    assert_eq!(
+        store.outcomes().unwrap().len(),
+        BOUND as usize,
+        "every queued outcome is flushed"
+    );
+}

@@ -204,8 +204,26 @@ pub(crate) struct DecisionAdvisory {
     factory: Option<DecisionBackendFactory>,
     /// Opened by a background task, never on the turn's path (P1-04).
     telemetry: Arc<tokio::sync::OnceCell<AdvisoryRuntime>>,
-    /// Background openings still running; shutdown drains waits for them.
-    opening: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Admission before the store is open (P1-10): one opener task and one
+    /// bounded queue, created by the first observation.
+    pending: Arc<parking_lot::Mutex<PendingTelemetry>>,
+}
+
+/// Observation admission before the telemetry store is open.
+enum PendingTelemetry {
+    /// Nothing has been observed yet.
+    Idle,
+    /// The single opener task is running. Outcomes wait in a queue bounded
+    /// like the [`ObserveQueue`] they move to; an outcome that does not fit
+    /// is dropped and counted in `dropped`.
+    Opening {
+        outcomes: tokio::sync::mpsc::Sender<TurnOutcome>,
+        dropped: u64,
+        opener: Option<tokio::task::JoinHandle<()>>,
+    },
+    /// The opener moved the queue and its drops into the open store's
+    /// [`ObserveQueue`]; observations go there directly.
+    Opened,
 }
 
 impl DecisionAdvisory {
@@ -214,7 +232,7 @@ impl DecisionAdvisory {
             config,
             factory,
             telemetry: Arc::new(tokio::sync::OnceCell::new()),
-            opening: parking_lot::Mutex::new(Vec::new()),
+            pending: Arc::new(parking_lot::Mutex::new(PendingTelemetry::Idle)),
         }
     }
 
@@ -294,8 +312,11 @@ impl DecisionAdvisory {
     /// Close observation admission and wait for the telemetry worker until
     /// `deadline`. `false` means the worker is still running.
     pub(crate) async fn drain(&self, deadline: std::time::Instant) -> bool {
-        let opening = std::mem::take(&mut *self.opening.lock());
-        for handle in opening {
+        let opener = match &mut *self.pending.lock() {
+            PendingTelemetry::Opening { opener, .. } => opener.take(),
+            PendingTelemetry::Idle | PendingTelemetry::Opened => None,
+        };
+        if let Some(handle) = opener {
             match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "decision engine telemetry opening failed"),
@@ -508,9 +529,9 @@ impl DecisionAdvisory {
 
     /// Record the turn's outcome. `trace` is read only when observation runs.
     /// Admission never waits: an open store takes the outcome on its bounded
-    /// queue at once; before the store is open, a background task opens it
-    /// and then admits the outcome, so the turn completes without any
-    /// telemetry I/O (P1-04).
+    /// queue at once (P1-04). Before the store is open, the outcome waits in
+    /// one queue with the same bound while a single background task opens
+    /// the store; an outcome that does not fit is dropped and counted (P1-10).
     pub(crate) async fn observe(
         &self,
         trace: impl FnOnce() -> ExecutionTraceSnapshot,
@@ -533,19 +554,79 @@ impl DecisionAdvisory {
             runtime.engine.observe(outcome);
             return;
         }
-        let cell = Arc::clone(&self.telemetry);
-        let engine_config = Arc::clone(&self.config);
-        let opening = tokio::spawn(async move {
-            Self::open_telemetry(&cell, &engine_config)
-                .await
-                .engine
-                .observe(outcome);
-        });
-        let mut pending = self.opening.lock();
-        pending.retain(|handle| !handle.is_finished());
-        pending.push(opening);
+        let mut pending = self.pending.lock();
+        // The opener publishes the store and then takes the queue over under
+        // this lock, so an outcome admitted here is either queued before the
+        // takeover or observed directly after it.
+        if let Some(runtime) = self.telemetry.get() {
+            drop(pending);
+            runtime.engine.observe(outcome);
+            return;
+        }
+        if matches!(*pending, PendingTelemetry::Idle) {
+            let bound = config.observe_queue as usize;
+            if !(1..=OBSERVE_QUEUE_MAX).contains(&bound) {
+                tracing::warn!("decision engine observation queue bound is invalid; outcome dropped");
+                return;
+            }
+            let (outcomes, receiver) = tokio::sync::mpsc::channel(bound);
+            let opener = tokio::spawn(Self::open_and_take_over(
+                Arc::clone(&self.telemetry),
+                Arc::clone(&self.config),
+                Arc::clone(&self.pending),
+                receiver,
+            ));
+            *pending = PendingTelemetry::Opening {
+                outcomes,
+                dropped: 0,
+                opener: Some(opener),
+            };
+        }
+        match &mut *pending {
+            PendingTelemetry::Opening { outcomes, dropped, .. } => {
+                if outcomes.try_send(outcome).is_err() {
+                    *dropped = dropped.saturating_add(1);
+                }
+            }
+            // `Opened` is set only after the store is published, which the
+            // check above has seen; `Idle` was replaced above.
+            PendingTelemetry::Idle | PendingTelemetry::Opened => {
+                tracing::warn!("decision engine observation arrived in an unexpected admission state; dropped");
+            }
+        }
+    }
+
+    /// The single opener task: open the store, then move the queued outcomes
+    /// and the pre-open drop count into its [`ObserveQueue`].
+    async fn open_and_take_over(
+        cell: Arc<tokio::sync::OnceCell<AdvisoryRuntime>>,
+        config: Arc<Config>,
+        pending: Arc<parking_lot::Mutex<PendingTelemetry>>,
+        mut receiver: tokio::sync::mpsc::Receiver<TurnOutcome>,
+    ) {
+        let runtime = Self::open_telemetry(&cell, &config).await;
+        let dropped = match std::mem::replace(&mut *pending.lock(), PendingTelemetry::Opened) {
+            PendingTelemetry::Opening { dropped, .. } => dropped,
+            PendingTelemetry::Idle | PendingTelemetry::Opened => 0,
+        };
+        // Every queued send completed under the lock taken above, and later
+        // observations see the open store, so this drains the whole queue.
+        receiver.close();
+        while let Ok(outcome) = receiver.try_recv() {
+            runtime.engine.observe(outcome);
+        }
+        runtime
+            .engine
+            .observations
+            .counters
+            .dropped
+            .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// The largest observation queue bound ([`ObserveQueue::start`] and the
+/// `observe_queue` config range).
+const OBSERVE_QUEUE_MAX: usize = 1_024;
 
 fn lineage(state: &CausalState) -> CausalLineage {
     let trusted = state.trusted.parts();
