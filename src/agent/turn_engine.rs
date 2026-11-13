@@ -670,8 +670,9 @@ async fn run_turn_unguarded(
         // what puts the handoff into history, and the iteration that receives
         // the handoff is the one that has to publish the recovery tool the
         // handoff tells the model to call.
-        let context_lookup_required = compaction_config
-            .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
+        let context_lookup_required = !context.is_plain_answer_abstention()
+            && compaction_config
+                .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Switch))
             && history.iter().any(is_context_handoff_message);
         if context_lookup_required
             && !selected_tools
