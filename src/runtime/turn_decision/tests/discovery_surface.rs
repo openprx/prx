@@ -939,14 +939,22 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
             context,
             ..
         } = &turn;
-        let core_before: Vec<_> = service
+        let full = autonomy == crate::security::AutonomyLevel::Full;
+        let mut core_before: Vec<_> = service
             .agent_execution_specs(proof, context)
             .unwrap()
             .specs
             .iter()
             .map(|spec| spec.name.clone())
             .collect();
-        assert_eq!(core_before, ["file_read"]);
+        core_before.sort();
+        // Prediction-free publication: every Direct entry that passes the
+        // gates is core. A direct `shell` passes only at Full autonomy.
+        if direct_shell && full {
+            assert_eq!(core_before, ["file_read", "shell"], "both direct tools are core");
+        } else {
+            assert_eq!(core_before, ["file_read"]);
+        }
         let original_refs = context.execution_refs().clone();
         // Nothing has been searched, so there is nothing to admit.
         assert_eq!(service.admit_offered_discoveries(proof, context, |_, _| false), 0);
@@ -991,13 +999,11 @@ async fn search_hits_are_admitted_for_the_next_request_through_the_same_gates() 
         let admitted = service.admit_offered_discoveries(proof, context, |_, _| false);
         let appended = appended_names(&turn);
         if direct_shell {
-            let expected = if autonomy == crate::security::AutonomyLevel::ReadOnly {
-                Vec::new()
-            } else {
-                vec!["shell"]
-            };
-            assert_eq!(admitted, expected.len());
-            assert_eq!(appended, expected);
+            // At Full the `shell` hit is an offer of a tool that is already
+            // core, so it admits nothing new; at read-only it is not even
+            // offered.
+            assert_eq!(admitted, 0, "a core shell offer is no new admission");
+            assert!(appended.is_empty(), "{appended:?}");
         } else if autonomy == crate::security::AutonomyLevel::ReadOnly {
             assert_eq!(admitted, 1);
             assert_eq!(
