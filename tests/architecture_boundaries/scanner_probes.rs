@@ -58,8 +58,8 @@ use super::memory::{
 use super::panic_policy::production_has_no_panic_shortcuts;
 use super::process::{
     every_production_process_command_is_inventoried, git_is_named_only_in_the_reviewed_places,
-    git_runs_only_through_the_hardened_launch, plain_git_policy_has_only_the_reviewed_production_sites,
-    process_command_types_are_never_aliased,
+    git_runs_only_through_the_hardened_launch, native_working_root_selection_sites_are_explicit,
+    plain_git_policy_has_only_the_reviewed_production_sites, process_command_types_are_never_aliased,
 };
 use super::providers::{
     agent_entries_reach_provider_factories_only_through_the_scoped_selection,
@@ -293,6 +293,10 @@ macro_rules! planted_violation_probes {
 }
 
 planted_violation_probes! {
+    probe_native_working_root_selection: native_working_root_selection_sites_are_explicit,
+        "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "fn d0_root(config: Config) { let _ = config.runtime.workdir.unwrap_or(config.workspace_dir); }\n";
+
     probe_plain_git_policy: plain_git_policy_has_only_the_reviewed_production_sites,
         "src/tools/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "fn d0_policy() { let _ = crate::runtime::shell_process::ShellGitPolicy::PlainGit; }\n";

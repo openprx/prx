@@ -179,13 +179,26 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Invalid configured or CLI native working directory.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkdirError {
+    #[error("runtime.workdir must be absolute")]
+    Relative,
+    #[error("invalid runtime.workdir: {0}")]
+    Canonicalize(#[source] std::io::Error),
+    #[error("runtime.workdir must be an existing directory")]
+    NotDirectory,
+}
+
 impl RuntimeConfig {
-    pub fn validate_workdir(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-        anyhow::ensure!(path.is_absolute(), "runtime.workdir must be absolute");
-        let canonical = path
-            .canonicalize()
-            .map_err(|error| anyhow::anyhow!("invalid runtime.workdir: {error}"))?;
-        anyhow::ensure!(canonical.is_dir(), "runtime.workdir must be an existing directory");
+    pub fn validate_workdir(path: &std::path::Path) -> Result<std::path::PathBuf, WorkdirError> {
+        if !path.is_absolute() {
+            return Err(WorkdirError::Relative);
+        }
+        let canonical = path.canonicalize().map_err(WorkdirError::Canonicalize)?;
+        if !canonical.is_dir() {
+            return Err(WorkdirError::NotDirectory);
+        }
         Ok(canonical)
     }
 
@@ -406,6 +419,70 @@ mod workdir_tests {
             manager.pin().effective.runtime.workdir.is_none(),
             "test: running root stays pinned"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_symlink_root_uses_canonical_forbidden_policy() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let home = tempfile::tempdir().expect("test: fixture");
+            let workspace = home.path().join("workspace");
+            let forbidden = home.path().join("forbidden");
+            std::fs::create_dir(&workspace).expect("test: workspace");
+            std::fs::create_dir(&forbidden).expect("test: forbidden directory");
+            std::fs::write(forbidden.join("target"), "private").expect("test: private target");
+            let alias = home.path().join("allowed-looking");
+            std::os::unix::fs::symlink(&forbidden, &alias).expect("test: root alias");
+            let config_path = home.path().join("config.toml");
+            let mut config = crate::config::Config::default();
+            config.secrets.encrypt = false;
+            config.runtime.workdir = Some(alias.clone());
+            config.autonomy.workspace_only = false;
+            config.autonomy.forbidden_paths = vec![
+                forbidden
+                    .canonicalize()
+                    .expect("test: forbidden root")
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+            std::fs::write(&config_path, toml::to_string(&config).expect("test: stored config"))
+                .expect("test: config file");
+            let loaded = crate::config::Config::load_from_path(&config_path, workspace).expect("test: load config");
+            assert_eq!(
+                loaded.runtime.workdir.as_deref(),
+                Some(forbidden.canonicalize().expect("test: canonical root").as_path()),
+                "test: effective config must store the canonical root"
+            );
+            let security = crate::runtime::bootstrap::build_security_policy(&loaded);
+            let tool = crate::tools::file_read::FileReadTool::new(security, false).with_workdir(loaded.runtime.workdir);
+            use crate::tools::Tool as _;
+            for level in [
+                crate::security::AutonomyLevel::Supervised,
+                crate::security::AutonomyLevel::ReadOnly,
+            ] {
+                let result =
+                    crate::tools::effective_autonomy::scope(level, tool.execute(serde_json::json!({"path":"target"})))
+                        .await
+                        .expect("test: read result");
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("Path not allowed by security policy: target"),
+                    "test: the forbidden real root must be refused: {result:?}"
+                );
+            }
+            std::fs::remove_file(&alias).expect("test: remove alias");
+            let error = crate::config::Config::load_from_path(&config_path, home.path().join("workspace"))
+                .expect_err("test: missing config root");
+            assert!(
+                matches!(
+                    error.downcast_ref::<WorkdirError>(),
+                    Some(WorkdirError::Canonicalize(_))
+                ),
+                "test: canonicalization failure retains its typed error: {error}"
+            );
+        })
+        .await
+        .expect("test: config root deadline");
     }
 
     #[test]

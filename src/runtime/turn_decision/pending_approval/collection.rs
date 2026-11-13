@@ -121,6 +121,9 @@ impl ApprovalCollectionLease {
             }
             match crate::security::approval_operation::grant_op_for_call(&call.name, &arguments) {
                 Some(crate::security::approval_operation::GrantOp::Command(command)) => {
+                    if call.name == "shell" {
+                        self.service.check_shell_path_arguments(&command)?;
+                    }
                     (command, crate::acl::approval_grant::RiskLevel::High)
                 }
                 Some(crate::security::approval_operation::GrantOp::ResourceExact(operation, risk)) => (operation, risk),

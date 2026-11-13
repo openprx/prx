@@ -617,7 +617,12 @@ impl TurnDecisionService {
             );
         }
         let (operation, risk) = match grant_op_for_call(&command.name, &command.arguments) {
-            Some(GrantOp::Command(operation)) => (operation, RiskLevel::High),
+            Some(GrantOp::Command(operation)) => {
+                if command.name == "shell" {
+                    self.check_shell_path_arguments(&operation)?;
+                }
+                (operation, RiskLevel::High)
+            }
             Some(GrantOp::ResourceExact(operation, risk)) => (operation, risk),
             Some(GrantOp::ResourceGlob(_, _)) => match command.name.as_str() {
                 "message_send" => {

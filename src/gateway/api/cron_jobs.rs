@@ -115,8 +115,9 @@ fn authorize_cron(state: &AppState, operation: &str, risk: ResourceRiskLevel) ->
 /// Command policy at the HTTP boundary. `run_job_command` does not call this.
 fn authorize_stored_command(config: &crate::config::Config, command: &str) -> Result<(), ApiResponse> {
     let policy = policy(config);
+    // Scheduled jobs execute in the workspace, independently of runtime.workdir.
     SideEffectGate::new(policy.as_ref())
-        .authorize_command_execution("cron", command, None)
+        .authorize_command_execution(None, "cron", command, None)
         .map(|_| ())
         .map_err(|error| error_response(StatusCode::FORBIDDEN, error))
 }

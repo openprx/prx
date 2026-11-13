@@ -89,7 +89,11 @@ and cron/Xin shell jobs keep their existing git policy.
 for shell, native file tools and `git_operations`; otherwise they use the workspace.
 Restricted native file and shell path checks resolve relative requests against
 that root before evaluating forbidden paths and workspace confinement. ReadOnly
-still refuses mutations. Full native file tools bypass workspace and forbidden-path
+still refuses mutations. Configured roots follow symlinks to their canonical directory.
+With workspace-only confinement enabled, an outside root refuses relative native
+file requests and shell path arguments containing `/`. Disabling confinement does
+not exempt an outside root under default-forbidden `/home`, `/tmp` or `/var` prefixes.
+Full native file tools bypass workspace and forbidden-path
 confinement, while still refusing `..`. Owner-private routing and memory ACLs remain enforced.
 See [working-directory configuration](configuration.md#native-tool-working-directory-and-full-autonomy)
 for validation, restart and Docker mount rules.

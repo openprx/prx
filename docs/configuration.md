@@ -3467,7 +3467,13 @@ the workspace and forbidden paths; parent traversal (`..`) remains refused. Priv
 owner filesystems and memory ACL checks retain their own rules. Supervised and ReadOnly
 resolve relative native file requests and shell path arguments against the selected
 working root. All forbidden-path and workspace-only limits are evaluated on that
-resolved path; ReadOnly still refuses mutations. An approval does not enable git
+resolved path; ReadOnly still refuses mutations. Configured roots are canonicalized
+at load, just like CLI roots, so a symlink alias is checked against its real directory.
+With `workspace_only = true` (the default), a root outside the security workspace
+refuses every relative native file request and every shell path argument containing
+`/`. With `workspace_only = false`, a root outside the workspace under a default
+forbidden prefix such as `/home`, `/tmp` or `/var` still refuses those paths; the
+workspace ancestor exemption applies only inside the security workspace. An approval does not enable git
 in a Supervised shell.
 A child's effective level cannot exceed its manifest or the current service level.
 Direct tool calls without runtime authority keep the Supervised behavior.

@@ -111,7 +111,7 @@ impl FileReadTool {
     }
 
     fn working_root(&self) -> &std::path::Path {
-        self.working_root.as_deref().unwrap_or(&self.security.workspace_dir)
+        crate::security::path_policy::effective_root(self.working_root.as_deref(), &self.security)
     }
 
     async fn execute_operation(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
