@@ -1640,10 +1640,12 @@ mod tests {
             "test: a refused call to an unpublished tool executes nothing"
         );
         let mut bound_denied = refused.clone();
-        bound_denied.calls.push(crate::causal_tree::store::RecordedToolCall {
-            capability_id: "fixture_capability".to_owned(),
-            status: "denied".to_owned(),
-        });
+        bound_denied
+            .calls
+            .push(crate::runtime::decision_journal::store::RecordedToolCall {
+                capability_id: "fixture_capability".to_owned(),
+                status: "denied".to_owned(),
+            });
         let mut unbound_failed = refused.clone();
         unbound_failed.denied_attempts = 0;
         unbound_failed.failed_attempts = 1;
