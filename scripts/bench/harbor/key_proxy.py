@@ -17,9 +17,11 @@ Operator notes (also printed by `run_tb2.sh --help`):
 - Run the benchmark host on an isolated network, or pass `--proxy-peers` with
   the source network container traffic arrives from; other peers are then
   dropped at accept, before a slot is taken.
-- The upstream host is resolved once when the proxy starts; a trial uses those
-  addresses until it ends.
+- The upstream host is resolved once, off the event loop and under a startup
+  deadline (RESOLVE_DEADLINE), before the proxy exists; a trial connects only
+  to those addresses until it ends.
 """
+import asyncio
 import errno
 import hmac
 import http.client
@@ -43,6 +45,7 @@ UPSTREAM_TIMEOUT = 600   # inactivity, upstream socket
 READ_DEADLINE = 120      # absolute: request head and body fully received
 REQUEST_DEADLINE = 1800  # absolute: whole exchange, upstream response included
 STOP_JOIN = 5            # stop(): every blocking call is cut or polls within POLL
+RESOLVE_DEADLINE = 5     # absolute: upstream DNS resolution at startup
 POLL = 0.05
 CHUNK = 65536
 CONTAINER_HOST = "host.containers.internal"
@@ -81,12 +84,68 @@ def primary_ipv4():
 
 
 def resolve(host, port):
-    """Resolve the upstream once; the standard library cannot bound or cancel a DNS lookup."""
+    """Resolve the upstream; blocking, with no bound: only ever call it off the event loop."""
     addresses = []
     for family, _, _, _, address in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
         if (family, address) not in addresses and len(addresses) < MAX_ADDRESSES:
             addresses.append((family, address))
     return addresses
+
+
+async def resolve_bounded(host, port, resolver=None, deadline=RESOLVE_DEADLINE):
+    """Resolve without blocking the event loop, within an absolute `deadline`.
+
+    The standard library cannot cancel a DNS lookup, so the lookup runs in a
+    daemon thread that is abandoned, never joined, on timeout or cancellation:
+    the awaiting coroutine returns at once and a stuck resolver cannot hold up
+    the trial or interpreter exit. Its late result is dropped. Errors are
+    reduced to a type name; they never carry key material.
+    """
+    resolver = resolver or resolve
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def deliver(outcome, value):
+        if not future.done():
+            (future.set_result if outcome else future.set_exception)(value)
+
+    def work():
+        try:
+            outcome, value = True, resolver(host, port)
+        except Exception as error:  # reported to the awaiting coroutine
+            outcome, value = False, error
+        try:
+            loop.call_soon_threadsafe(deliver, outcome, value)
+        except RuntimeError:  # the loop is already closed: nobody is waiting
+            pass
+
+    threading.Thread(target=work, name="key-proxy-resolve", daemon=True).start()
+    try:
+        addresses = await asyncio.wait_for(future, deadline)
+    except asyncio.TimeoutError:
+        raise OSError(f"upstream DNS resolution did not finish within {deadline:g} seconds") from None
+    except OSError as error:
+        raise OSError(f"cannot resolve the upstream host ({type(error).__name__})") from None
+    if not addresses:
+        raise OSError("upstream host has no address")
+    return addresses
+
+
+def upstream_endpoint(upstream, allow_http_upstream=False):
+    """(host, port) of a validated upstream base URL; ValueError otherwise."""
+    parts = urlsplit(upstream)
+    if parts.scheme not in (("https", "http") if allow_http_upstream else ("https",)):
+        raise ValueError("proxy upstream must be an https URL")
+    if not parts.hostname:
+        raise ValueError("proxy upstream must be a plain base URL")
+    return parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+
+
+async def open_proxy(upstream, key, bind, *, resolver=None, resolve_deadline=RESOLVE_DEADLINE, **options):
+    """Resolve the upstream off the event loop, then build the (not yet started) KeyProxy."""
+    host, port = upstream_endpoint(upstream, options.get("allow_http_upstream", False))
+    addresses = await resolve_bounded(host, port, resolver, resolve_deadline)
+    return KeyProxy(upstream, key, bind, addresses=addresses, **options)
 
 
 def holds_key(data, key):
@@ -355,7 +414,7 @@ class _Server(http.server.HTTPServer):
 class KeyProxy:
     """One trial's forwarding proxy; `token` is the only credential the container sees."""
 
-    def __init__(self, upstream, key, bind, port=0, *, allow_http_upstream=False, allowed_peers=None,
+    def __init__(self, upstream, key, bind, port=0, *, addresses, allow_http_upstream=False, allowed_peers=None,
                  upstream_timeout=UPSTREAM_TIMEOUT, max_body=MAX_BODY, max_inflight=MAX_INFLIGHT,
                  read_deadline=READ_DEADLINE, request_deadline=REQUEST_DEADLINE):
         parts = urlsplit(upstream)
@@ -376,9 +435,11 @@ class KeyProxy:
             self.peers = [ipaddress.ip_network(peer.strip(), strict=False) for peer in allowed_peers]
         self.scheme, self.host, self.prefix = parts.scheme, parts.hostname, prefix
         self.port = parts.port or (443 if parts.scheme == "https" else 80)
-        # Resolved here, once, on the caller's thread, so no handler ever
-        # waits in a DNS lookup that stop() could not interrupt.
-        self.addresses = resolve(self.host, self.port)
+        # Resolved by the caller (open_proxy) before construction, so neither
+        # the event loop nor a handler ever waits in a DNS lookup.
+        if not addresses:
+            raise ValueError("proxy upstream needs at least one resolved address")
+        self.addresses = list(addresses)[:MAX_ADDRESSES]
         self.key = key
         self.token = secrets.token_urlsafe(32)
         self.max_body = max_body
