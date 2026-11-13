@@ -2816,10 +2816,13 @@ impl ToolExecutionService {
         };
 
         let service_level = self.policy.autonomy_level();
-        let effective_level = context.child_scope.as_ref().map_or(service_level, |scope| {
-            service_level.min(scope.gate_inputs().0.authority.level)
-        });
         let full = service_level == crate::security::AutonomyLevel::Full;
+        // Full has no permission limits (R51): a Full child's backend runs at
+        // Full whatever its manifest level; below Full the manifest attenuates.
+        let effective_level = match context.child_scope.as_ref() {
+            Some(scope) if !full => service_level.min(scope.gate_inputs().0.authority.level),
+            _ => service_level,
+        };
         let decision = admission::child_autonomy(
             &context,
             &descriptor,

@@ -625,6 +625,47 @@ async fn full_autonomy_has_no_permission_limits() {
     );
     assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
 
+    // A Full child with an attenuated (Supervised) manifest runs a real
+    // native tool at Full: the backend sees Full autonomy, so a file outside
+    // the workspace that only Full may read is read. Below Full the native
+    // path restriction would refuse it.
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside.txt");
+    std::fs::write(&target, "outside-content").unwrap();
+    let security = Arc::new(SecurityPolicy {
+        autonomy: AutonomyLevel::Full,
+        workspace_dir: workspace.path().to_owned(),
+        ..SecurityPolicy::default()
+    });
+    let mut native = admission_matrix::child_fixture::ChildCase::build_with(
+        &["config_reload"],
+        "owner-a",
+        AutonomyLevel::Supervised,
+        2,
+        &|| vec![Box::new(crate::tools::FileReadTool::new(Arc::clone(&security), false)) as Box<dyn Tool>],
+    );
+    native.service.policy = policy(AutonomyLevel::Full);
+    let outcome = native
+        .service
+        .execute(
+            call("file_read", serde_json::json!({"path": target.display().to_string()})),
+            native.context(true, true),
+            None,
+        )
+        .await;
+    assert_eq!(
+        outcome.status,
+        ToolExecutionStatus::Succeeded,
+        "{}",
+        outcome.model_content
+    );
+    assert!(
+        outcome.model_content.contains("outside-content"),
+        "{}",
+        outcome.model_content
+    );
+
     // A missing admitted H2 descriptor still refuses in Full (integrity).
     let (workspace, fabric, chat_binding, origin) =
         crate::runtime::h2_entry::recorded_terminal_approval_fixture().await;

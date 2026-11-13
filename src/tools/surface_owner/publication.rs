@@ -226,11 +226,15 @@ impl PublicationRules<'_, '_> {
             return blocked(4, "policy_deny");
         }
         let policy_asks = decision == ToolExecutionDecision::Ask;
-        let child_supervised = self
-            .facts
-            .child_scope()
-            .is_some_and(|(manifest, _)| manifest.authority.level == AutonomyLevel::Supervised);
-        let approval_required = entry.effect > SideEffectClass::ReadOnly
+        // Full has no permission limits (R51): a Supervised manifest does not
+        // make a Full turn's discoveries approval-required.
+        let child_supervised = !full
+            && self
+                .facts
+                .child_scope()
+                .is_some_and(|(manifest, _)| manifest.authority.level == AutonomyLevel::Supervised);
+        let approval_required = !full
+            && entry.effect > SideEffectClass::ReadOnly
             && (trusted.side_effect_mode == SideEffectMode::ApprovalRequired || child_supervised);
         if reference.fingerprint != entry.fingerprint {
             return blocked(5, "schema_changed");

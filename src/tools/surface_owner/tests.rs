@@ -238,3 +238,80 @@ fn turn_scope_refuses_foreign_owner_and_other_model() {
         .turn_scope_admits()
     );
 }
+
+/// R51 / P1-02: an attenuated (Supervised) child manifest limits neither
+/// membership nor approval in a Full turn: an effectful member and a
+/// capability outside the manifest are both published for automatic
+/// discovery. In a Supervised turn the member still needs approval and the
+/// non-member is blocked.
+#[test]
+fn full_turn_discovery_ignores_an_attenuated_child_manifest() {
+    use super::publication::PublicationAdmission;
+    use crate::security::decision_id::DecisionId;
+    use crate::tools::capability::child::{AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest};
+    let registry: Vec<Box<dyn Tool>> = vec![
+        Box::new(FixtureTool("memory_recall")),
+        Box::new(FixtureTool("file_write")),
+        Box::new(FixtureTool("shell")),
+    ];
+    let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())
+        .expect("test: catalog");
+    let view = catalog.view(&CatalogScope::default());
+    let entry = |name: &str| catalog.entry_for_public_name(name).expect("test: registered entry");
+    let cost = Some(CostEstimate {
+        tokens: 0,
+        micro_usd: 0,
+    });
+    for (level, mode) in [
+        (AutonomyLevel::Full, SideEffectMode::GuardedWrite),
+        (AutonomyLevel::Supervised, SideEffectMode::ApprovalRequired),
+    ] {
+        let trusted = trusted_for(&catalog, mode, &[]);
+        let parent = CapabilityConstraints {
+            parent_authority_id: DecisionId::legacy(&[7; 32]).into(),
+            allowed: ["memory_recall", "file_write", "shell"]
+                .into_iter()
+                .map(|name| entry_ref(entry(name)))
+                .collect(),
+            authority: AuthorityEnvelope {
+                owner: "owner-1".into(),
+                workspace: trusted.workspace_id.to_string(),
+                level: AutonomyLevel::Supervised,
+                max_cost_cents: 100,
+                remaining_depth: 2,
+                delegation: None,
+            },
+            catalog_generation: *catalog.generation(),
+            key: fixtures::key(),
+        };
+        let manifest = ChildCapabilityManifest::derive_strict_subset(&parent, &[entry_ref(entry("file_write"))])
+            .expect("test: attenuated manifest");
+        let mut facts = facts_for(Arc::new(SecurityPolicy {
+            autonomy: level,
+            ..SecurityPolicy::default()
+        }));
+        facts.child_scope = Some((Arc::new(manifest), Arc::new(parent)));
+        let rules = PublicationRules {
+            trusted: &trusted,
+            facts: &facts,
+            catalog: &view,
+        };
+        let member = rules.capability(entry("file_write"), &entry_ref(entry("file_write")), false, cost, false);
+        let outside = rules.capability(entry("shell"), &entry_ref(entry("shell")), false, cost, false);
+        if level == AutonomyLevel::Full {
+            assert_eq!(
+                member,
+                PublicationAdmission::Passed,
+                "Full: effectful member is published"
+            );
+            assert_eq!(outside, PublicationAdmission::Passed, "Full: non-member is published");
+        } else {
+            assert_eq!(
+                member,
+                PublicationAdmission::ApprovalRequired,
+                "Supervised: effectful member needs approval"
+            );
+            assert!(outside.is_blocked(), "Supervised: non-member is blocked");
+        }
+    }
+}

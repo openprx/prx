@@ -627,10 +627,22 @@ pub(in crate::tools::execution::tests) mod child_fixture {
             level: AutonomyLevel,
             depth: u8,
         ) -> Self {
+            Self::build_with(members, owner, level, depth, &Vec::new)
+        }
+
+        /// [`Self::build`] plus `extra` registered tools that no manifest
+        /// holds (for example a real native tool).
+        pub(in crate::tools::execution::tests) fn build_with(
+            members: &[&str],
+            owner: &str,
+            level: AutonomyLevel,
+            depth: u8,
+            extra: &dyn Fn() -> Vec<Box<dyn Tool>>,
+        ) -> Self {
             let fixture = fixture();
             let drift = Arc::new(AtomicUsize::new(0));
             let tools = |state: &Arc<AtomicUsize>| -> Vec<Box<dyn Tool>> {
-                vec![
+                let mut tools: Vec<Box<dyn Tool>> = vec![
                     Box::new(RecordingTool {
                         root_name: "config_reload",
                         aliases: vec![],
@@ -685,7 +697,9 @@ pub(in crate::tools::execution::tests) mod child_fixture {
                         arguments: Arc::clone(&fixture.arguments),
                         stages: Arc::clone(&fixture.stages),
                     }),
-                ]
+                ];
+                tools.extend(extra());
+                tools
             };
             let catalog = Arc::new(
                 CapabilityCatalog::build(&tools(&drift), &CatalogSources::default(), &SurfacePolicy::default())
