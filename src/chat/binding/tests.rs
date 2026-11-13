@@ -1,3 +1,4 @@
+#![cfg(test)]
 mod operator_accounting;
 #[cfg(unix)]
 mod shell_parity_working_root;

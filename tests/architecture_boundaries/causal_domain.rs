@@ -505,6 +505,13 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
                     "config::deprecations::file_holding",
                 ],
                 "src/runtime/decision_journal/store/child_outcome.rs" => &["agent::terminal::VerifiedTerminalReplay"],
+                // R21: `HardGatesProbe` (until Part 2) reads the same catalog
+                // view the generator's admission port reads.
+                "src/causal_tree/hard_gates_probe.rs" => &["tools::capability::catalog::CatalogView"],
+                // R53: the reasons moved to execution-owned `agent::refusal`;
+                // the legacy `classify` that stays here until Part 2 returns
+                // them. `agent::refusal` imports nothing from the engine.
+                "src/causal_tree/refusal.rs" => &["agent::refusal::RefusalReason", "agent::refusal::unpriced_reason"],
                 _ => &[],
             };
             let allowed = CAUSAL_DOMAIN_CRATE_PATHS.iter().chain(file_paths.iter()).any(|entry| {

@@ -442,8 +442,21 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
         classified.push(format!("{relative}::{function}::{anchor} -> {source_kind:?}"));
     }
     // Decision-owned windows retain initial admission; router readmission
-    // (`router_history_hop_inner`) was deleted.
-    let relative = "src/runtime/turn_decision.rs";
+    // (`router_history_hop_inner`) was deleted. The turn decision service
+    // forwards its budget snapshot to the publication scope (strip P1), which
+    // now owns the resolved producer.
+    let forwarder = compact_rust_tokens(&function_body(
+        &strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+            &repository_root().join("src/runtime/turn_decision.rs"),
+        ))),
+        "agent_budget_snapshot",
+    ));
+    assert_eq!(
+        braced_block(&forwarder, forwarder.find('{').expect("budget snapshot body")),
+        Some("{self.publication_scope().agent_budget_snapshot(proof)}"),
+        "src/runtime/turn_decision.rs: the budget snapshot must forward to the publication scope"
+    );
+    let relative = "src/runtime/turn_context/publication_scope.rs";
     let function = "agent_budget_snapshot";
     let resolver =
         compact_rust_tokens("let effective = self.effective_compaction(proof.provider_name(), proof.model_name());");

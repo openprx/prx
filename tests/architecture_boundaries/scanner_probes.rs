@@ -911,11 +911,19 @@ fn mutation_proof_compaction_producer_guard() {
             new,
         );
     }
+    // The resolved producer lives in the publication scope (strip P1); the
+    // turn decision service only forwards to it.
+    assert_reviewed_source_mutation(
+        forwarded_compaction_values_are_produced_from_the_effective_window,
+        "src/runtime/turn_context/publication_scope.rs",
+        "let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;",
+        "let main_compaction = config.agent.compaction.clone();",
+    );
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
         "src/runtime/turn_decision.rs",
-        "let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;",
-        "let main_compaction = config.agent.compaction.clone();",
+        "self.publication_scope().agent_budget_snapshot(proof)",
+        "unreviewed_budget_snapshot(self, proof)",
     );
 }
 fn mutation_proof_gateway_registration_guard() {

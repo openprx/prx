@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Golden: the execution-owned publication rules reproduce the pre-strip
 //! direct surface (`direct_answer_refs` over the hard gates' capability
 //! publication scope) in Supervised, read-only and Full turns.

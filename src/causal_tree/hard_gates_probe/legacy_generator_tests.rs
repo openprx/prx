@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Gate-dependent generator tests, run through the execution admission probe
 //! (`HardGatesProbe`). Bodies are unchanged; the shim below adapts the legacy
 //! `GateInputs` call shape. Part 2 retires them with the hard gates.

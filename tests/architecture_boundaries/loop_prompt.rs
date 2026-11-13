@@ -233,16 +233,18 @@ fn production_tool_loop_memory_is_wired_to_request_context_events() {
 /// source-owned decision handoff. Rust makes the context mandatory; this guard
 /// prevents a new entrypoint or an altered handoff from escaping review.
 /// Runtime origin/parity checks and EP behavior tests prove semantic provenance.
+/// The runtime context (R26) is always read from the decision context the turn
+/// opened, never built at the call site.
 pub(super) const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
     (
         "src/agent/embedded_turn.rs",
         1,
-        "crate::agent::turn_request::TurnDecision{service:&service,context:&decision,proof:source,}",
+        "crate::agent::turn_request::TurnDecision{service:&service,context:&decision,runtime:decision.runtime(),proof:source,}",
     ),
     (
         "src/agent/entry.rs",
         2,
-        "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,proof:decision_proof,}",
+        "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,runtime:decision_context.runtime(),proof:decision_proof,}",
     ),
     ("src/channels/turn.rs", 1, "decision_turn.routing()"),
     ("src/chat/dispatcher.rs", 1, "routing"),
@@ -254,12 +256,12 @@ pub(super) const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
     (
         "src/gateway/api/sessions.rs",
         1,
-        "crate::agent::turn_request::TurnDecision{service:&decision.service,context:&decision.context,proof:decision.proof,}",
+        "crate::agent::turn_request::TurnDecision{service:&decision.service,context:&decision.context,runtime:decision.context.runtime(),proof:decision.proof,}",
     ),
     (
         "src/gateway/mod.rs",
         1,
-        "crate::agent::turn_request::TurnDecision{service,context:&context,proof:&gateway_proof,}",
+        "crate::agent::turn_request::TurnDecision{service,context:&context,runtime:context.runtime(),proof:&gateway_proof,}",
     ),
     ("src/session_worker/runner/run.rs", 1, "admitted_turn.routing()"),
     ("src/tools/delegate.rs", 1, "child_turn.routing()"),

@@ -721,15 +721,22 @@ fn use_tree_paths(text: &str, at: usize, prefix: &str, paths: &mut Vec<String>) 
 fn path_tree_end(text: &str) -> usize {
     let mut depth = 0_usize;
     for (offset, character) in text.char_indices() {
+        // A use-tree group opens only after `::`; a `{` after a plain segment
+        // is a struct literal or a block (`if x == crate::a::B {`) and ends
+        // the path, as does a top-level `}` or `,`.
+        let ends_path = match character {
+            '{' => depth == 0 && offset > 0 && !text[..offset].ends_with("::"),
+            '}' | ',' => depth == 0,
+            ':' | '*' => false,
+            _ => depth == 0 && !is_ident_char(character),
+        };
+        if ends_path {
+            return offset;
+        }
         match character {
             '{' => depth += 1,
-            '}' if depth == 0 => return offset,
             '}' => depth -= 1,
-            ',' if depth == 0 => return offset,
-            ':' | ',' | '*' => {}
-            _ if is_ident_char(character) => {}
-            _ if depth > 0 => {}
-            _ => return offset,
+            _ => {}
         }
     }
     text.len()
@@ -739,9 +746,10 @@ fn path_tree_end(text: &str) -> usize {
 /// every path it names.
 fn expand_tree(prefix: &str, tree: &str, paths: &mut Vec<String>) {
     let Some(open) = tree.find('{') else {
-        // Whitespace is removed, so an `as` alias only extends the last
-        // segment; the forbidden-root match is on leading segments.
-        paths.push(format!("{prefix}{}", tree.trim_end_matches("::")));
+        // Whitespace survives only between two identifiers
+        // ([`compact_rust_path_text`]), so an `as` alias follows a space.
+        let path = tree.split(' ').next().unwrap_or(tree);
+        paths.push(format!("{prefix}{}", path.trim_end_matches("::")));
         return;
     };
     let head = &tree[..open];
@@ -777,7 +785,27 @@ pub(super) fn module_segments(relative: &str) -> Vec<String> {
     segments
 }
 
-/// Every crate-rooted path named in `compact` (whitespace removed): explicit
+/// `text` with whitespace removed except one space between two identifier
+/// characters, so `use crate::x` keeps `crate` a separate token (plain
+/// removal gives `usecrate::x`, which no longer starts a path).
+pub(super) fn compact_rust_path_text(text: &str) -> String {
+    let mut compact = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && is_ident_char(character) && compact.chars().next_back().is_some_and(is_ident_char) {
+            compact.push(' ');
+        }
+        pending_space = false;
+        compact.push(character);
+    }
+    compact
+}
+
+/// Every crate-rooted path named in `compact` ([`compact_rust_path_text`]): explicit
 /// `crate::` paths and `super::` chains that climb to the crate root.
 pub(super) fn module_resolved_paths(compact: &str, module: &[String]) -> Vec<String> {
     let mut paths = Vec::new();

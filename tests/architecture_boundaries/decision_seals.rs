@@ -28,6 +28,14 @@ const TRUST_BEARING_DEFINITIONS: [(&str, &str); 3] = [
     ("recorded_by_runtime", "src/decision_engine/state.rs"),
 ];
 
+/// Production files that may name one trust-bearing constructor exactly once
+/// without becoming a [`TRUST_BEARING_CALLERS`] entry: every other AG-28 rule
+/// (literals, field writes, further constructors) still applies to them.
+/// Strip P1 R9: `decision_advisory::build_state` reuses
+/// `TrustedState::from_runtime` over the trusted parts the turn decision
+/// service pinned in `TurnRuntimeContext`; it builds no new trust.
+const TRUST_BEARING_REUSERS: [(&str, &str); 1] = [("from_runtime", "src/runtime/decision_advisory.rs")];
+
 /// AG-28 (CDP-PLAN 1.9, scope amended by D-066 N-3 and its amendment).
 /// Trusted and observed state carry authority: a trusted part grants or
 /// excludes capabilities, and a failed step marks a candidate
@@ -61,9 +69,14 @@ pub(super) fn trust_bearing_turn_state_is_built_only_by_the_turn_decision_servic
                     .iter()
                     .any(|(name, file)| *name == constructor && relative == *file),
             );
+            let reused = usize::from(
+                TRUST_BEARING_REUSERS
+                    .iter()
+                    .any(|(name, file)| *name == constructor && relative == *file),
+            );
             let named = identifier_count(&compact, constructor);
             let defined = identifier_count(&compact, &format!("fn {constructor}"));
-            if named > allowed || defined > allowed {
+            if named > allowed + reused || defined > allowed {
                 violations.push(format!("{relative}: names {constructor}"));
             }
         }
@@ -204,25 +217,19 @@ fn decision_compiler_source_errors(source: &str) -> Vec<&'static str> {
     {
         errors.push("request state must move from redacted projection and recover only for checked size shrinking");
     }
+    // The forced-choice sidecar (`forced_choice`, `forced_choices_match`) and
+    // its five candidate-derived option ids were deleted with the prediction
+    // hop (strip P1, R9-DEAD); the four criteria keys below are the whole set.
     let allowed_option_calls = [
-        "OptionId::code(candidate.action().as_str())",
         "OptionId::code(action)",
         "OptionId::code(\"other\")",
-        "OptionId::code(candidate.target().as_str())",
-        "OptionId::code(target.as_str())",
         "OptionId::code(target)",
         "OptionId::code(\"none\")",
     ];
-    if production.matches("OptionId::code(").count() != 10
-        || allowed_option_calls.iter().any(|call| {
-            let expected = match *call {
-                "OptionId::code(target)"
-                | "OptionId::code(candidate.action().as_str())"
-                | "OptionId::code(candidate.target().as_str())" => 2,
-                _ => 1,
-            };
-            production.matches(call).count() != expected
-        })
+    if production.matches("OptionId::code(").count() != allowed_option_calls.len()
+        || allowed_option_calls
+            .iter()
+            .any(|call| production.matches(call).count() != 1)
     {
         errors.push("option ids must be derived from typed action or target values");
     }
@@ -386,7 +393,7 @@ pub(super) fn validation_requires_the_sealed_request_manifest() {
     let validation = function_body(&protocol, "validate_parts");
     let construction = function_body(&protocol, "from_validated_parts");
     assert!(!validation.contains("Uuid::now_v7"));
-    assert!(validation.contains("super::wire::salted_question_ids("));
+    assert!(validation.contains("crate::decision_engine::prediction::wire::salted_question_ids("));
     assert_eq!(protocol.matches("Uuid::now_v7()").count(), 1);
     assert_eq!(construction.matches("Uuid::now_v7()").count(), 1);
     for name in ["DecisionRequest", "DecisionRequestManifest"] {

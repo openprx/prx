@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Canonical-state tests of the exact-call observations (moved from
 //! `state/exact_calls.rs` with the neutral turn scope, R15).
 use crate::tools::capability::turn_state::exact_calls::*;

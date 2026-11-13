@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! R54: a pre-switch pending decision approval resumes exactly once.
 //!
 //! The pending item is seeded the way the pre-switch runtime left it: both

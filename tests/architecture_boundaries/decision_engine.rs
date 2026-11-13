@@ -3,8 +3,8 @@
 //! depend on the engine.
 
 use super::helpers::{
-    blank_comments_and_literals, is_ident_char, is_test_code_file, module_resolved_paths, module_segments, read_source,
-    relative_path, rust_source_files, strip_cfg_test_items, test_module_files,
+    blank_comments_and_literals, compact_rust_path_text, is_ident_char, is_test_code_file, module_resolved_paths,
+    module_segments, read_source, relative_path, rust_source_files, strip_cfg_test_items, test_module_files,
 };
 
 /// The neutral homes (R15-R17, R52, OV-14). There is no exception for
@@ -146,7 +146,7 @@ pub(super) fn decision_engine_never_imports_agent_or_tool_execution() {
         }
         scanned += 1;
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
-        let compact: String = production.split_whitespace().collect();
+        let compact = compact_rust_path_text(&production);
         let module = module_segments(&relative);
         for named in module_resolved_paths(&compact, &module) {
             if is_forbidden_engine_import(&named) {
