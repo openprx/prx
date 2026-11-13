@@ -1794,7 +1794,7 @@ async fn prx_message_tool_emits_one_external_send_envelope() {
             .entry_for_public_name("prx_message")
             .expect("test: prx_message_tool_emits_one_external_send_envelope: entry_for_public_name succeeds")
             .effect,
-        crate::causal_tree::branch::SideEffectClass::ExternalSend,
+        crate::tools::capability::contract::SideEffectClass::ExternalSend,
         "prx message tool emits one external send envelope: expected messaging contract changed"
     );
     let result = tool

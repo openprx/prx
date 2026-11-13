@@ -4,9 +4,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
-use crate::causal_tree::branch::CapabilityRef;
-use crate::causal_tree::branch::{CapabilityTarget, CausalActionKind, CostEstimate};
-#[cfg(test)]
 use crate::causal_tree::candidate_generator::CapabilityCostModel;
 use crate::causal_tree::candidate_generator::CostEstimateSource;
 use crate::config::Config;
@@ -19,6 +16,9 @@ use crate::providers::catalog::ResolvedModel;
 use crate::tools::capability::catalog::CapabilityEntry;
 #[cfg(test)]
 use crate::tools::capability::catalog::CatalogView;
+#[cfg(test)]
+use crate::tools::capability::contract::CapabilityRef;
+use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind, CostEstimate};
 
 /// V1 family fallback estimates in milliseconds. Complete single-capability
 /// outcomes can replace one capability's default with observed total-turn p50.

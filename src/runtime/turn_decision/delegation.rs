@@ -42,11 +42,11 @@ impl TurnDecisionService {
     pub(super) async fn validate_delegation_storage(&self, context: Arc<TurnDecisionContext>) -> anyhow::Result<()> {
         #[cfg(test)]
         crate::decision_engine::access_spy::record_delegation_storage(&self.generation.effective.workspace_dir);
-        let deadline = crate::causal_tree::logical_clock::now()
+        let deadline = crate::runtime::logical_clock::now()
             .checked_add(DELEGATION_DURABILITY_TIMEOUT)
             .context("delegation durability deadline cannot be represented")?;
         anyhow::ensure!(
-            crate::causal_tree::logical_clock::now() < deadline,
+            crate::runtime::logical_clock::now() < deadline,
             "delegation persistence exceeded the decision deadline"
         );
         // Preserve the issued-context authority checks before reading storage.
@@ -57,12 +57,8 @@ impl TurnDecisionService {
             workspace_id: Arc::clone(&workspace),
             owner_id: trusted.owner_id.clone().context("parent decision owner missing")?,
         };
-        let records = crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(
-            &context,
-            &self.state_key,
-            true,
-            self.generation.effective.causal_tree.store.record_redacted_projection,
-        )?;
+        let records =
+            crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(&context, &self.state_key, true)?;
         let writer = self.store.writer().context("parent decision writer missing")?;
         let rows = writer.replay_chain(scope, context.hop_ids().to_vec(), deadline).await?;
         anyhow::ensure!(rows.len() == records.len(), "delegation chain readback count conflicts");
@@ -84,7 +80,7 @@ impl TurnDecisionService {
             );
         }
         anyhow::ensure!(
-            crate::causal_tree::logical_clock::now() < deadline,
+            crate::runtime::logical_clock::now() < deadline,
             "delegation readback exceeded the decision deadline"
         );
         Ok(())
@@ -180,12 +176,8 @@ impl TurnDecisionService {
         );
         let scope = self.verified_delegation_scope(context)?;
         let store_workspace = self.store.workspace_id().context("parent decision store missing")?;
-        let records = crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(
-            context,
-            &self.state_key,
-            true,
-            self.generation.effective.causal_tree.store.record_redacted_projection,
-        )?;
+        let records =
+            crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(context, &self.state_key, true)?;
         let parent_record = records.last().context("parent decision record missing")?;
         let parent_digest = parent_record.replay_digest(&store_workspace)?;
         let parent_issuer =

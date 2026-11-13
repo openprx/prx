@@ -42,7 +42,7 @@ fn worker_reader(config: Config, metadata: Vec<crate::skills::SkillMetadata>) ->
     let entry = catalog
         .entry_for_public_name("prx_bound")
         .expect("test: signed child skill");
-    let allowed = std::collections::BTreeSet::from([crate::causal_tree::branch::CapabilityRef {
+    let allowed = std::collections::BTreeSet::from([crate::tools::capability::contract::CapabilityRef {
         id: entry.id.clone(),
         fingerprint: entry.fingerprint,
         generation: entry.generation,

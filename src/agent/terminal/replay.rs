@@ -7,8 +7,8 @@ mod router_history;
 use super::{DecisionSettlementRef, TurnTerminalCommit, TurnTerminalStatus, terminal_semantic_scope};
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::store::{DecisionReplayRecord, DecisionScope, DecisionStoreReader, DecisionView};
-use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MessageEvent, MessageEventScope};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,10 +39,6 @@ enum RecordedDirective {
     Clarify {
         reason_code: String,
     },
-    RequestApproval {
-        decision_id: String,
-        effect: String,
-    },
     Refuse {
         policy_code: String,
         user_hint: Option<String>,
@@ -56,7 +52,6 @@ fn recorded_from_hop(
     row: &DecisionReplayRecord,
     hop: &crate::causal_tree::decision_engine::EngineDecision,
 ) -> anyhow::Result<RecordedDirective> {
-    use crate::causal_tree::decision_select::Selection;
     Ok(match row.decision.directive_kind.as_str() {
         "collect_approval_arguments" => RecordedDirective::CollectApprovalArguments,
         "answer" => RecordedDirective::Answer,
@@ -67,38 +62,10 @@ fn recorded_from_hop(
         "clarify" => RecordedDirective::Clarify {
             reason_code: row.decision.abstention_reason.clone().unwrap_or_default(),
         },
-        "request_approval" => {
-            let Selection::RequestApproval {
-                pending_candidate_id, ..
-            } = &hop.selection
-            else {
-                anyhow::bail!("recorded approval row differs from its persisted hop selection");
-            };
-            let pending = match &hop.candidates {
-                crate::causal_tree::candidate_generator::CandidateSet::Legal {
-                    candidates,
-                    approval_scopes,
-                    ..
-                } => candidates
-                    .iter()
-                    .chain(approval_scopes.values().flatten().map(|item| &item.candidate))
-                    .find(|candidate| candidate.candidate_id() == pending_candidate_id),
-                crate::causal_tree::candidate_generator::CandidateSet::NoLegalPath {
-                    terminals,
-                    approval_only,
-                    ..
-                } => terminals
-                    .iter()
-                    .chain(approval_only.iter().map(|item| &item.candidate))
-                    .find(|candidate| candidate.candidate_id() == pending_candidate_id),
-            }
-            .context("recorded approval candidate is missing")?;
-            let effect = pending.side_effect().as_str().to_owned();
-            RecordedDirective::RequestApproval {
-                decision_id: row.decision.decision_id.to_string(),
-                effect,
-            }
-        }
+        // The prediction hop that selected RequestApproval was retired (R9):
+        // a live hop is always a committed Answer, so such a row never
+        // matches its persisted hop selection.
+        "request_approval" => anyhow::bail!("recorded approval row differs from its persisted hop selection"),
         "refuse" => {
             let policy_code = row.decision.abstention_reason.clone().unwrap_or_default();
             // The persisted hop has already been compared with the issued
@@ -126,9 +93,6 @@ fn render_recorded_terminal(directive: &RecordedDirective) -> anyhow::Result<std
             "approval_requires_call" => APPROVAL_UNAVAILABLE_REPLY,
             _ => "Could you clarify the result you want?",
         })),
-        RecordedDirective::RequestApproval { decision_id, effect } => Ok(std::borrow::Cow::Owned(format!(
-            "Approval is required for decision {decision_id} (effect: {effect}). Review this decision before resuming it. The operation has not run."
-        ))),
         RecordedDirective::Refuse { policy_code, .. } if policy_code == "approval_requires_call" => {
             Ok(std::borrow::Cow::Borrowed(APPROVAL_UNAVAILABLE_REPLY))
         }
@@ -147,9 +111,7 @@ fn recorded_fixed_close(
     assistant: Option<&str>,
 ) -> anyhow::Result<bool> {
     match recorded {
-        RecordedDirective::Clarify { .. }
-        | RecordedDirective::RequestApproval { .. }
-        | RecordedDirective::Refuse { .. } => {
+        RecordedDirective::Clarify { .. } | RecordedDirective::Refuse { .. } => {
             let reply = render_recorded_terminal(recorded)?;
             Ok(status == TurnTerminalStatus::Completed && !has_provider && assistant == Some(reply.as_ref()))
         }
@@ -184,15 +146,6 @@ fn recorded_run_capabilities(recorded: &RecordedDirective, link: &DecisionSettle
             .collect(),
         _ => Vec::new(),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn recorded_pre_switch_request_approval_closes(decision_id: &str, effect: &str, assistant: &str) -> bool {
-    let recorded = RecordedDirective::RequestApproval {
-        decision_id: decision_id.to_owned(),
-        effect: effect.to_owned(),
-    };
-    recorded_fixed_close(&recorded, TurnTerminalStatus::Completed, false, Some(assistant)).unwrap_or(false)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -410,7 +363,6 @@ impl PreparedReplay {
             &link.context,
             &recorded.key,
             true,
-            link.record_redacted_projection,
         )?;
         let mut hops = Vec::with_capacity(link.context.hop_ids().len());
         let mut last_recorded = None;
@@ -1545,66 +1497,3 @@ pub(crate) fn reseal_payload_for_test(
 
 #[cfg(all(test, unix, feature = "llm-router"))]
 mod legacy_tests;
-
-#[cfg(test)]
-mod recorded_approval_tests {
-    use super::*;
-    #[tokio::test]
-    async fn prepared_replay_reads_pre_switch_request_approval_effect_from_recorded_hop() -> anyhow::Result<()> {
-        let workspace = tempfile::tempdir()?;
-        let (hop, record) = crate::causal_tree::directive::tests::recorded_request_approval_hop();
-        let store = crate::causal_tree::store::testing::open_private(
-            workspace.path(),
-            Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
-        );
-        let writer = store.writer().context("test: actual decision writer")?;
-        assert_eq!(
-            writer.record_decision(record),
-            crate::causal_tree::store::Enqueue::Queued,
-            "test: persist historical row"
-        );
-        assert!(
-            writer
-                .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
-                .await,
-            "test: committed row"
-        );
-        let row = store
-            .reader()
-            .replay_record(
-                &DecisionScope::Owner {
-                    workspace_id: store.workspace_id().context("test: store namespace")?,
-                    owner_id: Arc::from("prx_user"),
-                },
-                &hop.decision_id,
-            )?
-            .context("test: recorded pre-switch approval row")?;
-        assert_eq!(
-            row.decision.directive_kind, "request_approval",
-            "test: historical row type"
-        );
-        let reply = "Approval is required for decision 0192f0c4-0000-7000-8000-000000000001 (effect: local_write). Review this decision before resuming it. The operation has not run.";
-        let (directive, fixed_close) =
-            PreparedReplay::classify_recorded_hop(&row, &hop, TurnTerminalStatus::Completed, false, Some(reply))?;
-        assert!(
-            matches!(directive, RecordedDirective::RequestApproval { effect, .. } if effect == "local_write"),
-            "test: persisted pending candidate supplies the effect"
-        );
-        assert!(
-            fixed_close,
-            "test: PreparedReplay classifies the original approval text as fixed"
-        );
-        assert!(
-            !PreparedReplay::classify_recorded_hop(
-                &row,
-                &hop,
-                TurnTerminalStatus::Completed,
-                false,
-                Some("Could you clarify the result you want?")
-            )?
-            .1,
-            "test: mismatched historical text is refused"
-        );
-        Ok(())
-    }
-}

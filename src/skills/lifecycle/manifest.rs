@@ -119,7 +119,7 @@ fn lenient(
 /// * an MCP id is `mcp:<server>:mcp__<server>__<tool>`, or
 ///   `mcp:mcp:mcp__<server>__<tool>` for an alias not discovered yet.
 fn is_capability_id(id: &str) -> bool {
-    use crate::causal_tree::branch::CapabilityTarget;
+    use crate::tools::capability::contract::CapabilityTarget;
     let mut parts = id.split(':');
     let (Some(family), Some(namespace), Some(name), None) = (parts.next(), parts.next(), parts.next(), parts.next())
     else {

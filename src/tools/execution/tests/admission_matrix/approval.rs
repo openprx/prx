@@ -359,7 +359,7 @@ fn verify_admitted_call_capability_equals_catalog_entry() {
         .expect("test: admitted catalog entry");
     assert_eq!(
         verified.capability(),
-        &crate::causal_tree::branch::CapabilityRef {
+        &crate::tools::capability::contract::CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
             generation: entry.generation

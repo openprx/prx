@@ -1,4 +1,4 @@
-use super::decision_seals::braced_block;
+use super::helpers::braced_block;
 use super::helpers::{
     assert_inventory, blank_comments_and_literals, enclosing_function, function_body, read_source, repository_root,
     strip_cfg_test_items,

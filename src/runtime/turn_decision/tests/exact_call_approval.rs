@@ -410,3 +410,93 @@ mod native_usage;
 
 #[path = "exact_call_approval/ordinary_plane.rs"]
 mod ordinary_plane;
+
+/// R9.6 (V-17): every resume turn now opens prediction-free (directive
+/// `AnswerDirectly`) whatever the engine setting, so the historical resume
+/// check is execution-owned. With the plane on and the engine on or off, the
+/// resume surface built from the real execution service and restricted to
+/// the prepared tool admits exactly that tool; another tool, a widened
+/// surface or a missing surface is refused, and a changed argument is a
+/// different command than the prepared one.
+#[tokio::test]
+async fn historical_resume_survives_prediction_free_opening() {
+    use crate::runtime::turn_decision::pending_approval::published_only;
+    use crate::tools::execution::admission::TurnSurface;
+    for engine in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.decision_engine.enabled = engine;
+        config.causal_tree.enabled = true;
+        config.workspace_dir = workspace.path().to_owned();
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(crate::tools::file_read::FileReadTool::new(Arc::clone(&security), false)),
+            Box::new(CountedFileMutation {
+                inner: Box::new(FileWriteTool::new(Arc::clone(&security))),
+                calls: Arc::clone(&dispatches),
+            }),
+        ]);
+        let execution = ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(AdapterOwnedPreparation),
+            Arc::new(TracingToolExecutionAudit),
+        );
+        let full = TurnSurface::build_from(
+            &execution,
+            execution.current_descriptors(),
+            &config.tool_tiering,
+            "prx-local-model",
+            false,
+            |_| true,
+        );
+        assert!(
+            full.contains("file_write") && full.contains("file_read"),
+            "engine {engine}"
+        );
+        let context = |surface: Option<TurnSurface>| {
+            let mut context = ToolExecutionContext::new(
+                crate::runtime::envelope::RuntimeEnvelope::agent("workspace-a", "resume-run")
+                    .with_channel("terminal")
+                    .with_sender("owner-a")
+                    .with_owner_id("owner-a"),
+                "dm",
+            );
+            context.turn_surface = surface.map(Arc::new);
+            context
+        };
+        // The surface owner restricts a resume turn to the prepared tool.
+        let resume = context(Some(full.restricted_to("file_write")));
+        assert!(
+            published_only(&resume, "file_write"),
+            "engine {engine}: approve executes the prepared call"
+        );
+        assert!(
+            !published_only(&resume, "file_read"),
+            "engine {engine}: another tool is refused"
+        );
+        assert!(
+            !published_only(&context(Some(full.clone())), "file_write"),
+            "engine {engine}: a widened surface is refused"
+        );
+        assert!(
+            !published_only(&context(None), "file_write"),
+            "engine {engine}: no surface is refused"
+        );
+        // A changed argument is not the prepared command, which the adapter
+        // compares byte-for-byte before the surface check.
+        let prepared =
+            crate::tools::ToolExecutionCommand::new("file_write", serde_json::json!({"path": "a.txt", "content": "x"}));
+        let changed =
+            crate::tools::ToolExecutionCommand::new("file_write", serde_json::json!({"path": "a.txt", "content": "y"}));
+        assert_ne!(prepared, changed, "engine {engine}");
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            0,
+            "engine {engine}: no execution without a claim"
+        );
+    }
+}

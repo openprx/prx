@@ -309,7 +309,7 @@ impl SkillsLifecycleService {
         // The stage worker is a new task. A test clock does not cross `spawn`,
         // so the lesson pin check would otherwise spend wall time.
         #[cfg(test)]
-        let inherited_clock = crate::causal_tree::logical_clock::capture();
+        let inherited_clock = crate::runtime::logical_clock::capture();
         #[cfg(test)]
         let hook_clock = inherited_clock.clone();
         let worker = async move {
@@ -331,7 +331,7 @@ impl SkillsLifecycleService {
                 crate::skills::lifecycle::adoption::worker_clock::scope(hook_clock, "experiment.stage-lookup", run);
             #[cfg(test)]
             if let Some(clock) = inherited_clock {
-                return crate::causal_tree::logical_clock::scope(clock, run).await;
+                return crate::runtime::logical_clock::scope(clock, run).await;
             }
             run.await
         };

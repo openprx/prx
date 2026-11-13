@@ -1,4 +1,4 @@
-//! Keep authority/control messages independent of admission-local telemetry waits.
+//! Keep authority/control messages independent of the ordinary telemetry backlog.
 use super::{QueueItem, QueuedEvent, applied_input_matches, report_incomplete, to_message_input};
 use crate::decision::telemetry::{CausalEventSink, IncompleteReason};
 use std::{collections::VecDeque, sync::Arc};
@@ -11,29 +11,24 @@ pub(super) struct Worker {
     pub(super) workspace: String,
     pub(super) generation: u64,
     pub(super) revision: String,
-    pub(super) deferral: Arc<super::deferral::PersistenceDeferral>,
 }
 
 impl Worker {
     pub(super) async fn run(mut self) {
-        let registry = Arc::clone(&self.deferral);
-        let mut deferred = VecDeque::new();
+        let mut backlog = VecDeque::new();
         let mut ordinary_closed = false;
         let mut control_closed = false;
         loop {
-            let changed = registry.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
             // Read control first; ordinary telemetry cannot consume its slots.
             for _ in 0..super::EVENT_QUEUE_CAPACITY {
                 match self.control_receiver.try_recv() {
-                    Ok(control) => self.control(control, &mut deferred).await,
+                    Ok(control) => self.control(control, &mut backlog).await,
                     Err(_) => break,
                 }
             }
             for _ in 0..super::EVENT_QUEUE_CAPACITY {
                 match self.receiver.try_recv() {
-                    Ok(event) => deferred.push_back(event),
+                    Ok(event) => backlog.push_back(event),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         ordinary_closed = true;
@@ -42,40 +37,32 @@ impl Worker {
                 }
             }
             if ordinary_closed && control_closed {
-                self.flush_all(&mut deferred).await;
+                self.flush_all(&mut backlog).await;
                 return;
             }
-            let batch = take_ready(&mut deferred, false);
-            if !batch.is_empty() {
-                self.persist(batch).await;
+            if !backlog.is_empty() {
+                self.persist(take_batch(&mut backlog)).await;
                 continue;
             }
-            let next_deadline = deferred
-                .iter()
-                .filter_map(|event| event.deferral.as_ref().map(|state| state.deadline))
-                .min();
+            // At least one channel is open here; `else` re-checks closure.
             tokio::select! {
                 biased;
                 item = self.control_receiver.recv(), if !control_closed => match item {
-                    Some(control) => self.control(control, &mut deferred).await,
+                    Some(control) => self.control(control, &mut backlog).await,
                     None => control_closed = true,
                 },
                 item = self.receiver.recv(), if !ordinary_closed => match item {
-                    Some(event) => deferred.push_back(event),
+                    Some(event) => backlog.push_back(event),
                     None => ordinary_closed = true,
                 },
-                () = changed => {},
-                () = async {
-                    if let Some(deadline) = next_deadline { tokio::time::sleep_until(deadline).await; }
-                    else { std::future::pending::<()>().await; }
-                } => {},
+                else => {}
             }
         }
     }
 
-    async fn flush_all(&self, deferred: &mut VecDeque<QueuedEvent>) {
-        while !deferred.is_empty() {
-            self.persist(take_ready(deferred, true)).await;
+    async fn flush_all(&self, backlog: &mut VecDeque<QueuedEvent>) {
+        while !backlog.is_empty() {
+            self.persist(take_batch(backlog)).await;
         }
     }
 
@@ -127,20 +114,19 @@ impl Worker {
         }
     }
 
-    async fn control(&mut self, control: QueueItem, deferred: &mut VecDeque<QueuedEvent>) {
+    async fn control(&mut self, control: QueueItem, backlog: &mut VecDeque<QueuedEvent>) {
         match control {
             QueueItem::Drain(reply) => {
-                // The barrier makes earlier events durable now; it never waits
-                // for a live admission to release its optional I/O preference.
+                // The barrier makes earlier events durable now.
                 // Separate channels have no common FIFO. Drain snapshots every
                 // earlier ordinary send into the backlog before its barrier.
                 for _ in 0..super::EVENT_QUEUE_CAPACITY {
                     match self.receiver.try_recv() {
-                        Ok(event) => deferred.push_back(event),
+                        Ok(event) => backlog.push_back(event),
                         Err(_) => break,
                     }
                 }
-                self.flush_all(deferred).await;
+                self.flush_all(backlog).await;
                 let _ = reply.send(());
             }
             QueueItem::Applied {
@@ -183,21 +169,7 @@ impl Worker {
     }
 }
 
-fn take_ready(deferred: &mut VecDeque<QueuedEvent>, force: bool) -> Vec<QueuedEvent> {
-    let mut batch = Vec::new();
-    let mut index = 0;
-    while index < deferred.len() && batch.len() < crate::memory::traits::MESSAGE_EVENT_BATCH_LIMIT {
-        if force
-            || deferred
-                .get(index)
-                .is_some_and(|event| event.deferral.as_ref().is_none_or(|state| state.ready()))
-        {
-            if let Some(event) = deferred.remove(index) {
-                batch.push(event);
-            }
-        } else {
-            index += 1;
-        }
-    }
-    batch
+fn take_batch(backlog: &mut VecDeque<QueuedEvent>) -> Vec<QueuedEvent> {
+    let count = backlog.len().min(crate::memory::traits::MESSAGE_EVENT_BATCH_LIMIT);
+    backlog.drain(..count).collect()
 }

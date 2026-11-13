@@ -3,7 +3,7 @@
 //! Explicit controlled predictions for turn mechanics; registry, gates and bars stay real.
 use super::*;
 use crate::decision::backend::DecisionBackend;
-use crate::decision::factory::{ServedBy, SlotLimits};
+use crate::decision::factory::SlotLimits;
 use crate::decision::outbound::{GuardedBody, OutboundSecrets};
 use crate::decision::protocol::{BackendIdentity, BackendKind, BackendLocality, DecisionResponse};
 use crate::decision::validate::ModelVersionPolicy;
@@ -132,21 +132,6 @@ impl TurnDecisionService {
         Ok(())
     }
 }
-impl TurnDecisionContext {
-    pub(crate) fn ordinary_fixture_prediction_verified(&self) -> bool {
-        self.audit_hops().any(|hop| {
-            hop.prediction.as_ref().is_some_and(|prediction| {
-                prediction.served_by == ServedBy::Primary
-                    && prediction.served.claimed_backend() == "mock"
-                    && prediction
-                        .attempts
-                        .iter()
-                        .any(|attempt| attempt.identity.kind == BackendKind::Mock)
-            })
-        })
-    }
-}
-
 // Positive mechanics fixtures need an actually above-bar prediction. This
 // opt-in never changes the production builtin, policy or admitted references.
 #[derive(Clone, Copy)]
@@ -215,41 +200,4 @@ pub(super) fn wrap_factory(
         SlotLimits::default(),
     )
     .with_events(events)
-}
-
-impl TurnDecisionService {
-    /// A schema-publication witness: discover once, then use an above-bar
-    /// ordinary Answer. This never selects an unapproved Destructive Commit.
-    pub(crate) fn install_ordinary_publication_fixture(
-        service: &mut Arc<Self>,
-        family: &'static str,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(family, "shell" | "native_tool"),
-            "unreviewed publication fixture family"
-        );
-        let owned = Arc::get_mut(service).context("publication fixture already shared")?;
-        anyhow::ensure!(
-            !owned.generation.effective.causal_tree.enabled,
-            "publication fixture must remain disabled"
-        );
-        owned.factory = DecisionBackendFactory::from_slots(
-            vec![Box::new(OrdinaryFixtureBackend {
-                identity: BackendIdentity {
-                    kind: BackendKind::Mock,
-                    provider: None,
-                    configured_model: Arc::from("prx-native-decision"),
-                },
-                key: Arc::clone(&owned.state_key),
-                action: "answer",
-                family: "none",
-                follow_builtin: false,
-                publication_family: Some(family),
-            })],
-            Arc::clone(&owned.state_key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
-        );
-        Ok(())
-    }
 }

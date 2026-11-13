@@ -3,6 +3,7 @@ use super::helpers::{
     blank_comments_and_literals, function_body, is_ident_char, normalize_line, read_source, relative_path,
     repository_root, rust_source_files, strip_cfg_test_items,
 };
+use super::helpers::{braced_block, identifier_count};
 use super::tool_scanner::contains_identifier;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -21,22 +22,6 @@ const TRUST_BEARING_CALLERS: &[&str] = &[
 /// with the file that defines each once.
 const TRUST_BEARING_CONSTRUCTORS: [&str; 3] = ["from_runtime", "from_runtime_records", "recorded_by_runtime"];
 const TRUST_BEARING_DEFINITIONS: &str = "src/causal_tree/state.rs";
-
-/// How often `name` occurs in `text` as a whole identifier.
-pub(super) fn identifier_count(text: &str, name: &str) -> usize {
-    let mut count = 0;
-    let mut search = 0;
-    while let Some(found) = text[search..].find(name) {
-        let start = search + found;
-        search = start + name.len();
-        let before = text[..start].chars().next_back();
-        let after = text[search..].chars().next();
-        if !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char) {
-            count += 1;
-        }
-    }
-    count
-}
 
 /// AG-28 (CDP-PLAN 1.9, scope amended by D-066 N-3 and its amendment).
 /// Trusted and observed state carry authority: a trusted part grants or
@@ -116,26 +101,6 @@ pub(super) fn trust_bearing_turn_state_is_built_only_by_the_turn_decision_servic
         violations.is_empty(),
         "trusted and observed turn state is built only by the turn decision service (AG-28): {violations:?}"
     );
-}
-
-/// The text of the brace-delimited block that opens at the first `{` at or
-/// after `from`, braces included.
-pub(super) fn braced_block(text: &str, from: usize) -> Option<&str> {
-    let open = from + text[from..].find('{')?;
-    let mut depth = 0usize;
-    for (offset, character) in text[open..].char_indices() {
-        match character {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[open..=open + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Every `impl` header in `production` (whitespace-normalized, up to its

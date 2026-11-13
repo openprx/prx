@@ -250,7 +250,7 @@ fn a_symlinked_database_or_side_file_is_refused() {
         let target = temp.path().join("target-file");
         std::fs::write(&target, b"not a database, a file that must stay as it is").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let dir = crate::decision::key::prepare_decision_dir(&temp.path().join("ws")).unwrap();
+        let dir = crate::security::runtime_key::prepare_decision_dir(&temp.path().join("ws")).unwrap();
         std::os::unix::fs::symlink(&target, dir.join(name)).unwrap();
         for mode in [StoreMode::ReadWrite, StoreMode::ReadOnly] {
             let opened = CausalDecisionStore::open(
@@ -321,7 +321,7 @@ async fn a_newer_schema_with_a_live_wal_is_untouched() {
     // connection left open on the copy: a read-write open would
     // checkpoint it on close.
     let copy = tempfile::TempDir::new().unwrap();
-    let copied = crate::decision::key::prepare_decision_dir(copy.path())
+    let copied = crate::security::runtime_key::prepare_decision_dir(copy.path())
         .unwrap()
         .join(DB_FILE);
     {
@@ -355,7 +355,7 @@ fn a_zero_retention_keeps_everything() {
 #[test]
 fn a_taken_quarantine_name_is_never_overwritten() {
     let temp = tempfile::TempDir::new().unwrap();
-    let dir = crate::decision::key::prepare_decision_dir(temp.path()).unwrap();
+    let dir = crate::security::runtime_key::prepare_decision_dir(temp.path()).unwrap();
     let path = dir.join(DB_FILE);
     std::fs::write(&path, b"first garbage").unwrap();
     quarantine_as(&path, "fixed").unwrap();
@@ -372,7 +372,7 @@ fn a_taken_quarantine_name_is_never_overwritten() {
 #[test]
 fn quarantined_files_are_never_overwritten() {
     let temp = tempfile::TempDir::new().unwrap();
-    let dir = crate::decision::key::prepare_decision_dir(temp.path()).unwrap();
+    let dir = crate::security::runtime_key::prepare_decision_dir(temp.path()).unwrap();
     let path = dir.join(DB_FILE);
     for garbage in [b"first garbage".as_slice(), b"second garbage".as_slice()] {
         std::fs::write(&path, garbage).unwrap();

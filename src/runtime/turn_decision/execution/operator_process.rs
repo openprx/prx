@@ -121,7 +121,10 @@ impl TurnDecisionService {
         let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
         let service = Arc::new(Self {
             recovery,
-            advisory_engine: Default::default(),
+            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
+                Arc::clone(&snapshots.generation.effective),
+                None,
+            ),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

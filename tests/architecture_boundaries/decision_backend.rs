@@ -1,4 +1,4 @@
-use super::decision_seals::identifier_count;
+use super::helpers::identifier_count;
 use super::helpers::{
     blank_comments_and_literals, is_ident_char, read_source, relative_path, repository_root, rust_source_files,
     strip_cfg_test_items,

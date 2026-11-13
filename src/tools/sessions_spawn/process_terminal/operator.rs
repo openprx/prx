@@ -132,7 +132,7 @@ pub(in crate::tools::sessions_spawn) async fn verify_startup_failure(
     transport_key: &ring::hmac::Key,
     envelope: &crate::session_worker::startup_failure::WorkerOutput,
 ) -> anyhow::Result<()> {
-    let key = crate::decision::key::DecisionKey::from_worker_channel(
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         transport_key,
         fabric.workspace_id(),
         &worker.run_id,
@@ -190,8 +190,11 @@ pub(super) async fn authenticate_launch(
     worker: &WorkerManifest,
     generation: &crate::config::ConfigGeneration,
     transport_key: &ring::hmac::Key,
-) -> anyhow::Result<(std::sync::Arc<crate::decision::DecisionKey>, CompletionLineage)> {
-    let key = crate::decision::key::DecisionKey::from_worker_channel(
+) -> anyhow::Result<(
+    std::sync::Arc<crate::security::runtime_key::DecisionKey>,
+    CompletionLineage,
+)> {
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         transport_key,
         fabric.workspace_id(),
         &worker.run_id,
@@ -218,7 +221,7 @@ pub(super) async fn authenticate_launch(
 async fn verify_completion(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     result: WorkerResult,
     domain: &[u8],
 ) -> anyhow::Result<VerifiedOperatorWorkerCompletion> {
@@ -236,7 +239,7 @@ async fn verify_completion(
         .context("operator worker completion evidence missing")?;
     anyhow::ensure!(
         key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 domain,
                 lineage.publication_id.as_bytes(),
@@ -420,7 +423,7 @@ pub(crate) async fn recover_completion(
 async fn recover_journal(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    derived_key: &crate::decision::DecisionKey,
+    derived_key: &crate::security::runtime_key::DecisionKey,
 ) -> anyhow::Result<Option<VerifiedOperatorWorkerCompletion>> {
     anyhow::ensure!(lineage.recording_enabled, "operator recovery requires recording");
     let owner = lineage.owner_id.as_deref().context("operator recovery owner missing")?;
@@ -476,7 +479,7 @@ async fn verify_segment_replay(
         .is_null()
     {
         let workspace = std::path::Path::new(fabric.workspace_id());
-        let decision_key = crate::decision::DecisionKey::load_existing(workspace)?;
+        let decision_key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
         let journal = replay_requires_journal(&decision_key, event, None)?;
         let store = (!journal).then(|| CausalDecisionStore::open_unshared_read_only(workspace));
         let reader = store.as_ref().map(|store| store.reader());

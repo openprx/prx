@@ -15,8 +15,8 @@ mod tests;
 
 use crate::acl::approval_grant::{DecisionApprovalBinding, RiskLevel, Subject};
 use crate::causal_tree::store::CausalDecisionStore;
-use crate::decision::DecisionKey;
 use crate::memory::Memory;
+use crate::security::runtime_key::DecisionKey;
 use pending::{PendingRecord, VerifiedPendingDecisionApproval};
 use std::sync::Arc;
 

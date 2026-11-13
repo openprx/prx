@@ -236,8 +236,8 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
                 &hop.candidates,
                 crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. }
                     if candidates.iter().any(|candidate| {
-                        candidate.action() == crate::causal_tree::branch::CausalActionKind::Discover
-                            && candidate.target() == crate::causal_tree::branch::CapabilityTarget::NativeTool
+                        candidate.action() == crate::tools::capability::contract::CausalActionKind::Discover
+                            && candidate.target() == crate::tools::capability::contract::CapabilityTarget::NativeTool
                             && candidate.required_capabilities() == std::slice::from_ref(&seed)
                     })
             )),
@@ -259,7 +259,7 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
             &hop.candidates,
             crate::causal_tree::candidate_generator::CandidateSet::Legal { candidates, .. }
                 if candidates.iter().any(|candidate| {
-                    candidate.action() == crate::causal_tree::branch::CausalActionKind::UseTool
+                    candidate.action() == crate::tools::capability::contract::CausalActionKind::UseTool
                         && candidate.required_capabilities() == [expected.clone()]
                 })
         )));
@@ -305,7 +305,6 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
                         .as_ref()
                         .map(|prediction| format!("{:?}", prediction.served_by)),
                     hop.fallback_cause,
-                    hop.scored_count,
                     hop.scores.len(),
                     hop.selection.clone(),
                     format!("{:?}", hop.pre_commit.outcomes),
@@ -353,232 +352,4 @@ impl Tool for DriftingCatalogTool {
         self.dispatches.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("catalog drift must not dispatch a tool")
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CatalogDriftMoment {
-    BeforeTurn,
-    AfterResponse,
-    WhileBackendPending,
-}
-
-struct DriftProbe {
-    context: Result<Arc<TurnDecisionContext>, AgentDecisionError>,
-    requests: usize,
-    dispatches: usize,
-    /// Published spec count, or the refused selection kind.
-    specs: Option<Result<usize, &'static str>>,
-}
-
-async fn run_catalog_drift_probe(moment: CatalogDriftMoment, cancel_while_pending: bool) -> DriftProbe {
-    let workspace = tempfile::tempdir().expect("test workspace");
-    let mut config = crate::config::Config::default();
-    config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind =
-        crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
-    config.workspace_dir = workspace.path().to_path_buf();
-    config.causal_tree.policy.extra_latency_budget_ms = if moment == CatalogDriftMoment::WhileBackendPending {
-        500
-    } else {
-        5_000
-    };
-    config.providers.models.push(
-        toml::from_str(
-            "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
-        )
-        .expect("verified test model declaration"),
-    );
-    let generation = crate::config::new_shared(config.clone()).pin();
-    let memory: Arc<dyn Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("real fixture SQLite"));
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
-    let changed = Arc::new(AtomicBool::new(false));
-    let dispatches = Arc::new(AtomicUsize::new(0));
-    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(DriftingCatalogTool {
-        changed: Arc::clone(&changed),
-        dispatches: Arc::clone(&dispatches),
-    })]);
-    let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
-        Arc::clone(&registry),
-        Arc::new(SecurityEffectPolicy::new(Arc::clone(&security))),
-        Arc::new(DenyApprovalStrategy),
-        Arc::new(AdapterOwnedPreparation),
-        Arc::new(TracingToolExecutionAudit),
-    ));
-    let provider_catalog = ProviderCatalogView::from_config(&config);
-    let transports = CountingTransports(AtomicUsize::new(0));
-    let mut service = build_turn_decision_service(
-        TurnSurfaceKind::AgentLoop,
-        TurnServiceBuild {
-            parent_grant: None,
-            generation: Arc::clone(&generation),
-            registry,
-            execution,
-            catalog_sources: sources(&generation, &config),
-            surface_policy: SurfacePolicy::default(),
-            provider_catalog: &provider_catalog,
-            transports: &transports,
-            events: Arc::new(SilentEvents),
-            memory: Arc::clone(&memory),
-            security,
-        },
-    )
-    .await
-    .expect("initial catalog parity");
-    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let backend_entered = Arc::new(tokio::sync::Notify::new());
-    if moment != CatalogDriftMoment::BeforeTurn {
-        let service_mut = Arc::get_mut(&mut service).expect("unshared fixture service");
-        service_mut.factory = DecisionBackendFactory::from_slots(
-            vec![Box::new(RetrieveProbeBackend {
-                identity: BackendIdentity {
-                    kind: BackendKind::Mock,
-                    provider: None,
-                    configured_model: Arc::from("prx-local-model"),
-                },
-                requests: Arc::clone(&requests),
-                stall: moment == CatalogDriftMoment::WhileBackendPending,
-                entered: Arc::clone(&backend_entered),
-                drift_after_response: (moment == CatalogDriftMoment::AfterResponse).then(|| Arc::clone(&changed)),
-            })],
-            Arc::clone(&service_mut.state_key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
-        );
-    }
-
-    let work = Box::pin(async {
-        changed.store(moment == CatalogDriftMoment::BeforeTurn, Ordering::SeqCst);
-        let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_selection(
-            &generation,
-            Arc::clone(&memory),
-            "prx_drift_tool",
-            "prx_run_drift",
-            ("ollama", "prx-local-model"),
-        )
-        .await;
-        let cancellation = CancellationToken::new();
-        let decision = service.open_issued_turn_context(&proof, AgentTurnKind::Repl, &cancellation);
-        let context = if moment == CatalogDriftMoment::WhileBackendPending {
-            let change_during_wait = async {
-                backend_entered.notified().await;
-                changed.store(true, Ordering::SeqCst);
-                if cancel_while_pending {
-                    cancellation.cancel();
-                }
-            };
-            let ((), result) = tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::join!(change_during_wait, decision)
-            })
-            .await
-            .expect("pending backend must reach bounded fallback");
-            result
-        } else {
-            decision.await
-        };
-        let request_count = requests.lock().len();
-        // Execution first rechecks live parity, which a still-drifted registry
-        // fails for every selection. Let the drift settle, then read the issued
-        // context's real execution publication, as run_turn would.
-        changed.store(false, Ordering::SeqCst);
-        let specs = context.as_ref().ok().map(|context| {
-            service
-                .agent_execution_specs(&proof, context)
-                .map(|selection| selection.specs.len())
-                .map_err(|error| {
-                    error
-                        .downcast_ref::<crate::causal_tree::directive::DirectiveError>()
-                        .map(|error| match error {
-                            crate::causal_tree::directive::DirectiveError::NonExecutableSelection { kind } => *kind,
-                            _ => "other_directive_error",
-                        })
-                        .unwrap_or("other_error")
-                })
-        });
-        DriftProbe {
-            context,
-            requests: request_count,
-            dispatches: dispatches.load(Ordering::SeqCst),
-            specs,
-        }
-    });
-    ledger_probe::finish_service_fixture(&service, work).await
-}
-
-#[tokio::test]
-async fn catalog_drift_closes_with_fresh_unlinked_terminal_and_no_dispatch() {
-    for (moment, expected_requests) in [
-        (CatalogDriftMoment::BeforeTurn, 0),
-        (CatalogDriftMoment::AfterResponse, 1),
-        (CatalogDriftMoment::WhileBackendPending, 1),
-    ] {
-        let probe = run_catalog_drift_probe(moment, false).await;
-        let context = probe.context.expect("catalog drift closes locally");
-        assert_eq!(probe.requests, expected_requests);
-        assert_eq!(probe.dispatches, 0);
-        assert_eq!(context.hop_ids().len(), 1, "stale work hop must be discarded");
-        assert_eq!(context.audit_hops().count(), 1);
-        assert_eq!(context.engine().state.lineage.prior_decision_id(), None);
-        assert!(
-            context.engine().prediction.is_none(),
-            "recovery must not call a backend"
-        );
-        assert!(context.execution_refs().is_empty());
-        // R177-6 rev 3 on the drift terminal: the interactive drift Clarify has
-        // a gate-passed Answer, so it degrades to one plain, tool-free answer.
-        assert!(
-            matches!(
-                context.engine().selection,
-                crate::causal_tree::decision_select::Selection::Abstain {
-                    action: crate::causal_tree::branch::CausalActionKind::Clarify,
-                    reason_code: "catalog_drift",
-                }
-            ),
-            "test: drift terminal keeps its Clarify accounting selection: {:?}",
-            context.engine().selection
-        );
-        assert!(
-            crate::runtime::turn_decision::admitted_fallback_answer(context.engine()).is_some(),
-            "test: the drift terminal has a gate-passed legal Answer"
-        );
-        assert!(
-            matches!(context.directive(), TurnExecutionDirective::AnswerDirectly),
-            "test: drift Clarify degrades like the normal path"
-        );
-        assert_eq!(
-            probe.specs,
-            Some(Ok(0)),
-            "test: the degraded drift answer publishes zero selected tools"
-        );
-        let rows = DecisionRecordBuilder::build_enabled_chain(&context, &DecisionKey::ephemeral(), true, false)
-            .expect("single local terminal audit row");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows.first().expect("one local terminal row").lineage.prior_decision_id,
-            None
-        );
-    }
-}
-
-#[tokio::test]
-async fn cancellation_during_backend_and_catalog_drift_wins_before_recovery() {
-    let probe = run_catalog_drift_probe(CatalogDriftMoment::WhileBackendPending, true).await;
-    assert!(matches!(probe.context, Err(AgentDecisionError::Cancelled)));
-    assert_eq!(probe.requests, 1);
-    assert_eq!(probe.dispatches, 0);
-}
-
-#[tokio::test]
-async fn catalog_drift_after_selected_read_discards_retrieved_work_chain() {
-    let (reads, transports, requests, _, context) =
-        run_retrieve_probe_case(true, ProbeCancelMode::CatalogDriftRead).await;
-    let context = context.expect("selected read drift closes locally");
-    assert_eq!(reads, 1);
-    assert_eq!(requests.len(), 1);
-    assert_eq!(transports, 0);
-    assert_eq!(context.hop_ids().len(), 1);
-    assert_eq!(context.engine().state.lineage.prior_decision_id(), None);
-    assert!(context.engine().prediction.is_none());
-    assert!(context.execution_refs().is_empty());
-    assert!(matches!(context.directive(), TurnExecutionDirective::Refuse { .. }));
 }

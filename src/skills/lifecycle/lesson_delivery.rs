@@ -3,7 +3,7 @@ use super::experiment::ExperimentRunBinding;
 use super::generation::{StoreLock, ensure_dir_synced};
 use super::store::{check_private, record_bytes};
 use super::{LessonRef, ModelBinding, OwnerScope, PreparedLessonContext, SkillId, SkillLifecycleStore};
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -281,7 +281,7 @@ impl SkillLifecycleStore {
         );
         // The deadline is `logical_clock::now() + elapsed`. Compare on that
         // same clock. With no clock installed, both sides are wall time.
-        let now = || crate::causal_tree::logical_clock::now();
+        let now = || crate::runtime::logical_clock::now();
         ensure!(now() < limits.deadline, "delivery retention work deadline exhausted");
         let dir = self.root().join(DIRECTORY);
         let entries = match fs::read_dir(&dir) {

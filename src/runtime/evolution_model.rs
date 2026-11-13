@@ -37,7 +37,7 @@ pub(crate) struct EvolutionModel {
     provider: Arc<dyn crate::providers::Provider>,
     binding: ModelBinding,
     purpose: EvolutionPurpose,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
 }
 impl EvolutionModel {
     pub(crate) fn from_config(config: &Config, purpose: EvolutionPurpose) -> anyhow::Result<Arc<Self>> {
@@ -64,7 +64,7 @@ impl EvolutionModel {
             "evolution provider has no transport binding"
         );
         Ok(Arc::new(Self {
-            key: crate::decision::DecisionKey::load_or_create(&config.workspace_dir)?,
+            key: crate::security::runtime_key::DecisionKey::load_or_create(&config.workspace_dir)?,
             config: Arc::new(config.clone()),
             provider: Arc::from(provider),
             purpose,
@@ -85,7 +85,7 @@ impl EvolutionModel {
             .as_ref()
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), |value| value.identity.clone());
         let scope_id = key.hmac(
-            crate::decision::KeyDomain::TerminalClaim,
+            crate::security::runtime_key::KeyDomain::TerminalClaim,
             &[
                 b"evolution-model-call-v1",
                 if envelope.is_some() {
@@ -115,7 +115,7 @@ impl EvolutionModel {
         };
         let scope = if let Some(envelope) = envelope {
             let config_pin = key.hmac(
-                crate::decision::KeyDomain::TerminalClaim,
+                crate::security::runtime_key::KeyDomain::TerminalClaim,
                 &[b"experiment-config-v1", &serde_json::to_vec(self.config.as_ref())?],
             );
             envelope.accounting(hex::encode(config_pin), create_scope)?
@@ -164,7 +164,7 @@ impl ProposerModel for EvolutionModel {
 
 struct EvolutionAccounting {
     targets: crate::providers::AccountingTargets,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
     scope: Arc<AccountingScope>,
     provider_label: String,
     purpose: EvolutionPurpose,
@@ -184,7 +184,7 @@ impl AttemptAccounting for EvolutionAccounting {
             .match_request(&request, &self.provider_label)
             .ok_or(AccountingRefusal)?;
         let binding = self.key.hmac(
-            crate::decision::KeyDomain::AttemptAccounting,
+            crate::security::runtime_key::KeyDomain::AttemptAccounting,
             &[
                 b"evolution-physical-chat-v1",
                 self.purpose.label().as_bytes(),

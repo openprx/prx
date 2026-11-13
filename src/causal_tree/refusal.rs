@@ -4,10 +4,11 @@
 //! policy-internal reasons stay on the generic sentence. A new [`RefusalReason`]
 //! variant is a compile error here until it is classified.
 
-use super::branch::{CausalActionKind, CausalCandidate};
+use super::branch::CausalCandidate;
 use super::candidate_generator::CandidateSet;
 use super::decision_engine::EngineDecision;
 use super::gates::GateOutcome;
+use crate::tools::capability::contract::CausalActionKind;
 
 /// User-facing sentence for every refusal. Configuration hints follow it.
 pub(crate) const GENERIC_REFUSAL_REPLY: &str = "I can't complete this request under the current policy.";

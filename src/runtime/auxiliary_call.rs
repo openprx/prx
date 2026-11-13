@@ -204,7 +204,7 @@ pub(crate) struct AuxiliaryAccounting {
     requested: (String, String),
     provider: Arc<dyn crate::providers::Provider>,
     targets: crate::providers::AccountingTargets,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
     scope: Arc<super::decision_accounting::AccountingScope>,
     purpose: AuxiliaryPurpose,
     execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
@@ -215,7 +215,7 @@ impl AuxiliaryAccounting {
         selected: crate::providers::catalog::ResolvedModel,
         requested: (String, String),
         provider: Arc<dyn crate::providers::Provider>,
-        key: Arc<crate::decision::DecisionKey>,
+        key: Arc<crate::security::runtime_key::DecisionKey>,
         scope: Arc<super::decision_accounting::AccountingScope>,
         purpose: AuxiliaryPurpose,
         execution_trace: crate::tools::capability::execution_trace::ExecutionTrace,
@@ -287,7 +287,7 @@ impl crate::providers::attempt_accounting::AttemptAccounting for AuxiliaryAccoun
             .ok_or(AccountingRefusal)?;
         let credential_present = [u8::from(request.credential().is_some())];
         let binding = self.key.hmac(
-            crate::decision::KeyDomain::AttemptAccounting,
+            crate::security::runtime_key::KeyDomain::AttemptAccounting,
             &[
                 b"auxiliary-physical-chat-v1",
                 self.purpose.label().as_bytes(),

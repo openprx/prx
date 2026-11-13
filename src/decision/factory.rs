@@ -45,7 +45,6 @@ use super::breaker::{BreakerState, BreakerTransition, CircuitBreaker};
 use super::builtin::BuiltinDecisionBackend;
 use super::cache::{CacheKey, DecisionCache};
 use super::error::DecisionError;
-use super::key::DecisionKey;
 use super::outbound::{GuardedBody, OutboundSecrets, check_outbound};
 use super::protocol::{
     BackendIdentity, BackendKind, BackendLocality, DecisionQuestion, DecisionRequest, GlobalQuestion, QuestionId,
@@ -56,11 +55,12 @@ use super::telemetry::{
 };
 use super::validate::{DecisionResponseValidator, ModelVersionPolicy, ValidatedDecision, ValidationContext};
 use super::wire::SystemOneCodec;
-use crate::causal_tree::config::{BackendSelection, CausalTreeConfig, CredentialRefSetting};
+use crate::causal_tree::config::{BackendSelection, CredentialRefSetting, DecisionBackendConfig};
 use crate::config::Config;
 use crate::providers::ProviderId;
 use crate::providers::catalog::{CatalogView, ResolutionError, ResolvedModel};
 use crate::providers::credentials::CredentialRef;
+use crate::security::runtime_key::DecisionKey;
 
 /// The shortest attempt worth starting.
 const MIN_ATTEMPT: Duration = Duration::from_millis(20);
@@ -68,9 +68,8 @@ const MIN_ATTEMPT: Duration = Duration::from_millis(20);
 /// Why a configured backend is not in the order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exclusion {
-    /// The decision plane is disabled: nothing leaves PRX.
-    Disabled,
-    /// The advisory engine is off, so no physical backend is constructed.
+    /// The advisory engine is off, so no physical backend is constructed
+    /// and nothing leaves PRX.
     EngineDisabled,
     /// A remote backend while `remote_enabled` is false.
     RemoteDisabled,
@@ -91,7 +90,6 @@ impl Exclusion {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Disabled => "disabled",
             Self::EngineDisabled => "engine_disabled",
             Self::RemoteDisabled => "remote_disabled",
             Self::CircuitOpen => "circuit_open",
@@ -177,10 +175,13 @@ pub struct FactoryDeps<'a> {
 }
 
 impl FactoryDeps<'_> {
-    /// Load the workspace decision key of `config`, or `None` when it is
-    /// unavailable (the cause is logged by the key module, and the plane
-    /// falls back to the builtin). While the plane is disabled the key is
-    /// neither read nor created (D-079 L-14).
+    /// Load the workspace decision key of `config` for the legacy decision
+    /// plane (store, recovery, node ids), or `None` when it is unavailable
+    /// (the cause is logged by the key module). While the plane is disabled
+    /// the key is neither read nor created (D-079 L-14). The advisory engine
+    /// never selects or enables a backend through this switch (R55): its
+    /// factory is built from the effective engine backend with the turn's
+    /// state key.
     #[must_use]
     pub fn load_key(config: &Config) -> Option<Arc<DecisionKey>> {
         if !config.causal_tree.enabled {
@@ -284,39 +285,6 @@ pub struct PredictionResult {
     pub reason: Option<FallbackReason>,
 }
 
-impl PredictionResult {
-    /// True only when every configured backend reached response validation and
-    /// every such response failed it. Transport, service, circuit and budget
-    /// failures keep the deterministic builtin eligible.
-    pub(crate) fn all_configured_attempts_failed_semantic_validation(&self) -> bool {
-        self.reason == Some(FallbackReason::AllFailed)
-            && !self.attempts.is_empty()
-            && self.attempts.iter().all(|attempt| {
-                matches!(
-                    &attempt.outcome,
-                    AttemptOutcome::Failed(error) if error.is_semantic_validation_failure()
-                )
-            })
-    }
-
-    /// The serving result can authorize terminal continuation. A builtin
-    /// shadow remains usable after infrastructure fallback, but not after all
-    /// configured responses failed semantic validation.
-    pub(crate) fn served_attempt_succeeded(&self) -> bool {
-        match self.served_by {
-            ServedBy::Builtin => !self.all_configured_attempts_failed_semantic_validation(),
-            ServedBy::Primary | ServedBy::Fallback => self
-                .attempts
-                .iter()
-                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Served)),
-            ServedBy::Cache => self
-                .attempts
-                .iter()
-                .any(|attempt| matches!(&attempt.outcome, AttemptOutcome::Cached)),
-        }
-    }
-}
-
 impl std::fmt::Debug for PredictionResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PredictionResult")
@@ -391,23 +359,6 @@ pub(crate) struct AccountedPrediction<'a> {
 }
 impl crate::causal_tree::decision_engine::prediction_sealed::Producer for AccountedPrediction<'_> {}
 impl crate::causal_tree::decision_engine::PredictionPort for AccountedPrediction<'_> {
-    fn remaining_budget(&self) -> Option<(u64, u64)> {
-        self.accounting.map(|owner| owner.remaining_budget())
-    }
-    fn terminal_fallback_cause(
-        &self,
-        result: &PredictionResult,
-    ) -> Option<crate::causal_tree::decision_engine::FallbackCause> {
-        use crate::causal_tree::decision_engine::FallbackCause;
-        match result.reason {
-            Some(FallbackReason::AllFailed) if result.all_configured_attempts_failed_semantic_validation() => {
-                Some(FallbackCause::DecisionFailed)
-            }
-            Some(FallbackReason::AllFailed) => None,
-            Some(FallbackReason::DeadlineExhausted) => Some(FallbackCause::DeadlineExceeded),
-            Some(FallbackReason::Disabled | FallbackReason::BudgetUnproven) | None => None,
-        }
-    }
     async fn predict<'a>(
         &'a self,
         request: &'a crate::decision::DecisionRequest,
@@ -479,9 +430,9 @@ impl std::fmt::Debug for DecisionBackendFactory {
 /// none. The one reading of the `kind` setting, shared with the
 /// configuration's risk rule (D-082 N-5).
 #[must_use]
-pub fn configured_kind(section: &CausalTreeConfig) -> Option<BackendKind> {
-    match section.backend.kind {
-        BackendSelection::Auto if section.backend.endpoint.trim().is_empty() => None,
+pub fn configured_kind(backend: &DecisionBackendConfig) -> Option<BackendKind> {
+    match backend.kind {
+        BackendSelection::Auto if backend.endpoint.trim().is_empty() => None,
         BackendSelection::Auto => Some(BackendKind::CompatibleHttp),
         BackendSelection::Fixed(BackendKind::Builtin) => None,
         BackendSelection::Fixed(kind) => Some(kind),
@@ -513,7 +464,7 @@ fn credential_ref_for(setting: &CredentialRefSetting, locality: BackendLocality)
     }
 }
 
-/// The backend a `[causal_tree]` section configures, as the strict
+/// The backend an effective engine backend configures (R55), as the strict
 /// selection sees it; `None` for the builtin, or `auto` without an
 /// endpoint. The factory builds from it and the configuration check
 /// (`config::manage::validate`) checks it, so both read one rule.
@@ -527,17 +478,18 @@ pub struct ConfiguredSelection {
     pub credential: CredentialRef,
 }
 
-/// The configured selection of `section`.
+/// The configured selection of `backend` (the effective engine backend,
+/// `decision_engine::config::effective_engine_backend`, for every engine use).
 #[must_use]
-pub fn configured_selection(section: &CausalTreeConfig) -> Option<ConfiguredSelection> {
-    let kind = configured_kind(section)?;
-    let endpoint = section.backend.endpoint.trim();
+pub fn configured_selection(backend: &DecisionBackendConfig) -> Option<ConfiguredSelection> {
+    let kind = configured_kind(backend)?;
+    let endpoint = backend.endpoint.trim();
     let locality = locality_of(kind, endpoint);
     Some(ConfiguredSelection {
         kind,
         locality,
         provider: provider_of(kind, endpoint),
-        credential: credential_ref_for(&section.backend.credential_ref, locality),
+        credential: credential_ref_for(&backend.credential_ref, locality),
     })
 }
 
@@ -706,18 +658,17 @@ impl DecisionBackendFactory {
         self.prediction_port_calls.load(Ordering::SeqCst)
     }
 
-    /// The backend order for `section` (SP-CDP-A 5.6 under D-040). Pure:
-    /// the same configuration and health always give the same order. The
-    /// builtin is always the last included slot.
+    /// The backend order for `backend` (SP-CDP-A 5.6 under D-040) with the
+    /// engine switch `enabled`. Pure: the same configuration and health always
+    /// give the same order. The builtin is always the last included slot.
     #[must_use]
-    pub fn backend_order(section: &CausalTreeConfig, health: &HealthView) -> Vec<PlannedSlot> {
+    pub fn backend_order(backend: &DecisionBackendConfig, enabled: bool, health: &HealthView) -> Vec<PlannedSlot> {
         let builtin = PlannedSlot {
             kind: BackendKind::Builtin,
             locality: BackendLocality::Builtin,
             exclusion: None,
         };
-        let backend = &section.backend;
-        let Some(kind) = configured_kind(section) else {
+        let Some(kind) = configured_kind(backend) else {
             let mut order = Vec::new();
             if backend.kind == BackendSelection::Auto {
                 order.push(PlannedSlot {
@@ -730,8 +681,8 @@ impl DecisionBackendFactory {
             return order;
         };
         let locality = locality_of(kind, backend.endpoint.trim());
-        let exclusion = if !section.enabled {
-            Some(Exclusion::Disabled)
+        let exclusion = if !enabled {
+            Some(Exclusion::EngineDisabled)
         } else if locality == BackendLocality::Remote && !backend.remote_enabled {
             Some(Exclusion::RemoteDisabled)
         } else if health.key_unavailable {
@@ -753,9 +704,9 @@ impl DecisionBackendFactory {
         ]
     }
 
-    /// Build the factory for `config`'s `[causal_tree]` section.
+    /// Build the factory for `config`'s effective engine backend (R55).
     ///
-    /// Nothing is built for an excluded backend: a disabled plane, a remote
+    /// Nothing is built for an excluded backend: a disabled engine, a remote
     /// backend without `remote_enabled` and an unavailable key never reach
     /// a transport.
     ///
@@ -765,9 +716,10 @@ impl DecisionBackendFactory {
     /// the configured backend, [`FactoryBuildError::Transport`] when it
     /// cannot be built.
     pub fn from_config(config: &Config, deps: FactoryDeps<'_>) -> Result<Self, FactoryBuildError> {
-        let section = &config.causal_tree;
+        let backend = crate::decision_engine::config::effective_engine_backend(config);
+        let enabled = config.decision_engine.enabled;
         #[cfg(any(test, feature = "test-mock"))]
-        if section.backend.kind == BackendSelection::Fixed(BackendKind::Mock) {
+        if backend.kind == BackendSelection::Fixed(BackendKind::Mock) {
             return Err(FactoryBuildError::MockNotConfigurable);
         }
         let health = HealthView {
@@ -776,27 +728,16 @@ impl DecisionBackendFactory {
             unhealthy: false,
         };
         let mut secrets = OutboundSecrets::of_config(config);
-        let backend = &section.backend;
         let endpoint = backend.endpoint.trim();
         // Strict selection of the configured backend at every build, whether
         // or not it takes part (D-040 OQ-A2, D-079 L-5): a configuration that
         // would fail once enabled fails now. It reads local state only.
-        let selected = match configured_selection(section) {
+        let selected = match configured_selection(backend) {
             None => None,
-            // A disabled plane builds no backend. A disabled decision engine
-            // also builds no slot, including public loopback HTTP.
-            // No engine-off slot may resolve a stored credential (D-082 N-9).
-            Some(selection) if !section.enabled => {
-                crate::providers::selection::check_decision_model(
-                    deps.catalog,
-                    &selection.provider,
-                    backend.model.trim(),
-                    &selection.credential,
-                )
-                .map_err(FactoryBuildError::Selection)?;
-                None
-            }
-            Some(selection) if !config.decision_engine.enabled => {
+            // A disabled decision engine builds no slot, including public
+            // loopback HTTP. No engine-off slot may resolve a stored
+            // credential (D-082 N-9).
+            Some(selection) if !enabled => {
                 crate::providers::selection::check_decision_model(
                     deps.catalog,
                     &selection.provider,
@@ -820,7 +761,7 @@ impl DecisionBackendFactory {
         };
         let mut slots = Vec::new();
         let mut excluded = Vec::new();
-        for planned in Self::backend_order(section, &health) {
+        for planned in Self::backend_order(backend, enabled, &health) {
             if planned.kind == BackendKind::Builtin {
                 continue;
             }
@@ -828,19 +769,15 @@ impl DecisionBackendFactory {
                 excluded.push((planned.kind, planned.locality, exclusion));
                 continue;
             }
-            if !config.decision_engine.enabled {
-                excluded.push((planned.kind, planned.locality, Exclusion::EngineDisabled));
-                continue;
-            }
             let (Some(key), Some((provider, resolved))) = (deps.key.clone(), selected.as_ref()) else {
                 excluded.push((planned.kind, planned.locality, Exclusion::KeyUnavailable));
                 continue;
             };
             if let Some(material) = resolved.credential().api_key() {
-                secrets.add("causal_tree.backend.credential_ref", material);
+                secrets.add("decision_engine.backend.credential_ref", material);
             }
             for rotation in resolved.credential().rotation_keys() {
-                secrets.add("causal_tree.backend.credential_ref", rotation);
+                secrets.add("decision_engine.backend.credential_ref", rotation);
             }
             let request_model: Arc<str> = Arc::from(resolved.model());
             let identity = BackendIdentity {
@@ -889,7 +826,7 @@ impl DecisionBackendFactory {
             });
         }
         Ok(Self {
-            enabled: section.enabled,
+            enabled,
             budget_unproven: false,
             events: deps.events,
             slots,
@@ -1157,11 +1094,6 @@ impl DecisionBackendFactory {
                     continue;
                 }
             };
-            #[cfg(test)]
-            let mut material_boundary = crate::causal_tree::decision_engine::original_observation::material::evaluation(
-                request.request_id(),
-                body.bytes(),
-            );
             events.emit(CausalEventKind::PredictionStarted, Emitter::slot_fields(slot));
             // Ordinarily the whole attempt is bounded by the slot timeout or
             // the turn deadline, whichever comes first.
@@ -1206,8 +1138,6 @@ impl DecisionBackendFactory {
                     },
                 )
             });
-            #[cfg(test)]
-            material_boundary.returned();
             let latency = now.elapsed();
             match outcome {
                 Ok(decision) => {
@@ -1412,6 +1342,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+    use crate::causal_tree::config::CausalTreeConfig;
     use crate::decision::mock::{MockDecisionBackend, MockOutcome, MockStep};
     use crate::decision::protocol::{
         DecisionQuestion, DecisionResponse, GlobalQuestion, QuestionId, RequestLimits, RequestParts, StructuredValue,
@@ -1802,7 +1733,7 @@ mod tests {
             let mut section = CausalTreeConfig::default();
             section.enabled = true;
             change(&mut section);
-            DecisionBackendFactory::backend_order(&section, &health)
+            DecisionBackendFactory::backend_order(&section.backend, section.enabled, &health)
                 .into_iter()
                 .map(|slot| (slot.kind, slot.locality, slot.exclusion))
                 .collect::<Vec<_>>()
@@ -1916,7 +1847,7 @@ mod tests {
                 (
                     BackendKind::CompatibleHttp,
                     BackendLocality::Loopback,
-                    Some(Exclusion::Disabled)
+                    Some(Exclusion::EngineDisabled)
                 ),
                 builtin
             ]
@@ -1935,7 +1866,7 @@ mod tests {
         let mut default = Config::default();
         default.workspace_dir = temp.path().to_path_buf();
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
-        disabled.causal_tree.enabled = false;
+        disabled.decision_engine.enabled = false;
         let auto_without_endpoint = config(&temp, |_| {});
         for (config, reason) in [
             (&default, None),
@@ -1973,7 +1904,7 @@ mod tests {
             [(
                 BackendKind::CompatibleHttp,
                 BackendLocality::Loopback,
-                Exclusion::Disabled
+                Exclusion::EngineDisabled
             )]
         );
     }
@@ -2185,7 +2116,8 @@ mod tests {
         section.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
         section.backend.endpoint = LOOPBACK.to_string();
         let order = DecisionBackendFactory::backend_order(
-            &section,
+            &section.backend,
+            section.enabled,
             &HealthView {
                 circuit_open: false,
                 key_unavailable: false,
@@ -2260,7 +2192,7 @@ mod tests {
     fn a_disabled_plane_still_validates_its_backend() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
-        disabled.causal_tree.enabled = false;
+        disabled.decision_engine.enabled = false;
         let transports = CountingTransports::refusing();
         assert!(matches!(
             build(&disabled, &CatalogView::from_config(&disabled), None, &transports),
@@ -2364,7 +2296,7 @@ mod tests {
     fn a_disabled_plane_creates_no_key() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
-        disabled.causal_tree.enabled = false;
+        disabled.decision_engine.enabled = false;
         assert!(FactoryDeps::load_key(&disabled).is_none());
         assert!(!temp.path().join("self").exists(), "no key file was written");
         let enabled = config(&temp, compatible(LOOPBACK, false));
@@ -2646,144 +2578,6 @@ mod tests {
         let question = QuestionId::global(GlobalQuestion::EvidenceSufficient);
         assert_eq!(result.served.answer(&question), result.builtin_shadow.answer(&question));
         assert_eq!(request.state().as_json(), &state_before);
-    }
-
-    #[tokio::test]
-    async fn only_all_semantic_validation_failures_close_the_configured_decision_path() {
-        let temp = tempfile::tempdir().expect("test: temp dir");
-        let key = key(&temp);
-
-        for error in [
-            DecisionError::Transport,
-            DecisionError::Unavailable,
-            DecisionError::BudgetExceeded,
-        ] {
-            let request = request(&key);
-            let (backend, _) = scripted(&key, "fallback", vec![MockStep::now(MockOutcome::Fail(error.clone()))]);
-            let factory = DecisionBackendFactory::from_slots(
-                vec![backend],
-                Arc::clone(&key),
-                OutboundSecrets::default(),
-                SlotLimits::default(),
-            );
-            let result = factory
-                .decide(&request, &CausalLineage::default())
-                .await
-                .expect("builtin fallback");
-            assert_eq!(result.served_by, ServedBy::Builtin);
-            assert!(result.served_attempt_succeeded());
-            assert!(!result.all_configured_attempts_failed_semantic_validation());
-            assert_eq!(
-                crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
-                    &factory.prediction_port(None),
-                    &result,
-                ),
-                None,
-                "{error:?} must fall back to the builtin"
-            );
-        }
-
-        let semantic_request = request(&key);
-        let mut invalid = answer_as(&semantic_request, "semantic");
-        invalid.answers.clear();
-        let (backend, _) = scripted(&key, "semantic", vec![MockStep::now(MockOutcome::Respond(invalid))]);
-        let factory = DecisionBackendFactory::from_slots(
-            vec![backend],
-            Arc::clone(&key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
-        );
-        let result = factory
-            .decide(&semantic_request, &CausalLineage::default())
-            .await
-            .expect("semantic failure record");
-        assert!(result.all_configured_attempts_failed_semantic_validation());
-        assert!(
-            !result.served_attempt_succeeded(),
-            "the builtin shadow cannot turn an all-semantic rejection into a served decision"
-        );
-        assert_eq!(
-            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
-                &factory.prediction_port(None),
-                &result,
-            ),
-            Some(crate::causal_tree::decision_engine::FallbackCause::DecisionFailed)
-        );
-
-        let served_request = request(&key);
-        let (first, _) = scripted(
-            &key,
-            "first",
-            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
-        );
-        let (second, _) = scripted(
-            &key,
-            "second",
-            vec![MockStep::now(MockOutcome::Respond(answer_as(
-                &served_request,
-                "second",
-            )))],
-        );
-        let factory = DecisionBackendFactory::from_slots(
-            vec![first, second],
-            Arc::clone(&key),
-            OutboundSecrets::default(),
-            SlotLimits::default(),
-        );
-        let result = factory
-            .decide(&served_request, &CausalLineage::default())
-            .await
-            .expect("second backend serves");
-        assert_eq!(result.served_by, ServedBy::Fallback);
-        assert!(matches!(
-            &result.attempts[0].outcome,
-            AttemptOutcome::Failed(DecisionError::Transport)
-        ));
-        assert!(matches!(&result.attempts[1].outcome, AttemptOutcome::Served));
-        assert!(result.served_attempt_succeeded());
-        assert_eq!(
-            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
-                &factory.prediction_port(None),
-                &result,
-            ),
-            None
-        );
-
-        let circuit_request = request(&key);
-        let (backend, _) = scripted(
-            &key,
-            "circuit",
-            vec![MockStep::now(MockOutcome::Fail(DecisionError::Transport))],
-        );
-        let factory = DecisionBackendFactory::from_slots(
-            vec![backend],
-            Arc::clone(&key),
-            OutboundSecrets::default(),
-            SlotLimits {
-                failure_threshold: 1,
-                ..SlotLimits::default()
-            },
-        );
-        factory
-            .decide(&circuit_request, &CausalLineage::default())
-            .await
-            .expect("circuit-opening fallback");
-        let result = factory
-            .decide(&circuit_request, &CausalLineage::default())
-            .await
-            .expect("open-circuit fallback");
-        assert!(matches!(
-            &result.attempts[0].outcome,
-            AttemptOutcome::Skipped(DecisionError::CircuitOpen)
-        ));
-        assert!(result.served_attempt_succeeded());
-        assert_eq!(
-            crate::causal_tree::decision_engine::PredictionPort::terminal_fallback_cause(
-                &factory.prediction_port(None),
-                &result,
-            ),
-            None
-        );
     }
 
     /// Invariant 16.2: a request whose state carries a configured secret is

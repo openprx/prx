@@ -530,3 +530,138 @@ impl Tool for CompositionTool {
         })
     }
 }
+
+/// R51: Full autonomy has no permission limits; integrity checks stay, and
+/// Supervised keeps its ACL deny and explicit-grant Ask.
+#[tokio::test]
+async fn full_autonomy_has_no_permission_limits() {
+    let policy = |autonomy: AutonomyLevel| {
+        Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
+            autonomy,
+            // No scope rule admits the sender: an identity-ACL miss.
+            scope_default_allow: false,
+            ..SecurityPolicy::default()
+        })))
+    };
+    let call = |name: &'static str, arguments: serde_json::Value| ToolExecutionCommand::new(name, arguments);
+
+    // ACL-denied sender in Full executes once.
+    let full = fixture();
+    let mut service = full.service("project_tool", vec![], ToolExecutionDecision::Ask, approved(), true);
+    service.policy = policy(AutonomyLevel::Full);
+    service.approval = Arc::new(DenyApprovalStrategy);
+    let outcome = service
+        .execute(call("project_tool", serde_json::json!({"value": 1})), context(), None)
+        .await;
+    assert_eq!(
+        outcome.status,
+        ToolExecutionStatus::Succeeded,
+        "{}",
+        outcome.model_content
+    );
+    assert_eq!(full.calls.load(Ordering::SeqCst), 1);
+
+    // Supervised ACL miss is a Deny.
+    let supervised = fixture();
+    let mut service = supervised.service("project_tool", vec![], ToolExecutionDecision::Ask, approved(), true);
+    service.policy = policy(AutonomyLevel::Supervised);
+    let outcome = service
+        .execute(call("project_tool", serde_json::json!({"value": 1})), context(), None)
+        .await;
+    assert_eq!(outcome.decision, Some(ToolExecutionDecision::Deny));
+    assert_eq!(supervised.calls.load(Ordering::SeqCst), 0);
+
+    // An explicit-grant operation on the controlled H2 ingress: Full executes
+    // once without an Ask; Supervised still asks.
+    for (autonomy, expected_calls) in [(AutonomyLevel::Full, 1), (AutonomyLevel::Supervised, 0)] {
+        let (workspace, fabric, chat_binding, origin) =
+            crate::runtime::h2_entry::recorded_terminal_approval_fixture().await;
+        let record = origin.record();
+        let mut envelope = RuntimeEnvelope::agent(&record.workspace, &record.run)
+            .with_channel("terminal")
+            .with_sender("local-user")
+            .with_owner_id(&record.actor)
+            .with_source_message_event_id(&record.event);
+        envelope.session_key = record.session.clone();
+        let mut context = context();
+        context.envelope = envelope;
+        context.set_h2_origin(Some(origin));
+        let grant = fixture();
+        let mut service = grant.service("skills_manage", vec![], ToolExecutionDecision::Ask, approved(), true);
+        service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
+            autonomy,
+            ..SecurityPolicy::default()
+        })));
+        service.approval = Arc::new(DenyApprovalStrategy);
+        let arguments = serde_json::json!({"value": 1, "action": "lifecycle_publish", "proposal_id": "prop-1"});
+        assert!(crate::security::approval_operation::requires_explicit_grant(
+            "skills_manage",
+            &arguments
+        ));
+        let outcome = service.execute(call("skills_manage", arguments), context, None).await;
+        drop((workspace, fabric, chat_binding));
+        assert_eq!(grant.calls.load(Ordering::SeqCst), expected_calls, "{autonomy:?}");
+        if autonomy == AutonomyLevel::Full {
+            assert_eq!(outcome.decision, Some(ToolExecutionDecision::Allow));
+        } else {
+            assert_eq!(outcome.decision, Some(ToolExecutionDecision::Ask));
+        }
+    }
+
+    // A Full child calls a registered, parity-valid tool outside its manifest.
+    let mut case = admission_matrix::child_fixture::ChildCase::new(&["config_reload"]);
+    case.service.policy = policy(AutonomyLevel::Full);
+    assert_eq!(
+        case.call("file_write", case.context(true, true)).await,
+        ToolExecutionStatus::Succeeded
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+    // Integrity stays: a foreign owner still refuses in Full.
+    let mut foreign_owner = case.context(true, true);
+    foreign_owner.envelope.owner_id = Some("owner-b".into());
+    assert_eq!(
+        case.call("file_write", foreign_owner).await,
+        ToolExecutionStatus::StaleCapability
+    );
+    assert_eq!(case.fixture.calls.load(Ordering::SeqCst), 1);
+
+    // A missing admitted H2 descriptor still refuses in Full (integrity).
+    let (workspace, fabric, chat_binding, origin) =
+        crate::runtime::h2_entry::recorded_terminal_approval_fixture().await;
+    let record = origin.record();
+    let mut envelope = RuntimeEnvelope::agent(&record.workspace, &record.run)
+        .with_channel("terminal")
+        .with_sender("local-user")
+        .with_owner_id(&record.actor)
+        .with_source_message_event_id(&record.event);
+    envelope.session_key = record.session.clone();
+    let mut context = context();
+    context.envelope = envelope;
+    context.set_h2_origin(Some(origin));
+    let stale = fixture();
+    let mut service = stale.service("skills_manage", vec![], ToolExecutionDecision::Allow, approved(), true);
+    service.policy = Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy {
+        autonomy: AutonomyLevel::Full,
+        ..SecurityPolicy::default()
+    })));
+    let outcome = service
+        .execute(
+            call(
+                "skills_manage",
+                serde_json::json!({"value": 1, "action": "lifecycle_experiment_catalog"}),
+            ),
+            context,
+            None,
+        )
+        .await;
+    drop((workspace, fabric, chat_binding));
+    assert_eq!(outcome.status, ToolExecutionStatus::Denied);
+    assert!(
+        outcome
+            .model_content
+            .contains("experiment action has no admitted descriptor"),
+        "{}",
+        outcome.model_content
+    );
+    assert_eq!(stale.calls.load(Ordering::SeqCst), 0);
+}

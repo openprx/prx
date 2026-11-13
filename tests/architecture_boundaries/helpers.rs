@@ -584,3 +584,130 @@ fn module_path_attribute(raw: &[char], masked: &[char], begin: usize, end: usize
 pub(super) fn is_test_code_file(relative: &str, source: &str, test_modules: &BTreeSet<String>) -> bool {
     is_test_only_file(source) || test_modules.contains(relative)
 }
+
+/// How often `name` occurs in `text` as a whole identifier.
+pub(super) fn identifier_count(text: &str, name: &str) -> usize {
+    let mut count = 0;
+    let mut search = 0;
+    while let Some(found) = text[search..].find(name) {
+        let start = search + found;
+        search = start + name.len();
+        let before = text[..start].chars().next_back();
+        let after = text[search..].chars().next();
+        if !before.is_some_and(is_ident_char) && !after.is_some_and(is_ident_char) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The text of the brace-delimited block that opens at the first `{` at or
+/// after `from`, braces included.
+pub(super) fn braced_block(text: &str, from: usize) -> Option<&str> {
+    let open = from + text[from..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, character) in text[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[open..=open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where a crate-rooted path in a causal file starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PathRoot {
+    /// `crate::`, or `super::` in `src/causal_tree/mod.rs`, where it is the
+    /// crate root.
+    Crate,
+    /// `super::super::`: the crate root from a top-level causal file, or the
+    /// causal domain itself from a module nested in one.
+    Relative,
+}
+
+/// Every path a `use` tree or a qualified path names from the crate root,
+/// with its root, and with brace groups expanded: `crate::decision::{A, b::C}`
+/// gives `decision::A` and `decision::b::C`; a glob gives `...::*`. In
+/// `mod.rs`, `super::` is the crate root too (D-066 N-5).
+pub(super) fn crate_rooted_paths(production: &str, is_mod_rs: bool) -> Vec<(PathRoot, String)> {
+    let mut paths = Vec::new();
+    let mut roots = vec![("crate::", PathRoot::Crate), ("super::super::", PathRoot::Relative)];
+    if is_mod_rs {
+        roots.push(("super::", PathRoot::Crate));
+    }
+    for (root, kind) in roots {
+        let mut search = 0;
+        while let Some(found) = production[search..].find(root) {
+            let start = search + found;
+            search = start + root.len();
+            let before = production[..start].chars().next_back();
+            if before.is_some_and(|character| character.is_alphanumeric() || character == '_' || character == ':') {
+                continue;
+            }
+            if root == "super::" && production[search..].starts_with("super::") {
+                continue;
+            }
+            let mut found_paths = Vec::new();
+            use_tree_paths(production, search, "", &mut found_paths);
+            paths.extend(found_paths.into_iter().map(|path| (kind, path)));
+        }
+    }
+    paths
+}
+
+/// The paths of the use tree that starts at byte `at`, each prefixed with
+/// `prefix`; returns where the tree ends.
+fn use_tree_paths(text: &str, at: usize, prefix: &str, paths: &mut Vec<String>) -> usize {
+    let bytes = text.as_bytes();
+    let skip_space = |mut index: usize| {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        index
+    };
+    let mut index = skip_space(at);
+    if index < bytes.len() && bytes[index] == b'{' {
+        index += 1;
+        loop {
+            index = skip_space(index);
+            if index >= bytes.len() {
+                return index;
+            }
+            match bytes[index] {
+                b'}' => return index + 1,
+                b',' => index += 1,
+                _ => {
+                    let end = use_tree_paths(text, index, prefix, paths);
+                    index = end.max(index + 1);
+                }
+            }
+        }
+    }
+    if index < bytes.len() && bytes[index] == b'*' {
+        paths.push(format!("{prefix}*"));
+        return index + 1;
+    }
+    let start = index;
+    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    let segment = &text[start..index];
+    if segment.is_empty() {
+        paths.push(prefix.to_string());
+        return index;
+    }
+    let path = format!("{prefix}{segment}");
+    let after = skip_space(index);
+    if text[after..].starts_with("::") {
+        return use_tree_paths(text, after + 2, &format!("{path}::"), paths);
+    }
+    paths.push(path);
+    index
+}

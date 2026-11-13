@@ -77,7 +77,7 @@ pub(super) async fn recovery_failed_readwrite_open_leaves_drain_unclean() {
     let dir = tempfile::tempdir().expect("test: workspace");
     let workspace = dir.path();
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
-    crate::decision::key::DecisionKey::load_or_create(workspace).expect("test: plane-on key");
+    crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: plane-on key");
     std::fs::create_dir_all(workspace.join("self/causal_tree/decisions.db")).expect("test: block ReadWrite db path");
     let tracker = Arc::new(CleanupTracker::default());
     match tracker.scope(publish_plane_on(workspace, memory)).await {
@@ -128,7 +128,7 @@ pub(super) async fn recovery_store_without_writer_rejoin_fails_closed() {
             .expect("test: assistant lookup"),
         None => None,
     };
-    let key = crate::decision::key::DecisionKey::load_existing(workspace).expect("test: existing key");
+    let key = crate::security::runtime_key::DecisionKey::load_existing(workspace).expect("test: existing key");
     crate::agent::terminal::reseal_payload_for_test(&key, &mut payload, assistant.as_ref())
         .expect("test: reseal pre-journal marker");
     sqlite
@@ -306,7 +306,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
     {
         let dir = tempfile::tempdir().expect("test: workspace");
         let workspace = dir.path();
-        crate::decision::key::DecisionKey::load_or_create(workspace).expect("test: key");
+        crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: key");
         let store = open_private(workspace, events());
         assert_eq!(
             store.writer().expect("test: writer").record_decision(seeded_record(1)),
@@ -345,7 +345,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
     {
         let dir = tempfile::tempdir().expect("test: workspace");
         let workspace = dir.path();
-        crate::decision::key::DecisionKey::load_or_create(workspace).expect("test: key");
+        crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: key");
         let store = open_private(workspace, events());
         assert_eq!(
             store.writer().expect("test: writer").record_decision(seeded_record(1)),
@@ -387,7 +387,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
     {
         let dir = tempfile::tempdir().expect("test: workspace");
         let workspace = dir.path();
-        crate::decision::key::DecisionKey::load_or_create(workspace).expect("test: key");
+        crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: key");
         let writer_store = open_private(workspace, events());
         assert_eq!(
             writer_store

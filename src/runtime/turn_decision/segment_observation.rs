@@ -217,7 +217,7 @@ impl SegmentObservation {
             steps.len() <= MAX_CALLS + MAX_PROVIDER_ATTEMPTS && !self.terminal_event_id.is_empty(),
             "segment observation capacity invalid"
         );
-        let observed = ObservedState::from_runtime_records(steps.clone(), Vec::new(), 0)
+        let observed = ObservedState::from_runtime_records(steps.clone(), 0)
             .with_exact_call_observations(self.exact_call_observations.clone());
         ensure!(
             !cancellation.is_cancelled() && Instant::now() < deadline,
@@ -276,7 +276,7 @@ pub(super) fn initial_observations(
     cancellation: &CancellationToken,
 ) -> Result<ObservedState, AgentDecisionError> {
     observation.map_or_else(
-        || Ok(ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0)),
+        || Ok(ObservedState::from_runtime_records(Vec::new(), 0)),
         |observation| {
             observation
                 .observed(deadline, cancellation)

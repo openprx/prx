@@ -753,24 +753,6 @@ async fn operator_command_binding_cannot_be_reused_as_model_admission() {
         .await;
 }
 
-/// Test-only access to the actual Chat issuer; no raw proof constructor.
-pub(crate) async fn recorded_plan_source(
-    generation: &Arc<ConfigGeneration>,
-    memory: Arc<dyn Memory>,
-    input: &str,
-) -> Arc<ChatTurnBinding> {
-    recorded_approval_source(
-        generation,
-        memory,
-        input,
-        crate::agent::turn_contracts::ChatMode::Plan,
-        "prx_plan_discovery_run",
-        1,
-    )
-    .await
-    .0
-}
-
 /// Actual durable Chat issuance for exact-call approval lifecycle tests.
 /// Mode is captured at ingress; the returned envelope comes from that binding.
 pub(crate) async fn recorded_approval_source(

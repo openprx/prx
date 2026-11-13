@@ -61,7 +61,7 @@ impl AttemptAccounting for SolverAccounting {
             .match_request(&request, &self.label)
             .ok_or(AccountingRefusal)?;
         let binding = self.stage.key.hmac(
-            crate::decision::KeyDomain::AttemptAccounting,
+            crate::security::runtime_key::KeyDomain::AttemptAccounting,
             &[
                 b"experiment-solver-physical-chat-v1",
                 self.stage.binding.experiment_sha256.as_bytes(),

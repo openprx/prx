@@ -50,28 +50,18 @@ async fn decision_reply(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<
 
 #[tokio::test]
 async fn operator_task_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
-    run_operator_case(false, false).await
+    run_operator_case(false).await
 }
 
 #[tokio::test]
 async fn restored_operator_process_direct_admission_keeps_the_ledger_without_prediction_sends() -> anyhow::Result<()> {
-    run_operator_case(true, false).await
-}
-
-#[tokio::test]
-async fn actual_operator_task_decision_accounts_physical_send_and_drains() -> anyhow::Result<()> {
-    run_operator_case(false, true).await
-}
-
-#[tokio::test]
-async fn restored_operator_process_decision_accounts_physical_send_without_os_spawn() -> anyhow::Result<()> {
-    run_operator_case(true, true).await
+    run_operator_case(true).await
 }
 
 // All cases also assert the operator child approval-ledger opt-in (task mode and
 // restored process mode) inside `run_operator_case`.
 
-async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()> {
+async fn run_operator_case(process: bool) -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let cleanup_scope = crate::runtime::turn_cleanup::CleanupScope::new(Some(&owner), CancellationToken::new())?;
@@ -94,15 +84,7 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");
         config.causal_tree.enabled = true;
-        if prediction {
-            config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind =
-                crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
-            config.causal_tree.backend.endpoint = endpoint.clone();
-            config.causal_tree.backend.model = "prx-operator-decision".to_owned();
-        }
-        // Auto without a configured backend stays Direct. Explicit loopback
-        // prediction owns and settles one physical request before fallback.
+        // Auto without a configured backend stays Direct.
         assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
         let priced_provider = format!("custom:{endpoint}");
         config.providers.models.push(serde_json::from_value(json!({
@@ -299,26 +281,13 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
                 );
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
-                    usize::from(prediction),
-                    "only explicit prediction sends to the decision backend"
+                    0,
+                    "a prediction-free opening sends nothing to the decision backend"
                 );
-                if prediction {
-                    assert!(
-                        matches!(
-                            &turn.routing().context.engine().selection,
-                            crate::causal_tree::decision_select::Selection::Abstain {
-                                reason_code: "decision_failed",
-                                ..
-                            }
-                        ),
-                        "test: failed physical prediction is recorded as abstention"
-                    );
-                } else {
-                    assert!(
-                        turn.routing().context.engine().prediction.is_none(),
-                        "test: direct admission has no prediction"
-                    );
-                }
+                assert!(
+                    turn.routing().context.engine().prediction.is_none(),
+                    "test: direct admission has no prediction"
+                );
                 drop(turn);
                 Ok::<_, anyhow::Error>(())
             })
@@ -351,60 +320,13 @@ async fn run_operator_case(process: bool, prediction: bool) -> anyhow::Result<()
             anyhow::ensure!(confirmed, "operator accounting cleanup unconfirmed");
             result?;
             let journal_path = costs_workspace.join("state/costs.reservations.jsonl");
-            if !prediction {
-                assert!(
-                    !journal_path.exists(),
-                    "test: Direct admission invents no reservation journal"
-                );
-                assert!(
-                    !costs_workspace.join("state/costs.jsonl").exists(),
-                    "test: Direct admission invents no cost settlement"
-                );
-                return Ok(());
-            }
-            let journal = std::fs::read_to_string(journal_path)?;
-            let rows: Vec<Value> = journal.lines().map(serde_json::from_str).collect::<Result<_, _>>()?;
-            let matching = |event: &str| {
-                rows.iter()
-                    .filter(|row| row.get("event").and_then(Value::as_str) == Some(event))
-                    .collect::<Vec<_>>()
-            };
-            let reserved = matching("estimated_reserved_v1");
-            let dispatched = matching("dispatched");
-            let settled = matching("estimated_settled_v1");
-            assert_eq!((reserved.len(), dispatched.len(), settled.len()), (1, 1, 1));
-            let attempt = reserved
-                .first()
-                .and_then(|row| row.pointer("/request/reservation/attempt_id"))
-                .and_then(Value::as_str)
-                .context("actual reservation identity missing")?;
-            assert!(attempt.starts_with("decision:"));
-            assert_eq!(
-                dispatched
-                    .first()
-                    .and_then(|row| row.get("attempt_id"))
-                    .and_then(Value::as_str),
-                Some(attempt)
+            assert!(
+                !journal_path.exists(),
+                "test: Direct admission invents no reservation journal"
             );
-            assert_eq!(
-                settled
-                    .first()
-                    .and_then(|row| row.get("attempt_id"))
-                    .and_then(Value::as_str),
-                Some(attempt)
-            );
-            assert_eq!(
-                settled
-                    .first()
-                    .and_then(|row| row.get("actual_tokens"))
-                    .and_then(Value::as_str),
-                Some("30")
-            );
-            assert_eq!(
-                std::fs::read_to_string(costs_workspace.as_path().join("state/costs.jsonl"))?
-                    .lines()
-                    .count(),
-                1
+            assert!(
+                !costs_workspace.join("state/costs.jsonl").exists(),
+                "test: Direct admission invents no cost settlement"
             );
             Ok(())
         }
@@ -492,7 +414,7 @@ async fn restore_operator_process(
     // does not claim outer worker-channel authentication or an OS spawn.
     let channel_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx_operator_process_fixture_channel");
     ProcessSourceLaunch::Operator(Box::new(launch)).bind_worker_manifest(&channel_key, &mut manifest)?;
-    let key = crate::decision::key::DecisionKey::from_worker_channel(
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         &channel_key,
         source.proof().workspace_id(),
         &manifest.run_id,

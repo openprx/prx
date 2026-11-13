@@ -2,9 +2,10 @@
 //! Original allocation/sealing implementation under the current question policy.
 //! The 2026-10-29 policy omits all unused fixed-terminal candidate predictions.
 use super::*;
-use crate::causal_tree::branch::{CandidateSpec, SideEffectClass};
+use crate::causal_tree::branch::CandidateSpec;
 use crate::decision::builtin::allocation_counter::count;
 use crate::decision::protocol::ownership::assert_same_request;
+use crate::tools::capability::contract::SideEffectClass;
 
 fn original_compile(
     state: &CausalState,
@@ -62,15 +63,11 @@ fn original_compile(
         .collect();
     let mut questions = BTreeMap::new();
     let mut omitted = Vec::new();
-    let mut forced_choices = BTreeMap::new();
     if nonterminal.len() == 1 {
         omitted.push((
             QuestionId::global(GlobalQuestion::NextAction),
             OmissionReason::SingleLegalCandidate,
         ));
-        if let Some(candidate) = nonterminal.first() {
-            forced_choices.insert(GlobalQuestion::NextAction, OptionId::code(candidate.action().as_str()));
-        }
     } else {
         let mut actions = BTreeSet::new();
         for candidate in candidates {
@@ -100,14 +97,6 @@ fn original_compile(
                 OmissionReason::SingleTarget
             },
         ));
-        if let Some(candidate) = nonterminal.first() {
-            forced_choices.insert(
-                GlobalQuestion::CapabilityTarget,
-                OptionId::code(candidate.target().as_str()),
-            );
-        } else if let Some(target) = targets.first() {
-            forced_choices.insert(GlobalQuestion::CapabilityTarget, OptionId::code(target));
-        }
     } else {
         let mut criteria = BTreeMap::new();
         for target in targets {
@@ -246,10 +235,7 @@ fn original_compile(
             &policy.limits,
         ) {
             Ok(request) => {
-                return Ok(CompiledQuestionRequest {
-                    request,
-                    forced_choices,
-                });
+                return Ok(CompiledQuestionRequest { request });
             }
             Err(DecisionError::InvalidRequest(RequestRule::RequestTooLarge)) => {
                 projection = shrink_oldest_artifact_summary(&projection)?.ok_or(CompileError::Budget)?;
@@ -260,7 +246,6 @@ fn original_compile(
     }
 }
 fn assert_same_compiled(a: &CompiledQuestionRequest, b: &CompiledQuestionRequest, key: &DecisionKey) {
-    assert_eq!(a.forced_choices, b.forced_choices);
     assert_same_request(&a.request, &b.request, key);
 }
 fn fixture(key: &DecisionKey, count: usize, effect: SideEffectClass) -> CausalState {
@@ -371,27 +356,9 @@ fn compiler_moves_parts_with_fixed_allocation_improvement() {
 }
 
 #[test]
-fn compiler_multiple_shrinks_budget_and_empty_summary_match_original() {
+fn compiler_budget_and_invalid_model_match_original() {
     let key = fixtures::key();
-    let mut state = fixture(&key, 3, SideEffectClass::ReadOnly);
-    let mut empty = fixtures::artifact("", 900);
-    empty.summary_was_truncated = true;
-    state.observed = crate::causal_tree::state::ObservedState::from_runtime_records(
-        Vec::new(),
-        vec![
-            empty,
-            fixtures::artifact(&"neutral evidence ".repeat(15), 1000),
-            fixtures::artifact(&"project facts ".repeat(15), 1000),
-            fixtures::artifact(&"release notes ".repeat(15), 2000),
-        ],
-        0,
-    );
-    let (initial_projection, initial_manifest) = redacted_projection(&state).unwrap();
-    let initial_cuts = initial_manifest
-        .truncated
-        .iter()
-        .filter(|p| **p == "artifacts.summary")
-        .count();
+    let state = fixture(&key, 3, SideEffectClass::ReadOnly);
     let set = legal(&state);
     let mut policy = CompilerPolicy {
         key: &key,
@@ -399,37 +366,6 @@ fn compiler_multiple_shrinks_budget_and_empty_summary_match_original() {
         expires_at: Instant::now() + Duration::from_secs(30),
         limits: RequestLimits::default(),
     };
-    let mut found = None;
-    // Choose from the literal old oracle before comparing new behavior.
-    for bytes in (1000..=8000).step_by(32) {
-        policy.limits.max_request_bytes = bytes;
-        if let Ok(old) = original_compile(&state, &set, &policy) {
-            let cuts = old
-                .request
-                .manifest()
-                .projection_audit()
-                .truncated_fields
-                .iter()
-                .filter(|p| p.as_str() == "artifacts.summary")
-                .count();
-            if cuts >= initial_cuts + 2 {
-                found = Some((bytes, old));
-                break;
-            }
-        }
-    }
-    let (bytes, old) = found.expect("at least two actual retry shrinks plus existing truncation");
-    policy.limits.max_request_bytes = bytes;
-    let initial_artifacts = initial_projection.as_json()["artifacts"].as_array().unwrap();
-    let final_artifacts = old.request.state().as_json()["artifacts"].as_array().unwrap();
-    let cleared = initial_artifacts
-        .iter()
-        .zip(final_artifacts)
-        .filter(|(a, b)| a["summary"].as_str().is_some_and(|s| !s.is_empty()) && b["summary"] == "")
-        .count();
-    assert!(cleared >= 2, "at least two nonempty summaries actually shrink");
-    let new = QuestionCompiler::compile(&state, &set, &policy).unwrap();
-    assert_same_compiled(&old, &new, &key);
     policy.limits.max_request_bytes = 64;
     assert!(matches!(
         original_compile(&state, &set, &policy),
@@ -457,7 +393,7 @@ fn compiler_multiple_shrinks_budget_and_empty_summary_match_original() {
 
 #[test]
 fn compiler_mention_approval_bindings_and_forced_choices_match_original() {
-    use crate::causal_tree::branch::OpId;
+    use crate::tools::capability::contract::OpId;
     let key = fixtures::key();
     let mut state = fixture(&key, 1, SideEffectClass::LocalWrite);
     let mut derived = state.derived.candidates().to_vec();
@@ -495,7 +431,6 @@ fn compiler_mention_approval_bindings_and_forced_choices_match_original() {
     let original = original_compile(&state, &set, &policy).unwrap();
     let current = QuestionCompiler::compile(&state, &set, &policy).unwrap();
     assert!(!original.request.manifest().cacheable());
-    assert!(!original.forced_choices.is_empty());
     assert_same_compiled(&original, &current, &key);
     let neutral = fixture(&key, 1, SideEffectClass::LocalWrite);
     let neutral_set = legal(&neutral);

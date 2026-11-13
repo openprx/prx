@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, SchemaFingerprint};
+use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, SchemaFingerprint};
 
 fn parent(workspace: &std::path::Path) -> (CapabilityConstraints, CapabilityRef, CapabilityRef) {
     let generation = CatalogGeneration([7; 32]);

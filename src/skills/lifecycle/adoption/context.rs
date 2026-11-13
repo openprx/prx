@@ -105,7 +105,7 @@ pub(crate) enum LessonPlacement {
 /// editor factory below may construct it after signed-source revalidation.
 pub(crate) struct PreparedLessonContext {
     #[cfg(test)]
-    clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
+    clock: Option<Arc<crate::runtime::logical_clock::ManualClock>>,
     store: Arc<SkillLifecycleStore>,
     skill_id: SkillId,
     binding: ExperimentRunBinding,
@@ -162,7 +162,7 @@ impl PreparedLessonContext {
             return super::lookup::worker_clock::sync_scope(
                 Some(Arc::clone(clock)),
                 "experiment.handoff-lookup",
-                || crate::causal_tree::logical_clock::sync_scope(Arc::clone(clock), work),
+                || crate::runtime::logical_clock::sync_scope(Arc::clone(clock), work),
             );
         }
         work()
@@ -257,7 +257,7 @@ impl SkillLifecycleStore {
         }
         let prepared = PreparedLessonContext {
             #[cfg(test)]
-            clock: crate::causal_tree::logical_clock::capture(),
+            clock: crate::runtime::logical_clock::capture(),
             store: Arc::clone(self),
             skill_id: plan.spec().pins.skill_id.clone(),
             binding,

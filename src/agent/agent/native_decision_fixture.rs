@@ -16,7 +16,7 @@ pub(crate) const REHEARSAL_TIMEOUT_MS: u32 = 450;
 #[derive(Clone)]
 pub(crate) enum ChildResponseControl {
     WallStall(std::time::Duration),
-    AdvanceClock(Arc<crate::causal_tree::logical_clock::ManualClock>, std::time::Duration),
+    AdvanceClock(Arc<crate::runtime::logical_clock::ManualClock>, std::time::Duration),
 }
 struct State {
     action: &'static str,

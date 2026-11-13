@@ -114,14 +114,14 @@ async fn launch_v3_refuses_missing_parent_row() -> Result<()> {
 /// Replaces one sealed `launch_parent` row so a test can reseal it for another run.
 fn reseal_launch_parent(
     workspace: &std::path::Path,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     key_run: &str,
     launch: &authority_journal::LaunchParentRow,
 ) -> Result<()> {
     // Mirrors the journal's sealing: HMAC over the domain and the payload.
     let payload = serde_json::to_string(launch)?;
     let seal = key.hmac(
-        crate::decision::key::KeyDomain::StateFingerprint,
+        crate::security::runtime_key::KeyDomain::StateFingerprint,
         &[b"child-launch-parent-authority-v1", payload.as_bytes()],
     );
     let entry = serde_json::to_string(&serde_json::json!({ "payload": payload, "seal": seal }))?;
@@ -227,7 +227,7 @@ async fn launch_v3_refuses_launch_parent_sealed_for_another_run() -> Result<()> 
     let tmp = tempfile::tempdir()?;
     with_prepared_worker_manifest(&tmp, "ollama".into(), None, |worker| async move {
         let workspace = std::path::Path::new(&worker.child_source.as_ref().unwrap().parent_constraints.workspace);
-        let key = crate::decision::DecisionKey::load_existing(workspace)?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
         let original =
             authority_journal::read_launch_parent(workspace, &worker.run_id, &key)?.expect("test: launch parent row");
         let mut other_run = original.clone();

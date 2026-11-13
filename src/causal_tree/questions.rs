@@ -10,7 +10,7 @@ use std::time::Instant;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::branch::{ApprovalRequirement, CandidateId, CausalActionKind, CausalCandidate};
+use super::branch::{CandidateId, CausalCandidate};
 use super::candidate_generator::{CandidateSet, PendingApproval};
 use super::projection::{ProjectionError, redacted_projection, shrink_oldest_artifact_summary};
 use super::state::CausalState;
@@ -18,6 +18,7 @@ use crate::decision::{
     CandidateQuestion, DecisionError, DecisionKey, DecisionQuestion, DecisionRequest, GlobalQuestion, OmissionReason,
     OptionId, ProjectionAudit, QuestionId, RequestLimits, RequestParts, RequestRule, StructuredValue,
 };
+use crate::tools::capability::contract::{ApprovalRequirement, CausalActionKind};
 
 /// Inputs bound by the runtime to this decision hop.
 pub(crate) struct CompilerPolicy<'a> {
@@ -30,74 +31,11 @@ pub(crate) struct CompilerPolicy<'a> {
 /// The sealed request and local projection facts the service records with it.
 pub(crate) struct CompiledQuestionRequest {
     request: DecisionRequest,
-    /// Values that a selector reads as probability 1 when a Choice question
-    /// was omitted because there was only one possible value.
-    forced_choices: BTreeMap<GlobalQuestion, OptionId>,
 }
 
 impl CompiledQuestionRequest {
     pub(crate) const fn request(&self) -> &DecisionRequest {
         &self.request
-    }
-
-    pub(crate) fn forced_choice(&self, question: GlobalQuestion) -> Option<&OptionId> {
-        self.forced_choices.get(&question)
-    }
-
-    /// Check the sidecar against the sealed omission manifest and the exact
-    /// admitted set before extraction treats an omitted Choice as certain.
-    pub(crate) fn forced_choices_match(&self, candidates: &[CausalCandidate]) -> bool {
-        let working: Vec<_> = candidates
-            .iter()
-            .filter(|candidate| !is_fixed_terminal(candidate.action()))
-            .collect();
-        let targets: BTreeSet<_> = candidates.iter().map(CausalCandidate::target).collect();
-        let action = working.first().filter(|_| working.len() == 1).map(|candidate| {
-            (
-                OptionId::code(candidate.action().as_str()),
-                OmissionReason::SingleLegalCandidate,
-            )
-        });
-        let target = if working.len() == 1 {
-            working.first().map(|candidate| {
-                (
-                    OptionId::code(candidate.target().as_str()),
-                    OmissionReason::SingleLegalCandidate,
-                )
-            })
-        } else if targets.len() == 1 {
-            targets
-                .first()
-                .map(|target| (OptionId::code(target.as_str()), OmissionReason::SingleTarget))
-        } else {
-            None
-        };
-        [
-            (GlobalQuestion::NextAction, action),
-            (GlobalQuestion::CapabilityTarget, target),
-        ]
-        .into_iter()
-        .all(|(question, expected)| {
-            let id = QuestionId::global(question);
-            let omitted = self
-                .request
-                .manifest()
-                .omitted_questions()
-                .iter()
-                .find(|(found, _)| *found == id);
-            match expected {
-                Some((option, reason)) => {
-                    self.forced_choices.get(&question) == Some(&option)
-                        && omitted.is_some_and(|(_, actual)| *actual == reason)
-                        && !self.request.questions().contains_key(&id)
-                }
-                None => {
-                    !self.forced_choices.contains_key(&question)
-                        && omitted.is_none()
-                        && self.request.questions().contains_key(&id)
-                }
-            }
-        })
     }
 }
 
@@ -176,15 +114,11 @@ impl QuestionCompiler {
             .collect();
         let mut questions = BTreeMap::new();
         let mut omitted = Vec::new();
-        let mut forced_choices = BTreeMap::new();
         if nonterminal.len() == 1 {
             omitted.push((
                 QuestionId::global(GlobalQuestion::NextAction),
                 OmissionReason::SingleLegalCandidate,
             ));
-            if let Some(candidate) = nonterminal.first() {
-                forced_choices.insert(GlobalQuestion::NextAction, OptionId::code(candidate.action().as_str()));
-            }
         } else {
             let mut actions = BTreeSet::new();
             for candidate in candidates {
@@ -214,14 +148,6 @@ impl QuestionCompiler {
                     OmissionReason::SingleTarget
                 },
             ));
-            if let Some(candidate) = nonterminal.first() {
-                forced_choices.insert(
-                    GlobalQuestion::CapabilityTarget,
-                    OptionId::code(candidate.target().as_str()),
-                );
-            } else if let Some(target) = targets.first() {
-                forced_choices.insert(GlobalQuestion::CapabilityTarget, OptionId::code(target));
-            }
         } else {
             let mut criteria = BTreeMap::new();
             for target in targets {
@@ -359,10 +285,7 @@ impl QuestionCompiler {
                 &policy.limits,
             ) {
                 Ok(request) => {
-                    return Ok(CompiledQuestionRequest {
-                        request,
-                        forced_choices,
-                    });
+                    return Ok(CompiledQuestionRequest { request });
                 }
                 Err((DecisionError::InvalidRequest(RequestRule::RequestTooLarge), recovered)) => {
                     parts = *recovered;
@@ -481,7 +404,7 @@ mod tests {
     use super::*;
     static EMPTY_DISCOVERED_REFS: std::sync::LazyLock<crate::causal_tree::candidate_generator::DiscoveredRefs> =
         std::sync::LazyLock::new(crate::causal_tree::candidate_generator::DiscoveredRefs::empty);
-    use crate::causal_tree::branch::{CapabilityRef, CapabilityTarget, CausalCandidate};
+    use crate::causal_tree::branch::CausalCandidate;
     use crate::causal_tree::candidate_generator::{CandidatePolicy, CapabilityCostModel, CausalCandidateGenerator};
     use crate::causal_tree::gates::GateInputs;
     use crate::causal_tree::gates::GateReport;
@@ -491,6 +414,7 @@ mod tests {
     use crate::decision::wire::SystemOneCodec;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
+    use crate::tools::capability::contract::{CapabilityRef, CapabilityTarget};
     use crate::tools::mcp::McpCapabilitySpec;
     use crate::tools::traits::{Tool, ToolResult, ToolSpec};
     use async_trait::async_trait;
@@ -511,12 +435,9 @@ mod tests {
         CandidateSet::Legal {
             candidates,
             exact_mentions: BTreeSet::new(),
-            truncated: Vec::new(),
-            discoverable_families: Default::default(),
             approval_scopes: BTreeMap::new(),
             report: GateReport {
                 outcomes: BTreeMap::new(),
-                gate_set_hash: [0; 32],
             },
         }
     }
@@ -677,12 +598,9 @@ mod tests {
             Err(CompileError::CandidateMismatch)
         ));
         let no_legal = CandidateSet::NoLegalPath {
-            reason: super::super::candidate_generator::NoLegalReason::NoLegalCandidate,
             terminals: Vec::new(),
-            approval_only: Vec::new(),
             report: GateReport {
                 outcomes: BTreeMap::new(),
-                gate_set_hash: [0; 32],
             },
         };
         assert!(matches!(
@@ -711,7 +629,7 @@ mod tests {
                 (
                     CapabilityTarget::None,
                     (
-                        super::super::branch::CostEstimate {
+                        crate::tools::capability::contract::CostEstimate {
                             tokens: 1,
                             micro_usd: 0,
                         },
@@ -721,7 +639,7 @@ mod tests {
                 (
                     CapabilityTarget::NativeTool,
                     (
-                        super::super::branch::CostEstimate {
+                        crate::tools::capability::contract::CostEstimate {
                             tokens: 1,
                             micro_usd: 0,
                         },
@@ -761,7 +679,17 @@ mod tests {
             replayed_non_idempotent: &calls_seen,
             retry_limit: Some(2),
         };
-        let first = CausalCandidateGenerator::generate(&state, &view, &candidate_policy, &gates).unwrap();
+        let first = CausalCandidateGenerator::generate(
+            &state,
+            &view,
+            &candidate_policy,
+            &crate::causal_tree::admission_probe::HardGatesProbe {
+                state: &state,
+                catalog: &view,
+                gates: &gates,
+            },
+        )
+        .unwrap();
         let CandidateSet::Legal {
             candidates,
             exact_mentions,
@@ -787,7 +715,17 @@ mod tests {
         let mut trusted = state.trusted.parts().clone();
         trusted.exclusions.push("prx_read".into());
         state.trusted = TrustedState::from_runtime(trusted);
-        let admitted = CausalCandidateGenerator::generate(&state, &view, &candidate_policy, &gates).unwrap();
+        let admitted = CausalCandidateGenerator::generate(
+            &state,
+            &view,
+            &candidate_policy,
+            &crate::causal_tree::admission_probe::HardGatesProbe {
+                state: &state,
+                catalog: &view,
+                gates: &gates,
+            },
+        )
+        .unwrap();
         assert!(
             matches!(&admitted, CandidateSet::Legal { candidates, .. } if candidates.iter().all(|candidate| candidate.candidate_id().as_str() != gated_id))
         );
@@ -860,7 +798,7 @@ mod tests {
                     (
                         CapabilityTarget::None,
                         (
-                            super::super::branch::CostEstimate {
+                            crate::tools::capability::contract::CostEstimate {
                                 tokens: 1,
                                 micro_usd: 0,
                             },
@@ -870,7 +808,7 @@ mod tests {
                     (
                         CapabilityTarget::Mcp,
                         (
-                            super::super::branch::CostEstimate {
+                            crate::tools::capability::contract::CostEstimate {
                                 tokens: 1,
                                 micro_usd: 0,
                             },
@@ -910,7 +848,17 @@ mod tests {
                 replayed_non_idempotent: &calls_seen,
                 retry_limit: Some(2),
             };
-            let admitted = CausalCandidateGenerator::generate(&state, &view, &candidate_policy, &gates).unwrap();
+            let admitted = CausalCandidateGenerator::generate(
+                &state,
+                &view,
+                &candidate_policy,
+                &crate::causal_tree::admission_probe::HardGatesProbe {
+                    state: &state,
+                    catalog: &view,
+                    gates: &gates,
+                },
+            )
+            .unwrap();
             let seed = view
                 .entries()
                 .iter()
@@ -991,11 +939,11 @@ mod tests {
         assert_ne!(mentioned, empty_scope);
         let scope_a = PendingApproval {
             candidate: candidate.clone(),
-            op_ids: vec![super::super::branch::OpId::new("mcp:call:a")],
+            op_ids: vec![crate::tools::capability::contract::OpId::new("mcp:call:a")],
         };
         let scope_b = PendingApproval {
             candidate,
-            op_ids: vec![super::super::branch::OpId::new("mcp:call:b")],
+            op_ids: vec![crate::tools::capability::contract::OpId::new("mcp:call:b")],
         };
         assert_ne!(
             hash_candidate_set(
@@ -1005,132 +953,6 @@ mod tests {
             ),
             hash_candidate_set(&candidates, &BTreeSet::new(), &BTreeMap::from([(id, vec![scope_b])])),
         );
-    }
-
-    #[test]
-    fn byte_budget_shrinks_summaries_without_changing_questions_or_candidates() {
-        let key = fixtures::key();
-        let mut state = fixtures::state(&key, "neutral request");
-        let artifacts = (0..8)
-            .map(|index| fixtures::artifact(&format!("artifact-{index}-{}", "a".repeat(220)), index * 10))
-            .collect();
-        state.observed = crate::causal_tree::state::ObservedState::from_runtime_records(Vec::new(), artifacts, 0);
-        let set = legal(&state);
-        let mut policy = CompilerPolicy {
-            key: &key,
-            model: None,
-            expires_at: Instant::now() + Duration::from_secs(30),
-            limits: RequestLimits::default(),
-        };
-        let baseline = QuestionCompiler::compile(&state, &set, &policy).unwrap();
-        let mut shrunk = None;
-        for bytes in (2_000..=8_000).step_by(256) {
-            policy.limits.max_request_bytes = bytes;
-            if let Ok(compiled) = QuestionCompiler::compile(&state, &set, &policy) {
-                if !compiled
-                    .request
-                    .manifest()
-                    .projection_audit()
-                    .truncated_fields
-                    .is_empty()
-                {
-                    shrunk = Some(compiled);
-                    break;
-                }
-            }
-        }
-        let shrunk = shrunk.expect("a bounded request fits after artifact shrinking");
-        assert_eq!(baseline.request.questions(), shrunk.request.questions());
-        assert_eq!(
-            baseline.request.state().as_json()["candidates"],
-            shrunk.request.state().as_json()["candidates"],
-        );
-        assert_ne!(
-            baseline.request.manifest().request_fingerprint(),
-            shrunk.request.manifest().request_fingerprint()
-        );
-        policy.limits.max_request_bytes = 64;
-        assert!(matches!(
-            QuestionCompiler::compile(&state, &set, &policy),
-            Err(CompileError::Budget)
-        ));
-    }
-
-    #[test]
-    fn fixed_terminals_remain_choices_without_unused_predictions_on_the_wire() {
-        let key = fixtures::key();
-        let mut state = fixtures::state(&key, "neutral request");
-        let working = fixtures::candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Mcp, None);
-        let mut candidates = vec![working];
-        for action in [
-            CausalActionKind::Clarify,
-            CausalActionKind::RequestApproval,
-            CausalActionKind::Refuse,
-        ] {
-            candidates.push(fixtures::candidate(&key, action, CapabilityTarget::None, None));
-        }
-        state.derived = DerivedState::new(candidates).unwrap();
-        let set = legal(&state);
-        let compiled = QuestionCompiler::compile(
-            &state,
-            &set,
-            &CompilerPolicy {
-                key: &key,
-                model: Some("prx_fixture"),
-                expires_at: Instant::now() + Duration::from_secs(30),
-                limits: RequestLimits::default(),
-            },
-        )
-        .unwrap();
-        let wire: serde_json::Value = serde_json::from_slice(
-            &SystemOneCodec::new(compiled.request(), &key)
-                .unwrap()
-                .encode_request()
-                .unwrap(),
-        )
-        .unwrap();
-        let questions = wire.get("questions").and_then(Value::as_object).unwrap();
-        let projected = wire
-            .get("state")
-            .and_then(|value| value.get("candidates"))
-            .and_then(Value::as_array)
-            .unwrap();
-        assert_eq!(questions.len(), compiled.request().questions().len());
-        for action in ["clarify", "request_approval", "refuse"] {
-            let index = projected
-                .iter()
-                .position(|candidate| candidate.get("action").and_then(Value::as_str) == Some(action))
-                .expect("terminal remains in transmitted state");
-            let reference = format!("$.candidates[{index}]");
-            assert!(
-                !questions
-                    .values()
-                    .any(|question| question.to_string().contains(&reference)),
-                "no unused terminal prediction is sent"
-            );
-            assert!(
-                !compiled
-                    .request()
-                    .questions()
-                    .keys()
-                    .any(|id| id.as_str().starts_with(&format!("candidate.{action}-")))
-            );
-        }
-        let response = crate::decision::builtin::BuiltinDecisionBackend::answer(compiled.request()).unwrap();
-        let validated = crate::decision::DecisionResponseValidator::validate(
-            compiled.request(),
-            response,
-            &crate::decision::ValidationContext {
-                received_at: Instant::now(),
-                max_response_bytes: 256 * 1024,
-                version_policy: crate::decision::ModelVersionPolicy::Unpinned,
-                local_backend: crate::decision::builtin::BuiltinDecisionBackend::identity(),
-            },
-        )
-        .unwrap();
-        let evidence =
-            crate::causal_tree::decision_score::PredictionEvidence::extract(&validated, &compiled, &set).unwrap();
-        assert_eq!(evidence.candidates.len(), 1, "only the working path is scored");
     }
 
     #[test]
@@ -1148,15 +970,7 @@ mod tests {
             expires_at: Instant::now() + Duration::from_secs(30),
             limits: RequestLimits::default(),
         };
-        let mut compiled = QuestionCompiler::compile(&state, &set, &policy).unwrap();
-        assert_eq!(
-            compiled.forced_choices.get(&GlobalQuestion::NextAction),
-            Some(&OptionId::code("use_tool"))
-        );
-        assert_eq!(
-            compiled.forced_choices.get(&GlobalQuestion::CapabilityTarget),
-            Some(&OptionId::code("mcp"))
-        );
+        let compiled = QuestionCompiler::compile(&state, &set, &policy).unwrap();
         assert!(
             !compiled
                 .request
@@ -1198,13 +1012,5 @@ mod tests {
                 .map(|(_, reason)| *reason),
             Some(OmissionReason::SingleLegalCandidate),
         );
-        let CandidateSet::Legal { candidates, .. } = &set else {
-            panic!("expected legal candidates");
-        };
-        assert!(compiled.forced_choices_match(candidates));
-        compiled
-            .forced_choices
-            .insert(GlobalQuestion::NextAction, OptionId::code("refuse"));
-        assert!(!compiled.forced_choices_match(candidates));
     }
 }

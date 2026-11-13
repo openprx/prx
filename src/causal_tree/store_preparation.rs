@@ -25,7 +25,7 @@ pub(crate) async fn open_store(
 }
 
 /// Key creation includes filesystem synchronization, just like store opening.
-pub(crate) async fn load_key(config: crate::config::Config) -> Option<Arc<crate::decision::DecisionKey>> {
+pub(crate) async fn load_key(config: crate::config::Config) -> Option<Arc<crate::security::runtime_key::DecisionKey>> {
     match tokio::task::spawn_blocking(move || crate::decision::factory::FactoryDeps::load_key(&config)).await {
         Ok(key) => key,
         Err(error) => {

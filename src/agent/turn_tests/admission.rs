@@ -172,36 +172,6 @@ impl AdmittedTurn {
         .await
     }
 
-    /// The enabled builtin plane over a registry whose MCP root has already
-    /// discovered its servers; `mcp_snapshot` is that root's published state.
-    pub(crate) async fn with_enabled_builtin_model_and_mcp(
-        config: crate::config::Config,
-        input: &str,
-        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
-        memory: Arc<dyn crate::memory::Memory>,
-        selection: (&str, &str),
-        mcp_snapshot: Vec<crate::tools::mcp::McpCapabilitySpec>,
-    ) -> Self {
-        assert!(
-            config.causal_tree.enabled,
-            "enabled-builtin fixture requires causal tree"
-        );
-        Self::build_mode(
-            config,
-            input,
-            registry,
-            memory,
-            FixtureOrigin::Cli { recorded: true },
-            selection,
-            None,
-            None,
-            None,
-            true,
-            mcp_snapshot,
-        )
-        .await
-    }
-
     pub(crate) async fn with_channel(
         config: crate::config::Config,
         message: crate::channels::traits::ChannelMessage,
@@ -210,27 +180,6 @@ impl AdmittedTurn {
         let memory: Arc<dyn crate::memory::Memory> =
             Arc::new(crate::memory::SqliteMemory::new(&config.workspace_dir).expect("channel fixture memory"));
         Self::with_channel_memory(config, message, registry, memory).await
-    }
-
-    /// Q67 only; PMM operation metadata remains true while serving wire stays original.
-    pub(crate) async fn ordinary_controlled_channel(
-        config: crate::config::Config,
-        message: crate::channels::traits::ChannelMessage,
-        registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
-    ) -> Self {
-        assert!(!config.causal_tree.enabled, "ordinary child fixture starts disabled");
-        let memory: Arc<dyn crate::memory::Memory> =
-            Arc::new(crate::memory::SqliteMemory::new(&config.workspace_dir).expect("ordinary fixture memory"));
-        let input = message.content.clone();
-        Self::build(
-            config,
-            &input,
-            registry,
-            memory,
-            FixtureOrigin::OrdinaryControlledChannel(Box::new(message)),
-            ("ollama", "prx-local-model"),
-        )
-        .await
     }
 
     /// Q67 ordinary-child admission with a caller-owned durable backend.
@@ -407,9 +356,9 @@ impl AdmittedTurn {
         endpoint: &str,
         provider: &dyn crate::providers::Provider,
     ) -> Self {
-        let clock = crate::causal_tree::logical_clock::capture()
-            .unwrap_or_else(crate::causal_tree::logical_clock::ManualClock::new);
-        crate::causal_tree::logical_clock::scope(
+        let clock =
+            crate::runtime::logical_clock::capture().unwrap_or_else(crate::runtime::logical_clock::ManualClock::new);
+        crate::runtime::logical_clock::scope(
             clock,
             Self::configured_mechanics_on_current_clock(config, input, registry, memory, endpoint, provider),
         )
@@ -444,13 +393,10 @@ impl AdmittedTurn {
             Vec::new(),
         )
         .await;
-        // An Answer/Clarify abstention may publish tool-free fallback specs
-        // (R177-6); that is a plain answer, not a reached Execute.
-        if admitted.context.is_plain_answer_abstention()
-            || admitted
-                .service
-                .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
-                .is_err()
+        if admitted
+            .service
+            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+            .is_err()
         {
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine
@@ -478,12 +424,11 @@ impl AdmittedTurn {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
                 engine.selection,
                 engine.fallback_cause,
                 engine.elapsed_ms,
                 engine.request_compiled,
-                engine.scored_count,
                 admitted.context.hop_ids().len(),
                 engine.state.trusted.parts().budgets,
             );
@@ -525,13 +470,10 @@ impl AdmittedTurn {
             Vec::new(),
         )
         .await;
-        // An Answer/Clarify abstention may publish tool-free fallback specs
-        // (R177-6); that is a plain answer, not a reached Execute.
-        if admitted.context.is_plain_answer_abstention()
-            || admitted
-                .service
-                .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
-                .is_err()
+        if admitted
+            .service
+            .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
+            .is_err()
         {
             let engine = admitted.context.engine();
             let blocked: Vec<u8> = engine
@@ -559,12 +501,11 @@ impl AdmittedTurn {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} scored={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
+                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
                 engine.selection,
                 engine.fallback_cause,
                 engine.elapsed_ms,
                 engine.request_compiled,
-                engine.scored_count,
                 admitted.context.hop_ids().len(),
                 engine.state.trusted.parts().budgets,
             );
@@ -1063,14 +1004,6 @@ async fn stalled_mechanics_driver() -> StalledMechanics {
     }
 }
 
-fn panic_text(payload: &dyn std::any::Any) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_string()))
-        .unwrap_or_else(|| "non-string panic".to_string())
-}
-
 #[inline(never)]
 fn boxed_mechanics_work<'a>(
     work: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a,
@@ -1078,59 +1011,8 @@ fn boxed_mechanics_work<'a>(
     Box::pin(work)
 }
 
-/// Old setup (no logical clock): a >250 ms decision-HTTP stall spends the
-/// production extra_latency_budget_ms and the fixture panics at Execute.
-#[tokio::test]
-async fn configured_mechanics_on_wall_clock_expires_when_decision_http_stalls_past_budget() {
-    use futures::FutureExt as _;
-    assert!(
-        !crate::causal_tree::logical_clock::installed(),
-        "BtF control must run on the wall clock"
-    );
-    let fixture = stalled_mechanics_driver().await;
-    let StalledMechanics {
-        _workspace,
-        config,
-        memory,
-        registry,
-        provider,
-        driver,
-        endpoint,
-    } = fixture;
-    driver
-        .run_factory(true, || async move {
-            let cleanup =
-                crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())
-                    .expect("mechanics cleanup owner");
-            cleanup
-                .run(boxed_mechanics_work(async move {
-                    let caught = std::panic::AssertUnwindSafe(AdmittedTurn::configured_mechanics_on_current_clock(
-                        config,
-                        "Use native_probe.",
-                        registry,
-                        memory,
-                        &endpoint,
-                        &provider,
-                    ))
-                    .catch_unwind()
-                    .await;
-                    let message = match caught {
-                        Err(payload) => panic_text(payload.as_ref()),
-                        Ok(_) => panic!("wall-clock stall must miss Execute"),
-                    };
-                    assert!(
-                        message.contains("deadline_exceeded"),
-                        "old path must fail on the production latency budget: {message}"
-                    );
-                    Ok(())
-                }))
-                .await
-                .expect("mechanics cleanup drain");
-        })
-        .await;
-}
-
-/// After the fix, the same stall does not charge logical decision time.
+/// A stalled decision endpoint never delays or blocks turn opening: since R9
+/// the opening sends no prediction, so admission reaches execution.
 #[tokio::test]
 async fn configured_mechanics_reaches_execute_when_decision_http_stalls_past_budget() {
     let fixture = stalled_mechanics_driver().await;

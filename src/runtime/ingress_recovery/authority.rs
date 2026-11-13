@@ -1,9 +1,9 @@
 //! Version-directed authentication: derived slots always follow their capsule.
 use super::IngressRecorder;
 use crate::agent::terminal::TurnTerminalStatus;
-use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule};
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

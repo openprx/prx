@@ -69,11 +69,11 @@ impl TurnDecisionService {
         self.agent_execution_specs(proof, context)?;
         anyhow::ensure!(context.is_run()?, "auxiliary call requires a running decision");
         #[cfg(test)]
-        crate::causal_tree::logical_clock::visit_site("auxiliary_deadline");
+        crate::runtime::logical_clock::visit_site("auxiliary_deadline");
         // Minted from `logical_clock::now()`. `Instant::now()` ignores a logical
         // advance at this site (see the accounted skip test).
         anyhow::ensure!(
-            crate::causal_tree::logical_clock::now() < context.engine.deadline,
+            crate::runtime::logical_clock::now() < context.engine.deadline,
             "auxiliary decision deadline expired"
         );
         let original = self
@@ -162,7 +162,7 @@ impl TurnDecisionService {
         let scope = context.accounting.as_ref().map_or_else(
             || {
                 let scope_id = self.state_key.hmac(
-                    crate::decision::KeyDomain::TerminalClaim,
+                    crate::security::runtime_key::KeyDomain::TerminalClaim,
                     &[
                         b"turn-decision-accounting-v1",
                         proof.workspace_id().as_bytes(),

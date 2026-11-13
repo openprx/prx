@@ -1,8 +1,8 @@
 //! Parent provenance for child issuance, deliberately not a TurnSourceProof.
 use super::{Arc, ChildInputReceipt, Context, MemoryFabric};
 use crate::causal_tree::state::TurnSurfaceKind;
-use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::memory::principal::MemoryWriteContext;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]

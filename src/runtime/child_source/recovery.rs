@@ -6,10 +6,10 @@ use crate::agent::terminal::{
     VerifiedTerminalReplay, read_journal_replay_record_on, verify_terminal_replay_journal_until,
 };
 use crate::causal_tree::store::ChildRecoveryLineage;
-use crate::decision::DecisionKey;
 use crate::memory::ingress_recovery::{IngressRecoveryScope, remaining};
 use crate::memory::{Memory, MessageEvent};
 use crate::runtime::turn_cleanup::CleanupTracker;
+use crate::security::runtime_key::DecisionKey;
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;

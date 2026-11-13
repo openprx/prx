@@ -168,7 +168,7 @@ async fn prepare_recovery(
     generation: &crate::config::ConfigGeneration,
     memory: Arc<dyn Memory>,
     tracker: &Arc<CleanupTracker>,
-    workspace_key: Option<Arc<crate::decision::key::DecisionKey>>,
+    workspace_key: Option<Arc<crate::security::runtime_key::DecisionKey>>,
     advisory: crate::runtime::ingress_recovery::PreparedAdvisory,
 ) -> Arc<RecoveryScope> {
     RecoveryScope::prepare(
@@ -303,7 +303,7 @@ async fn run_matrix_cell(cell: MatrixCell) {
     drop(recorder);
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
     let workspace_key = if plane && recording {
-        Some(crate::decision::key::DecisionKey::load_or_create(&workspace).expect("test: workspace key"))
+        Some(crate::security::runtime_key::DecisionKey::load_or_create(&workspace).expect("test: workspace key"))
     } else {
         None
     };
@@ -634,7 +634,7 @@ pub(super) async fn recovery_legacy_chain_writes_no_attestation() {
     ticket.finish(true);
     drop(recorder);
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-    let key = crate::decision::key::DecisionKey::load_or_create(&workspace).expect("test: workspace key");
+    let key = crate::security::runtime_key::DecisionKey::load_or_create(&workspace).expect("test: workspace key");
     let tracker = Arc::new(CleanupTracker::default());
     let advisory = open_advisory(&generation, Arc::clone(&memory), &tracker).await;
     let recovery = prepare_recovery(&generation, Arc::clone(&memory), &tracker, Some(key), advisory).await;

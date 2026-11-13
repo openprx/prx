@@ -5,8 +5,8 @@
 //! table, and the seal is checked before the payload is interpreted.
 use crate::causal_tree::ids::DecisionId;
 use crate::causal_tree::store::{ChildRecoveryLineage, DecisionRecord, replay_column_names};
-use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::runtime::child_source::completion::ChildOutcomeError;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::session_worker::protocol::WorkerManifest;
 use anyhow::Context;
 use rusqlite::types::Value as SqlValue;

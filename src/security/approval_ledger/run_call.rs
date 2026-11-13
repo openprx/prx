@@ -2,8 +2,8 @@
 use super::keys::{ApprovalAuthority, RunCallAuthority};
 use super::pending::scope_from_source;
 use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, RiskLevel, Subject, WitnessKeyring};
-use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MemoryFabric, MessageEvent};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::execution_binding::{CallDigestSource, admitted_call_digest};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 impl RunCallAuthority {
     pub(crate) fn for_call(
-        capability: &crate::causal_tree::branch::CapabilityRef,
+        capability: &crate::tools::capability::contract::CapabilityRef,
         source: CallDigestSource<'_>,
         arguments: &serde_json::Value,
         operation: &str,
@@ -227,7 +227,7 @@ impl ApprovalLedgerPort<'_> {
     pub(crate) async fn record_pending(
         &self,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
-        capability: &crate::causal_tree::branch::CapabilityRef,
+        capability: &crate::tools::capability::contract::CapabilityRef,
         tool: &str,
         arguments: &serde_json::Value,
     ) -> anyhow::Result<PendingCall> {
@@ -241,7 +241,7 @@ impl ApprovalLedgerPort<'_> {
         entry: &crate::tools::capability::catalog::CapabilityEntry,
         arguments: &serde_json::Value,
     ) -> anyhow::Result<PendingCall> {
-        let capability = crate::causal_tree::branch::CapabilityRef {
+        let capability = crate::tools::capability::contract::CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
             generation: entry.generation,
@@ -253,7 +253,7 @@ impl ApprovalLedgerPort<'_> {
     async fn record_pending_target(
         &self,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
-        capability: &crate::causal_tree::branch::CapabilityRef,
+        capability: &crate::tools::capability::contract::CapabilityRef,
         tool: &str,
         arguments: &serde_json::Value,
         entry: Option<&crate::tools::capability::catalog::CapabilityEntry>,
@@ -294,7 +294,8 @@ impl ApprovalLedgerPort<'_> {
         let (operation, operation_match, risk) = if tool == "mcp_call" {
             let operation = if let Some(entry) = entry.filter(|entry| entry.public_name != "mcp_call") {
                 anyhow::ensure!(
-                    entry.family == crate::causal_tree::branch::CapabilityTarget::Mcp && entry.op_ids.len() == 1,
+                    entry.family == crate::tools::capability::contract::CapabilityTarget::Mcp
+                        && entry.op_ids.len() == 1,
                     "MCP approval target is not pinned"
                 );
                 entry

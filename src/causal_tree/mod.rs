@@ -12,21 +12,18 @@
 
 // Decision state and candidates are independent of the optional model router.
 pub mod admin;
+pub(crate) mod admission_probe;
 pub(crate) mod approval_collection;
 pub mod branch;
 pub(crate) mod candidate_generator;
-pub(crate) mod capability_policy;
 pub mod config;
 pub(crate) mod decision_engine;
-pub(crate) mod decision_rehearsal;
 pub(crate) mod decision_score;
 pub(crate) mod decision_select;
 pub(crate) mod directive;
 pub mod evaluate;
-pub(crate) mod exploration;
 pub(crate) mod gates;
 pub mod ids;
-pub(crate) mod logical_clock;
 pub(crate) mod outcome;
 pub mod projection;
 pub(crate) mod questions;

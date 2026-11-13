@@ -2,7 +2,7 @@
 //! Only the historical-proof owner may mint a verified record. This is not a
 //! publisher, a memory backend or a second accounting ledger.
 use super::context::{LessonCompatibility, LessonRef};
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::generation::ensure_dir_synced;
 use crate::skills::lifecycle::store::check_private;
 use crate::skills::lifecycle::{LifecycleError, OwnerScope, RevisionId, SkillId, SkillLifecycleStore};

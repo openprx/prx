@@ -34,9 +34,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use super::branch::{CausalActionKind, Ns8};
+use super::branch::Ns8;
 use super::state::{CausalState, DerivedCandidate};
 use crate::decision::{DecisionError, StructuredValue};
+use crate::tools::capability::contract::CausalActionKind;
 
 /// Bounds of the state v1 contract (`tests/fixtures/decision/state_v1/SCHEMA.md`).
 const LATEST_USER_TURN_BYTES: usize = 4096;
@@ -44,7 +45,6 @@ const GOAL_BYTES: usize = 1024;
 const ARTIFACT_SUMMARY_CHARS: usize = 256;
 const CANDIDATE_SUMMARY_CHARS: usize = 160;
 const MAX_STEPS: usize = 32;
-const MAX_ARTIFACTS: usize = 16;
 const MAX_FAILED_FINGERPRINTS: usize = 16;
 const MAX_CONSTRAINTS: usize = 32;
 const MAX_CANDIDATES: usize = 64;
@@ -123,29 +123,6 @@ pub(crate) fn redacted_projection(
         .map(|step| json!({"kind": step.kind().as_str(), "status": step.status().as_str()}))
         .collect();
 
-    let artifacts = recent(state.observed.artifacts(), MAX_ARTIFACTS, "artifacts", &mut manifest);
-    let artifacts: Vec<Value> = artifacts
-        .iter()
-        .map(|artifact| {
-            if artifact.summary_was_redacted {
-                manifest.redacted_texts = manifest.redacted_texts.saturating_add(1);
-            }
-            if artifact.summary_was_truncated {
-                manifest.truncated.push("artifacts.summary");
-            }
-            json!({
-                "kind": artifact.kind.as_str(),
-                "age_ms": artifact.age_ms,
-                "summary": project_text(
-                    &artifact.summary,
-                    Bound::Chars(ARTIFACT_SUMMARY_CHARS),
-                    "artifacts.summary",
-                    &mut manifest,
-                ),
-            })
-        })
-        .collect();
-
     // D-061 M-3: the per-candidate `failed_before` flag is what a backend
     // reads; `failed_tool_fingerprints` stays a diagnostic list of the failed
     // candidates' namespaces and marks no candidate by itself.
@@ -215,7 +192,8 @@ pub(crate) fn redacted_projection(
         "goal": goal,
         "has_conversation_history": state.has_conversation_history,
         "completed_steps": completed_steps,
-        "artifacts": artifacts,
+        // No runtime path records an artifact since R9; the state v1 field stays.
+        "artifacts": [],
         "failed_tool_fingerprints": failed_namespaces,
         "retry_count": state.observed.retry_count().min(255),
         "approval_pending": trusted.approval_pending,
@@ -645,20 +623,19 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
-    use std::num::NonZeroU8;
     use std::sync::Arc;
 
     use proptest::prelude::*;
-    use uuid::Uuid;
 
-    use super::super::branch::{CandidateId, CapabilityTarget, CausalActionKind};
-    use super::super::state::fixtures::{artifact, candidate, candidates, derived, executed, key, state};
+    use super::super::branch::CandidateId;
+    use super::super::state::fixtures::{candidate, candidates, derived, executed, key, state};
     use super::super::state::{
-        ConstraintCode, HopLineage, ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus, RawRoutingInput,
+        ConstraintCode, ObservedState, ObservedStep, ObservedStepKind, ObservedStepStatus, RawRoutingInput,
         TrustedState,
     };
     use super::*;
     use crate::decision::builtin::features;
+    use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -667,7 +644,8 @@ mod tests {
 
     #[test]
     fn effective_approval_projection_does_not_change_intrinsic_execution_requirement() {
-        use super::super::branch::{ApprovalRequirement, CandidateSpec, CausalCandidate, SideEffectClass};
+        use super::super::branch::{CandidateSpec, CausalCandidate};
+        use crate::tools::capability::contract::{ApprovalRequirement, SideEffectClass};
         let key = key();
         let mut turn = state(&key, "Native file operation");
         let mut item = candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Filesystem, None);
@@ -787,11 +765,8 @@ mod tests {
         let failed_tool = list[2].candidate.candidate_id().clone();
         assert!(failed_tool.as_str().starts_with("use_tool-mcp-"));
         turn.derived = derived(list);
-        turn.observed = ObservedState::from_runtime_records(
-            vec![executed(ObservedStepStatus::Failed, &failed_tool)],
-            Vec::new(),
-            1,
-        );
+        turn.observed =
+            ObservedState::from_runtime_records(vec![executed(ObservedStepStatus::Failed, &failed_tool)], 1);
         let (value, _) = redacted_projection(&turn).expect("test: projection");
         assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
         let extracted = features::extract(value.as_json());
@@ -888,24 +863,16 @@ mod tests {
         );
     }
 
-    /// R-CDP16 M-2: the hop and the prior decision always agree, so hop 0
-    /// sends a null prior and every later hop a canonical UUID.
+    /// R-CDP16 M-2: the only hop is hop 0, sent with a null prior.
     #[test]
     fn the_hop_and_the_prior_decision_are_projected_together() {
         let key = key();
-        let mut turn = state(&key, "hello");
+        let turn = state(&key, "hello");
         let (first, _) = redacted_projection(&turn).expect("test: first");
         assert_eq!(first.as_json()["hop"], 0);
         assert!(first.as_json()["prior_decision_id"].is_null());
-        let prior = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
-        turn.lineage = HopLineage::After {
-            hop: NonZeroU8::new(3).expect("test: hop"),
-            prior_decision_id: prior,
-        };
-        let (later, _) = redacted_projection(&turn).expect("test: later");
-        assert_eq!(later.as_json()["hop"], 3);
-        assert_eq!(later.as_json()["prior_decision_id"], prior.to_string());
-        assert_eq!(state_v1_violations(later.as_json()), Vec::<String>::new());
+        assert_eq!(first.as_json()["artifacts"], serde_json::json!([]));
+        assert_eq!(state_v1_violations(first.as_json()), Vec::<String>::new());
     }
 
     /// R-CDP16 L-6 and D-066 N-4: an unknown cost or latency is sent as the
@@ -921,8 +888,8 @@ mod tests {
                 super::super::branch::CandidateSpec {
                     namespace: None,
                     required_capabilities: Vec::new(),
-                    side_effect: super::super::branch::SideEffectClass::ReadOnly,
-                    approval: super::super::branch::ApprovalRequirement::None,
+                    side_effect: crate::tools::capability::contract::SideEffectClass::ReadOnly,
+                    approval: crate::tools::capability::contract::ApprovalRequirement::None,
                     estimated_cost: None,
                     estimated_latency_ms: None,
                 },
@@ -1023,7 +990,6 @@ mod tests {
             (0..40)
                 .map(|_| ObservedStep::recorded_by_runtime(ObservedStepKind::Tool, ObservedStepStatus::Ok, None, None))
                 .collect(),
-            Vec::new(),
             0,
         );
         let mut parts = turn.trusted.parts().clone();
@@ -1128,13 +1094,11 @@ mod tests {
 
     prop_compose! {
         /// An arbitrary turn state: candidate lists of 0 to 100 (distinct by
-        /// construction), steps and artifacts of 0 to 100, any hop lineage,
-        /// retries, constraints and budgets, and hostile texts everywhere.
+        /// construction), steps of 0 to 100, retries, constraints and
+        /// budgets, and hostile texts everywhere.
         fn any_state()(
             candidate_shapes in prop::collection::vec((0..ACTIONS.len(), 0..TARGETS.len(), any::<bool>(), any::<bool>()), 0..100),
-            steps in prop::collection::vec((0..4_usize, 0..4_usize, prop::option::of(0..100_usize)), 0..100),
-            artifacts in prop::collection::vec((text(), any::<u64>()), 0..100),
-            hop in prop::option::of((1..=255_u8, any::<u128>())),
+            steps in prop::collection::vec((0..3_usize, 0..4_usize, prop::option::of(0..100_usize)), 0..100),
             retries in any::<u32>(),
             constraints in prop::collection::vec(0..CODES.len(), 0..40),
             budgets in (any::<u64>(), any::<u64>(), any::<u64>()),
@@ -1155,7 +1119,7 @@ mod tests {
                 })
                 .collect();
             let ids: Vec<CandidateId> = list.iter().map(|derived| derived.candidate.candidate_id().clone()).collect();
-            let kinds = [ObservedStepKind::Tool, ObservedStepKind::Provider, ObservedStepKind::Retrieve, ObservedStepKind::Discover];
+            let kinds = [ObservedStepKind::Tool, ObservedStepKind::Provider, ObservedStepKind::Discover];
             let statuses = [ObservedStepStatus::Ok, ObservedStepStatus::Failed, ObservedStepStatus::Denied, ObservedStepStatus::Cancelled];
             let steps: Vec<ObservedStep> = steps
                 .iter()
@@ -1168,15 +1132,10 @@ mod tests {
                     )
                 })
                 .collect();
-            let artifacts = artifacts.iter().map(|(summary, age)| artifact(summary, *age)).collect();
             let mut turn = state(&key, &turn);
             turn.goal = RawRoutingInput::new(goal);
-            turn.observed = ObservedState::from_runtime_records(steps, artifacts, retries);
+            turn.observed = ObservedState::from_runtime_records(steps, retries);
             turn.derived = derived(list);
-            turn.lineage = hop.map_or(HopLineage::First, |(hop, prior)| HopLineage::After {
-                hop: NonZeroU8::new(hop).unwrap_or(NonZeroU8::MIN),
-                prior_decision_id: Uuid::from_u128(prior),
-            });
             let mut parts = turn.trusted.parts().clone();
             parts.constraints = constraints.iter().map(|index| ConstraintCode::new(CODES[*index])).collect();
             parts.budgets.tokens = budgets.0;
@@ -1200,7 +1159,6 @@ mod tests {
             let key = key();
             let mut state = state(&key, &turn);
             state.goal = RawRoutingInput::new(goal.clone());
-            state.observed = ObservedState::from_runtime_records(Vec::new(), vec![artifact(&note, 5)], 0);
             let mut list = candidates(&key);
             list[0].summary = Arc::from(note.as_str());
             state.derived = derived(list);
@@ -1257,7 +1215,7 @@ mod tests {
         let key = key();
         let mut state = state(&key, "");
         state.goal = RawRoutingInput::new(String::new());
-        state.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0);
+        state.observed = ObservedState::from_runtime_records(Vec::new(), 0);
         let mut answer = candidate(&key, CausalActionKind::Answer, CapabilityTarget::None, Some("ns0"));
         answer.summary = Arc::from("");
         answer.available = false;

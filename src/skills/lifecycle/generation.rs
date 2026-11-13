@@ -209,7 +209,7 @@ impl SkillLifecycleStore {
     ) -> Result<StoreLock, LifecycleError> {
         let _ = site;
         #[cfg(test)]
-        if crate::causal_tree::logical_clock::installed() {
+        if crate::runtime::logical_clock::installed() {
             let locks = self.root().join(LOCKS_DIR);
             ensure_dir_synced(self.root(), &locks)?;
             return clock_lock::lock_file(&locks.join(STORE_LOCK), shared, timeout, site)

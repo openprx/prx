@@ -3,7 +3,7 @@ use super::{
     Arc, CatalogView, CuratedModel, DescriptorSource, Dialects, FeatureSet, ModelDescriptor, ModelOperation,
     ProviderId, RouteTarget, Support,
 };
-use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::child::ParentAuthorityId;
 use serde::{Deserialize, Serialize};
 

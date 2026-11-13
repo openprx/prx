@@ -319,7 +319,6 @@ async fn small_native_schema_fixture(excluded: bool) {
                     "candidates":format!("{:?}", hop.candidates),
                     "post_rehearsal":format!("{:?}", hop.post_rehearsal),
                     "pre_commit":format!("{:?}", hop.pre_commit),
-                    "audit":format!("{:?}", hop.audit_trace),
                 })).collect::<Vec<_>>();
                 eprintln!(
                     "actual_small_native_admission={}",
@@ -519,8 +518,8 @@ async fn configured_small_native_schema_fixture() {
                 // the unchanged decision budget uses the fixture's logical clock.
                 let admission = tokio::time::timeout(
                     Duration::from_secs(5),
-                    crate::causal_tree::logical_clock::scope(
-                        crate::causal_tree::logical_clock::ManualClock::new(),
+                    crate::runtime::logical_clock::scope(
+                        crate::runtime::logical_clock::ManualClock::new(),
                         crate::agent::turn_tests::admission::AdmittedTurn::configured_native_schema(
                             admission_config,
                             &history.last().expect("test: current fixture input").content,
@@ -556,7 +555,6 @@ async fn configured_small_native_schema_fixture() {
                     "candidates":format!("{:?}", hop.candidates),
                     "post_rehearsal":format!("{:?}", hop.post_rehearsal),
                     "pre_commit":format!("{:?}", hop.pre_commit),
-                    "audit":format!("{:?}", hop.audit_trace),
                 })).collect::<Vec<_>>();
                     eprintln!(
                         "actual_small_native_admission={}",

@@ -149,7 +149,7 @@ impl SkillsLifecycleService {
         // Verification runs on the blocking pool. Re-enter the test clock there
         // so the snapshot budget does not fall back to wall time.
         #[cfg(test)]
-        let inherited_clock = crate::causal_tree::logical_clock::capture();
+        let inherited_clock = crate::runtime::logical_clock::capture();
         #[cfg(test)]
         let hook_clock = inherited_clock.clone();
         crate::runtime::blocking::spawn_blocking(move || {
@@ -173,7 +173,7 @@ impl SkillsLifecycleService {
                 #[cfg(test)]
                 {
                     if let Some(clock) = inherited_clock {
-                        crate::causal_tree::logical_clock::sync_scope(clock, run)
+                        crate::runtime::logical_clock::sync_scope(clock, run)
                     } else {
                         run()
                     }

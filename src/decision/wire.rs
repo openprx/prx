@@ -32,12 +32,12 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest as _, Sha256};
 
 use super::error::{DecisionError, RequestRule, ValidationRule};
-use super::key::{DecisionKey, KeyDomain};
 use super::protocol::{
     ChoiceAnswer, DecisionAnswer, DecisionQuestion, DecisionRequest, DecisionResponse, DecisionUsage, NoulAnswer,
     Primitive, Probability, QuestionId, ScoreAnswer, StructuredLimits, StructuredValue, write_canonical,
     write_json_string, write_question,
 };
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 
 /// The wire ids of `ids`, in the order given, salted with `key` over
 /// `request_fingerprint`. Two ids that salt to the same wire id are refused

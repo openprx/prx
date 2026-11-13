@@ -1,5 +1,5 @@
 use super::*;
-use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, SchemaFingerprint};
+use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, SchemaFingerprint};
 
 fn parent() -> CapabilityConstraints {
     let key = DecisionKey::ephemeral();

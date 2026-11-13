@@ -5,8 +5,8 @@ use super::{
     RecoveredWorkerUsage, VerifiedOperatorWorkerCompletion, WorkerManifest, authenticate_launch, recover_journal,
     verify_lineage,
 };
-use crate::decision::key::KeyDomain;
 use crate::memory::{MemoryVisibility, MessageEventScope};
+use crate::security::runtime_key::KeyDomain;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -124,7 +124,7 @@ pub(super) struct VerifiedLaunch {
     pub(super) event: MessageEvent,
     pub(super) input: Option<MessageEvent>,
     fields: LaunchFields,
-    key: std::sync::Arc<crate::decision::DecisionKey>,
+    key: std::sync::Arc<crate::security::runtime_key::DecisionKey>,
 }
 
 impl VerifiedLaunch {
@@ -195,7 +195,7 @@ pub(super) async fn read(
     )?;
     let fields = record.fields;
     let transport = crate::tools::sessions_spawn::existing_session_worker_signing_key()?;
-    let key = crate::decision::DecisionKey::from_worker_channel(
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         &transport,
         fabric.workspace_id(),
         run,

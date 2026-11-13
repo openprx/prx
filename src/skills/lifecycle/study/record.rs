@@ -1,7 +1,7 @@
 //! Private authenticated study records under the existing lifecycle store.
 //! No constructor here can admit work, refresh resources or create a grant.
 use super::{StudyPlan, StudyReport, StudyTrialReceipt, digest, require_digest};
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::experiment::{ExperimentId, ExperimentJournal};
 use crate::skills::lifecycle::generation::ensure_dir_synced;
 use crate::skills::lifecycle::store::{MAX_RECORD_BYTES, check_private, read_record, record_bytes};

@@ -30,7 +30,7 @@ impl SkillsLifecycleService {
             journal.plan.spec().owner_scope == *self.owner_scope(),
             "experiment owner mismatch"
         );
-        let key = crate::decision::DecisionKey::load_existing(&config.workspace_dir)?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(&config.workspace_dir)?;
         let mut stages = serde_json::Map::new();
         for stage in &journal.plan.spec().stages {
             let scope = hex::encode(ExperimentStageRuntime::physical_identity(

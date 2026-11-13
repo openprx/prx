@@ -78,7 +78,7 @@ async fn every_auxiliary_purpose_retains_prepared_parameters_after_success_or_fa
                 Some("prx-test-credential"),
             ));
             let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-            let key = crate::decision::DecisionKey::ephemeral();
+            let key = crate::security::runtime_key::DecisionKey::ephemeral();
             let accounting_scope = Arc::new(crate::runtime::decision_accounting::AccountingScope::new(
                 Arc::clone(&config),
                 Arc::clone(&key),

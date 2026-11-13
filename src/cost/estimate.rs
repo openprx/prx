@@ -1,8 +1,8 @@
 //! Pure per-call cost estimation shared by the G6 candidate model and send admission.
 
-use crate::causal_tree::branch::CostEstimate;
 use crate::config::schema::CostConfig;
 use crate::providers::catalog::ResolvedModel;
+use crate::tools::capability::contract::CostEstimate;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Candidate estimate for one schema, with the shared pricing and refusal rules.

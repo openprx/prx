@@ -43,10 +43,10 @@ async fn context_drop_and_denied_pending_remove_every_run_alias() {
 
 #[test]
 fn recursive_allowance_exhausted_refuses_spawn_without_decision_service() -> anyhow::Result<()> {
-    use crate::causal_tree::branch::{
+    use crate::tools::capability::child::{AuthorityEnvelope, ChildCapabilityManifest};
+    use crate::tools::capability::contract::{
         CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, SchemaFingerprint,
     };
-    use crate::tools::capability::child::{AuthorityEnvelope, ChildCapabilityManifest};
     let generation = CatalogGeneration([7; 32]);
     let allowed = ["prx_read", "sessions_spawn"]
         .into_iter()
@@ -70,7 +70,7 @@ fn recursive_allowance_exhausted_refuses_spawn_without_decision_service() -> any
             delegation: None,
         },
         generation,
-        crate::decision::key::DecisionKey::ephemeral(),
+        crate::security::runtime_key::DecisionKey::ephemeral(),
         Arc::new(RecursiveAllowance::new(100_000)),
     );
     let child = ChildCapabilityManifest::derive_strict_subset(&parent.constraints, &[])?;

@@ -3,10 +3,11 @@ use super::{
     BTreeMap, BTreeSet, CapabilityRef, CausalActionKind, GateInputs, Ordering, ToolSpec, TurnDecisionContext,
     TurnDecisionService, TurnSourceProof,
 };
-use crate::causal_tree::branch::{CandidateSpec, CausalCandidate, SideEffectClass};
+use crate::causal_tree::branch::{CandidateSpec, CausalCandidate};
 use crate::causal_tree::candidate_generator::CostEstimateSource;
 use crate::causal_tree::gates::{GateOutcome, HardGates};
 use crate::causal_tree::state::SideEffectMode;
+use crate::tools::capability::contract::SideEffectClass;
 use anyhow::Context;
 
 /// Most discovered tools one turn may declare, counted across every search.

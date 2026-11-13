@@ -157,7 +157,7 @@ mod tests {
         );
     }
 
-    fn request(key: &crate::decision::DecisionKey) -> crate::decision::DecisionRequest {
+    fn request(key: &crate::security::runtime_key::DecisionKey) -> crate::decision::DecisionRequest {
         let mut questions = std::collections::BTreeMap::new();
         questions.insert(
             crate::decision::QuestionId::global(crate::decision::GlobalQuestion::EvidenceSufficient),
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn the_body_id_and_cost_are_read() {
         let temp = tempfile::TempDir::new().unwrap();
-        let key = crate::decision::DecisionKey::load_or_create(temp.path()).unwrap();
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(temp.path()).unwrap();
         let request = request(&key);
         let codec = SystemOneCodec::new(&request, &key).unwrap();
         let sent: serde_json::Value = serde_json::from_slice(&codec.encode_request().unwrap()).unwrap();
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn an_error_only_body_is_a_transport_failure() {
         let temp = tempfile::TempDir::new().unwrap();
-        let key = crate::decision::DecisionKey::load_or_create(temp.path()).unwrap();
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(temp.path()).unwrap();
         let request = request(&key);
         let codec = SystemOneCodec::new(&request, &key).unwrap();
         let only = br#"{"error": {"code": 502, "message": "Provider returned error"}}"#;

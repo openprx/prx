@@ -3512,7 +3512,7 @@
           "default": "127.0.0.1:16831"
         },
         "exposed_tools": {
-          "description": "Tools exposed to external MCP callers.\n\nThe defaults are all read-only. Every external MCP caller runs\nowner-isolated, so only names on the owner-isolation-aware list\n(`crate::causal_tree::capability_policy::OWNER_ISOLATION_AWARE_TOOLS`) can run; any\nother name is not advertised, is refused with HTTP 403, and is warned\nabout at config load. An admissible tool with side effects\n(`memory_forget`, `memory_store`, `document_ingest`) is advertised with its real effect by\n`GET /mcp/v1/tools/list`, and a retry-safe call of it needs an\n`Idempotency-Key`.",
+          "description": "Tools exposed to external MCP callers.\n\nThe defaults are all read-only. Every external MCP caller runs\nowner-isolated, so only names on the owner-isolation-aware list\n(`crate::tools::capability::policy::OWNER_ISOLATION_AWARE_TOOLS`) can run; any\nother name is not advertised, is refused with HTTP 403, and is warned\nabout at config load. An admissible tool with side effects\n(`memory_forget`, `memory_store`, `document_ingest`) is advertised with its real effect by\n`GET /mcp/v1/tools/list`, and a retry-safe call of it needs an\n`Idempotency-Key`.",
           "type": "array",
           "default": [
             "memory_search",

@@ -507,7 +507,7 @@ async fn run_work(
         .run(crate::agent::turn_engine::run_turn(
             &mut history.wire,
             crate::agent::turn_request::TurnRequest {
-                advice: service.analyze_advisory(&decision, cancellation).await,
+                advice: service.advisory().analyze_turn(decision.runtime(), cancellation).await,
                 channel_name: "agent_api",
                 scope: None,
                 mode: crate::agent::turn_contracts::ChatMode::default(),

@@ -409,7 +409,7 @@ fn verify_worker_input(
     );
     anyhow::ensure!(
         parent.key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
                 child.parent_authority_id.to_string().as_bytes(),
@@ -783,7 +783,7 @@ impl IssuedChildGrant {
             .parent
             .bind_process(manifest.parent_authority_id, &constraints.key)?;
         let input_event_mac = constraints.key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
                 manifest.parent_authority_id.to_string().as_bytes(),

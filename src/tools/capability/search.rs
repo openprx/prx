@@ -1,5 +1,5 @@
 use super::catalog::{CapabilityEntry, CatalogView, Exposure};
-use crate::causal_tree::branch::CapabilityTarget;
+use crate::tools::capability::contract::CapabilityTarget;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -51,7 +51,7 @@ fn wait_for_lock(_attempt: i32) -> bool {
         std::thread::sleep(left.min(Duration::from_millis(5)));
         IO_DEADLINE
             .with(Cell::get)
-            .is_some_and(|deadline| crate::causal_tree::logical_clock::deadline_now(deadline) < deadline)
+            .is_some_and(|deadline| crate::runtime::logical_clock::deadline_now(deadline) < deadline)
     })
 }
 
@@ -82,7 +82,7 @@ impl<'a> ConnectionDeadline<'a> {
         }
         guard.connection.progress_handler(
             1_000,
-            Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
+            Some(move || crate::runtime::logical_clock::deadline_now(deadline) >= deadline),
         )?;
         #[cfg(test)]
         if handler_fail_due(HandlerFailStage::AfterProgress) {

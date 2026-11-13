@@ -18,8 +18,8 @@ impl crate::causal_tree::state::model_admission::ModelAdmissionView for ModelAdm
 
 #[cfg(test)]
 use super::catalog::CapabilityEntry;
-use crate::causal_tree::branch::CatalogGeneration;
 use crate::tools::Tool;
+use crate::tools::capability::contract::CatalogGeneration;
 use std::sync::Arc;
 
 #[derive(PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl ModelAdmission {
         model: &str,
         allowlist: &[String],
         policy_version: &str,
-        key: &crate::decision::DecisionKey,
+        key: &crate::security::runtime_key::DecisionKey,
     ) -> Arc<Self> {
         let mut denied = vec![0_u64; catalog.all_entries.len().div_ceil(64)];
         for (word_index, word) in denied.iter_mut().enumerate() {
@@ -80,7 +80,7 @@ impl ModelAdmission {
         }
         let encoded = hash.finish();
         let digest = key.hmac(
-            crate::decision::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[b"model-admission-policy-v1", encoded.as_ref()],
         );
         Arc::new(Self {

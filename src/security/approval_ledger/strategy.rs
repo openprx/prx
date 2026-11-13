@@ -65,7 +65,7 @@ impl ApprovalStrategy for LedgerApprovalStrategy<'_> {
 #[derive(Clone)]
 pub(crate) struct ExecutionApprovalLedger {
     pub(crate) memory: std::sync::Arc<dyn crate::memory::Memory>,
-    pub(crate) state_key: std::sync::Arc<crate::decision::DecisionKey>,
+    pub(crate) state_key: std::sync::Arc<crate::security::runtime_key::DecisionKey>,
     pub(crate) workspace: String,
     pub(crate) catalog: std::sync::Arc<crate::tools::capability::catalog::CapabilityCatalog>,
 }

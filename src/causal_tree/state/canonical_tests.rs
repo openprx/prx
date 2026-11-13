@@ -2,9 +2,9 @@
 #![allow(clippy::expect_used)] // All constructions are private typed fixtures.
 
 use super::*;
-use crate::causal_tree::branch::{
-    CandidateSpec, CapabilityId, CapabilityRef, CapabilityTarget, CausalActionKind, CostEstimate, Ns8,
-    SchemaFingerprint, SideEffectClass,
+use crate::causal_tree::branch::{CandidateSpec, Ns8};
+use crate::tools::capability::contract::{
+    CapabilityId, CapabilityRef, CapabilityTarget, CausalActionKind, CostEstimate, SchemaFingerprint, SideEffectClass,
 };
 
 fn canonical_fixture(key: &DecisionKey, size: u8) -> CausalState {
@@ -142,7 +142,7 @@ fn canonical_bytes_and_keyed_digests_match_independent_owned_oracle() {
         trusted.budgets = TurnBudgets::default();
         trusted.delivery = DeliveryConstraints::default();
         empty.trusted = TrustedState::from_runtime(trusted);
-        empty.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0);
+        empty.observed = ObservedState::from_runtime_records(Vec::new(), 0);
         assert_oracle(&empty, &key);
         for mode in [
             SideEffectMode::ReadOnly,
@@ -171,29 +171,12 @@ fn canonical_bytes_and_keyed_digests_match_independent_owned_oracle() {
                 micro_usd: u64::MAX,
             };
             changed.trusted = TrustedState::from_runtime(trusted);
-            changed.lineage = HopLineage::After {
-                hop: NonZeroU8::new(4).expect("nonzero hop"),
-                prior_decision_id: Uuid::from_u128(7),
-            };
             changed.built_at_ms = u64::MAX;
             changed.observed = ObservedState::from_runtime_records(
                 vec![
-                    fixtures::step(ObservedStepKind::Retrieve, ObservedStepStatus::Failed),
+                    fixtures::step(ObservedStepKind::Discover, ObservedStepStatus::Failed),
                     fixtures::step(ObservedStepKind::Tool, ObservedStepStatus::Denied),
                 ],
-                [
-                    0,
-                    FRESH_ARTIFACT_MS - 1,
-                    FRESH_ARTIFACT_MS,
-                    FRESH_ARTIFACT_MS + 1,
-                    STALE_ARTIFACT_MS - 1,
-                    STALE_ARTIFACT_MS,
-                    STALE_ARTIFACT_MS + 1,
-                    u64::MAX,
-                ]
-                .into_iter()
-                .map(|age| fixtures::artifact("PRX summary\n\u{2603}", age))
-                .collect(),
                 u32::MAX,
             );
             changed.routing_input = RawRoutingInput::new("x".repeat(16384));
@@ -275,7 +258,7 @@ fn canonical_empty_state_matches_independent_lexical_golden() {
     trusted.policy_version = Arc::from("prx_policy");
     trusted.resolved_model = Arc::from("prx_model");
     state.trusted = TrustedState::from_runtime(trusted);
-    state.observed = ObservedState::from_runtime_records(Vec::new(), Vec::new(), 0);
+    state.observed = ObservedState::from_runtime_records(Vec::new(), 0);
     state.routing_input = RawRoutingInput::new("prx_input".to_owned());
     state.goal = RawRoutingInput::new("prx_goal".to_owned());
     state.built_at_ms = 0;
@@ -318,7 +301,6 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
     for kind in [
         ObservedStepKind::Tool,
         ObservedStepKind::Provider,
-        ObservedStepKind::Retrieve,
         ObservedStepKind::Discover,
     ] {
         for status in [
@@ -336,19 +318,7 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
             steps.push(ObservedStep::recorded_by_runtime(kind, status, None, None));
         }
     }
-    let mut artifacts = Vec::new();
-    for kind in [
-        ObservedArtifactKind::Memory,
-        ObservedArtifactKind::Document,
-        ObservedArtifactKind::Session,
-    ] {
-        let mut artifact = fixtures::artifact("PRX summary\u{0000}\t\r\u{001f}", STALE_ARTIFACT_MS);
-        artifact.kind = kind;
-        artifacts.push(artifact.clone());
-        artifact.source_event_id = None;
-        artifacts.push(artifact);
-    }
-    state.observed = ObservedState::from_runtime_records(steps, artifacts, 7);
+    state.observed = ObservedState::from_runtime_records(steps, 7);
     assert_oracle(&state, &key);
     let mut reversed_steps = state.clone();
     reversed_steps.observed.completed_steps.reverse();
@@ -356,15 +326,6 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
     assert_ne!(
         state.canonical(false).expect("test: canonical state serializes"),
         reversed_steps
-            .canonical(false)
-            .expect("test: canonical state serializes")
-    );
-    let mut reversed_artifacts = state.clone();
-    reversed_artifacts.observed.artifacts.reverse();
-    assert_oracle(&reversed_artifacts, &key);
-    assert_ne!(
-        state.canonical(false).expect("test: canonical state serializes"),
-        reversed_artifacts
             .canonical(false)
             .expect("test: canonical state serializes")
     );
@@ -409,11 +370,6 @@ fn canonical_preserves_observation_and_capability_sequence_order() {
         .completed_steps
         .iter_mut()
         .for_each(|step| step.event_id = None);
-    record_only
-        .observed
-        .artifacts
-        .iter_mut()
-        .for_each(|artifact| artifact.source_event_id = None);
     assert_oracle(&record_only, &key);
     assert_eq!(
         state.canonical(false).expect("test: canonical state serializes"),
@@ -452,11 +408,7 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
                 step.status().as_str(),
                 step.candidate().map(CandidateId::as_str),
             ])).collect::<Vec<_>>(),
-            "artifacts": state.observed.artifacts().iter().map(|artifact| json!([
-                artifact.kind.as_str(),
-                artifact_age_class(artifact.age_ms),
-                artifact.summary,
-            ])).collect::<Vec<_>>(),
+            "artifacts": [],
             "retry_count": state.observed.retry_count(),
         },
         "derived": state.derived_sorted().map(|derived| {
@@ -502,8 +454,8 @@ fn legacy_canonical(state: &CausalState, record: bool) -> String {
             "hop": state.lineage.hop(),
             "prior_decision_id": state.lineage.prior_decision_id().map(|id| id.to_string()),
             "step_event_ids": state.observed.completed_steps().iter().map(|step| text(step.event_id())).collect::<Vec<_>>(),
-            "artifact_ages_ms": state.observed.artifacts().iter().map(|artifact| artifact.age_ms).collect::<Vec<_>>(),
-            "artifact_event_ids": state.observed.artifacts().iter().map(|artifact| text(&artifact.source_event_id)).collect::<Vec<_>>(),
+            "artifact_ages_ms": [],
+            "artifact_event_ids": [],
             "built_at_ms": state.built_at_ms,
         });
         object.insert("record".to_string(), record);
@@ -520,7 +472,7 @@ fn legacy_sorted_set<'a>(items: impl Iterator<Item = &'a str>) -> Vec<String> {
 }
 
 #[test]
-fn canonical_distinguishes_mixed_delivery_empty_optionals_and_maximum_hop() {
+fn canonical_distinguishes_mixed_delivery_and_empty_optionals() {
     let key = fixtures::key();
     let state = canonical_fixture(&key, 3);
     for flags in 0_u8..8 {
@@ -539,10 +491,6 @@ fn canonical_distinguishes_mixed_delivery_empty_optionals_and_maximum_hop() {
         trusted.source_event_id = Some(Arc::from(""));
         trusted.causation_event_id = Some(Arc::from(""));
         changed.trusted = TrustedState::from_runtime(trusted);
-        changed.lineage = HopLineage::After {
-            hop: NonZeroU8::new(u8::MAX).expect("maximum nonzero hop"),
-            prior_decision_id: Uuid::from_u128(u128::MAX),
-        };
         assert_oracle(&changed, &key);
         let mut absent = changed.clone();
         let mut trusted = absent.trusted.parts().clone();

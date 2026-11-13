@@ -183,7 +183,6 @@ mod tests {
             state
                 .record_fingerprint(&key)
                 .expect("test: canonical state serializes"),
-            state.evidence_fingerprint(&key),
         ];
         let mut changed = facts;
         changed.calls.first_mut().expect("actual fact").fingerprint = [8; 32];
@@ -202,10 +201,6 @@ mod tests {
                 .record_fingerprint(&key)
                 .expect("test: canonical state serializes"),
             before.get(1).expect("record").as_str()
-        );
-        assert_ne!(
-            state.evidence_fingerprint(&key),
-            before.get(2).expect("evidence").as_str()
         );
     }
 }

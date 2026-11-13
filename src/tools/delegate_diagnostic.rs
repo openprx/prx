@@ -200,22 +200,8 @@ pub(super) fn admission(
                 CandidateSet::NoLegalPath { terminals, report, .. } => ("no_legal_path", terminals, report),
             };
             anyhow::ensure!(candidates.len() <= 128, "candidate diagnostic bound");
-            let selection = match &hop.selection {
-                Selection::Commit { candidate_id, .. } => {
-                    json!({"kind":"commit","action":candidate_id.action().as_str()})
-                }
-                Selection::Recover {
-                    candidate_id,
-                    reason_code,
-                } => json!({"kind":"recover","action":candidate_id.action().as_str(),"reason":code(reason_code)?}),
-                Selection::RequestApproval { reason_code, .. } => {
-                    json!({"kind":"request_approval","reason":code(reason_code)?})
-                }
-
-                Selection::Abstain { action, reason_code } => {
-                    json!({"kind":"abstain","action":action.as_str(),"reason":code(reason_code)?})
-                }
-            };
+            let Selection::Commit { candidate_id, .. } = &hop.selection;
+            let selection = json!({"kind":"commit","action":candidate_id.action().as_str()});
             let prediction = if let Some(prediction) = &hop.prediction {
                 anyhow::ensure!(prediction.attempts.len() <= 32, "prediction diagnostic bound");
                 use crate::decision::factory::{AttemptOutcome, FallbackReason, ServedBy};
@@ -249,7 +235,7 @@ pub(super) fn admission(
                 json!({"ordinal_in_candidates":ordinal,"action":candidate.action().as_str(),"required_capability_count":candidate.required_capabilities().len()})).collect();
             hops.push(json!({"ordinal":hops.len(),"candidate_set":kind,"candidates":actions,
                 "selection":selection,"prediction":prediction,"request_compiled":hop.request_compiled,
-                "scored_count":hop.scored_count,"pre_prediction":gates(pre)?,
+                "pre_prediction":gates(pre)?,
                 "post_rehearsal":gates(&hop.post_rehearsal)?,"pre_commit":gates(&hop.pre_commit)?}));
         }
         Ok(json!({"stage":"admission_returned","hops":hops,

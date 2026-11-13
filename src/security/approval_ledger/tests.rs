@@ -94,8 +94,8 @@ use super::resolution::ResumeClaimScope;
 use super::{ApprovalLedger, ApprovalRuntime, GrantScope};
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding, RiskLevel, Subject, WitnessKeyring};
 use crate::causal_tree::store::{CausalDecisionStore, DecisionScope, Retention, StoreMode};
-use crate::decision::{DecisionKey, KeyDomain};
 use crate::memory::{Memory, MemoryFabric, MemoryVisibility, MessageEventScope, SqliteMemory};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use std::sync::Arc;
 
 // This port isolates ledger persistence; runtime admission is outside this test scope.
@@ -841,8 +841,8 @@ async fn corrupt_run_keyed_review_is_skipped() {
     assert!(page.next_cursor.is_none());
 }
 
-fn call_capability() -> crate::causal_tree::branch::CapabilityRef {
-    use crate::causal_tree::branch::*;
+fn call_capability() -> crate::tools::capability::contract::CapabilityRef {
+    use crate::tools::capability::contract::*;
     CapabilityRef {
         id: CapabilityId::new(CapabilityTarget::NativeTool, "prx", "memory_reindex").unwrap(),
         fingerprint: SchemaFingerprint([7; 32]),

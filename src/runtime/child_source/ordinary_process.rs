@@ -72,7 +72,7 @@ pub(crate) async fn restore_input(
         .context("ordinary worker input is unavailable")?;
     anyhow::ensure!(
         parent.key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"worker-child-input-v1",
                 child.parent_authority_id.to_string().as_bytes(),

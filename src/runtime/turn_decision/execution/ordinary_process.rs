@@ -134,7 +134,7 @@ impl OrdinaryProcessLaunch {
             route.map(|route| route.hint.as_str()) == worker.route_hint.as_deref(),
             "ordinary worker route differs from its source"
         );
-        let key = crate::decision::key::DecisionKey::from_worker_channel(
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
             transport_key,
             proof.workspace_id(),
             &worker.run_id,
@@ -151,7 +151,7 @@ impl OrdinaryProcessLaunch {
                 Ok(WorkerRecordedInput {
                     event_id: receipt.event().event_id.clone(),
                     event_mac: parent.key.hmac(
-                        crate::decision::key::KeyDomain::StateFingerprint,
+                        crate::security::runtime_key::KeyDomain::StateFingerprint,
                         &[
                             b"worker-child-input-v1",
                             child.parent_authority_id.to_string().as_bytes(),
@@ -246,7 +246,10 @@ impl TurnDecisionService {
                 config.workspace_dir.clone(),
                 TurnSurfaceKind::Worker,
             )),
-            advisory_engine: Default::default(),
+            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
+                Arc::clone(&snapshots.generation.effective),
+                None,
+            ),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

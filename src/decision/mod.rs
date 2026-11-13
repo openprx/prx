@@ -8,7 +8,7 @@
 //! - [`validate`]: the one response validator; [`ValidatedDecision`] is the
 //!   only form in which a prediction reaches causal code.
 //! - [`error`]: the decision error classes and their named rules.
-//! - [`key`]: the per-workspace decision key.
+//! - `DecisionKey`: re-exported from `crate::security::runtime_key`.
 //! - [`loopback`]: the literal-loopback predicate and the endpoint check that
 //!   configuration, the factory and the HTTP client share (AG-17).
 //! - [`model_pin`]: whether a model id pins one version, shared by the
@@ -40,7 +40,6 @@ pub mod compatible_http;
 pub mod error;
 pub mod factory;
 pub mod http;
-pub mod key;
 pub mod loopback;
 #[cfg(any(test, feature = "test-mock"))]
 pub mod mock;
@@ -54,7 +53,8 @@ pub mod validate;
 pub mod wire;
 
 pub use error::{DecisionError, PolicyRule, RequestRule, ValidationRule};
-pub use key::{DecisionKey, KeyDomain};
+// Forwarding re-export of the runtime key (moved to `security::runtime_key`); removed in Part 2.
+pub use crate::security::runtime_key::{DecisionKey, KeyDomain};
 pub use protocol::{
     BackendIdentity, BackendKind, BackendLocality, CandidateKey, CandidateQuestion, ChoiceAnswer, DecisionAnswer,
     DecisionQuestion, DecisionRequest, DecisionRequestManifest, DecisionResponse, DecisionUsage, GlobalQuestion,

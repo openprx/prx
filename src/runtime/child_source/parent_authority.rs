@@ -1,8 +1,8 @@
 //! Shared in-process parent limits and monetary ownership, without admission.
 use super::recursive_allowance::RecursiveAllowance;
-use crate::causal_tree::branch::{CapabilityRef, CatalogGeneration};
-use crate::decision::key::DecisionKey;
+use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::child::{AuthorityEnvelope, CapabilityConstraints, ParentAuthorityId};
+use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use std::{collections::BTreeSet, sync::Arc};
 
 pub(crate) struct ParentAuthority {

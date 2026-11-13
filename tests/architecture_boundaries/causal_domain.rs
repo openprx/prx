@@ -1,3 +1,4 @@
+use super::helpers::{PathRoot, crate_rooted_paths};
 use super::helpers::{
     blank_comments_and_literals, normalize_line, read_source, relative_path, repository_root, rust_source_files,
     strip_cfg_test_items,
@@ -166,11 +167,20 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "decision::DecisionKey",
     "decision::DecisionRequest",
     "decision::KeyDomain",
+    // The runtime key (moved from `decision::key`) and its directory checks.
+    "security::runtime_key::DecisionKey",
+    "security::runtime_key::KeyDomain",
+    // Shared capability contract types, Plan/owner-isolation policy and the
+    // runtime logical clock (moved out of the causal domain).
+    "tools::capability::contract::",
+    "tools::capability::policy::plan_intercepts_tool",
+    "tools::capability::policy::admits_owner_isolated_identity",
+    "runtime::logical_clock::",
     // The credential reference grammar (CDP-12): a pure check of the id.
     "config::manage::credentials::CredentialReferences::reference",
     // The store's directory passes the key's directory checks (D-091 F-1).
-    "decision::key::check_decision_dir",
-    "decision::key::prepare_decision_dir",
+    "security::runtime_key::check_decision_dir",
+    "security::runtime_key::prepare_decision_dir",
     "decision::QuestionId",
     "decision::StructuredValue",
     "decision::ValidatedDecision",
@@ -262,9 +272,6 @@ const CAUSAL_SCORE_CRATE_PATHS: &[&str] = &[
     "decision::OmissionReason",
     "decision::ScoreAnswer",
 ];
-
-// The bounded rehearsal sees only the pinned catalog snapshot.
-const CAUSAL_REHEARSAL_CRATE_PATHS: &[&str] = &["tools::capability::catalog::CatalogView"];
 
 // The engine is the one causal-domain caller of the factory. Its selection
 // inputs are a validated result and an immutable catalog view, not a client.
@@ -377,97 +384,6 @@ const CAUSAL_DOMAIN_FORBIDDEN_NAMES: [&str; 25] = [
     "create_provider",
 ];
 
-/// Where a crate-rooted path in a causal file starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PathRoot {
-    /// `crate::`, or `super::` in `src/causal_tree/mod.rs`, where it is the
-    /// crate root.
-    Crate,
-    /// `super::super::`: the crate root from a top-level causal file, or the
-    /// causal domain itself from a module nested in one.
-    Relative,
-}
-
-/// Every path a `use` tree or a qualified path names from the crate root,
-/// with its root, and with brace groups expanded: `crate::decision::{A, b::C}`
-/// gives `decision::A` and `decision::b::C`; a glob gives `...::*`. In
-/// `mod.rs`, `super::` is the crate root too (D-066 N-5).
-pub(super) fn crate_rooted_paths(production: &str, is_mod_rs: bool) -> Vec<(PathRoot, String)> {
-    let mut paths = Vec::new();
-    let mut roots = vec![("crate::", PathRoot::Crate), ("super::super::", PathRoot::Relative)];
-    if is_mod_rs {
-        roots.push(("super::", PathRoot::Crate));
-    }
-    for (root, kind) in roots {
-        let mut search = 0;
-        while let Some(found) = production[search..].find(root) {
-            let start = search + found;
-            search = start + root.len();
-            let before = production[..start].chars().next_back();
-            if before.is_some_and(|character| character.is_alphanumeric() || character == '_' || character == ':') {
-                continue;
-            }
-            if root == "super::" && production[search..].starts_with("super::") {
-                continue;
-            }
-            let mut found_paths = Vec::new();
-            use_tree_paths(production, search, "", &mut found_paths);
-            paths.extend(found_paths.into_iter().map(|path| (kind, path)));
-        }
-    }
-    paths
-}
-
-/// The paths of the use tree that starts at byte `at`, each prefixed with
-/// `prefix`; returns where the tree ends.
-fn use_tree_paths(text: &str, at: usize, prefix: &str, paths: &mut Vec<String>) -> usize {
-    let bytes = text.as_bytes();
-    let skip_space = |mut index: usize| {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        index
-    };
-    let mut index = skip_space(at);
-    if index < bytes.len() && bytes[index] == b'{' {
-        index += 1;
-        loop {
-            index = skip_space(index);
-            if index >= bytes.len() {
-                return index;
-            }
-            match bytes[index] {
-                b'}' => return index + 1,
-                b',' => index += 1,
-                _ => {
-                    let end = use_tree_paths(text, index, prefix, paths);
-                    index = end.max(index + 1);
-                }
-            }
-        }
-    }
-    if index < bytes.len() && bytes[index] == b'*' {
-        paths.push(format!("{prefix}*"));
-        return index + 1;
-    }
-    let start = index;
-    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
-        index += 1;
-    }
-    let segment = &text[start..index];
-    if segment.is_empty() {
-        paths.push(prefix.to_string());
-        return index;
-    }
-    let path = format!("{prefix}{segment}");
-    let after = skip_space(index);
-    if text[after..].starts_with("::") {
-        return use_tree_paths(text, after + 2, &format!("{path}::"), paths);
-    }
-    paths.push(path);
-    index
-}
-
 /// AG-01 (I-04.3; D-064 M-5). The causal domain is pure: building,
 /// projecting and fingerprinting a turn state never reaches the network. It
 /// reaches a backend only through `DecisionBackend`, from the caller. The
@@ -519,7 +435,6 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
                 "src/causal_tree/candidate_generator.rs" => CAUSAL_GENERATOR_CRATE_PATHS,
                 "src/causal_tree/questions.rs" => CAUSAL_QUESTION_CRATE_PATHS,
                 "src/causal_tree/decision_score.rs" => CAUSAL_SCORE_CRATE_PATHS,
-                "src/causal_tree/decision_rehearsal.rs" => CAUSAL_REHEARSAL_CRATE_PATHS,
                 "src/causal_tree/decision_engine.rs" => CAUSAL_ENGINE_CRATE_PATHS,
                 "src/causal_tree/directive.rs" => CAUSAL_DIRECTIVE_CRATE_PATHS,
                 "src/causal_tree/outcome.rs" => CAUSAL_OUTCOME_CRATE_PATHS,

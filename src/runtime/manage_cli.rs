@@ -214,7 +214,9 @@ async fn store_decision_credential(
     io: &mut Io<'_>,
 ) -> Result<()> {
     let config = service.config();
-    let Some(selection) = openprx::decision::factory::configured_selection(&config.causal_tree) else {
+    let Some(selection) = openprx::decision::factory::configured_selection(
+        openprx::decision_engine::config::effective_engine_backend(&config),
+    ) else {
         bail!(
             "no decision backend that takes a credential is configured; choose one with `prx causal config set backend`"
         );

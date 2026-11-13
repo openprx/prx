@@ -54,8 +54,8 @@ fn changed(current: Option<&Config>, candidate: &Config) -> bool {
 /// The check of one configuration's decision section: one sentence naming
 /// the setting and the reason; never a credential.
 fn check_section(config: &Config) -> Result<(), String> {
-    let section = &config.causal_tree;
-    let backend = &section.backend;
+    // The same effective engine backend the factory builds from (R55).
+    let backend = crate::decision_engine::config::effective_engine_backend(config);
     let nothing_remote = match backend.kind {
         BackendSelection::Fixed(BackendKind::Builtin) => true,
         BackendSelection::Auto => backend.endpoint.trim().is_empty(),
@@ -68,13 +68,13 @@ fn check_section(config: &Config) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let Some(selection) = crate::decision::factory::configured_selection(section) else {
+    let Some(selection) = crate::decision::factory::configured_selection(backend) else {
         return Ok(());
     };
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
     // Recovery may remain enabled without permitting credential resolution.
     // Public loopback slots need no stored credential to compile predictions.
-    let checked = if section.enabled && config.decision_engine.enabled {
+    let checked = if config.decision_engine.enabled {
         crate::providers::selection::check_decision_backend(
             config,
             &catalog,

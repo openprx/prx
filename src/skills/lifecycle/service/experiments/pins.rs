@@ -83,9 +83,9 @@ impl SkillsLifecycleService {
             .read_revision(skill, &binding.revision_id, Some(&binding.record_digest))?;
         let model =
             crate::providers::selection::check_default(config, crate::providers::catalog::UnknownPolicy::Invocation)?;
-        let key = crate::decision::DecisionKey::load_or_create(&config.workspace_dir)?;
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(&config.workspace_dir)?;
         let configuration = hex::encode(key.hmac(
-            crate::decision::KeyDomain::TerminalClaim,
+            crate::security::runtime_key::KeyDomain::TerminalClaim,
             &[b"instruction-experiment-config-v1", &canonical_config(config)?],
         ));
         let policy = Self::experiment_policy_digest(&self.experiment_policy_snapshot(config))?;

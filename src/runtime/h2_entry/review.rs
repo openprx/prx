@@ -52,9 +52,9 @@ impl LocalControlAuthority {
             catalog_generation,
             expires,
         };
-        let key = crate::decision::DecisionKey::load_or_create(self.profile.workspace())?;
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(self.profile.workspace())?;
         let mac = key.hmac(
-            crate::decision::KeyDomain::ApprovalState,
+            crate::security::runtime_key::KeyDomain::ApprovalState,
             &[b"h2-local-owner-review-v1", &serde_json::to_vec(&body)?],
         );
         Ok(LocalOwnerReviewStamp {
@@ -121,10 +121,10 @@ impl LocalOwnerReviewStamp {
     fn verify_live(&self, origin: &VerifiedEntryOrigin) -> Result<()> {
         origin.ensure_live()?;
         let profile = origin.profile();
-        let key = crate::decision::DecisionKey::load_existing(profile.workspace())?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(profile.workspace())?;
         ensure!(
             key.verify_hmac(
-                crate::decision::KeyDomain::ApprovalState,
+                crate::security::runtime_key::KeyDomain::ApprovalState,
                 &[b"h2-local-owner-review-v1", &serde_json::to_vec(&self.body)?],
                 &self.mac
             ) && self.body.version == 1

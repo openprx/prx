@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use super::error::DecisionError;
-use super::key::DecisionKey;
 use super::protocol::{BackendIdentity, BackendKind, DecisionRequest, DecisionResponse};
 use super::wire::{ResponseEnvelope, SystemOneCodec};
+use crate::security::runtime_key::DecisionKey;
 
 /// What one scripted call returns.
 #[derive(Debug, Clone)]

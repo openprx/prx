@@ -1,5 +1,4 @@
 //! Recovery consumes authenticated durable reception, never execution authority.
-use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::memory::ingress_recovery::PendingFacts;
 use crate::memory::ingress_recovery::{
     IngressAppendOutcome, IngressAttestation, IngressCapsule, IngressEventLookup, IngressLifetime,
@@ -8,6 +7,7 @@ use crate::memory::ingress_recovery::{
 };
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryMacDomain, RecoveryRepository, RecoveryTag};
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

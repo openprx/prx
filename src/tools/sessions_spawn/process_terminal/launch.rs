@@ -68,7 +68,7 @@ pub(super) async fn persist(
             .then(|| grant.parent().spawn_run_id().to_owned()),
         input_event_id: source.event_id.clone(),
         input_event_mac: constraints.key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[b"worker-recovery-input-v1", &serde_json::to_vec(source)?],
         ),
         config_generation_id: grant.generation().id.0,
@@ -78,7 +78,7 @@ pub(super) async fn persist(
         batch_id: batch_id.map(str::to_owned),
     };
     let seal = constraints.key.hmac(
-        crate::decision::key::KeyDomain::StateFingerprint,
+        crate::security::runtime_key::KeyDomain::StateFingerprint,
         &[b"worker-recovery-launch-v1", &serde_json::to_vec(&fields)?],
     );
     let payload = serde_json::to_string(&LaunchBinding { fields, seal })?;
@@ -139,7 +139,7 @@ pub(super) struct VerifiedLaunch {
     fields: LaunchFields,
     workspace: std::path::PathBuf,
     input: crate::memory::MessageEvent,
-    key: std::sync::Arc<crate::decision::DecisionKey>,
+    key: std::sync::Arc<crate::security::runtime_key::DecisionKey>,
     parent_decision: crate::tools::capability::child::ParentAuthorityId,
     store_workspace_id: String,
 }
@@ -199,8 +199,8 @@ pub(super) async fn read(
 ) -> anyhow::Result<Option<VerifiedLaunch>> {
     use crate::causal_tree::ids::DecisionId;
     use crate::causal_tree::store::{CausalDecisionStore, DecisionScope};
-    use crate::decision::key::KeyDomain;
     use crate::memory::MessageEventSource;
+    use crate::security::runtime_key::KeyDomain;
     use std::sync::Arc;
     let workspace_matches = workspace.to_string_lossy() == fabric.workspace_id();
     anyhow::ensure!(
@@ -221,7 +221,7 @@ pub(super) async fn read(
             .as_deref()
             .context("worker launch payload missing")?,
     )?;
-    let key = crate::decision::DecisionKey::load_existing(workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
     anyhow::ensure!(
         key.verify_hmac(
             KeyDomain::StateFingerprint,

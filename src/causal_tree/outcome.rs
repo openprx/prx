@@ -7,9 +7,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::branch::{CandidateId, CapabilityTarget, CausalActionKind};
 use super::candidate_generator::CandidateSet;
-use super::decision_engine::{EngineDecision, FallbackCause, PredictionAuditAnswer};
+use super::decision_engine::{EngineDecision, FallbackCause};
 use super::decision_score::SCORER_VERSION;
 use super::decision_select::Selection;
 use super::gates::{GateOutcome, GateReport};
@@ -26,6 +25,7 @@ use crate::decision::factory::{AttemptOutcome, FallbackReason, ServedBy};
 use crate::decision::{DecisionAnswer, DecisionKey, GlobalQuestion, KeyDomain, PROTOCOL_VERSION, QuestionId};
 use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::runtime::turn_decision::TurnDecisionContext;
+use crate::tools::capability::contract::CausalActionKind;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RecordBuildError {
@@ -92,7 +92,6 @@ impl DecisionRecordBuilder {
         context: &TurnDecisionContext,
         key: &DecisionKey,
         enabled_and_recordable: bool,
-        record_redacted_projection: bool,
     ) -> Result<Vec<DecisionRecord>, RecordBuildError> {
         if !enabled_and_recordable {
             return Err(RecordBuildError::Binding);
@@ -107,19 +106,12 @@ impl DecisionRecordBuilder {
             if hop.decision_id != *expected_id {
                 return Err(RecordBuildError::Chain);
             }
+            // Since R9 a turn has exactly one hop: hop 0 with no prior decision.
             let prior = match (index, hop.state.lineage) {
                 (0, HopLineage::First) => None,
-                (position, HopLineage::After { hop, prior_decision_id })
-                    if usize::from(hop.get()) == position
-                        && records.last().is_some_and(|record: &DecisionRecord| {
-                            record.decision_id.as_uuid() == prior_decision_id
-                        }) =>
-                {
-                    Some(records.last().ok_or(RecordBuildError::Chain)?.decision_id)
-                }
                 _ => return Err(RecordBuildError::Chain),
             };
-            let mut record = Self::build_hop(hop, key, prior, enabled_and_recordable, record_redacted_projection)?;
+            let mut record = Self::build_hop(hop, key, prior, enabled_and_recordable)?;
             turn_rejections.add(&GateRejections::for_hop(hop));
             record
                 .gates
@@ -139,7 +131,6 @@ impl DecisionRecordBuilder {
         key: &DecisionKey,
         prior_decision_id: Option<DecisionId>,
         enabled_and_recordable: bool,
-        record_redacted_projection: bool,
     ) -> Result<DecisionRecord, RecordBuildError> {
         let trusted = hop.state.trusted.parts();
         let state_fingerprint = hop
@@ -147,22 +138,11 @@ impl DecisionRecordBuilder {
             .material_fingerprint(key)
             .map_err(RecordBuildError::Fingerprint)?;
         let catalog_generation = trusted.catalog_generation.to_hex();
-        let projection = match (&hop.audit_trace, record_redacted_projection) {
-            (Some(trace), enabled) => {
-                if trace.state_fingerprint != state_fingerprint
-                    || trace.policy_version != trusted.policy_version.as_ref()
-                    || trace.catalog_generation != catalog_generation
-                    || trace.redacted_projection.is_some() != enabled
-                    || !hop.request_compiled
-                    || hop.prediction.is_none()
-                {
-                    return Err(RecordBuildError::Binding);
-                }
-                trace.redacted_projection.clone()
-            }
-            (None, _) if hop.prediction.is_none() => None,
-            _ => return Err(RecordBuildError::Binding),
-        };
+        // The retired prediction hop (R9) was the only source of an audit
+        // trace, so a hop record never carries a redacted projection.
+        if hop.prediction.is_some() {
+            return Err(RecordBuildError::Binding);
+        }
         let (backend_kind, backend_locality, configured_model, backend_endpoint, claimed_model, provider_request_id) =
             hop.prediction.as_ref().map_or_else(
                 || {
@@ -272,7 +252,7 @@ impl DecisionRecordBuilder {
             },
             enabled_snapshot: enabled_and_recordable,
             state_fingerprint,
-            redacted_projection: projection,
+            redacted_projection: None,
             protocol_version: if hop.request_compiled {
                 u32::from(PROTOCOL_VERSION)
             } else {
@@ -319,53 +299,17 @@ impl DecisionRecordBuilder {
 
 fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Option<String>, f64), RecordBuildError> {
     let fallback = hop.fallback_cause.map(fallback_code);
-    let (selected, action, reason, propensity) = match &hop.selection {
-        Selection::Commit {
-            candidate_id,
-            propensity,
-            ..
-        } => (
-            Some(candidate_id.clone()),
-            candidate_id.action().as_str(),
-            fallback,
-            *propensity,
-        ),
-        Selection::Recover {
-            candidate_id,
-            reason_code,
-        } => (
-            Some(candidate_id.clone()),
-            candidate_id.action().as_str(),
-            Some(*reason_code),
-            1.0,
-        ),
-        Selection::RequestApproval {
-            terminal_id,
-            reason_code,
-            ..
-        } => (Some(terminal_id.clone()), "request_approval", Some(*reason_code), 1.0),
-        Selection::Abstain { action, reason_code } => {
-            let terminal_id = CandidateId::new(*action, CapabilityTarget::None, None);
-            let admitted = match &hop.candidates {
-                CandidateSet::Legal { candidates, report, .. } => {
-                    candidates
-                        .iter()
-                        .any(|candidate| candidate.candidate_id() == &terminal_id)
-                        && matches!(report.outcomes.get(&terminal_id), Some(GateOutcome::Passed))
-                }
-                CandidateSet::NoLegalPath { terminals, report, .. } => {
-                    terminals
-                        .iter()
-                        .any(|candidate| candidate.candidate_id() == &terminal_id)
-                        && matches!(report.outcomes.get(&terminal_id), Some(GateOutcome::Passed))
-                }
-            };
-            if !admitted || !matches!(hop.pre_commit.outcomes.get(&terminal_id), Some(GateOutcome::Passed)) {
-                return Err(RecordBuildError::Binding);
-            }
-            (Some(terminal_id), action.as_str(), Some(*reason_code), 1.0)
-        }
-    };
+    let Selection::Commit {
+        candidate_id,
+        propensity,
+        ..
+    } = &hop.selection;
+    let (selected, action, reason, propensity) = (
+        Some(candidate_id.clone()),
+        candidate_id.action().as_str(),
+        fallback,
+        *propensity,
+    );
     if !propensity.is_finite() || !(0.0..=1.0).contains(&propensity) {
         return Err(RecordBuildError::Number);
     }
@@ -379,10 +323,6 @@ fn selection_fields(hop: &EngineDecision) -> Result<(Option<String>, String, Opt
 
 const fn fallback_code(cause: FallbackCause) -> &'static str {
     match cause {
-        FallbackCause::NoLegalPath => "no_legal_path",
-        FallbackCause::ExpiredBeforePrediction => "expired_before_prediction",
-        FallbackCause::DecisionFailed => "decision_failed",
-        FallbackCause::DeadlineExceeded => "deadline_exceeded",
         FallbackCause::HopStopped => "hop_stopped",
     }
 }
@@ -423,57 +363,12 @@ fn gate_fields(report: &GateReport, key: &DecisionKey) -> Value {
 }
 
 fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), RecordBuildError> {
-    let mut distributions = RecordedDistributions::default();
-    let mut answer_fields = serde_json::Map::new();
-    let mut omitted = BTreeMap::new();
-    let mut forced = BTreeMap::new();
-    if let Some(trace) = &hop.audit_trace {
-        for (id, answer) in &trace.answers {
-            let value = match answer {
-                PredictionAuditAnswer::Choice {
-                    chosen,
-                    probabilities,
-                    confidence,
-                } => {
-                    check_numbers(probabilities.values().copied().chain(std::iter::once(*confidence)))?;
-                    if id == GlobalQuestion::NextAction.as_str() {
-                        distributions.next_action = probabilities.clone();
-                    } else if id == GlobalQuestion::CapabilityTarget.as_str() {
-                        distributions.capability_target = probabilities.clone();
-                    }
-                    json!({"kind":"choice", "chosen":chosen, "probabilities":probabilities, "confidence":confidence})
-                }
-                PredictionAuditAnswer::Score {
-                    distribution,
-                    expected,
-                    confidence,
-                } => {
-                    check_numbers(distribution.iter().copied().chain([*expected, *confidence]))?;
-                    json!({"kind":"score", "distribution":distribution, "expected":expected, "confidence":confidence})
-                }
-                PredictionAuditAnswer::Noul { probability_true } => {
-                    check_numbers([*probability_true])?;
-                    distributions.features.insert(id.clone(), *probability_true);
-                    json!({"kind":"noul", "probability_true":probability_true})
-                }
-            };
-            answer_fields.insert(id.clone(), value);
-        }
-        omitted = trace.omitted_questions.clone();
-        forced = trace.forced_choices.clone();
-        for question in forced.keys() {
-            if question != GlobalQuestion::NextAction.as_str() && question != GlobalQuestion::CapabilityTarget.as_str()
-            {
-                return Err(RecordBuildError::Binding);
-            }
-            if (question == GlobalQuestion::NextAction.as_str() && !distributions.next_action.is_empty())
-                || (question == GlobalQuestion::CapabilityTarget.as_str()
-                    && !distributions.capability_target.is_empty())
-            {
-                return Err(RecordBuildError::Binding);
-            }
-        }
-    }
+    // The retired prediction hop (R9) was the only source of audited
+    // answers, omitted questions and forced choices.
+    let distributions = RecordedDistributions::default();
+    let answer_fields = serde_json::Map::new();
+    let omitted: BTreeMap<String, &'static str> = BTreeMap::new();
+    let forced: BTreeMap<String, String> = BTreeMap::new();
     let mut scores = BTreeMap::new();
     for (id, score) in &hop.scores {
         check_numbers([score.semantic_utility, score.execution_utility])?;
@@ -491,8 +386,7 @@ fn audit_fields(hop: &EngineDecision) -> Result<(RecordedDistributions, Value), 
         "forced_choices":forced,
         "scores":scores,
         "fallback_cause":hop.fallback_cause.map(fallback_code),
-        "fallback": (matches!(hop.selection, Selection::Abstain { action: CausalActionKind::Answer, .. })
-            || matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped)))
+        "fallback": matches!(&hop.selection, Selection::Commit { candidate_id, .. } if candidate_id.action() == CausalActionKind::Answer && hop.fallback_cause == Some(FallbackCause::HopStopped))
             .then_some("answer_on_abstention"),
         "factory_reason":hop.prediction.as_ref().and_then(|prediction| prediction.reason.map(factory_reason)),
     });
@@ -958,14 +852,14 @@ impl OutcomeCorrelator {
         facts: &TerminalFacts,
     ) -> Result<OutcomeRecord, OutcomeCorrelationError> {
         let action = decision.selected().and_then(|candidate| {
-            super::branch::CausalActionKind::ALL
+            crate::tools::capability::contract::CausalActionKind::ALL
                 .into_iter()
                 .find(|kind| kind.as_str() == candidate.action)
         });
         // The signed row retains the original abstention. Account for its
         // observed plain reply only with completed, tool-free serving evidence;
         // this grants no capability or child authority from the Clarify row.
-        let action = if action == Some(super::branch::CausalActionKind::Clarify)
+        let action = if action == Some(crate::tools::capability::contract::CausalActionKind::Clarify)
             && decision.directive_kind == "clarify"
             && decision.abstention_reason.is_some()
             && decision
@@ -974,7 +868,7 @@ impl OutcomeCorrelator {
                 .any(|candidate| candidate.action == "answer" && candidate.target == "none")
             && facts.confirms_plain_answer()
         {
-            Some(super::branch::CausalActionKind::Answer)
+            Some(crate::tools::capability::contract::CausalActionKind::Answer)
         } else {
             action
         };
@@ -989,7 +883,7 @@ impl OutcomeCorrelator {
     fn settle_for(
         writer: &DecisionStoreWriter,
         decision_id: DecisionId,
-        action: Option<super::branch::CausalActionKind>,
+        action: Option<crate::tools::capability::contract::CausalActionKind>,
         target: Option<&str>,
         facts: &TerminalFacts,
     ) -> Result<Enqueue, OutcomeCorrelationError> {
@@ -998,7 +892,7 @@ impl OutcomeCorrelator {
 
     fn record_for(
         decision_id: DecisionId,
-        action: Option<super::branch::CausalActionKind>,
+        action: Option<crate::tools::capability::contract::CausalActionKind>,
         target: Option<&str>,
         facts: &TerminalFacts,
     ) -> Result<OutcomeRecord, OutcomeCorrelationError> {
@@ -1045,7 +939,10 @@ impl OutcomeCorrelator {
                 OutcomeClassification::Silent
             } else if matches!(
                 action,
-                Some(super::branch::CausalActionKind::UseTool | super::branch::CausalActionKind::Delegate)
+                Some(
+                    crate::tools::capability::contract::CausalActionKind::UseTool
+                        | crate::tools::capability::contract::CausalActionKind::Delegate
+                )
             ) && facts.status == TurnTerminalStatus::Completed
             {
                 let trace = facts
@@ -1068,7 +965,7 @@ impl OutcomeCorrelator {
                     OutcomeClassification::Failed
                 } else {
                     match provider_status {
-                        None if action == Some(super::branch::CausalActionKind::UseTool)
+                        None if action == Some(crate::tools::capability::contract::CausalActionKind::UseTool)
                             && facts.resume_claimed
                             && facts.execution_trace.as_ref().is_some_and(|trace| {
                                 let capabilities: Vec<_> =
@@ -1079,7 +976,7 @@ impl OutcomeCorrelator {
                             OutcomeClassification::Success
                         }
                         Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess)
-                            if action == Some(super::branch::CausalActionKind::Delegate) =>
+                            if action == Some(crate::tools::capability::contract::CausalActionKind::Delegate) =>
                         {
                             OutcomeClassification::Delegated
                         }
@@ -1135,7 +1032,7 @@ impl OutcomeCorrelator {
         let executed = match classification {
             OutcomeClassification::Delegated => Some(("delegate", "session")),
             OutcomeClassification::Success | OutcomeClassification::FallbackSuccess
-                if action == Some(super::branch::CausalActionKind::UseTool) =>
+                if action == Some(crate::tools::capability::contract::CausalActionKind::UseTool) =>
             {
                 Some(("use_tool", target.ok_or(OutcomeCorrelationError::Unsupported)?))
             }
@@ -1189,11 +1086,11 @@ impl OutcomeCorrelator {
 }
 
 const fn classify_terminal(
-    action: Option<super::branch::CausalActionKind>,
+    action: Option<crate::tools::capability::contract::CausalActionKind>,
     status: TurnTerminalStatus,
     provider_status: Option<&ExecutionStatus>,
 ) -> Result<OutcomeClassification, OutcomeCorrelationError> {
-    use super::branch::CausalActionKind;
+    use crate::tools::capability::contract::CausalActionKind;
     match status {
         TurnTerminalStatus::Cancelled => Ok(OutcomeClassification::Cancelled),
         TurnTerminalStatus::Failed => Ok(OutcomeClassification::Failed),
@@ -1221,10 +1118,9 @@ fn exact_cost_micro(usd: f64) -> Result<i64, OutcomeCorrelationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::causal_tree::branch::{CapabilityTarget, CausalActionKind};
-    use crate::causal_tree::decision_engine::PredictionAuditTrace;
     use crate::causal_tree::gates::GateOutcome;
     use crate::causal_tree::state::fixtures;
+    use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
@@ -1249,7 +1145,6 @@ mod tests {
                 (id(CausalActionKind::Clarify), GateOutcome::ApprovalDeferred),
                 (id(CausalActionKind::Refuse), GateOutcome::Passed),
             ]),
-            gate_set_hash: [0; 32],
         };
         let mut later = first.clone();
         later.outcomes.insert(
@@ -1530,7 +1425,7 @@ mod tests {
                 reason_code: "prx_é",
             }),
             Some(GateOutcome::ApprovalOnly {
-                op_ids: vec![crate::causal_tree::branch::OpId::new("prx:exact-write")],
+                op_ids: vec![crate::tools::capability::contract::OpId::new("prx:exact-write")],
             }),
             Some(GateOutcome::ApprovalDeferred),
         ] {
@@ -1538,12 +1433,12 @@ mod tests {
             let candidate = fixtures::candidate(&key, CausalActionKind::Refuse, CapabilityTarget::None, None).candidate;
             let unselected =
                 fixtures::candidate(&key, CausalActionKind::Clarify, CapabilityTarget::None, None).candidate;
+            let selected_id = candidate.candidate_id().clone();
             let report = GateReport {
                 outcomes: outcome
                     .into_iter()
                     .map(|outcome| (unselected.candidate_id().clone(), outcome))
                     .collect(),
-                gate_set_hash: [0; 32],
             };
             // A real abstention requires its selected terminal to pass both
             // admission and commit. Exercise other gate outcomes on the distinct
@@ -1567,30 +1462,25 @@ mod tests {
                 candidates: CandidateSet::Legal {
                     candidates: vec![candidate, unselected],
                     exact_mentions: BTreeSet::new(),
-                    truncated: Vec::new(),
-                    discoverable_families: Default::default(),
                     approval_scopes: BTreeMap::new(),
                     report: admitted_report.clone(),
                 },
-                selection: Selection::Abstain {
-                    action: CausalActionKind::Refuse,
-                    reason_code: "hop_stopped",
+                selection: Selection::Commit {
+                    candidate_id: selected_id,
+                    propensity: 1.0,
+                    reason_code: None,
                 },
                 exploration_propensities: BTreeMap::new(),
                 prediction: None,
                 request_compiled: false,
-                audit_trace: None,
                 fallback_cause: None,
                 scores: BTreeMap::new(),
-                scored_count: 0,
-                rehearsal: BTreeMap::new(),
                 post_rehearsal: report.clone(),
                 pre_commit: admitted_report,
-                call_fingerprints: BTreeMap::new(),
                 outgoing_child: None,
                 outgoing_parent_allowed: None,
             };
-            let record = DecisionRecordBuilder::build_hop(&decision, &key, None, true, false)
+            let record = DecisionRecordBuilder::build_hop(&decision, &key, None, true)
                 .expect("actual record builder accepts fixture binding");
             let mut original_phases = record.gates.clone();
             let fields = original_phases.as_object_mut().expect("gate object");
@@ -1617,70 +1507,6 @@ mod tests {
     }
 
     #[test]
-    fn forced_choice_stays_out_of_calibration_and_builtin_shadow() {
-        let key = fixtures::key();
-        let state = fixtures::state(&key, "neutral request");
-        let candidate = fixtures::candidate(&key, CausalActionKind::Refuse, CapabilityTarget::None, None).candidate;
-        let candidate_id = candidate.candidate_id().clone();
-        let gates = GateReport {
-            outcomes: BTreeMap::from([(candidate_id, GateOutcome::Passed)]),
-            gate_set_hash: [0; 32],
-        };
-        let trace = PredictionAuditTrace {
-            state_fingerprint: state
-                .material_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            policy_version: state.trusted.parts().policy_version.to_string(),
-            catalog_generation: state.trusted.parts().catalog_generation.to_hex(),
-            answers: BTreeMap::new(),
-            omitted_questions: BTreeMap::from([(GlobalQuestion::NextAction.as_str().to_owned(), "forced")]),
-            forced_choices: BTreeMap::from([(GlobalQuestion::NextAction.as_str().to_owned(), "refuse".to_owned())]),
-            redacted_projection: None,
-        };
-        let decision = EngineDecision {
-            decision_id: DecisionId::new_runtime(),
-            deadline: Instant::now() + Duration::from_secs(1),
-            elapsed_ms: 1,
-            state,
-            candidates: CandidateSet::Legal {
-                candidates: vec![candidate],
-                exact_mentions: BTreeSet::new(),
-                truncated: Vec::new(),
-                discoverable_families: Default::default(),
-                approval_scopes: BTreeMap::new(),
-                report: gates.clone(),
-            },
-            selection: Selection::Abstain {
-                action: CausalActionKind::Refuse,
-                reason_code: "hop_stopped",
-            },
-            exploration_propensities: BTreeMap::new(),
-            prediction: None,
-            request_compiled: false,
-            audit_trace: Some(trace),
-            fallback_cause: None,
-            scores: BTreeMap::new(),
-            scored_count: 0,
-            rehearsal: BTreeMap::new(),
-            post_rehearsal: gates.clone(),
-            pre_commit: gates,
-            call_fingerprints: BTreeMap::new(),
-            outgoing_child: None,
-            outgoing_parent_allowed: None,
-        };
-        let (distributions, features) = audit_fields(&decision).expect("forced code maps only to features");
-        assert!(distributions.next_action.is_empty());
-        assert!(distributions.capability_target.is_empty());
-        assert_eq!(
-            features
-                .get("forced_choices")
-                .and_then(|choices| choices.get(GlobalQuestion::NextAction.as_str())),
-            Some(&json!("refuse"))
-        );
-        assert!(shadow_fields(&decision).next_action.is_none());
-        assert!(shadow_fields(&decision).capability_target.is_none());
-    }
-    #[test]
     fn deterministic_record_keeps_selection_propensity_without_explored_flag() {
         let key = fixtures::key();
         let state = fixtures::state(&key, "neutral request");
@@ -1688,7 +1514,6 @@ mod tests {
         let candidate_id = candidate.candidate_id().clone();
         let gates = GateReport {
             outcomes: BTreeMap::from([(candidate_id.clone(), GateOutcome::Passed)]),
-            gate_set_hash: [0; 32],
         };
         let mut decision = EngineDecision {
             decision_id: DecisionId::new_runtime(),
@@ -1698,8 +1523,6 @@ mod tests {
             candidates: CandidateSet::Legal {
                 candidates: vec![candidate],
                 exact_mentions: BTreeSet::new(),
-                truncated: Vec::new(),
-                discoverable_families: Default::default(),
                 approval_scopes: BTreeMap::new(),
                 report: gates.clone(),
             },
@@ -1711,20 +1534,15 @@ mod tests {
             exploration_propensities: BTreeMap::new(),
             prediction: None,
             request_compiled: false,
-            audit_trace: None,
             fallback_cause: None,
             scores: BTreeMap::new(),
-            scored_count: 0,
-            rehearsal: BTreeMap::new(),
             post_rehearsal: gates.clone(),
             pre_commit: gates,
-            call_fingerprints: BTreeMap::new(),
             outgoing_child: None,
             outgoing_parent_allowed: None,
         };
 
-        let record =
-            DecisionRecordBuilder::build_hop(&decision, &key, None, true, false).expect("deterministic record");
+        let record = DecisionRecordBuilder::build_hop(&decision, &key, None, true).expect("deterministic record");
         assert_eq!(record.propensity, 1.0);
         assert!(!record.explored);
         assert!(record.candidates.iter().all(|candidate| candidate.propensity.is_none()));
@@ -1735,7 +1553,7 @@ mod tests {
             reason_code: None,
         };
         let sampled =
-            DecisionRecordBuilder::build_hop(&decision, &key, None, true, false).expect("recorded sampling metadata");
+            DecisionRecordBuilder::build_hop(&decision, &key, None, true).expect("recorded sampling metadata");
         assert!(sampled.explored);
         assert_eq!(sampled.propensity, 0.75);
         assert_eq!(

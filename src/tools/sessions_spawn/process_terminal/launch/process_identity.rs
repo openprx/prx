@@ -1,5 +1,5 @@
 //! Conservative, read-only process identity checks for signed launch recovery.
-use crate::decision::{DecisionKey, key::KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 
 pub(in crate::tools::sessions_spawn::process_terminal) fn context_mac(
     key: &DecisionKey,

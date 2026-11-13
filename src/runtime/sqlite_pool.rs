@@ -580,7 +580,7 @@ impl SqliteConnectionPool {
     /// retain the unbounded `write` contract.
     pub fn write_until(&self, deadline: Instant) -> anyhow::Result<SqliteWriteGuard<'_>> {
         anyhow::ensure!(
-            crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+            crate::runtime::logical_clock::deadline_now(deadline) < deadline,
             "SQLite writer deadline elapsed"
         );
         let started = Instant::now();
@@ -589,9 +589,9 @@ impl SqliteConnectionPool {
         } else {
             self.metrics.write_waiters.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
-            let guard = if crate::causal_tree::logical_clock::is_logical_deadline(deadline) {
+            let guard = if crate::runtime::logical_clock::is_logical_deadline(deadline) {
                 loop {
-                    if crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline {
+                    if crate::runtime::logical_clock::deadline_now(deadline) >= deadline {
                         break None;
                     }
                     if let Some(guard) = self.writer.try_lock_for(std::time::Duration::from_millis(5)) {
@@ -611,7 +611,7 @@ impl SqliteConnectionPool {
             guard.ok_or_else(|| anyhow::anyhow!("SQLite writer deadline elapsed"))?
         };
         anyhow::ensure!(
-            crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+            crate::runtime::logical_clock::deadline_now(deadline) < deadline,
             "SQLite writer deadline elapsed"
         );
         self.metrics.write_acquisitions.fetch_add(1, Ordering::Relaxed);

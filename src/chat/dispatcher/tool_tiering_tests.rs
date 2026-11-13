@@ -277,8 +277,8 @@ async fn offered_tools_for(
         .audit_hops()
         .map(|hop| {
             format!(
-                "candidates={:?} selection={:?} prediction={:?} trace={:?} scores={:?} gates={:?}",
-                hop.candidates, hop.selection, hop.prediction, hop.audit_trace, hop.scores, hop.pre_commit.outcomes
+                "candidates={:?} selection={:?} prediction={:?} scores={:?} gates={:?}",
+                hop.candidates, hop.selection, hop.prediction, hop.scores, hop.pre_commit.outcomes
             )
         })
         .collect::<Vec<_>>();

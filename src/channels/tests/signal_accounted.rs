@@ -474,8 +474,8 @@ fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str, pric
         // report. Answer is explicitly proposed and its G6 result remains in
         // NoLegalPath.report even though candidates_json keeps only Refuse.
         let answer = crate::causal_tree::branch::CandidateId::new(
-            crate::causal_tree::branch::CausalActionKind::Answer,
-            crate::causal_tree::branch::CapabilityTarget::None,
+            crate::tools::capability::contract::CausalActionKind::Answer,
+            crate::tools::capability::contract::CapabilityTarget::None,
             None,
         );
         let rejected = gates

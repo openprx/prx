@@ -635,7 +635,7 @@ async fn ingress_recovery_unchanged_by_switch() {
             .unwrap()
             .expect("recording sqlite prepares a recorder");
         let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-        let key = crate::decision::key::DecisionKey::load_or_create(dir.path()).unwrap();
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(dir.path()).unwrap();
         let advisory = if plane {
             let observer = Arc::new(crate::decision::telemetry::ObserverCausalSink::new(Arc::new(
                 crate::observability::NoopObserver,

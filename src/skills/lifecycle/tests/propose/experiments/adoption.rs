@@ -275,8 +275,8 @@ async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
     // One paused clock for every lookup in this body, including confirm,
     // plan, the spawned stage pin check, prune, and lesson preparation.
     // Production still measures wall time when no clock is installed.
-    let clock = crate::causal_tree::logical_clock::ManualClock::new();
-    let result = crate::causal_tree::logical_clock::scope(Arc::clone(&clock), async {
+    let clock = crate::runtime::logical_clock::ManualClock::new();
+    let result = crate::runtime::logical_clock::scope(Arc::clone(&clock), async {
         let mut config = config(&f, &server);
         let price=config.cost.prices.get_mut(&format!("{}/experiment-loopback",config.default_provider.as_deref().unwrap()))
             .context("fixture model pricing missing")?;
@@ -653,7 +653,7 @@ async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
                     max_decoded_bytes: 1024 * 1024,
                     // This body runs on a logical clock an hour ahead of wall
                     // time. The retention comparison reads that clock.
-                    deadline: crate::causal_tree::logical_clock::now() + Duration::from_secs(5),
+                    deadline: crate::runtime::logical_clock::now() + Duration::from_secs(5),
                 },
             )?;
             assert_eq!(refs.refs, vec![reference.clone()]);
@@ -881,7 +881,7 @@ async fn owned_attempts_then_retire(
     )?;
     let scope = runtime.scope_id();
     cleanup.run(runtime.scope(async {
-            let clock = crate::causal_tree::logical_clock::capture().expect("test: owned editor retains its decision clock");
+            let clock = crate::runtime::logical_clock::capture().expect("test: owned editor retains its decision clock");
             if probe_expiry {
             let before_expiry = server.count.load(Ordering::SeqCst);
             clock.arm_site("experiment.preparation-lookup", Duration::ZERO, Duration::from_millis(501));
@@ -907,13 +907,13 @@ async fn owned_attempts_then_retire(
             let default_binding = prepared.binding().clone();
             let default_user = user.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
-                assert!(!crate::causal_tree::logical_clock::installed());
+                assert!(!crate::runtime::logical_clock::installed());
                 let default_prepared = default_store.prepare_verified_lesson_context(
                     &default_plan, default_binding, &default_user, Utc::now())?
                     .context("test: default factory returned no lesson context")?;
                 let guard = default_prepared.lock_handoff(&default_plan.spec().pins.model, Utc::now())?;
                 guard.recheck_target_locked(Utc::now())?;
-                assert!(!crate::causal_tree::logical_clock::installed(), "test: default handoff cannot install a clock");
+                assert!(!crate::runtime::logical_clock::installed(), "test: default handoff cannot install a clock");
                 Ok(())
             }).await??;
             if probe_expiry {

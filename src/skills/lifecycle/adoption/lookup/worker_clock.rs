@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 //! Independent, task-scoped regression hooks survive a missing clock re-entry.
-use crate::causal_tree::logical_clock::ManualClock;
+use crate::runtime::logical_clock::ManualClock;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ pub(super) fn apply() {
 #[tokio::test]
 async fn worker_hooks_preserve_logical_expiry_and_do_not_install_or_leak_a_clock() {
     use super::{LessonLimits, LookupBudget};
-    use crate::causal_tree::logical_clock;
+    use crate::runtime::logical_clock;
     use std::time::Duration;
     for name in ["experiment.stage-lookup", "experiment.preparation-lookup"] {
         let clock = ManualClock::new();

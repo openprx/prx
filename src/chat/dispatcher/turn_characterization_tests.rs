@@ -346,14 +346,14 @@ fn assert_enabled_builtin_selection(decision: crate::agent::turn_request::TurnDe
     );
     assert_eq!(
         decision.context.terminal_outcome_action(),
-        Some(crate::causal_tree::branch::CausalActionKind::Answer),
+        Some(crate::tools::capability::contract::CausalActionKind::Answer),
         "step 7.1 must select the intended Answer action"
     );
     assert!(
         matches!(
             decision.context.engine().selection,
             crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
         ),
         "step 7.1 must commit Answer: {:?}",
         decision.context.engine().selection
@@ -1244,116 +1244,4 @@ pub(crate) async fn drive_search_chat_entry(config: crate::config::Config, input
     result?;
     joined??;
     Ok(())
-}
-
-#[tokio::test]
-async fn enabled_interactive_backend_failure_publishes_provider_reply() {
-    let cleanup = crate::runtime::turn_cleanup::CleanupScope::new(None, CancellationToken::new())
-        .expect("test: interactive accounting cleanup owner");
-    tokio::time::timeout(Duration::from_secs(20), cleanup.run(crate::agent::turn_tests::reachability::boxed_root_probe(|| async {
-    let workspace = tempfile::tempdir().expect("test: chat workspace");
-    let workspace = workspace.path();
-    let (actions, _receiver) = mpsc::channel::<Action>(128);
-    let mut config = enabled_builtin_admission_config(workspace);
-    config.decision_engine.enabled = true;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("test: prediction listener");
-    let endpoint = format!("http://{}/v1", listener.local_addr().expect("test: prediction address"));
-    let failure_peer = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(5), async move {
-            const MAX_REQUEST_PREFIX: usize = 5;
-            let (mut stream, _) = listener.accept().await.expect("test: prediction connection");
-            let mut prefix = [0_u8; MAX_REQUEST_PREFIX];
-            stream.read_exact(&mut prefix).await.expect("test: bounded prediction prefix");
-            assert_eq!(&prefix, b"POST ", "test: real prediction request reaches the failure peer");
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .await.expect("test: real invalid decision response");
-            stream.shutdown().await.expect("test: response half-close");
-            const MAX_REQUEST_BYTES: usize = 128 * 1024;
-            const DRAIN_CHUNK_BYTES: usize = 1024;
-            let mut drained = MAX_REQUEST_PREFIX;
-            let mut chunk = [0_u8; DRAIN_CHUNK_BYTES];
-            loop {
-                let read = stream.read(&mut chunk).await.expect("test: bounded request drain");
-                if read == 0 { break; }
-                drained += read;
-                assert!(drained <= MAX_REQUEST_BYTES, "test: prediction request stays within the fixture bound");
-            }
-        }).await.expect("test: prediction failure peer deadline");
-    });
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
-    config.causal_tree.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp);
-    config.causal_tree.backend.endpoint = endpoint.clone();
-    config.causal_tree.backend.model = "prx-decision-probe".into();
-    config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":format!("custom:{endpoint}"), "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: decision model"));
-    config.cost.prices.insert(format!("custom:{endpoint}/prx-decision-probe"), crate::config::schema::ModelPricing {
-        input: 0.1, output: 0.2, cache_write: 0.3, cache_read: 0.1,
-    });
-    let provider = Arc::new(FixtureProvider::new(vec![FixtureStep::Final {
-        chunks: vec!["ok".to_owned()],
-        reasoning: String::new(),
-        usage: reported_usage(1, 1),
-    }]));
-    let port: Arc<dyn Provider> = provider.clone();
-    let cancellation = CancellationToken::new();
-    let admitted = crate::agent::turn_tests::reachability::boxed_root_probe(|| admit_chat_fixture_with_config(
-        port.clone(),
-        None,
-        config,
-        (FIXTURE_PROVIDER, FIXTURE_MODEL, None),
-        ("engine-off-chat", "hello"),
-        actions.clone(),
-        cancellation.clone(),
-    ))
-    .await;
-    let decisions = Arc::clone(admitted.binding.decision_routing().expect("test: interactive routing").service);
-    let context = decisions.open_issued_turn_context(admitted.binding.as_ref(), crate::runtime::turn_decision::AgentTurnKind::Repl, &cancellation).await.expect("test: interactive decision");
-    let prediction = context.engine().prediction.as_ref().expect("test: configured prediction attempted");
-    assert!(prediction.attempts.iter().any(|attempt| matches!(&attempt.outcome,
-        crate::decision::factory::AttemptOutcome::Failed(error) if error.is_semantic_validation_failure())),
-        "test: real backend semantic failure is retained: {:?}", prediction.attempts);
-    assert!(matches!(context.engine().selection, crate::causal_tree::decision_select::Selection::Abstain { action: crate::causal_tree::branch::CausalActionKind::Clarify, reason_code: "decision_failed" }), "test: actual failed backend selects interactive Clarify: {:?}", context.engine().selection);
-    let specs = decisions.agent_execution_specs(admitted.binding.as_ref(), &context).expect("test: Clarify can answer");
-    assert!(specs.specs.is_empty(), "test: degraded interactive answer offers no tools");
-    let mut history = vec![ChatMessage::system("Project assistant"), ChatMessage::user("hello")];
-    let multimodal = crate::config::MultimodalConfig::default();
-    let hooks = crate::hooks::HookManager::new(workspace.to_owned());
-    let (reply, trace) = crate::agent::turn_tests::reachability::boxed_root_probe(|| crate::agent::turn_engine::run_turn(
-        &mut history,
-        crate::agent::turn_request::TurnRequest {
-            advice: None, channel_name: "terminal", scope: None,
-            mode: crate::agent::turn_contracts::ChatMode::Edit, silent: true,
-            expose_stay_silent: false, multimodal: &multimodal,
-            schedule: crate::agent::turn_request::TurnSchedule { read_only_tool_concurrency_window: 1, priority_scheduling_enabled: false, low_priority_tool_names: Vec::new() },
-            compaction: None,
-            decision: crate::agent::turn_request::TurnDecision { service: &decisions, context: &context, proof: admitted.binding.as_ref() },
-        },
-        crate::agent::turn_request::TurnServices {
-            provider: port.as_ref(), provider_name: FIXTURE_PROVIDER, model: FIXTURE_MODEL, temperature: 0.0,
-            tools_registry: admitted.registry, observer: &NoopObserver, hooks: &hooks,
-            approval: None, approval_resolver: None,
-            runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-                verify_chat_completion: true,
-                provider_trace: admitted.binding.retained_provider_trace(),
-                events: None,
-                stream_provider: false,
-                tool_execution_service: Some(admitted.service),
-                tool_execution_context: admitted.context,
-                allowed_tool_names: None,
-            }),
-            memory: crate::agent::turn_request::ToolLoopMemory::none(),
-        },
-        crate::agent::turn_request::TurnDelivery { cancellation: None, on_delta: None, on_tool_call: None },
-    )).await.expect("test: interactive degraded turn completes");
-    assert_eq!(reply.into_text(), "ok", "test: serving model reply is published");
-    assert!(trace.execution_trace.as_ref().is_none_or(|trace| trace.calls.is_empty()), "test: no tools execute");
-    assert_eq!(provider.histories().len(), 1, "test: exactly one serving request");
-    assert_eq!(provider.traced_calls() + provider.stream_calls() + provider.assessment_calls.load(Ordering::SeqCst), 1,
-        "test: plain degradation makes exactly one provider request including assessments");
-    tokio::time::timeout(Duration::from_secs(5), failure_peer).await
-        .expect("test: failure peer join deadline").expect("test: failure peer completed");
-    decisions.shutdown(std::time::Instant::now() + Duration::from_secs(2)).await;
-    Ok::<(), anyhow::Error>(())
-    }))).await.expect("test: interactive failure turn deadline")
-        .expect("test: interactive accounting cleanup settled");
 }

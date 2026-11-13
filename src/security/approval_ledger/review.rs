@@ -7,8 +7,8 @@ use super::pending::{
 use super::{ApprovalLedger, GrantScope};
 use crate::acl::approval_grant::{ApprovalGrantV2, WitnessKeyring};
 use crate::causal_tree::ids::DecisionId;
-use crate::decision::KeyDomain;
 use crate::memory::{MemoryFabric, MessageEvent};
+use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

@@ -19,7 +19,7 @@ pub(super) fn validate_worker_manifest_with_capability_env(
         "session-worker cannot mix operator and delegated source authority"
     );
     if let Some(source) = &manifest.operator_source {
-        let key = crate::decision::key::DecisionKey::from_worker_channel(
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
             &transport.key,
             &source.publication.workspace,
             &manifest.run_id,
@@ -28,7 +28,7 @@ pub(super) fn validate_worker_manifest_with_capability_env(
         let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
             &source.catalog,
             &key,
-            crate::causal_tree::branch::CatalogGeneration(source.publication.catalog_generation),
+            crate::tools::capability::contract::CatalogGeneration(source.publication.catalog_generation),
         )?;
         let publication = source.publication.verify(&key, &catalog)?;
         anyhow::ensure!(

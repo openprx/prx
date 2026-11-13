@@ -2,10 +2,9 @@
 //! digest can create a record; issuance requires the service's gated context.
 mod h2;
 mod sealed_call;
-use super::{TurnDecisionContext, TurnDecisionService, TurnExecutionDirective};
+use super::{TurnDecisionContext, TurnDecisionService};
 use crate::acl::approval_grant::{ApprovalGrantV2, RiskLevel, WitnessKeyring};
 use crate::causal_tree::ids::DecisionId;
-use crate::decision::KeyDomain;
 use crate::memory::MessageEvent;
 use crate::runtime::turn_source::TurnSourceProof;
 pub(crate) use crate::security::approval_ledger::pending::{
@@ -14,6 +13,7 @@ pub(crate) use crate::security::approval_ledger::pending::{
 };
 use crate::security::approval_ledger::pending::{PendingRecord, VerifiedDecisionApproval, scope_from_source};
 use crate::security::approval_ledger::{ApprovalLedger, ApprovalRuntime};
+use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use chrono::Utc;
 use serde::Deserialize;
@@ -281,7 +281,7 @@ impl TurnDecisionService {
             record.op_ids.as_slice() == [operation.as_str()] && risk == record.approval_risk()?,
             "resume operation or risk changed"
         );
-        let capability = crate::causal_tree::branch::CapabilityRef {
+        let capability = crate::tools::capability::contract::CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
             generation: entry.generation,
@@ -344,7 +344,7 @@ struct ExplicitDecisionResumeRequest {
 
 /// Fresh admitted request plus the authenticated original call. No execution
 /// permission is exposed: re-decision and final durable claim still follow.
-pub(super) struct AdmittedDecisionResume {
+pub(crate) struct AdmittedDecisionResume {
     prepared: PreparedDecisionResume,
     source: MessageEvent,
     receipt: MessageEvent,
@@ -367,6 +367,15 @@ pub(super) struct ExecutionResumeAdapter {
     context: Arc<TurnDecisionContext>,
     proof: crate::runtime::turn_source::OwnedTurnSourceProof,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
+}
+
+/// V-17: the dispatch's published surface exists and contains exactly `name`.
+pub(super) fn published_only(execution_context: &crate::tools::ToolExecutionContext, name: &str) -> bool {
+    execution_context
+        .turn_surface
+        .as_ref()
+        .and_then(|surface| surface.single_published())
+        .is_some_and(|published| published == name)
 }
 
 impl ExecutionResumeAdapter {
@@ -407,11 +416,9 @@ impl crate::tools::capability::execution_binding::DecisionResumeAdapter for Exec
                     .is_some_and(|trace| !trace.is_sealed()),
             "resume call or execution scope changed"
         );
-        let selected = self.service.agent_execution_specs(&self.proof, &self.context)?;
+        // V-17: the resume turn publishes exactly the prepared tool.
         anyhow::ensure!(
-            matches!(self.context.directive, TurnExecutionDirective::Execute { .. })
-                && selected.specs.len() == 1
-                && selected.specs.first().is_some_and(|spec| spec.name == command.name),
+            published_only(execution_context, &command.name),
             "resume call was not selected"
         );
         let [grant] = resume.prepared.approval.grants() else {
@@ -432,7 +439,7 @@ impl crate::tools::capability::execution_binding::DecisionResumeAdapter for Exec
         execution_context: &crate::tools::ToolExecutionContext,
     ) -> anyhow::Result<Box<dyn crate::security::decision_approval::DecisionGrantAuthority>> {
         self.verify(command, execution_context)?;
-        let claimed = self.claim_decision_resume(command).await?;
+        let claimed = self.claim_decision_resume(command, execution_context).await?;
         Ok(Box::new(claimed))
     }
 }
@@ -495,6 +502,7 @@ impl ExecutionResumeAdapter {
     async fn claim_decision_resume(
         &self,
         command: &crate::tools::ToolExecutionCommand,
+        execution_context: &crate::tools::ToolExecutionContext,
     ) -> anyhow::Result<ClaimedDecisionResume> {
         let service = &self.service;
         let proof: &dyn TurnSourceProof = &self.proof;
@@ -507,12 +515,8 @@ impl ExecutionResumeAdapter {
                     && context.execution_trace.get().is_some_and(|trace| !trace.is_sealed()),
                 "resume execution is closed"
             );
-            let selected = service.agent_execution_specs(proof, context)?;
             anyhow::ensure!(
-                matches!(context.directive, TurnExecutionDirective::Execute { .. })
-                    && selected.specs.len() == 1
-                    && selected.specs.first().is_some_and(|spec| spec.name == command.name)
-                    && *command == resume.prepared.command,
+                published_only(execution_context, &command.name) && *command == resume.prepared.command,
                 "resume dispatch differs from the prepared selected call"
             );
             Ok(())
@@ -688,18 +692,16 @@ impl TurnDecisionService {
     }
 }
 
-pub(super) struct ResumeGateEvidence {
-    /// Authenticated original source content, still untrusted decision data.
-    pub(super) original_request: Arc<str>,
-    pub(super) candidate_reference: crate::causal_tree::branch::CapabilityRef,
-    pub(super) calls: std::collections::BTreeMap<crate::causal_tree::branch::CandidateId, [u8; 32]>,
-    pub(super) approvals:
-        std::collections::BTreeMap<[u8; 32], std::collections::BTreeSet<crate::causal_tree::branch::CapabilityRef>>,
-    pub(super) grants: Vec<Arc<str>>,
-    pub(super) causation: Arc<str>,
-}
+/// Zero-sized proof that `AdmittedDecisionResume::gate_evidence` verified a
+/// resume. Only this module constructs it; it moves with that code (R54).
+pub(crate) struct ResumeEvidenceWitness(());
 
 impl AdmittedDecisionResume {
+    /// The prepared command's tool: the only tool a resume turn publishes.
+    pub(crate) fn prepared_tool_name(&self) -> &str {
+        self.prepared.command.name.as_str()
+    }
+
     pub(super) fn original_run(&self) -> &str {
         &self.prepared.approval.pending().record().run_id
     }
@@ -728,9 +730,9 @@ impl AdmittedDecisionResume {
         &self,
         service: &TurnDecisionService,
         proof: &dyn TurnSourceProof,
-    ) -> anyhow::Result<ResumeGateEvidence> {
-        use crate::causal_tree::branch::{CandidateId, CapabilityRef, CausalActionKind, Ns8};
-        use std::collections::{BTreeMap, BTreeSet};
+    ) -> anyhow::Result<crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1> {
+        use crate::tools::capability::contract::CapabilityRef;
+        use crate::tools::capability::resume_evidence::{VerifiedResumeEvidenceV1, VerifiedResumeParts};
         let pending = self.prepared.approval.pending().record();
         anyhow::ensure!(
             self.source.event_id == proof.source_event_id().context("resume source missing")?
@@ -781,30 +783,24 @@ impl AdmittedDecisionResume {
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        Ok(ResumeGateEvidence {
-            original_request: Arc::from(self.prepared.approval.pending().source().content.as_str()),
-            candidate_reference: reference.clone(),
-            calls: BTreeMap::from([
-                (CandidateId::new(CausalActionKind::UseTool, entry.family, None), digest),
-                (
-                    CandidateId::new(
-                        CausalActionKind::UseTool,
-                        entry.family,
-                        Some(Ns8::of(&service.state_key, &entry.namespace)),
-                    ),
-                    digest,
-                ),
-            ]),
-            approvals: BTreeMap::from([(digest, BTreeSet::from([reference]))]),
-            grants: self
-                .prepared
-                .approval
-                .grants()
-                .iter()
-                .map(|grant| Arc::from(grant.grant_id.as_str()))
-                .collect(),
-            causation: Arc::from(self.receipt.event_id.as_str()),
-        })
+        Ok(VerifiedResumeEvidenceV1::from_verified(
+            VerifiedResumeParts {
+                call_digest: digest,
+                capability: reference,
+                family: entry.family,
+                namespace: entry.namespace.clone(),
+                grants: self
+                    .prepared
+                    .approval
+                    .grants()
+                    .iter()
+                    .map(|grant| Arc::from(grant.grant_id.as_str()))
+                    .collect(),
+                causation: Arc::from(self.receipt.event_id.as_str()),
+                original_request: Arc::from(self.prepared.approval.pending().source().content.as_str()),
+            },
+            ResumeEvidenceWitness(()),
+        ))
     }
 }
 

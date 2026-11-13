@@ -295,7 +295,7 @@ pub(super) fn verify_worker_parent_authority(
         wire.workspace == logical_workspace.to_string_lossy(),
         "session-worker parent workspace differs from configuration"
     );
-    let key = crate::decision::key::DecisionKey::load_existing(logical_workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(logical_workspace)?;
     let parent = CapabilityConstraints::from_worker_constraints(&source.parent_constraints, key)?;
     let child = ChildCapabilityManifest::from_worker_manifest(wire, &parent)?;
     let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
@@ -369,7 +369,7 @@ fn owned_worker_future(
 pub(crate) fn worker_child_skill_reader(
     config: &Config,
     catalog: &crate::tools::capability::catalog::CapabilityCatalog,
-    allowed: &std::collections::BTreeSet<crate::causal_tree::branch::CapabilityRef>,
+    allowed: &std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef>,
 ) -> anyhow::Result<crate::tools::SkillReadTool> {
     let references: Vec<_> = allowed.iter().cloned().collect();
     let metadata: Vec<crate::skills::SkillMetadata> = catalog
@@ -1543,7 +1543,7 @@ async fn run_owned_manifest(
         };
         evidence.validate_inventory(worker_result.success)?;
         evidence.seal = constraints.key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"worker-completion-v1",
                 child.parent_authority_id.to_string().as_bytes(),
@@ -1583,7 +1583,7 @@ async fn run_owned_manifest(
         evidence.validate_inventory(worker_result.success)?;
         let (child, constraints) = authority.snapshots().scope.gate_inputs();
         evidence.seal = constraints.key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"ordinary-worker-completion-v1",
                 child.parent_authority_id.to_string().as_bytes(),

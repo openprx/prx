@@ -126,12 +126,12 @@ fn readonly_cost_snapshot_does_not_create_or_migrate_old_storage() -> Result<()>
 
 #[test]
 fn empty_query_rejects_owner_and_caps_without_inventing_eligible_lessons() -> Result<()> {
-    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    let clock = crate::runtime::logical_clock::ManualClock::new();
     crate::skills::lifecycle::adoption::worker_clock::sync_scope(
         Some(std::sync::Arc::clone(&clock)),
         "lesson.lookup-budget",
         || {
-            crate::causal_tree::logical_clock::sync_scope(std::sync::Arc::clone(&clock), || {
+            crate::runtime::logical_clock::sync_scope(std::sync::Arc::clone(&clock), || {
                 let f = fixture();
                 let now = Utc::now();
                 let query = LessonQuery {

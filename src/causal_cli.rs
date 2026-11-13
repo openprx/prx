@@ -818,7 +818,7 @@ impl DecisionPlaneBuilder for HttpPlane {
         &'a self,
         factory: &'a DecisionBackendFactory,
         config: &'a Config,
-        key: Option<Arc<crate::decision::DecisionKey>>,
+        key: Option<Arc<crate::security::runtime_key::DecisionKey>>,
     ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, bool> {
         Box::pin(async move {
             if !factory
@@ -853,7 +853,7 @@ impl DecisionPlaneBuilder for HttpPlane {
         &'a self,
         factory: &'a DecisionBackendFactory,
         config: &'a Config,
-        key: Arc<crate::decision::DecisionKey>,
+        key: Arc<crate::security::runtime_key::DecisionKey>,
         request: &'a crate::decision::DecisionRequest,
         lineage: &'a crate::decision::telemetry::CausalLineage,
     ) -> crate::causal_tree::admin::AdminPlaneFuture<'a, crate::causal_tree::admin::AdminPrediction> {
@@ -892,7 +892,7 @@ impl DecisionPlaneBuilder for HttpPlane {
     fn build(
         &self,
         config: &Config,
-        key: Option<Arc<crate::decision::DecisionKey>>,
+        key: Option<Arc<crate::security::runtime_key::DecisionKey>>,
     ) -> Result<DecisionBackendFactory, FactoryBuildError> {
         let catalog = CatalogView::from_config(config);
         DecisionBackendFactory::from_config(
@@ -917,7 +917,7 @@ fn admin_accounting_error(reason: &str) -> crate::causal_tree::admin::AdminError
 async fn admin_accounting_scope(
     config: &Config,
     factory: &DecisionBackendFactory,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
     operation: &[u8],
     deadline: std::time::Instant,
 ) -> Result<crate::runtime::decision_accounting::AccountingScope> {
@@ -965,12 +965,12 @@ async fn admin_accounting_scope(
     })
     .await??;
     let scope_id = key.hmac(
-        crate::decision::KeyDomain::TerminalClaim,
+        crate::security::runtime_key::KeyDomain::TerminalClaim,
         &[
             b"admin-accounting-v1",
             uuid::Uuid::new_v4().as_bytes(),
             operation,
-            &serde_json::to_vec(&config.causal_tree.backend)?,
+            &serde_json::to_vec(crate::decision_engine::config::effective_engine_backend(&config))?,
         ],
     );
     let budgets = crate::causal_tree::state::TurnBudgets {
@@ -1566,7 +1566,7 @@ mod tests {
             );
             let mut section = crate::causal_tree::config::CausalTreeConfig::default();
             section.backend.kind = crate::causal_tree::config::BackendSelection::Fixed(kind);
-            let selection = crate::decision::factory::configured_selection(&section).expect("test: selection");
+            let selection = crate::decision::factory::configured_selection(&section.backend).expect("test: selection");
             assert_eq!(
                 crate::providers::ProviderId::of(owner),
                 crate::providers::ProviderId::of(&selection.provider),

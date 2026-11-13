@@ -7,7 +7,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn cancelled_store_publication_keeps_blocking_preparation_and_queues_owned() -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
-    let directory = crate::decision::key::prepare_decision_dir(workspace.path()).map_err(anyhow::Error::msg)?;
+    let directory = crate::security::runtime_key::prepare_decision_dir(workspace.path()).map_err(anyhow::Error::msg)?;
     let database = directory.join("decisions.db");
     let blocker = rusqlite::Connection::open(&database)?;
     #[cfg(unix)]

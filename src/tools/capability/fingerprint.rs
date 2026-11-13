@@ -1,4 +1,4 @@
-use crate::causal_tree::branch::SchemaFingerprint;
+use crate::tools::capability::contract::SchemaFingerprint;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};

@@ -1216,32 +1216,10 @@ async fn enabled_engine_adds_brief_but_never_changes_tool_surface() {
     );
 }
 
-#[test]
-fn recorded_pre_switch_directive_replays_unchanged() {
-    let decision_id = "dec-1";
-    let effect = "local_write";
-    let reply = format!(
-        "Approval is required for decision {decision_id} (effect: {effect}). Review this decision before resuming it. The operation has not run."
-    );
-    assert!(
-        crate::agent::terminal::recorded_pre_switch_request_approval_closes(decision_id, effect, &reply),
-        "a recorded RequestApproval hop with its rendered reply must still close"
-    );
-    assert!(
-        !crate::agent::terminal::recorded_pre_switch_request_approval_closes(
-            decision_id,
-            effect,
-            "Could you clarify the result you want?"
-        ),
-        "a RequestApproval hop must not close on a Clarify reply"
-    );
-}
-
-async fn run_plain_fallback_cell(enabled: bool, input: &str) {
+async fn run_plain_fallback_cell(input: &str) {
     let workspace = tempfile::tempdir().expect("test: plain workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
-    config.decision_engine.enabled = enabled;
     config.causal_tree.enabled = true;
     config.causal_tree.backend.kind =
         crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Builtin);
@@ -1249,69 +1227,13 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
     // Pin confidence abstention even when the catalog makes Answer the clear winner.
     config.causal_tree.policy.commit_threshold = 1.0;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
-    let memory: Arc<dyn crate::memory::Memory> =
-        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: entry memory"));
-    // The enabled cell registers the loop's four control tools, as production
-    // does, so the plain fallback can be compared with main's control surface.
-    let registry: Arc<Vec<Box<dyn Tool>>> = if enabled {
-        Arc::new(vec![
-            Box::new(crate::tools::StaySilentTool::new()),
-            Box::new(crate::tools::SkillReadTool::new(
-                workspace.path().to_path_buf(),
-                config.clone(),
-            )),
-            Box::new(crate::tools::TranscriptHistoryLookupTool::new(Arc::clone(&memory))),
-            Box::new(crate::tools::capability::search_tool::CapabilitySearchTool),
-        ])
-    } else {
-        Arc::new(Vec::new())
-    };
-    let admitted = if enabled {
-        // A flat NextAction distribution forces the Answer abstention: with
-        // the control tools registered, the genuine Builtin would commit.
-        crate::runtime::turn_decision::plain_abstention_fixture::with_flat_next_action(
-            crate::agent::turn_tests::reachability::boxed_root_probe(|| {
-                AdmittedTurn::with_prediction_memory(config, input, Arc::clone(&registry), memory)
-            }),
-        )
-        .await
-    } else {
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| {
-            AdmittedTurn::with_config(config, input, Arc::clone(&registry))
-        })
-        .await
-    };
-    if enabled {
-        assert!(
-            matches!(
-                admitted.decision().context.engine().selection,
-                crate::causal_tree::decision_select::Selection::Abstain {
-                    action: crate::causal_tree::branch::CausalActionKind::Answer,
-                    ..
-                }
-            ),
-            "test: exercise an actual Answer abstention: {:?}",
-            admitted.decision().context.engine().selection
-        );
-        assert!(
-            matches!(
-                admitted.decision().context.directive(),
-                crate::causal_tree::directive::TurnExecutionDirective::AnswerDirectly
-            ),
-            "test: the abstention takes the plain-answer path"
-        );
-        assert_eq!(
-            admitted
-                .decision()
-                .context
-                .engine()
-                .prediction
-                .as_ref()
-                .map(|prediction| prediction.served_by),
-            Some(crate::decision::factory::ServedBy::Primary),
-            "test: the scoped flat-NextAction backend serves the prediction"
-        );
-    }
+    // No metadata discovery: this cell must exercise confidence abstention,
+    // rather than the separate committed Answer after a successful catalog read.
+    let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
+    let admitted = crate::agent::turn_tests::reachability::boxed_root_probe(|| {
+        AdmittedTurn::with_config(config, input, Arc::clone(&registry))
+    })
+    .await;
     let published = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let provider = EngineOffProvider {
@@ -1326,13 +1248,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
             .into(),
         ),
     };
-    // The enabled cell advertises skills so main's skill_read publication applies.
-    let system = if enabled {
-        "sys\n<available_skills>\n</available_skills>"
-    } else {
-        "sys"
-    };
-    let mut history = vec![ChatMessage::system(system), ChatMessage::user(input)];
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user(input)];
     let multimodal = crate::config::MultimodalConfig::default();
     let hooks = crate::hooks::HookManager::new(workspace.path().to_path_buf());
     let result = tokio::time::timeout(
@@ -1346,7 +1262,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
                     scope: None,
                     mode: ChatMode::default(),
                     silent: true,
-                    expose_stay_silent: enabled,
+                    expose_stay_silent: false,
                     multimodal: &multimodal,
                     schedule: TurnSchedule {
                         read_only_tool_concurrency_window: 1,
@@ -1361,7 +1277,7 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
                     provider_name: "ollama",
                     model: "prx-local-model",
                     temperature: 0.0,
-                    tools_registry: Arc::clone(&registry),
+                    tools_registry: registry,
                     observer: &crate::observability::NoopObserver,
                     hooks: &hooks,
                     approval: None,
@@ -1386,21 +1302,9 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
         1,
         "test: exactly one serving request"
     );
-    // As on main: a plain fallback answer has no selected capability specs,
-    // but keeps the loop's control tools, offered and never executed. Without
-    // a Switch-mode handoff, main does not publish the transcript lookup.
-    let expected_surface: Vec<String> = if enabled {
-        ["capability_search", "skill_read", "stay_silent"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    assert_eq!(
-        *published.lock().expect("test: surface"),
-        expected_surface,
-        "test: fallback publishes only main's control tools"
+    assert!(
+        published.lock().expect("test: surface").is_empty(),
+        "test: fallback offers zero tools"
     );
     assert!(
         result
@@ -1410,43 +1314,15 @@ async fn run_plain_fallback_cell(enabled: bool, input: &str) {
             .is_none_or(|trace| trace.calls.is_empty()),
         "test: fallback executes zero tools"
     );
-    if enabled {
-        let decision = admitted.decision();
-        assert!(
-            decision
-                .service
-                .agent_execution_specs(decision.proof, decision.context)
-                .expect("test: fallback publication")
-                .specs
-                .is_empty(),
-            "test: fallback selects no capability specs"
-        );
-        decision
-            .service
-            .agent_runtime_dependency_spec(decision.proof, decision.context, "stay_silent")
-            .expect("test: the plain fallback keeps its runtime control dependency");
-    }
 
-    if !enabled {
-        spy.assert_constructs_nothing("blank Direct input");
-    }
-}
-
-#[tokio::test]
-async fn enabled_builtin_low_confidence_run_turn_publishes_plain_answer() {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(true, "Explain `2 + 2`.")),
-    )
-    .await
-    .expect("test: complete turn deadline");
+    spy.assert_constructs_nothing("blank Direct input");
 }
 
 #[tokio::test]
 async fn disabled_blank_direct_run_turn_calls_provider_without_prediction() {
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell(false, "  ")),
+        crate::agent::turn_tests::reachability::boxed_root_probe(|| run_plain_fallback_cell("  ")),
     )
     .await
     .expect("test: complete turn deadline");
@@ -1465,4 +1341,263 @@ async fn disabled_whitespace_agent_entry_is_direct_without_prediction() {
     )
     .await
     .expect("test: whitespace Agent entry deadline");
+}
+
+/// What one Agent turn showed its provider and did, for the on/off comparison.
+struct OpenedTurn {
+    reply: String,
+    provider_requests: usize,
+    tools: Vec<String>,
+    tools_fingerprint: String,
+    systems: Vec<String>,
+    executions: Vec<String>,
+}
+
+/// Runs one Agent turn whose provider calls `project_tool` once and then
+/// answers. The provider records every request's tool list and system text.
+async fn open_agent_turn(enabled: bool, configure: impl FnOnce(&mut crate::config::Config)) -> OpenedTurn {
+    struct ScriptedProvider {
+        requests: Arc<Mutex<Vec<(Vec<String>, String, Vec<String>)>>>,
+        responses: Mutex<VecDeque<ChatResponse>>,
+    }
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+        async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+            anyhow::bail!("fixture requires a structured request")
+        }
+        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            let specs = request.tools.unwrap_or(&[]);
+            let names = specs.iter().map(|spec| spec.name.clone()).collect();
+            let fingerprint = crate::agent::prompt::prompt_sha256(
+                &specs
+                    .iter()
+                    .map(|spec| format!("{}\u{0}{}\u{0}{}", spec.name, spec.description, spec.parameters))
+                    .collect::<Vec<_>>()
+                    .join("\u{1}"),
+            );
+            let systems = request
+                .messages
+                .iter()
+                .filter(|message| message.role == "system")
+                .map(|message| message.content.clone())
+                .collect();
+            self.requests
+                .lock()
+                .expect("test: requests")
+                .push((names, fingerprint, systems));
+            self.responses
+                .lock()
+                .expect("test: scripted responses")
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted"))
+        }
+    }
+    let workspace = tempfile::tempdir().expect("test: switch workspace");
+    let mut config = engine_off_config(workspace.path());
+    config.decision_engine.enabled = enabled;
+    config.tool_tiering.always_include.push("project_tool".into());
+    configure(&mut config);
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: switch sqlite"));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        requests: Arc::clone(&requests),
+        responses: Mutex::new(
+            vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "project_tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+            ]
+            .into(),
+        ),
+    };
+    let mut agent = crate::agent::agent::Agent::builder()
+        .runtime_config(config, "ollama")
+        .workspace_dir(workspace.path().to_owned())
+        .provider(Box::new(provider))
+        .tools(vec![Box::new(RecordingTool {
+            name: "project_tool".to_owned(),
+            execution_order: Arc::clone(&executions),
+        }) as Box<dyn Tool>])
+        .memory(memory)
+        .observer(Arc::new(crate::observability::NoopObserver))
+        .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+        .build()
+        .expect("test: switch agent");
+    let reply = agent.turn("run the project tool").await.expect("test: turn is served");
+    let requests = requests.lock().expect("test: requests").clone();
+    let (tools, tools_fingerprint, systems) = requests.first().cloned().expect("test: one provider request");
+    OpenedTurn {
+        reply,
+        provider_requests: requests.len(),
+        tools,
+        tools_fingerprint,
+        systems,
+        executions: executions.lock().expect("test: executions").clone(),
+    }
+}
+
+const BRIEF_MARKER: &str = "Decision advice (advisory only):";
+
+/// R9 (P1-I1): engine-on equals engine-off plus the advisory brief. With a
+/// zero-cost (builtin) backend the provider sees the same tool list and tool
+/// fingerprint, the same tool executes once, and the same reply is published;
+/// only the brief differs. A policy that forced the retired hop to abstain
+/// (refuse or clarify) no longer changes anything: one provider request, one
+/// execution, a published reply.
+#[tokio::test]
+async fn engine_on_and_off_open_identical_turns() {
+    let off = Box::pin(open_agent_turn(false, |_| {})).await;
+    let on = Box::pin(open_agent_turn(true, |_| {})).await;
+    assert_eq!(on.reply, off.reply, "same published reply");
+    assert_eq!(on.tools, off.tools, "same provider tool list");
+    assert_eq!(on.tools_fingerprint, off.tools_fingerprint, "same tool fingerprint");
+    assert_eq!(on.executions, off.executions, "same executions");
+    assert_eq!(off.executions, vec!["project_tool".to_owned()]);
+    assert_eq!(on.provider_requests, off.provider_requests, "same provider requests");
+    assert!(off.systems.iter().all(|text| !text.contains(BRIEF_MARKER)));
+    assert!(on.systems.iter().any(|text| text.contains(BRIEF_MARKER)));
+    let without_brief = |systems: &[String]| -> Vec<String> {
+        systems
+            .iter()
+            .map(|text| {
+                text.find(BRIEF_MARKER)
+                    .map_or_else(|| text.clone(), |at| text[..at].trim_end().to_owned())
+            })
+            .filter(|text| !text.is_empty())
+            .collect()
+    };
+    assert_eq!(
+        without_brief(&on.systems),
+        without_brief(&off.systems),
+        "engine-on adds only the brief"
+    );
+
+    // Pin the policy that made the retired hop abstain on every input.
+    let abstaining = Box::pin(open_agent_turn(true, |config| {
+        config.causal_tree.policy.commit_threshold = 1.0;
+    }))
+    .await;
+    assert_eq!(abstaining.reply, off.reply, "an abstaining backend never refuses");
+    assert_eq!(abstaining.provider_requests, off.provider_requests);
+    assert_eq!(abstaining.executions, off.executions);
+    assert_eq!(abstaining.tools, off.tools);
+}
+
+/// R9.5 / P1-I3: a priced analysis that does not fit the turn's remaining
+/// budget plus the first send's minimum is skipped (no backend attempt, no
+/// analysis); with ample budget it runs on the turn's own accounting scope.
+/// An engine-on turn whose analysis is skipped is still served, without a
+/// brief.
+#[tokio::test]
+async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
+    use crate::runtime::decision_advisory::DecisionAdvisory;
+    use crate::runtime::decision_advisory::tests::{RecordingBackend, analysis_input, enabled_config};
+    let temp = tempfile::tempdir().expect("test: budget workspace");
+    let mut config = (*enabled_config(temp.path())).clone();
+    config.decision_engine.backend = Some(crate::causal_tree::config::DecisionBackendConfig {
+        kind: crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::Mock),
+        model: "recording-model".into(),
+        ..Default::default()
+    });
+    config.cost.prices.insert(
+        crate::config::schema::usage_pricing_key("mock", "recording-model"),
+        crate::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    let config = Arc::new(config);
+    let key = crate::causal_tree::state::fixtures::key();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let advisory_with = |attempts: &Arc<std::sync::atomic::AtomicUsize>| {
+        let factory = crate::decision::factory::DecisionBackendFactory::from_slots(
+            vec![Box::new(RecordingBackend {
+                identity: crate::decision::BackendIdentity {
+                    kind: crate::decision::BackendKind::Mock,
+                    provider: None,
+                    configured_model: Arc::from("recording-model"),
+                },
+                key: Arc::clone(&key),
+                attempts: Arc::clone(attempts),
+                request_bytes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            })],
+            Arc::clone(&key),
+            crate::decision::outbound::OutboundSecrets::default(),
+            crate::decision::factory::SlotLimits::default(),
+        );
+        DecisionAdvisory::new(Arc::clone(&config), Some(factory))
+    };
+
+    // Tight: the remaining budget cannot pay the worst case plus the first send.
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let advisory = advisory_with(&attempts);
+    let mut tight = analysis_input(&config, &key, advisory.request_limits());
+    tight.remaining = (1, 1);
+    tight.first_send_minimum = Some((1, 1));
+    assert!(advisory.analyze(tight, &cancellation).await.is_none(), "no analysis");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no backend attempt"
+    );
+
+    // Ample: the analysis runs and is handed the turn's accounting scope.
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let advisory = advisory_with(&attempts);
+    let ample = analysis_input(&config, &key, advisory.request_limits());
+    assert!(advisory.analyze(ample, &cancellation).await.is_some(), "analysis runs");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one attempt charged to the turn's accounting scope"
+    );
+
+    // Served: an engine-on turn whose priced analysis cannot be afforded
+    // (no price for the remote decision model) is answered without a brief.
+    let served = Box::pin(open_agent_turn(true, |config| {
+        config.decision_engine.backend = Some(crate::causal_tree::config::DecisionBackendConfig {
+            kind: crate::causal_tree::config::BackendSelection::Fixed(crate::decision::BackendKind::CompatibleHttp),
+            remote_enabled: true,
+            endpoint: "https://example.invalid/v1".into(),
+            model: "decision-model".into(),
+            ..Default::default()
+        });
+        config.providers.models.push(
+            serde_json::from_value(serde_json::json!({
+                "provider": "custom:https://example.invalid/v1",
+                "model": "decision-model",
+                "operations": ["decision_endpoint"],
+            }))
+            .expect("test: decision model declaration"),
+        );
+    }))
+    .await;
+    assert_eq!(served.reply, "done", "the request is served");
+    assert_eq!(served.provider_requests, 2, "the turn is not refused or shortened");
+    assert_eq!(served.executions, vec!["project_tool".to_owned()]);
+    assert!(
+        served.systems.iter().all(|text| !text.contains(BRIEF_MARKER)),
+        "a skipped analysis adds no brief"
+    );
 }

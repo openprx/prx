@@ -39,8 +39,13 @@ gates. The prompt budget is 50–2000 tokens and candidates is 1–20.
 `backend` is optional and uses the decision plane's backend configuration and
 remote-processing restrictions. Explicit `[decision_engine.backend]` wins over
 legacy `[causal_tree.backend]`; an explicit empty table selects defaults.
-The advisory path currently projects already validated answers and does not
-fetch backend credentials itself.
+The advisory driver (`runtime/decision_advisory.rs`) is the only caller of the
+prediction path. Every turn opens without it; the analysis runs afterwards
+within `timeout_ms` and is charged to the turn's own accounting scope. When
+the remaining tokens or money do not cover the analysis worst case plus the
+first send's minimum admission, the analysis is skipped; the request is never
+refused because of the engine. A brief that does not fit the first send's
+token budget is dropped. Builtin and cache hits spend nothing.
 
 ## Telemetry and diagnostics
 
@@ -53,7 +58,8 @@ and increment the store-error counter. Shutdown closes admission and drains
 accepted outcomes until its deadline; late advisory telemetry warns without
 failing catalog retirement. Catalog and causal writes retain their hard checks.
 
-Gateway status and doctor report enabled/mode, configured backend kind, cap,
+Gateway status and doctor report enabled/mode, configured backend kind, the
+effective cap (always 0 in `pre` mode, which records no outcomes),
 queue depth, dropped count and store errors, without endpoints or credentials.
 Counters cover live engine queues in the current process and workspace; a
 separate doctor process reports zero runtime counters, not daemon totals.

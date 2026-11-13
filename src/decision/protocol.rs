@@ -26,8 +26,8 @@ use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 
 use super::error::{DecisionError, RequestRule, ValidationRule};
-use super::key::DecisionKey;
 use crate::providers::ProviderId;
+use crate::security::runtime_key::DecisionKey;
 
 /// The decision protocol version PRX speaks.
 pub const PROTOCOL_VERSION: u16 = 1;

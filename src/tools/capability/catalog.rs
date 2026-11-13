@@ -3,12 +3,12 @@ pub(crate) mod process_snapshot;
 use super::fingerprint::tool_spec_fingerprint;
 use crate::acl::approval_grant::RiskLevel;
 use crate::capability::{CapabilityAvailability, CapabilityAvailabilityLevel};
-use crate::causal_tree::branch::{
+use crate::security::runtime_key::DecisionKey;
+use crate::skills::SkillMetadata;
+use crate::tools::capability::contract::{
     ApprovalRequirement, CapabilityId, CapabilityRef, CapabilityTarget, CatalogGeneration, OpId, SchemaFingerprint,
     SideEffectClass,
 };
-use crate::decision::key::DecisionKey;
-use crate::skills::SkillMetadata;
 use crate::tools::execution::{ToolAdapterKind, ToolCatalog, ToolDescriptor, ToolEffect, ToolExecutionService};
 use crate::tools::mcp::McpCapabilitySpec;
 use crate::tools::traits::{Tool, ToolCategory, ToolSpec};
@@ -129,9 +129,9 @@ impl CapabilityEntry {
     /// Aliases/effect labels never substitute for the registered root.
     pub(crate) fn plan_intercepted(&self) -> bool {
         match &self.target {
-            ExecutionTarget::Tool(name) => crate::causal_tree::capability_policy::plan_intercepts_tool(name),
+            ExecutionTarget::Tool(name) => crate::tools::capability::policy::plan_intercepts_tool(name),
             ExecutionTarget::Skill { root, .. } | ExecutionTarget::Node { root, .. } => {
-                crate::causal_tree::capability_policy::plan_intercepts_tool(root)
+                crate::tools::capability::policy::plan_intercepts_tool(root)
             }
             ExecutionTarget::Hook => true,
         }
@@ -609,7 +609,7 @@ impl CapabilityCatalog {
     pub(crate) fn check_published_parity(
         &self,
         exec: &ToolExecutionService,
-        allowed: &std::collections::BTreeSet<crate::causal_tree::branch::CapabilityRef>,
+        allowed: &std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef>,
     ) -> Result<(), ParityError> {
         for reference in allowed {
             let entry = self
@@ -1882,7 +1882,7 @@ mod tests {
             Box::new(DocumentCategoryProbe("document_sync")),
         ];
         let catalog = CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).unwrap();
-        let key = crate::decision::DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::DecisionKey::ephemeral();
         let snapshot = catalog.bind_process(&key).unwrap();
         let restored = CapabilityCatalog::restore_process(&snapshot, &key, *catalog.generation()).unwrap();
         for (name, family) in [

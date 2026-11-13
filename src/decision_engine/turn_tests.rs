@@ -264,8 +264,13 @@ fn process_seal_matches_inherited_backend_and_rejects_changed_override() {
     config.causal_tree.backend.timeout_ms = 2_000;
     let generation = crate::config::new_shared(config.clone()).pin();
     let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-engine-seal-fixture");
-    let key = crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")
-        .unwrap();
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &transport,
+        "prx-workspace",
+        "prx-run",
+        "prx-config",
+    )
+    .unwrap();
     let binding = generation.bind_process(&key).unwrap();
     config.decision_engine.backend = Some(config.causal_tree.backend.clone());
     crate::config::ConfigGeneration::restore_process(config.clone(), &binding, &key).unwrap();

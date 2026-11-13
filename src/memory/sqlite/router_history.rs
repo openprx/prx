@@ -12,7 +12,7 @@ use std::time::Instant;
 
 fn check(deadline: Instant) -> anyhow::Result<()> {
     anyhow::ensure!(
-        crate::causal_tree::logical_clock::deadline_now(deadline) < deadline,
+        crate::runtime::logical_clock::deadline_now(deadline) < deadline,
         "Router history deadline expired"
     );
     Ok(())
@@ -140,7 +140,7 @@ impl SqliteMemory {
         evidence.validate(deadline)?;
         let pool = Arc::clone(&self.pool);
         #[cfg(test)]
-        let hook_clock = crate::causal_tree::logical_clock::capture();
+        let hook_clock = crate::runtime::logical_clock::capture();
         {
             let work = move || {
                 #[cfg(test)]
@@ -199,7 +199,7 @@ impl SqliteMemory {
                 Ok(result)
             };
             #[cfg(test)]
-            let work = crate::causal_tree::logical_clock::inherit_sync(work);
+            let work = crate::runtime::logical_clock::inherit_sync(work);
             crate::runtime::blocking::spawn_blocking(work)
         }
         .await?
@@ -263,7 +263,7 @@ impl SqliteMemory {
             Ok(RouterHistoryCommitReceipt {terminal_event_id:event.event_id.clone(),record_sha256,replayed:false})
         };
             #[cfg(test)]
-            let work = crate::causal_tree::logical_clock::inherit_sync(work);
+            let work = crate::runtime::logical_clock::inherit_sync(work);
             crate::runtime::blocking::spawn_blocking(work)
         }.await?
     }
@@ -313,7 +313,7 @@ mod clock_tests {
 
     #[test]
     fn default_read_check_still_expires_on_the_unchanged_wall_deadline() {
-        assert!(!crate::causal_tree::logical_clock::installed());
+        assert!(!crate::runtime::logical_clock::installed());
         let deadline = Instant::now() + std::time::Duration::from_millis(100);
         std::thread::sleep(std::time::Duration::from_millis(150));
         let error = check(deadline).expect_err("test: default reader must reject its expired wall deadline");

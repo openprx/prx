@@ -27,13 +27,13 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::branch::{CapabilityTarget, CausalActionKind};
 use super::ids::DecisionId;
 use super::store::{
     CausalDecisionStore, DecisionRecord, Enqueue, ImportProgress, RecordLineage, RecordedCandidate,
     RecordedDistributions, RecordedShadow, StoreError,
 };
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
+use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
 
 /// The longest v1 line read; a longer one is counted as malformed.
 const MAX_LINE_BYTES: u64 = 1 << 20;

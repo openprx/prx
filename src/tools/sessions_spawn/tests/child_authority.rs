@@ -26,7 +26,7 @@ async fn read_plan(worker: &WorkerManifest, version: u8, batch: &str) -> Result<
     let memory_dir = tempfile::tempdir()?;
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(memory_dir.path())?);
     let fabric = MemoryFabric::new(memory, workspace.to_string_lossy().into_owned());
-    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
     batch_journal::record_plan_fixture(
         fabric.clone(),
         key,
@@ -82,7 +82,7 @@ fn completed_child_fixture(
                     .context("test: capability manifest")?
                     .parent_decision_id
                     .clone();
-                let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+                let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
                 // The signed launch row must describe this manifest and an eligible, non-legacy parent.
                 let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
                     .context("test: launch parent authority row")?;
@@ -207,7 +207,7 @@ fn decision_evidence_roundtrips_typed_columns() -> Result<()> {
     use rusqlite::types::Value;
 
     let tmp = tempfile::tempdir()?;
-    let key = crate::decision::DecisionKey::load_or_create(tmp.path())?;
+    let key = crate::security::runtime_key::DecisionKey::load_or_create(tmp.path())?;
     let record = testing::record(
         DecisionId::new_runtime(),
         "store-ws-1",
@@ -260,7 +260,7 @@ fn decision_evidence_rejects_scope_substitution() -> Result<()> {
     use crate::runtime::child_source::authority_journal as journal;
 
     let tmp = tempfile::tempdir()?;
-    let key = crate::decision::DecisionKey::load_or_create(tmp.path())?;
+    let key = crate::security::runtime_key::DecisionKey::load_or_create(tmp.path())?;
     let record = testing::record(
         DecisionId::new_runtime(),
         "store-ws-1",
@@ -296,7 +296,7 @@ fn decision_evidence_rejects_scope_substitution() -> Result<()> {
 /// Everything a reopened restart needs. Plain data only, with no live handle.
 struct ReopenedChild {
     workspace: PathBuf,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
     expected: ChildOutcomeRow,
     launch_version: u8,
 }
@@ -326,7 +326,7 @@ async fn reopened_child_evidence(manifest: &WorkerManifest, result: &WorkerResul
         memory,
         manifest.memory_workspace_id.clone().context("test: memory workspace")?,
     );
-    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
     let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
         .context("test: launch parent authority row")?;
     let store = CausalDecisionStore::open_unshared_read_only(&workspace);
@@ -612,7 +612,7 @@ fn evidence_digest(columns: &[(&'static str, rusqlite::types::Value)]) -> Result
 /// Replaces the single `decision_evidence` row of one decision, test-only.
 fn replace_evidence_row(
     workspace: &std::path::Path,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     store_workspace: &str,
     owner: &str,
     decision: &str,
@@ -630,7 +630,7 @@ fn replace_evidence_row(
 
 /// Points the last signed hop at `digest` and reseals the marker with its assistant.
 fn reseal_last_hop(
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     event: &mut crate::memory::MessageEvent,
     digest: &str,
     assistant: Option<&crate::memory::MessageEvent>,
@@ -678,7 +678,7 @@ async fn terminal_replay_refuses_hop_digest_substitution() -> Result<()> {
         memory,
         manifest.memory_workspace_id.clone().context("test: memory workspace")?,
     );
-    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
     let mut terminal = fabric
         .memory()
         .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{terminal_id}:final"))
@@ -985,7 +985,7 @@ async fn launch_v3_succeeds_with_matching_parent_row() -> Result<()> {
             .context("test: capability manifest")?
             .parent_decision_id
             .clone();
-        let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
         let authority_before = journal_entries(&workspace, AUTHORITY_ENTRIES)?;
         let launch_before = journal_entries(&workspace, LAUNCH_ENTRIES)?;
         let launch = authority_journal::read_launch_parent(&workspace, &manifest.run_id, &key)?
@@ -1030,7 +1030,7 @@ fn owner_evidence(db: &rusqlite::Connection, store_workspace: &str, owner: &str)
 async fn replay_candidate(
     memory: &dyn Memory,
     workspace: &std::path::Path,
-    key: &Arc<crate::decision::DecisionKey>,
+    key: &Arc<crate::security::runtime_key::DecisionKey>,
     store_workspace: &str,
     scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
     lineage: &crate::causal_tree::store::ChildRecoveryLineage,
@@ -1297,7 +1297,7 @@ async fn non_worker_child_replays_with_parent_evidence() -> Result<()> {
     // Reopen memory, fabric and key; only the journals remain.
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.as_path())?);
     let fabric = MemoryFabric::new(memory, workspace.to_string_lossy().into_owned());
-    let key = crate::decision::DecisionKey::load_existing(&workspace)?;
+    let key = crate::security::runtime_key::DecisionKey::load_existing(&workspace)?;
     let marker = fabric
         .memory()
         .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{terminal_id}:final"))

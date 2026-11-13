@@ -3,7 +3,7 @@
 //! The observer receives ordinary phase events synchronously. Applied events
 //! notify it only after winning durable insertion; crash recovery can retain
 //! the durable event without a notification. A single task writes a
-//! metadata-only copy to `message_events` with admission-local ordering; no prompt, state,
+//! metadata-only copy to `message_events` in arrival order; no prompt, state,
 //! request/response, endpoint, or configured model enters this copy.
 
 use std::sync::Arc;
@@ -19,19 +19,16 @@ use crate::decision::telemetry::{
 use crate::memory::{Memory, MemoryVisibility, MessageEventInput, MessageEventSource};
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
-// Ordinary events retain permits through deferred persistence. Control has
-// its own bounded channel, independent of the full ordinary backlog.
+// Ordinary events retain permits until they are persisted. Control has its
+// own bounded channel, independent of the full ordinary backlog.
 const ORDINARY_QUEUE_CAPACITY: usize = EVENT_QUEUE_CAPACITY - 1;
 
-mod deferral;
 pub(crate) mod routes;
 mod worker;
-pub(super) use deferral::PersistenceGuard;
 
 struct QueuedEvent {
     memory: Arc<routes::EventMemory>,
     event: Box<CausalEvent>,
-    deferral: Option<Arc<deferral::AdmissionDeferral>>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -59,7 +56,6 @@ pub(crate) struct DurableCausalEventSink {
     observer: Arc<dyn CausalEventSink>,
     queue: mpsc::Sender<QueuedEvent>,
     control_queue: mpsc::Sender<QueueItem>,
-    deferral: Arc<deferral::PersistenceDeferral>,
     ordinary_slots: Arc<Semaphore>,
 }
 
@@ -79,8 +75,6 @@ impl DurableCausalEventSink {
         let replay_workspace = workspace_id.clone();
         let replay_revision = config_source_revision.clone();
         let worker_observer = Arc::clone(&observer);
-        let deferral = Arc::new(deferral::PersistenceDeferral::default());
-        let worker_deferral = Arc::clone(&deferral);
         handle.spawn(
             worker::Worker {
                 receiver,
@@ -89,14 +83,12 @@ impl DurableCausalEventSink {
                 workspace: workspace_id,
                 generation: config_generation_id,
                 revision: config_source_revision,
-                deferral: worker_deferral,
             }
             .run(),
         );
         Ok(Self {
             store_namespace: Default::default(),
             ordinary_slots: Arc::new(Semaphore::new(ORDINARY_QUEUE_CAPACITY)),
-            deferral,
             observer,
             queue,
             control_queue,
@@ -115,12 +107,6 @@ impl DurableCausalEventSink {
             );
         }
         Ok(())
-    }
-
-    /// A source-bound admission may defer only its own ordinary events. Drain
-    /// overrides that preference; deferral expires at the admission deadline.
-    pub(super) fn defer_ordinary_persistence(&self, lineage: &CausalLineage, deadline: Instant) -> PersistenceGuard {
-        self.deferral.begin(lineage, deadline)
     }
 
     /// Wait at most until `deadline` for every event queued before this marker.
@@ -266,11 +252,9 @@ impl CausalEventSink for DurableCausalEventSink {
             }
             routes::EventMemory::fallback(memory, self.generation_id, &self.revision)
         };
-        let deferred = self.deferral.for_event(&event.lineage);
         let queued = QueuedEvent {
             memory,
             event: Box::new(event),
-            deferral: deferred,
             _permit: permit,
         };
         if let Err(failed) = self.queue.try_send(queued) {

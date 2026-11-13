@@ -2260,7 +2260,7 @@ async fn run_console_message_job_work(
                         }
                     }
                     .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
-                    let advice = service.analyze_advisory(&context, &cancellation).await;
+                    let advice = service.advisory().analyze_turn(context.runtime(), &cancellation).await;
                     Ok::<_, String>((service, context, advice))
                 }
                 .await;
@@ -3304,7 +3304,7 @@ mod tests {
                     matches!(
                         context.engine().selection,
                         crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                            if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
                     ),
                     "console plain message must commit Answer: {:?}",
                     context.engine().selection
@@ -3548,33 +3548,14 @@ mod tests {
                     console_test_source(&mut state, envelope, INPUT).await;
                 let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
                 let cancellation = tokio_util::sync::CancellationToken::new();
-                let (context, observed) = crate::causal_tree::decision_engine::original_observation::capture(
-                    "console-owned-file-window-diagnostic",
-                    service.open_issued_turn_context(
+                let context = service
+                    .open_issued_turn_context(
                         &proof,
                         crate::runtime::turn_decision::AgentTurnKind::SingleShot,
                         &cancellation,
-                    ),
-                ).await.expect("bounded actual Console decision observation");
-                let context = context.unwrap();
-                let hops = context.audit_hops().collect::<Vec<_>>();
-                let diagnostic = hops.iter().map(|hop| serde_json::json!({
-                    "decision_id":hop.decision_id.to_string(),
-                    "selection":format!("{:?}", hop.selection),
-                    "fallback_cause":format!("{:?}", hop.fallback_cause),
-                    "factory_prediction":format!("{:?}", hop.prediction),
-                    "factory_attempts":hop.prediction.as_ref().map(|prediction| format!("{:?}", prediction.attempts)),
-                    "request_compiled":hop.request_compiled,
-                    "scored_count":hop.scored_count,
-                    "candidates":format!("{:?}", hop.candidates),
-                    "post_rehearsal":format!("{:?}", hop.post_rehearsal),
-                    "pre_commit":format!("{:?}", hop.pre_commit),
-                    "audit":format!("{:?}", hop.audit_trace),
-                })).collect::<Vec<_>>();
-                eprintln!("actual_console_window_hops={}", serde_json::to_string(&diagnostic).unwrap());
-                let sidecar = observed.checked_sidecar(&hops);
-                eprintln!("actual_console_window_original={sidecar:?}");
-                sidecar.expect("original objects must match the actual returned hop inventory");
+                    )
+                    .await
+                    .expect("bounded actual Console decision");
                 let decision = ConsoleDecisionTurn {
                     service: service.clone(),
                     context,

@@ -118,36 +118,6 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         .expect("exclusive returned context")
         .service_id = service.service_id;
     let writer = service.store.writer().expect("writable decision store");
-    for n in 1_u8..=5 {
-        let decision_id = DecisionId::new_runtime();
-        let mut row = crate::causal_tree::store::testing::record(
-            decision_id,
-            proof.workspace_id(),
-            Some(proof.owner_id()),
-            chrono::Utc::now().timestamp_millis() + i64::from(n),
-        );
-        row.catalog_generation = context.catalog_generation().to_hex();
-        assert_eq!(writer.record_decision(row), crate::causal_tree::store::Enqueue::Queued);
-        assert!(
-            writer.drain(Instant::now() + Duration::from_secs(5)).await,
-            "decision row must commit before its synthetic outcome"
-        );
-        crate::causal_tree::store::testing::write_single_call_latency(
-            workspace.path(),
-            decision_id,
-            &format!("prx_latency_{n}"),
-            "native_tool:prx_project:read",
-            u32::from(n) * 10,
-        );
-    }
-    assert_eq!(
-        service
-            .observed_capability_latency(proof.owner_id(), context.catalog_generation())
-            .await
-            .get("native_tool:prx_project:read"),
-        Some(&30),
-        "the service must use the store's stable workspace ID"
-    );
     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), proof.workspace_id());
     let now = chrono::Utc::now();
     let terminal = crate::agent::terminal::finalize_turn(
@@ -827,9 +797,9 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let (_, completed_context, completed_scope) =
         fresh_terminal_run(&reopened, &generation, Arc::clone(&memory), "prx_completed_rejoin_run").await;
     let (expected_classification, completed_outcome) = match completed_context.terminal_outcome_action() {
-        Some(crate::causal_tree::branch::CausalActionKind::Clarify) => ("clarification", None),
-        Some(crate::causal_tree::branch::CausalActionKind::Refuse) => ("refusal", None),
-        Some(crate::causal_tree::branch::CausalActionKind::Answer) => (
+        Some(crate::tools::capability::contract::CausalActionKind::Clarify) => ("clarification", None),
+        Some(crate::tools::capability::contract::CausalActionKind::Refuse) => ("refusal", None),
+        Some(crate::tools::capability::contract::CausalActionKind::Answer) => (
             "success",
             Some(crate::llm::route_decision::ProviderExecutionOutcome {
                 prepared_parameters: Vec::new(),

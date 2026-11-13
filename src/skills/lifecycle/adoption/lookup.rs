@@ -52,7 +52,7 @@ impl LessonLimits {
 }
 
 pub(super) struct LookupBudget {
-    /// Captured from [`crate::causal_tree::logical_clock::now`].
+    /// Captured from [`crate::runtime::logical_clock::now`].
     /// No installed clock means wall time, so production still spends the
     /// real `elapsed_ms` budget. A test clock stays put until the test
     /// advances it, so a wall stall does not exhaust the lookup.
@@ -64,7 +64,7 @@ impl LookupBudget {
     pub fn new(limits: LessonLimits) -> Result<Self, LifecycleError> {
         limits.validate()?;
         Ok(Self {
-            started: crate::causal_tree::logical_clock::now(),
+            started: crate::runtime::logical_clock::now(),
             limits,
             stats: LessonSnapshotStats::default(),
         })
@@ -82,7 +82,7 @@ impl LookupBudget {
                 std::thread::sleep(Duration::from_millis(stall_ms));
             }
         }
-        let elapsed = crate::causal_tree::logical_clock::now().saturating_duration_since(self.started);
+        let elapsed = crate::runtime::logical_clock::now().saturating_duration_since(self.started);
         self.stats.elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         if elapsed > Duration::from_millis(self.limits.elapsed_ms) {
             return Err(refusal(
@@ -277,10 +277,10 @@ mod tests {
     /// Advancing the logical clock past the same cap must still refuse.
     #[tokio::test]
     async fn lookup_budget_ignores_a_wall_stall_and_expires_on_logical_time() {
-        let clock = crate::causal_tree::logical_clock::ManualClock::new();
+        let clock = crate::runtime::logical_clock::ManualClock::new();
         let limits = LessonLimits::default();
         let stalled = std::sync::Arc::clone(&clock);
-        let refused = crate::causal_tree::logical_clock::scope(clock, async move {
+        let refused = crate::runtime::logical_clock::scope(clock, async move {
             let mut budget = LookupBudget::new(limits).expect("test: limits");
             std::thread::sleep(Duration::from_millis(limits.elapsed_ms.saturating_add(50)));
             budget

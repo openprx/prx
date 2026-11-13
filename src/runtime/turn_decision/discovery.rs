@@ -4,13 +4,11 @@ use super::{
     Arc, BTreeMap, BTreeSet, CapabilityAvailabilityLevel, CapabilityRef, CatalogScope, Exposure, GateInputs, Ordering,
     TurnDecisionContext, TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
 };
-use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CausalActionKind};
 use crate::tools::ToolSpec;
+use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, CausalActionKind};
 use crate::tools::capability::search::CatalogSearch;
 use crate::tools::capability::search_tool::CapabilitySearchPort;
 pub(super) use append::DiscoveryAdmission;
-#[cfg(test)]
-pub(super) use append::MAX_DISCOVERED_TOOLS_PER_TURN;
 
 pub(super) use crate::tools::capability::search_tool::DiscoveryOffers;
 use crate::tools::capability::search_tool::{DiscoveryEntry, DiscoveryScope};
@@ -70,7 +68,7 @@ impl TurnDecisionService {
             ) && (entry.supports_metadata_discovery()
                 || matches!(entry.exposure, Exposure::Direct) && (offered_direct.contains(&entry.id) || core))
                 && (!trusted.owner_isolated()
-                    || crate::causal_tree::capability_policy::admits_owner_isolated_identity(
+                    || crate::tools::capability::policy::admits_owner_isolated_identity(
                         &entry.public_name,
                         &entry.root,
                     )
@@ -88,7 +86,7 @@ impl TurnDecisionService {
                     .any(|code| code.as_str() == "intercepts_writes")
                     && entry.plan_intercepted())
                 && !(trusted.side_effect_mode == crate::causal_tree::state::SideEffectMode::ReadOnly
-                    && entry.effect > crate::causal_tree::branch::SideEffectClass::ReadOnly)
+                    && entry.effect > crate::tools::capability::contract::SideEffectClass::ReadOnly)
                 && (trusted.channel.is_none() || entry.channel_eligible)
                 && proof.child_scope().is_none_or(|scope| {
                     scope.gate_inputs().0.allowed.iter().any(|reference| {
@@ -142,7 +140,9 @@ impl TurnDecisionService {
         context: &TurnDecisionContext,
     ) -> anyhow::Result<Vec<CapabilityTarget>> {
         self.agent_execution_specs(proof, context)?;
-        Ok(super::discovery_scope(context.audit_hops())?.into_iter().collect())
+        // The retired prediction hop (R9) was the only source of a selected
+        // discovery family.
+        Ok(Vec::new())
     }
 
     /// Stable control definition, separate from the selected business refs and
@@ -228,15 +228,13 @@ impl TurnDecisionService {
                 )
             })
         });
-        let selected_filesystem = super::discovery_scope(context.audit_hops()).ok().flatten()
-            == Some(CapabilityTarget::Filesystem)
-            || matches!(context.directive(), TurnExecutionDirective::Execute { .. })
-                && context.execution_refs.iter().any(|reference| {
-                    view.entry_any(&reference.id).is_some_and(|entry| {
-                        entry.family == CapabilityTarget::Filesystem
-                            && entry.effect <= crate::causal_tree::branch::SideEffectClass::LocalWrite
-                    })
-                });
+        let selected_filesystem = matches!(context.directive(), TurnExecutionDirective::Execute { .. })
+            && context.execution_refs.iter().any(|reference| {
+                view.entry_any(&reference.id).is_some_and(|entry| {
+                    entry.family == CapabilityTarget::Filesystem
+                        && entry.effect <= crate::tools::capability::contract::SideEffectClass::LocalWrite
+                })
+            });
         let mut entries =
             CatalogSearch::exact_mentions(&view, context.engine.state.routing_input.as_str(), 64).unwrap_or_default();
         if selected_skill || selected_filesystem {
@@ -244,7 +242,7 @@ impl TurnDecisionService {
                 matches!(entry.exposure, Exposure::Direct)
                     && (selected_skill
                         || entry.family == CapabilityTarget::Filesystem
-                            && entry.effect <= crate::causal_tree::branch::SideEffectClass::LocalWrite)
+                            && entry.effect <= crate::tools::capability::contract::SideEffectClass::LocalWrite)
             }));
         }
         entries

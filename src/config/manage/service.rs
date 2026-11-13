@@ -766,7 +766,7 @@ fn uses_of(config: &Config, id: &ProviderId) -> Vec<String> {
             names.push(name);
         }
     }
-    if let Some(selection) = crate::decision::factory::configured_selection(&config.causal_tree)
+    if let Some(selection) = crate::decision::factory::configured_selection(&config.causal_tree.backend)
         && ProviderId::of(&selection.provider) == *id
     {
         names.push("the decision backend (causal_tree.backend)".to_string());
@@ -924,7 +924,7 @@ pub fn reference_use(config: &Config, id: &str) -> Result<String, ManageError> {
     referrers.sort();
     referrers.dedup();
     let decision_can_run = config.causal_tree.enabled
-        && crate::decision::factory::configured_selection(&config.causal_tree).is_some_and(|selection| {
+        && crate::decision::factory::configured_selection(&config.causal_tree.backend).is_some_and(|selection| {
             selection.locality != crate::decision::BackendLocality::Remote || config.causal_tree.backend.remote_enabled
         });
     if decision_refers && decision_can_run {

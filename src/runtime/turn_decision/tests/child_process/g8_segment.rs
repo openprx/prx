@@ -794,7 +794,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
             let input_sha256 = format!("{:x}", sha2::Sha256::digest(command.arguments.to_string().as_bytes()));
             let envelope = &bound.envelope;
             child_service.state_key.hmac(
-                crate::decision::KeyDomain::StateFingerprint,
+                crate::security::runtime_key::KeyDomain::StateFingerprint,
                 &[
                     b"exact-tool-ledger-observation.v1",
                     envelope.workspace_id.as_bytes(),

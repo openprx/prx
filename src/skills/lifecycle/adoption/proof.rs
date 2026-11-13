@@ -504,7 +504,7 @@ impl SkillLifecycleStore {
         );
         // load_existing does not mint a key or reinterpret missing history as a
         // fresh zero-cost root. Actual current evidence retains the original key.
-        let key = crate::decision::DecisionKey::load_existing(workspace)?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
         let scopes: Vec<_> = journal
             .plan
             .spec()

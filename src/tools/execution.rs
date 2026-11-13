@@ -452,9 +452,9 @@ impl SharedBinding {
 }
 
 impl CurrentToolSpecValue<'_> {
-    pub(crate) fn fingerprint(&self) -> crate::causal_tree::branch::SchemaFingerprint {
+    pub(crate) fn fingerprint(&self) -> crate::tools::capability::contract::SchemaFingerprint {
         match self {
-            Self::Shared { entry, .. } => crate::causal_tree::branch::SchemaFingerprint(entry.fingerprint()),
+            Self::Shared { entry, .. } => crate::tools::capability::contract::SchemaFingerprint(entry.fingerprint()),
             Self::Legacy(spec) => {
                 super::capability::fingerprint::tool_spec_fingerprint(&spec.name, &spec.description, &spec.parameters)
             }
@@ -2779,8 +2779,11 @@ impl ToolExecutionService {
                 .verify_admitted_call(&context.envelope, admission, &descriptor, &command)
                 .map_err(|_| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
             // Only execution after the original approval can consume this port.
-            // The initial pending call still needs to be recorded first.
+            // The initial pending call still needs to be recorded first. Full
+            // autonomy requests no approval (R51); the admitted-descriptor
+            // verification above still applies.
             if context.decision_resume.is_none()
+                && self.policy.autonomy_level() != crate::security::AutonomyLevel::Full
                 && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
             {
                 return Ok(None);
@@ -2816,11 +2819,19 @@ impl ToolExecutionService {
         let effective_level = context.child_scope.as_ref().map_or(service_level, |scope| {
             service_level.min(scope.gate_inputs().0.authority.level)
         });
-        let decision = admission::child_autonomy(&context, &descriptor, self.policy.decide(&descriptor, &context));
+        let full = service_level == crate::security::AutonomyLevel::Full;
+        let decision = admission::child_autonomy(
+            &context,
+            &descriptor,
+            self.policy.decide(&descriptor, &context),
+            service_level,
+        );
         // Ordinary calls honor the execution policy, including Full's Allow.
         // Only the verified controlled H2 ingress retains its durable exact
-        // grant protocol. Deny always remains Deny.
+        // grant protocol, and only below Full: Full has no permission limits
+        // (R51). Deny always remains Deny.
         let decision = if decision != ToolExecutionDecision::Deny
+            && !full
             && context.h2_origin().is_some()
             && crate::security::approval_operation::requires_explicit_grant(&descriptor.public_name, &command.arguments)
         {
@@ -3667,7 +3678,7 @@ pub const RUNTIME_ONLY_ARG_PREFIXES: [&str; 2] = ["_zc_", "_prx_"];
 /// but the gateway does not register them, so they stay off the list until it
 /// does: an exposed entry is then refused with 403 before any identity binding
 /// is written, instead of passing this gate and answering 404 afterwards.
-pub use crate::causal_tree::capability_policy::OWNER_ISOLATION_AWARE_TOOLS;
+pub use crate::tools::capability::policy::OWNER_ISOLATION_AWARE_TOOLS;
 
 /// Whether `name` is on [`OWNER_ISOLATION_AWARE_TOOLS`].
 #[must_use]
@@ -3682,10 +3693,7 @@ pub fn is_owner_isolation_aware_tool(name: &str) -> bool {
 /// listed name from another backend is refused: it is not the audited tool.
 #[must_use]
 pub fn admits_owner_isolated_origin(descriptor: &ToolDescriptor) -> bool {
-    crate::causal_tree::capability_policy::admits_owner_isolated_identity(
-        &descriptor.public_name,
-        &descriptor.backend_name,
-    )
+    crate::tools::capability::policy::admits_owner_isolated_identity(&descriptor.public_name, &descriptor.backend_name)
 }
 
 /// The refusal given to an owner-isolated caller for a tool that does not

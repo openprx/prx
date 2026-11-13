@@ -1,7 +1,7 @@
 //! Persist and read back the source-bound result of one bounded admission.
 use super::{
     AgentDecisionError, Arc, CancellationToken, Context, DecisionRecordBuilder, Ordering, TurnDecisionContext,
-    TurnDecisionService, TurnExecutionDirective, TurnSourceProof, accounting,
+    TurnDecisionService, TurnExecutionDirective, TurnSourceProof,
 };
 use crate::runtime::child_source::authority_journal;
 
@@ -12,7 +12,7 @@ impl TurnDecisionService {
         context: Arc<TurnDecisionContext>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        self.record_issued_decision(proof, (context, None), cancellation).await
+        self.record_issued_decision(proof, context, cancellation).await
     }
 
     pub(crate) async fn open_issued_turn_context(
@@ -21,12 +21,6 @@ impl TurnDecisionService {
         kind: super::AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        if self.should_run_prediction_hop() {
-            // Keep the optional prediction state out of every caller's
-            // async frame, including child admission on ordinary stacks.
-            let admission = Box::pin(self.decide_agent_initial_inner(proof, kind, cancellation, None, None)).await?;
-            return self.record_issued_decision(proof, admission, cancellation).await;
-        }
         let opened = self.open_turn_context(proof, kind, cancellation).await?;
         self.record_opened_context(proof, opened, cancellation).await
     }
@@ -37,19 +31,6 @@ impl TurnDecisionService {
         observation: Option<&super::segment_observation::SegmentObservation>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        if self.should_run_prediction_hop() {
-            // Keep the optional prediction state out of every caller's
-            // async frame, including child admission on ordinary stacks.
-            let admission = Box::pin(self.decide_agent_initial_inner(
-                proof,
-                super::AgentTurnKind::SingleShot,
-                cancellation,
-                None,
-                observation,
-            ))
-            .await?;
-            return self.record_issued_decision(proof, admission, cancellation).await;
-        }
         let opened = self.open_segment_turn_context(proof, observation, cancellation).await?;
         self.record_opened_context(proof, opened, cancellation).await
     }
@@ -57,10 +38,9 @@ impl TurnDecisionService {
     pub(super) async fn record_issued_decision(
         &self,
         proof: &dyn TurnSourceProof,
-        admission: accounting::AdmissionDecision,
+        context: Arc<TurnDecisionContext>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        let (context, _telemetry) = admission;
         // Admission, including a pause before any child publication, owns the
         // original run allowance. The context lease cleans up failed issuance.
         self.issue_recursive_allowance(proof, &context);
@@ -68,12 +48,7 @@ impl TurnDecisionService {
             return Err(AgentDecisionError::Cancelled);
         }
         if self.durable_key && self.recordable && self.generation.effective.causal_tree.enabled {
-            let records = DecisionRecordBuilder::build_enabled_chain(
-                &context,
-                &self.state_key,
-                true,
-                self.generation.effective.causal_tree.store.record_redacted_projection,
-            )?;
+            let records = DecisionRecordBuilder::build_enabled_chain(&context, &self.state_key, true)?;
             if cancellation.is_cancelled() {
                 return Err(AgentDecisionError::Cancelled);
             }

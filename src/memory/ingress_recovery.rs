@@ -458,7 +458,7 @@ impl IngressCapsule {
 
 pub(crate) fn remaining(deadline: std::time::Instant) -> anyhow::Result<std::time::Duration> {
     deadline
-        .checked_duration_since(crate::causal_tree::logical_clock::deadline_now(deadline))
+        .checked_duration_since(crate::runtime::logical_clock::deadline_now(deadline))
         .filter(|left| !left.is_zero())
         .ok_or_else(|| anyhow::anyhow!("ingress recovery deadline elapsed"))
 }

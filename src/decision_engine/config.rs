@@ -148,6 +148,15 @@ pub(crate) fn effective_backend<'a>(
     inherited_backend(explicit, Some(legacy)).unwrap_or(legacy)
 }
 
+/// The one backend every engine use reads (R55): `[decision_engine.backend]`
+/// when present (an explicitly empty table is "all defaults", not "absent"),
+/// otherwise the copied legacy `[causal_tree.backend]`. Neither
+/// `[causal_tree].enabled` nor `[causal_tree.backend]` selects, enables or
+/// limits the engine except through this copy rule.
+pub fn effective_engine_backend(config: &crate::config::Config) -> &BackendConfig {
+    effective_backend(config.decision_engine.backend.as_ref(), &config.causal_tree.backend)
+}
+
 fn inherited_backend<T>(explicit: Option<T>, legacy: Option<T>) -> Option<T> {
     explicit.or(legacy)
 }

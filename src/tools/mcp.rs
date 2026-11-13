@@ -220,8 +220,6 @@ pub struct McpTool {
     /// (D-095 M-2).
     retired: Mutex<HashSet<String>>,
     lifecycle: tokio::sync::RwLock<()>,
-    #[cfg(test)]
-    test_invocations: std::sync::atomic::AtomicUsize,
 }
 
 pub struct McpStatusTool {
@@ -293,8 +291,6 @@ impl McpTool {
             stdio_sessions: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashSet::new()),
             lifecycle: tokio::sync::RwLock::new(()),
-            #[cfg(test)]
-            test_invocations: std::sync::atomic::AtomicUsize::new(0),
         };
         tool.rebuild_catalog_snapshot();
         tool
@@ -434,16 +430,6 @@ impl McpTool {
         state.initialized = true;
         Self::publish_catalog_snapshot(&mut state, self.spec());
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_boxed_tool(self: &Arc<Self>) -> Box<dyn Tool> {
-        super::ArcDelegatingTool::boxed(self.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_invocation_count(&self) -> usize {
-        self.test_invocations.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn capability_snapshot(&self) -> Vec<McpCapabilitySpec> {
@@ -1530,7 +1516,7 @@ impl McpTool {
             crate::tools::capability::execution_binding::verify_current_dispatch(
                 MCP_ROOT_NAME,
                 public_name,
-                published.map(|entry| crate::causal_tree::branch::SchemaFingerprint(entry.fingerprint())),
+                published.map(|entry| crate::tools::capability::contract::SchemaFingerprint(entry.fingerprint())),
                 published.and_then(|entry| entry.binding_digest()),
             )?;
             let server = Self::resolve_server(&state.effective_config, &server_name)?;
@@ -1684,8 +1670,6 @@ impl Tool for McpTool {
         if name == MCP_ROOT_NAME {
             crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         }
-        #[cfg(test)]
-        self.test_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let action = if name == MCP_ROOT_NAME {
             args.get("action").and_then(serde_json::Value::as_str).unwrap_or("call")
         } else {

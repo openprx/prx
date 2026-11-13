@@ -306,7 +306,10 @@ impl OrdinaryChildPublication {
                 parent.generation.effective.workspace_dir.clone(),
                 TurnSurfaceKind::Worker,
             )),
-            advisory_engine: Default::default(),
+            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
+                Arc::clone(&parent.generation.effective),
+                None,
+            ),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,
@@ -365,7 +368,7 @@ impl OrdinaryChildPublication {
                 .gate_inputs()
                 .0
                 .allowed
-                .contains(&crate::causal_tree::branch::CapabilityRef {
+                .contains(&crate::tools::capability::contract::CapabilityRef {
                     id: entry.id.clone(),
                     fingerprint: entry.fingerprint,
                     generation: entry.generation,
@@ -901,36 +904,10 @@ impl TurnDecisionService {
             context.catalog_generation() == catalog.generation(),
             "decision catalog changed"
         );
-        let selected_id = match &context.engine.selection {
-            crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } => candidate_id,
-            crate::causal_tree::decision_select::Selection::Recover { candidate_id, .. } => candidate_id,
-
-            crate::causal_tree::decision_select::Selection::Abstain {
-                action:
-                    crate::causal_tree::branch::CausalActionKind::Answer
-                    | crate::causal_tree::branch::CausalActionKind::Clarify,
-                ..
-            } if matches!(context.directive, TurnExecutionDirective::AnswerDirectly)
-                && super::admitted_fallback_answer(&context.engine).is_some() =>
-            {
-                super::admitted_fallback_answer(&context.engine)
-                    .context("admitted fallback answer disappeared")?
-                    .candidate_id()
-            }
-            crate::causal_tree::decision_select::Selection::Abstain { action, .. } => {
-                let error = anyhow::Error::new(super::DirectiveError::NonExecutableSelection { kind: action.as_str() });
-                return Err(match context.refusal_reply() {
-                    Some(reply) => error.context(reply.into_owned()),
-                    None => error,
-                });
-            }
-            crate::causal_tree::decision_select::Selection::RequestApproval { .. } => {
-                return Err(super::DirectiveError::NonExecutableSelection {
-                    kind: "request_approval",
-                }
-                .into());
-            }
-        };
+        let crate::causal_tree::decision_select::Selection::Commit {
+            candidate_id: selected_id,
+            ..
+        } = &context.engine.selection;
         let candidates = match &context.engine.candidates {
             CandidateSet::Legal { candidates, .. } => candidates,
             CandidateSet::NoLegalPath { .. } => anyhow::bail!("decision has no admitted candidate set"),
@@ -947,9 +924,10 @@ impl TurnDecisionService {
             .as_ref()
             .map(|resume| resume.gate_evidence(self, proof))
             .transpose()?;
-        let call_fingerprints = resume_evidence
-            .as_ref()
-            .map_or_else(BTreeMap::new, |evidence| evidence.calls.clone());
+        let (call_fingerprints, verified_approval_calls) = resume_evidence.as_ref().map_or_else(
+            || (BTreeMap::new(), BTreeMap::new()),
+            |evidence| crate::runtime::decision_advisory::resume_gate_maps(evidence, &self.state_key),
+        );
         let replayed_non_idempotent = BTreeSet::new();
         let gates = GateInputs {
             policy: &self.security,
@@ -962,9 +940,7 @@ impl TurnDecisionService {
             model_can_call_tools: self.model_can_call_tools(proof),
             decision_endpoint_ready: true,
             child_scope: proof.child_scope().map(|scope| scope.gate_inputs()),
-            verified_approval_calls: resume_evidence
-                .as_ref()
-                .map_or_else(BTreeMap::new, |evidence| evidence.approvals.clone()),
+            verified_approval_calls,
             call_fingerprints: &call_fingerprints,
             failed_call_counts: BTreeMap::new(),
             replayed_non_idempotent: &replayed_non_idempotent,
@@ -974,7 +950,7 @@ impl TurnDecisionService {
         let references = match &context.directive {
             TurnExecutionDirective::AnswerDirectly => {
                 anyhow::ensure!(
-                    selected.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                    selected.action() == crate::tools::capability::contract::CausalActionKind::Answer
                         && selected_references.is_empty(),
                     "answer directive differs from its selected candidate"
                 );
@@ -992,7 +968,7 @@ impl TurnDecisionService {
             TurnExecutionDirective::Execute { allowed_capability_ids } => {
                 let ids: BTreeSet<_> = selected_references.iter().map(|reference| &reference.id).collect();
                 anyhow::ensure!(
-                    selected.action() == crate::causal_tree::branch::CausalActionKind::UseTool
+                    selected.action() == crate::tools::capability::contract::CausalActionKind::UseTool
                         && !selected_references.is_empty()
                         && selected_references.len() == selected.required_capabilities().len()
                         && ids.len() == allowed_capability_ids.len()
@@ -1007,8 +983,6 @@ impl TurnDecisionService {
                     &context.engine,
                     &DirectiveContext {
                         current_generation: catalog.generation(),
-                        approval_expires_at: chrono::Utc::now(),
-                        discovery_limit: 1,
                     },
                 )?;
                 anyhow::ensure!(

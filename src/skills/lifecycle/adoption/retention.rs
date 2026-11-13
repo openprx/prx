@@ -27,7 +27,7 @@ impl SkillLifecycleStore {
                 DeliveryRetentionLimits {
                     max_records: usize::try_from(limits.examined).unwrap_or(64),
                     max_decoded_bytes: limits.decoded_bytes,
-                    deadline: crate::causal_tree::logical_clock::now()
+                    deadline: crate::runtime::logical_clock::now()
                         .checked_add(Duration::from_millis(limits.elapsed_ms))
                         .ok_or_else(|| refusal("retention deadline overflow"))?,
                 },

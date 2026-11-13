@@ -5,8 +5,8 @@
 //! after refresh and inside the ownership protecting physical dispatch.
 
 use super::{CapabilityCatalog, CapabilityRef, ExecutionBinding, ToolExecutionError};
-use crate::causal_tree::branch::SchemaFingerprint;
 use crate::tools::capability::catalog::CatalogScope;
+use crate::tools::capability::contract::SchemaFingerprint;
 use std::future::Future;
 use std::sync::Arc;
 

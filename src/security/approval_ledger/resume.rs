@@ -4,8 +4,8 @@ use super::keys::{ApprovalAuthority, DecisionAuthority};
 use super::pending::scope_from_source;
 use crate::acl::approval_grant::{ApprovalGrantV2, DecisionApprovalBinding};
 use crate::causal_tree::ids::DecisionId;
-use crate::decision::KeyDomain;
 use crate::memory::{MemoryFabric, MessageEvent};
+use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, PartialEq, Eq)]

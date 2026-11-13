@@ -3,10 +3,10 @@
 
 use super::*;
 use crate::decision::builtin::BuiltinDecisionBackend;
-use crate::decision::key::DecisionKey;
 use crate::decision::protocol::{
     CandidateKey, CandidateQuestion, GlobalQuestion, OptionId, RequestLimits, RequestParts,
 };
+use crate::security::runtime_key::DecisionKey;
 use std::time::Duration;
 
 fn structured(value: serde_json::Value) -> StructuredValue {

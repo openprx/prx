@@ -5,41 +5,6 @@
 
 use super::*;
 
-/// A synthetic complete single-call settlement for scoped latency-reader
-/// integration tests. Production outcomes use the bounded writer.
-pub(crate) fn write_single_call_latency(
-    workspace_dir: &Path,
-    decision_id: DecisionId,
-    settlement_id: &str,
-    capability_id: &str,
-    latency_ms: u32,
-) {
-    let conn = Connection::open(db_path(workspace_dir)).expect("test: open store");
-    let family = capability_id.split(':').next().expect("test: family");
-    let ids = serde_json::to_string(&[capability_id]).expect("test: ids");
-    let calls = serde_json::to_string(&[RecordedToolCall {
-        capability_id: capability_id.to_owned(),
-        status: "success".to_owned(),
-    }])
-    .expect("test: calls");
-    conn.execute(
-        "INSERT INTO outcomes (decision_id, settlement_id, recorded_at_ms, classification,
-             executed_action, executed_target, tool_calls_json, capability_ids_json, latency_ms,
-             completeness, record_hash) VALUES (?1, ?2, ?3, 'success', 'use_tool', ?4, ?5, ?6, ?7,
-             'complete', 'synthetic-test')",
-        params![
-            decision_id.to_string(),
-            settlement_id,
-            now_ms(),
-            family,
-            calls,
-            ids,
-            i64::from(latency_ms)
-        ],
-    )
-    .expect("test: committed latency outcome");
-}
-
 /// A complete decision record for `id` in `workspace`, owned by `owner`.
 pub(crate) fn record(id: DecisionId, workspace: &str, owner: Option<&str>, created_at_ms: i64) -> DecisionRecord {
     DecisionRecord {

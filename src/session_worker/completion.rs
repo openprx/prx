@@ -35,7 +35,7 @@ pub(crate) async fn persist(
     // The durable representation carries redacted result text and its own MAC.
     // The stdout result retains the independently signed original representation.
     evidence.seal = constraints.key.hmac(
-        crate::decision::key::KeyDomain::StateFingerprint,
+        crate::security::runtime_key::KeyDomain::StateFingerprint,
         &[
             b"worker-completion-journal-v1",
             child.parent_authority_id.to_string().as_bytes(),
@@ -123,7 +123,7 @@ pub(crate) async fn persist_ordinary(
         return Ok(());
     }
     evidence.seal = constraints.key.hmac(
-        crate::decision::key::KeyDomain::StateFingerprint,
+        crate::security::runtime_key::KeyDomain::StateFingerprint,
         &[
             b"ordinary-worker-completion-journal-v1",
             child.parent_authority_id.to_string().as_bytes(),
@@ -218,7 +218,7 @@ pub(crate) async fn persist_operator(
         return Ok(());
     }
     evidence.seal = authority.snapshots().key.hmac(
-        crate::decision::key::KeyDomain::StateFingerprint,
+        crate::security::runtime_key::KeyDomain::StateFingerprint,
         &[
             b"operator-worker-completion-journal-v1",
             publication.id().to_string().as_bytes(),

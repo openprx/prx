@@ -80,7 +80,7 @@ async fn experiment_stage_forwards_child_accounting_and_enforces_durable_cancel(
             ExperimentStageRuntime::new(&config, &plan, "proposal", cancel.clone(), store.clone())
         })
         .await?;
-    let key = crate::decision::DecisionKey::load_or_create(root.path())?;
+    let key = crate::security::runtime_key::DecisionKey::load_or_create(root.path())?;
     cleanup
         .run(runtime.scope(async {
             let mut child_config = config.clone();
@@ -258,7 +258,7 @@ async fn live_foreign_parent_is_refused_before_physical_admission_and_unparented
         .await?;
     cleanup
         .run(async {
-            let key = crate::decision::DecisionKey::load_or_create(root.path())?;
+            let key = crate::security::runtime_key::DecisionKey::load_or_create(root.path())?;
             let child = || {
                 Arc::new(AccountingScope::new(
                     Arc::new(config.clone()),

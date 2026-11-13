@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 fn blocked_migration_leaves_other_workspace_open_and_existing_borrow_available() -> anyhow::Result<()> {
     let blocked = tempfile::tempdir()?;
     let independent = tempfile::tempdir()?;
-    crate::decision::key::prepare_decision_dir(blocked.path()).map_err(anyhow::Error::msg)?;
+    crate::security::runtime_key::prepare_decision_dir(blocked.path()).map_err(anyhow::Error::msg)?;
     let database = db_path(blocked.path());
     let blocker = rusqlite::Connection::open(&database)?;
     #[cfg(unix)]

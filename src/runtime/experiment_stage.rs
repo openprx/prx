@@ -67,7 +67,7 @@ impl ExperimentStageRuntime {
     }
     pub(crate) fn physical_identity(key: &DecisionKey, digest: &str, stage: &str) -> [u8; 32] {
         key.hmac(
-            crate::decision::KeyDomain::TerminalClaim,
+            crate::security::runtime_key::KeyDomain::TerminalClaim,
             &[b"instruction-experiment-stage-v1", digest.as_bytes(), stage.as_bytes()],
         )
     }

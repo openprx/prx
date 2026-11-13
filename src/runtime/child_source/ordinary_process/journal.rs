@@ -1,6 +1,6 @@
 //! Signed per-segment evidence for partial ordinary-worker accounting.
 use super::{Arc, ChildInputReceipt, Context, MemoryFabric, MessageEventScope, OrdinaryProcessAuthority};
-use crate::decision::key::KeyDomain;
+use crate::security::runtime_key::KeyDomain;
 use crate::session_worker::protocol::WorkerSegmentTerminal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,7 +38,7 @@ pub(crate) struct OrdinarySegmentJournal {
     process_id: String,
     task_run_id: String,
     parent_scope_id: String,
-    key: Arc<crate::decision::DecisionKey>,
+    key: Arc<crate::security::runtime_key::DecisionKey>,
     recording: bool,
 }
 

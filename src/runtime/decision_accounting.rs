@@ -184,6 +184,22 @@ impl AccountingScope {
 
 impl budget::sealed::AccountingOwner for AccountingScope {}
 
+impl AccountingScope {
+    /// The money one decision attempt of `tokens` may reserve on `provider`
+    /// and `model`, at the highest applicable PMM rate (the same estimate an
+    /// attempt reserves). `None` when the price is missing or invalid.
+    pub(crate) fn worst_case_micro_usd(&self, provider: &str, model: &str, tokens: u64) -> Option<u64> {
+        estimated_cost(
+            &self.config.cost,
+            provider,
+            effective_api_url(&self.config, provider),
+            model,
+            tokens,
+        )
+        .ok()
+    }
+}
+
 /// The base URL a provider is reached at: the root connection's `api_url`
 /// when `provider` is the configured default provider, otherwise unset (the
 /// provider's own default).

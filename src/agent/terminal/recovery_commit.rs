@@ -11,7 +11,6 @@ use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::causal_tree::store::Enqueue;
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
-use crate::decision::KeyDomain;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, UsagePrice, usage_cost_resolution};
 use crate::memory::fabric::MemoryFabric;
 use crate::memory::recovery_authority::{
@@ -20,6 +19,7 @@ use crate::memory::recovery_authority::{
 };
 use crate::memory::{Memory, MessageEventInput, MessageEventScope};
 use crate::runtime::ingress_recovery::{SettledTerminalFacts, SkillObservation};
+use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -634,11 +634,9 @@ fn recovered_skill(
         commit.provider_outcome.clone(),
         trace.cloned(),
     );
-    let kind = match &commit.decision.context.audit_hops().last().map(|hop| &hop.selection) {
-        Some(crate::causal_tree::decision_select::Selection::RequestApproval { .. }) => "request_approval",
-        _ => "",
-    };
-    facts.recovered_signals(kind)
+    // A live hop is always a committed selection since R9; only a
+    // RequestApproval selection carried a recovery kind.
+    facts.recovered_signals("")
 }
 
 fn recovery_pricing(usage: Option<&MeteredTokenUsageRecord>, cost_config: &CostConfig) -> RecoveryPricing {

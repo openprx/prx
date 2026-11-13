@@ -1990,7 +1990,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             shutdown,
                         )
                         .await?;
-                    let advice = service.analyze_advisory(&decision, shutdown).await;
+                    let advice = service.advisory().analyze_turn(decision.runtime(), shutdown).await;
                     *decision_settlement.lock() = Some(service.terminal_settlement_ref(Arc::clone(&decision))?);
                     let cleanup_ticket = if scheduled_admission.is_some() {
                         scheduled_input_guard
@@ -2464,7 +2464,7 @@ pub(crate) async fn run_with_runtime_envelope(
                                 return Err(anyhow::Error::from(error));
                             }
                         };
-                    let advice = service.analyze_advisory(&decision, shutdown).await;
+                    let advice = service.advisory().analyze_turn(decision.runtime(), shutdown).await;
                     let retained_provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
                     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
                         provider_name,

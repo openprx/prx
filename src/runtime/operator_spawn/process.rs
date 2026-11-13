@@ -1,9 +1,9 @@
 //! Signed operator capability ceiling. This is transport authority, not a turn.
 mod snapshots;
-use crate::causal_tree::branch::CapabilityRef;
-use crate::decision::key::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::session_worker::protocol::WorkerOperatorPublication;
 use crate::tools::capability::catalog::CapabilityCatalog;
+use crate::tools::capability::contract::CapabilityRef;
 use std::collections::BTreeSet;
 use subtle::ConstantTimeEq;
 

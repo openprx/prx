@@ -5,41 +5,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sha2::{Digest, Sha256};
-
-use super::branch::{
-    ApprovalRequirement, CandidateId, CapabilityRef, CausalActionKind, CausalCandidate, OpId, SideEffectClass,
-};
+use super::branch::{CandidateId, CausalCandidate};
 use super::state::{CausalState, SideEffectMode};
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CatalogView, Exposure};
 use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest};
+use crate::tools::capability::contract::{ApprovalRequirement, CapabilityRef, CausalActionKind, OpId, SideEffectClass};
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GateOutcome {
-    Passed,
-    Blocked { gate: u8, reason_code: &'static str },
-    ApprovalOnly { op_ids: Vec<OpId> },
-    ApprovalDeferred,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct GateReport {
-    pub outcomes: BTreeMap<CandidateId, GateOutcome>,
-    pub gate_set_hash: [u8; 32],
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum GateError {
-    #[error("duplicate candidate id in gate input")]
-    DuplicateCandidate,
-    #[error("candidate set has no refusal path")]
-    MissingRefusal,
-    #[error("candidate limit must reserve at least one working and two terminal paths")]
-    InvalidCandidateLimit,
-}
+// The gate outcome and report are the admission probe's types (R11); the
+// hard gates are the probe's execution implementation until Part 2.
+pub(crate) use super::admission_probe::{
+    Admission as GateOutcome, GenerationError as GateError, ProbeReport as GateReport,
+};
 
 /// Runtime-only inputs that are not yet fields of `CausalState`. The
 /// caller pins this snapshot to the same generation as the catalog and state.
@@ -114,10 +93,7 @@ impl HardGates {
                 return Err(GateError::DuplicateCandidate);
             }
         }
-        Ok(GateReport {
-            outcomes,
-            gate_set_hash: Sha256::digest(b"prx-cdp-gates-v1:G1,G2,G3,G4,G5,G6,G7,G8,G9").into(),
-        })
+        Ok(GateReport { outcomes })
     }
 
     /// Evaluate one transient generator probe without allocating a report.
@@ -216,15 +192,13 @@ impl HardGates {
         // Check before G4, including the argument-collection candidate path.
         if trusted.owner_isolated()
             && entries.iter().flatten().any(|entry| {
-                !(crate::causal_tree::capability_policy::admits_owner_isolated_identity(
-                    &entry.public_name,
-                    &entry.root,
-                ) || (trusted
-                    .constraints
-                    .iter()
-                    .any(|code| code.as_str() == "owner_private_filesystem_v1")
-                    && entry.public_name == entry.root
-                    && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
+                !(crate::tools::capability::policy::admits_owner_isolated_identity(&entry.public_name, &entry.root)
+                    || (trusted
+                        .constraints
+                        .iter()
+                        .any(|code| code.as_str() == "owner_private_filesystem_v1")
+                        && entry.public_name == entry.root
+                        && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit")))
             })
         {
             return blocked(1, "owner_isolation");
@@ -467,14 +441,13 @@ fn effective_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::causal_tree::branch::{
-        CandidateSpec, CapabilityTarget, CatalogGeneration, CostEstimate, SchemaFingerprint,
-    };
+    use crate::causal_tree::branch::CandidateSpec;
     use crate::causal_tree::ids::DecisionId;
     use crate::causal_tree::state::{ConstraintCode, TrustedState, fixtures};
     use crate::security::AutonomyLevel;
     use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
     use crate::tools::capability::child::AuthorityEnvelope;
+    use crate::tools::capability::contract::{CapabilityTarget, CatalogGeneration, CostEstimate, SchemaFingerprint};
     use crate::tools::mcp::McpCapabilitySpec;
     use crate::tools::traits::{Tool, ToolResult, ToolSpec};
     use async_trait::async_trait;
@@ -1270,9 +1243,12 @@ mod tests {
                 },
             )
         };
-        let missing_id =
-            crate::causal_tree::branch::CapabilityId::new(CapabilityTarget::NativeTool, "native", "prx_missing")
-                .unwrap();
+        let missing_id = crate::tools::capability::contract::CapabilityId::new(
+            CapabilityTarget::NativeTool,
+            "native",
+            "prx_missing",
+        )
+        .unwrap();
         let mut missing = references.first().unwrap().clone();
         missing.id = missing_id;
         let single_missing = candidate_for(vec![missing.clone()]);

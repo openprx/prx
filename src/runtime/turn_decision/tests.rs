@@ -7,22 +7,15 @@ mod discovery_surface;
 mod enabled_service;
 pub(crate) mod exact_call_approval;
 mod execution;
-mod ledger_probe;
-mod performance;
 mod recorded_chain;
 mod recursive_budget;
-mod selected_memory;
-mod selection_probes;
 mod skill_receipts;
 mod terminal_scope;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use chrono::TimeZone;
-
 use super::*;
-use crate::causal_tree::decision_select::Selection;
 use crate::decision::backend::DecisionBackend;
 use crate::decision::builtin::BuiltinDecisionBackend;
 use crate::decision::factory::BackendSpec;
@@ -30,13 +23,13 @@ use crate::decision::factory::SlotLimits;
 use crate::decision::outbound::{GuardedBody, OutboundSecrets};
 use crate::decision::protocol::{
     BackendIdentity, BackendKind, BackendLocality, DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion,
-    NoulAnswer, Probability, QuestionId,
+    Probability, QuestionId,
 };
 use crate::decision::telemetry::CausalEvent;
 use crate::decision::telemetry::testing::RecordingSink;
 use crate::decision::validate::ModelVersionPolicy;
 use crate::decision::{DecisionError, KeyDomain};
-use crate::memory::{MemoryCategory, MemoryEntry, MemoryFabric, NoneMemory};
+use crate::memory::{MemoryFabric, NoneMemory};
 use crate::security::SecurityPolicy;
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, TracingToolExecutionAudit,
@@ -45,10 +38,6 @@ use crate::tools::traits::{ToolResult, ToolSpec};
 
 use async_trait::async_trait;
 use catalog_drift::DriftingCatalogTool;
-use selection_probes::{
-    CountingProbeMemory, ExecuteContextProbeBackend, ProbeCancelMode, RetrieveProbeBackend, UsageRecordProbeBackend,
-    run_retrieve_probe, run_retrieve_probe_case,
-};
 
 struct SilentEvents;
 

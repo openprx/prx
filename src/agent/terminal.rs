@@ -10,7 +10,7 @@ pub(crate) mod oversized_reply;
 pub(crate) mod recovery_commit;
 mod replay;
 #[cfg(test)]
-pub(crate) use replay::{recorded_pre_switch_request_approval_closes, reseal_payload_for_test};
+pub(crate) use replay::reseal_payload_for_test;
 pub(crate) mod served_auxiliary;
 pub(crate) use replay::{
     REPLAY_EVIDENCE_AUTHORITY, VerifiedTerminalReplay, authenticated_replay_store_workspace,
@@ -23,11 +23,11 @@ use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::causal_tree::store::{DecisionScope, DecisionStoreReader, DecisionStoreWriter, Enqueue};
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
-use crate::decision::{DecisionKey, KeyDomain};
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::memory::{Memory, MemoryFabric, MessageEvent, MessageEventScope};
 use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
 use crate::runtime::turn_decision::{SettlementIssueToken, TurnDecisionContext};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -129,7 +129,6 @@ pub struct DecisionSettlementRef {
     recorded: Option<RecordedDecisionSettlement>,
     workspace_dir: PathBuf,
     cost_config: CostConfig,
-    record_redacted_projection: bool,
     memory: Arc<dyn Memory>,
 }
 
@@ -171,7 +170,6 @@ impl DecisionSettlementRef {
         key: Arc<DecisionKey>,
         workspace_dir: PathBuf,
         cost_config: CostConfig,
-        record_redacted_projection: bool,
         memory: Arc<dyn Memory>,
         _token: SettlementIssueToken,
     ) -> Self {
@@ -194,7 +192,6 @@ impl DecisionSettlementRef {
             }),
             workspace_dir,
             cost_config,
-            record_redacted_projection,
             memory,
         }
     }
@@ -216,7 +213,6 @@ impl DecisionSettlementRef {
             recorded: None,
             workspace_dir,
             cost_config,
-            record_redacted_projection: false,
             memory,
         }
     }
@@ -1530,8 +1526,8 @@ mod tests {
             // retaining a real wall bound on fixture I/O.
             let context = tokio::time::timeout(
                 Duration::from_secs(5),
-                crate::causal_tree::logical_clock::scope(
-                    crate::causal_tree::logical_clock::ManualClock::new(),
+                crate::runtime::logical_clock::scope(
+                    crate::runtime::logical_clock::ManualClock::new(),
                     service.open_issued_turn_context(
                         &proof,
                         crate::runtime::turn_decision::AgentTurnKind::Repl,
@@ -1551,7 +1547,7 @@ mod tests {
                     matches!(
                         context.engine().selection,
                         crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                            if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
                     ),
                     "fixture requires real scoped retrieval to authorize Answer: {:?}",
                     context.engine().selection

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::catalog::{CapabilityCatalog, CatalogScope, SurfacePolicy};
 use super::search::CatalogSearch;
-use crate::causal_tree::branch::{CapabilityId, CapabilityRef};
 use crate::tools::ToolSpec;
+use crate::tools::capability::contract::{CapabilityId, CapabilityRef};
 use crate::tools::{Tool, ToolResult};
 use anyhow::Context as _;
 use std::collections::BTreeMap;

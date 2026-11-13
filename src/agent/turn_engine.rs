@@ -149,7 +149,12 @@ pub(crate) async fn run_turn(
     )
     .await;
     advisory_service
-        .observe_advisory(advisory_context, advisory_id, result.is_ok())
+        .advisory()
+        .observe(
+            || advisory_context.terminal_execution_trace(),
+            advisory_id,
+            result.is_ok(),
+        )
         .await;
     result
 }
@@ -293,10 +298,26 @@ async fn run_turn_unguarded(
         runtime_adapter,
         memory: memory_runtime,
     } = services;
-    let decision_brief = advice.as_ref().map(|analysis| {
-        let config = service.advisory_config();
-        crate::decision_engine::render::render_decision_brief(analysis, config.prompt_budget_tokens, config.candidates)
-    });
+    let decision_brief = advice
+        .as_ref()
+        .map(|analysis| {
+            let config = service.advisory().config();
+            crate::decision_engine::render::render_decision_brief(
+                analysis,
+                config.prompt_budget_tokens,
+                config.candidates,
+            )
+        })
+        // V-12: a brief that does not fit the first send's token admission is
+        // dropped; the send itself is never refused because of the engine.
+        .filter(|brief| {
+            let fits = crate::cost::estimate::candidate_tokens(brief.len())
+                <= crate::agent::send_admission::live_g6_tokens(context);
+            if !fits {
+                tracing::debug!("decision brief dropped: it does not fit the first send's token budget");
+            }
+            fits
+        });
     let decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
     let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
@@ -489,6 +510,11 @@ async fn run_turn_unguarded(
             tool_calls_allowed: service.model_can_call_tools(proof),
         },
     ));
+    // V-17: a historical resume turn publishes exactly its prepared tool.
+    let safety_surface = match context.runtime().resume_tool_name() {
+        Some(name) => Arc::new(safety_surface.restricted_to(name)),
+        None => safety_surface,
+    };
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);

@@ -8,7 +8,7 @@ use crate::runtime::child_source::ordinary_process::journal::SegmentEvidence;
 async fn read_evidence(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     index: u64,
     kind: &str,
 ) -> anyhow::Result<Option<SegmentEvidence>> {
@@ -50,7 +50,7 @@ async fn read_evidence(
             && !process.is_nil()
             && process.to_string() == evidence.process_id
             && key.verify_hmac(
-                crate::decision::key::KeyDomain::StateFingerprint,
+                crate::security::runtime_key::KeyDomain::StateFingerprint,
                 &[
                     b"ordinary-worker-segment-v1",
                     kind.as_bytes(),
@@ -75,7 +75,7 @@ async fn read_evidence(
 pub(super) async fn recover_usage(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
 ) -> anyhow::Result<RecoveredWorkerUsage> {
     anyhow::ensure!(
         lineage.recording_enabled,

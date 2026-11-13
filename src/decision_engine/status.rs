@@ -37,6 +37,16 @@ pub(crate) struct DecisionEngineStatus {
     pub store_errors: u64,
 }
 
+/// The telemetry cap the engine actually applies: `pre` mode records no
+/// outcomes, so its effective cap is 0 whatever `telemetry_cap` says.
+pub(crate) fn effective_telemetry_cap(engine: &super::config::DecisionEngineConfig) -> u32 {
+    if engine.mode == super::config::DecisionMode::Pre {
+        0
+    } else {
+        engine.telemetry_cap
+    }
+}
+
 pub(crate) fn snapshot(config: &Config) -> DecisionEngineStatus {
     use super::config::DecisionMode;
     let engine = &config.decision_engine;
@@ -51,10 +61,8 @@ pub(crate) fn snapshot(config: &Config) -> DecisionEngineStatus {
                 DecisionMode::Both => "both",
             }
         },
-        backend_kind: super::config::effective_backend(engine.backend.as_ref(), &config.causal_tree.backend)
-            .kind
-            .as_str(),
-        telemetry_cap: engine.telemetry_cap,
+        backend_kind: super::config::effective_engine_backend(config).kind.as_str(),
+        telemetry_cap: effective_telemetry_cap(engine),
         queue_depth: 0,
         dropped: 0,
         store_errors: 0,

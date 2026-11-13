@@ -1528,7 +1528,7 @@ impl AccountedFactory {
 }
 
 fn fixture_price(config: &mut Config, catalog: &CatalogView) {
-    let selection = openprx::decision::factory::configured_selection(&config.causal_tree)
+    let selection = openprx::decision::factory::configured_selection(&config.causal_tree.backend)
         .expect("test: configured decision selection");
     let resolved = openprx::providers::selection::check_decision_backend(
         config,
@@ -1553,8 +1553,8 @@ fn fixture_price(config: &mut Config, catalog: &CatalogView) {
 
 fn decision_tranche_micro_usd(config: &Config, tokens: u64) -> u64 {
     use crate::llm::route_decision::{UsagePrice, usage_cost_resolution};
-    let selection =
-        crate::decision::factory::configured_selection(&config.causal_tree).expect("configured decision selection");
+    let selection = crate::decision::factory::configured_selection(&config.causal_tree.backend)
+        .expect("configured decision selection");
     let catalog = CatalogView::from_config(config).with_curated([CuratedModel {
         operations: Some(vec![ModelOperation::DecisionEndpoint]),
         ..CuratedModel::new(

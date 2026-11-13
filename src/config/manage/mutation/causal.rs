@@ -306,7 +306,7 @@ impl CausalConfigService {
             })
             .into());
         }
-        let Some(selection) = crate::decision::factory::configured_selection(&desired.causal_tree) else {
+        let Some(selection) = crate::decision::factory::configured_selection(&desired.causal_tree.backend) else {
             return Err(CausalMutationError::Invalid(
                 "no decision backend that takes a credential is configured".to_string(),
             ));
@@ -427,7 +427,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             if let Some(timeout_ms) = timeout_ms {
                 section.backend.timeout_ms = *timeout_ms;
             }
-            if let Some(selection) = crate::decision::factory::configured_selection(section) {
+            if let Some(selection) = crate::decision::factory::configured_selection(&section.backend) {
                 let model = section.backend.model.trim().to_string();
                 if let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
                     && let Some(entry) = catalog.model(&crate::providers::ProviderId::of(&selection.provider), &model)

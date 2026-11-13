@@ -738,7 +738,7 @@ mod tests {
                         matches!(
                             context.engine().selection,
                             crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Answer
+                                if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
                         ),
                         "gateway fixture parent must commit Answer: {:?}",
                         context.engine().selection

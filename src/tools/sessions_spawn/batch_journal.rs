@@ -1,9 +1,9 @@
 //! Durable batch membership; no execution authority is reconstructed from it.
 use super::{BatchMember, BatchRoster};
-use crate::decision::{DecisionKey, key::KeyDomain};
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEventScope};
 use crate::runtime::child_source::IssuedChildGrant;
 use crate::runtime::child_source::authority_journal::{self, BatchParentRow};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

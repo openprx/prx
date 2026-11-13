@@ -20,6 +20,7 @@ pub(crate) mod path_policy;
 pub mod policy;
 pub mod ramflux_aead;
 pub mod redaction;
+pub mod runtime_key;
 pub mod secrets;
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 pub use secrets::SecretStore;

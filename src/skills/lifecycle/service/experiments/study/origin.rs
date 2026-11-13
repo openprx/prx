@@ -119,7 +119,7 @@ impl SkillsLifecycleService {
             workspace == config.workspace_dir.canonicalize()?,
             "study accounting workspace differs from its actual owner"
         );
-        let key = crate::decision::DecisionKey::load_existing(workspace)?;
+        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
         let scope_id = hex::encode(ExperimentStageRuntime::physical_identity(&key, experiment, stage));
         let usage = crate::cost::tracker::CostTracker::physical_scope_usage_read_only(workspace, &scope_id)?;
         Ok(StudyPhysicalObservation {

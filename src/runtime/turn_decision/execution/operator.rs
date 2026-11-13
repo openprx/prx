@@ -199,7 +199,10 @@ impl OperatorChildPublication {
                 parent_authority_id: None,
                 ..parent.recovery.as_ref().clone()
             }),
-            advisory_engine: Default::default(),
+            advisory: crate::runtime::decision_advisory::DecisionAdvisory::new(
+                Arc::clone(&parent.generation.effective),
+                None,
+            ),
             child_recovery: Default::default(),
             recursive_allowances: Default::default(),
             memory_loader: None,

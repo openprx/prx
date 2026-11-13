@@ -315,7 +315,7 @@ pub(crate) fn evaluate(
 pub(crate) fn write_report(workspace_dir: &Path, report: &EvaluationReport) -> Result<PathBuf, EvaluateError> {
     // The directories are created 0700 and never through a symlink
     // (D-091 F-6).
-    let dir = crate::decision::key::prepare_decision_dir(workspace_dir)
+    let dir = crate::security::runtime_key::prepare_decision_dir(workspace_dir)
         .map_err(|reason| EvaluateError::Io(std::io::Error::other(reason)))?
         .join("reports");
     match std::fs::symlink_metadata(&dir) {

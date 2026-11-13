@@ -65,7 +65,7 @@ impl OperatorProcessAuthority {
         };
         evidence.validate_inventory(result.success)?;
         evidence.seal = self.snapshots.key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"operator-worker-completion-v1",
                 self.snapshots.publication.id().to_string().as_bytes(),

@@ -144,10 +144,7 @@ pub struct ProcessGenerationBinding {
 // must bind the same representation while retaining explicit overrides.
 fn normalized_process_config(config: &Config) -> anyhow::Result<serde_json::Value> {
     let mut normalized = serde_json::to_value(config)?;
-    let backend = crate::decision_engine::config::effective_backend(
-        config.decision_engine.backend.as_ref(),
-        &config.causal_tree.backend,
-    );
+    let backend = crate::decision_engine::config::effective_engine_backend(config);
     let mut engine = config.decision_engine.clone();
     engine.backend = Some(backend.clone());
     if let Some(root) = normalized.as_object_mut() {
@@ -207,7 +204,7 @@ impl ConfigGeneration {
 
     pub(crate) fn bind_process(
         &self,
-        key: &crate::decision::key::DecisionKey,
+        key: &crate::security::runtime_key::DecisionKey,
     ) -> anyhow::Result<ProcessGenerationBinding> {
         anyhow::ensure!(
             self.source_revision.fingerprint_sha256.len() == 64
@@ -228,7 +225,7 @@ impl ConfigGeneration {
             seal: [0; 32],
         };
         binding.seal = key.hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"process-effective-config-v1",
                 &binding.signing_payload(&self.effective)?,
@@ -241,7 +238,7 @@ impl ConfigGeneration {
     pub(crate) fn verify_pinned_process_binding(
         &self,
         binding: &ProcessGenerationBinding,
-        key: &crate::decision::key::DecisionKey,
+        key: &crate::security::runtime_key::DecisionKey,
     ) -> anyhow::Result<()> {
         let deferred_changes_match = self.deferred_changes.as_ref() == binding.deferred_changes.as_slice();
         anyhow::ensure!(
@@ -255,7 +252,7 @@ impl ConfigGeneration {
         );
         anyhow::ensure!(
             key.verify_hmac(
-                crate::decision::key::KeyDomain::StateFingerprint,
+                crate::security::runtime_key::KeyDomain::StateFingerprint,
                 &[
                     b"process-effective-config-v1",
                     &binding.signing_payload(&self.effective)?
@@ -272,7 +269,7 @@ impl ConfigGeneration {
     pub(crate) fn restore_process(
         config: Config,
         binding: &ProcessGenerationBinding,
-        key: &crate::decision::key::DecisionKey,
+        key: &crate::security::runtime_key::DecisionKey,
     ) -> anyhow::Result<Arc<Self>> {
         if config.runtime.workdir != binding.working_root {
             return Err(ProcessWorkingRootMismatch.into());
@@ -283,7 +280,7 @@ impl ConfigGeneration {
         );
         anyhow::ensure!(
             key.verify_hmac(
-                crate::decision::key::KeyDomain::StateFingerprint,
+                crate::security::runtime_key::KeyDomain::StateFingerprint,
                 &[b"process-effective-config-v1", &binding.signing_payload(&config)?],
                 &binding.seal
             ),
@@ -2061,7 +2058,11 @@ w_cost = 0.4
 mod pinned_parent_process_binding_tests {
     use super::*;
 
-    fn fixture() -> anyhow::Result<(tempfile::TempDir, ConfigGeneration, Arc<crate::decision::DecisionKey>)> {
+    fn fixture() -> anyhow::Result<(
+        tempfile::TempDir,
+        ConfigGeneration,
+        Arc<crate::security::runtime_key::DecisionKey>,
+    )> {
         let home = tempfile::tempdir()?;
         let config = Config {
             config_path: home.path().join("config.toml"),
@@ -2078,8 +2079,12 @@ mod pinned_parent_process_binding_tests {
             deferred_changes: Arc::from([]),
         };
         let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-parent-binding-fixture");
-        let key =
-            crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")?;
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+            &transport,
+            "prx-workspace",
+            "prx-run",
+            "prx-config",
+        )?;
         Ok((home, generation, key))
     }
 
@@ -2227,8 +2232,12 @@ mod pinned_parent_process_binding_tests {
             assert!(changed.verify_pinned_process_binding(&binding, &key).is_err());
         }
         let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-wrong-binding-key");
-        let wrong =
-            crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")?;
+        let wrong = crate::security::runtime_key::DecisionKey::from_worker_channel(
+            &transport,
+            "prx-workspace",
+            "prx-run",
+            "prx-config",
+        )?;
         assert!(generation.verify_pinned_process_binding(&binding, &wrong).is_err());
         let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-parent-binding-fixture");
         for (workspace, run, config) in [
@@ -2237,7 +2246,7 @@ mod pinned_parent_process_binding_tests {
             ("prx-workspace", "prx-run", "prx-other-config"),
         ] {
             let different_scope =
-                crate::decision::DecisionKey::from_worker_channel(&transport, workspace, run, config)?;
+                crate::security::runtime_key::DecisionKey::from_worker_channel(&transport, workspace, run, config)?;
             assert!(
                 generation
                     .verify_pinned_process_binding(&binding, &different_scope)

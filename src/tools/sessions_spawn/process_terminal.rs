@@ -420,7 +420,7 @@ struct RecoveryProvenance<'a> {
     parent_decision: crate::tools::capability::child::ParentAuthorityId,
     parent_digest: &'a str,
     input: &'a MessageEvent,
-    key: &'a std::sync::Arc<crate::decision::DecisionKey>,
+    key: &'a std::sync::Arc<crate::security::runtime_key::DecisionKey>,
     /// Signed launch version mapped to the journal version, or the grant's own.
     journal_version: Option<u8>,
 }
@@ -487,7 +487,7 @@ async fn verify_bound(
         .context("worker completion evidence missing")?;
     anyhow::ensure!(
         provenance.key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 signature_domain,
                 provenance.parent_decision.to_string().as_bytes(),

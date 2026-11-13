@@ -5,7 +5,7 @@ use super::{
     SideEffectClass, Value, insert, risk_for_effect,
 };
 use crate::acl::approval_grant::RiskLevel;
-use crate::decision::key::KeyDomain;
+use crate::security::runtime_key::KeyDomain;
 use crate::tools::traits::ToolCategory;
 use serde::{Deserialize, Serialize};
 

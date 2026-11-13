@@ -2074,8 +2074,8 @@ impl SecurityPolicy {
     /// authorization logic. Evaluation order:
     ///
     /// 1. **Identity scope ACL** — [`is_tool_allowed`](Self::is_tool_allowed)
-    ///    (per user / channel / chat_type). A scope denial is `Deny`,
-    ///    independent of autonomy level.
+    ///    (per user / channel / chat_type). A scope denial is `Deny` except
+    ///    in `full`, which has no permission limits.
     /// 2. **Autonomy level**:
     ///    * `full`        → `Allow` (allow everything; no prompt, no grant).
     ///    * `read_only`   → read-only tools `Allow`, everything else `Deny`.
@@ -2087,8 +2087,8 @@ impl SecurityPolicy {
     /// loop, not here.
     #[must_use]
     pub fn decide(&self, tool_name: &str, sender: &str, channel: &str, chat_type: &str) -> ToolDecision {
-        // 1. Identity scope ACL — independent of autonomy level.
-        if !self.is_tool_allowed(tool_name, sender, channel, chat_type) {
+        // 1. Identity scope ACL — Full autonomy has no permission limits.
+        if self.autonomy != AutonomyLevel::Full && !self.is_tool_allowed(tool_name, sender, channel, chat_type) {
             return ToolDecision::Deny;
         }
 

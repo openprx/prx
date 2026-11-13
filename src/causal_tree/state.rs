@@ -1,24 +1,24 @@
 pub(crate) mod model_admission;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::num::NonZeroU8;
 use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use uuid::Uuid;
 
-use super::branch::{ApprovalRequirement, CandidateId, CatalogGeneration, CausalCandidate, OpId};
+use super::branch::{CandidateId, CausalCandidate};
+use crate::tools::capability::contract::{ApprovalRequirement, CatalogGeneration, OpId};
 
 mod canonical;
 pub(crate) mod exact_calls;
 
 #[cfg(test)]
 mod canonical_tests;
-use crate::decision::builtin::weights::{FRESH_ARTIFACT_MS, STALE_ARTIFACT_MS};
 use crate::decision::{DecisionAnswer, DecisionKey, KeyDomain, QuestionId};
 #[cfg(test)]
 use crate::decision::{DecisionRequest, ValidatedDecision};
@@ -224,7 +224,6 @@ impl TrustedState {
 pub(crate) enum ObservedStepKind {
     Tool,
     Provider,
-    Retrieve,
     Discover,
     /// Router training-history work is audited separately and is not query
     /// evidence for a user answer or an ordinary Memory Retrieve candidate.
@@ -236,7 +235,6 @@ impl ObservedStepKind {
         match self {
             Self::Tool => "tool",
             Self::Provider => "provider",
-            Self::Retrieve => "retrieve",
             Self::Discover => "discover",
             Self::RouterHistory => "router_history",
         }
@@ -317,68 +315,6 @@ impl ObservedStep {
     }
 }
 
-/// The kind of an artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ObservedArtifactKind {
-    Memory,
-    Document,
-    Session,
-}
-
-impl ObservedArtifactKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Memory => "memory",
-            Self::Document => "document",
-            Self::Session => "session",
-        }
-    }
-}
-
-/// A bounded artifact summary with its provenance.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ObservedArtifact {
-    pub(crate) kind: ObservedArtifactKind,
-    pub(crate) age_ms: u64,
-    /// Runtime summaries are redacted and bounded to 256 characters before
-    /// entering the state; projection rechecks both properties defensively.
-    pub(crate) summary: String,
-    /// Preserve projection accounting for redaction performed before storage.
-    pub(crate) summary_was_redacted: bool,
-    /// Preserve projection accounting for a pre-storage summary cut.
-    pub(crate) summary_was_truncated: bool,
-    pub(crate) source_event_id: Option<Arc<str>>,
-}
-
-impl fmt::Debug for ObservedArtifact {
-    /// The summary may contain private source text: only its length prints.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ObservedArtifact")
-            .field("kind", &self.kind)
-            .field("age_ms", &self.age_ms)
-            .field("summary_len", &self.summary.len())
-            .field("summary_was_redacted", &self.summary_was_redacted)
-            .field("summary_was_truncated", &self.summary_was_truncated)
-            .field("source_event_id", &self.source_event_id)
-            .finish()
-    }
-}
-
-/// How old an artifact is, in the classes a decision distinguishes: the
-/// builtin's fresh and stale thresholds (`weights::FRESH_ARTIFACT_MS`,
-/// `weights::STALE_ARTIFACT_MS`). The material fingerprint holds the class,
-/// not the exact age, so a state that only grew older within a class is not
-/// materially different (R-CDP16 L-4).
-pub(crate) const fn artifact_age_class(age_ms: u64) -> &'static str {
-    if age_ms < FRESH_ARTIFACT_MS {
-        "fresh"
-    } else if age_ms > STALE_ARTIFACT_MS {
-        "stale"
-    } else {
-        "aging"
-    }
-}
-
 /// What completed executions observed (CDP 5.2).
 ///
 /// Built only by [`ObservedState::from_runtime_records`] from the runtime's records of
@@ -390,21 +326,15 @@ pub(crate) const fn artifact_age_class(age_ms: u64) -> &'static str {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObservedState {
     completed_steps: Vec<ObservedStep>,
-    artifacts: Vec<ObservedArtifact>,
     retry_count: u32,
     exact_call_observations: Option<Arc<exact_calls::ExactCallObservations>>,
 }
 
 impl ObservedState {
     /// The observations of a turn so far.
-    pub(crate) const fn from_runtime_records(
-        completed_steps: Vec<ObservedStep>,
-        artifacts: Vec<ObservedArtifact>,
-        retry_count: u32,
-    ) -> Self {
+    pub(crate) const fn from_runtime_records(completed_steps: Vec<ObservedStep>, retry_count: u32) -> Self {
         Self {
             completed_steps,
-            artifacts,
             retry_count,
             exact_call_observations: None,
         }
@@ -425,11 +355,6 @@ impl ObservedState {
     /// The completed steps, in order.
     pub(crate) fn completed_steps(&self) -> &[ObservedStep] {
         &self.completed_steps
-    }
-
-    /// The artifacts, in order.
-    pub(crate) fn artifacts(&self) -> &[ObservedArtifact] {
-        &self.artifacts
     }
 
     /// Retries so far.
@@ -604,16 +529,14 @@ impl fmt::Debug for RawRoutingInput {
     }
 }
 
-/// Where a decision hop sits in its turn. The first hop has no prior
-/// decision; every later hop has a hop number of at least 1 and names the
-/// decision before it. One type, so the two can never disagree (the state
-/// v1 rule "null exactly on hop 0"; R-CDP16 M-2).
+/// Where a decision hop sits in its turn. Since R9 every turn opens
+/// prediction-free with exactly one hop, so the only lineage is hop 0 with
+/// no prior decision (the state v1 rule "null exactly on hop 0"; R-CDP16
+/// M-2). The wire keeps both fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HopLineage {
     /// Hop 0.
     First,
-    /// A later hop.
-    After { hop: NonZeroU8, prior_decision_id: Uuid },
 }
 
 impl HopLineage {
@@ -621,7 +544,6 @@ impl HopLineage {
     pub(crate) const fn hop(self) -> u8 {
         match self {
             Self::First => 0,
-            Self::After { hop, .. } => hop.get(),
         }
     }
 
@@ -629,7 +551,6 @@ impl HopLineage {
     pub(crate) const fn prior_decision_id(self) -> Option<Uuid> {
         match self {
             Self::First => None,
-            Self::After { prior_decision_id, .. } => Some(prior_decision_id),
         }
     }
 }
@@ -669,71 +590,16 @@ fn fingerprint_from_canonical(
 impl CausalState {
     /// The keyed fingerprint of everything that decides the turn: trusted,
     /// observed and derived inputs and the raw texts. Lineage and time are
-    /// not material: the run and task ids, the source, causation, step and
-    /// artifact event ids, the build time, the exact artifact ages (only
-    /// their [`artifact_age_class`] counts), the hop number and the prior
-    /// decision id (R-CDP16 M-1). It never reads predicted values. Every
-    /// executed hop adds its own completed step, which is material, so this
-    /// fingerprint cannot tell that a hop made no progress; the hop loop
-    /// uses [`CausalState::evidence_fingerprint`] for that (D-066 N-1).
+    /// not material: the run and task ids, the source, causation and step
+    /// event ids, the build time, the hop number and the prior decision id
+    /// (R-CDP16 M-1). The canonical `artifacts` sequences stay empty: no
+    /// runtime path records an artifact since R9. It never reads predicted
+    /// values. Every executed hop adds its own completed step, which is
+    /// material.
     /// Lowercase hex of
     /// `HMAC(DecisionKey, StateFingerprint, "material" ‖ canonical JSON)`.
     pub(crate) fn material_fingerprint(&self, key: &DecisionKey) -> Result<String, serde_json::Error> {
         fingerprint_from_canonical(key, b"material", self.canonical(false))
-    }
-
-    /// The keyed fingerprint of the evidence the turn has observed (D-066
-    /// N-1 and its amendment): the set of artifact contents (kind and
-    /// summary), the set of completed steps that did not succeed (kind,
-    /// status and candidate), and the set of candidate ids the turn can
-    /// choose from, so a hop that discovers a new candidate is progress even
-    /// when it records no artifact. A successful retrieve or discover step
-    /// adds nothing of its own; its evidence is the artifacts and
-    /// candidates it returned. CDP-21's hop loop compares
-    /// this fingerprint before and after a Retrieve or Discover hop and
-    /// stops when it is unchanged: a hop that found nothing new made no
-    /// progress. Sets, so the order and repeats of entries do not matter.
-    /// Lowercase hex of
-    /// `HMAC(DecisionKey, StateFingerprint, "evidence" ‖ canonical JSON)`.
-    pub(crate) fn evidence_fingerprint(&self, key: &DecisionKey) -> String {
-        let artifacts: BTreeSet<String> = self
-            .observed
-            .artifacts()
-            .iter()
-            .map(|artifact| json!([artifact.kind.as_str(), artifact.summary]).to_string())
-            .collect();
-        let unsuccessful: BTreeSet<String> = self
-            .observed
-            .completed_steps()
-            .iter()
-            .filter(|step| step.kind() != ObservedStepKind::RouterHistory && step.status() != ObservedStepStatus::Ok)
-            .map(|step| {
-                json!([
-                    step.kind().as_str(),
-                    step.status().as_str(),
-                    step.candidate().map(CandidateId::as_str),
-                ])
-                .to_string()
-            })
-            .collect();
-        let candidates: BTreeSet<&str> = self
-            .derived
-            .candidates()
-            .iter()
-            .map(|derived| derived.candidate.candidate_id().as_str())
-            .collect();
-        let mut canonical = json!({
-            "artifacts": artifacts,
-            "unsuccessful_steps": unsuccessful,
-            "candidates": candidates,
-        });
-        if let Some(facts) = self.observed.exact_call_observations()
-            && let serde_json::Value::Object(fields) = &mut canonical
-        {
-            fields.insert("exact_call_observations".to_owned(), json!(facts.as_ref()));
-        }
-        let canonical = canonical.to_string();
-        hex::encode(key.hmac(KeyDomain::StateFingerprint, &[b"evidence", canonical.as_bytes()]))
     }
 
     /// The keyed fingerprint of the full record: the material inputs plus
@@ -746,7 +612,7 @@ impl CausalState {
     /// Canonical JSON of the fingerprinted inputs: object keys in a fixed
     /// order, sets (exclusions, constraints, grants, approval op ids,
     /// candidates) deduplicated and sorted so neither their listing order
-    /// nor a repeat matters, sequences (steps, artifacts) in order, no
+    /// nor a repeat matters, sequences (steps) in order, no
     /// floats.
     fn canonical(&self, record: bool) -> Result<String, serde_json::Error> {
         canonical::serialize(self, record)
@@ -764,10 +630,11 @@ impl CausalState {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) mod fixtures {
-    use super::super::branch::{
-        ApprovalRequirement, CandidateSpec, CapabilityTarget, CausalActionKind, CostEstimate, Ns8, SideEffectClass,
-    };
+    use super::super::branch::{CandidateSpec, Ns8};
     use super::*;
+    use crate::tools::capability::contract::{
+        ApprovalRequirement, CapabilityTarget, CausalActionKind, CostEstimate, SideEffectClass,
+    };
 
     pub(crate) fn key() -> Arc<DecisionKey> {
         let dir = tempfile::tempdir().expect("test: tempdir");
@@ -867,23 +734,8 @@ pub(crate) mod fixtures {
         )
     }
 
-    pub(crate) fn artifact(summary: &str, age_ms: u64) -> ObservedArtifact {
-        ObservedArtifact {
-            kind: ObservedArtifactKind::Memory,
-            age_ms,
-            summary: summary.to_string(),
-            summary_was_redacted: false,
-            summary_was_truncated: false,
-            source_event_id: Some(Arc::from("event-artifact-1")),
-        }
-    }
-
     pub(crate) fn observed() -> ObservedState {
-        ObservedState::from_runtime_records(
-            vec![step(ObservedStepKind::Retrieve, ObservedStepStatus::Ok)],
-            vec![artifact("Two notes about the release plan.", 1_000)],
-            0,
-        )
+        ObservedState::from_runtime_records(vec![step(ObservedStepKind::Tool, ObservedStepStatus::Ok)], 0)
     }
 
     pub(crate) fn state(key: &DecisionKey, turn: &str) -> CausalState {
@@ -899,15 +751,6 @@ pub(crate) mod fixtures {
             built_at_ms: 1_000,
         }
     }
-
-    /// The hop after `state`, with `prior` as the previous decision.
-    pub(crate) fn next_hop(state: &CausalState, prior: Uuid) -> HopLineage {
-        let hop = NonZeroU8::new(state.lineage.hop().saturating_add(1)).unwrap_or(NonZeroU8::MIN);
-        HopLineage::After {
-            hop,
-            prior_decision_id: prior,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -915,14 +758,14 @@ pub(crate) mod fixtures {
 mod turn_state_tests {
     use std::time::{Duration, Instant};
 
-    use super::super::branch::{CapabilityTarget, CausalActionKind};
-    use super::fixtures::{artifact, candidate, candidates, derived, executed, key, next_hop, observed, state, step};
+    use super::fixtures::{candidate, candidates, derived, executed, key, observed, state, step};
     use super::*;
     use crate::decision::{
         BackendIdentity, BackendKind, ChoiceAnswer, DecisionQuestion, DecisionResponse, DecisionResponseValidator,
         DecisionUsage, GlobalQuestion, ModelVersionPolicy, OptionId, Probability, RequestLimits, RequestParts,
         StructuredValue, ValidationContext,
     };
+    use crate::tools::capability::contract::{CapabilityTarget, CausalActionKind};
 
     fn with_trusted(state: &CausalState, edit: impl FnOnce(&mut TrustedParts)) -> CausalState {
         let mut parts = state.trusted.parts().clone();
@@ -933,8 +776,7 @@ mod turn_state_tests {
     }
 
     /// R-CDP16 M-1: lineage and time are not material. A state that differs
-    /// only in the hop, the prior decision, the run and task ids, the event
-    /// ids, the build time and the exact artifact age (within its class) has
+    /// only in the run and task ids, the event ids and the build time has
     /// the same material fingerprint and a different record fingerprint.
     #[test]
     fn lineage_and_time_are_not_material() {
@@ -953,17 +795,14 @@ mod turn_state_tests {
             parts.source_event_id = Some(Arc::from("event-9"));
             parts.causation_event_id = Some(Arc::from("event-8"));
         });
-        later.lineage = next_hop(&base, Uuid::from_u128(7));
         later.built_at_ms = 99_000;
-        let mut aged = artifact("Two notes about the release plan.", 2_000);
-        aged.source_event_id = Some(Arc::from("event-artifact-9"));
         let renamed = ObservedStep::recorded_by_runtime(
-            ObservedStepKind::Retrieve,
+            ObservedStepKind::Tool,
             ObservedStepStatus::Ok,
             None,
             Some(Arc::from("event-step-9")),
         );
-        later.observed = ObservedState::from_runtime_records(vec![renamed], vec![aged], 0);
+        later.observed = ObservedState::from_runtime_records(vec![renamed], 0);
         assert_eq!(
             later
                 .material_fingerprint(&key)
@@ -980,98 +819,8 @@ mod turn_state_tests {
         );
     }
 
-    /// D-066 N-1, the hop loop simulated: decide Retrieve, execute it, then
-    /// compare the evidence fingerprint. A retrieval that returned nothing
-    /// adds a successful step but no evidence, so the loop stops, even
-    /// though the material fingerprint changed; a retrieval that returned
-    /// an artifact, a failed retrieval and a discovery that found something
-    /// are progress.
-    #[test]
-    fn the_hop_loop_stops_when_a_hop_found_no_new_evidence() {
-        let key = key();
-        // The first hop has done nothing yet: no step, one artifact from the
-        // session.
-        let mut before = state(&key, "what changed in the release?");
-        before.observed = ObservedState::from_runtime_records(Vec::new(), before.observed.artifacts().to_vec(), 0);
-        let before = before;
-        let hop = |status, found: Option<(ObservedArtifactKind, &str)>, kind| {
-            let mut after = before.clone();
-            after.lineage = next_hop(&before, Uuid::from_u128(9));
-            let mut steps = before.observed.completed_steps().to_vec();
-            steps.push(ObservedStep::recorded_by_runtime(
-                kind,
-                status,
-                None,
-                Some(Arc::from("event-hop")),
-            ));
-            let mut artifacts = before.observed.artifacts().to_vec();
-            if let Some((kind, summary)) = found {
-                let mut found = artifact(summary, 10);
-                found.kind = kind;
-                artifacts.push(found);
-            }
-            after.observed = ObservedState::from_runtime_records(steps, artifacts, before.observed.retry_count());
-            after
-        };
-        let evidence = before.evidence_fingerprint(&key);
-
-        // D-066 amendment: a Discover hop that only adds a candidate is
-        // progress too.
-        let mut discovered = hop(ObservedStepStatus::Ok, None, ObservedStepKind::Discover);
-        let mut list = before.derived.candidates().to_vec();
-        list.push(candidate(
-            &key,
-            CausalActionKind::UseTool,
-            CapabilityTarget::Web,
-            Some("search"),
-        ));
-        discovered.derived = derived(list);
-        assert_ne!(
-            discovered.evidence_fingerprint(&key),
-            evidence,
-            "a discovered candidate is new evidence"
-        );
-
-        let empty = hop(ObservedStepStatus::Ok, None, ObservedStepKind::Retrieve);
-        assert_eq!(empty.evidence_fingerprint(&key), evidence, "no new evidence: stop");
-        assert_ne!(
-            empty
-                .material_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            before
-                .material_fingerprint(&key)
-                .expect("test: canonical state serializes"),
-            "the step itself is material, which is why the loop does not use it"
-        );
-
-        for progress in [
-            hop(
-                ObservedStepStatus::Ok,
-                Some((ObservedArtifactKind::Memory, "The release moved to Friday.")),
-                ObservedStepKind::Retrieve,
-            ),
-            hop(ObservedStepStatus::Failed, None, ObservedStepKind::Retrieve),
-        ] {
-            assert_ne!(progress.evidence_fingerprint(&key), evidence, "{progress:?}");
-        }
-
-        let mut repeated = before.clone();
-        let mut artifacts = before.observed.artifacts().to_vec();
-        artifacts.extend(before.observed.artifacts().iter().cloned());
-        artifacts.reverse();
-        repeated.observed =
-            ObservedState::from_runtime_records(before.observed.completed_steps().to_vec(), artifacts, 0);
-        assert_eq!(
-            repeated.evidence_fingerprint(&key),
-            evidence,
-            "a set: order and repeats do not matter"
-        );
-        assert_ne!(before.evidence_fingerprint(&super::fixtures::key()), evidence, "keyed");
-    }
-
-    /// New evidence, a new failure, a new catalog generation, a new approval
-    /// grant, a new routing input or an artifact crossing an age class is
-    /// material.
+    /// A new failure, a new catalog generation, a new approval grant, a new
+    /// routing input, a retry or an exact mention is material.
     #[test]
     fn new_inputs_are_material() {
         let key = key();
@@ -1084,29 +833,7 @@ mod turn_state_tests {
         let changes: Vec<CausalState> = vec![
             {
                 let mut changed = base.clone();
-                changed.observed = ObservedState::from_runtime_records(
-                    base.observed.completed_steps().to_vec(),
-                    vec![
-                        artifact("Two notes about the release plan.", 1_000),
-                        artifact("A third note.", 1_000),
-                    ],
-                    0,
-                );
-                changed
-            },
-            {
-                let mut changed = base.clone();
-                changed.observed =
-                    ObservedState::from_runtime_records(vec![failed], base.observed.artifacts().to_vec(), 0);
-                changed
-            },
-            {
-                let mut changed = base.clone();
-                changed.observed = ObservedState::from_runtime_records(
-                    base.observed.completed_steps().to_vec(),
-                    vec![artifact("Two notes about the release plan.", 2 * 60 * 60 * 1000)],
-                    0,
-                );
+                changed.observed = ObservedState::from_runtime_records(vec![failed], 0);
                 changed
             },
             with_trusted(&base, |parts| parts.catalog_generation = CatalogGeneration([8; 32])),
@@ -1118,11 +845,7 @@ mod turn_state_tests {
             },
             {
                 let mut changed = base.clone();
-                changed.observed = ObservedState::from_runtime_records(
-                    base.observed.completed_steps().to_vec(),
-                    base.observed.artifacts().to_vec(),
-                    1,
-                );
+                changed.observed = ObservedState::from_runtime_records(base.observed.completed_steps().to_vec(), 1);
                 changed
             },
             {
@@ -1201,7 +924,6 @@ mod turn_state_tests {
                 executed(ObservedStepStatus::Ok, &answer),
                 step(ObservedStepKind::Tool, ObservedStepStatus::Failed),
             ],
-            Vec::new(),
             0,
         );
         assert_eq!(observed.failed_candidates().into_iter().collect::<Vec<_>>(), [&github]);
@@ -1217,11 +939,8 @@ mod turn_state_tests {
         // Which candidate failed is material, not only that a step failed.
         let failed_on = |candidate: &CandidateId| {
             let mut changed = base.clone();
-            changed.observed = ObservedState::from_runtime_records(
-                vec![executed(ObservedStepStatus::Failed, candidate)],
-                Vec::new(),
-                0,
-            );
+            changed.observed =
+                ObservedState::from_runtime_records(vec![executed(ObservedStepStatus::Failed, candidate)], 0);
             changed
                 .material_fingerprint(&key)
                 .expect("test: canonical state serializes")
@@ -1241,15 +960,12 @@ mod turn_state_tests {
         assert_eq!(DerivedState::new(twice), Err(DuplicateCandidate(repeated)));
     }
 
-    /// The hop lineage gives hop 0 with no prior, and a later hop with one.
+    /// The only hop lineage is hop 0 with no prior decision.
     #[test]
     fn the_hop_lineage_pairs_hop_and_prior() {
         let key = key();
         let first = state(&key, "hello");
         assert_eq!((first.lineage.hop(), first.lineage.prior_decision_id()), (0, None));
-        let prior = Uuid::from_u128(5);
-        let after = next_hop(&first, prior);
-        assert_eq!((after.hop(), after.prior_decision_id()), (1, Some(prior)));
     }
 
     fn sealed(key: &DecisionKey, material: &str) -> (DecisionRequest, QuestionId, DecisionAnswer) {
@@ -1360,7 +1076,7 @@ mod turn_state_tests {
     }
 
     /// D-057 M-5 and R-CDP16 M-4: `Debug` of a state prints no raw text: not
-    /// the routing input, the goal, an artifact or catalog summary, an
+    /// the routing input, the goal, a catalog summary, an
     /// identity, an exclusion or a grant.
     #[test]
     fn debug_output_carries_no_private_text() {
@@ -1378,8 +1094,6 @@ mod turn_state_tests {
             parts.approval_grants = vec![Arc::from("grant-sentinel-5")];
         });
         turn.goal = RawRoutingInput::new("goal-sentinel-6".to_string());
-        turn.observed =
-            ObservedState::from_runtime_records(Vec::new(), vec![artifact("password=hunter2-sentinel-7", 10)], 0);
         let mut list = candidates(&key);
         list[0].summary = Arc::from("catalog-sentinel-8");
         turn.derived = derived(list);
@@ -1392,9 +1106,7 @@ mod turn_state_tests {
             "exclusion-sentinel-4",
             "grant-sentinel-5",
             "goal-sentinel-6",
-            "hunter2-sentinel-7",
             "catalog-sentinel-8",
-            "release plan",
         ] {
             assert!(!printed.contains(sentinel), "{sentinel} printed: {printed}");
         }

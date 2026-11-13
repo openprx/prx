@@ -5,8 +5,8 @@
 
 use super::CapabilityCatalog;
 use super::{CallDigestSource, ToolExecutionError, admitted_call_digest};
-use crate::causal_tree::branch::CapabilityRef;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::fingerprint::tool_spec_fingerprint;
 use crate::tools::execution::{ToolDescriptor, ToolExecutionCommand, ToolExecutionService};
 use std::sync::Arc;
@@ -160,7 +160,7 @@ impl ToolExecutionService {
 mod tests {
     use super::*;
     use crate::acl::approval_grant::RiskLevel;
-    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
+    use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
 
     #[test]
     fn h2_call_digest_matches_previous_decision_call_digest_formula() {

@@ -27,10 +27,10 @@ fn associated_data(record: &PendingRecord) -> anyhow::Result<Vec<u8>> {
 impl TurnDecisionService {
     fn pending_call_cipher(&self) -> anyhow::Result<ChaCha20Poly1305> {
         anyhow::ensure!(self.durable_key, "approval call encryption requires a durable key");
-        let key = Zeroizing::new(
-            self.state_key
-                .hmac(crate::decision::KeyDomain::ApprovalState, &[b"call-encryption-key-v1"]),
-        );
+        let key = Zeroizing::new(self.state_key.hmac(
+            crate::security::runtime_key::KeyDomain::ApprovalState,
+            &[b"call-encryption-key-v1"],
+        ));
         Ok(ChaCha20Poly1305::new(Key::from_slice(key.as_ref())))
     }
 
@@ -77,7 +77,7 @@ impl TurnDecisionService {
             id == entry.id.as_str() && *fingerprint == entry.fingerprint.0 && *generation == entry.generation.0,
             "stored approval capability changed"
         );
-        let capability = crate::causal_tree::branch::CapabilityRef {
+        let capability = crate::tools::capability::contract::CapabilityRef {
             id: entry.id.clone(),
             fingerprint: entry.fingerprint,
             generation: entry.generation,

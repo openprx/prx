@@ -57,7 +57,7 @@ impl OperatorProcessSnapshots {
         let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
             &source.catalog,
             &key,
-            crate::causal_tree::branch::CatalogGeneration(source.publication.catalog_generation),
+            crate::tools::capability::contract::CatalogGeneration(source.publication.catalog_generation),
         )?;
         let publication = source.publication.verify(&key, &catalog)?;
         anyhow::ensure!(

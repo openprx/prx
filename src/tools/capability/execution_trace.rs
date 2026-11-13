@@ -96,7 +96,7 @@ fn mcp_policy_denial(error: &str) -> bool {
 
 #[derive(Debug, Default)]
 struct State {
-    exact_key: Option<Arc<crate::decision::DecisionKey>>,
+    exact_key: Option<Arc<crate::security::runtime_key::DecisionKey>>,
     exact_call_observations: Option<ExactCallObservations>,
     authorized_silent: bool,
     provider_attempts: Vec<RecordedOutcomeAttempt>,

@@ -190,7 +190,11 @@ pub fn configured_models(config: &crate::config::Config) -> Vec<String> {
         models.push(model.clone());
         models.extend(fallbacks.iter().cloned());
     }
-    models.push(config.causal_tree.backend.model.clone());
+    models.push(
+        crate::decision_engine::config::effective_engine_backend(config)
+            .model
+            .clone(),
+    );
     models
 }
 

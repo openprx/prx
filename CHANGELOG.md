@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- BREAKING (operators): with `[decision_engine] enabled = true` the engine
+  gives advice only. Every turn opens the same way whatever the engine
+  setting; the engine no longer selects Clarify, Refuse, RequestApproval,
+  Retrieve, Discover or Execute, never changes the published tool surface
+  and never refuses a request. Its analysis is charged to the turn's own
+  budget and is skipped when the budget is too tight. The legacy selection
+  pipeline (selector, scorer, rehearsal, exploration) is gone. Historical
+  approvals recorded before this change still resume their exact prepared
+  call.
+- BREAKING (operators): Full autonomy has no permission limits. Identity
+  scope ACLs, forced explicit-grant approvals and child manifest tool
+  membership no longer restrict a Full turn. Integrity checks, budgets,
+  recursive money and spawn depth still apply. Supervised and ReadOnly are
+  unchanged.
 - BREAKING (operators): the Matrix channel and its vendored SDK were removed,
   including the `channel-matrix` feature and the `matrix-sdk` dependency.
   Existing `[channels_config.matrix]` sections are ignored with one warning at

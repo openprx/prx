@@ -1,10 +1,10 @@
 //! Child completion settlement. Admission stays in the gated adapter.
 use crate::agent::terminal::VerifiedTerminalReplay;
 use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-use crate::decision::DecisionKey;
 use crate::memory::{MessageEvent, MessageEventSource};
 use crate::runtime::child_source::authority_journal::{self, CHILD_OUTCOME_VERSION, ChildOutcomeRow};
 use crate::runtime::turn_cleanup::{CleanupTracker, current_tracker};
+use crate::security::runtime_key::DecisionKey;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;

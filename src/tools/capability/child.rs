@@ -2,10 +2,10 @@ mod cost_allowance;
 pub(crate) mod wire;
 mod worker_constraints;
 
-use crate::causal_tree::branch::{CapabilityRef, CatalogGeneration};
 use crate::causal_tree::ids::DecisionId;
-use crate::decision::key::{DecisionKey, KeyDomain};
 use crate::security::AutonomyLevel;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
+use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -376,7 +376,7 @@ fn decode_worker_refs(
     items: &[wire::WorkerChildCapabilityRef],
     generation: CatalogGeneration,
 ) -> Result<BTreeSet<CapabilityRef>, ChildManifestError> {
-    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, SchemaFingerprint};
+    use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, SchemaFingerprint};
     let invalid = || ChildManifestError::InvalidTransport;
     let mut allowed = BTreeSet::new();
     for item in items {
@@ -419,7 +419,7 @@ const fn level_rank(level: AutonomyLevel) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, SchemaFingerprint};
+    use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, SchemaFingerprint};
 
     #[test]
     fn child_manifest_is_a_sealed_strict_subset_with_narrower_depth() {

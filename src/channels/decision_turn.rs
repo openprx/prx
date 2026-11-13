@@ -124,7 +124,7 @@ impl ChannelDecisionTurn {
                 cancellation,
             )
             .await?;
-        let advice = service.analyze_advisory(&context, cancellation).await;
+        let advice = service.advisory().analyze_turn(context.runtime(), cancellation).await;
         let terminal = crate::runtime::turn_terminal::TurnTerminalGuard::new(
             admission.take_terminal_ticket()?,
             Arc::clone(&service),

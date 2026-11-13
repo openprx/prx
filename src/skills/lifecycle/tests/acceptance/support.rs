@@ -356,7 +356,7 @@ pub(super) struct World {
     pub loopback: Loopback,
     /// Decision deadlines on this world's runs elapse only when a test advances
     /// this clock. The latency budget itself is unchanged.
-    clock: std::sync::Arc<crate::causal_tree::logical_clock::ManualClock>,
+    clock: std::sync::Arc<crate::runtime::logical_clock::ManualClock>,
 }
 
 impl World {
@@ -380,7 +380,7 @@ impl World {
             owner,
             store,
             loopback,
-            clock: crate::causal_tree::logical_clock::ManualClock::new(),
+            clock: crate::runtime::logical_clock::ManualClock::new(),
         }
     }
 
@@ -439,7 +439,7 @@ impl World {
 
     /// One task through the real single-shot agent entry (`prx agent -m`).
     pub async fn run_task(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
-        let run = crate::causal_tree::logical_clock::scope(
+        let run = crate::runtime::logical_clock::scope(
             std::sync::Arc::clone(&self.clock),
             Box::pin(crate::agent::run(
                 config.clone(),
@@ -453,20 +453,6 @@ impl World {
         tokio::time::timeout(std::time::Duration::from_secs(60), run)
             .await
             .map_err(|_| anyhow::anyhow!("the agent run did not finish within 60s"))?
-    }
-
-    /// One plain turn whose decision sleeps 600 ms of wall time after the
-    /// deadline is captured. The logical budget is not spent.
-    pub async fn run_plain_under_wall_stall(&self, config: &Config) -> anyhow::Result<String> {
-        self.clock.arm_wall_stall(std::time::Duration::from_millis(600));
-        self.run_task(config, "Say hello.").await
-    }
-
-    /// One plain turn that spends the 500 ms logical latency budget as soon as
-    /// the deadline is captured.
-    pub async fn run_plain_after_logical_budget(&self, config: &Config) -> anyhow::Result<String> {
-        self.clock.arm_logical_advance(std::time::Duration::from_millis(500));
-        self.run_task(config, "Say hello.").await
     }
 
     /// [`Self::run_task`] for a task that selects a catalog skill, with the

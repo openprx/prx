@@ -1,4 +1,4 @@
-use super::causal_domain::crate_rooted_paths;
+use super::helpers::crate_rooted_paths;
 use super::helpers::{
     blank_comments_and_literals, is_ident_char, read_source, relative_path, rust_source_files, strip_cfg_test_items,
 };

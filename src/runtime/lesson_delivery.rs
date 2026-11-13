@@ -1,7 +1,7 @@
 //! Optional editor-only final-wire delivery proof through the existing owner.
 use super::turn_cleanup::{CleanupTracker, current_tracker};
-use crate::decision::{DecisionKey, KeyDomain};
 use crate::providers::attempt_accounting::{AttemptReceipt, PhysicalAttemptIdentity, sealed};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::{ModelBinding, PreparedLessonContext};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;

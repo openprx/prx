@@ -138,7 +138,7 @@ async fn exercise_grounding_request(
                         matches!(
                             admission.decision().context.engine().selection,
                             crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                                if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::UseTool
+                                if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::UseTool
                         ),
                         explicit_execution
                     );

@@ -240,11 +240,11 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
         })),
     };
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-    let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    let clock = crate::runtime::logical_clock::ManualClock::new();
     if matches!(plan, ClockPlan::LogicalExpiry) {
         clock.arm_site("auxiliary_deadline", Duration::ZERO, Duration::from_millis(5_100));
     }
-    crate::causal_tree::logical_clock::scope(clock, async move {
+    crate::runtime::logical_clock::scope(clock, async move {
         let outcome = std::panic::AssertUnwindSafe(async {
             let provider = format!("custom:{endpoint}");
             let mut config = Config::default();

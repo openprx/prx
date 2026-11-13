@@ -10,13 +10,12 @@
 //! the test has not advanced logical time. Timeout helpers on this path wait
 //! on logical time, so they do not sleep until that epoch.
 
+#[cfg(test)]
 use std::future::Future;
 use std::time::Instant;
 
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 #[cfg(test)]
@@ -46,10 +45,7 @@ struct SiteHook {
 pub(crate) struct ManualClock {
     origin: Instant,
     elapsed_ms: watch::Sender<u64>,
-    stall_ms: AtomicU64,
-    advance_ms: AtomicU64,
     sites: parking_lot::Mutex<std::collections::HashMap<&'static str, SiteHook>>,
-    checkpoint: parking_lot::Mutex<Option<(&'static str, usize, Duration)>>,
 }
 
 #[cfg(test)]
@@ -60,9 +56,6 @@ impl ManualClock {
         Arc::new(Self {
             origin: Instant::now() + EPOCH_LEAD,
             elapsed_ms,
-            stall_ms: AtomicU64::new(0),
-            advance_ms: AtomicU64::new(0),
-            checkpoint: parking_lot::Mutex::new(None),
             sites: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -83,27 +76,6 @@ impl ManualClock {
         self.elapsed_ms.send_modify(|slot| {
             *slot = slot.saturating_add(add);
         });
-    }
-
-    /// After the decision deadline is captured, sleep this long on the wall
-    /// clock without spending logical time. Consumed once.
-    #[cfg(test)]
-    pub(crate) fn arm_wall_stall(&self, delay: Duration) {
-        self.stall_ms
-            .store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::Release);
-    }
-
-    /// After the decision deadline is captured, spend this much logical time.
-    /// Consumed once.
-    #[cfg(test)]
-    pub(crate) fn arm_logical_advance(&self, delay: Duration) {
-        self.advance_ms
-            .store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::Release);
-    }
-
-    /// Spend logical time on the Nth matching engine checkpoint.
-    pub(crate) fn arm_checkpoint(&self, name: &'static str, occurrence: usize, by: Duration) {
-        *self.checkpoint.lock() = Some((name, occurrence, by));
     }
 
     pub(crate) fn arm_site(&self, name: &'static str, stall: Duration, advance: Duration) {
@@ -127,27 +99,6 @@ impl ManualClock {
             .lock()
             .get(name)
             .is_some_and(|entry| entry.hits > 0 && entry.on_clock)
-    }
-
-    #[cfg(test)]
-    async fn wait_until<T>(&self, deadline: Instant, call: impl Future<Output = T>) -> Result<T, ()> {
-        let limit_ms = u64::try_from(deadline.saturating_duration_since(self.origin).as_millis()).unwrap_or(u64::MAX);
-        tokio::pin!(call);
-        let mut seen = self.elapsed_ms.subscribe();
-        loop {
-            if *seen.borrow() >= limit_ms {
-                return Err(());
-            }
-            tokio::select! {
-                biased;
-                output = &mut call => return Ok(output),
-                changed = seen.changed() => {
-                    if changed.is_err() {
-                        return Ok(call.await);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -196,70 +147,6 @@ pub(crate) fn now() -> Instant {
 #[cfg(test)]
 pub(crate) fn installed() -> bool {
     current().is_some()
-}
-
-#[cfg(not(test))]
-pub(crate) const fn installed() -> bool {
-    false
-}
-
-/// Applies a test stall or logical advance armed on the current clock.
-/// Unarmed tests return immediately. Production does not call this.
-#[cfg(test)]
-pub(crate) async fn apply_test_stall() {
-    let Some(clock) = current() else {
-        return;
-    };
-    let stall = clock.stall_ms.swap(0, Ordering::AcqRel);
-    if stall > 0 {
-        tokio::time::sleep(Duration::from_millis(stall)).await;
-    }
-    let advance = clock.advance_ms.swap(0, Ordering::AcqRel);
-    if advance > 0 {
-        clock.advance(Duration::from_millis(advance));
-    }
-}
-
-/// Waits for `call` until `deadline`. With a clock installed the wait follows
-/// logical time. The error means the deadline elapsed.
-pub(crate) async fn timeout_at_std<T>(deadline: Instant, call: impl Future<Output = T>) -> Result<T, ()> {
-    #[cfg(test)]
-    if let Some(clock) = current() {
-        return clock.wait_until(deadline, call).await;
-    }
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), call)
-        .await
-        .map_err(|_| ())
-}
-
-/// Whether `deadline` (a tokio instant built from a decision deadline) has elapsed.
-pub(crate) fn tokio_deadline_reached(deadline: tokio::time::Instant) -> bool {
-    #[cfg(test)]
-    if let Some(clock) = current() {
-        return clock.instant() >= deadline.into_std();
-    }
-    tokio::time::Instant::now() >= deadline
-}
-
-/// Engine phase hook; only the installed logical test clock can advance time.
-#[cfg(not(test))]
-pub(crate) const fn checkpoint(_name: &'static str) {}
-
-#[cfg(test)]
-pub(crate) fn checkpoint(checkpoint_name: &'static str) {
-    #[cfg(test)]
-    if let Some(clock) = current() {
-        let mut armed = clock.checkpoint.lock();
-        if let Some((name, remaining, by)) = armed.as_mut()
-            && *name == checkpoint_name
-        {
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 {
-                clock.advance(*by);
-                *armed = None;
-            }
-        }
-    }
 }
 
 /// Run the hook armed on this shared clock, independently of clock re-entry.

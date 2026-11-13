@@ -1223,12 +1223,6 @@ mod tests {
                     assert!(user.content.contains("[End untrusted custom memory context]\n"));
                     assert!(user.content.contains("PRX_CUSTOM_PRESENTATION"));
                 }
-                if user.content == "unclear request" {
-                    assert!(
-                        request.tools.is_none_or(<[_]>::is_empty),
-                        "test: degraded Clarify answer offers zero tools"
-                    );
-                }
                 self.0.chat_traced(request, model, temperature).await
             }
         }
@@ -1286,11 +1280,9 @@ mod tests {
         let mut agent = builder.build().unwrap();
         // Q56: durable Builtin covers selected retrieval from the original scoped seed.
         // The default Builtin must admit a plain first message without invoking
-        // the custom Memory loader. The Q54 Mock's explicit `other` choice
-        // selects Clarify; with a gate-passed Answer it degrades to one plain,
-        // tool-free answer (R177-6) that still never runs the selected loader.
-        // The no-legal-Answer refusal is pinned by
-        // `clarify_without_gate_passed_answer_is_typed_refusal`.
+        // the custom Memory loader. After R9 the opening is prediction-free:
+        // an undecidable request is no longer a Clarify selection but one
+        // ordinary plain answer, which still never runs the selected loader.
         if record_decisions {
             assert_eq!(agent.turn("hello").await.unwrap(), "done");
         } else {
@@ -1298,7 +1290,7 @@ mod tests {
                 agent
                     .turn("unclear request")
                     .await
-                    .expect("test: Clarify with a gate-passed Answer degrades to a plain answer"),
+                    .expect("test: an undecidable request opens as a plain answer"),
                 "done"
             );
         }
@@ -2121,7 +2113,7 @@ mod tests {
             crate::llm::route_decision::AttemptStatus::Success
         );
         let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
-        let key = crate::decision::key::DecisionKey::load_existing(workspace.path()).unwrap();
+        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
         let store_id = store.workspace_id().unwrap();
         let replay = crate::agent::terminal::verify_terminal_replay(
             agent.memory.as_ref(),
@@ -2330,7 +2322,7 @@ mod tests {
             crate::llm::route_decision::AttemptStatus::Success
         );
         let store = crate::causal_tree::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
-        let key = crate::decision::key::DecisionKey::load_existing(workspace.path()).unwrap();
+        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
         let store_id = store.workspace_id().unwrap();
         let replay = crate::agent::terminal::verify_terminal_replay(
             agent.memory.as_ref(),

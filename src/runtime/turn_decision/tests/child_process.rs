@@ -1052,7 +1052,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         assert!(matches!(context.directive(), TurnExecutionDirective::Delegate { .. }));
         assert_eq!(
             context.terminal_outcome_action(),
-            Some(crate::causal_tree::branch::CausalActionKind::Delegate)
+            Some(crate::tools::capability::contract::CausalActionKind::Delegate)
         );
         let selected = service.agent_execution_specs(&proof, &context)?;
         assert_eq!(selected.specs.len(), 1);
@@ -1096,7 +1096,7 @@ async fn parent_effect_policy_case(level: crate::security::AutonomyLevel) -> any
         };
         let candidate = candidates
             .iter()
-            .find(|candidate| candidate.action() == crate::causal_tree::branch::CausalActionKind::Delegate)
+            .find(|candidate| candidate.action() == crate::tools::capability::contract::CausalActionKind::Delegate)
             .expect("actual delegate candidate");
         let calls = BTreeMap::new();
         let seen = BTreeSet::new();
@@ -1225,12 +1225,12 @@ async fn supervised_without_exact_approval_cannot_issue_parent_delegate_grant() 
 /// latency budget, then verifies its durable chain while `advance` of logical
 /// time elapses during the readback (after the verifier captured its deadline).
 async fn durability_readback_case(advance: Duration) -> anyhow::Result<Result<(), String>> {
-    let clock = crate::causal_tree::logical_clock::ManualClock::new();
-    crate::causal_tree::logical_clock::scope(Arc::clone(&clock), durability_readback_body(clock, advance)).await
+    let clock = crate::runtime::logical_clock::ManualClock::new();
+    crate::runtime::logical_clock::scope(Arc::clone(&clock), durability_readback_body(clock, advance)).await
 }
 
 async fn durability_readback_body(
-    clock: Arc<crate::causal_tree::logical_clock::ManualClock>,
+    clock: Arc<crate::runtime::logical_clock::ManualClock>,
     advance: Duration,
 ) -> anyhow::Result<Result<(), String>> {
     let scratch = tempfile::tempdir()?;

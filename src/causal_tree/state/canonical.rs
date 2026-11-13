@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use super::{ApprovalRequirement, CandidateId, CausalState, OpId, SideEffectMode, artifact_age_class};
+use super::{ApprovalRequirement, CandidateId, CausalState, OpId, SideEffectMode};
 
 #[derive(Serialize)]
 struct CanonicalState<'a> {
@@ -42,7 +42,9 @@ struct CanonicalTrusted<'a> {
 
 #[derive(Serialize)]
 struct CanonicalObserved<'a> {
-    artifacts: Vec<(&'a str, &'static str, &'a str)>,
+    /// No runtime path records an artifact since R9; the empty sequence
+    /// keeps the canonical bytes (`"artifacts":[]`) unchanged.
+    artifacts: [(); 0],
     completed_steps: Vec<(&'a str, &'a str, Option<&'a str>)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exact_call_observations: Option<&'a super::exact_calls::ExactCallObservations>,
@@ -73,8 +75,9 @@ struct CanonicalCandidate<'a> {
 
 #[derive(Serialize)]
 struct CanonicalRecord<'a> {
-    artifact_ages_ms: Vec<u64>,
-    artifact_event_ids: Vec<Option<&'a str>>,
+    /// Empty since R9, like `CanonicalObserved::artifacts`.
+    artifact_ages_ms: [(); 0],
+    artifact_event_ids: [(); 0],
     built_at_ms: u64,
     causation_event_id: Option<&'a str>,
     hop: u8,
@@ -133,18 +136,7 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
         goal: state.goal.as_str(),
         has_conversation_history: state.has_conversation_history,
         observed: CanonicalObserved {
-            artifacts: state
-                .observed
-                .artifacts()
-                .iter()
-                .map(|artifact| {
-                    (
-                        artifact.kind.as_str(),
-                        artifact_age_class(artifact.age_ms),
-                        artifact.summary.as_str(),
-                    )
-                })
-                .collect(),
+            artifacts: [],
             completed_steps: state
                 .observed
                 .completed_steps()
@@ -161,18 +153,8 @@ pub(super) fn serialize(state: &CausalState, record: bool) -> Result<String, ser
             retry_count: state.observed.retry_count(),
         },
         record: record.then(|| CanonicalRecord {
-            artifact_ages_ms: state
-                .observed
-                .artifacts()
-                .iter()
-                .map(|artifact| artifact.age_ms)
-                .collect(),
-            artifact_event_ids: state
-                .observed
-                .artifacts()
-                .iter()
-                .map(|artifact| artifact.source_event_id.as_deref())
-                .collect(),
+            artifact_ages_ms: [],
+            artifact_event_ids: [],
             built_at_ms: state.built_at_ms,
             causation_event_id: trusted.causation_event_id.as_deref(),
             hop: state.lineage.hop(),

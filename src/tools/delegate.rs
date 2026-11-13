@@ -1147,7 +1147,7 @@ impl DelegateTool {
             }
         });
         #[cfg(test)]
-        let work = crate::causal_tree::logical_clock::inherit(work);
+        let work = crate::runtime::logical_clock::inherit(work);
         #[cfg(all(test, unix))]
         let work = delegate_diagnostic::inherit(work);
         let mut task = DelegateTask(crate::agent::channel_approval::spawn(boxed_delegate_field(|| {
@@ -1356,16 +1356,13 @@ impl DelegateLoopResources {
                     .catalog()
                     .entry_for_public_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
                     .is_some_and(|entry| {
-                        grant
-                            .scope()
-                            .gate_inputs()
-                            .0
-                            .allowed
-                            .contains(&crate::causal_tree::branch::CapabilityRef {
+                        grant.scope().gate_inputs().0.allowed.contains(
+                            &crate::tools::capability::contract::CapabilityRef {
                                 id: entry.id.clone(),
                                 fingerprint: entry.fingerprint,
                                 generation: entry.generation,
-                            })
+                            },
+                        )
                     }),
                 DelegateChildAuthority::Ordinary { publication, .. } => {
                     publication.allows_tool(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
@@ -2817,18 +2814,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// Logical decision time still expires: a clock fixture is not permission
-    /// to execute after the production admission budget has been spent. The
-    /// expired child selects Clarify, which degrades to one tool-free answer
-    /// (R177-6): its provider sees no tools and a named tool never executes.
+    /// Spending the child's logical decision time no longer refuses the
+    /// child: after R9 the engine is advisory only, its analysis is charged to
+    /// the turn and skipped when the budget is tight, and the request is never
+    /// refused because of it. The child executes its tool once and finishes.
     #[tokio::test]
-    async fn delegate_child_logical_deadline_still_refuses_tool_execution() {
-        let clock = crate::causal_tree::logical_clock::ManualClock::new();
+    async fn delegate_child_logical_deadline_never_refuses_the_child() {
+        let clock = crate::runtime::logical_clock::ManualClock::new();
         let control = crate::agent::agent::native_decision_fixture::ChildResponseControl::AdvanceClock(
             Arc::clone(&clock),
             std::time::Duration::from_millis(600),
         );
-        let (result, requests) = crate::causal_tree::logical_clock::scope_local(
+        let (result, requests) = crate::runtime::logical_clock::scope_local(
             clock,
             DELEGATE_CHILD_RESPONSE.scope(
                 control,
@@ -2846,20 +2843,15 @@ pub(crate) mod tests {
         .await;
         assert!(
             result.success,
-            "test: expired Clarify degrades to a plain child answer: {:?}",
+            "test: a spent logical deadline never refuses the child: {:?}",
             result.error
         );
-        // The fixture model names dynamic_alias on its first reply even though
-        // nothing was offered; the refusal then reaches the second request.
-        assert_eq!(requests.len(), 2, "test: one refused call, then the final reply");
-        for request in &requests {
-            assert!(
-                request
-                    .get("tools")
-                    .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)),
-                "test: the expired child offers no tools: {request}"
-            );
-        }
+        assert_eq!(
+            requests.len(),
+            2,
+            "test: the child executes the tool, then finishes: {}",
+            result.output
+        );
         let tool_replies: Vec<&str> = requests
             .iter()
             .filter_map(|request| request["messages"].as_array())
@@ -2867,13 +2859,14 @@ pub(crate) mod tests {
             .filter(|message| message["role"] == "tool")
             .filter_map(|message| message["content"].as_str())
             .collect();
-        assert!(
-            !tool_replies.is_empty() && tool_replies.iter().all(|content| *content != "dynamic_alias"),
-            "test: the named tool is refused, never executed: {tool_replies:?}"
+        assert_eq!(
+            tool_replies,
+            ["dynamic_alias"],
+            "test: the allowed tool executes exactly once"
         );
         assert!(
             result.output.ends_with("\ndone"),
-            "test: the child returns its plain reply: {}",
+            "test: the child returns its final reply: {}",
             result.output
         );
     }
@@ -3073,11 +3066,11 @@ pub(crate) mod tests {
             driver.control_child_response(control);
         }
         let endpoint = driver.endpoint().to_owned();
-        let clock = crate::causal_tree::logical_clock::capture()
-            .unwrap_or_else(crate::causal_tree::logical_clock::ManualClock::new);
+        let clock =
+            crate::runtime::logical_clock::capture().unwrap_or_else(crate::runtime::logical_clock::ManualClock::new);
         // These tests assert child tool behavior. Exclude OS preemption from
         // admission while leaving production budgets and real I/O intact.
-        crate::causal_tree::logical_clock::scope_local(
+        crate::runtime::logical_clock::scope_local(
             clock,
             driver.run_factory(true, move || async move {
                 observe_owned_delegate_workspace(move |workspace| async move {
@@ -3547,7 +3540,7 @@ pub(crate) mod tests {
                     matches!(
                         admitted.decision().context.engine().selection,
                         crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                            if candidate_id.action() == crate::causal_tree::branch::CausalActionKind::Delegate
+                            if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Delegate
                     ),
                     "configured parent must receive actual issued delegation: {:?}",
                     admitted.decision().context.engine().selection

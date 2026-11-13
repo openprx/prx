@@ -146,7 +146,7 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let fixture = Fixture::new(EntryKind::Terminal);
-    crate::decision::DecisionKey::load_or_create(&fixture.config.workspace_dir).unwrap();
+    crate::security::runtime_key::DecisionKey::load_or_create(&fixture.config.workspace_dir).unwrap();
     let generation = crate::config::new_shared(fixture.config.clone()).pin();
     let memory: Arc<dyn crate::memory::Memory> =
         Arc::new(crate::memory::SqliteMemory::new(fixture.directory.path()).unwrap());

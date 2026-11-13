@@ -16,7 +16,7 @@ use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 
-use super::error::DecisionError;
+use crate::decision::error::DecisionError;
 
 /// Length of the key in bytes.
 const KEY_LEN: usize = 32;

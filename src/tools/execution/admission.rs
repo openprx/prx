@@ -171,6 +171,23 @@ impl TurnSurface {
         self
     }
 
+    /// Restrict the published set to `name` alone (a historical resume turn
+    /// publishes only its prepared tool). Never widens the ceiling.
+    pub(crate) fn restricted_to(&self, name: &str) -> Self {
+        let mut surface = self.clone();
+        surface.published.retain(|published| published == name);
+        surface
+    }
+
+    /// The published tool when exactly one is published.
+    pub(crate) fn single_published(&self) -> Option<&str> {
+        let mut names = self.published.iter().filter(|name| self.contains(name));
+        match (names.next(), names.next()) {
+            (Some(name), None) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn observed_capability_id(&self, name: &str) -> Option<&str> {
         self.capability_ids.get(name).map(String::as_str)
     }
@@ -281,12 +298,15 @@ pub(super) fn admit_child(
                 ) == entry.fingerprint
         })
         .ok_or_else(stale)?;
-    let reference = crate::causal_tree::branch::CapabilityRef {
+    let reference = crate::tools::capability::contract::CapabilityRef {
         id: entry.id.clone(),
         fingerprint: entry.fingerprint,
         generation: entry.generation,
     };
-    if !scope.gate_inputs().0.allowed.contains(&reference) {
+    // Full autonomy has no permission limits (R51): manifest membership does
+    // not limit a Full child. Scope MAC, pin and parity above and below stay.
+    let full = service.policy.autonomy_level() == crate::security::AutonomyLevel::Full;
+    if !full && !scope.gate_inputs().0.allowed.contains(&reference) {
         return Err(stale());
     }
     pin.catalog.check_child_parity(service, scope).map_err(|_| stale())?;
@@ -305,17 +325,22 @@ pub(super) fn admit_child(
 }
 
 /// Combines the parent policy decision with the child manifest autonomy by
-/// Deny > Ask > Allow. A child can only tighten the parent decision.
+/// Deny > Ask > Allow. A child can only tighten the parent decision, except
+/// under a Full service, which has no permission limits (R51).
 pub(super) fn child_autonomy(
     context: &ToolExecutionContext,
     descriptor: &ToolDescriptor,
     decision: super::ToolExecutionDecision,
+    service_level: crate::security::policy::AutonomyLevel,
 ) -> super::ToolExecutionDecision {
     use super::ToolExecutionDecision::{Allow, Ask, Deny};
     use crate::security::policy::AutonomyLevel;
     let Some(scope) = &context.child_scope else {
         return decision;
     };
+    if service_level == AutonomyLevel::Full {
+        return decision;
+    }
     let name = if descriptor.adapter == super::ToolAdapterKind::Skill {
         &descriptor.backend_name
     } else {

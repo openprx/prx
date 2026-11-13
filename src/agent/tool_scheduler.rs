@@ -431,7 +431,7 @@ impl DelegationExecutionTask {
         work: std::pin::Pin<Box<dyn std::future::Future<Output = crate::tools::ToolExecutionOutcome> + Send>>,
     ) -> Self {
         #[cfg(test)]
-        let work = crate::causal_tree::logical_clock::inherit(work);
+        let work = crate::runtime::logical_clock::inherit(work);
         Self(Some(tokio::spawn(work.with_current_subscriber())))
     }
 

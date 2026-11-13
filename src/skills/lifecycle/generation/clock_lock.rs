@@ -2,7 +2,7 @@
 
 //! Test-clock acquisition of the same advisory file locks, with unchanged ordering.
 use super::*;
-use crate::causal_tree::logical_clock;
+use crate::runtime::logical_clock;
 use std::sync::Arc;
 
 pub(super) fn lock_file(

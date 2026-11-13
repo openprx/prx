@@ -61,20 +61,6 @@ use crate::decision::telemetry::{
 /// The database file, under `<workspace>/self/causal_tree/`.
 const DB_FILE: &str = "decisions.db";
 
-/// Limit the owner-scoped history before the outcome join. The query-plan
-/// regression below keeps this read on the existing scope/time index.
-const CAPABILITY_LATENCY_SQL: &str = "WITH recent AS (
-    SELECT decision_id, catalog_generation, created_at_ms FROM decisions
-    WHERE workspace_id = ?1 AND owner_id = ?2
-    ORDER BY created_at_ms DESC, decision_id DESC LIMIT 1024
-  )
-  SELECT o.capability_ids_json, o.tool_calls_json, o.executed_target, o.latency_ms
-  FROM recent d JOIN outcomes o ON o.decision_id = d.decision_id
-  WHERE d.catalog_generation = ?3 AND o.completeness = 'complete'
-    AND o.classification IN ('success', 'fallback_success')
-    AND o.executed_action = 'use_tool' AND o.latency_ms IS NOT NULL
-  ORDER BY d.created_at_ms DESC, d.decision_id DESC, o.settlement_id DESC LIMIT 1024";
-
 /// The writer queue's capacity (SP-CDP-A 5.10).
 const QUEUE_CAPACITY: usize = 1024;
 
@@ -424,10 +410,10 @@ fn bounded_capability_id(value: &str) -> bool {
     else {
         return false;
     };
-    super::branch::CapabilityTarget::ALL
+    crate::tools::capability::contract::CapabilityTarget::ALL
         .iter()
         .find(|target| target.as_str() == family)
-        .and_then(|target| super::branch::CapabilityId::new(*target, namespace, public_name).ok())
+        .and_then(|target| crate::tools::capability::contract::CapabilityId::new(*target, namespace, public_name).ok())
         .is_some_and(|canonical| canonical.as_str() == value)
 }
 
@@ -474,12 +460,12 @@ impl OutcomeRecord {
             return false;
         }
         let valid_action = self.executed_action.as_ref().is_none_or(|action| {
-            super::branch::CausalActionKind::ALL
+            crate::tools::capability::contract::CausalActionKind::ALL
                 .iter()
                 .any(|candidate| candidate.as_str() == action)
         });
         let valid_target = self.executed_target.as_ref().is_none_or(|target| {
-            super::branch::CapabilityTarget::ALL
+            crate::tools::capability::contract::CapabilityTarget::ALL
                 .iter()
                 .any(|candidate| candidate.as_str() == target)
         });
@@ -1896,71 +1882,6 @@ impl DecisionStoreReader {
         self.with(false, |conn| outcome_matches_on_connection(conn, scope, record))
     }
 
-    /// Median total-turn latency associated with exactly one successful
-    /// capability call, scoped to one owner and one catalog generation. This
-    /// is an estimate, never an execution deadline or isolated tool duration.
-    /// Fewer than five unambiguous complete outcomes leave the family default
-    /// in force. Only the newest 1024 scoped decisions are joined, and at
-    /// most 1024 outcome rows are decoded.
-    pub(crate) fn capability_latency_p50(
-        &self,
-        workspace_id: &str,
-        owner_id: &str,
-        catalog_generation: &str,
-    ) -> Result<BTreeMap<String, u32>, StoreError> {
-        self.with(BTreeMap::new(), |conn| {
-            // Disabled/keyless services may read an older store immutably.
-            // Its scope/time index lacks the tie breaker needed for a
-            // bounded read, so keep the versioned family defaults.
-            if store_schema::version(conn)? < 4 {
-                return Ok(BTreeMap::new());
-            }
-            // The existing scope/time index bounds the history read before
-            // joining outcomes. A stale generation can only cause fallback.
-            let mut statement = conn.prepare_cached(CAPABILITY_LATENCY_SQL)?;
-            let mut rows = statement.query(params![workspace_id, owner_id, catalog_generation])?;
-            let mut samples: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-            while let Some(row) = rows.next()? {
-                let ids_json: Option<String> = row.get(0)?;
-                let calls_json: Option<String> = row.get(1)?;
-                let target: Option<String> = row.get(2)?;
-                let latency: i64 = row.get(3)?;
-                let (Some(ids_json), Some(calls_json), Some(target), Ok(latency)) =
-                    (ids_json, calls_json, target, u32::try_from(latency))
-                else {
-                    continue;
-                };
-                if ids_json.len() > MAX_OUTCOME_STORED_BYTES || calls_json.len() > MAX_OUTCOME_STORED_BYTES {
-                    return Err(StoreError::Unsafe("outcome latency sample is oversized".to_owned()));
-                }
-                let ids: Vec<String> = serde_json::from_str(&ids_json)?;
-                let calls: Vec<RecordedToolCall> = serde_json::from_str(&calls_json)?;
-                let ([id], [call]) = (ids.as_slice(), calls.as_slice()) else {
-                    continue;
-                };
-                if !bounded_capability_id(id) || call.capability_id != *id || call.status != "success" {
-                    continue;
-                }
-                if id.split(':').next() != Some(target.as_str()) {
-                    continue;
-                }
-                samples.entry(id.clone()).or_default().push(latency);
-            }
-            Ok(samples
-                .into_iter()
-                .filter_map(|(id, mut values)| {
-                    if values.len() < 5 {
-                        return None;
-                    }
-                    values.sort_unstable();
-                    // Upper median for an even count avoids underestimating
-                    // the observed midpoint at a tight latency gate.
-                    values.get(values.len() / 2).copied().map(|median| (id, median))
-                })
-                .collect())
-        })
-    }
-
     /// The non-legacy decisions of `scope` created in `window`, with their
     /// outcomes, and the number of legacy rows left out.
     ///
@@ -2353,7 +2274,7 @@ impl CausalDecisionStore {
         if mode == StoreMode::ReadOnly {
             return Self::open_read_only(workspace_dir, true);
         }
-        let dir = crate::decision::key::prepare_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
+        let dir = crate::security::runtime_key::prepare_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
         let path = real_path(&dir)?;
         check_files(&path)?;
         // A database written by a newer build is recognised without ever
@@ -2440,7 +2361,7 @@ impl CausalDecisionStore {
     /// `-wal` present ⇒ non-immutable `mode=ro`; `-wal` absent ⇒ `immutable=1`.
     /// Missing database ⇒ `None`.
     pub(crate) fn open_recovery_read_only(workspace_dir: &Path) -> Result<Option<Self>, StoreError> {
-        let dir_exists = crate::decision::key::check_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
+        let dir_exists = crate::security::runtime_key::check_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
         if !dir_exists {
             return Ok(None);
         }
@@ -2478,7 +2399,7 @@ impl CausalDecisionStore {
     /// database reads as empty. `immutable` reads take no lock and create no
     /// side file (the disabled plane).
     fn open_read_only(workspace_dir: &Path, immutable: bool) -> Result<Self, StoreError> {
-        let dir_exists = crate::decision::key::check_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
+        let dir_exists = crate::security::runtime_key::check_decision_dir(workspace_dir).map_err(StoreError::Unsafe)?;
         let path = if dir_exists {
             real_path(&workspace_dir.join("self").join("causal_tree"))?
         } else {
@@ -3326,7 +3247,7 @@ fn recovery_handler_fail_due(stage: HandlerFailStage) -> bool {
 
 fn recovery_time_left(deadline: Instant) -> Result<std::time::Duration, StoreError> {
     deadline
-        .checked_duration_since(crate::causal_tree::logical_clock::deadline_now(deadline))
+        .checked_duration_since(crate::runtime::logical_clock::deadline_now(deadline))
         .filter(|left| !left.is_zero())
         .ok_or(StoreError::RecoveryDeadline)
 }
@@ -3336,7 +3257,7 @@ fn recovery_busy(_attempt: i32) -> bool {
     if let Some(deadline) = deadline {
         if let Ok(left) = recovery_time_left(deadline) {
             std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
-            return crate::causal_tree::logical_clock::deadline_now(deadline) < deadline;
+            return crate::runtime::logical_clock::deadline_now(deadline) < deadline;
         }
     }
     false
@@ -3364,7 +3285,7 @@ impl<'a> RecoveryReadBudget<'a> {
         }
         guard.connection.progress_handler(
             1_000,
-            Some(move || crate::causal_tree::logical_clock::deadline_now(deadline) >= deadline),
+            Some(move || crate::runtime::logical_clock::deadline_now(deadline) >= deadline),
         )?;
         #[cfg(test)]
         if recovery_handler_fail_due(HandlerFailStage::AfterProgress) {

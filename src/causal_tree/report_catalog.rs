@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::evaluate::{EvaluateError, EvaluationReport};
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +95,7 @@ pub(crate) fn verified_report(
     key: &DecisionKey,
     id: uuid::Uuid,
 ) -> Option<serde_json::Value> {
-    if owner.is_empty() || !crate::decision::key::check_decision_dir(workspace).ok()? {
+    if owner.is_empty() || !crate::security::runtime_key::check_decision_dir(workspace).ok()? {
         return None;
     }
     let dir = workspace.join("self/causal_tree/reports");
@@ -148,7 +148,9 @@ pub(crate) struct SavedReports {
 }
 
 pub(crate) fn list_owned_reports(workspace: &Path, owner: &str, key: &DecisionKey) -> std::io::Result<SavedReports> {
-    if owner.is_empty() || !crate::decision::key::check_decision_dir(workspace).map_err(std::io::Error::other)? {
+    if owner.is_empty()
+        || !crate::security::runtime_key::check_decision_dir(workspace).map_err(std::io::Error::other)?
+    {
         return Ok(SavedReports::default());
     }
     let dir = workspace.join("self/causal_tree/reports");

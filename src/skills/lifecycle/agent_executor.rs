@@ -73,7 +73,7 @@ pub struct AgentCaseExecutor {
     /// Acceptance installs this so a spawned evaluation case sees the same
     /// logical decision deadline as `World::run_task`. Absent everywhere else.
     #[cfg(test)]
-    logical_clock: Option<Arc<crate::causal_tree::logical_clock::ManualClock>>,
+    logical_clock: Option<Arc<crate::runtime::logical_clock::ManualClock>>,
     /// Replaces `run_quiet` so a test can enter the Failed arm with a chosen
     /// error. Production never sets it.
     #[cfg(test)]
@@ -112,7 +112,7 @@ impl AgentCaseExecutor {
     /// entered inside the spawned case task, where `agent::run` polls.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_logical_clock(mut self, clock: Arc<crate::causal_tree::logical_clock::ManualClock>) -> Self {
+    pub(crate) fn with_logical_clock(mut self, clock: Arc<crate::runtime::logical_clock::ManualClock>) -> Self {
         self.logical_clock = Some(clock);
         self
     }
@@ -706,7 +706,7 @@ impl AgentCaseExecutor {
         #[cfg(test)]
         let run: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>> =
             match self.logical_clock.clone() {
-                Some(clock) => Box::pin(crate::causal_tree::logical_clock::scope(clock, run)),
+                Some(clock) => Box::pin(crate::runtime::logical_clock::scope(clock, run)),
                 None => run,
             };
         #[cfg(test)]

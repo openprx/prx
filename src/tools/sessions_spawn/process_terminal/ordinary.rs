@@ -127,7 +127,10 @@ pub(super) async fn authenticate_launch(
     worker: &WorkerManifest,
     generation: &crate::config::ConfigGeneration,
     transport_key: &ring::hmac::Key,
-) -> anyhow::Result<(std::sync::Arc<crate::decision::DecisionKey>, CompletionLineage)> {
+) -> anyhow::Result<(
+    std::sync::Arc<crate::security::runtime_key::DecisionKey>,
+    CompletionLineage,
+)> {
     let source = worker
         .ordinary_source
         .as_ref()
@@ -147,7 +150,7 @@ pub(super) async fn authenticate_launch(
             && worker.memory_event_recording.record_tool_events == recording.record_tool_events,
         "ordinary launch recording policy differs from generation"
     );
-    let key = crate::decision::key::DecisionKey::from_worker_channel(
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         transport_key,
         fabric.workspace_id(),
         &worker.run_id,
@@ -180,7 +183,7 @@ pub(super) async fn authenticate_launch(
 async fn verify_completion(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    key: &crate::decision::DecisionKey,
+    key: &crate::security::runtime_key::DecisionKey,
     result: WorkerResult,
     domain: &[u8],
 ) -> anyhow::Result<VerifiedOrdinaryWorkerCompletion> {
@@ -198,7 +201,7 @@ async fn verify_completion(
         .context("ordinary worker completion evidence missing")?;
     anyhow::ensure!(
         key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 domain,
                 lineage.parent_scope_id.as_bytes(),
@@ -380,7 +383,7 @@ pub(crate) async fn recover_completion(
 async fn recover_journal(
     fabric: &MemoryFabric,
     lineage: &CompletionLineage,
-    derived_key: &crate::decision::DecisionKey,
+    derived_key: &crate::security::runtime_key::DecisionKey,
 ) -> anyhow::Result<Option<VerifiedOrdinaryWorkerCompletion>> {
     anyhow::ensure!(lineage.recording_enabled, "ordinary recovery requires recording");
     let owner = lineage.owner_id.as_deref().context("ordinary recovery owner missing")?;

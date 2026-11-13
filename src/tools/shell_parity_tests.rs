@@ -322,7 +322,7 @@ async fn full_parent_supervised_child_keeps_native_restrictions_after_approval()
     use super::capability::child::{
         AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest, ChildDispatchPin, VerifiedChildScope,
     };
-    use crate::causal_tree::branch::CapabilityRef;
+    use crate::tools::capability::contract::CapabilityRef;
     let root = tempfile::tempdir().expect("test: workspace");
     let outside = tempfile::tempdir().expect("test: outside");
     let parent_service = service(root.path(), AutonomyLevel::Full);
@@ -346,7 +346,7 @@ async fn full_parent_supervised_child_keeps_native_restrictions_after_approval()
             generation: entry.generation,
         }
     };
-    let key = crate::decision::DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::DecisionKey::ephemeral();
     let parent = CapabilityConstraints {
         parent_authority_id: crate::causal_tree::ids::DecisionId::legacy(&[7; 32]).into(),
         allowed: ["shell", "file_write", "file_read"]

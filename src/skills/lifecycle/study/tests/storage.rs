@@ -13,7 +13,7 @@ fn private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 fn metadata_store(plan: &StudyPlan) -> Result<(tempfile::TempDir, SkillLifecycleStore)> {
     let workspace = tempfile::tempdir()?;
     let store = SkillLifecycleStore::open(workspace.path(), plan.manifest.owner_scope.clone())?;
-    crate::decision::DecisionKey::load_or_create(workspace.path())?;
+    crate::security::runtime_key::DecisionKey::load_or_create(workspace.path())?;
     Ok((workspace, store))
 }
 

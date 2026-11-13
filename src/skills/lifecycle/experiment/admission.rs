@@ -2,7 +2,7 @@
 //! Its data cannot recreate the private live entrypoint continuation.
 use super::{ControlledAdmissionPin, ExperimentError, ExperimentId, ExperimentSpec, FrozenExperiment};
 use crate::config::Config;
-use crate::decision::{DecisionKey, KeyDomain};
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::skills::lifecycle::SkillLifecycleStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

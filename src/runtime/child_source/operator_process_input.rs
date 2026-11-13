@@ -68,7 +68,7 @@ pub(crate) async fn restore_input(
         .context("operator worker input is unavailable")?;
     anyhow::ensure!(
         snapshots.key.verify_hmac(
-            crate::decision::key::KeyDomain::StateFingerprint,
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[
                 b"operator-worker-input-v1",
                 snapshots.publication.id().to_string().as_bytes(),

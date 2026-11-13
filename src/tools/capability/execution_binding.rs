@@ -6,8 +6,8 @@ mod dispatch;
 pub(crate) use dispatch::{scope_dispatch_binding, verify_current_dispatch};
 
 use super::catalog::{CapabilityCatalog, CapabilityEntry};
-use crate::causal_tree::branch::CapabilityRef;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::execution::{ToolDescriptor, ToolExecutionCommand, ToolExecutionService};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

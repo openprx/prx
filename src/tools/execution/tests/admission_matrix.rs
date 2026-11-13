@@ -13,7 +13,7 @@ use crate::tools::execution::admission::CallTokenBudget;
 pub(crate) async fn ledger_context(path: &std::path::Path) -> ToolExecutionContext {
     crate::acl::approval_grant::WitnessKeyring::global_for_tests();
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(path).unwrap());
-    let key = crate::decision::DecisionKey::load_or_create(path).unwrap();
+    let key = crate::security::runtime_key::DecisionKey::load_or_create(path).unwrap();
     let fixture = fixture();
     let registry: Vec<Box<dyn Tool>> = [
         "file_write",
@@ -177,7 +177,7 @@ async fn denied_and_expired_approvals_never_execute() {
             let typed: crate::security::approval_ledger::run_call::PendingCall =
                 serde_json::from_value(record.clone()).unwrap();
             let mac = ledger.state_key.hmac(
-                crate::decision::KeyDomain::ApprovalState,
+                crate::security::runtime_key::KeyDomain::ApprovalState,
                 &[b"call.pending", &serde_json::to_vec(&typed).unwrap()],
             );
             *payload.get_mut("mac").unwrap() = serde_json::to_value(mac).unwrap();
@@ -558,13 +558,13 @@ async fn pinned_mcp_alias_uses_catalog_operation_and_rejects_changed_live_target
     );
 }
 
-mod child_fixture {
+pub(in crate::tools::execution::tests) mod child_fixture {
     use super::*;
-    use crate::causal_tree::branch::CapabilityRef;
-    use crate::decision::DecisionKey;
+    use crate::security::runtime_key::DecisionKey;
     use crate::tools::capability::child::{
         AuthorityEnvelope, CapabilityConstraints, ChildCapabilityManifest, ChildDispatchPin, VerifiedChildScope,
     };
+    use crate::tools::capability::contract::CapabilityRef;
 
     /// A tool whose published description follows a shared counter, so a test
     /// can drift one registered capability after the catalog was pinned.
@@ -600,28 +600,33 @@ mod child_fixture {
         }
     }
 
-    pub(super) struct ChildCase {
-        pub(super) fixture: Fixture,
-        pub(super) service: ToolExecutionService,
-        pub(super) drift: Arc<AtomicUsize>,
-        pub(super) key: Arc<DecisionKey>,
-        pub(super) owner: String,
-        pub(super) catalog: Arc<CapabilityCatalog>,
-        pub(super) scope: Arc<VerifiedChildScope>,
+    pub(in crate::tools::execution::tests) struct ChildCase {
+        pub(in crate::tools::execution::tests) fixture: Fixture,
+        pub(in crate::tools::execution::tests) service: ToolExecutionService,
+        pub(in crate::tools::execution::tests) drift: Arc<AtomicUsize>,
+        pub(in crate::tools::execution::tests) key: Arc<DecisionKey>,
+        pub(in crate::tools::execution::tests) owner: String,
+        pub(in crate::tools::execution::tests) catalog: Arc<CapabilityCatalog>,
+        pub(in crate::tools::execution::tests) scope: Arc<VerifiedChildScope>,
     }
 
     impl ChildCase {
         /// `members` names the registered tools the sealed manifest allows.
-        pub(super) fn new(members: &[&str]) -> Self {
+        pub(in crate::tools::execution::tests) fn new(members: &[&str]) -> Self {
             Self::owned_by(members, "owner-a")
         }
 
-        pub(super) fn owned_by(members: &[&str], owner: &str) -> Self {
+        pub(in crate::tools::execution::tests) fn owned_by(members: &[&str], owner: &str) -> Self {
             Self::build(members, owner, AutonomyLevel::Full, 2)
         }
 
         /// `depth` is the parent's remaining depth; the child holds one less.
-        pub(super) fn build(members: &[&str], owner: &str, level: AutonomyLevel, depth: u8) -> Self {
+        pub(in crate::tools::execution::tests) fn build(
+            members: &[&str],
+            owner: &str,
+            level: AutonomyLevel,
+            depth: u8,
+        ) -> Self {
             let fixture = fixture();
             let drift = Arc::new(AtomicUsize::new(0));
             let tools = |state: &Arc<AtomicUsize>| -> Vec<Box<dyn Tool>> {
@@ -756,7 +761,7 @@ mod child_fixture {
             }
         }
 
-        pub(super) fn context(&self, scope: bool, pin: bool) -> ToolExecutionContext {
+        pub(in crate::tools::execution::tests) fn context(&self, scope: bool, pin: bool) -> ToolExecutionContext {
             let mut context = context();
             context.envelope.workspace_id = "workspace-a".into();
             context.child_scope = scope.then(|| Arc::clone(&self.scope));
@@ -772,7 +777,11 @@ mod child_fixture {
         }
 
         /// Dispatches without bindings, a surface or a decision context.
-        pub(super) async fn call(&self, name: &str, context: ToolExecutionContext) -> ToolExecutionStatus {
+        pub(in crate::tools::execution::tests) async fn call(
+            &self,
+            name: &str,
+            context: ToolExecutionContext,
+        ) -> ToolExecutionStatus {
             self.service
                 .execute(
                     ToolExecutionCommand::new(name, serde_json::json!({"value":1})),
@@ -838,7 +847,7 @@ async fn child_provenance_without_scope_is_stale() {
     let mut foreign_key = case.context(true, true);
     foreign_key.child_pin = Some(Arc::new(crate::tools::capability::child::ChildDispatchPin {
         catalog: Arc::clone(&case.catalog),
-        key: crate::decision::DecisionKey::ephemeral(),
+        key: crate::security::runtime_key::DecisionKey::ephemeral(),
         owner: "owner-a".into(),
         workspace: "workspace-a".into(),
     }));

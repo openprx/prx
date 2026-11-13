@@ -9,7 +9,7 @@ pub(super) fn restore(
 ) -> Result<OperatorProcessSnapshots> {
     transport.verify_manifest(manifest)?;
     let workspace = config.workspace_dir.to_string_lossy();
-    let key = crate::decision::key::DecisionKey::from_worker_channel(
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         &transport.key,
         &workspace,
         &manifest.run_id,

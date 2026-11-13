@@ -543,7 +543,7 @@ async fn rejoin_never_creates_a_store_or_an_experience() {
 
 #[test]
 fn an_admission_waiting_for_approval_is_not_an_executable_capability_id() {
-    use crate::causal_tree::branch::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
+    use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, CatalogGeneration, SchemaFingerprint};
     let admission = |name: &str, requires_approval: bool| {
         (
             name.to_owned(),

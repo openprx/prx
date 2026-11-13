@@ -428,21 +428,25 @@ impl From<&super::store::RecordedDistributions> for DistributionView {
             if !matches!(question, "applicable" | "success") {
                 return false;
             }
-            super::branch::CausalActionKind::ALL.into_iter().any(|action| {
-                super::branch::CapabilityTarget::ALL.into_iter().any(|target| {
-                    let base = format!("{}-{}", action.as_str(), target.as_str());
-                    key == base
-                        || key
-                            .strip_prefix(&base)
-                            .and_then(|tail| tail.strip_prefix('-'))
-                            .is_some_and(|suffix| {
-                                suffix.len() == 8
-                                    && suffix
-                                        .bytes()
-                                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                            })
+            crate::tools::capability::contract::CausalActionKind::ALL
+                .into_iter()
+                .any(|action| {
+                    crate::tools::capability::contract::CapabilityTarget::ALL
+                        .into_iter()
+                        .any(|target| {
+                            let base = format!("{}-{}", action.as_str(), target.as_str());
+                            key == base
+                                || key
+                                    .strip_prefix(&base)
+                                    .and_then(|tail| tail.strip_prefix('-'))
+                                    .is_some_and(|suffix| {
+                                        suffix.len() == 8
+                                            && suffix
+                                                .bytes()
+                                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                                    })
+                        })
                 })
-            })
         }
         Self {
             features: (!source.legacy_v1
@@ -454,16 +458,16 @@ impl From<&super::store::RecordedDistributions> for DistributionView {
             .then(|| source.features.clone()),
             next_action: allowed(
                 &source.next_action,
-                super::branch::CausalActionKind::ALL
+                crate::tools::capability::contract::CausalActionKind::ALL
                     .into_iter()
-                    .map(super::branch::CausalActionKind::as_str),
+                    .map(crate::tools::capability::contract::CausalActionKind::as_str),
                 source.legacy_v1,
             ),
             capability_target: allowed(
                 &source.capability_target,
-                super::branch::CapabilityTarget::ALL
+                crate::tools::capability::contract::CapabilityTarget::ALL
                     .into_iter()
-                    .map(super::branch::CapabilityTarget::as_str),
+                    .map(crate::tools::capability::contract::CapabilityTarget::as_str),
                 source.legacy_v1,
             ),
         }
@@ -780,8 +784,8 @@ impl DecisionAdmin {
         };
         StatusView {
             enabled: self.config.causal_tree.enabled,
-            remote_enabled: self.config.causal_tree.backend.remote_enabled,
-            backend_timeout_ms: self.config.causal_tree.backend.timeout_ms,
+            remote_enabled: crate::decision_engine::config::effective_engine_backend(&self.config).remote_enabled,
+            backend_timeout_ms: crate::decision_engine::config::effective_engine_backend(&self.config).timeout_ms,
             latency_budget_warning: self.config.decision_latency_budget_warning(),
             policy: PolicyView::from(&self.config.causal_tree.policy),
             key_available,
@@ -868,9 +872,11 @@ impl DecisionAdmin {
     /// userinfo redacted; `None` when the configured backend is not remote
     /// (a live test then sends nothing off this machine).
     pub(crate) fn live_target(&self) -> Option<String> {
-        crate::decision::factory::configured_selection(&self.config.causal_tree)
-            .filter(|selection| selection.locality == BackendLocality::Remote)
-            .map(|selection| shown(&selection.provider))
+        crate::decision::factory::configured_selection(crate::decision_engine::config::effective_engine_backend(
+            &self.config,
+        ))
+        .filter(|selection| selection.locality == BackendLocality::Remote)
+        .map(|selection| shown(&selection.provider))
     }
 
     pub(crate) fn backends(&self) -> BackendsView {
@@ -880,14 +886,18 @@ impl DecisionAdmin {
         };
         BackendsView {
             enabled: self.config.causal_tree.enabled,
-            order: DecisionBackendFactory::backend_order(&self.config.causal_tree, &health)
-                .into_iter()
-                .map(|slot| PlannedView {
-                    kind: slot.kind.as_str(),
-                    locality: slot.locality.as_str(),
-                    excluded: slot.exclusion.map(|exclusion| exclusion.as_str()),
-                })
-                .collect(),
+            order: DecisionBackendFactory::backend_order(
+                crate::decision_engine::config::effective_engine_backend(&self.config),
+                self.config.decision_engine.enabled,
+                &health,
+            )
+            .into_iter()
+            .map(|slot| PlannedView {
+                kind: slot.kind.as_str(),
+                locality: slot.locality.as_str(),
+                excluded: slot.exclusion.map(|exclusion| exclusion.as_str()),
+            })
+            .collect(),
         }
     }
 
@@ -946,7 +956,9 @@ impl DecisionAdmin {
                 "a remote backend is tested only with a confirmed live call (`--live --yes`); nothing was sent",
             ));
         }
-        let model = self.config.causal_tree.backend.model.trim();
+        let model = crate::decision_engine::config::effective_engine_backend(&self.config)
+            .model
+            .trim();
         let fixture = neutral_fixture(&key, (!model.is_empty()).then_some(model))?;
         // The fixture is the probe: no separate health check first.
         let lineage = CausalLineage {

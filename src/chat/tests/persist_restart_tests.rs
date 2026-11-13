@@ -332,7 +332,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
             let fabric = MemoryFabric::new(memory.clone(), workspace.to_string_lossy());
             let receipt = persist_completed_chat(&binding, &fabric, workspace, 2).await;
             if !matches!(fault, Fault::None) {
-                let key = crate::decision::DecisionKey::load_or_create(workspace).unwrap();
+                let key = crate::security::runtime_key::DecisionKey::load_or_create(workspace).unwrap();
                 let mut payload: serde_json::Value =
                     serde_json::from_str(receipt.terminal_event.raw_payload_json.as_deref().unwrap()).unwrap();
                 let cost = 0.002_917_600_000_000_000_2_f64;
@@ -987,7 +987,7 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
                     .remove("journal_version")
                     .is_some()
             );
-            let key = crate::decision::DecisionKey::load_or_create(dir.path())?;
+            let key = crate::security::runtime_key::DecisionKey::load_or_create(dir.path())?;
             crate::agent::terminal::reseal_payload_for_test(&key, &mut payload, receipt.assistant_event.as_ref())?;
             memory.replace_event_payload_for_test(&receipt.terminal_event.event_id, &payload.to_string())?;
 

@@ -277,6 +277,89 @@ mod working_root_tests {
         .expect("test: shell approval deadline");
     }
 
+    struct FixedShellApproval(bool);
+
+    #[async_trait::async_trait]
+    impl crate::tools::ApprovalStrategy for FixedShellApproval {
+        async fn resolve(&self, _: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision {
+            if self.0 {
+                crate::tools::ToolApprovalDecision::Approved {
+                    runtime_approval_granted: true,
+                    runtime_grant: None,
+                }
+            } else {
+                crate::tools::ToolApprovalDecision::Denied {
+                    reason: "test: operator denied".into(),
+                }
+            }
+        }
+    }
+
+    /// R58: in Supervised, a shell call whose path resolves inside a working
+    /// root outside the workspace is approved once and executes once; a
+    /// denied one never executes. The approval path check uses the root.
+    #[tokio::test]
+    async fn supervised_working_root_approval_executes_once_and_denial_never_executes() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let workspace = tempfile::tempdir().expect("test: workspace");
+            let root = tempfile::tempdir().expect("test: working root");
+            let mut config = crate::config::Config::default();
+            config.workspace_dir = workspace.path().into();
+            config.runtime.workdir = Some(root.path().into());
+            config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+            config.autonomy.workspace_only = false;
+            config.autonomy.forbidden_paths = vec![root.path().join("blocked").to_string_lossy().into_owned()];
+            config.causal_tree.enabled = false;
+            let generation = crate::config::new_shared(config.clone()).pin();
+            let catalog = crate::providers::catalog::CatalogView::from_config(&config);
+            let service = super::super::tests::disabled_agent_service(&generation, &catalog).await;
+            std::fs::create_dir(root.path().join("state")).expect("test: state directory");
+            let command = "printf x >> state/count";
+            service
+                .check_shell_path_arguments(command)
+                .expect("test: the working-root path is approvable");
+            assert!(
+                service.check_shell_path_arguments("cat blocked/x").is_err(),
+                "test: the check resolves against the working root, not the workspace"
+            );
+            for (approve, expected) in [(false, ""), (true, "x")] {
+                let tool = crate::tools::shell::ShellTool::new(
+                    std::sync::Arc::new(crate::runtime::NativeRuntime::new()),
+                    root.path().into(),
+                )
+                .with_path_policy(service.security.clone());
+                let execution = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+                    std::sync::Arc::new(vec![Box::new(tool) as Box<dyn crate::tools::Tool>]),
+                    std::sync::Arc::new(crate::tools::SecurityEffectPolicy::new(service.security.clone())),
+                    std::sync::Arc::new(FixedShellApproval(approve)),
+                    std::sync::Arc::new(crate::tools::AdapterOwnedPreparation),
+                    std::sync::Arc::new(crate::tools::TracingToolExecutionAudit),
+                );
+                let context = crate::tools::ToolExecutionContext::new(
+                    crate::runtime::envelope::RuntimeEnvelope::agent("workspace-a", "run-a")
+                        .with_channel("cli")
+                        .with_sender("local-user")
+                        .with_owner_id("owner-a"),
+                    "dm",
+                );
+                let outcome = execution
+                    .execute(
+                        crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command": command})),
+                        context,
+                        None,
+                    )
+                    .await;
+                let written = std::fs::read_to_string(root.path().join("state/count")).unwrap_or_default();
+                assert_eq!(written, expected, "test: approve={approve}: {}", outcome.model_content);
+                if !approve {
+                    assert_eq!(outcome.status, crate::tools::ToolExecutionStatus::ApprovalDenied);
+                }
+            }
+        })
+        .await
+        .expect("test: working-root approval deadline");
+    }
+
     #[tokio::test]
     async fn approval_path_checks_the_execution_root() {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {

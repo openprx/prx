@@ -46,7 +46,6 @@ use super::budget::{AttemptBinding, DecisionAttemptAccounting};
 use super::error::{DecisionError, PolicyRule, RequestRule, ValidationRule};
 use super::factory::BackendSpec;
 use super::http::DecisionHttp;
-use super::key::{DecisionKey, KeyDomain};
 use super::loopback::check_endpoint;
 use super::outbound::GuardedBody;
 use super::protocol::{BackendIdentity, BackendKind, BackendLocality, DecisionRequest, DecisionResponse};
@@ -54,6 +53,7 @@ use super::validate::ModelVersionPolicy;
 use super::wire::{ResponseEnvelope, SystemOneCodec};
 use super::{openrouter, typesafe};
 use crate::providers::catalog::ResolvedCredential;
+use crate::security::runtime_key::{DecisionKey, KeyDomain};
 
 /// The System One route under the endpoint.
 const ROUTE: &str = "/v1/systemone";
@@ -384,14 +384,9 @@ impl CompatibleHttpBackend {
         if Instant::now() >= deadline {
             return Err(DecisionError::BudgetExceeded.into());
         }
-        #[cfg(test)]
-        let mut material_send =
-            crate::causal_tree::decision_engine::original_observation::material::send(request_id, body.bytes());
         let sent = tokio::time::timeout_at(deadline.into(), builder.send())
             .await
             .map_err(|_| Failure::from(deadline_error()))?;
-        #[cfg(test)]
-        material_send.returned();
         let mut response = sent.map_err(|error| {
             tracing::warn!(
                 backend = self.identity.kind.as_str(),

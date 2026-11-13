@@ -200,8 +200,13 @@ fn disabled_engine_legacy_migration_preserves_process_binding() {
     std::fs::write(&config.config_path, toml::to_string(&config).unwrap()).unwrap();
     let generation = crate::config::new_shared(config.clone()).pin();
     let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-engine-binding-fixture");
-    let key = crate::decision::DecisionKey::from_worker_channel(&transport, "prx-workspace", "prx-run", "prx-config")
-        .unwrap();
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &transport,
+        "prx-workspace",
+        "prx-run",
+        "prx-config",
+    )
+    .unwrap();
     let binding = generation.bind_process(&key).unwrap();
     let mut loaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).unwrap();
     assert_eq!(
@@ -232,4 +237,89 @@ fn disabled_direct_backend_obeys_configured_causal_latency_budget() {
     ));
     config.causal_tree.policy.extra_latency_budget_ms = 500;
     config.validate().unwrap();
+}
+
+fn remote_legacy() -> crate::causal_tree::config::DecisionBackendConfig {
+    toml::from_str(REMOTE).unwrap()
+}
+
+fn factory_for(config: &Config) -> crate::decision::factory::DecisionBackendFactory {
+    struct NoTransports;
+    impl crate::decision::factory::DecisionTransports for NoTransports {
+        fn build(
+            &self,
+            _: &crate::decision::factory::BackendSpec<'_>,
+        ) -> Result<Box<dyn crate::decision::backend::DecisionBackend>, crate::decision::DecisionError> {
+            Err(crate::decision::DecisionError::Unavailable)
+        }
+    }
+    let catalog = crate::providers::catalog::CatalogView::from_config(config);
+    crate::decision::factory::DecisionBackendFactory::from_config(
+        config,
+        crate::decision::factory::FactoryDeps {
+            catalog: &catalog,
+            key: None,
+            transports: &NoTransports,
+            config_generation: 1,
+            events: std::sync::Arc::new(crate::decision::telemetry::testing::RecordingSink::default()),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn effective_backend_prefers_explicit_table_over_differing_legacy() {
+    let mut config = Config::default();
+    config.decision_engine.enabled = true;
+    config.causal_tree.backend = remote_legacy();
+    let mut explicit = crate::causal_tree::config::DecisionBackendConfig::default();
+    explicit.max_request_bytes = 4096;
+    explicit.model = "explicit-model".into();
+    config.decision_engine.backend = Some(explicit.clone());
+    let effective = effective_engine_backend(&config);
+    assert_eq!(effective, &explicit);
+    assert_eq!(effective.max_request_bytes, 4096);
+    assert_eq!(effective.model, "explicit-model");
+    // Factory selection reads the same table: the explicit builtin wins over the remote legacy slot.
+    assert!(crate::decision::factory::configured_selection(effective).is_none());
+    let factory = factory_for(&config);
+    assert!(
+        factory.status().order.is_empty(),
+        "no remote slot from the legacy table"
+    );
+    assert_eq!(
+        crate::decision_engine::status::snapshot(&config).backend_kind,
+        explicit.kind.as_str()
+    );
+}
+
+#[test]
+fn explicit_empty_engine_backend_uses_defaults_not_legacy() {
+    let mut root: toml::Value = toml::from_str(&format!(
+        "[causal_tree.backend]\n{REMOTE}\n[decision_engine]\nenabled = true\n[decision_engine.backend]\n"
+    ))
+    .unwrap();
+    legacy::migrate_legacy_config_keys(&mut root, None).unwrap();
+    let mut config: Config = root.try_into().unwrap();
+    config.causal_tree.backend = remote_legacy();
+    let effective = effective_engine_backend(&config);
+    assert_eq!(effective, &crate::causal_tree::config::DecisionBackendConfig::default());
+    assert!(crate::decision::factory::configured_selection(effective).is_none());
+    let factory = factory_for(&config);
+    assert!(factory.status().order.is_empty(), "no remote construction");
+    assert!(factory.status().excluded.is_empty());
+}
+
+#[test]
+fn legacy_only_backend_is_copied_into_the_engine() {
+    let mut config = Config::default();
+    config.decision_engine.enabled = true;
+    config.decision_engine.backend = None;
+    config.causal_tree.backend = remote_legacy();
+    let effective = effective_engine_backend(&config);
+    assert_eq!(effective, &remote_legacy());
+    assert_eq!(effective.max_request_bytes, 8192);
+    assert_eq!(effective.max_response_bytes, 16384);
+    let selection = crate::decision::factory::configured_selection(effective).unwrap();
+    assert_eq!(selection.kind, crate::decision::BackendKind::CompatibleHttp);
 }

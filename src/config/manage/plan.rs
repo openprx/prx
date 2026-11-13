@@ -973,7 +973,7 @@ fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskRe
 fn sends_remotely(section: &crate::causal_tree::config::CausalTreeConfig) -> bool {
     section.enabled
         && section.backend.remote_enabled
-        && crate::decision::factory::configured_kind(section).is_some_and(|kind| {
+        && crate::decision::factory::configured_kind(&section.backend).is_some_and(|kind| {
             crate::decision::backend::locality_of(kind, section.backend.endpoint.trim())
                 == crate::decision::BackendLocality::Remote
         })

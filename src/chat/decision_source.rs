@@ -29,7 +29,7 @@ impl ChatTurnBinding {
                     let opened = service.open_turn_context(self, kind, cancellation).await?;
                     service.record_opened_context(self, opened, cancellation).await?
                 };
-                let advice = service.analyze_advisory(&context, cancellation).await;
+                let advice = service.advisory().analyze_turn(context.runtime(), cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
                     advice,
                     resume,
@@ -98,12 +98,17 @@ mod tests {
             } else {
                 assert!(advice.is_none());
             }
-            assert!(!service.advisory_initialized());
+            assert!(!service.advisory().initialized());
             assert!(!dir.path().join("decision-engine.sqlite").exists());
             service
-                .observe_advisory(context, binding.decision_advice().map(|a| a.decision_id), true)
+                .advisory()
+                .observe(
+                    || context.terminal_execution_trace(),
+                    binding.decision_advice().map(|a| a.decision_id),
+                    true,
+                )
                 .await;
-            assert_eq!(service.advisory_initialized(), enabled && mode != DecisionMode::Pre);
+            assert_eq!(service.advisory().initialized(), enabled && mode != DecisionMode::Pre);
             assert!(
                 service
                     .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))

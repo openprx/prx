@@ -140,10 +140,10 @@ fn tampered_or_corrupt_delivery_aborts_the_whole_retention_read() -> Result<()> 
 async fn advancing_the_manual_clock_expires_the_retention_deadline() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let store = SkillLifecycleStore::open(workspace.path(), OwnerScope::new("fixture-owner")?)?;
-    let clock = crate::causal_tree::logical_clock::ManualClock::new();
-    crate::causal_tree::logical_clock::scope(Arc::clone(&clock), async move {
+    let clock = crate::runtime::logical_clock::ManualClock::new();
+    crate::runtime::logical_clock::scope(Arc::clone(&clock), async move {
         let exclusive = store.lock_store(false, Duration::from_secs(1))?;
-        let deadline = crate::causal_tree::logical_clock::now() + Duration::from_millis(500);
+        let deadline = crate::runtime::logical_clock::now() + Duration::from_millis(500);
         let open = DeliveryRetentionLimits {
             max_records: 1,
             max_decoded_bytes: 1024,

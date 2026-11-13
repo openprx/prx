@@ -604,7 +604,7 @@ mod tests {
                 excluded: Vec::new(),
                 cached: 0,
             },
-            catalog_generation: crate::causal_tree::branch::CatalogGeneration([7; 32]),
+            catalog_generation: crate::tools::capability::contract::CatalogGeneration([7; 32]),
             store_mode: crate::causal_tree::store::StoreMode::ReadOnly,
             durable_key: false,
             recordable: false,
