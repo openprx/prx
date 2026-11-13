@@ -308,6 +308,10 @@ jobs:
                   fi
                   version="$(cargo nextest --version)"
                   grep -q "^cargo-nextest 0.9.151 " <<<"$version"
+            # Build the prx binary first so its link never overlaps the all-features lib test link (hosted runner OOM, exit 143).
+            - name: Build the binaries before the lib test archive
+              if: matrix.name == 'lib'
+              run: cargo build --locked --all-features --profile test --bins
             - name: Build the test archive
               run: cargo nextest archive --locked --all-features ${{ matrix.targets }} --archive-file prx-tests-${{ matrix.name }}.tar.zst
             - name: List every test (the sharded runs must add up to this)
