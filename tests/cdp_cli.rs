@@ -194,6 +194,21 @@ fn decision_engine_config_set_rejects_unknown_and_secret_keys() {
     );
     let written = std::fs::read_to_string(dir.join("config.toml")).expect("test: config");
     assert!(written.contains("telemetry_cap = 10"), "{written}");
+    // Allowlisted keys whose names contain a credential word are accepted.
+    for (key, value, expected) in [
+        ("prompt_budget_tokens", "300", "prompt_budget_tokens = 300"),
+        ("token_ratio_limit", "0.5", "token_ratio_limit = 0.5"),
+    ] {
+        let output = prx_in(&dir, &["decision-engine", "config", "set", key, value, "--yes"]);
+        assert!(
+            output.status.success(),
+            "{key}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written = std::fs::read_to_string(dir.join("config.toml")).expect("test: config");
+        assert!(written.contains(expected), "{key}: {written}");
+    }
 }
 
 /// `prx` with `args`, HOME and XDG inside `root`.

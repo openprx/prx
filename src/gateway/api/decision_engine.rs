@@ -490,4 +490,27 @@ mod tests {
             .await;
         assert_eq!(status, 200, "{response}");
     }
+
+    /// P2-R8/R9: the allowlisted keys whose names contain a credential word
+    /// plan and apply through the Gateway, and the applied values load back.
+    #[tokio::test]
+    async fn config_apply_accepts_allowlisted_token_keys() {
+        let served = serve_config(|_| {}).await;
+        let body = json!({"changes": {"prompt_budget_tokens": 300, "token_ratio_limit": 0.5}});
+        let (status, response) = served
+            .call(Method::POST, "/api/decision-engine/config/plan", Some(body.clone()))
+            .await;
+        assert_eq!(status, 200, "{response}");
+        let revision = json(&response)["revision"]
+            .as_str()
+            .expect("test: plan revision")
+            .to_string();
+        let (status, response) = served
+            .call_if_match(Method::POST, "/api/decision-engine/config/apply", &revision, Some(body))
+            .await;
+        assert_eq!(status, 200, "{response}");
+        let loaded = served.loaded();
+        assert_eq!(loaded.decision_engine.prompt_budget_tokens, 300);
+        assert!((loaded.decision_engine.token_ratio_limit - 0.5).abs() < f32::EPSILON);
+    }
 }
