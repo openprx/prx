@@ -450,7 +450,7 @@ impl OrdinaryChildPublication {
             })
     }
 
-    pub(crate) fn scope(&self) -> &Arc<crate::tools::capability::child::VerifiedChildScope> {
+    pub(crate) const fn scope(&self) -> &Arc<crate::tools::capability::child::VerifiedChildScope> {
         &self.scope
     }
 

@@ -268,7 +268,7 @@ impl TurnRuntimeService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<OpenedTurn>, AgentDecisionError> {
         let opened = self.open_turn_context(proof, kind, cancellation).await?;
-        self.admit_opened_context(proof, opened, cancellation).await
+        self.admit_opened_context(proof, opened, cancellation)
     }
 
     pub(in crate::runtime) async fn open_issued_segment_turn_context(
@@ -278,12 +278,12 @@ impl TurnRuntimeService {
         cancellation: &CancellationToken,
     ) -> Result<Arc<OpenedTurn>, AgentDecisionError> {
         let opened = self.open_segment_turn_context(proof, observation, cancellation).await?;
-        self.admit_opened_context(proof, opened, cancellation).await
+        self.admit_opened_context(proof, opened, cancellation)
     }
 
     /// Admit an opened turn: the run allowance, the cancellation checks and
     /// the delegator readiness check.
-    pub(crate) async fn admit_opened_context(
+    pub(crate) fn admit_opened_context(
         &self,
         proof: &dyn TurnSourceProof,
         context: Arc<OpenedTurn>,

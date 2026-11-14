@@ -404,7 +404,7 @@ fn hold_released(shared: &Shared) -> bool {
 fn review_reply(body: &str, shared: &Shared) -> Reply {
     let tools_empty = serde_json::from_str::<serde_json::Value>(body)
         .is_ok_and(|request| request["tools"].as_array().is_none_or(Vec::is_empty));
-    if !tools_empty || !(body.contains("observed_tools") && body.contains("proposed_final_reply")) {
+    if !(tools_empty && body.contains("observed_tools") && body.contains("proposed_final_reply")) {
         shared.fail("final-reply review request changed shape".into());
     }
     Reply::Assistant(serde_json::json!({

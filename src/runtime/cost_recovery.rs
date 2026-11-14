@@ -23,7 +23,7 @@ const PASS_DEADLINE: Duration = Duration::from_secs(15);
 /// Cadence while retryable rows remain and the last pass made progress.
 const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// Back-off ceiling after passes without progress.
-const MAX_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const MAX_INTERVAL: Duration = Duration::from_mins(15);
 
 /// Re-arms the projector after an inline projection failure.
 static REARM: tokio::sync::Notify = tokio::sync::Notify::const_new();

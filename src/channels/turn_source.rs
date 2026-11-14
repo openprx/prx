@@ -419,7 +419,6 @@ impl ChannelSourceReceipt {
                 "channel source receipt differs from durable input"
             );
             envelope = envelope.with_source_message_event_id(recorded.event_id.clone());
-        } else {
         }
         Ok(Self {
             message_id: message.id.clone(),

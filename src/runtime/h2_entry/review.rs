@@ -122,10 +122,17 @@ impl LocalOwnerReview {
             profile: profile.as_ref(),
             id: id.clone(),
         };
-        println!(
-            "Local owner review {id}: {:?} session {} run {} args {}; approve {id} {} | deny {id}",
-            call.action, call.session, call.run, call.args_sha256, call.call_digest
-        );
+        {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            writeln!(
+                stdout,
+                "Local owner review {id}: {:?} session {} run {} args {}; approve {id} {} | deny {id}",
+                call.action, call.session, call.run, call.args_sha256, call.call_digest
+            )
+            .and_then(|()| stdout.flush())
+            .context("local lifecycle owner review prompt could not be shown")?;
+        }
         let approved = tokio::time::timeout(REVIEW_WINDOW, answer)
             .await
             .map_err(|_| anyhow::anyhow!("local lifecycle owner review timed out"))?

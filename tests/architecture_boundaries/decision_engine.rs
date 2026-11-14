@@ -234,5 +234,5 @@ fn no_legacy_decision_artifacts_rejects_a_planted_file() {
             "#[cfg(test)]\nmod tests {\n    const OLD: &str = \"terminal_replay_v1\";\n}\n".to_owned(),
         ),
     ];
-    assert!(legacy_artifact_violations(&allowed).is_empty());
+    assert_eq!(legacy_artifact_violations(&allowed), Vec::<String>::new());
 }

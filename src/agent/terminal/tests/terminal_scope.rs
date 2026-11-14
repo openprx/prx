@@ -172,7 +172,7 @@ impl LinkedFixture {
             transports,
             dispatches,
         };
-        fixture.assert_no_outcome().await;
+        fixture.assert_no_outcome();
         fixture
     }
 
@@ -180,7 +180,7 @@ impl LinkedFixture {
         MemoryFabric::new(memory, self.workspace.path().to_string_lossy())
     }
 
-    async fn assert_no_outcome(&self) {
+    fn assert_no_outcome(&self) {
         assert_eq!(self.transports.0.load(Ordering::SeqCst), 0);
         assert_eq!(self.dispatches.load(Ordering::SeqCst), 0);
     }
@@ -223,7 +223,7 @@ impl LinkedFixture {
             self.marker_presence(&self.fabric(Arc::clone(&self.memory))).await,
             [false; 4]
         );
-        self.assert_no_outcome().await;
+        self.assert_no_outcome();
         assert!(!self.workspace.path().join("state/costs.jsonl").exists());
         self.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }

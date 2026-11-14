@@ -238,7 +238,11 @@ pub(super) fn no_production_file_opens_a_legacy_decision_database() {
     let databases: Vec<&str> = super::decision_engine::LEGACY_DECISION_ARTIFACTS
         .iter()
         .copied()
-        .filter(|artifact| artifact.ends_with(".db"))
+        .filter(|artifact| {
+            std::path::Path::new(artifact)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+        })
         .collect();
     assert_eq!(databases.len(), 2, "the store and the journal are both checked");
     let mut violations = Vec::new();

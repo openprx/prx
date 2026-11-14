@@ -957,7 +957,7 @@ fn golden_constraints_and_effective_config_payloads() {
         "nested maps serialize sorted regardless of insertion order"
     );
     let value: serde_json::Value = serde_json::from_slice(&payload).expect("test: payload JSON");
-    let mut resorted = value.clone();
+    let mut resorted = value;
     resorted.sort_all_objects();
     assert_eq!(
         serde_json::to_vec(&resorted).expect("test: resorted"),

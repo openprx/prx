@@ -111,11 +111,7 @@ async fn commit_restart_cell(
     let receipt = finalize_turn(&fabric, draft, &cost, &workspace)
         .await
         .expect("test: committed terminal");
-    let owner = receipt
-        .terminal_event
-        .owner_id
-        .clone()
-        .expect("test: terminal owner");
+    let owner = receipt.terminal_event.owner_id.expect("test: terminal owner");
     RestartCell {
         _dir: dir,
         workspace,
@@ -201,6 +197,15 @@ async fn restart_rejoin_verifies_every_terminal_status() {
 
     // Negative cells, each against a reopened store.
     type Mutation = fn(&RestartCell, &crate::memory::SqliteMemory, &crate::memory::MessageEvent, &crate::memory::MessageEvent);
+    /// Replace one field of the claim's persisted semantic object.
+    fn set_semantic(payload: &mut serde_json::Value, key: &str, value: serde_json::Value) {
+        payload
+            .get_mut("semantic")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test: claim semantic object")
+            .insert(key.to_owned(), value);
+    }
+
     fn claim_semantic_edit(cell: &RestartCell, memory: &crate::memory::SqliteMemory, claim: &crate::memory::MessageEvent, edit: fn(&mut serde_json::Value)) {
         let _ = cell;
         let mut payload: serde_json::Value =
@@ -248,7 +253,7 @@ async fn restart_rejoin_verifies_every_terminal_status() {
         }),
         ("semantic edited", |cell, memory, claim, _terminal| {
             claim_semantic_edit(cell, memory, claim, |payload| {
-                payload["semantic"]["telemetry"] = serde_json::json!({"summary": "edited"});
+                set_semantic(payload, "telemetry", serde_json::json!({"summary": "edited"}));
             });
         }),
         ("semantic removed", |cell, memory, claim, _terminal| {
@@ -260,7 +265,7 @@ async fn restart_rejoin_verifies_every_terminal_status() {
         }),
         ("status differs", |cell, memory, claim, _terminal| {
             claim_semantic_edit(cell, memory, claim, |payload| {
-                payload["semantic"]["status"] = serde_json::json!("failed");
+                set_semantic(payload, "status", serde_json::json!("failed"));
             });
         }),
         ("prepared parameters dropped from S", |cell, memory, claim, _terminal| {
@@ -311,8 +316,11 @@ async fn restart_rejoin_verifies_every_terminal_status() {
         .expect("test: claim lookup")
         .expect("test: claim");
     claim_semantic_edit(&cell, &memory, &claim, |payload| {
-        payload["semantic"]["replay_unavailable"] =
-            serde_json::json!({"reply_sha256": "0".repeat(64), "reply_bytes": 4, "result_hash": "0".repeat(64)});
+        set_semantic(
+            payload,
+            "replay_unavailable",
+            serde_json::json!({"reply_sha256": "0".repeat(64), "reply_bytes": 4, "result_hash": "0".repeat(64)}),
+        );
     });
     drop(memory);
     assert!(rejoin_restart_cell(&cell).await.is_err(), "test: one-sided replay_unavailable must be refused");

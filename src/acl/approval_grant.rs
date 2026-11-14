@@ -398,7 +398,7 @@ impl ApprovalGrantV2 {
 
     /// Decision-bound grants are kept on the wire for format stability
     /// (OV-10) but no consumer accepts one.
-    pub fn refuse_decision_binding(&self) -> std::result::Result<(), GrantRefused> {
+    pub const fn refuse_decision_binding(&self) -> std::result::Result<(), GrantRefused> {
         if self.decision_binding.is_some() {
             return Err(GrantRefused::DecisionBound);
         }

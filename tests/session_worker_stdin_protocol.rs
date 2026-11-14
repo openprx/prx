@@ -224,7 +224,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     // credential changed. A fresh outer HMAC under `T` cannot make that
     // mutation match the authenticated model selection in the ordinary source.
     let transport_secret = fixture.transport_secret();
-    let mut manifest = route.manifest.clone();
+    let mut manifest = route.manifest;
     assert_eq!(manifest.route_hint.as_deref(), Some("fast"), "{WIRE_UNCHANGED}");
     assert_eq!(
         manifest.route_credential,
@@ -526,7 +526,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     // genuine agent source with its route provenance removed, re-signed under
     // `T`, may not reach the provider.
     let requests_before_missing_source = server.requests().len();
-    let mut missing_source_manifest = agent.manifest.clone();
+    let mut missing_source_manifest = agent.manifest;
     missing_source_manifest.route_source_provider = None;
     let missing_source_run = run_forged_worker(&mut missing_source_manifest, &home, &transport_secret, expiry);
     let missing_source_result = assert_single_json_line(&missing_source_run.stdout);

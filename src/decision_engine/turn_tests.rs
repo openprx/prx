@@ -229,7 +229,7 @@ async fn telemetry_store_holds_only_analyses_and_outcomes() {
         analyses.iter().map(AnalysisRecord::decision_id).collect::<Vec<_>>(),
         vec!["a3", "a2"]
     );
-    assert_eq!(analyses[0].brief_sha256().len(), 64);
+    assert_eq!(analyses.first().map(|row| row.brief_sha256().len()), Some(64));
     assert_eq!(store.outcomes(10).unwrap(), vec![outcome("o1")]);
     let connection = rusqlite::Connection::open(&path).unwrap();
     let tables: Vec<String> = connection
@@ -281,7 +281,7 @@ async fn telemetry_store_holds_only_analyses_and_outcomes() {
             .unwrap();
     }
     let reopened = SqliteTelemetryWriter::open(&legacy).unwrap();
-    assert!(reopened.outcomes(10).unwrap().is_empty());
+    assert_eq!(reopened.outcomes(10).unwrap(), Vec::new());
     let version: i64 = rusqlite::Connection::open(&legacy)
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -301,11 +301,19 @@ async fn telemetry_store_holds_only_analyses_and_outcomes() {
     let record = AnalysisRecord::new(&analysis("u"), "redacted brief".into(), 1, 1).unwrap();
     let values: serde_json::Value = serde_json::from_str(record.values_json()).unwrap();
     assert_eq!(
-        values["candidates"].as_array().map(Vec::len),
+        values
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
         Some(1),
         "capped to `candidates`"
     );
-    assert_eq!(values["global"]["risk"]["probability"], 0.25);
+    assert_eq!(
+        values
+            .pointer("/global/risk/probability")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.25)
+    );
     assert!(!record.values_json().contains("user"));
 }
 

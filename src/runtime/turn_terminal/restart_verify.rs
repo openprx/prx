@@ -41,12 +41,12 @@ const MIRRORED_FIELDS: [&str; 6] = [
     "delivery_intent",
 ];
 
-fn refuse(reason: &'static str) -> TerminalNotReplayable {
+const fn refuse(reason: &'static str) -> TerminalNotReplayable {
     TerminalNotReplayable(reason)
 }
 
 fn payload(event: &MessageEvent, missing: &'static str) -> Result<Value, TerminalNotReplayable> {
-    let raw = event.raw_payload_json.as_deref().ok_or(refuse(missing))?;
+    let raw = event.raw_payload_json.as_deref().ok_or_else(|| refuse(missing))?;
     serde_json::from_str(raw).map_err(|_| refuse(missing))
 }
 
@@ -90,7 +90,7 @@ pub(crate) fn verify_semantics(
     let claim_payload = payload(claim, "claim payload missing or malformed")?;
     let claim_object = claim_payload
         .as_object()
-        .ok_or(refuse("claim payload is not an object"))?;
+        .ok_or_else(|| refuse("claim payload is not an object"))?;
     if claim_object.get("recovery_key_id").and_then(Value::as_str) != Some(facts.key_id.as_str())
         || claim_object.get("semantic_mac_v3").and_then(Value::as_str) != Some(facts.semantic_mac_v3.as_str())
     {
@@ -101,10 +101,14 @@ pub(crate) fn verify_semantics(
     if claim_object.len() != CLAIM_FIELDS.len() || CLAIM_FIELDS.iter().any(|field| !claim_object.contains_key(*field)) {
         return Err(refuse("claim carries fields outside its schema"));
     }
-    let semantic = claim_object.get("semantic").ok_or(refuse("claim semantic missing"))?;
+    let semantic = claim_object
+        .get("semantic")
+        .ok_or_else(|| refuse("claim semantic missing"))?;
 
     // Step 6: semantic ↔ payload.
-    let semantic_object = semantic.as_object().ok_or(refuse("claim semantic is not an object"))?;
+    let semantic_object = semantic
+        .as_object()
+        .ok_or_else(|| refuse("claim semantic is not an object"))?;
     if semantic_object.get("version").and_then(Value::as_u64) != Some(2)
         || semantic_object.get("terminal_id").and_then(Value::as_str) != Some(facts.terminal_id.as_str())
         || semantic_object.get("workspace_id").and_then(Value::as_str) != Some(workspace_id)
@@ -130,7 +134,7 @@ pub(crate) fn verify_semantics(
     }
     let scope = semantic_object
         .get("scope")
-        .ok_or(refuse("claim semantic scope missing"))?;
+        .ok_or_else(|| refuse("claim semantic scope missing"))?;
     crate::agent::terminal::oversized_reply::verify_scope(terminal, scope)
         .map_err(|_| refuse("final event scope differs from the claim"))?;
 
@@ -171,7 +175,7 @@ pub(crate) fn verify_claim_and_cost(
         let row = repository
             .recovery_cost_row(&chain.workspace_id, &facts.terminal_id)
             .map_err(|_| refuse("cost outbox row does not authenticate"))?
-            .ok_or(refuse("metered terminal has no cost outbox row"))?;
+            .ok_or_else(|| refuse("metered terminal has no cost outbox row"))?;
         let outbox_final = serde_json::from_slice::<Value>(&row.facts)
             .ok()
             .and_then(|value| value.get("final_event_id").and_then(Value::as_str).map(str::to_owned));

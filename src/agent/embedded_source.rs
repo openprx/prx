@@ -382,7 +382,6 @@ impl EmbeddedAgentBinding {
                 issued_input = Some(Arc::new(VerifiedEmbeddedInputMetadata::from_verified(&event)?));
             }
             envelope = envelope.with_source_message_event_id(event.event_id);
-        } else {
         }
         Ok(EmbeddedAgentSource {
             owner: envelope.resolved_owner_id(),

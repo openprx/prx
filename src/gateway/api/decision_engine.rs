@@ -126,9 +126,8 @@ where
     F: FnOnce(&SqliteTelemetryWriter) -> anyhow::Result<Vec<T>> + Send + 'static,
 {
     let path = state.config.load_full().workspace_dir.join(TELEMETRY_FILE);
-    let read = tokio::task::spawn_blocking(move || match SqliteTelemetryWriter::open_existing(&path)? {
-        Some(store) => read(&store),
-        None => Ok(Vec::new()),
+    let read = tokio::task::spawn_blocking(move || {
+        SqliteTelemetryWriter::open_existing(&path)?.map_or_else(|| Ok(Vec::new()), |store| read(&store))
     })
     .await;
     match read {

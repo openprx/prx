@@ -290,9 +290,8 @@ mod tests {
         let path = dir.path().join("session_worker.secret");
         rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::from_raw_mode(0o600))?;
         let (sender, receiver) = std::sync::mpsc::channel();
-        let probe = path.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(existing_at(&probe).map(|_| ()));
+            let _ = sender.send(existing_at(&path).map(|_| ()));
         });
         let outcome = receiver.recv_timeout(std::time::Duration::from_secs(2))?;
         assert!(

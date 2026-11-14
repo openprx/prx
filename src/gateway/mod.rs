@@ -2113,7 +2113,7 @@ async fn run_gateway_inner(
         let producer = producer
             .take()
             .ok_or_else(|| anyhow::anyhow!("local control producer missing"))?;
-        h2_control::start_local_control(producer, shutdown.clone()).await?;
+        h2_control::start_local_control(producer, shutdown.clone())?;
     }
     let limited_public_routes = Router::new()
         .route("/pair", post(handle_pair))

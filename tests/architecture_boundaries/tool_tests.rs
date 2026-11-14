@@ -554,11 +554,12 @@ fn the_occurrence_rule_reports_extra_calls_stale_entries_and_duplicates() {
 #[test]
 pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
     // Pin the two issued execution-service bindings, not merely a nearby type name.
-    for (relative, function, binding) in [(
-        "src/agent/embedded_turn.rs",
-        "run_work",
-        "let(execution,context)=service.bind_agent_execution(source,&decision,&context,&selected.specs)?;",
-    )] {
+    {
+        let (relative, function, binding) = (
+            "src/agent/embedded_turn.rs",
+            "run_work",
+            "let(execution,context)=service.bind_agent_execution(source,&decision,&context,&selected.specs)?;",
+        );
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
             &repository_root().join(relative),
         )));

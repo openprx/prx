@@ -74,10 +74,7 @@ fn own_task(text: &str) -> String {
 
 /// A task whose model spawns `next` (spawn arguments) before answering.
 fn chain(label: &str, next: Option<serde_json::Value>) -> String {
-    match next {
-        Some(next) => format!("{label} {NEXT}{next}{END}"),
-        None => label.to_owned(),
-    }
+    next.map_or_else(|| label.to_owned(), |next| format!("{label} {NEXT}{next}{END}"))
 }
 
 fn spawn_args(task: String) -> serde_json::Value {

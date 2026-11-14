@@ -21,7 +21,7 @@ impl ChatTurnBinding {
             .get_or_try_init(|| async {
                 let kind = crate::runtime::turn_context::AgentTurnKind::Repl;
                 let opened = service.open_turn_context(self, kind, cancellation).await?;
-                let context = service.admit_opened_context(self, opened, cancellation).await?;
+                let context = service.admit_opened_context(self, opened, cancellation)?;
                 let advice = service.advisory().analyze_turn(context.runtime(), cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
                     advice,

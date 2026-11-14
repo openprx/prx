@@ -137,8 +137,7 @@ pub(super) async fn finalize_recovery_terminal(
                 &key_id,
                 original_reference,
             )?;
-            let semantic_bytes = serde_json::to_vec(&semantic)?;
-            let mut claim_preimage = semantic_bytes.clone();
+            let mut claim_preimage = serde_json::to_vec(&semantic)?;
             claim_preimage.extend_from_slice(key_id.as_bytes());
             if let Some(payload) = existing_payload.as_ref() {
                 let bytes = hex::decode(

@@ -544,7 +544,6 @@ impl AdmittedTurn {
                     crate::config::schema::decision_engine::BackendKind::Builtin,
                 );
         }
-        if configured_native_tools.is_none() && !keep_builtin_enabled {}
         if !config
             .providers
             .models

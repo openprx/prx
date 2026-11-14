@@ -34,7 +34,7 @@ pub async fn run_gateway_controlled(
     result
 }
 
-pub(super) async fn start_local_control(producer: TerminalInputProducer, shutdown: CancellationToken) -> Result<()> {
+pub(super) fn start_local_control(producer: TerminalInputProducer, shutdown: CancellationToken) -> Result<()> {
     let authority = producer.into_local_control()?;
     let profile = Arc::clone(authority.profile());
     println!("Controlled local control: approve REVIEW CALL_DIGEST; deny REVIEW; exit");

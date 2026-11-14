@@ -675,7 +675,7 @@ async fn recovery_missing_key_after_erasure_never_readmits() -> anyhow::Result<(
         // K1 is back, the plane is off (plain path, no recorder).
         restore_keys(&workspace)?;
         let plain = backend_memory(backend, &workspace)?;
-        let off = Admission { ..ADMISSION };
+        let off = ADMISSION;
         let (retry, duplicate) = admit_as(&plain, &workspace, "different", &dispatched, off).await;
         anyhow::ensure!(
             is_already_accepted(&retry) && duplicate,

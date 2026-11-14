@@ -1193,10 +1193,10 @@ impl DelegateLoopResources {
     ) -> anyhow::Result<DelegateAgenticExecution> {
         #[cfg(all(test, unix))]
         delegate_diagnostic::phase("child-body-entered.json");
-        let security = match child_source.as_ref() {
-            Some(source) => Arc::clone(source.authority.publication.security()),
-            None => Arc::clone(&self.security),
-        };
+        let security = child_source.as_ref().map_or_else(
+            || Arc::clone(&self.security),
+            |source| Arc::clone(source.authority.publication.security()),
+        );
         if let Some(source) = child_source.as_ref() {
             use crate::runtime::turn_source::TurnSourceProof;
             anyhow::ensure!(

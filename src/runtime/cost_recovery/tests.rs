@@ -103,9 +103,21 @@ async fn idle_restart_projects_every_pending_row() {
             RecoveryCostState::Error,
         )
         .expect("test: force error");
-    assert_eq!(fixture_readback::outbox_rows(&ws2)[0].state, "error");
+    assert_eq!(
+        fixture_readback::outbox_rows(&ws2)
+            .first()
+            .map(|row| row.state.as_str())
+            .expect("test: outbox row"),
+        "error"
+    );
     CostOutboxProjector::run_once(Arc::clone(&memory2), ws2.clone(), cost.clone()).await;
-    assert_eq!(fixture_readback::outbox_rows(&ws2)[0].state, "acknowledged");
+    assert_eq!(
+        fixture_readback::outbox_rows(&ws2)
+            .first()
+            .map(|row| row.state.as_str())
+            .expect("test: outbox row"),
+        "acknowledged"
+    );
     assert_eq!(ledger_lines(&ws2, "prx-error-row"), 1);
 
     // Cell 3: a concurrent projection of the same settlement yields one ledger row.
@@ -123,7 +135,13 @@ async fn idle_restart_projects_every_pending_row() {
         second.join().expect("test: second").expect("test: second pass");
     });
     assert_eq!(ledger_lines(&ws3, "prx-concurrent"), 1);
-    assert_eq!(fixture_readback::outbox_rows(&ws3)[0].state, "acknowledged");
+    assert_eq!(
+        fixture_readback::outbox_rows(&ws3)
+            .first()
+            .map(|row| row.state.as_str())
+            .expect("test: outbox row"),
+        "acknowledged"
+    );
 
     // Cell 4: 70 invalid-MAC rows sort ahead of one valid row.
     let (_dir4, ws4) = workspace();

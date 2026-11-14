@@ -235,7 +235,7 @@ async fn persist_completed_chat(
     let provider = crate::agent::terminal::provider_outcome_from_trace(&route, started, trace);
     let run = binding.envelope().run_id.as_deref().expect("test: completed run");
     let scope = binding.envelope().message_scope();
-    let receipt = binding
+    binding
         .commit_terminal(
             fabric,
             TurnTerminalDraft {
@@ -262,8 +262,7 @@ async fn persist_completed_chat(
             workspace,
         )
         .await
-        .expect("test: persist provider terminal");
-    receipt
+        .expect("test: persist provider terminal")
 }
 
 async fn completed_chat_under_cleanup(workspace: &Path, cleanup: &CleanupScope) -> MessageEvent {
@@ -521,12 +520,11 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         assert!(line.contains(expected), "missing {expected}: {line}");
     }
     assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
-    for store in [dir.path().join("memory/brain.db")] {
-        assert!(
-            line.contains(store.to_str().unwrap()),
-            "missing full store path: {line}"
-        );
-    }
+    let store = dir.path().join("memory/brain.db");
+    assert!(
+        line.contains(store.to_str().unwrap()),
+        "missing full store path: {line}"
+    );
     assert!(line.contains("run_id="), "missing structured run field: {line}");
 
     let private_error = anyhow::anyhow!("permission denied")

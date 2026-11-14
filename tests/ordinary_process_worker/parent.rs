@@ -182,19 +182,15 @@ impl OwnedParent {
     /// On expiry the parent is killed and reaped and the test fails.
     pub fn wait(mut self) -> ParentOutput {
         let status = loop {
-            match self.child.try_wait().expect("test: parent exit status") {
-                Some(status) => {
-                    self.reaped = true;
-                    break status;
-                }
-                None => {
-                    assert!(
-                        self.started.elapsed() < PARENT_DEADLINE,
-                        "parent exceeded PARENT_DEADLINE"
-                    );
-                    std::thread::sleep(PARENT_POLL);
-                }
+            if let Some(status) = self.child.try_wait().expect("test: parent exit status") {
+                self.reaped = true;
+                break status;
             }
+            assert!(
+                self.started.elapsed() < PARENT_DEADLINE,
+                "parent exceeded PARENT_DEADLINE"
+            );
+            std::thread::sleep(PARENT_POLL);
         };
         let stdout = self.collect_stream(true);
         let stderr = self.collect_stream(false);
