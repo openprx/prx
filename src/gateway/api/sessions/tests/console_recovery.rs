@@ -12,12 +12,9 @@ fn count(turns: &[ConversationTurn], role: &str) -> usize {
 /// Remove the committed reply's transcript row: the store as a process
 /// leaves it when it exits between the terminal commit and the projection.
 fn drop_assistant_projection(workspace: &std::path::Path, session: &str) {
-    let connection = rusqlite::Connection::open(workspace.join("memory/brain.db")).expect("test: db");
-    let removed = connection
-        .execute(
-            "DELETE FROM conversation_turns WHERE session_key = ?1 AND role = 'assistant'",
-            [session],
-        )
+    let removed = crate::memory::SqliteMemory::new(workspace)
+        .expect("test: sqlite")
+        .remove_conversation_turns_for_test(session, "assistant")
         .expect("test: drop the assistant projection");
     assert_eq!(removed, 1, "test: one committed reply was projected");
 }

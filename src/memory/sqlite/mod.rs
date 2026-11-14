@@ -613,6 +613,16 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Remove a session's projected transcript rows of `role`, leaving their
+    /// durable events: the store a process leaves when it exits between a
+    /// terminal commit and its transcript projection. Returns the rows removed.
+    pub(crate) fn remove_conversation_turns_for_test(&self, session_key: &str, role: &str) -> anyhow::Result<usize> {
+        Ok(self.pool.write().execute(
+            "DELETE FROM conversation_turns WHERE session_key = ?1 AND role = ?2",
+            params![session_key, role],
+        )?)
+    }
+
     /// Corrupt source metadata while retaining the durable event identity.
     pub(crate) fn replace_event_channel_for_test(&self, event_id: &str, channel: &str) -> anyhow::Result<()> {
         let updated = self.pool.write().execute(
