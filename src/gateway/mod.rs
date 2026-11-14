@@ -28,7 +28,6 @@ mod api;
 #[cfg(test)]
 pub(crate) use api::{drive_disabled_engine_console_entry, drive_search_console_entry};
 mod compat;
-mod decision_runtime;
 mod h2_control;
 pub use h2_control::run_gateway_controlled;
 mod jobs;
@@ -1023,7 +1022,7 @@ pub struct AppState {
 
 pub struct TurnRuntimeGeneration {
     provider_binding: Option<Arc<turn_source::GatewayProviderBinding>>,
-    decision_slot: Arc<decision_runtime::GatewayDecisionSlot>,
+    publication_slot: Arc<turn_source::publication_slot::GatewayPublicationSlot>,
     pub config_generation: Arc<crate::config::ConfigGeneration>,
     pub provider: Arc<dyn Provider>,
     pub model: String,
@@ -1120,7 +1119,7 @@ impl GatewayTurnRuntimeOwner {
         let agents = agent_lifecycle::AgentLifecycle::default();
         agents.reconcile(memory.as_ref(), &config.pin().effective, true);
         Self {
-            cleanup: Arc::clone(&current.decision_slot.cleanup),
+            cleanup: Arc::clone(&current.publication_slot.cleanup),
             current: Arc::new(ArcSwap::from_pointee(current)),
             config,
             memory,
@@ -1148,11 +1147,11 @@ impl GatewayTurnRuntimeOwner {
     /// The lifecycle experiment HTTP adapter uses this to refuse when the
     /// process has no profile. It does not mint an invocation.
     pub(crate) fn has_controlled_profile(&self) -> bool {
-        self.current.load().decision_slot.controlled.is_some()
+        self.current.load().publication_slot.controlled.is_some()
     }
 
     fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<TurnRuntimeGeneration> {
-        if let Some(profile) = &self.current.load().decision_slot.controlled {
+        if let Some(profile) = &self.current.load().publication_slot.controlled {
             profile.revoke();
             anyhow::bail!("controlled Gateway generation cannot be rebuilt");
         }
@@ -1168,7 +1167,7 @@ impl GatewayTurnRuntimeOwner {
             #[cfg(feature = "wasm-plugins")]
             self.plugin_runtime.clone(),
         )?;
-        Arc::get_mut(&mut runtime.decision_slot)
+        Arc::get_mut(&mut runtime.publication_slot)
             .ok_or_else(|| anyhow::anyhow!("new gateway decision slot was unexpectedly shared"))?
             .cleanup = Arc::clone(&self.cleanup);
         Ok(runtime)
@@ -1233,7 +1232,7 @@ impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
         self.agents.commit()?;
         self.current.store(Arc::new(TurnRuntimeGeneration {
             provider_binding: self.generation.provider_binding.clone(),
-            decision_slot: Arc::clone(&self.generation.decision_slot),
+            publication_slot: Arc::clone(&self.generation.publication_slot),
             config_generation: Arc::clone(&self.generation.config_generation),
             provider: Arc::clone(&self.generation.provider),
             model: self.generation.model.clone(),
@@ -1344,7 +1343,7 @@ impl AppState {
         {
             let mut generation = TurnRuntimeGeneration {
                 provider_binding: None,
-                decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
+                publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
                 config_generation: self.config.pin(),
                 provider: Arc::clone(&self.provider),
                 model: self.model.clone(),
@@ -1372,7 +1371,8 @@ impl AppState {
                         &config.autonomy,
                         &config.workspace_dir,
                     ));
-                    generation.decision_slot = Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0));
+                    generation.publication_slot =
+                        Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(security, 0));
                 }
             }
             Arc::new(generation)
@@ -1598,16 +1598,19 @@ fn build_gateway_turn_runtime(
     let temperature = config.default_temperature;
     Ok(TurnRuntimeGeneration {
         provider_binding,
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), {
-            #[cfg(feature = "wasm-plugins")]
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(
+            Arc::clone(&security),
             {
-                plugin_runtime.as_ref().map_or(0, |runtime| runtime.generation_id())
-            }
-            #[cfg(not(feature = "wasm-plugins"))]
-            {
-                0
-            }
-        })),
+                #[cfg(feature = "wasm-plugins")]
+                {
+                    plugin_runtime.as_ref().map_or(0, |runtime| runtime.generation_id())
+                }
+                #[cfg(not(feature = "wasm-plugins"))]
+                {
+                    0
+                }
+            },
+        )),
         config_generation: generation,
         provider,
         model,
@@ -2027,8 +2030,8 @@ async fn run_gateway_inner(
     let turn_runtime_owner = start_gateway_turn_runtime(
         TurnRuntimeGeneration {
             provider_binding,
-            decision_slot: Arc::new(
-                decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), {
+            publication_slot: Arc::new(
+                turn_source::publication_slot::GatewayPublicationSlot::new(Arc::clone(&security), {
                     #[cfg(feature = "wasm-plugins")]
                     {
                         wasm_plugin_runtime
@@ -2596,7 +2599,7 @@ async fn run_gateway_chat_with_multimodal(
         generation: Arc::clone(&config_generation),
         fabric: fabric.clone(),
         envelope: runtime_envelope,
-        ticket: turn_runtime.decision_slot.cleanup.register(cancellation.clone())?,
+        ticket: turn_runtime.publication_slot.cleanup.register(cancellation.clone())?,
         acknowledgement: jobs::register_terminal_cleanup(),
     };
     let (source_receipt, gateway_user_event, mut admission_guard) = pending_input
@@ -2633,7 +2636,7 @@ async fn run_gateway_chat_with_multimodal(
     // A spawned webhook job cannot inherit the caller's cleanup task-local.
     // Prediction and later work must retain the same concrete cleanup owner.
     let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
-        Some(&turn_runtime.decision_slot.cleanup),
+        Some(&turn_runtime.publication_slot.cleanup),
         cancellation.clone(),
     ) {
         Ok(scope) => scope.with_acknowledgement(jobs::register_terminal_cleanup()),
@@ -2654,7 +2657,7 @@ async fn run_gateway_chat_with_multimodal(
     };
     let admission = child_cleanup
         .scope_admission(Box::pin(async {
-            let service = turn_runtime.decision_slot.publish(&turn_runtime, state).await?;
+            let service = turn_runtime.publication_slot.publish(&turn_runtime, state).await?;
             let context = service
                 .open_issued_turn_context(
                     &gateway_proof,
@@ -2697,7 +2700,7 @@ async fn run_gateway_chat_with_multimodal(
     };
     let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
     let terminal_binding = service.terminal_binding(&context)?;
-    let terminal_guard = decision_runtime::GatewayTerminalGuard::new(
+    let terminal_guard = turn_source::publication_slot::GatewayTerminalGuard::new(
         cleanup_ticket,
         Arc::clone(service),
         Arc::clone(&context),
@@ -2952,7 +2955,7 @@ async fn run_gateway_chat_with_multimodal(
                         .run_id
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("gateway source run id is missing"))?;
-                    if let Err(finalize_error) = decision_runtime::commit_terminal(
+                    if let Err(finalize_error) = turn_source::publication_slot::commit_terminal(
                         Some(&terminal_guard),
                         &fabric,
                         crate::agent::terminal::TurnTerminalDraft {
@@ -3008,7 +3011,7 @@ async fn run_gateway_chat_with_multimodal(
                 .run_id
                 .clone()
                 .unwrap_or_else(|| provider_outcome.decision_id.clone());
-            let receipt = decision_runtime::commit_terminal(
+            let receipt = turn_source::publication_slot::commit_terminal(
                 Some(&terminal_guard),
                 &fabric,
                 crate::agent::terminal::TurnTerminalDraft {

@@ -1,21 +1,15 @@
-//! Free-standing advisory decision driver and its execution-owned gate inputs.
-//!
-//! The helpers here rebuild the hard-gate inputs from execution-owned facts
-//! (`AdmissionFactsV1`).
+//! Free-standing advisory decision driver. The analysed candidate set is
+//! structural only; no admission outcome annotates or filters it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::causal_tree::gates::GateInputs;
-use crate::causal_tree::hard_gates_probe::HardGatesProbe;
 use crate::config::Config;
 use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode, effective_engine_backend};
 use crate::cost::decision_attempt::DecisionAttemptAccounting;
-use crate::decision_engine::admission_probe::{AdmissionProbe, AdvisoryProbe};
-use crate::decision_engine::candidate::CandidateId;
 use crate::decision_engine::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
 };
@@ -35,52 +29,16 @@ use crate::runtime::decision_accounting::analysis_bound::{AnalysisAccounting, an
 use crate::runtime::turn_context::TurnRuntimeContext;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
-use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogView, SurfacePolicy};
-use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
+use crate::tools::capability::contract::CatalogGeneration;
 use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
 use crate::tools::capability::turn_state::TrustedState;
 
-/// Exact call fingerprints by candidate id.
-pub(crate) type CallFingerprints = BTreeMap<CandidateId, [u8; 32]>;
-/// Verified exact capability scope by call digest.
-pub(crate) type VerifiedApprovalCalls = BTreeMap<[u8; 32], BTreeSet<CapabilityRef>>;
-
-/// The only `GateInputs` constructor of the advisory driver: execution-owned
-/// facts plus the resume maps (empty on a non-resume turn). Failed-call
-/// counts, replay and retry limits are empty, as on every turn opening.
-pub(crate) fn gate_inputs<'a>(
-    facts: &'a AdmissionFactsV1,
-    call_fingerprints: &'a CallFingerprints,
-    verified_approval_calls: VerifiedApprovalCalls,
-    replayed: &'a BTreeSet<[u8; 32]>,
-) -> GateInputs<'a> {
-    GateInputs {
-        policy: &facts.policy,
-        owner_id: &facts.owner_id,
-        sender: &facts.sender,
-        policy_channel: &facts.policy_channel,
-        chat_type: &facts.chat_type,
-        model_ref: &facts.model_ref,
-        model_can_chat: facts.model_can_chat,
-        model_can_call_tools: facts.model_can_call_tools,
-        decision_endpoint_ready: true,
-        child_scope: facts.child_scope(),
-        verified_approval_calls,
-        call_fingerprints,
-        failed_call_counts: BTreeMap::new(),
-        replayed_non_idempotent: replayed,
-        retry_limit: None,
-    }
-}
-
 /// The owned input of one advisory analysis, cloned from the turn's
-/// [`TurnRuntimeContext`]. It holds no execution probe: `analyze` builds the
-/// borrowed hard-gate probe locally from the facts and the resume evidence.
+/// [`TurnRuntimeContext`].
 pub(crate) struct AdvisoryInput {
     pub(crate) decision_id: DecisionId,
     pub(crate) state: CausalState,
-    pub(crate) facts: AdmissionFactsV1,
     pub(crate) state_key: Arc<DecisionKey>,
     pub(crate) catalog: Arc<CapabilityCatalog>,
     pub(crate) publication_policy: SurfacePolicy,
@@ -115,7 +73,6 @@ impl AdvisoryInput {
         Some(Self {
             decision_id: runtime.decision_id,
             state: build_state(runtime),
-            facts: runtime.admission.clone(),
             state_key: Arc::clone(&runtime.state_key),
             catalog: Arc::clone(&runtime.catalog),
             publication_policy: runtime.publication_policy.clone(),
@@ -428,9 +385,6 @@ impl DecisionAdvisory {
         if view.generation() != input.catalog_generation {
             return Err(());
         }
-        let calls = BTreeMap::new();
-        let replayed = BTreeSet::new();
-        let gates = gate_inputs(&input.facts, &calls, BTreeMap::new(), &replayed);
         let observed_latency = BTreeMap::new();
         let cost_model =
             crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &self.config, &observed_latency);
@@ -444,27 +398,14 @@ impl DecisionAdvisory {
             cost_model: &cost_model,
             discovered_refs: &discovered,
         };
-        // R13: the execution probe only annotates the analysed set; no
-        // admission outcome filters it, and the advice never reaches execution.
-        // The probes borrow `dyn AdmissionProbe` (not `Sync`), so they end
-        // before the prediction is awaited.
-        let candidates = {
-            let probe = HardGatesProbe {
-                state: &input.state,
-                catalog: &view,
-                gates: &gates,
-            };
-            let advisory = AdvisoryProbe {
-                inner: &probe as &dyn AdmissionProbe,
-            };
-            CausalCandidateGenerator::generate(&input.state, &view, &policy, &advisory).map_err(|_| ())?
-        };
+        // The analysed set is structural; the advice never reaches execution.
+        let candidates = CausalCandidateGenerator::generate(&input.state, &view, &policy).map_err(|_| ())?;
         let keys = match &candidates {
             CandidateSet::Legal { candidates, .. } => candidates
                 .iter()
                 .map(|candidate| candidate.candidate_id().key())
                 .collect::<Vec<_>>(),
-            CandidateSet::NoLegalPath { .. } => Vec::new(),
+            CandidateSet::NoLegalPath => Vec::new(),
         };
         let mut answers = BTreeMap::new();
         if matches!(candidates, CandidateSet::Legal { .. }) {

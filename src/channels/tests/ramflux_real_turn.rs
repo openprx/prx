@@ -188,7 +188,7 @@ fn runtime_autonomy(
         ..crate::config::Config::default()
     };
     let runtime = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(config.clone()),
         config_generation: crate::config::new_shared(config).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -2316,7 +2316,7 @@ impl Provider for DecisionReadProbe {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_turn_decision_memory_reads_own_plaintext_and_excludes_foreign_workspace_memory() {
+async fn real_turn_memory_reads_own_plaintext_and_excludes_foreign_workspace_memory() {
     let provider = Arc::new(DecisionReadProbe {
         seen: Mutex::new(Vec::new()),
     });

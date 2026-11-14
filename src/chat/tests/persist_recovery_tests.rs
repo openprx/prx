@@ -252,7 +252,7 @@ async fn unverifiable_terminal_is_quarantined_so_chat_can_start() {
                 .record_inbound_user_message(scope, "prx again", Some("chat:2:user".to_owned()), None)
                 .await?;
             assert!(second.id > 0);
-            let published = crate::runtime::turn_publication::TurnDecisionPublication {
+            let published = crate::runtime::turn_publication::TurnPublication {
                 generation: Arc::clone(&generation),
                 registry: Arc::new(Vec::new()),
                 mcp_tool: None,

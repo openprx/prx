@@ -82,7 +82,7 @@ pub(super) async fn through_validation(
 
 #[tokio::test]
 async fn explicit_holdout_runs_each_split_once_on_same_proposal_and_replay_sends_nothing() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -191,7 +191,7 @@ async fn explicit_holdout_runs_each_split_once_on_same_proposal_and_replay_sends
 
 #[tokio::test]
 async fn failed_validation_never_reserves_or_sends_holdout() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
     let f = fixture();
     let pattern = usable_pattern(&f);
     let server = Server::start(false).await?;
@@ -226,7 +226,7 @@ async fn failed_validation_never_reserves_or_sends_holdout() -> Result<()> {
 
 #[tokio::test]
 async fn holdout_refuses_changed_epoch_window_status_and_same_candidate_other_proposal_before_send() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -318,7 +318,7 @@ async fn holdout_refuses_changed_epoch_window_status_and_same_candidate_other_pr
 
 #[tokio::test]
 async fn legacy_unbound_evaluation_keeps_seal_and_history_but_cannot_authorize_new_holdout() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -396,7 +396,7 @@ async fn legacy_unbound_evaluation_keeps_seal_and_history_but_cannot_authorize_n
 
 #[tokio::test]
 async fn requested_holdout_missing_from_manual_plan_never_qualifies() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

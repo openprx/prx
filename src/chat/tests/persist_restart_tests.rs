@@ -36,8 +36,8 @@ fn config_at(workspace: &Path) -> crate::config::Config {
 async fn publish(
     memory: Arc<dyn Memory>,
     generation: Arc<crate::config::ConfigGeneration>,
-) -> Result<Arc<crate::runtime::turn_decision::TurnDecisionService>> {
-    crate::runtime::turn_publication::TurnDecisionPublication {
+) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
+    crate::runtime::turn_publication::TurnPublication {
         security: Arc::new(crate::security::SecurityPolicy::from_config(
             &generation.effective.autonomy,
             &generation.effective.workspace_dir,

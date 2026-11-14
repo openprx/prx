@@ -599,7 +599,7 @@ async fn dispatch_preconstruction_parent(
             let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(tool)]);
             assert!(tools_handle.set(&registry));
             crate::chat::binding::tests::dispatch_unknown_agent_fixture(
-                crate::runtime::turn_publication::TurnDecisionPublication {
+                crate::runtime::turn_publication::TurnPublication {
                     generation,
                     registry,
                     mcp_tool: None,

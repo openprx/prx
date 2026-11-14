@@ -282,8 +282,8 @@ async fn run_internal(
         ctx.controlled_entry.as_ref(),
     )?;
 
-    let mut turn_decisions = ctx
-        .publish_turn_decisions(
+    let mut turn_service = ctx
+        .publish_turn_runtimes(
             Arc::clone(&tools_registry),
             crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
         )
@@ -297,7 +297,7 @@ async fn run_internal(
     let chat_result = cleanup.run(async {
     let child_cleanup = crate::runtime::turn_cleanup::current_tracker()
         .context("chat cleanup owner missing")?;
-    child_cleanup.retain_service(Arc::clone(&turn_decisions));
+    child_cleanup.retain_service(Arc::clone(&turn_service));
 
     // v3a: coordination handle for interactive PTY terminal handoff. Shared with
     // the unified TUI render loop (which parks while a PTY is attached) and the
@@ -2300,7 +2300,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                             continue;
                                         }
                                     };
-                                    let (mut args, operator_source) = match command.admit(Arc::clone(&mem), &chat_session_key, Arc::clone(&ctx.security), Arc::clone(&turn_decisions)).await {
+                                    let (mut args, operator_source) = match command.admit(Arc::clone(&mem), &chat_session_key, Arc::clone(&ctx.security), Arc::clone(&turn_service)).await {
                                         Ok(admitted) => admitted,
                                         Err(error) => { emit_chat_output(&format!("Cannot record background command source: {error}")); continue; }
                                     };
@@ -2946,7 +2946,7 @@ Retry with a compatible model: /provider {shown} <model>",
         };
         let provider_admission =
             provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
-        let catalog_changed = turn_decisions.check_live_parity().is_err();
+        let catalog_changed = turn_service.check_live_parity().is_err();
         if !provider_admission.can_start_visible || (catalog_changed && provider_admission.active_workers > 0) {
             tracing::warn!(
                 active_workers = provider_admission.active_workers,
@@ -2980,12 +2980,12 @@ Retry with a compatible model: /provider {shown} <model>",
             // have finished. Their sealed catalog/grants are never rewritten.
             // Keep publication's large builder future off the chat task's
             // stack, including unoptimized binaries used by PTY regression.
-            let replacement = Box::pin(ctx.publish_turn_decisions(
+            let replacement = Box::pin(ctx.publish_turn_runtimes(
                 Arc::clone(&tools_registry),
                 crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
             )).await?;
             child_cleanup.retain_service(Arc::clone(&replacement));
-            let retired = std::mem::replace(&mut turn_decisions, replacement);
+            let retired = std::mem::replace(&mut turn_service, replacement);
             let retirement = child_cleanup.retire(&retired)?;
             let drained = retired.drain_writes(std::time::Instant::now() + Duration::from_secs(2)).await;
             retirement.finish(drained);
@@ -3019,7 +3019,7 @@ Retry with a compatible model: /provider {shown} <model>",
             child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input)?,
         ).await?;
         let admission = admitted_binding
-            .issue_decision(&turn_decisions, &cancellation)
+            .issue_decision(&turn_service, &cancellation)
             .await;
         if let Err(error) = admission {
             if let Err(record_error) = admission_guard.finish_failure(
@@ -4720,7 +4720,7 @@ Retry with a compatible model: /provider {shown} <model>",
         &mem, &chat_session, plain_mode_turn_failed,
     ).await
     }).await;
-    turn_decisions
+    turn_service
         .shutdown(std::time::Instant::now() + Duration::from_secs(2))
         .await;
     hooks.drain_for_shutdown().await;

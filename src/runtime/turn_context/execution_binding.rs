@@ -1,60 +1,21 @@
-//! Source-bound selection of exact tool schemas for the shared turn loop.
-use super::{
-    Arc, CapabilityAvailabilityLevel, ConfigGeneration, Context, Memory, SecurityPolicy, ToolExecutionService,
-    TurnDecisionContext, TurnDecisionService, TurnSourceProof, TurnSurfaceKind,
-};
+//! Bind the turn's exact tool schemas, scope and child publication onto the
+//! shared execution context.
+use std::sync::Arc;
+
+use anyhow::Context;
+
+use super::OpenedTurn;
 use crate::runtime::child_source::publication::OrdinaryChildPublication;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::ToolSpec;
+use crate::tools::execution::ToolExecutionService;
 
-impl TurnDecisionService {
-    /// Local operator commands retain the actual Interactive publication.
-    /// This validates source provenance without inventing a model decision.
-    pub(crate) fn verify_operator_spawn_source(
-        &self,
-        source: &dyn TurnSourceProof,
-        generation: &Arc<ConfigGeneration>,
-        memory: &Arc<dyn Memory>,
-        security: &Arc<SecurityPolicy>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.surface == TurnSurfaceKind::Interactive
-                && Arc::ptr_eq(&self.generation, generation)
-                && Arc::ptr_eq(&self.memory, memory)
-                && Arc::ptr_eq(&self.security, security)
-                && self.child_scope().is_none()
-                && source.policy_channel() == "terminal"
-                && source.policy_sender() == "local-user",
-            "operator spawn differs from its actual runtime publication"
-        );
-        super::validate_agent_turn_origin(&self.generation, self.surface, source)?;
-        self.check_live_parity()?;
-        let entry = self
-            .catalog
-            .entry_for_public_name("sessions_spawn")
-            .context("operator spawn capability is absent from its publication")?;
-        anyhow::ensure!(
-            self.catalog_view().contains(&entry.id)
-                && entry.availability.level >= CapabilityAvailabilityLevel::Configured
-                && crate::tools::execution::decide_tool_execution(
-                    &self.security,
-                    entry.policy_tool_name(),
-                    source.policy_sender(),
-                    source.policy_channel(),
-                    source.policy_chat_type(),
-                ) != crate::tools::execution::ToolExecutionDecision::Deny,
-            "operator spawn capability is unavailable or denied by publication policy"
-        );
-        // Ask still requires the explicit command's resource-operation grant
-        // at the existing spawn gate; source validation never mints approval.
-        Ok(())
-    }
-}
-
-impl TurnDecisionService {
+impl TurnRuntimeService {
     pub(crate) fn bind_agent_execution(
         self: &Arc<Self>,
         proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
+        context: &Arc<OpenedTurn>,
         execution_context: &crate::tools::ToolExecutionContext,
         specs: &[ToolSpec],
     ) -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {
@@ -69,7 +30,7 @@ impl TurnDecisionService {
     pub(crate) fn bind_agent_execution_with_runtime(
         self: &Arc<Self>,
         proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
+        context: &Arc<OpenedTurn>,
         execution_context: &crate::tools::ToolExecutionContext,
         specs: &[ToolSpec],
         runtime_execution: Option<Arc<ToolExecutionService>>,
@@ -82,7 +43,7 @@ impl TurnDecisionService {
     fn bind_execution(
         self: &Arc<Self>,
         proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
+        context: &Arc<OpenedTurn>,
         execution_context: &crate::tools::ToolExecutionContext,
         specs: &[ToolSpec],
     ) -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {
@@ -156,11 +117,11 @@ impl TurnDecisionService {
         Ok((Arc::clone(&self.execution), execution_context))
     }
 
-    /// Delegates to the R25 owner in `runtime::turn_terminal::silence` (until Part 2).
+    /// Delegates to the R25 owner in `runtime::turn_terminal::silence`.
     pub(crate) fn record_agent_silence(
         &self,
         proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
+        context: &OpenedTurn,
         compiled: &crate::agent::turn_context::CompiledToolContext,
     ) -> anyhow::Result<()> {
         crate::runtime::turn_terminal::silence::record_agent_silence(self, proof, context, compiled)

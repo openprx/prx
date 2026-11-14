@@ -433,7 +433,7 @@ async fn recover_console_history(
                     }
                 }
                 if cleanup.is_none() {
-                    cleanup = Some(runtime.decision_slot.cleanup.register(cancellation.clone())?);
+                    cleanup = Some(runtime.publication_slot.cleanup.register(cancellation.clone())?);
                 }
                 let terminal_id = event
                     .run_id
@@ -449,7 +449,7 @@ async fn recover_console_history(
                     .as_deref()
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Console terminal owner missing"))?;
-                let service = runtime.decision_slot.publish(runtime, state).await?;
+                let service = runtime.publication_slot.publish(runtime, state).await?;
                 service
                     .runtime_holder()
                     .recovery_scope()
@@ -542,8 +542,8 @@ struct ConsoleTurnResult {
 }
 
 struct ConsoleDecisionTurn<'a> {
-    service: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionService>,
-    context: std::sync::Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    service: std::sync::Arc<crate::runtime::turn_publication::TurnRuntimeService>,
+    context: std::sync::Arc<crate::runtime::turn_context::OpenedTurn>,
     advice: Option<crate::decision_engine::IntentAnalysis>,
     proof: &'a crate::gateway::turn_source::GatewayTurnProof,
     cancellation: tokio_util::sync::CancellationToken,
@@ -1272,16 +1272,16 @@ pub(super) async fn get_session_approvals(
     let limit = normalize_inbox_limit(query.limit);
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cleanup =
-        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.publication_slot.cleanup), cancellation) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console approval inbox", &error);
+                warn_cleanup_refused(&runtime.publication_slot.cleanup, "Console approval inbox", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
     let result = cleanup
         .run(Box::pin(async {
-            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            let service = runtime.publication_slot.publish(&runtime, &state).await?;
             let mut envelope = RuntimeEnvelope::console(
                 runtime
                     .config_generation
@@ -1799,10 +1799,14 @@ async fn submit_console_message(
     }
 
     let input_cancellation = tokio_util::sync::CancellationToken::new();
-    let ticket = match turn_runtime.decision_slot.cleanup.register(input_cancellation) {
+    let ticket = match turn_runtime.publication_slot.cleanup.register(input_cancellation) {
         Ok(ticket) => ticket,
         Err(error) => {
-            warn_cleanup_refused(&turn_runtime.decision_slot.cleanup, "Console input admission", &error);
+            warn_cleanup_refused(
+                &turn_runtime.publication_slot.cleanup,
+                "Console input admission",
+                &error,
+            );
             return json_error(StatusCode::SERVICE_UNAVAILABLE, "Console input admission is closed");
         }
     };
@@ -1925,7 +1929,7 @@ async fn run_console_message_job_work(
     let _cancel_guard = cancellation.clone().drop_guard();
     let config = &turn_runtime.config_generation.effective;
     let cleanup_ticket = turn_runtime
-        .decision_slot
+        .publication_slot
         .cleanup
         .register(cancellation.clone())
         .map_err(|_| "Console turn admission is closed".to_owned())?;
@@ -1954,7 +1958,7 @@ async fn run_console_message_job_work(
     // Prediction transport accounting and later work retain the same owner.
     // Register its monitor acknowledgement before the first admission await.
     let child_cleanup = match crate::runtime::turn_cleanup::CleanupScope::new(
-        Some(&turn_runtime.decision_slot.cleanup),
+        Some(&turn_runtime.publication_slot.cleanup),
         cancellation.child_token(),
     ) {
         Ok(scope) => scope.with_acknowledgement(jobs::register_terminal_cleanup()),
@@ -1976,7 +1980,7 @@ async fn run_console_message_job_work(
                         .verify_runtime_input(&turn_runtime, &message)
                         .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
                     let service = turn_runtime
-                        .decision_slot
+                        .publication_slot
                         .publish(&turn_runtime, &state)
                         .await
                         .map_err(|_| "Console decision publication failed".to_owned())?;
@@ -2029,7 +2033,7 @@ async fn run_console_message_job_work(
     let (cleanup_ticket, admission_acknowledgement) = admission_guard
         .into_terminal_parts()
         .map_err(|error| error.to_string())?;
-    let terminal_guard = crate::gateway::decision_runtime::GatewayTerminalGuard::new(
+    let terminal_guard = crate::gateway::turn_source::publication_slot::GatewayTerminalGuard::new(
         cleanup_ticket,
         std::sync::Arc::clone(&decision.service),
         std::sync::Arc::clone(&decision.context),
@@ -2119,7 +2123,7 @@ async fn run_console_message_job_work(
             .service
             .terminal_binding(&decision.context)
             .map_err(|error| error.to_string())?;
-        match crate::gateway::decision_runtime::commit_terminal(
+        match crate::gateway::turn_source::publication_slot::commit_terminal(
             Some(&terminal_guard),
             &terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
@@ -2746,7 +2750,8 @@ mod tests {
         ));
         let mutable = Arc::get_mut(&mut runtime).unwrap();
         mutable.provider_binding = Some(Arc::new(binding));
-        mutable.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(security, 0));
+        mutable.publication_slot =
+            Arc::new(crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::new(security, 0));
         let principal = super::super::ApiPrincipal::of_token("prx-test-token");
         let envelope = envelope
             .with_run_id(uuid::Uuid::new_v4().to_string())
@@ -2804,7 +2809,12 @@ mod tests {
 
                         let (runtime, _, _, proof) =
                             console_test_source(&mut state, envelope, "current question").await;
-                        let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                        let service = runtime
+                            .publication_slot
+                            .publish(&runtime, &state)
+                            .await
+                            .unwrap()
+                            .clone();
                         let cancellation = tokio_util::sync::CancellationToken::new();
                         let context = service
                             .open_issued_turn_context(
@@ -2918,7 +2928,7 @@ mod tests {
                 );
                 let input = "hello";
                 let (runtime, _, _, proof) = console_test_source(&mut state, envelope, input).await;
-                let service = runtime.decision_slot.publish(&runtime, &state).await?.clone();
+                let service = runtime.publication_slot.publish(&runtime, &state).await?.clone();
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let context = service
                     .open_issued_turn_context(
@@ -3164,7 +3174,7 @@ mod tests {
                 const INPUT: &str = "file_read prx-console-window.txt: summarise the console bulky probe";
                 let (runtime, _, _, proof) =
                     console_test_source(&mut state, envelope, INPUT).await;
-                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let service = runtime.publication_slot.publish(&runtime, &state).await.unwrap().clone();
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 let context = service
                     .open_issued_turn_context(
@@ -3404,7 +3414,12 @@ mod tests {
 
                 // Keep the actual writer/runtime alive through the full file scan.
                 let retained_runtime = Arc::clone(&runtime);
-                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let service = runtime
+                    .publication_slot
+                    .publish(&runtime, &state)
+                    .await
+                    .unwrap()
+                    .clone();
                 let output = run_console_message_job(
                     runtime,
                     state,
@@ -3434,7 +3449,7 @@ mod tests {
                     "the controlled provider must actually run once"
                 );
                 retained_runtime
-                    .decision_slot
+                    .publication_slot
                     .cleanup
                     .drain(tokio::time::Instant::now() + Duration::from_secs(5))
                     .await
@@ -3445,7 +3460,7 @@ mod tests {
                 );
                 crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
                 service.shutdown(Instant::now() + Duration::from_secs(2)).await;
-                let retirement = Arc::clone(&retained_runtime.decision_slot.cleanup);
+                let retirement = Arc::clone(&retained_runtime.publication_slot.cleanup);
                 drop(retained_runtime);
                 retirement
                     .drain(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -3478,7 +3493,12 @@ mod tests {
 
                 // Keep the actual writer/runtime alive through the full file scan.
                 let retained_runtime = Arc::clone(&runtime);
-                let service = runtime.decision_slot.publish(&runtime, &state).await.unwrap().clone();
+                let service = runtime
+                    .publication_slot
+                    .publish(&runtime, &state)
+                    .await
+                    .unwrap()
+                    .clone();
                 let result = run_console_message_job(
                     runtime,
                     state,
@@ -3499,7 +3519,7 @@ mod tests {
                     "the controlled provider must actually run once"
                 );
                 retained_runtime
-                    .decision_slot
+                    .publication_slot
                     .cleanup
                     .drain(tokio::time::Instant::now() + Duration::from_secs(5))
                     .await
@@ -3510,7 +3530,7 @@ mod tests {
                 );
                 crate::agent::terminal::persistence_probe::assert_nothing_under_persists_the_probe_secret(tmp.path());
                 service.shutdown(Instant::now() + Duration::from_secs(2)).await;
-                let retirement = Arc::clone(&retained_runtime.decision_slot.cleanup);
+                let retirement = Arc::clone(&retained_runtime.publication_slot.cleanup);
                 drop(retained_runtime);
                 retirement
                     .drain(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -3857,7 +3877,8 @@ mod tests {
                 &runtime.config_generation.effective.workspace_dir,
             ));
             let mutable = Arc::get_mut(&mut runtime).expect("test: runtime uniquely owned");
-            mutable.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(security, 0));
+            mutable.publication_slot =
+                Arc::new(crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::new(security, 0));
         }
         let current = Arc::try_unwrap(runtime).unwrap_or_else(|_| panic!("test: runtime uniquely owned"));
         state.turn_runtime = Some(Arc::new(crate::gateway::GatewayTurnRuntimeOwner::new(
@@ -3874,7 +3895,7 @@ mod tests {
         )));
         let runtime = state.pin_turn_runtime();
         let service = runtime
-            .decision_slot
+            .publication_slot
             .publish(&runtime, &state)
             .await
             .expect("test: decision plane publishes");
@@ -3952,7 +3973,7 @@ mod tests {
         );
         let _ = service.drain_writes(Instant::now() + Duration::from_secs(5)).await;
         let _ = runtime
-            .decision_slot
+            .publication_slot
             .cleanup
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
@@ -4009,16 +4030,16 @@ async fn call_approval_action(
     }
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cleanup =
-        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
+        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.publication_slot.cleanup), cancellation) {
             Ok(value) => value,
             Err(error) => {
-                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console call approval", &error);
+                warn_cleanup_refused(&runtime.publication_slot.cleanup, "Console call approval", &error);
                 return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
             }
         };
     let result = cleanup
         .run(Box::pin(async {
-            let service = runtime.decision_slot.publish(&runtime, &state).await?;
+            let service = runtime.publication_slot.publish(&runtime, &state).await?;
             let mut envelope = RuntimeEnvelope::console(
                 runtime
                     .config_generation

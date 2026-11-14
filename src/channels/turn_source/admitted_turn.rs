@@ -1,13 +1,14 @@
 //! Decision and terminal ownership for an admitted channel turn.
 use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalReceipt};
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use std::sync::Arc;
 
-pub(super) struct ChannelDecisionTurn {
-    service: Arc<TurnDecisionService>,
-    proof: super::turn_source::ChannelTurnProof,
-    context: Arc<TurnDecisionContext>,
+pub(in crate::channels) struct ChannelAdmittedTurn {
+    service: Arc<TurnRuntimeService>,
+    proof: super::ChannelTurnProof,
+    context: Arc<OpenedTurn>,
     advice: Option<crate::decision_engine::IntentAnalysis>,
     terminal: crate::runtime::turn_terminal::TurnTerminalGuard,
     envelope: crate::runtime::envelope::RuntimeEnvelope,
@@ -15,31 +16,33 @@ pub(super) struct ChannelDecisionTurn {
     config: Arc<crate::config::Config>,
     generation: Arc<crate::config::ConfigGeneration>,
     trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
-    pub(super) route: crate::llm::route_decision::RouteDecision,
+    pub(in crate::channels) route: crate::llm::route_decision::RouteDecision,
 }
 
-pub(super) struct SmartGroupClassifierCall {
+pub(in crate::channels) struct SmartGroupClassifierCall {
     accounting: Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>,
     observation: Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>,
     route: crate::llm::route_decision::RouteDecision,
-    context: Arc<TurnDecisionContext>,
+    context: Arc<OpenedTurn>,
 }
 
 impl SmartGroupClassifierCall {
-    pub(super) fn provider(&self) -> Arc<dyn crate::providers::Provider> {
+    pub(in crate::channels) fn provider(&self) -> Arc<dyn crate::providers::Provider> {
         self.accounting.provider()
     }
-    pub(super) fn model(&self) -> &str {
+    pub(in crate::channels) fn model(&self) -> &str {
         self.accounting.selected_model().model()
     }
-    pub(super) fn accounting(&self) -> Arc<dyn crate::providers::attempt_accounting::AttemptAccounting> {
+    pub(in crate::channels) fn accounting(&self) -> Arc<dyn crate::providers::attempt_accounting::AttemptAccounting> {
         self.accounting.clone()
     }
-    pub(super) fn begin(&self) -> anyhow::Result<crate::tools::capability::execution_trace::PendingProvider> {
+    pub(in crate::channels) fn begin(
+        &self,
+    ) -> anyhow::Result<crate::tools::capability::execution_trace::PendingProvider> {
         self.observation.begin()?;
         self.accounting.begin_provider_observation()
     }
-    pub(super) fn complete(
+    pub(in crate::channels) fn complete(
         &self,
         pending: crate::tools::capability::execution_trace::PendingProvider,
         trace: &crate::providers::traits::ChatTrace,
@@ -47,19 +50,23 @@ impl SmartGroupClassifierCall {
         pending.finish(Some(&trace.attempts));
         self.observation.complete(trace)
     }
-    pub(super) fn fail(&self, pending: crate::tools::capability::execution_trace::PendingProvider, cancelled: bool) {
+    pub(in crate::channels) fn fail(
+        &self,
+        pending: crate::tools::capability::execution_trace::PendingProvider,
+        cancelled: bool,
+    ) {
         if cancelled {
             pending.cancelled();
         } else {
             pending.failed();
         }
     }
-    pub(super) fn authorize_silence(&self) -> anyhow::Result<()> {
+    pub(in crate::channels) fn authorize_silence(&self) -> anyhow::Result<()> {
         self.accounting.authorize_silence()?;
         self.context.terminal_execution_trace();
         Ok(())
     }
-    pub(super) fn provider_outcome(
+    pub(in crate::channels) fn provider_outcome(
         &self,
         trace: &crate::providers::traits::ChatTrace,
         started_at: chrono::DateTime<chrono::Utc>,
@@ -77,15 +84,15 @@ impl SmartGroupClassifierCall {
     }
 }
 
-impl ChannelDecisionTurn {
-    pub(super) async fn admit(
-        ctx: &super::ChannelRuntimeContext,
-        source: &super::turn_source::ChannelSourceReceipt,
+impl ChannelAdmittedTurn {
+    pub(in crate::channels) async fn admit(
+        ctx: &crate::channels::ChannelRuntimeContext,
+        source: &super::ChannelSourceReceipt,
         generation: &Arc<crate::config::ConfigGeneration>,
         security: &Arc<crate::security::SecurityPolicy>,
-        route: &super::ChannelRouteSelection,
+        route: &crate::channels::ChannelRouteSelection,
         cancellation: &tokio_util::sync::CancellationToken,
-        admission: &mut super::turn_source::ChannelAdmissionGuard,
+        admission: &mut super::ChannelAdmissionGuard,
     ) -> anyhow::Result<Self> {
         let envelope_for_scope = source.envelope();
         let conversation_id = envelope_for_scope.recipient.clone().unwrap_or_default();
@@ -98,7 +105,7 @@ impl ChannelDecisionTurn {
             .transpose()?
             .unwrap_or_else(|| Arc::clone(&ctx.memory));
         let service = ctx
-            .decisions
+            .publication_slot
             .publish(ctx, generation, security, Arc::clone(&turn_memory))
             .await?;
         let proof = source.bind_model(&route.provider, &route.model)?;
@@ -168,7 +175,7 @@ impl ChannelDecisionTurn {
         })
     }
 
-    pub(super) fn with_child_cleanup(
+    pub(in crate::channels) fn with_child_cleanup(
         mut self,
         acknowledgement: tokio::sync::oneshot::Receiver<Result<(), String>>,
     ) -> Self {
@@ -176,7 +183,9 @@ impl ChannelDecisionTurn {
         self
     }
 
-    pub(super) fn vision_accounting(&self) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>> {
+    pub(in crate::channels) fn vision_accounting(
+        &self,
+    ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryAccounting>> {
         self.service.auxiliary_accounting(
             &self.proof,
             &self.context,
@@ -184,7 +193,7 @@ impl ChannelDecisionTurn {
         )
     }
 
-    pub(super) fn smart_group_classifier(&mut self) -> anyhow::Result<SmartGroupClassifierCall> {
+    pub(in crate::channels) fn smart_group_classifier(&mut self) -> anyhow::Result<SmartGroupClassifierCall> {
         let config = &self.generation.effective.smart_group;
         let accounting = self.service.smart_group_accounting(
             &self.proof,
@@ -219,7 +228,7 @@ impl ChannelDecisionTurn {
         })
     }
 
-    pub(super) fn register_vision_observation(
+    pub(in crate::channels) fn register_vision_observation(
         &mut self,
         accounting: &crate::runtime::auxiliary_call::AuxiliaryAccounting,
     ) -> anyhow::Result<Arc<crate::runtime::auxiliary_call::AuxiliaryProviderCall>> {
@@ -232,9 +241,12 @@ impl ChannelDecisionTurn {
         Ok(observation)
     }
 
-    pub(super) fn build_provider(
+    pub(in crate::channels) fn build_provider(
         &self,
-    ) -> anyhow::Result<(super::ChannelRouteSelection, Arc<dyn crate::providers::Provider>)> {
+    ) -> anyhow::Result<(
+        crate::channels::ChannelRouteSelection,
+        Arc<dyn crate::providers::Provider>,
+    )> {
         let resolved = self.service.resolve_agent_model(&self.proof)?;
         let catalog = crate::providers::selection::catalog_for(&self.config);
         let provider = crate::providers::create_provider_for(
@@ -245,7 +257,7 @@ impl ChannelDecisionTurn {
             &crate::providers::provider_runtime_options_from_config(&self.config),
         )?;
         Ok((
-            super::ChannelRouteSelection {
+            crate::channels::ChannelRouteSelection {
                 provider: resolved.provider_label().to_owned(),
                 model: resolved.model().to_owned(),
             },
@@ -253,7 +265,7 @@ impl ChannelDecisionTurn {
         ))
     }
 
-    pub(super) fn routing(&self) -> crate::agent::turn_request::TurnDecision<'_> {
+    pub(in crate::channels) fn routing(&self) -> crate::agent::turn_request::TurnDecision<'_> {
         crate::agent::turn_request::TurnDecision {
             service: &self.service,
             context: &self.context,
@@ -261,19 +273,19 @@ impl ChannelDecisionTurn {
             proof: &self.proof,
         }
     }
-    pub(super) fn advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
+    pub(in crate::channels) fn advice(&self) -> Option<crate::decision_engine::IntentAnalysis> {
         self.advice.clone()
     }
-    pub(super) fn compaction(&self) -> &crate::config::AgentCompactionConfig {
+    pub(in crate::channels) fn compaction(&self) -> &crate::config::AgentCompactionConfig {
         self.context.main_compaction()
     }
-    pub(super) fn prompt_skills(&self) -> anyhow::Result<Vec<crate::skills::Skill>> {
+    pub(in crate::channels) fn prompt_skills(&self) -> anyhow::Result<Vec<crate::skills::Skill>> {
         self.service.agent_prompt_skills(&self.proof, &self.context)
     }
-    pub(super) fn memory_context(&self) -> String {
+    pub(in crate::channels) fn memory_context(&self) -> String {
         self.recalled_context.clone()
     }
-    pub(super) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
+    pub(in crate::channels) fn adapter(&self) -> crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
         let mut execution =
             crate::tools::ToolExecutionContext::new(self.envelope.clone(), self.proof.policy_chat_type())
                 .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
@@ -289,11 +301,14 @@ impl ChannelDecisionTurn {
             allowed_tool_names: None,
         }
     }
-    pub(super) async fn fail(&self, error: &anyhow::Error, cancelled: bool) -> anyhow::Result<()> {
+    pub(in crate::channels) async fn fail(&self, error: &anyhow::Error, cancelled: bool) -> anyhow::Result<()> {
         self.terminal.finish_failure(error, cancelled).await
     }
 
-    pub(super) async fn commit(&self, mut proposal: TurnTerminalDraft) -> anyhow::Result<TurnTerminalReceipt> {
+    pub(in crate::channels) async fn commit(
+        &self,
+        mut proposal: TurnTerminalDraft,
+    ) -> anyhow::Result<TurnTerminalReceipt> {
         proposal.binding = Some(self.service.terminal_binding(&self.context)?);
         // Terminal provenance belongs to the admitted sender; assistant history
         // has a separate projection scope and cannot replace source authority.

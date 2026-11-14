@@ -2,9 +2,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::{PublicationBuildError, PublicationInputs, PublicationLoopRuntime};
+use super::{PublicationInputs, PublicationLoopRuntime, TurnRuntimeBuildError};
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
-use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::pinned_policy_version;
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -13,7 +14,7 @@ pub(super) async fn operator_process_publication(
     authority: Arc<crate::runtime::child_source::operator_process::OperatorProcessAuthority>,
     mut build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
-) -> anyhow::Result<Arc<TurnDecisionService>> {
+) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
     anyhow::ensure!(
@@ -65,7 +66,7 @@ pub(super) async fn operator_process_publication(
     );
     // The runtime key is the turn's state key always (OV-2). The legacy plane
     // consumers still see it only while the plane is enabled.
-    let runtime_key = super::builder::load_key(Arc::clone(&build.generation)).await?;
+    let runtime_key = super::builder::load_runtime_key(Arc::clone(&build.generation)).await?;
     let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
     let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
@@ -79,7 +80,7 @@ pub(super) async fn operator_process_publication(
     .await?;
     let state_key = runtime_key;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
-        .map_err(PublicationBuildError::PolicyFingerprint)?;
+        .map_err(TurnRuntimeBuildError::PolicyFingerprint)?;
 
     let factory = DecisionBackendFactory::from_config(
         config,
@@ -91,7 +92,7 @@ pub(super) async fn operator_process_publication(
             events: Arc::clone(&events),
         },
     )?;
-    let service = Arc::new(TurnDecisionService {
+    let service = Arc::new(TurnRuntimeService {
         runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
             recovery,
             None,

@@ -227,14 +227,7 @@ mod candidate_tests {
         assert_eq!(
             actions,
             [
-                "answer",
-                "retrieve",
-                "discover",
-                "use_tool",
-                "delegate",
-                "clarify",
-                "request_approval",
-                "refuse"
+                "answer", "retrieve", "discover", "use_tool", "delegate", "clarify", "refuse"
             ]
         );
         for action in CausalActionKind::ALL {

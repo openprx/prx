@@ -411,7 +411,7 @@ fn router_layer(config: &Config) -> ControlLayerTrace {
 
 /// Report only after publication checks and cleanup ownership succeed.
 /// Reads the exact service without probes, store opens or config reconstruction.
-pub(crate) fn report_decision_service_status(service: &super::turn_decision::TurnDecisionService) {
+pub(crate) fn report_decision_service_status(service: &crate::runtime::turn_publication::TurnRuntimeService) {
     if tracing::enabled!(tracing::Level::INFO) {
         let layer = published_decision_layer(service.status());
         tracing::info!(

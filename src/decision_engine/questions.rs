@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cost::decision_attempt::error::{DecisionError, RequestRule};
 use crate::decision_engine::candidate::{CandidateId, CausalCandidate};
-use crate::decision_engine::candidate_generator::{CandidateSet, PendingApproval};
+use crate::decision_engine::candidate_generator::CandidateSet;
 use crate::decision_engine::prediction::{
     CandidateQuestion, DecisionQuestion, DecisionRequest, GlobalQuestion, OmissionReason, OptionId, ProjectionAudit,
     QuestionId, RequestLimits, RequestParts, StructuredValue,
@@ -68,8 +68,6 @@ impl QuestionCompiler {
         let CandidateSet::Legal {
             candidates,
             exact_mentions,
-            approval_scopes,
-            ..
         } = candidate_set
         else {
             return Err(CompileError::NoLegalPath);
@@ -255,7 +253,7 @@ impl QuestionCompiler {
         }
         omitted.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let candidate_set_hash = hash_candidate_set(candidates, exact_mentions, approval_scopes);
+        let candidate_set_hash = hash_candidate_set(candidates, exact_mentions);
         let trusted = state.trusted.parts();
         let mut parts = RequestParts {
             state: projection,
@@ -268,7 +266,7 @@ impl QuestionCompiler {
             policy_version: Arc::clone(&trusted.policy_version),
             catalog_generation: trusted.catalog_generation.to_hex(),
             omitted_questions: omitted,
-            approval_pending: trusted.approval_pending || !approval_scopes.is_empty(),
+            approval_pending: trusted.approval_pending,
         };
         loop {
             let projection_audit = ProjectionAudit {
@@ -300,11 +298,7 @@ impl QuestionCompiler {
     }
 }
 
-pub(crate) fn hash_candidate_set(
-    candidates: &[CausalCandidate],
-    exact_mentions: &BTreeSet<CandidateId>,
-    approval_scopes: &BTreeMap<CandidateId, Vec<PendingApproval>>,
-) -> String {
+pub(crate) fn hash_candidate_set(candidates: &[CausalCandidate], exact_mentions: &BTreeSet<CandidateId>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"prx.cdp.candidates.v1\0");
     let mut ordered: Vec<_> = candidates.iter().collect();
@@ -319,21 +313,10 @@ pub(crate) fn hash_candidate_set(
     for id in exact_mentions {
         hash_text(&mut hasher, id.as_str());
     }
+    // The retired approval scopes keep their always-empty encoding, so the
+    // hash bytes equal the former advisory case.
     hasher.update(b"approval_scopes\0");
-    hasher.update(approval_scopes.len().to_be_bytes());
-    for (id, pending) in approval_scopes {
-        hash_text(&mut hasher, id.as_str());
-        hasher.update(pending.len().to_be_bytes());
-        for scope in pending {
-            hash_candidate(&mut hasher, &scope.candidate);
-            let mut op_ids: Vec<_> = scope.op_ids.iter().collect();
-            op_ids.sort();
-            hasher.update(op_ids.len().to_be_bytes());
-            for op_id in op_ids {
-                hash_text(&mut hasher, op_id.as_str());
-            }
-        }
-    }
+    hasher.update(0usize.to_be_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -383,10 +366,7 @@ fn hash_text(hasher: &mut Sha256, text: &str) {
 }
 
 const fn is_fixed_terminal(action: CausalActionKind) -> bool {
-    matches!(
-        action,
-        CausalActionKind::Clarify | CausalActionKind::RequestApproval | CausalActionKind::Refuse
-    )
+    matches!(action, CausalActionKind::Clarify | CausalActionKind::Refuse)
 }
 
 fn fixed_text(text: &str) -> Result<StructuredValue, DecisionError> {
@@ -406,20 +386,16 @@ mod tests {
     use super::*;
     static EMPTY_DISCOVERED_REFS: std::sync::LazyLock<crate::decision_engine::candidate_generator::DiscoveredRefs> =
         std::sync::LazyLock::new(crate::decision_engine::candidate_generator::DiscoveredRefs::empty);
-    use crate::causal_tree::gates::GateInputs;
-    use crate::causal_tree::gates::GateReport;
     use crate::decision_engine::candidate::CausalCandidate;
     use crate::decision_engine::candidate_generator::{CandidatePolicy, CausalCandidateGenerator};
     use crate::decision_engine::cost_model::CapabilityCostModel;
     use crate::decision_engine::prediction::wire::SystemOneCodec;
     use crate::decision_engine::state::{DerivedCandidate, DerivedState, RawRoutingInput, fixtures};
-    use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
     use crate::tools::capability::contract::{CapabilityRef, CapabilityTarget};
     use crate::tools::capability::turn_state::{SideEffectMode, TrustedState};
     use crate::tools::mcp::McpCapabilitySpec;
-    use crate::tools::traits::{Tool, ToolResult, ToolSpec};
-    use async_trait::async_trait;
+    use crate::tools::traits::ToolSpec;
     use std::time::Duration;
 
     include!(concat!(
@@ -437,10 +413,6 @@ mod tests {
         CandidateSet::Legal {
             candidates,
             exact_mentions: BTreeSet::new(),
-            approval_scopes: BTreeMap::new(),
-            report: GateReport {
-                outcomes: BTreeMap::new(),
-            },
         }
     }
 
@@ -461,28 +433,6 @@ mod tests {
             }
         }
         cost
-    }
-
-    struct ReadProbe(&'static str);
-
-    #[async_trait]
-    impl Tool for ReadProbe {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn description(&self) -> &str {
-            "Read project evidence"
-        }
-        fn parameters_schema(&self) -> Value {
-            serde_json::json!({"type":"object","properties":{}})
-        }
-        async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: String::new(),
-                error: None,
-            })
-        }
     }
 
     fn bind_generated(state: &mut CausalState, set: &CandidateSet, catalog: &CapabilityCatalog) {
@@ -509,7 +459,6 @@ mod tests {
                     ),
                     exact_mention: exact_mentions.contains(candidate.candidate_id()),
                     available: true,
-                    effective_approval_required: None,
                 })
                 .collect(),
         )
@@ -607,157 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn hard_gated_candidate_is_absent_from_compiled_request() {
-        let key = fixtures::key();
-        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ReadProbe("prx_read")), Box::new(ReadProbe("prx_search"))];
-        let catalog =
-            CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default()).unwrap();
-        let view = catalog.view(&CatalogScope::default());
-        let mut state = fixtures::state(&key, "use prx_read");
-        let mut trusted = fixtures::trusted();
-        trusted.owner_id = Some(Arc::from("prx_user"));
-        trusted.catalog_generation = *catalog.generation();
-        trusted.channel = None;
-        trusted.side_effect_mode = SideEffectMode::GuardedWrite;
-        state.trusted = TrustedState::from_runtime(trusted);
-        let cost = CapabilityCostModel {
-            per_capability: BTreeMap::new(),
-            estimates: BTreeMap::from([
-                (
-                    CapabilityTarget::None,
-                    (
-                        crate::tools::capability::contract::CostEstimate {
-                            tokens: 1,
-                            micro_usd: 0,
-                        },
-                        1,
-                    ),
-                ),
-                (
-                    CapabilityTarget::NativeTool,
-                    (
-                        crate::tools::capability::contract::CostEstimate {
-                            tokens: 1,
-                            micro_usd: 0,
-                        },
-                        1,
-                    ),
-                ),
-            ]),
-        };
-        let cost = fixture_cost_for_view(&view, cost);
-        let candidate_policy = CandidatePolicy {
-            key: &key,
-            max_candidates: 12,
-            can_deliver_text: true,
-            may_delegate: false,
-            delegation_target: None,
-            cost_model: &cost,
-            discovered_refs: &EMPTY_DISCOVERED_REFS,
-        };
-        let mut security = SecurityPolicy::default();
-        security.autonomy = AutonomyLevel::Full;
-        let calls_seen = BTreeSet::new();
-        let calls = BTreeMap::new();
-        let gates = GateInputs {
-            policy: &security,
-            owner_id: "prx_user",
-            sender: "prx_user",
-            policy_channel: "terminal",
-            chat_type: "dm",
-            model_ref: "anthropic:claude",
-            model_can_chat: true,
-            model_can_call_tools: true,
-            decision_endpoint_ready: true,
-            child_scope: None,
-            verified_approval_calls: BTreeMap::new(),
-            call_fingerprints: &calls,
-            failed_call_counts: BTreeMap::new(),
-            replayed_non_idempotent: &calls_seen,
-            retry_limit: Some(2),
-        };
-        let first = CausalCandidateGenerator::generate(
-            &state,
-            &view,
-            &candidate_policy,
-            &crate::causal_tree::hard_gates_probe::HardGatesProbe {
-                state: &state,
-                catalog: &view,
-                gates: &gates,
-            },
-        )
-        .unwrap();
-        let CandidateSet::Legal {
-            candidates,
-            exact_mentions,
-            ..
-        } = &first
-        else {
-            panic!("expected legal candidates");
-        };
-        let gated_id = candidates
-            .iter()
-            .find(|candidate| {
-                exact_mentions.contains(candidate.candidate_id())
-                    && candidate.required_capabilities().first().is_some_and(|reference| {
-                        view.entries()
-                            .iter()
-                            .any(|entry| entry.id == reference.id && entry.public_name == "prx_read")
-                    })
-            })
-            .expect("read capability was admitted before exclusion")
-            .candidate_id()
-            .as_str()
-            .to_string();
-        let mut trusted = state.trusted.parts().clone();
-        trusted.exclusions.push("prx_read".into());
-        state.trusted = TrustedState::from_runtime(trusted);
-        let admitted = CausalCandidateGenerator::generate(
-            &state,
-            &view,
-            &candidate_policy,
-            &crate::causal_tree::hard_gates_probe::HardGatesProbe {
-                state: &state,
-                catalog: &view,
-                gates: &gates,
-            },
-        )
-        .unwrap();
-        assert!(
-            matches!(&admitted, CandidateSet::Legal { candidates, .. } if candidates.iter().all(|candidate| candidate.candidate_id().as_str() != gated_id))
-        );
-        bind_generated(&mut state, &admitted, &catalog);
-        let compiler_policy = CompilerPolicy {
-            key: &key,
-            model: Some("anthropic:claude"),
-            expires_at: Instant::now() + Duration::from_secs(30),
-            limits: RequestLimits::default(),
-        };
-        let compiled = QuestionCompiler::compile(&state, &admitted, &compiler_policy).unwrap();
-        let encoded = SystemOneCodec::new(&compiled.request, &key)
-            .unwrap()
-            .encode_request()
-            .unwrap();
-        let encoded = String::from_utf8(encoded).unwrap();
-        assert!(!encoded.contains(&gated_id));
-        assert!(encoded.contains("use prx_read"));
-        assert!(
-            compiled
-                .request
-                .questions()
-                .keys()
-                .all(|id| !id.as_str().contains(&gated_id))
-        );
-        assert!(
-            state_v1_violations(compiled.request.state().as_json()).is_empty(),
-            "expected an empty value"
-        );
-        assert!(
-            matches!(&admitted, CandidateSet::Legal { candidates, .. } if candidates.iter().any(|candidate| candidate.required_capabilities().first().is_some_and(|reference| view.entries().iter().any(|entry| entry.id == reference.id && entry.public_name == "prx_search"))))
-        );
-    }
-
-    #[test]
     fn decision_request_bytes_stay_constant_as_mcp_inventory_grows() {
         let key = fixtures::key();
         let mut wire_lengths = Vec::new();
@@ -824,38 +622,7 @@ mod tests {
                 cost_model: &cost,
                 discovered_refs: &EMPTY_DISCOVERED_REFS,
             };
-            let mut security = SecurityPolicy::default();
-            security.autonomy = AutonomyLevel::Full;
-            let calls_seen = BTreeSet::new();
-            let calls = BTreeMap::new();
-            let gates = GateInputs {
-                policy: &security,
-                owner_id: "prx_user",
-                sender: "prx_user",
-                policy_channel: "terminal",
-                chat_type: "dm",
-                model_ref: "anthropic:claude",
-                model_can_chat: true,
-                model_can_call_tools: true,
-                decision_endpoint_ready: true,
-                child_scope: None,
-                verified_approval_calls: BTreeMap::new(),
-                call_fingerprints: &calls,
-                failed_call_counts: BTreeMap::new(),
-                replayed_non_idempotent: &calls_seen,
-                retry_limit: Some(2),
-            };
-            let admitted = CausalCandidateGenerator::generate(
-                &state,
-                &view,
-                &candidate_policy,
-                &crate::causal_tree::hard_gates_probe::HardGatesProbe {
-                    state: &state,
-                    catalog: &view,
-                    gates: &gates,
-                },
-            )
-            .unwrap();
+            let admitted = CausalCandidateGenerator::generate(&state, &view, &candidate_policy).unwrap();
             let seed = view
                 .entries()
                 .iter()
@@ -922,33 +689,38 @@ mod tests {
     }
 
     #[test]
-    fn candidate_hash_separates_mentions_from_approval_scope() {
+    fn candidate_hash_separates_mentions_and_keeps_its_pre_change_bytes() {
         let key = fixtures::key();
-        let candidate = fixtures::candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Mcp, None).candidate;
-        let id = candidate.candidate_id().clone();
-        let candidates = vec![candidate.clone()];
-        let mentioned = hash_candidate_set(&candidates, &BTreeSet::from([id.clone()]), &BTreeMap::new());
-        let empty_scope = hash_candidate_set(
-            &candidates,
-            &BTreeSet::new(),
-            &BTreeMap::from([(id.clone(), Vec::new())]),
-        );
-        assert_ne!(mentioned, empty_scope);
-        let scope_a = PendingApproval {
-            candidate: candidate.clone(),
-            op_ids: vec![crate::tools::capability::contract::OpId::new("mcp:call:a")],
-        };
-        let scope_b = PendingApproval {
-            candidate,
-            op_ids: vec![crate::tools::capability::contract::OpId::new("mcp:call:b")],
-        };
+        let working = fixtures::candidate(&key, CausalActionKind::UseTool, CapabilityTarget::Mcp, None).candidate;
+        let id = working.candidate_id().clone();
+        let candidates = vec![working];
         assert_ne!(
-            hash_candidate_set(
-                &candidates,
-                &BTreeSet::new(),
-                &BTreeMap::from([(id.clone(), vec![scope_a])])
-            ),
-            hash_candidate_set(&candidates, &BTreeSet::new(), &BTreeMap::from([(id, vec![scope_b])])),
+            hash_candidate_set(&candidates, &BTreeSet::from([id])),
+            hash_candidate_set(&candidates, &BTreeSet::new())
+        );
+        // One fixed refusal, mentioned exactly. The literal was computed from
+        // the encoding with an empty approval-scope map, so the retired scope
+        // field must keep its empty bytes.
+        let refusal = CausalCandidate::new(
+            CausalActionKind::Refuse,
+            CapabilityTarget::None,
+            crate::decision_engine::candidate::CandidateSpec {
+                namespace: None,
+                required_capabilities: Vec::new(),
+                side_effect: crate::tools::capability::contract::SideEffectClass::ReadOnly,
+                approval: ApprovalRequirement::None,
+                estimated_cost: Some(crate::tools::capability::contract::CostEstimate {
+                    tokens: 0,
+                    micro_usd: 0,
+                }),
+                estimated_latency_ms: Some(0),
+            },
+        );
+        let refusal_id = refusal.candidate_id().clone();
+        assert_eq!(refusal_id.as_str(), "refuse-none");
+        assert_eq!(
+            hash_candidate_set(&[refusal], &BTreeSet::from([refusal_id])),
+            "7488d8d9c99dba9564d503160078244051053a52df671fa962625ff6a7739abb"
         );
     }
 

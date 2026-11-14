@@ -18,8 +18,6 @@
 
 pub mod activity;
 pub mod cli;
-mod decision_runtime;
-mod decision_turn;
 pub mod dingtalk;
 pub mod discord;
 pub mod email_channel;
@@ -236,7 +234,7 @@ struct SecurityGen {
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
-    decisions: Arc<decision_runtime::ChannelDecisionSlot>,
+    publication_slot: Arc<turn_source::publication_slot::ChannelPublicationSlot>,
     config: crate::config::SharedConfig,
     #[cfg(test)]
     config_generation: Arc<crate::config::ConfigGeneration>,

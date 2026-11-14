@@ -186,8 +186,9 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
         while let Some(found) = compact[search..].find("causal_tree:") {
             let start = search + found;
             search = start + "causal_tree:".len();
-            // Not a field value: a path (`crate::causal_tree::`), or the
-            // field's declaration (`pub causal_tree: CausalTreeConfig`). An
+            // Not a field value: a module path
+            // (`crate::config::schema::decision_engine::`), or the field's
+            // declaration (`pub causal_tree: CausalTreeConfig`). An
             // attribute before a field value (`#[cfg(x)] causal_tree: v`) is
             // no declaration.
             let before = compact[..start].trim_end();

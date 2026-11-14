@@ -155,7 +155,7 @@ async fn gate_none_is_omitted_and_every_resource_component_requires_original_roo
 
 #[tokio::test]
 async fn managed_gate_review_has_exact_actual_scope_sealed_history_and_zero_request_replay() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -359,7 +359,7 @@ async fn managed_gate_review_has_exact_actual_scope_sealed_history_and_zero_requ
 
 #[tokio::test]
 async fn judge_concern_and_malformed_reply_keep_real_root_cost_without_qualification() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         for mode in [1, 3] {
             let f = fixture();
             let pattern = usable_pattern(&f);
@@ -413,7 +413,7 @@ async fn judge_concern_and_malformed_reply_keep_real_root_cost_without_qualifica
 
 #[tokio::test]
 async fn unknown_stage_after_bound_finish_is_not_automatically_judged_or_reopened() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -520,7 +520,7 @@ where
 
 #[tokio::test]
 async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_rejudges() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         for durable_cancel in [false, true] {
             let f = fixture();
             let pattern = usable_pattern(&f);
@@ -603,7 +603,7 @@ async fn judge_timeout_or_durable_cancel_keeps_actual_root_liability_and_never_r
 
 #[tokio::test]
 async fn slow_judge_answer_is_kept_when_the_logical_deadline_has_not_elapsed() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -639,7 +639,7 @@ async fn slow_judge_answer_is_kept_when_the_logical_deadline_has_not_elapsed() -
 
 #[tokio::test]
 async fn unknown_failed_judge_attempt_keeps_root_allowance_and_refuses_a_retry() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -713,7 +713,7 @@ async fn unknown_failed_judge_attempt_keeps_root_allowance_and_refuses_a_retry()
 
 #[tokio::test]
 async fn postcleanup_witness_write_failure_keeps_sealed_gate_and_prevents_a_second_judge() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

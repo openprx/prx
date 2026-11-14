@@ -412,7 +412,7 @@ pub(super) fn provider_construction_outside_the_provider_module_is_pinned() {
     // Each site's credential source, as reviewed in C0 / R-C0:
     let expected: BTreeSet<String> = [
         "src/agent/entry.rs:build_provider:create_routed_provider_for",
-        "src/channels/decision_turn.rs:build_provider:create_provider_for",
+        "src/channels/turn_source/admitted_turn.rs:build_provider:create_provider_for",
         "src/channels/runtime_commands.rs:build_channel_hint_provider:create_provider_for",
         "src/channels/runtime_commands.rs:build_channel_startup_provider:create_routed_provider_for",
         "src/chat/bootstrap.rs:chat_provider_chain:create_routed_provider_for",

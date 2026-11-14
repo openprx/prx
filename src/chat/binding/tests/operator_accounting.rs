@@ -157,7 +157,7 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
             hooks: Arc::new(crate::hooks::HookManager::new(workspace.path().to_path_buf())),
             observer: Arc::new(crate::observability::noop::NoopObserver),
         };
-        let service = crate::runtime::turn_publication::TurnDecisionPublication {
+        let service = crate::runtime::turn_publication::TurnPublication {
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
             mcp_tool: None,
@@ -435,7 +435,7 @@ async fn process_segment(
         std::sync::Arc<crate::security::SecurityPolicy>,
     ),
 ) -> anyhow::Result<(
-    std::sync::Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    std::sync::Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     (
         std::sync::Arc<crate::runtime::turn_source::OwnedTurnSourceProof>,
         crate::tools::ToolExecutionContext,
@@ -443,7 +443,7 @@ async fn process_segment(
     crate::runtime::child_source::operator_process::OperatorProcessLifetime,
 )> {
     let (authority, lifetime) = restore_operator_process(claimed, scope, receipt, task, config_dir).await?;
-    let service = crate::runtime::turn_publication::OperatorProcessDecisionPublication {
+    let service = crate::runtime::turn_publication::OperatorProcessPublication {
         authority: std::sync::Arc::clone(&authority),
         registry,
         security: runtime_security.1,

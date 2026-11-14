@@ -42,7 +42,7 @@ impl OperatorSpawnSource {
         provider: Arc<dyn crate::providers::Provider>,
         task: String,
         security: Arc<crate::security::SecurityPolicy>,
-        publication: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        publication: Arc<crate::runtime::turn_publication::TurnRuntimeService>,
         runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(

@@ -509,7 +509,7 @@ async fn experiment_production_builder_runs_one_proposal_and_refuses_replay() ->
 
 #[tokio::test]
 async fn experiment_solver_and_independent_verifier_use_the_same_admitted_plan() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -627,7 +627,7 @@ async fn experiment_durable_cancel_reaches_active_provider_and_recovery_never_re
 
 #[tokio::test]
 async fn experiment_native_write_edit_read_requires_independently_correct_artifacts() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         for wrong in [false, true] {
             let f = fixture();
             let pattern = usable_pattern(&f);

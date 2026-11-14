@@ -7,9 +7,9 @@ use std::sync::Arc;
 impl ChatTurnBinding {
     pub(super) async fn issue_decision(
         &self,
-        service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        service: &Arc<crate::runtime::turn_publication::TurnRuntimeService>,
         cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
+    ) -> anyhow::Result<&Arc<crate::runtime::turn_context::OpenedTurn>> {
         anyhow::ensure!(
             matches!(self.admission_mode, ChatAdmissionMode::Model(_)),
             "operator command cannot issue a model-turn decision"
@@ -21,7 +21,7 @@ impl ChatTurnBinding {
             .get_or_try_init(|| async {
                 let kind = crate::runtime::turn_context::AgentTurnKind::Repl;
                 let opened = service.open_turn_context(self, kind, cancellation).await?;
-                let context = service.record_opened_context(self, opened, cancellation).await?;
+                let context = service.admit_opened_context(self, opened, cancellation).await?;
                 let advice = service.advisory().analyze_turn(context.runtime(), cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
                     advice,

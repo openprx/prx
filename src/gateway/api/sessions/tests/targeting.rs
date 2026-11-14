@@ -700,13 +700,15 @@ async fn drive(
                                 scripted.clone(),
                                 resolve("ollama"),
                             )));
-                        parent.decision_slot = Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(
-                            Arc::new(crate::security::SecurityPolicy::from_config(
-                                &effective.autonomy,
-                                &workspace,
-                            )),
-                            0,
-                        ));
+                        parent.publication_slot = Arc::new(
+                            crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::new(
+                                Arc::new(crate::security::SecurityPolicy::from_config(
+                                    &effective.autonomy,
+                                    &workspace,
+                                )),
+                                0,
+                            ),
+                        );
                     }
 
                     // The real target resolution and runtime derivation; only the
@@ -765,7 +767,7 @@ async fn drive(
                         crate::agent::channel_approval::install(&run_id, resolver.clone(), true, false);
                     }
                     let service = runtime
-                        .decision_slot
+                        .publication_slot
                         .publish(&runtime, &state)
                         .await
                         .expect("test: publish")

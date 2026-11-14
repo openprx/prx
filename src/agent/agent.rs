@@ -1187,8 +1187,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_custom_memory_loader_runs_only_for_selected_retrieval() {
-        crate::runtime::turn_decision::selected_loader_fixture::with_first_other(custom_memory_loader_fixture(false))
-            .await;
+        Box::pin(custom_memory_loader_fixture(false)).await;
     }
 
     #[tokio::test]
@@ -1263,8 +1262,7 @@ mod tests {
         selected_config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
             crate::config::schema::causal_tree::BackendKind::Builtin,
         );
-        // The durable case selects Builtin; the other case installs its scoped
-        // selected-loader Mock backend explicitly through with_first_other.
+        // Both cases select Builtin; turns open prediction-free.
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
             config.causal_tree.enabled = true;

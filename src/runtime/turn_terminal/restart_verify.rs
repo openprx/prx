@@ -28,6 +28,9 @@ const NULL_SEMANTIC_FIELDS: [&str; 7] = [
     "policy_version",
 ];
 
+/// The complete key set of a repository claim payload.
+const CLAIM_FIELDS: [&str; 4] = ["terminal_id", "semantic_mac_v3", "recovery_key_id", "semantic"];
+
 /// Semantic fields that must equal the final payload exactly.
 const MIRRORED_FIELDS: [&str; 6] = [
     "status",
@@ -93,8 +96,10 @@ pub(crate) fn verify_semantics(
     {
         return Err(refuse("claim key or tag differs from the settled facts"));
     }
-    if claim_object.contains_key("decision_id") || claim_object.contains_key("semantic_mac_v2") {
-        return Err(refuse("claim carries legacy decision fields"));
+    // The repository claim schema is closed: any other key (a legacy
+    // decision id or MAC included) refuses the terminal.
+    if claim_object.len() != CLAIM_FIELDS.len() || CLAIM_FIELDS.iter().any(|field| !claim_object.contains_key(*field)) {
+        return Err(refuse("claim carries fields outside its schema"));
     }
     let semantic = claim_object.get("semantic").ok_or(refuse("claim semantic missing"))?;
 

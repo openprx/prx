@@ -269,7 +269,7 @@ async fn stage_and_preparation_expire_before_dispatch_on_the_unchanged_logical_l
 }
 
 async fn adoption_clock_contract(probe_expiry: bool) -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
     let mut f = fixture();
     let server = Server::start(false).await?;
     // One paused clock for every lookup in this body, including confirm,

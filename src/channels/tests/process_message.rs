@@ -116,7 +116,7 @@ async fn process_channel_message_strips_unexecuted_tool_json_artifacts_from_repl
     channels_by_name.insert(channel.name().to_string(), channel);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -207,7 +207,7 @@ async fn process_channel_message_executes_tool_calls_with_alias_tags() {
     // the executions rather than trusting the canned reply.
     let executions = Arc::new(AtomicUsize::new(0));
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -371,7 +371,7 @@ async fn process_channel_message_handles_models_command_without_llm_call() {
     );
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: config_manager,
         config_generation,
         channels_by_name: Arc::new(channels_by_name),
@@ -505,7 +505,7 @@ async fn process_channel_message_uses_route_override_provider_and_model() {
     );
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: config_manager,
         config_generation,
         channels_by_name: Arc::new(channels_by_name),
@@ -612,7 +612,7 @@ async fn process_channel_message_uses_runtime_default_model_from_store() {
     );
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: config_manager,
         config_generation,
         channels_by_name: Arc::new(channels_by_name),
@@ -697,7 +697,7 @@ async fn process_channel_message_allows_long_tool_sequence_to_finish() {
     channels_by_name.insert(channel.name().to_string(), channel);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),

@@ -289,7 +289,7 @@ async fn failed_channel_turn_sends_classified_advice_carrying_the_turn_error_id(
     runtime_config.default_model = Some("test-model".to_string());
     let config_manager = crate::config::new_shared(runtime_config);
     let ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: Arc::clone(&config_manager),
         config_generation: config_manager.pin(),
         channels_by_name: Arc::new(channels_by_name),

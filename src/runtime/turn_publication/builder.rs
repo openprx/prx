@@ -4,13 +4,13 @@
 //! from the holder these builders create.
 use std::sync::Arc;
 
-use super::PublicationBuildError;
+use super::TurnRuntimeBuildError;
+use super::service::{TurnRuntimeService, pinned_policy_version};
 use crate::config::ConfigGeneration;
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, DecisionTransports, FactoryDeps};
 use crate::memory::Memory;
 use crate::observability::causal_event::CausalEventSink;
 use crate::providers::catalog::CatalogView as ProviderCatalogView;
-use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -47,24 +47,24 @@ pub(crate) struct PublicationLoopRuntime {
 pub(crate) async fn build_publication(
     surface: TurnSurfaceKind,
     build: PublicationInputs<'_>,
-) -> Result<Arc<TurnDecisionService>, PublicationBuildError> {
+) -> Result<Arc<TurnRuntimeService>, TurnRuntimeBuildError> {
     if build.catalog_sources.config_generation_id != build.generation.id.0.to_string() {
-        return Err(PublicationBuildError::SourceGeneration);
+        return Err(TurnRuntimeBuildError::SourceGeneration);
     }
     // Worker children publish through the ordinary or operator process path.
     if surface == TurnSurfaceKind::Worker {
-        return Err(PublicationBuildError::ChildAuthority);
+        return Err(TurnRuntimeBuildError::WorkerSurface);
     }
     let config = &build.generation.effective;
     if config.causal_tree.enabled && !crate::memory::serves_tool_execution_ledger(build.memory.name()) {
-        return Err(PublicationBuildError::EventStoreUnsupported);
+        return Err(TurnRuntimeBuildError::EventStoreUnsupported);
     }
     if config.causal_tree.enabled && !config.memory.events.record_user_messages {
-        return Err(PublicationBuildError::InboundEventsDisabled);
+        return Err(TurnRuntimeBuildError::InboundEventsDisabled);
     }
     // The runtime key is the turn's state key always (OV-2). The legacy plane
     // consumers still see it only while the plane is enabled.
-    let runtime_key = load_key(Arc::clone(&build.generation)).await?;
+    let runtime_key = load_runtime_key(Arc::clone(&build.generation)).await?;
     let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
     let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
@@ -77,10 +77,10 @@ pub(crate) async fn build_publication(
         &build.security,
     )
     .await
-    .map_err(PublicationBuildError::RecoveryPreparation)?;
+    .map_err(TurnRuntimeBuildError::RecoveryPreparation)?;
     let state_key = runtime_key;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
-        .map_err(PublicationBuildError::PolicyFingerprint)?;
+        .map_err(TurnRuntimeBuildError::PolicyFingerprint)?;
     let mut catalog_sources = build.catalog_sources;
     // Node ids and engine child seals must use the same key in this service.
     // The source's independent key cannot assert workspace provenance.
@@ -102,26 +102,6 @@ pub(crate) async fn build_publication(
             events: Arc::clone(&events),
         },
     )?;
-    #[cfg(test)]
-    let factory = crate::runtime::turn_decision::evidence_fixture::wrap_factory(
-        factory,
-        config,
-        Arc::clone(&state_key),
-        Arc::clone(&events),
-    );
-    #[cfg(test)]
-    let factory = crate::runtime::turn_decision::selected_loader_fixture::wrap_factory(
-        factory,
-        config,
-        Arc::clone(&state_key),
-        Arc::clone(&events),
-    );
-    #[cfg(test)]
-    let factory = crate::runtime::turn_decision::ordinary_child_fixture::wrap_factory(
-        factory,
-        Arc::clone(&state_key),
-        Arc::clone(&events),
-    );
     // The advisory engine's factory is built from the effective engine
     // backend with this service's state key, never through the plane switch
     // (R55, R9). A disabled engine builds no factory.
@@ -135,7 +115,7 @@ pub(crate) async fn build_publication(
             events: Arc::clone(&events),
         },
     )?;
-    Ok(Arc::new(TurnDecisionService {
+    Ok(Arc::new(TurnRuntimeService {
         runtime: Arc::new(runtime),
         advisory,
         memory_loader: None,
@@ -168,13 +148,13 @@ pub(crate) async fn build_publication(
 /// `<ws>/self/runtime/runtime.key` (OV-2), loaded or created off the Tokio
 /// workers. There is no plane condition and no ephemeral fallback: an
 /// unavailable runtime key refuses the publication.
-pub(in crate::runtime) async fn load_key(
+pub(in crate::runtime) async fn load_runtime_key(
     generation: Arc<ConfigGeneration>,
-) -> Result<Arc<crate::security::runtime_key::DecisionKey>, PublicationBuildError> {
+) -> Result<Arc<crate::security::runtime_key::DecisionKey>, TurnRuntimeBuildError> {
     let ticket = crate::runtime::turn_cleanup::current_tracker()
         .map(|owner| owner.register(tokio_util::sync::CancellationToken::new()))
         .transpose()
-        .map_err(PublicationBuildError::PreparationOwner)?;
+        .map_err(TurnRuntimeBuildError::PreparationOwner)?;
     let key = tokio::task::spawn_blocking(move || {
         crate::runtime::decision_accounting::initialize_tokenizers();
         let key = crate::security::runtime_key::DecisionKey::load_or_create(&generation.effective.workspace_dir);
@@ -184,5 +164,5 @@ pub(in crate::runtime) async fn load_key(
         key
     })
     .await?;
-    key.map_err(PublicationBuildError::RuntimeKey)
+    key.map_err(TurnRuntimeBuildError::RuntimeKey)
 }

@@ -327,7 +327,7 @@ pub async fn run(workspace: &Path, turns: usize) -> Result<()> {
                 let provider: Arc<dyn crate::providers::Provider> = Arc::new(ParentModel {
                     inner: Arc::new(crate::providers::router::MockEnvProvider::from_env()),
                 });
-                let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+                let publication = crate::runtime::turn_publication::TurnPublication {
                     generation,
                     registry,
                     mcp_tool: None,

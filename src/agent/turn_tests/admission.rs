@@ -9,7 +9,8 @@ use crate::agent::turn_request::TurnDecision;
 use crate::decision_engine::prediction::factory::{BackendSpec, DecisionTransports};
 use crate::observability::causal_event::{CausalEvent, CausalEventSink};
 use crate::runtime::turn_context::AgentTurnKind;
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_publication::{PublicationInputs, build_publication};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::capability::catalog::CatalogSources;
@@ -78,8 +79,8 @@ enum FixtureOrigin {
 }
 
 pub(crate) struct AdmittedTurn {
-    service: Arc<TurnDecisionService>,
-    context: Arc<TurnDecisionContext>,
+    service: Arc<TurnRuntimeService>,
+    context: Arc<OpenedTurn>,
     proof: Box<dyn TurnSourceProof>,
     execution: Arc<ToolExecutionService>,
     execution_context: crate::tools::ToolExecutionContext,
@@ -412,7 +413,7 @@ impl AdmittedTurn {
         {
             panic!(
                 "mechanics fixture must genuinely reach Execute; budget={:?}",
-                admitted.context.engine().state.trusted.parts().budgets,
+                admitted.context.runtime().trusted.budgets,
             );
         }
         admitted
@@ -459,7 +460,7 @@ impl AdmittedTurn {
         {
             panic!(
                 "mechanics fixture must genuinely reach Execute; budget={:?}",
-                admitted.context.engine().state.trusted.parts().budgets,
+                admitted.context.runtime().trusted.budgets,
             );
         }
         admitted
@@ -621,7 +622,7 @@ impl AdmittedTurn {
             blocked: None,
         };
         let provider_catalog = crate::providers::catalog::CatalogView::from_config(&config);
-        let mut service = build_publication(
+        let service = build_publication(
             surface,
             PublicationInputs {
                 generation: Arc::clone(&generation),
@@ -653,10 +654,6 @@ impl AdmittedTurn {
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
         .expect("fixture loop runtime");
-        if ordinary_controlled {
-            TurnDecisionService::install_ordinary_child_fixture(&mut service, "delegate", "session")
-                .expect("unshared genuine ordinary parent service");
-        }
         if configured_native_tools.is_some() || ordinary_controlled {
             crate::runtime::turn_cleanup::current_tracker()
                 .expect("Answer fixture must have an actual cleanup owner")

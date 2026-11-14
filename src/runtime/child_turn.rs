@@ -2,20 +2,21 @@
 
 pub(in crate::runtime) mod segment_observation;
 
-use super::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use super::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
 use crate::agent::terminal::{
     TurnDeliveryIntent, TurnTerminalDraft, TurnTerminalReceipt, TurnTerminalStatus, TurnTerminalTelemetry,
 };
 use crate::agent::turn_contracts::{ToolLoopOutcome, ToolLoopRuntimeAdapter, ToolLoopTrace};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use anyhow::Context;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct ChildSegmentTurn {
-    service: Arc<TurnDecisionService>,
+    service: Arc<TurnRuntimeService>,
     proof: Arc<OwnedTurnSourceProof>,
-    decision: Arc<TurnDecisionContext>,
+    decision: Arc<OpenedTurn>,
     /// The segment turn's execution-owned runtime context (R26); the service
     /// and decision context stay until Part 2.
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
@@ -39,7 +40,7 @@ struct ChildTerminalAdmission {
 
 impl ChildSegmentTurn {
     pub(crate) async fn admit(
-        service: Arc<TurnDecisionService>,
+        service: Arc<TurnRuntimeService>,
         source: (Arc<OwnedTurnSourceProof>, crate::tools::ToolExecutionContext),
         fabric: crate::memory::MemoryFabric,
         config: Arc<crate::config::Config>,
@@ -116,9 +117,9 @@ impl ChildSegmentTurn {
     // intermediate guards outside the earlier admission poll frame.
     #[inline(never)]
     fn finish_admission(
-        service: Arc<TurnDecisionService>,
+        service: Arc<TurnRuntimeService>,
         proof: Arc<OwnedTurnSourceProof>,
-        decision: Arc<TurnDecisionContext>,
+        decision: Arc<OpenedTurn>,
         execution: crate::tools::ToolExecutionContext,
         admission: ChildTerminalAdmission,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,

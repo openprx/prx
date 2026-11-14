@@ -23,7 +23,7 @@ async fn decision_service_present_in_every_model_turn_build() {
             .await
             .expect("actual AgentLoop bootstrap");
         let service = context
-            .turn_decisions
+            .turn_service
             .as_ref()
             .expect("model-turn bootstrap must publish the decision service");
         assert_eq!(service.status().durable_key, enabled);

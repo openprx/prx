@@ -84,7 +84,7 @@ pub(crate) async fn drive_disabled_engine_channel_entry(workspace: &std::path::P
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: shared,
         config_generation: generation,
         channels_by_name: Arc::new(channels_by_name),
@@ -170,7 +170,7 @@ fn make_workspace() -> TempDir {
 /// seeded with `histories`, for exercising compact/clear in isolation.
 pub(super) fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
     ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(HashMap::new()),
@@ -475,7 +475,7 @@ fn channel_turn_probe_ctx(
     runtime_config.default_model = Some("test-model".to_string());
     let config_manager = crate::config::new_shared(runtime_config);
     Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: Arc::clone(&config_manager),
         config_generation: config_manager.pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -701,7 +701,7 @@ fn gate_test_ctx_with(
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
     Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -796,7 +796,7 @@ pub(crate) async fn drive_search_channel_entry(config: Config, input: &str) -> a
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: shared,
         config_generation: generation,
         channels_by_name: Arc::new(channels_by_name),

@@ -1,15 +1,33 @@
-#![cfg(test)]
-
 //! V4.05: raw language does not grant the whole registry. A scripted model
 //! supplies an exact catalog query; runtime still gates the returned offer.
 //! Turns open prediction-free: discovery happens only through the model's
 //! `capability_search` call, never through a decision step.
-use super::*;
+use crate::memory::Memory;
+use crate::providers::catalog::CatalogView as ProviderCatalogView;
+use crate::runtime::turn_context::{AgentTurnKind, OpenedTurn};
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::test_support::{CountingTransports, SilentEvents, sources};
+use crate::runtime::turn_publication::{PublicationInputs, build_publication};
+use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::SecurityPolicy;
+use crate::tools::capability::catalog::SurfacePolicy;
+use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::search_tool::{CapabilitySearchPort, CapabilitySearchTool, with_search_authority};
+use crate::tools::capability::turn_state::TurnSurfaceKind;
+use crate::tools::execution::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
+    TracingToolExecutionAudit,
+};
+use crate::tools::traits::{Tool, ToolResult};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Whether the turn's execution-owned published surface carries the named
 /// catalog capability.
-fn publishes(service: &TurnDecisionService, context: &TurnDecisionContext, name: &str) -> bool {
+fn publishes(service: &TurnRuntimeService, context: &OpenedTurn, name: &str) -> bool {
     service.catalog().entry_for_public_name(name).is_some_and(|entry| {
         context
             .execution_refs()
@@ -25,7 +43,7 @@ struct DiscoverySurfaceTool {
 
 #[tokio::test]
 async fn named_memory_recall_is_reached_by_search_without_publishing_peers() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         for excluded in [false, true] {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
@@ -287,7 +305,7 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
 
 #[tokio::test]
 async fn direct_native_write_can_discover_read_peers_through_search() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
@@ -438,9 +456,9 @@ async fn fixed_catalog_without_search_control_remains_valid() -> anyhow::Result<
 struct DiscoveryTurn {
     _workspace: tempfile::TempDir,
     memory: Arc<dyn Memory>,
-    service: Arc<TurnDecisionService>,
+    service: Arc<TurnRuntimeService>,
     proof: crate::runtime::turn_source::OwnedTurnSourceProof,
-    context: Arc<TurnDecisionContext>,
+    context: Arc<OpenedTurn>,
     dispatches: Arc<AtomicUsize>,
     transports: CountingTransports,
 }
@@ -647,7 +665,9 @@ async fn non_english_discovery_reaches_admitted_family_without_full_registry() {
                 assert!(proof.intercepts_writes());
                 assert!(
                     context
-                        .inherited_constraint_codes()
+                        .runtime()
+                        .trusted
+                        .constraints
                         .iter()
                         .any(|code| code.as_str() == "intercepts_writes")
                 );

@@ -1,23 +1,23 @@
 //! Decision publication belongs to the same immutable gateway generation as
 //! provider/model/tools. Initialization is shared by concurrent first turns.
-use crate::runtime::turn_decision::TurnDecisionService;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use std::sync::Arc;
 
-pub(super) struct GatewayDecisionSlot {
-    pub(super) controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
-    pub(super) cleanup: Arc<super::turn_source::CleanupTracker>,
-    service: tokio::sync::OnceCell<Arc<TurnDecisionService>>,
+pub(in crate::gateway) struct GatewayPublicationSlot {
+    pub(in crate::gateway) controlled: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
+    pub(in crate::gateway) cleanup: Arc<super::CleanupTracker>,
+    service: tokio::sync::OnceCell<Arc<TurnRuntimeService>>,
     security: Arc<crate::security::SecurityPolicy>,
     plugin_generation: u64,
     /// Set only for a targeted agent turn.
     targeted: Option<crate::runtime::turn_publication::TargetedSurface>,
 }
 
-impl GatewayDecisionSlot {
-    pub(super) fn new(security: Arc<crate::security::SecurityPolicy>, plugin_generation: u64) -> Self {
+impl GatewayPublicationSlot {
+    pub(in crate::gateway) fn new(security: Arc<crate::security::SecurityPolicy>, plugin_generation: u64) -> Self {
         Self {
             controlled: None,
-            cleanup: Arc::new(super::turn_source::CleanupTracker::default()),
+            cleanup: Arc::new(super::CleanupTracker::default()),
             service: tokio::sync::OnceCell::new(),
             security,
             plugin_generation,
@@ -28,7 +28,7 @@ impl GatewayDecisionSlot {
     /// A slot for one targeted agent turn: the same cleanup owner and
     /// generation as `self`, its own capped security policy and tool surface,
     /// and its own decision service (never the host's published one).
-    pub(super) fn targeted(
+    pub(in crate::gateway) fn targeted(
         &self,
         security: Arc<crate::security::SecurityPolicy>,
         surface: crate::runtime::turn_publication::TargetedSurface,
@@ -43,7 +43,7 @@ impl GatewayDecisionSlot {
         }
     }
 
-    pub(super) fn with_controlled(
+    pub(in crate::gateway) fn with_controlled(
         mut self,
         profile: Option<Arc<crate::runtime::h2_entry::ControlledH2Profile>>,
     ) -> Self {
@@ -51,17 +51,17 @@ impl GatewayDecisionSlot {
         self
     }
 
-    pub(super) async fn publish(
+    pub(in crate::gateway) async fn publish(
         &self,
-        runtime: &super::TurnRuntimeGeneration,
-        state: &super::AppState,
-    ) -> anyhow::Result<&Arc<TurnDecisionService>> {
+        runtime: &crate::gateway::TurnRuntimeGeneration,
+        state: &crate::gateway::AppState,
+    ) -> anyhow::Result<&Arc<TurnRuntimeService>> {
         if let Some(profile) = &self.controlled {
             profile.verify(&runtime.config_generation.effective)?;
         }
         self.service
             .get_or_try_init(|| async {
-                let service = crate::runtime::turn_publication::TurnDecisionPublication {
+                let service = crate::runtime::turn_publication::TurnPublication {
                     generation: Arc::clone(&runtime.config_generation),
                     registry: Arc::clone(&runtime.tools_registry),
                     mcp_tool: runtime.mcp_tool.clone(),
@@ -85,13 +85,13 @@ impl GatewayDecisionSlot {
 }
 
 #[cfg(test)]
-impl Default for GatewayDecisionSlot {
+impl Default for GatewayPublicationSlot {
     fn default() -> Self {
         Self::new(Arc::new(crate::security::SecurityPolicy::default()), 0)
     }
 }
 
-impl Drop for GatewayDecisionSlot {
+impl Drop for GatewayPublicationSlot {
     fn drop(&mut self) {
         let Some(service) = self.service.get().cloned() else {
             return;
@@ -117,6 +117,6 @@ impl Drop for GatewayDecisionSlot {
     }
 }
 
-pub(super) use crate::runtime::turn_terminal::TurnTerminalGuard as GatewayTerminalGuard;
+pub(in crate::gateway) use crate::runtime::turn_terminal::TurnTerminalGuard as GatewayTerminalGuard;
 
-pub(super) use crate::runtime::turn_terminal::commit_terminal;
+pub(in crate::gateway) use crate::runtime::turn_terminal::commit_terminal;

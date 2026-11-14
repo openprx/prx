@@ -328,7 +328,7 @@ async fn run_protocol_case(case: TestWorkerProtocolCase) -> anyhow::Result<Worke
         let tools_handle = spawn.tools_handle();
         let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(spawn)]);
         assert!(tools_handle.set(&registry));
-        let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+        let publication = crate::runtime::turn_publication::TurnPublication {
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
             mcp_tool: None,

@@ -4,7 +4,7 @@ pub(crate) mod restart_verify;
 pub(crate) mod settlement;
 pub(crate) mod silence;
 
-use crate::runtime::turn_decision::TurnDecisionService;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use anyhow::Context;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ impl TerminalUsageCollector {
     async fn record_with_recovery(
         &self,
         receipt: &crate::agent::terminal::TurnTerminalReceipt,
-        context: &crate::runtime::turn_decision::TurnDecisionContext,
+        context: &crate::runtime::turn_context::OpenedTurn,
         envelope: &crate::runtime::envelope::RuntimeEnvelope,
     ) -> anyhow::Result<()> {
         self.record(receipt)?;
@@ -234,7 +234,7 @@ struct ChildCleanupBarrier(tokio::sync::Mutex<ChildCleanupState>);
 /// outcome rejoin and the existing task recovery journal have all succeeded.
 pub(super) struct ConfirmedSegmentTerminal<'a> {
     receipt: &'a crate::agent::terminal::TurnTerminalReceipt,
-    context: &'a crate::runtime::turn_decision::TurnDecisionContext,
+    context: &'a crate::runtime::turn_context::OpenedTurn,
     envelope: &'a crate::runtime::envelope::RuntimeEnvelope,
 }
 impl<'a> ConfirmedSegmentTerminal<'a> {
@@ -242,7 +242,7 @@ impl<'a> ConfirmedSegmentTerminal<'a> {
         self,
     ) -> (
         &'a crate::agent::terminal::TurnTerminalReceipt,
-        &'a crate::runtime::turn_decision::TurnDecisionContext,
+        &'a crate::runtime::turn_context::OpenedTurn,
         &'a crate::runtime::envelope::RuntimeEnvelope,
     ) {
         (self.receipt, self.context, self.envelope)
@@ -275,7 +275,7 @@ pub(crate) struct TurnTerminalGuard {
     cleanup_ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
     usage_collector: Option<Arc<TerminalUsageCollector>>,
     cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
-    context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    context: Arc<crate::runtime::turn_context::OpenedTurn>,
     binding: crate::agent::terminal::TerminalBinding,
     fabric: crate::memory::MemoryFabric,
     config: Arc<crate::config::Config>,
@@ -298,8 +298,8 @@ struct TerminalState {
 impl TurnTerminalGuard {
     pub(crate) fn new(
         cleanup_ticket: crate::runtime::turn_cleanup::CleanupTicket,
-        service: Arc<TurnDecisionService>,
-        context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+        service: Arc<TurnRuntimeService>,
+        context: Arc<crate::runtime::turn_context::OpenedTurn>,
         fabric: crate::memory::MemoryFabric,
         config: Arc<crate::config::Config>,
         envelope: crate::runtime::envelope::RuntimeEnvelope,

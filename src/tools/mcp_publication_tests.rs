@@ -54,7 +54,7 @@ async fn cold_mcp_publication_survives_first_selected_tool_refresh() {
     );
     let mcp = result.mcp_tool.expect("production MCP metadata owner");
     assert!(mcp.capability_snapshot().is_empty(), "cold registry");
-    let service = crate::runtime::turn_publication::TurnDecisionPublication {
+    let service = crate::runtime::turn_publication::TurnPublication {
         generation: crate::config::new_shared(config.clone()).pin(),
         registry: Arc::new(result.tools),
         mcp_tool: Some(Arc::clone(&mcp)),

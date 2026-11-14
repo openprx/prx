@@ -272,7 +272,7 @@ async fn offered_tools_for(
     )
     .await;
     let routing = admitted.binding.decision_routing().expect("tiering routing");
-    let audit = format!("{:?}", routing.context.engine().state.trusted.parts().budgets);
+    let audit = format!("{:?}", routing.context.runtime().trusted.budgets);
     assert!(
         admitted
             .binding
@@ -353,7 +353,7 @@ async fn plain_answer_offers_for(
     )
     .await;
     let decision = admitted.binding.decision_routing().expect("plain turn decision");
-    let has_child_manifest = decision.context.engine().outgoing_child.is_some();
+    let has_child_manifest = decision.context.runtime().outgoing_delegation.is_some();
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     drive_start_turn_stream(
         Some(admitted.binding),

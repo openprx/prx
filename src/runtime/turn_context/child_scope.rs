@@ -1,19 +1,31 @@
-//! Construct the ordinary outgoing child scope from exact mentions or admitted discoveries.
-use super::{
-    Arc, CapabilityRef, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService, TurnSourceProof,
-};
-use super::{
-    BTreeSet, CapabilityAvailabilityLevel, CatalogView, CausalState, DecisionId, DiscoveredRefs, TurnSurfaceKind,
-};
-use crate::tools::capability::child::AuthorityEnvelope;
-use crate::tools::capability::child::CapabilityConstraints;
+//! Construct the ordinary outgoing child scope of a turn from its exact
+//! mentions and the sealed parent set.
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use anyhow::Context;
+
+use super::OpenedTurn;
+use crate::capability::CapabilityAvailabilityLevel;
+use crate::decision_engine::state::RawRoutingInput;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_source::TurnSourceProof;
+use crate::security::decision_id::DecisionId;
+use crate::security::{AutonomyLevel, SecurityPolicy};
+use crate::tools::capability::catalog::{CatalogView, Exposure};
+use crate::tools::capability::child::{AuthorityEnvelope, CapabilityConstraints};
+use crate::tools::capability::contract::CapabilityRef;
+use crate::tools::capability::turn_state::{SideEffectMode, TrustedParts, TurnSurfaceKind};
+
+/// The sealed parent authority and the requested strict subset of one
+/// outgoing child, before the manifest is derived.
 pub(super) struct OutgoingDelegation {
-    pub parent: CapabilityConstraints,
-    pub requested: Vec<CapabilityRef>,
+    pub(super) parent: CapabilityConstraints,
+    pub(super) requested: Vec<CapabilityRef>,
 }
 
-impl TurnDecisionService {
+impl TurnRuntimeService {
     pub(super) fn configured_delegation_target(&self, proof: &dyn TurnSourceProof) -> Option<&'static str> {
         let task = &self.generation.effective.task_routing;
         if proof.surface() != TurnSurfaceKind::AgentLoop
@@ -37,7 +49,7 @@ impl TurnDecisionService {
     /// separately before reconstructing its ordinary source.
     pub(super) fn verified_delegation_scope(
         &self,
-        context: &TurnDecisionContext,
+        context: &OpenedTurn,
     ) -> anyhow::Result<crate::tools::capability::child::VerifiedChildScope> {
         anyhow::ensure!(
             !context.runtime().execution_closed.load(Ordering::Acquire)
@@ -94,16 +106,14 @@ impl TurnDecisionService {
     pub(super) fn outgoing_delegation(
         &self,
         proof: &dyn TurnSourceProof,
-        state: &CausalState,
+        trusted: &TrustedParts,
+        routing_input: &RawRoutingInput,
         decision_id: DecisionId,
-        discovered: &DiscoveredRefs,
         catalog: &CatalogView<'_>,
     ) -> Option<OutgoingDelegation> {
-        // Ordinary turns without a discovery or an exact delegator name
-        // keep the allocation-free absence path; never scan the catalog.
-        // Every child carries the strict subset through an ordinary child
-        // publication.
-        let trusted = state.trusted.parts();
+        // Ordinary turns without an exact delegator name keep the
+        // allocation-free absence path; never scan the catalog. Every child
+        // carries the strict subset through an ordinary child publication.
         let permitted = |entry: &crate::tools::capability::catalog::CapabilityEntry| {
             catalog.contains(&entry.id)
                 && entry.generation == trusted.catalog_generation
@@ -132,27 +142,23 @@ impl TurnDecisionService {
                 .catalog
                 .entry_for_public_name("sessions_spawn")
                 .is_some_and(|entry| entry.supports_metadata_discovery() && permitted(entry));
-        let direct = if discovered.iter().next().is_none() {
-            let input = state.routing_input.as_str();
-            // This proposal comes from the pinned configuration of a sealed
-            // embedded source, not from synthetic text or operator identity.
-            let configured = self.configured_delegation_target(proof).is_some();
-            let names_delegator = configured
-                || input
-                    .split(|character: char| !character.is_alphanumeric() && character != '_')
-                    .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
-            if !names_delegator && !direct_delegator && !deferred_chat_delegator {
-                return None;
-            }
-            if names_delegator {
-                crate::tools::capability::search::CatalogSearch::exact_mentions(
-                    catalog,
-                    input,
-                    usize::from(self.generation.effective.causal_tree.policy.max_candidates),
-                )?
-            } else {
-                Vec::new()
-            }
+        let input = routing_input.as_str();
+        // This proposal comes from the pinned configuration of a sealed
+        // embedded source, not from synthetic text or operator identity.
+        let configured = self.configured_delegation_target(proof).is_some();
+        let names_delegator = configured
+            || input
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
+        if !names_delegator && !direct_delegator && !deferred_chat_delegator {
+            return None;
+        }
+        let direct = if names_delegator {
+            crate::tools::capability::search::CatalogSearch::exact_mentions(
+                catalog,
+                input,
+                usize::from(self.generation.effective.causal_tree.policy.max_candidates),
+            )?
         } else {
             Vec::new()
         };
@@ -214,16 +220,15 @@ impl TurnDecisionService {
             return None;
         }
         let mut requested = Vec::new();
-        let references = discovered.iter().cloned().chain(
-            direct.into_iter()
-                // The named parent entrypoint is not itself requested work.
-                .filter(|entry| !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn"))
-                .map(|entry| CapabilityRef {
-                    id: entry.id.clone(),
-                    fingerprint: entry.fingerprint,
-                    generation: entry.generation,
-                }),
-        );
+        let references = direct
+            .into_iter()
+            // The named parent entrypoint is not itself requested work.
+            .filter(|entry| !matches!(entry.public_name.as_str(), "delegate" | "sessions_spawn"))
+            .map(|entry| CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            });
         for reference in references {
             let entry = catalog.entry_any(&reference.id)?;
             if !permitted(entry)
@@ -239,8 +244,8 @@ impl TurnDecisionService {
             } else {
                 allowed.insert(reference.clone());
             }
-            // A discovered delegation capability may be passed onward, but
-            // only if the complete request still strictly narrows the parent.
+            // A delegation capability may be passed onward, but only if the
+            // complete request still strictly narrows the parent.
             requested.push(reference);
         }
         // A model-only child requests no tools. The empty set is a strict
@@ -257,8 +262,8 @@ impl TurnDecisionService {
         let max_cost_cents = u32::try_from(trusted.budgets.micro_usd / 10_000)
             .unwrap_or(u32::MAX)
             .min(self.security.max_cost_per_day_cents);
-        let level = if trusted.side_effect_mode == crate::tools::capability::turn_state::SideEffectMode::ReadOnly {
-            crate::security::AutonomyLevel::ReadOnly
+        let level = if trusted.side_effect_mode == SideEffectMode::ReadOnly {
+            AutonomyLevel::ReadOnly
         } else {
             self.security.autonomy
         };
@@ -285,14 +290,29 @@ impl TurnDecisionService {
         };
         // Retaining the exact inherited authority must not bypass a tighter
         // current policy or the remaining turn allowance.
-        if !crate::causal_tree::decision_engine::authority_within_policy(
-            &parent,
-            trusted,
-            &self.security,
-            parent.authority.remaining_depth,
-        ) {
+        if !authority_within_policy(&parent, trusted, &self.security, parent.authority.remaining_depth) {
             return None;
         }
         Some(OutgoingDelegation { parent, requested })
     }
+}
+
+/// The sealed parent authority stays within the current policy and the
+/// remaining turn allowance.
+fn authority_within_policy(
+    parent: &CapabilityConstraints,
+    trusted: &TrustedParts,
+    policy: &SecurityPolicy,
+    max_depth: u8,
+) -> bool {
+    let level_allowed = match policy.autonomy {
+        AutonomyLevel::ReadOnly => parent.authority.level == AutonomyLevel::ReadOnly,
+        AutonomyLevel::Supervised => parent.authority.level != AutonomyLevel::Full,
+        AutonomyLevel::Full => true,
+    };
+    level_allowed
+        && (trusted.side_effect_mode != SideEffectMode::ReadOnly || parent.authority.level == AutonomyLevel::ReadOnly)
+        && parent.authority.max_cost_cents <= policy.max_cost_per_day_cents
+        && u64::from(parent.authority.max_cost_cents).saturating_mul(10_000) <= trusted.budgets.micro_usd
+        && parent.authority.remaining_depth <= max_depth
 }

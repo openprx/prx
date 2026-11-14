@@ -80,7 +80,7 @@ pub(super) fn cycle_with_schedule(
 
 #[tokio::test]
 async fn instruction_cycle_runs_actual_four_probes_three_edits_then_independent_validation() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -191,7 +191,7 @@ async fn instruction_cycle_checks_all_operations_before_first_send() -> Result<(
 
 #[tokio::test]
 async fn instruction_cycle_retains_baseline_on_ties_and_rejects_harmful_composition() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         for mode in [1, 2] {
             let f = fixture();
             let pattern = usable_pattern(&f);
@@ -259,7 +259,7 @@ async fn instruction_cycle_retains_baseline_on_ties_and_rejects_harmful_composit
 
 #[tokio::test]
 async fn instruction_cycle_cannot_compose_from_changed_probe_evidence() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

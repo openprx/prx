@@ -551,7 +551,7 @@ mod tests {
         )
         .await;
         let routing = admitted.binding.decision_routing().expect("stream fixture routing");
-        let audit = format!("{:?}", routing.context.engine().state.trusted.parts().budgets);
+        let audit = format!("{:?}", routing.context.runtime().trusted.budgets);
         assert!(
             admitted
                 .binding

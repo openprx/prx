@@ -696,7 +696,7 @@ mod tests {
                     assert_eq!(registry.first().expect("one spawn tool").name(), "sessions_spawn");
                     let runtime = crate::gateway::TurnRuntimeGeneration {
                         provider_binding:Some(Arc::new(crate::gateway::turn_source::GatewayProviderBinding::new(Arc::clone(&provider), resolved))),
-                        decision_slot:Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::new(Arc::clone(&security), 0)),
+                        publication_slot:Arc::new(crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::new(Arc::clone(&security), 0)),
                         config_generation:Arc::clone(&generation), provider:Arc::clone(&provider),
                         model:"prx-gateway-parent".to_owned(), temperature:0.0, tools_registry:Arc::clone(&registry), mcp_tool:None,
                     };
@@ -727,7 +727,7 @@ mod tests {
                         memory.as_ref(), &generation, &envelope, input, &event,
                     ).await?;
                     let proof = receipt.bind(&runtime, &fabric_context)?;
-                    let service = crate::runtime::turn_publication::TurnDecisionPublication {
+                    let service = crate::runtime::turn_publication::TurnPublication {
                         generation:Arc::clone(&generation), registry:Arc::clone(&registry), mcp_tool:None,
                         security, observer:Arc::new(NoopObserver), hooks:Arc::new(HookManager::new(workspace.to_path_buf())),
                         memory:Arc::clone(&memory), plugin_generation:0,
@@ -736,10 +736,10 @@ mod tests {
                     let context = service.open_issued_turn_context(&proof, crate::runtime::turn_context::AgentTurnKind::SingleShot, &cancellation).await?;
                     assert!(
                         context
-                            .engine()
-                            .outgoing_child
+                            .runtime()
+                            .outgoing_delegation
                             .as_ref()
-                            .is_some_and(|manifest| manifest.allowed.is_empty()),
+                            .is_some_and(|outgoing| outgoing.manifest.allowed.is_empty()),
                         "the answer surface must retain the actual model-only child grant"
                     );
                     let specs = service.agent_execution_specs(&proof, &context)?;

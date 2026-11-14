@@ -3412,7 +3412,7 @@ pub(crate) mod tests {
                     published.specs.iter().map(|spec| &spec.name).collect::<Vec<_>>()
                 );
                 assert!(
-                    decision.context.engine().outgoing_child.is_some(),
+                    decision.context.runtime().outgoing_delegation.is_some(),
                     "configured parent must seal an outgoing child manifest"
                 );
             }

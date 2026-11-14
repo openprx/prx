@@ -1,8 +1,8 @@
-//! Execution-owned admission facts of one turn.
+//! Execution-owned publication facts of one turn.
 //!
-//! The hard-gate inputs other than state and catalog, captured once when the
-//! turn opens: actor-scoped policy facts (G4), model facts and the inherited
-//! child scope. Approval evidence is not a fact.
+//! The publication inputs other than the trusted state and the catalog,
+//! captured once when the turn opens: actor-scoped policy facts, model facts
+//! and the inherited child scope. Approval evidence is not a fact.
 //! Owned, read-only and cheap to clone; no interior mutability.
 
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityMani
 use crate::tools::capability::contract::CapabilityId;
 
 #[derive(Clone)]
-pub(crate) struct AdmissionFactsV1 {
+pub(crate) struct PublicationFacts {
     pub(crate) policy: Arc<SecurityPolicy>,
     pub(crate) owner_id: Arc<str>,
     /// The exact actor the execution service uses for policy.
@@ -38,8 +38,8 @@ pub(crate) struct AdmissionFactsV1 {
     pub(crate) child_served: Option<Arc<BTreeSet<CapabilityId>>>,
 }
 
-impl AdmissionFactsV1 {
-    /// The inherited child scope in the borrowed shape the gates read.
+impl PublicationFacts {
+    /// The inherited child scope in borrowed shape.
     pub(crate) fn child_scope(&self) -> Option<(&ChildCapabilityManifest, &CapabilityConstraints)> {
         self.child_scope
             .as_ref()

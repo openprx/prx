@@ -1,5 +1,5 @@
 //! Runtime-owned lifecycle for terminal writes across immutable generations.
-use crate::runtime::turn_decision::TurnDecisionService;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ struct State {
     failed: bool,
     next_id: u64,
     pending: BTreeMap<u64, CancellationToken>,
-    services: Vec<Arc<TurnDecisionService>>,
+    services: Vec<Arc<TurnRuntimeService>>,
     recovery_scopes: Vec<Arc<super::ingress_recovery::RecoveryScope>>,
     ingress_monitors: Vec<IngressMonitor>,
     ingress_lifetimes: BTreeMap<String, Arc<dyn crate::memory::ingress_recovery::IngressLifetime>>,
@@ -141,32 +141,28 @@ impl CleanupTracker {
         }
     }
 
-    pub(crate) fn retain_service(&self, service: Arc<TurnDecisionService>) {
+    pub(crate) fn retain_service(&self, service: Arc<TurnRuntimeService>) {
         let mut state = self.state.lock();
         Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
-        if service.has_decision_work() {
-            state.services.push(service);
-        }
+        state.services.push(service);
     }
 
     /// Child publication must finish before its owner starts draining. Keeping
     /// this check and retention under one lock closes the drain snapshot race.
-    pub(crate) fn retain_child_service(&self, service: Arc<TurnDecisionService>) -> anyhow::Result<()> {
+    pub(crate) fn retain_child_service(&self, service: Arc<TurnRuntimeService>) -> anyhow::Result<()> {
         let mut state = self.state.lock();
         anyhow::ensure!(
             !state.closed && !state.failed,
             "child decision publication owner is closed or has unconfirmed failures"
         );
         Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
-        if service.has_decision_work() {
-            state.services.push(service);
-        }
+        state.services.push(service);
         Ok(())
     }
 
     // Retiring a generation transfers its queue ownership into a tracked task
     // atomically, so shutdown cannot observe a gap between the two owners.
-    pub(crate) fn retire(self: &Arc<Self>, service: &Arc<TurnDecisionService>) -> anyhow::Result<CleanupTicket> {
+    pub(crate) fn retire(self: &Arc<Self>, service: &Arc<TurnRuntimeService>) -> anyhow::Result<CleanupTicket> {
         let mut state = self.state.lock();
         let ticket = self.register_locked(&mut state, CancellationToken::new())?;
         state.services.retain(|retained| !Arc::ptr_eq(retained, service));
@@ -214,12 +210,9 @@ impl CleanupTracker {
         let mut queues_drained = true;
         for service in services {
             #[cfg(test)]
-            let drained = self
-                .diagnostic
-                .scope(service.drain_decision_work(deadline.into_std()))
-                .await;
+            let drained = self.diagnostic.scope(service.drain_advisory(deadline.into_std())).await;
             #[cfg(not(test))]
-            let drained = service.drain_decision_work(deadline.into_std()).await;
+            let drained = service.drain_advisory(deadline.into_std()).await;
             queues_drained &= drained;
             #[cfg(test)]
             self.diagnostic

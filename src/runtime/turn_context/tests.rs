@@ -2,6 +2,11 @@
 //! parameters, the pinned provider catalog, the G6 budget and the recursive
 //! money without a decision service.
 
+mod discovery_surface;
+mod execution_binding;
+mod publication_scope;
+mod skill_receipts;
+
 use super::*;
 use crate::agent::test_admission::AdmittedTurn;
 use crate::cost::decision_attempt::{DecisionAttemptReceipt, DecisionUsage};
@@ -27,7 +32,7 @@ fn priced_config(workspace: &std::path::Path) -> crate::config::Config {
     config
 }
 
-/// The value `TurnDecisionContext::remaining_g6_tokens` returned before the
+/// The value `OpenedTurn::remaining_g6_tokens` returned before the
 /// move: the opening slice of the decision's trusted state narrowed by the
 /// accounting scope.
 fn pre_move_remaining_g6_tokens(runtime: &TurnRuntimeContext) -> u64 {
@@ -171,11 +176,11 @@ async fn rehomed_security_items_preserve_refusal() -> anyhow::Result<()> {
     // for a context another publication opened.
     assert!(matches!(
         one.service.terminal_binding(two.context),
-        Err(crate::runtime::turn_decision::SettlementRefUnavailable)
+        Err(crate::runtime::turn_publication::service::SettlementRefUnavailable)
     ));
     assert!(matches!(
         two.service.terminal_binding(one.context),
-        Err(crate::runtime::turn_decision::SettlementRefUnavailable)
+        Err(crate::runtime::turn_publication::service::SettlementRefUnavailable)
     ));
     Ok(())
 }

@@ -30,7 +30,7 @@ fn choice(journal: &ExperimentJournal, name: &str) -> Option<String> {
 
 #[tokio::test]
 async fn refinement_sequential_carries_exact_parent_and_retains_it_on_tie() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -134,7 +134,7 @@ async fn refinement_sequential_carries_exact_parent_and_retains_it_on_tie() -> R
 
 #[tokio::test]
 async fn refinement_round_two_replays_ordered_parent_patch_and_description_exactly() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -275,7 +275,7 @@ async fn refinement_round_two_replays_ordered_parent_patch_and_description_exact
 
 #[tokio::test]
 async fn refinement_parent_context_omits_assets_while_replay_preserves_the_complete_bundle() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         const SCRIPT: &[u8] = b"#!/bin/sh\n# C04-SCRIPT-CONTENT-MARKER\nexit 0\n";
         const REFERENCE: &[u8] = b"# C04-REFERENCE-CONTENT-MARKER\n";
         const BINARY: &[u8] = b"\xff\x00C04-BINARY-CONTENT-MARKER\xfe";
@@ -400,7 +400,7 @@ async fn refinement_parent_context_omits_assets_while_replay_preserves_the_compl
 
 #[tokio::test]
 async fn refinement_parent_relative_and_aggregate_over_budget_programs_remain_refused() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         for (mode, failure) in [
             (7, ProposalFailureKind::PatchNotApplicable),
             (8, ProposalFailureKind::EditBudgetExceeded),
@@ -478,7 +478,7 @@ async fn refinement_parent_relative_and_aggregate_over_budget_programs_remain_re
 
 #[tokio::test]
 async fn refinement_neutral_first_round_stops_without_round_two_or_validation() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -529,7 +529,7 @@ async fn refinement_neutral_first_round_stops_without_round_two_or_validation() 
 
 #[tokio::test]
 async fn refinement_parallel_runs_two_owned_branches_with_shared_baseline_and_one_final_validation() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -615,7 +615,7 @@ async fn refinement_parallel_runs_two_owned_branches_with_shared_baseline_and_on
 
 #[tokio::test]
 async fn refinement_parallel_cancel_drains_both_owners_and_recovery_sends_nothing() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -674,7 +674,7 @@ async fn refinement_parallel_cancel_drains_both_owners_and_recovery_sends_nothin
 
 #[tokio::test]
 async fn refinement_parallel_branch_failure_cancels_and_joins_sibling_without_retry() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -727,7 +727,7 @@ async fn refinement_parallel_branch_failure_cancels_and_joins_sibling_without_re
 
 #[tokio::test]
 async fn refinement_dropped_plan_waiter_preserves_both_owned_unknown_receipts() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -821,7 +821,7 @@ async fn refinement_planning_checks_each_aggregate_resource_and_legacy_operation
 
 #[tokio::test]
 async fn refinement_rejects_changed_selected_parent_before_round_two_dispatch() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

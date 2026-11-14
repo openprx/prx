@@ -471,11 +471,18 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         .last()
         .expect("test: unrecorded claim");
     let value: serde_json::Value = serde_json::from_str(&last).expect("test: unrecorded json");
-    assert!(
-        value.get("decision_id").is_none(),
-        "unrecorded claim has no decision_id"
+    let mut keys = value
+        .as_object()
+        .expect("test: claim object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["recovery_key_id", "semantic", "semantic_mac_v3", "terminal_id"],
+        "the claim carries only its closed schema (no decision id, no legacy MAC)"
     );
-    assert!(value.get("semantic_mac_v2").is_none(), "unrecorded claim has no v2 MAC");
     assert!(
         value
             .get("semantic_mac_v3")
@@ -739,7 +746,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         MemoryFabric,
         crate::agent::terminal::TurnTerminalDraft,
         CostConfig,
-        Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     ) {
         let (dir, workspace) = home_workspace();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).expect("test: open recovery database"));

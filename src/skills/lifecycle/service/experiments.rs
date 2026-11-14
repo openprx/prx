@@ -335,8 +335,6 @@ impl SkillsLifecycleService {
             }
             run.await
         };
-        #[cfg(test)]
-        let worker = crate::runtime::turn_decision::with_inherited_scored_prediction(worker);
         tokio::spawn(worker).await.context("experiment stage worker failed")?
     }
     async fn run_experiment_stage_owned(

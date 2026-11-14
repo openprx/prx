@@ -360,7 +360,7 @@ async fn operator_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> a
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let result = cleanup
         .scope(Box::pin(async {
-            let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+            let publication = crate::runtime::turn_publication::TurnPublication {
                 generation: Arc::clone(&generation),
                 registry: Arc::clone(&registry),
                 mcp_tool: None,
@@ -540,7 +540,7 @@ async fn operator_task_cells(
 }
 
 #[tokio::test]
-async fn child_publication_survives_without_turn_decision_service() -> anyhow::Result<()> {
+async fn child_publication_survives_without_a_turn_runtime_service() -> anyhow::Result<()> {
     for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
         ordinary_case(level, &tempfile::tempdir()?)
             .await

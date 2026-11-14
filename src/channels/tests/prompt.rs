@@ -646,7 +646,7 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
     let config_manager = crate::config::new_shared(runtime_config);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: Arc::clone(&config_manager),
         config_generation: config_manager.pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -760,7 +760,7 @@ async fn process_channel_message_answers_plain_turn_with_scoped_recall_without_s
     let provider_impl = Arc::new(HistoryCaptureProvider::default());
     let memory = Arc::new(RecallMemory::default());
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -876,7 +876,7 @@ async fn assert_channel_dm_autosave_excludes_live_input(record_user_messages: bo
     config.default_model = Some("test-model".into());
     let config = crate::config::new_shared(config);
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: config.clone(),
         config_generation: config.pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -979,7 +979,7 @@ async fn process_channel_message_telegram_keeps_system_instruction_at_top_only()
     );
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),

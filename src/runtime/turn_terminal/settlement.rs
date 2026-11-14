@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::agent::terminal::TerminalBinding;
-use crate::runtime::turn_decision::{SettlementRefUnavailable, TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::SettlementRefUnavailable;
 
 /// Only this module can authorize construction of a terminal binding.
 pub(crate) struct SettlementIssueToken(());
@@ -13,8 +15,8 @@ pub(crate) struct SettlementIssueToken(());
 /// configuration of the pinned generation, the turn memory, and the incoming
 /// child grant or operator parent of the publication.
 pub(crate) fn terminal_binding(
-    service: &TurnDecisionService,
-    context: &TurnDecisionContext,
+    service: &TurnRuntimeService,
+    context: &OpenedTurn,
 ) -> Result<TerminalBinding, SettlementRefUnavailable> {
     if context.service_id != service.service_id {
         return Err(SettlementRefUnavailable);

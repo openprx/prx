@@ -30,7 +30,7 @@ use super::turn_failure::{classify_turn_failure, turn_error_id, turn_failure_not
 use super::{
     Arc, CancellationToken, Channel, ChannelRouteSelection, ChannelRuntimeContext, ChatKind, ChatMessage,
     DocumentIngestRuntime, Instant, MemoryFabric, MemoryWriteContext, Result, SIGNAL_IMAGE_UNCERTAINTY_FALLBACK,
-    ScopeContext, SendMessage, decision_turn, memory, pre_gate, providers, traits, truncate_with_ellipsis, turn_source,
+    ScopeContext, SendMessage, memory, pre_gate, providers, traits, truncate_with_ellipsis, turn_source,
 };
 
 /// Authenticated pending approval id returned by the execution ledger.
@@ -514,7 +514,7 @@ pub(super) async fn run_channel_turn(
         (recent_context, heuristic)
     });
 
-    let mut decision_turn = match decision_turn::ChannelDecisionTurn::admit(
+    let mut decision_turn = match turn_source::admitted_turn::ChannelAdmittedTurn::admit(
         ctx.as_ref(),
         &channel_source,
         &config_generation,

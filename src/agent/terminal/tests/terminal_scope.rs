@@ -1,7 +1,23 @@
-#![cfg(test)]
-#![allow(clippy::expect_used)]
-
-use super::*;
+use crate::memory::{Memory, MemoryFabric};
+use crate::observability::causal_event::testing::RecordingSink;
+use crate::providers::catalog::CatalogView as ProviderCatalogView;
+use crate::runtime::turn_context::AgentTurnKind;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::test_support::{CountingTransports, sources};
+use crate::runtime::turn_publication::{PublicationInputs, build_publication};
+use crate::security::SecurityPolicy;
+use crate::tools::capability::catalog::SurfacePolicy;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
+use crate::tools::execution::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
+    TracingToolExecutionAudit,
+};
+use crate::tools::traits::{Tool, ToolResult};
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 struct DriftingCatalogTool {
     changed: Arc<AtomicBool>,
@@ -36,8 +52,8 @@ struct LinkedFixture {
     workspace: tempfile::TempDir,
     config: crate::config::Config,
     memory: Arc<dyn Memory>,
-    service: Arc<TurnDecisionService>,
-    proof: AgentTurnProof,
+    service: Arc<TurnRuntimeService>,
+    proof: crate::agent::entry::AgentTurnProof,
     commit: crate::agent::terminal::TurnTerminalDraft,
     transports: CountingTransports,
     dispatches: Arc<AtomicUsize>,
@@ -125,7 +141,7 @@ impl LinkedFixture {
         );
         let trace = context.runtime().execution_trace.get_or_init(Default::default);
         trace
-            .bind_exact_call_key(Arc::clone(&service.state_key))
+            .bind_exact_call_key(Arc::clone(&context.runtime().state_key))
             .expect("serving trace binds the decision key");
         trace
             .begin_provider()

@@ -119,7 +119,7 @@ fn no_oracle_feedback<T: serde::Serialize>(value: &T, plan: &StudyPlan) -> Resul
 
 #[tokio::test]
 async fn v01_loopback_keeps_original_owner_denominator_private_oracles_and_sealed_physical_evidence() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let server = Server::start_mode(false, Some(false)).await?;
         let result = async {

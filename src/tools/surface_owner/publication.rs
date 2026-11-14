@@ -16,11 +16,11 @@ use std::collections::BTreeSet;
 
 use crate::capability::CapabilityAvailabilityLevel;
 use crate::security::AutonomyLevel;
-use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
 use crate::tools::capability::contract::{CapabilityRef, CostEstimate, SideEffectClass};
 use crate::tools::capability::turn_state::{SideEffectMode, TrustedParts, TurnSurfaceKind};
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
+use crate::tools::surface_owner::facts::PublicationFacts;
 
 /// The publication outcome of one capability. `ApprovalRequired` is never
 /// executable publication; it may only be retained as a pending admission.
@@ -57,7 +57,7 @@ pub(crate) fn is_delegator(public_name: &str) -> bool {
 /// One turn's publication rules over its pinned scope and facts.
 pub(crate) struct PublicationRules<'a, 'c> {
     pub(crate) trusted: &'a TrustedParts,
-    pub(crate) facts: &'a AdmissionFactsV1,
+    pub(crate) facts: &'a PublicationFacts,
     pub(crate) catalog: &'a CatalogView<'c>,
 }
 

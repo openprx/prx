@@ -253,7 +253,7 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
         crate::runtime::turn_cleanup::CleanupScope::new(Some(&owner), tokio_util::sync::CancellationToken::new())?;
     let result = driver
         .run(scope.run(Box::pin(async {
-            let publication = crate::runtime::turn_publication::TurnDecisionPublication {
+            let publication = crate::runtime::turn_publication::TurnPublication {
                 generation: generation.clone(),
                 registry: registry.clone(),
                 mcp_tool: None,

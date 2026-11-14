@@ -1,14 +1,44 @@
-#![cfg(test)]
-
 //! Finding 84: the production sources of the skill lifecycle receipts. A turn
 //! that selects a managed skill leaves a selection receipt in its experience;
 //! restart recovery completes the experience with only the facts it can verify.
-use super::*;
+use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::cost::decision_attempt::BackendIdentity;
+use crate::cost::decision_attempt::error::DecisionError;
+use crate::decision_engine::prediction::backend::DecisionBackend;
+use crate::decision_engine::prediction::builtin::BuiltinDecisionBackend;
+use crate::decision_engine::prediction::factory::{DecisionBackendFactory, SlotLimits};
+use crate::decision_engine::prediction::outbound::{GuardedBody, OutboundSecrets};
+use crate::decision_engine::prediction::protocol::{
+    DecisionAnswer, DecisionRequest, DecisionResponse, GlobalQuestion, Probability, QuestionId,
+};
+use crate::decision_engine::prediction::validate::ModelVersionPolicy;
+use crate::memory::Memory;
+use crate::providers::catalog::CatalogView as ProviderCatalogView;
+use crate::runtime::turn_context::{AgentTurnKind, OpenedTurn};
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::test_support::{
+    CountingTransports, SilentEvents, agent_service_with_memory, rejoin_terminal, sources,
+};
+use crate::runtime::turn_publication::{PublicationInputs, build_publication};
+use crate::security::SecurityPolicy;
 use crate::skills::lifecycle::{
     Bundle, BundleEntry, Correlation, ExperienceOutcome, OwnerScope, SkillId, SkillLifecycleStore, SourceKind,
     test_support::publish_revision,
 };
+use crate::tools::capability::catalog::SurfacePolicy;
+use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::search_tool::CapabilitySearchTool;
+use crate::tools::capability::turn_state::TurnSurfaceKind;
+use crate::tools::execution::{
+    AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, ToolExecutionService,
+    TracingToolExecutionAudit,
+};
+use crate::tools::traits::{Tool, ToolResult};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 const SKILL_NAME: &str = "prx_skill";
 
@@ -160,9 +190,9 @@ fn base_config(workspace: &std::path::Path) -> crate::config::Config {
 
 struct SelectedSkillTurn {
     workspace: tempfile::TempDir,
-    service: Arc<TurnDecisionService>,
+    service: Arc<TurnRuntimeService>,
     proof: crate::agent::entry::AgentTurnProof,
-    context: Arc<TurnDecisionContext>,
+    context: Arc<OpenedTurn>,
 }
 
 /// A real turn whose discovery selects and admits the workspace skill `prx_skill`.
@@ -363,7 +393,7 @@ async fn crashed_after_marker(
     terminal_id: &str,
     input: &str,
     kind: AgentTurnKind,
-) -> (tempfile::TempDir, Arc<TurnDecisionService>, String, String) {
+) -> (tempfile::TempDir, Arc<TurnRuntimeService>, String, String) {
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
@@ -469,8 +499,7 @@ async fn rejoin_of_a_verified_recovered_completion_joins_the_terminal_once() {
             .is_none()
     );
 
-    service
-        .rejoin_terminal("rejoin-unknown-1", &owner)
+    rejoin_terminal(&service, "rejoin-unknown-1", &owner)
         .await
         .expect("test: rejoin");
     crate::skills::lifecycle::drain_background_for_test("rejoin-unknown-1").await;
@@ -490,8 +519,7 @@ async fn rejoin_of_a_verified_recovered_completion_joins_the_terminal_once() {
     );
 
     // A double rejoin keeps the first join.
-    service
-        .rejoin_terminal("rejoin-unknown-1", &owner)
+    rejoin_terminal(&service, "rejoin-unknown-1", &owner)
         .await
         .expect("test: second rejoin");
     crate::skills::lifecycle::drain_background_for_test("rejoin-unknown-1").await;
@@ -517,8 +545,7 @@ async fn rejoin_maps_a_settled_failure_like_the_live_terminal() {
     .await;
     let store = managed_store(workspace.path(), &owner);
     selected_experience(&store, &run_id);
-    service
-        .rejoin_terminal("rejoin-failed-1", &owner)
+    rejoin_terminal(&service, "rejoin-failed-1", &owner)
         .await
         .expect("test: rejoin");
     crate::skills::lifecycle::drain_background_for_test("rejoin-failed-1").await;
@@ -544,8 +571,7 @@ async fn rejoin_never_creates_a_store_or_an_experience() {
         AgentTurnKind::SingleShot,
     )
     .await;
-    service
-        .rejoin_terminal("rejoin-bare-1", &owner)
+    rejoin_terminal(&service, "rejoin-bare-1", &owner)
         .await
         .expect("test: rejoin");
     crate::skills::lifecycle::drain_background_for_test("rejoin-bare-1").await;

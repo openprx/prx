@@ -74,7 +74,7 @@ impl SegmentObservation {
         let (receipt, context, envelope) = confirmed.parts();
         validate_envelope(envelope)?;
         let event = &receipt.terminal_event;
-        let trusted = context.engine.state.trusted.parts();
+        let trusted = &context.runtime().trusted;
         ensure!(
             event.id > 0
                 && event.event_id.len() <= MAX_ID_BYTES

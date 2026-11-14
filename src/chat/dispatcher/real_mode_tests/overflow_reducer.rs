@@ -106,7 +106,7 @@ impl Provider for OverflowProvider {
 
 #[tokio::test]
 async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let (mut deps, mut actions, _hooks, temp) = build_deps(Arc::new(NoneMemory::new()), CancellationToken::new());
         std::fs::write(temp.path().join("overflow-probe.txt"), CONTENT).expect("real read fixture");
         let security = Arc::new(crate::security::SecurityPolicy {
@@ -198,7 +198,7 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
 
 #[tokio::test]
 async fn engine_capacity_failure_reaches_non_retryable_stream_failed() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let (mut deps, mut actions, _hooks, _temp) = build_deps(Arc::new(NoneMemory::new()), CancellationToken::new());
         let provider = Arc::new(OverflowProvider {
             calls: AtomicUsize::new(0),

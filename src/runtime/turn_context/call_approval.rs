@@ -1,13 +1,13 @@
 //! Run-keyed approval access using the service's pinned authority.
-use super::TurnDecisionService;
 use crate::acl::approval_grant::WitnessKeyring;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::security::approval_ledger::{run_call::ApprovalLedgerPort, strategy::LedgerApprovalStrategy};
-impl TurnDecisionService {
+impl TurnRuntimeService {
     pub(crate) fn execution_approval_ledger(
         &self,
     ) -> Option<crate::security::approval_ledger::strategy::ExecutionApprovalLedger> {
-        if !(self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled) {
+        if !self.recordable {
             return None;
         }
         let workspace = self.generation.effective.workspace_dir.to_str()?.to_owned();
@@ -23,10 +23,7 @@ impl TurnDecisionService {
         &self,
         envelope: RuntimeEnvelope,
     ) -> anyhow::Result<LedgerApprovalStrategy<'_>> {
-        anyhow::ensure!(
-            self.recordable && self.durable_key && self.generation.effective.causal_tree.enabled,
-            "call approvals are disabled"
-        );
+        anyhow::ensure!(self.recordable, "call approvals are disabled");
         anyhow::ensure!(
             envelope.workspace_id == self.generation.effective.workspace_dir.to_string_lossy(),
             "call approval workspace changed"

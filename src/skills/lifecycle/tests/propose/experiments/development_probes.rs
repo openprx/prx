@@ -97,7 +97,7 @@ async fn default_config_skill_solver_reads_its_instruction_file() -> Result<()> 
 
 #[tokio::test]
 async fn development_probes_run_one_arm_and_preserve_independent_attempts() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

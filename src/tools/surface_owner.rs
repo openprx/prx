@@ -3,7 +3,7 @@
 //! Registry ∩ ACL ∩ always_exclude/channel exclusions ∩ model allowlist ∩
 //! catalog `channel_eligible`, assembled here so a turn still has a surface
 //! when the decision engine is off. Callers pass the binding, registry, ACL,
-//! config and catalog; this module does not read `TurnDecisionService`.
+//! config and catalog; this module does not read `TurnRuntimeService`.
 use crate::config::ToolTieringConfig;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, SurfacePolicy};
@@ -72,6 +72,7 @@ pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {
     .with_tool_calls(parts.tool_calls_allowed)
 }
 
+pub(crate) mod facts;
 pub(crate) mod publication;
 pub(crate) mod turn_port;
 

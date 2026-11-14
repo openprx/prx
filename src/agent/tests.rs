@@ -508,7 +508,7 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
     // Q45: Text return and genuine public API source recording remain intact.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
         let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
@@ -981,7 +981,7 @@ async fn turn_executes_single_tool_then_returns() {
 #[tokio::test]
 async fn turn_handles_multi_step_tool_chain() {
     // Q45: Sequential tool rounds execute and return their original final text.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let (counting_tool, count) = CountingTool::new();
 
         let provider = Box::new(ScriptedProvider::new(vec![
@@ -1035,7 +1035,7 @@ async fn turn_handles_multi_step_tool_chain() {
 #[tokio::test]
 async fn turn_handles_unknown_tool_gracefully() {
     // Q52: evidence prerequisite only; preserve unknown tool rejection and diagnostic recovery.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             tool_response(vec![ToolCall {
                 id: "tc1".into(),
@@ -1114,7 +1114,7 @@ async fn turn_recovers_from_tool_error() {
 #[tokio::test]
 async fn turn_propagates_provider_error() {
     // Q52: evidence prerequisite only; preserve provider error propagation.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let mut agent = build_agent_with(Box::new(FailingProvider), vec![], Box::new(NativeToolDispatcher));
 
         let result = agent.turn("hello").await;
@@ -1139,7 +1139,7 @@ async fn turn_propagates_provider_error() {
 #[tokio::test]
 async fn history_is_not_trimmed_by_an_arbitrary_message_count() {
     // Q45: Conversation retention is governed by token budget rather than message count.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let turn_count = 11;
         let mut responses = vec![];
         for _ in 0..turn_count {
@@ -1258,7 +1258,7 @@ async fn native_dispatcher_completes_a_text_turn() {
 #[tokio::test]
 async fn turn_handles_empty_text_response() {
     // Q89 supersedes the Ok(empty) oracle: one corrective retry, then the exact error.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             ChatResponse {
                 text: Some(String::new()),
@@ -1289,7 +1289,7 @@ async fn turn_handles_empty_text_response() {
 #[tokio::test]
 async fn turn_handles_none_text_response() {
     // Q89 supersedes the Ok(empty) oracle: one corrective retry, then the exact error.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             ChatResponse {
                 text: None,
@@ -1324,7 +1324,7 @@ async fn turn_handles_none_text_response() {
 #[tokio::test]
 async fn turn_preserves_text_alongside_tool_calls() {
     // Q45: Intermediate text accompanying tool calls remains in history.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             ChatResponse {
                 text: Some("Let me check...".into()),
@@ -1396,7 +1396,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
 #[tokio::test]
 async fn turn_handles_multiple_tools_in_one_response() {
     // Q45: Multiple calls in one response each execute once.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let (counting_tool, count) = CountingTool::new();
 
         let provider = Box::new(ScriptedProvider::new(vec![
@@ -1457,7 +1457,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
     // Q45: First turn inserts one system prompt.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
         let mut agent = build_agent_with(provider, vec![Box::new(EchoTool)], Box::new(NativeToolDispatcher));
 
@@ -1478,7 +1478,7 @@ async fn system_prompt_injected_on_first_turn() {
 #[tokio::test]
 async fn system_prompt_not_duplicated_on_second_turn() {
     // Q45: Second turn preserves one system prompt.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             text_response("first"),
             text_response("second"),
@@ -1505,7 +1505,7 @@ async fn system_prompt_not_duplicated_on_second_turn() {
 #[tokio::test]
 async fn history_contains_all_expected_entries_after_tool_loop() {
     // Q45: Tool loop persists the expected message sequence.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             tool_response(vec![ToolCall {
                 id: "tc1".into(),
@@ -1567,7 +1567,7 @@ async fn builder_fails_without_provider() {
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
     // Q45: Successful consecutive replies grow conversation history.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             text_response("response 1"),
             text_response("response 2"),
@@ -1711,7 +1711,7 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
 #[tokio::test]
 async fn clear_history_resets_conversation() {
     // Q45: Clearing history resets subsequent conversation state.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let provider = Box::new(ScriptedProvider::new(vec![
             text_response("first"),
             text_response("second"),

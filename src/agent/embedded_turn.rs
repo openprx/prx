@@ -5,7 +5,8 @@ use crate::agent::terminal::{
 };
 use crate::agent::turn_contracts::{RetainedProviderTrace, ToolLoopOutcome, ToolLoopRuntimeAdapter};
 use crate::providers::{ChatMessage, ConversationMessage};
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::runtime::turn_terminal::TurnTerminalGuard;
 use anyhow::Context;
@@ -88,8 +89,8 @@ impl Drop for HistoryWriteback<'_> {
 }
 
 struct Terminal<'a> {
-    service: &'a TurnDecisionService,
-    decision: &'a Arc<TurnDecisionContext>,
+    service: &'a TurnRuntimeService,
+    decision: &'a Arc<OpenedTurn>,
     source: &'a crate::agent::embedded_source::EmbeddedAgentSource,
     started_at: chrono::DateTime<chrono::Utc>,
     history_commit_len: usize,
@@ -197,7 +198,7 @@ async fn run_work(
 ) -> anyhow::Result<String> {
     let owner = crate::runtime::turn_cleanup::current_tracker().context("embedded Agent cleanup owner missing")?;
     let config = &generation.effective;
-    let service = crate::runtime::turn_publication::TurnDecisionPublication {
+    let service = crate::runtime::turn_publication::TurnPublication {
         generation: Arc::clone(generation),
         registry: Arc::clone(&agent.tools),
         mcp_tool: agent.mcp_tool.clone(),

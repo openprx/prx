@@ -99,7 +99,7 @@ async fn message_dispatch_processes_messages_in_parallel() {
     channels_by_name.insert(channel.name().to_string(), channel);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -220,7 +220,7 @@ async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_co
     let config_generation = config.pin();
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config,
         config_generation,
         channels_by_name: Arc::new(channels_by_name),
@@ -354,7 +354,7 @@ async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
     channels_by_name.insert(channel.name().to_string(), channel);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),
@@ -462,7 +462,7 @@ async fn process_channel_message_cancels_scoped_typing_task() {
     channels_by_name.insert(channel.name().to_string(), channel);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),

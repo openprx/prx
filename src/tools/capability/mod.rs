@@ -1,6 +1,5 @@
 //! Canonical, generation-pinned capability discovery for the decision plane.
 
-pub(crate) mod admission_facts;
 pub(crate) mod catalog;
 pub(crate) mod child;
 pub(crate) mod contract;

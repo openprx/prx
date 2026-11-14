@@ -26,7 +26,7 @@ fn failed_inbound_persistence_names_the_cause_and_hides_private_text() {
 
 /// Admit only an actual local `/bg` fixture through Chat's private source path.
 pub(crate) async fn recorded_local_operator_spawn(
-    publication: crate::runtime::turn_publication::TurnDecisionPublication,
+    publication: crate::runtime::turn_publication::TurnPublication,
     provider: Arc<dyn crate::providers::Provider>,
     task: &str,
 ) -> anyhow::Result<(serde_json::Value, crate::runtime::operator_spawn::OperatorSpawnSource)> {
@@ -73,7 +73,7 @@ pub(crate) async fn recorded_local_operator_spawn(
 /// Record and admit a model-origin turn before dispatching its spawn call.
 /// This preserves the configured decision policy, including an abstention.
 pub(crate) async fn dispatch_recorded_model_spawn(
-    publication: crate::runtime::turn_publication::TurnDecisionPublication,
+    publication: crate::runtime::turn_publication::TurnPublication,
     provider: Arc<dyn crate::providers::Provider>,
     arguments: serde_json::Value,
     serving_phase: Arc<std::sync::atomic::AtomicU8>,
@@ -190,7 +190,7 @@ pub(crate) async fn dispatch_recorded_model_spawn(
 /// Record and admit a model-origin turn before dispatching its spawn call.
 /// This preserves the configured decision policy, including an abstention.
 pub(crate) async fn dispatch_unknown_agent_fixture(
-    publication: crate::runtime::turn_publication::TurnDecisionPublication,
+    publication: crate::runtime::turn_publication::TurnPublication,
     provider: Arc<dyn crate::providers::Provider>,
     arguments: serde_json::Value,
 ) -> anyhow::Result<crate::tools::ToolResult> {
@@ -369,7 +369,7 @@ pub(in crate::chat) async fn decided_binding(
     run_id: &str,
 ) -> (
     Arc<ChatTurnBinding>,
-    Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
 ) {
     let (binding, service, _) = decided_binding_for_input(fabric, session_key, run_id, "prx fixture input").await;
     (binding, service)
@@ -382,7 +382,7 @@ pub(in crate::chat) async fn decided_binding_for_input(
     input: &str,
 ) -> (
     Arc<ChatTurnBinding>,
-    Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     MessageEvent,
 ) {
     decided_binding_for_provider(fabric, session_key, run_id, input, "ollama", "prx-local-model").await
@@ -397,14 +397,14 @@ pub(in crate::chat) async fn decided_binding_for_provider(
     model_name: &str,
 ) -> (
     Arc<ChatTurnBinding>,
-    Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     MessageEvent,
 ) {
     decided_binding_for_provider_retained(fabric, session_key, run_id, input, provider_name, model_name, None).await
 }
 
 pub(in crate::chat) struct FixtureServiceDrain {
-    service: Option<Arc<crate::runtime::turn_decision::TurnDecisionService>>,
+    service: Option<Arc<crate::runtime::turn_publication::TurnRuntimeService>>,
     ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
 }
 
@@ -436,7 +436,7 @@ pub(in crate::chat) async fn decided_binding_for_input_retained(
     retained: &mut Option<FixtureServiceDrain>,
 ) -> (
     Arc<ChatTurnBinding>,
-    Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     MessageEvent,
 ) {
     decided_binding_for_provider_retained(
@@ -461,7 +461,7 @@ async fn decided_binding_for_provider_retained(
     retained: Option<&mut Option<FixtureServiceDrain>>,
 ) -> (
     Arc<ChatTurnBinding>,
-    Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     MessageEvent,
 ) {
     let mut config = crate::config::Config::default();
@@ -535,9 +535,9 @@ async fn decided_binding_for_provider_retained(
 pub(in crate::chat) async fn service(
     fabric: &MemoryFabric,
     binding: &ChatTurnBinding,
-) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
     let config = &binding.generation.effective;
-    crate::runtime::turn_publication::TurnDecisionPublication {
+    crate::runtime::turn_publication::TurnPublication {
         generation: Arc::clone(&binding.generation),
         registry: Arc::new(Vec::new()),
         mcp_tool: None,
@@ -629,11 +629,13 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
         let context = binding.issue_decision(&service, &cancellation).await.unwrap();
         assert!(
             context
-                .inherited_constraint_codes()
+                .runtime()
+                .trusted
+                .constraints
                 .iter()
                 .any(|code| code.as_str() == "intercepts_writes")
         );
-        let actual = &context.engine().state;
+        let actual = &crate::runtime::decision_advisory::build_state(context.runtime());
         let mut without_plan = actual.clone();
         let mut trusted = without_plan.trusted.parts().clone();
         trusted.constraints.retain(|code| code.as_str() != "intercepts_writes");

@@ -1034,7 +1034,9 @@ pub(crate) async fn recovery_ready(recovery: Arc<RecoveryScope>) -> anyhow::Resu
 
 /// Called after real publication and again before source-bound admission, so a
 /// cold startup can consume final evidence that pre-proof reception could not.
-pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
+pub(crate) async fn service_ready(
+    service: &crate::runtime::turn_publication::TurnRuntimeService,
+) -> anyhow::Result<()> {
     recovery_ready(service.runtime_holder().recovery_scope()).await
 }
 

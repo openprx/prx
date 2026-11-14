@@ -109,7 +109,6 @@ pub mod agent;
 pub mod approval;
 pub mod auth;
 pub mod capability;
-pub(crate) mod causal_tree;
 pub mod channels;
 #[allow(private_interfaces)]
 pub mod chat;
@@ -730,7 +729,6 @@ mod module_ownership_tests {
             "mod approval;",
             "mod auth;",
             "mod decision_engine_cli;",
-            "mod causal_tree;",
             "mod channels;",
             "mod chat;",
             "mod cli_tracing;",

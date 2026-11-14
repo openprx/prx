@@ -498,7 +498,7 @@ fn registry_probe_ctx(
     let tool_tiering = tiering_for_test_tools(tools_registry.as_ref());
 
     Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: crate::config::new_shared(Config::default()),
         config_generation: crate::config::new_shared(Config::default()).pin(),
         channels_by_name: Arc::new(channels_by_name),

@@ -301,7 +301,7 @@ pub(super) fn prepare_target(
     let security = crate::runtime::bootstrap::build_security_policy(&capped);
     let runtime = TurnRuntimeGeneration {
         provider_binding: Some(binding),
-        decision_slot: Arc::new(parent.decision_slot.targeted(security, plan.tools.surface())),
+        publication_slot: Arc::new(parent.publication_slot.targeted(security, plan.tools.surface())),
         config_generation: Arc::clone(&parent.config_generation),
         provider,
         model,

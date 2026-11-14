@@ -2,15 +2,16 @@
 //!
 //! R26 (ruling R26-HOLDER): the publication builders live here. They build
 //! the publication-scoped `TurnRuntimeHolder` and the `DecisionAdvisory`;
-//! every turn then opens its own `TurnRuntimeContext` from that holder. The
-//! assembled service remains until Part 2 deletes it.
+//! every turn then opens its own `TurnRuntimeContext` from that holder.
 mod build_error;
 mod builder;
 mod operator_process;
 mod ordinary_process;
+pub(crate) mod service;
 
-pub(crate) use build_error::PublicationBuildError;
+pub(crate) use build_error::TurnRuntimeBuildError;
 pub(crate) use builder::{PublicationInputs, PublicationLoopRuntime, build_publication};
+pub(crate) use service::TurnRuntimeService;
 
 use crate::tools;
 use anyhow::Result;
@@ -51,7 +52,7 @@ pub(crate) fn surface_policy(
     }
 }
 
-pub(crate) struct TurnDecisionPublication {
+pub(crate) struct TurnPublication {
     pub(crate) generation: Arc<crate::config::ConfigGeneration>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) mcp_tool: Option<Arc<tools::McpTool>>,
@@ -70,11 +71,11 @@ pub(crate) struct TargetedSurface {
     pub(crate) excluded_names: std::collections::BTreeSet<String>,
 }
 
-impl TurnDecisionPublication {
+impl TurnPublication {
     pub(crate) async fn publish(
         self,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
-    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+    ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         self.publish_with_memory_loader(surface, None).await
     }
 
@@ -82,7 +83,7 @@ impl TurnDecisionPublication {
         self,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
-    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+    ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         self.publish_scoped(surface, loader, None).await
     }
 
@@ -93,7 +94,7 @@ impl TurnDecisionPublication {
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
         targeted: Option<TargetedSurface>,
-    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+    ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         let registry = &self.registry;
         let config_generation = &self.generation;
         let config = &config_generation.effective;
@@ -212,7 +213,7 @@ impl TurnDecisionPublication {
 
 /// Publish an ordinary process against its restored catalog and the actual
 /// local executor. The driver separately owns its authority lifetime guard.
-pub(crate) struct OrdinaryProcessDecisionPublication {
+pub(crate) struct OrdinaryProcessPublication {
     pub(crate) authority: Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -220,8 +221,8 @@ pub(crate) struct OrdinaryProcessDecisionPublication {
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
 }
 
-impl OrdinaryProcessDecisionPublication {
-    pub(crate) async fn publish(self) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+impl OrdinaryProcessPublication {
+    pub(crate) async fn publish(self) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         let owner = super::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("ordinary process publication requires a cleanup owner"))?;
         self.authority.verify()?;
@@ -271,7 +272,7 @@ impl OrdinaryProcessDecisionPublication {
 }
 
 /// Publish a worker from authenticated explicit operator authority.
-pub(crate) struct OperatorProcessDecisionPublication {
+pub(crate) struct OperatorProcessPublication {
     pub(crate) authority: Arc<super::child_source::operator_process::OperatorProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -279,8 +280,8 @@ pub(crate) struct OperatorProcessDecisionPublication {
     pub(crate) surface_policy: crate::tools::capability::catalog::SurfacePolicy,
 }
 
-impl OperatorProcessDecisionPublication {
-    pub(crate) async fn publish(self) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
+impl OperatorProcessPublication {
+    pub(crate) async fn publish(self) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
         let owner = super::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("operator process publication requires a cleanup owner"))?;
         self.authority.verify()?;
@@ -357,7 +358,7 @@ mod static_publication_tests {
         }
     }
 
-    fn publication(workspace: &std::path::Path, probe: PublicationProbe) -> TurnDecisionPublication {
+    fn publication(workspace: &std::path::Path, probe: PublicationProbe) -> TurnPublication {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.to_owned();
         config.causal_tree.enabled = false;
@@ -365,7 +366,7 @@ mod static_publication_tests {
             &config.autonomy,
             workspace,
         ));
-        TurnDecisionPublication {
+        TurnPublication {
             generation: crate::config::new_shared(config).pin(),
             registry: Arc::new(vec![Box::new(probe)]),
             mcp_tool: None,

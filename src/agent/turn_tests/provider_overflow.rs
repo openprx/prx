@@ -188,7 +188,7 @@ fn overflow_config(mode: AgentCompactionMode) -> AgentCompactionConfig {
 
 #[tokio::test]
 async fn provider_overflow_retry_keeps_current_request() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         for streaming in [false, true] {
             // None: no config; Off: no patch; Safeguard: auxiliary provider
             // error; Aggressive: replacing summary with the Tail restore rule.
@@ -299,7 +299,7 @@ async fn provider_overflow_retry_keeps_current_request() {
 
 #[tokio::test]
 async fn provider_overflow_irreducible_request_stops() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         for streaming in [false, true] {
             // At six native rounds the 12-message fallback deletes only Q.
             // Restoring it cancels that apparent progress: stop immediately.
@@ -351,7 +351,7 @@ async fn provider_overflow_irreducible_request_stops() {
 
 #[tokio::test]
 async fn provider_overflow_recovery_stops_after_three_passes() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         for streaming in [false, true] {
             let tmp = TempDir::new().expect("pass cap workspace");
             let provider = OverflowProvider {

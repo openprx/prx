@@ -154,8 +154,7 @@ pub(crate) fn redacted_projection(
                 "action": candidate.action().as_str(),
                 "target": candidate.target().as_str(),
                 "side_effect": candidate.side_effect().as_str(),
-                "approval": derived.effective_approval_required.map_or_else(
-                    || candidate.approval().code(), |required| if required { "required" } else { "none" }),
+                "approval": candidate.approval().code(),
                 "cost_bucket": candidate
                     .estimated_cost()
                     .map_or(UNKNOWN_COST_BUCKET, |cost| bucket(cost.micro_usd, &COST_BUCKETS)),
@@ -258,10 +257,7 @@ pub(crate) fn shrink_oldest_artifact_summary(
 
 /// Whether an action is a safety candidate, which a projection never drops.
 const fn is_safety(action: CausalActionKind) -> bool {
-    matches!(
-        action,
-        CausalActionKind::Clarify | CausalActionKind::RequestApproval | CausalActionKind::Refuse
-    )
+    matches!(action, CausalActionKind::Clarify | CausalActionKind::Refuse)
 }
 
 /// The candidates a projection sends, in id order, at most
@@ -375,7 +371,7 @@ mod tests {
     ));
 
     #[test]
-    fn effective_approval_projection_does_not_change_intrinsic_execution_requirement() {
+    fn projection_renders_the_intrinsic_approval_requirement() {
         use crate::decision_engine::candidate::{CandidateSpec, CausalCandidate};
         use crate::tools::capability::contract::{ApprovalRequirement, SideEffectClass};
         let key = key();
@@ -393,28 +389,10 @@ mod tests {
                 estimated_latency_ms: None,
             },
         );
-        turn.derived = derived(vec![item.clone()]);
-        let unknown_fingerprint = turn
-            .material_fingerprint(&key)
-            .expect("test: canonical state serializes");
-        for (effective, expected) in [(None, "required"), (Some(true), "required"), (Some(false), "none")] {
-            item.effective_approval_required = effective;
-            turn.derived = derived(vec![item.clone()]);
-            let (value, _) = redacted_projection(&turn).unwrap();
-            assert_eq!(value.as_json()["candidates"][0]["approval"], expected);
-            assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
-            assert!(matches!(
-                item.candidate.approval(),
-                ApprovalRequirement::Required { .. }
-            ));
-            if effective.is_some() {
-                assert_ne!(
-                    turn.material_fingerprint(&key)
-                        .expect("test: canonical state serializes"),
-                    unknown_fingerprint
-                );
-            }
-        }
+        turn.derived = derived(vec![item]);
+        let (value, _) = redacted_projection(&turn).unwrap();
+        assert_eq!(value.as_json()["candidates"][0]["approval"], "required");
+        assert_eq!(state_v1_violations(value.as_json()), Vec::<String>::new());
     }
 
     /// Secret values that must never reach a projection (the C 5.2.6 kind of
@@ -491,7 +469,7 @@ mod tests {
         let key = key();
         let mut turn = state(&key, "retry the github call");
         let mut list = candidates(&key);
-        for action in [CausalActionKind::RequestApproval, CausalActionKind::Discover] {
+        for action in [CausalActionKind::Retrieve, CausalActionKind::Discover] {
             list.push(candidate(&key, action, CapabilityTarget::Mcp, Some("github")));
         }
         let failed_tool = list[2].candidate.candidate_id().clone();
@@ -512,7 +490,7 @@ mod tests {
         assert_eq!(
             extracted.candidates.len(),
             5,
-            "the approval and discover candidates are projected"
+            "the retrieve and discover candidates are projected"
         );
         assert_eq!(
             value.as_json()["failed_tool_fingerprints"],
@@ -549,11 +527,7 @@ mod tests {
             })
             .collect();
         list[69].exact_mention = true;
-        for action in [
-            CausalActionKind::Clarify,
-            CausalActionKind::RequestApproval,
-            CausalActionKind::Refuse,
-        ] {
+        for action in [CausalActionKind::Clarify, CausalActionKind::Refuse] {
             list.push(candidate(&key, action, CapabilityTarget::None, None));
         }
         list.push(candidate(&key, CausalActionKind::Answer, CapabilityTarget::None, None));
@@ -570,7 +544,7 @@ mod tests {
             .map(|candidate| candidate["id"].as_str().expect("test: id").to_string())
             .collect();
         assert_eq!(ids.len(), 64);
-        for kept in ["clarify-none", "request_approval-none", "refuse-none", "answer-none"] {
+        for kept in ["clarify-none", "refuse-none", "answer-none"] {
             assert!(ids.iter().any(|id| id == kept), "{kept} kept");
         }
         assert!(ids.contains(&named), "the exactly named tool is kept");
@@ -582,7 +556,7 @@ mod tests {
             .map(|index| {
                 candidate(
                     &key,
-                    CausalActionKind::RequestApproval,
+                    CausalActionKind::Clarify,
                     CapabilityTarget::Mcp,
                     Some(format!("ns{index}").as_str()),
                 )
@@ -820,7 +794,7 @@ mod tests {
         prop::collection::vec(segment(), 0..16).prop_map(|segments| segments.join(" "))
     }
 
-    const ACTIONS: [CausalActionKind; 8] = CausalActionKind::ALL;
+    const ACTIONS: [CausalActionKind; 7] = CausalActionKind::ALL;
     const TARGETS: [CapabilityTarget; 13] = CapabilityTarget::ALL;
     const CODES: [&str; 4] = ["no_destructive_filesystem", "no_external_send", "Not A Code", "x"];
 

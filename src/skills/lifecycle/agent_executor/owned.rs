@@ -95,8 +95,6 @@ impl AgentCaseExecutor {
             ticket.finish(outcome.is_ok());
             outcome
         };
-        #[cfg(test)]
-        let worker = crate::runtime::turn_decision::with_inherited_scored_prediction(worker);
         tokio::spawn(worker)
             .await
             .map_err(|error| EvaluationError::Executor(format!("owned case worker failed: {error}")))?

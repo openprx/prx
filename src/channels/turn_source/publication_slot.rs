@@ -1,9 +1,9 @@
 //! Channel capability publication from the actual component-owned registry.
-use crate::runtime::turn_decision::TurnDecisionService;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
-pub(super) struct ChannelDecisionSlot {
+pub(in crate::channels) struct ChannelPublicationSlot {
     mcp_tool: Option<Arc<crate::tools::McpTool>>,
     plugin_generation: u64,
     published: tokio::sync::Mutex<Published>,
@@ -11,12 +11,12 @@ pub(super) struct ChannelDecisionSlot {
 
 #[derive(Default)]
 struct Published {
-    latest: Option<Arc<TurnDecisionService>>,
-    generations: BTreeMap<u64, Weak<TurnDecisionService>>,
+    latest: Option<Arc<TurnRuntimeService>>,
+    generations: BTreeMap<u64, Weak<TurnRuntimeService>>,
 }
 
-impl ChannelDecisionSlot {
-    pub(super) fn new(mcp_tool: Option<Arc<crate::tools::McpTool>>, plugin_generation: u64) -> Self {
+impl ChannelPublicationSlot {
+    pub(in crate::channels) fn new(mcp_tool: Option<Arc<crate::tools::McpTool>>, plugin_generation: u64) -> Self {
         Self {
             mcp_tool,
             plugin_generation,
@@ -24,13 +24,13 @@ impl ChannelDecisionSlot {
         }
     }
 
-    pub(super) async fn publish(
+    pub(in crate::channels) async fn publish(
         &self,
-        ctx: &super::ChannelRuntimeContext,
+        ctx: &crate::channels::ChannelRuntimeContext,
         generation: &Arc<crate::config::ConfigGeneration>,
         security: &Arc<crate::security::SecurityPolicy>,
         memory: Arc<dyn crate::memory::Memory>,
-    ) -> anyhow::Result<Arc<TurnDecisionService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         let owner = crate::runtime::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("channel decision publication requires a cleanup owner"))?;
         // Only publication is serialized. Decisions and model turns run without
@@ -43,7 +43,7 @@ impl ChannelDecisionSlot {
             owner.retain_child_service(Arc::clone(&service))?;
             return Ok(service);
         }
-        let service = crate::runtime::turn_publication::TurnDecisionPublication {
+        let service = crate::runtime::turn_publication::TurnPublication {
             generation: Arc::clone(generation),
             registry: Arc::clone(&ctx.tools_registry),
             mcp_tool: self.mcp_tool.clone(),
@@ -68,7 +68,7 @@ impl ChannelDecisionSlot {
 }
 
 #[cfg(test)]
-impl Default for ChannelDecisionSlot {
+impl Default for ChannelPublicationSlot {
     fn default() -> Self {
         Self::new(None, 0)
     }

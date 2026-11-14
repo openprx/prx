@@ -161,7 +161,7 @@ fn code(value: &str) -> anyhow::Result<&str> {
 }
 
 pub(super) fn admission(
-    context: &crate::runtime::turn_decision::TurnDecisionContext,
+    context: &crate::runtime::turn_context::OpenedTurn,
     capabilities: crate::providers::ProviderCapabilities,
 ) {
     record("admission.json", || {

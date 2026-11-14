@@ -1,5 +1,8 @@
 //! Channel-owned input provenance after transport admission. Model admission
 //! remains separate and follows smart-group suppression.
+
+pub(super) mod admitted_turn;
+pub(super) mod publication_slot;
 use super::rich::RichChannel;
 use crate::config::ConfigGeneration;
 use crate::memory::{Memory, MessageEvent};

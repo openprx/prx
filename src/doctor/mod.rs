@@ -1199,17 +1199,17 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelProbeOutcome {
+enum ModelProbeVerdict {
     Skipped,
     AuthOrAccess,
     Error,
 }
 
-fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
+fn classify_model_probe_error(err_message: &str) -> ModelProbeVerdict {
     let lower = err_message.to_lowercase();
 
     if lower.contains("does not support live model discovery") {
-        return ModelProbeOutcome::Skipped;
+        return ModelProbeVerdict::Skipped;
     }
 
     if [
@@ -1228,10 +1228,10 @@ fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     .iter()
     .any(|hint| lower.contains(hint))
     {
-        return ModelProbeOutcome::AuthOrAccess;
+        return ModelProbeVerdict::AuthOrAccess;
     }
 
-    ModelProbeOutcome::Error
+    ModelProbeVerdict::Error
 }
 
 fn doctor_model_targets(provider_override: Option<&str>) -> Vec<String> {
@@ -1279,15 +1279,15 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
             Err(error) => {
                 let error_text = crate::security::redaction::redact_provider_text(&format_error_chain(&error));
                 match classify_model_probe_error(&error_text) {
-                    ModelProbeOutcome::Skipped => {
+                    ModelProbeVerdict::Skipped => {
                         skipped_count += 1;
                         println!("    ⚪ skipped: {}", truncate_for_display(&error_text, 160));
                     }
-                    ModelProbeOutcome::AuthOrAccess => {
+                    ModelProbeVerdict::AuthOrAccess => {
                         auth_count += 1;
                         println!("    ⚠️  auth/access: {}", truncate_for_display(&error_text, 160));
                     }
-                    ModelProbeOutcome::Error => {
+                    ModelProbeVerdict::Error => {
                         error_count += 1;
                         println!("    ❌ error: {}", truncate_for_display(&error_text, 160));
                     }
@@ -3362,16 +3362,16 @@ mod tests {
     #[test]
     fn classify_model_probe_error_marks_unsupported_as_skipped() {
         let outcome = classify_model_probe_error("Provider 'copilot' does not support live model discovery yet");
-        assert_eq!(outcome, ModelProbeOutcome::Skipped);
+        assert_eq!(outcome, ModelProbeVerdict::Skipped);
     }
 
     #[test]
     fn classify_model_probe_error_marks_auth_and_plan_issues() {
         let auth_outcome = classify_model_probe_error("OpenAI API error (401): unauthorized");
-        assert_eq!(auth_outcome, ModelProbeOutcome::AuthOrAccess);
+        assert_eq!(auth_outcome, ModelProbeVerdict::AuthOrAccess);
 
         let plan_outcome = classify_model_probe_error("Z.AI API error (429): plan does not include requested model");
-        assert_eq!(plan_outcome, ModelProbeOutcome::AuthOrAccess);
+        assert_eq!(plan_outcome, ModelProbeVerdict::AuthOrAccess);
     }
 
     #[test]

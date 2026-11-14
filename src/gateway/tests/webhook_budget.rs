@@ -237,7 +237,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
         trigger: crate::config::ConfigReloadTrigger::Test,
         deferred_changes: Arc::from([]),
     });
-    let mut replacement_slot = decision_runtime::GatewayDecisionSlot::new(
+    let mut replacement_slot = turn_source::publication_slot::GatewayPublicationSlot::new(
         Arc::new(crate::security::SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
@@ -254,7 +254,7 @@ async fn a_webhook_turn_stays_on_one_runtime_generation_across_reload() {
                 Arc::clone(&replacement_provider),
                 resolved,
             ))),
-            decision_slot: Arc::new(replacement_slot),
+            publication_slot: Arc::new(replacement_slot),
             config_generation: Arc::clone(&next_generation),
             provider: replacement_provider,
             model: previous.model.clone(),

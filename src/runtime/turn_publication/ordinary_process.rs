@@ -5,7 +5,8 @@ use anyhow::Context;
 
 use super::{PublicationInputs, PublicationLoopRuntime};
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
-use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::pinned_policy_version;
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 
@@ -15,7 +16,7 @@ pub(super) fn ordinary_process_publication(
     authority: Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>,
     build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
-) -> anyhow::Result<Arc<TurnDecisionService>> {
+) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
     anyhow::ensure!(
@@ -54,7 +55,7 @@ pub(super) fn ordinary_process_publication(
         },
     )?
     .with_unproven_budget_gate();
-    let service = Arc::new(TurnDecisionService {
+    let service = Arc::new(TurnRuntimeService {
         runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
             Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
                 Arc::clone(&build.memory),

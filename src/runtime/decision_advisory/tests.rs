@@ -1,6 +1,7 @@
 #![cfg(test)]
 use super::*;
 use crate::decision_engine::observe::TelemetryWriter;
+use std::collections::BTreeSet;
 
 struct GatedWriter {
     entered: Option<tokio::sync::oneshot::Sender<()>>,
@@ -333,19 +334,6 @@ pub(crate) fn analysis_input(
     AdvisoryInput {
         decision_id: DecisionId::new_runtime(),
         state,
-        facts: AdmissionFactsV1 {
-            policy: Arc::new(crate::security::SecurityPolicy::default()),
-            owner_id: Arc::from("owner-1"),
-            sender: Arc::from("owner-1"),
-            policy_channel: Arc::from("cli"),
-            chat_type: Arc::from("dm"),
-            model_ref: Arc::from("anthropic:claude"),
-            model_can_chat: true,
-            model_can_call_tools: true,
-            child_scope: None,
-            child_discovery: false,
-            child_served: None,
-        },
         state_key: Arc::clone(key),
         catalog_generation: *catalog.generation(),
         catalog,
@@ -362,7 +350,7 @@ pub(crate) fn analysis_input(
 /// slot is charged through the input's accounting scope with the input's
 /// request limits; the builtin spends nothing.
 #[tokio::test]
-async fn decision_advisory_runs_without_turn_decision_service() {
+async fn decision_advisory_runs_without_a_turn_runtime_service() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = (*enabled_config(temp.path())).clone();
     // Cheap enough that the whole 8,000-token fixture slice fits its money.
@@ -607,11 +595,11 @@ fn pre_mode_status_reports_effective_cap_zero() {
     assert_eq!(crate::decision_engine::status::snapshot(&config).telemetry_cap, 1000);
 }
 
-/// R13: from an `AdvisoryInput` alone (no turn service) the driver generates
-/// through `AdvisoryProbe`, so a candidate the hard gates block (a write tool
-/// in a read-only turn, G9) still reaches the `IntentAnalysis`.
+/// From an `AdvisoryInput` alone (no turn service) the driver analyses the
+/// structural candidate set: a write tool in a read-only turn is not filtered
+/// by any admission and still reaches the `IntentAnalysis`.
 #[tokio::test]
-async fn engine_driver_generates_with_advisory_probe() {
+async fn engine_driver_analyses_the_structural_set() {
     use crate::tools::traits::Tool;
     let temp = tempfile::tempdir().unwrap();
     let config = enabled_config(temp.path());
@@ -648,16 +636,8 @@ async fn engine_driver_generates_with_advisory_probe() {
     input.catalog = catalog;
     input.publication_policy = surface;
 
-    // The keys each probe admits into the analysed set.
+    // The keys of the structural set.
     let view = input.catalog_view();
-    let (calls, approvals) = (BTreeMap::new(), BTreeMap::new());
-    let replayed = BTreeSet::new();
-    let gates = gate_inputs(&input.facts, &calls, approvals, &replayed);
-    let probe = HardGatesProbe {
-        state: &input.state,
-        catalog: &view,
-        gates: &gates,
-    };
     let observed_latency = BTreeMap::new();
     let cost_model =
         crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &config, &observed_latency);
@@ -676,16 +656,17 @@ async fn engine_driver_generates_with_advisory_probe() {
             .iter()
             .map(|candidate| candidate.candidate_id().as_str().to_owned())
             .collect::<BTreeSet<_>>(),
-        CandidateSet::NoLegalPath { .. } => BTreeSet::new(),
+        CandidateSet::NoLegalPath => BTreeSet::new(),
     };
-    let execution = keys(CausalCandidateGenerator::generate(&input.state, &view, &policy, &probe).unwrap());
-    let advised = keys(
-        CausalCandidateGenerator::generate(&input.state, &view, &policy, &AdvisoryProbe { inner: &probe }).unwrap(),
-    );
-    let blocked: Vec<_> = advised.difference(&execution).cloned().collect();
+    let structural = keys(CausalCandidateGenerator::generate(&input.state, &view, &policy).unwrap());
+    let writes: Vec<_> = structural
+        .iter()
+        .filter(|id| id.starts_with("use_tool-"))
+        .cloned()
+        .collect();
     assert!(
-        blocked.iter().any(|id| id.starts_with("use_tool-")),
-        "the read-only turn blocks the write tool: {advised:?} vs {execution:?}"
+        !writes.is_empty(),
+        "the read-only turn keeps the write tool structurally: {structural:?}"
     );
     drop(view);
 
@@ -693,10 +674,10 @@ async fn engine_driver_generates_with_advisory_probe() {
         .analyze(input, &cancellation)
         .await
         .expect("test: analysis without a turn service");
-    for id in &blocked {
+    for id in &writes {
         assert!(
             analysis.candidates.contains_key(id),
-            "blocked candidate {id} reaches the analysis: {:?}",
+            "structural candidate {id} reaches the analysis: {:?}",
             analysis.candidates.keys()
         );
     }

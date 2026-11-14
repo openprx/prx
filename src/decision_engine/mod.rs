@@ -1,9 +1,8 @@
 //! Advisory intent analysis. This module never selects or authorizes execution.
 //!
 //! It owns the causal state, candidate generation, question compilation and
-//! projection, the admission-probe contract, the cost model and the
+//! projection, the cost model and the
 //! prediction backend stack (`prediction`, moved from `src/decision`, R21).
-pub(crate) mod admission_probe;
 pub(crate) mod candidate;
 pub(crate) mod candidate_generator;
 pub mod causal_adapter;

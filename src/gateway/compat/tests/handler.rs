@@ -377,7 +377,9 @@ async fn mcp_tool_call_rejects_schema_drift_after_async_admission() {
         previous: Arc::clone(&previous),
         generation: crate::gateway::TurnRuntimeGeneration {
             provider_binding: None,
-            decision_slot: Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::default()),
+            publication_slot: Arc::new(
+                crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::default(),
+            ),
             config_generation: Arc::clone(&previous.config_generation),
             provider: Arc::clone(&previous.provider),
             model: previous.model.clone(),
@@ -508,7 +510,9 @@ async fn mcp_tool_call_does_not_run_a_tool_the_reload_removed() {
         previous: Arc::clone(&previous),
         generation: crate::gateway::TurnRuntimeGeneration {
             provider_binding: None,
-            decision_slot: Arc::new(crate::gateway::decision_runtime::GatewayDecisionSlot::default()),
+            publication_slot: Arc::new(
+                crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::default(),
+            ),
             config_generation: Arc::clone(&previous.config_generation),
             provider: Arc::clone(&previous.provider),
             model: previous.model.clone(),
@@ -1005,7 +1009,7 @@ async fn run_admitted_webhook_spawn(
     .await?;
     let proof = receipt.bind(runtime, &fabric)?;
     let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
-    let service = crate::runtime::turn_publication::TurnDecisionPublication {
+    let service = crate::runtime::turn_publication::TurnPublication {
         generation,
         registry: Arc::clone(&runtime.tools_registry),
         mcp_tool: runtime.mcp_tool.clone(),

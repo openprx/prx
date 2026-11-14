@@ -188,7 +188,7 @@ async fn cli_turn_routing_pins_the_raw_turn_text() {
 
 #[tokio::test]
 async fn cli_single_shot_routes_on_the_raw_message_not_on_recalled_memory() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let (skill_refreshes, mcp_refreshes) = cli_turn_capability_refreshes(RAW_CLI_TURN_TEXT).await;
 
         assert_eq!(
@@ -205,7 +205,7 @@ async fn cli_single_shot_routes_on_the_raw_message_not_on_recalled_memory() {
 
 #[tokio::test]
 async fn cli_repl_routes_on_the_raw_input_not_on_recalled_memory() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let (skill_refreshes, mcp_refreshes) =
             cli_turn_capability_refreshes(&format!("and now {RAW_CLI_TURN_TEXT}")).await;
 
@@ -223,7 +223,7 @@ async fn cli_repl_routes_on_the_raw_input_not_on_recalled_memory() {
 
 #[tokio::test]
 async fn cron_job_turn_routes_on_the_raw_prefixed_prompt_not_on_recalled_memory() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         // A cron agent job enters the single-shot branch with the scheduler's
         // own `[cron:...]` prefix already on the prompt; that prefix is authored
         // by the scheduler, not recalled, so it stays part of the routing input.
@@ -244,7 +244,7 @@ async fn cron_job_turn_routes_on_the_raw_prefixed_prompt_not_on_recalled_memory(
 
 #[tokio::test]
 async fn xin_task_turn_routes_on_the_raw_prefixed_payload_not_on_recalled_memory() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         // Same single-shot branch, with the xin runner's `[xin:task:...]` prefix.
         let (skill_refreshes, mcp_refreshes) =
             cli_turn_capability_refreshes(&format!("[xin:task:42] {RAW_CLI_TURN_TEXT}")).await;

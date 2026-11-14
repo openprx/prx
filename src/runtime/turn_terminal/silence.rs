@@ -2,15 +2,16 @@
 //! the turn's execution trace is sealed (R25 owner).
 use anyhow::Context;
 
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 
 /// Confirm only the actual exposed runtime dependency, before sealing its
 /// decision-owned trace. This does not mint successful tool-call evidence.
 pub(crate) fn record_agent_silence(
-    service: &TurnDecisionService,
+    service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
-    context: &TurnDecisionContext,
+    context: &OpenedTurn,
     compiled: &crate::agent::turn_context::CompiledToolContext,
 ) -> anyhow::Result<()> {
     let name = crate::tools::STAY_SILENT_TOOL_NAME;

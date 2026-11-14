@@ -885,7 +885,7 @@ async fn disabled_whitespace_agent_entry_is_direct_without_prediction() {
 }
 
 /// What one Agent turn showed its provider and did, for the on/off comparison.
-struct OpenedTurn {
+struct OpenedAgentTurn {
     reply: String,
     provider_requests: usize,
     tools: Vec<String>,
@@ -896,7 +896,7 @@ struct OpenedTurn {
 
 /// Runs one Agent turn whose provider calls `project_tool` once and then
 /// answers. The provider records every request's tool list and system text.
-async fn open_agent_turn(enabled: bool, configure: impl FnOnce(&mut crate::config::Config)) -> OpenedTurn {
+async fn open_agent_turn(enabled: bool, configure: impl FnOnce(&mut crate::config::Config)) -> OpenedAgentTurn {
     struct ScriptedProvider {
         requests: Arc<Mutex<Vec<(Vec<String>, String, Vec<String>)>>>,
         responses: Mutex<VecDeque<ChatResponse>>,
@@ -986,7 +986,7 @@ async fn open_agent_turn(enabled: bool, configure: impl FnOnce(&mut crate::confi
     let reply = agent.turn("run the project tool").await.expect("test: turn is served");
     let requests = requests.lock().expect("test: requests").clone();
     let (tools, tools_fingerprint, systems) = requests.first().cloned().expect("test: one provider request");
-    OpenedTurn {
+    OpenedAgentTurn {
         reply,
         provider_requests: requests.len(),
         tools,

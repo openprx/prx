@@ -362,7 +362,7 @@ async fn process_channel_message_stamps_per_turn_run_id_on_message_events() {
     runtime_config.default_model = Some("test-model".to_string());
     let config_manager = crate::config::new_shared(runtime_config);
     let ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::default()),
         config: Arc::clone(&config_manager),
         config_generation: config_manager.pin(),
         channels_by_name: Arc::new(channels_by_name),

@@ -247,14 +247,6 @@ pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> R
     assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
     Ok(())
 }
-pub(crate) fn decision_answers_for_exact(
-    body: &serde_json::Value,
-    action: &str,
-    target: &str,
-) -> anyhow::Result<serde_json::Value> {
-    decision_answers_with_preference(body, action, target, true)
-}
-
 pub(crate) fn decision_answers(
     body: &serde_json::Value,
     action: &str,

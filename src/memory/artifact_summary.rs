@@ -1,7 +1,6 @@
 //! Bounded, redacted summaries of runtime artifacts and the one text
-//! redactor they share with the decision-state projection (moved from
-//! `causal_tree::projection`, R15). Every text goes through [`redact_text`]:
-//! credentials, secret-store values and private URLs are replaced, control
+//! redactor they share with the decision-state projection (R15). Every text
+//! goes through [`redact_text`]: credentials, secret-store values and private URLs are replaced, control
 //! characters and long base64 runs are sanitized, and the result is cut at a
 //! character boundary.
 

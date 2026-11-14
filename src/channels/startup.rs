@@ -19,8 +19,8 @@ use super::{
     EmailChannel, HashMap, HookManager, IMessageChannel, InboundPolicyConfig, IrcChannel, LarkChannel, LinqChannel,
     MattermostChannel, Memory, Mutex, NextcloudTalkChannel, Observer, Provider, ProviderCacheKey, ProviderCacheMap,
     QQChannel, RamfluxChannel, Result, SignalChannel, SignalNativeChannel, SlackChannel, TelegramChannel, WacliChannel,
-    WhatsAppChannel, decision_runtime, irc, memory, observability, outbound_registry, providers, runtime, tools,
-    traits, wacli,
+    WhatsAppChannel, irc, memory, observability, outbound_registry, providers, runtime, tools, traits, turn_source,
+    wacli,
 };
 
 /// Resolve the channel runtime's default provider and model for chat before
@@ -706,7 +706,10 @@ pub async fn start_channels_with_config(
         }
     };
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
-        decisions: Arc::new(decision_runtime::ChannelDecisionSlot::new(mcp_tool, plugin_generation)),
+        publication_slot: Arc::new(turn_source::publication_slot::ChannelPublicationSlot::new(
+            mcp_tool,
+            plugin_generation,
+        )),
         config: shared_config,
         #[cfg(test)]
         config_generation,

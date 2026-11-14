@@ -544,7 +544,7 @@ async fn model_spawn_within_turn_scope_captures_parent_run_id() -> anyhow::Resul
                             "chat:session-1".to_string(),
                         ),
                         crate::chat::binding::tests::dispatch_recorded_model_spawn(
-                            crate::runtime::turn_publication::TurnDecisionPublication {
+                            crate::runtime::turn_publication::TurnPublication {
                                 generation: Arc::clone(&generation),
                                 registry: Arc::clone(&registry),
                                 mcp_tool: None,
@@ -648,7 +648,7 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
             assert!(tools_handle.set(&registry));
             assert!(current_spawn_execution_context().is_none());
             let (args, source) = crate::chat::binding::tests::recorded_local_operator_spawn(
-                crate::runtime::turn_publication::TurnDecisionPublication {
+                crate::runtime::turn_publication::TurnPublication {
                     generation: Arc::clone(&generation),
                     registry: Arc::clone(&registry),
                     mcp_tool: None,

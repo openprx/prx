@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::causal_tree::decision_engine::EngineError;
 use crate::config::ConfigGeneration;
 use crate::decision_engine::state::{ObservedState, RawRoutingInput};
 use crate::providers::catalog::ReleaseCatalog;
@@ -21,20 +20,18 @@ use crate::providers::parameter_capture::Capture;
 use crate::runtime::child_source::recursive_allowance::{ContextAllowance, RecursiveAllowance, RunAllowances};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::ingress_recovery::RecoveryScope;
-use crate::runtime::turn_decision::{
-    AgentDecisionBudgetError, AgentDiscoveryError, AgentRetrievalError, SendLimits, TurnModelError,
-};
+use crate::runtime::turn_publication::service::{AgentDecisionBudgetError, SendLimits, TurnModelError};
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
-use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::ParityError;
 use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
-use crate::tools::capability::child::ChildCapabilityManifest;
+use crate::tools::capability::child::{ChildCapabilityManifest, ChildManifestError};
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use crate::tools::capability::search_tool::DiscoveryState;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::capability::turn_state::{TrustedParts, TurnBudgets};
+use crate::tools::surface_owner::facts::PublicationFacts;
 
 /// Live spend inputs of one provider send or called tool. `live` re-reads the
 /// ledger and the incoming funding on every call, so a later boundary sees a
@@ -187,7 +184,7 @@ pub(crate) struct TurnRuntimeContext {
     pub(crate) catalog: Arc<CapabilityCatalog>,
     pub(crate) publication_policy: SurfacePolicy,
     pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) admission: AdmissionFactsV1,
+    pub(crate) admission: PublicationFacts,
     /// The surface published at opening by the execution rules (R28):
     /// publication authority only, rechecked at binding and dispatch.
     pub(crate) published: BTreeSet<CapabilityRef>,
@@ -374,13 +371,9 @@ pub(crate) enum AgentDecisionError {
     #[error(transparent)]
     Parity(#[from] ParityError),
     #[error(transparent)]
-    Engine(#[from] EngineError),
+    ChildManifest(#[from] ChildManifestError),
     #[error("decision deadline cannot be represented")]
     Deadline,
-    #[error(transparent)]
-    Retrieval(#[from] AgentRetrievalError),
-    #[error(transparent)]
-    Discovery(#[from] AgentDiscoveryError),
     #[error("ordinary delegation scope could not be verified")]
     DelegationScope(#[source] anyhow::Error),
     #[error("durable ingress recovery is not ready")]
@@ -416,4 +409,13 @@ mod selected_custom_memory_scope_tests;
 #[cfg(test)]
 mod tests;
 
+mod call_approval;
+mod child_scope;
+mod execution_binding;
+mod opened_turn;
+mod opening;
+mod owner_filesystem;
 pub(crate) mod publication_scope;
+pub(crate) mod surface_binding;
+
+pub(crate) use opened_turn::OpenedTurn;

@@ -6,6 +6,7 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use anyhow::Context;
 
 mod admission;
+pub(super) mod publication_slot;
 /// Gateway ownership uses the shared runtime cleanup protocol.
 pub(super) use crate::runtime::turn_cleanup::CleanupTracker;
 pub(super) use admission::{GatewayAdmissionGuard, GatewayPendingInput};
@@ -472,7 +473,7 @@ impl GatewaySourceReceipt {
             model_binding: crate::agent::entry::AgentModelBinding::from_resolved(&binding.resolved, route),
             has_conversation_history: self.has_conversation_history,
         };
-        if let Some(profile) = &runtime.decision_slot.controlled {
+        if let Some(profile) = &runtime.publication_slot.controlled {
             if self.envelope.source == crate::runtime::envelope::RuntimeSource::Console {
                 let origin = profile.bind_gateway(&proof)?;
                 proof

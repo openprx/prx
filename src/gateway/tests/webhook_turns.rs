@@ -110,7 +110,7 @@ async fn webhook_default_hint_uses_only_selected_route_key_on_wire() {
     let security = crate::runtime::bootstrap::build_security_policy(&generation.effective);
     let runtime = TurnRuntimeGeneration {
         provider_binding,
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(security, 0)),
         config_generation: generation,
         provider: Arc::clone(&state.provider),
         model: state.model.clone(),
@@ -279,7 +279,7 @@ async fn a_webhook_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
                     Arc::clone(&provider),
                     resolved,
                 ))),
-                decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+                publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(security, 0)),
                 config_generation: state.config.pin(),
                 provider,
                 model,
@@ -287,7 +287,7 @@ async fn a_webhook_tool_schema_refusal_returns_a_stable_code_and_the_tools() {
                 tools_registry: Arc::clone(&state.tools_registry),
                 mcp_tool: None,
             };
-            let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+            let cleanup = Arc::clone(&runtime.publication_slot.cleanup);
             let owner = Arc::new(GatewayTurnRuntimeOwner::new(
                 runtime,
                 Arc::clone(&state.config),

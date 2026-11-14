@@ -61,7 +61,7 @@ fn fixture_main_compaction(config: &crate::config::AgentCompactionConfig) -> cra
 }
 
 #[tokio::test]
-async fn configured_extra_token_ratio_caps_real_turn_decision_admission() {
+async fn configured_extra_token_ratio_caps_real_turn_admission() {
     let workspace = TempDir::new().expect("budget fixture workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
@@ -96,7 +96,7 @@ async fn configured_extra_token_ratio_caps_real_turn_decision_admission() {
 #[tokio::test]
 async fn context_budget_counts_native_tool_schemas_before_provider_call() {
     // Q45: Native schemas participate in request token budgeting.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::with_fields("file_read", 16))];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         let tool_specs = business_tool_specs_of(&tools_registry);
@@ -306,7 +306,7 @@ async fn small_native_schema_fixture(excluded: bool) {
                 assert!(decision.context.execution_refs().is_empty());
                 assert!(decision.context.is_run());
             } else {
-                let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
+                let diagnostic = format!("{:?}", decision.context.runtime().trusted.budgets);
                 eprintln!(
                     "actual_small_native_admission={}",
                     serde_json::to_string(&diagnostic).unwrap()
@@ -529,7 +529,7 @@ async fn configured_small_native_schema_fixture() {
                     );
                     assert!(!decision.context.is_run());
                 } else {
-                    let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
+                    let diagnostic = format!("{:?}", decision.context.runtime().trusted.budgets);
                     eprintln!(
                         "actual_small_native_admission={}",
                         serde_json::to_string(&diagnostic).unwrap()
@@ -649,7 +649,7 @@ async fn configured_small_native_schema_fixture() {
 /// actually left is a number an operator can read.
 #[tokio::test]
 async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "file_read" })];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         let tool_specs = business_tool_specs_of(&tools_registry);
@@ -802,7 +802,7 @@ async fn the_compiled_request_event_reports_the_budgeted_and_the_prepared_totals
 /// prompt, not schema.
 #[tokio::test]
 async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_call() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NarrowSchemaTool { name: "gpio_read" })];
         let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
         // The only business capability is direct; no deferred entry remains for
@@ -923,7 +923,7 @@ async fn context_budget_counts_the_appended_prompt_sections_before_the_provider_
 #[tokio::test]
 async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
     // Q45: Post-tool-round trimming uses the reserved context window.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         // The same admitted tool supplies the wide schema and the large result,
         // so the reserved surface is the surface that actually executes.
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
@@ -1064,7 +1064,7 @@ async fn the_mid_turn_trim_after_a_tool_round_aims_at_the_reserved_window() {
 #[tokio::test]
 async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
     // Q45: Oversized schema budgeting retains current user message.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         const CURRENT_TURN_MARKER: &str = "current-turn-request-marker: use file_read";
 
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(WideSchemaTool::new("file_read"))];
@@ -1169,7 +1169,7 @@ async fn an_oversized_tool_payload_never_trims_away_the_current_user_message() {
 #[tokio::test]
 async fn the_inline_tool_result_budget_aims_at_the_reserved_window() {
     // Q45: Inline tool-result trimming respects reserved context window.
-    crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+    Box::pin(async {
         const INLINE_MARKER: &str = "inline-budget-probe-marker";
         /// Room left over once the published tool surface is reserved.
         const RESERVED_SLACK_TOKENS: usize = 400;
@@ -1433,7 +1433,7 @@ fn scripted_text_response(text: &str) -> ChatResponse {
 /// no later floor can reconstruct it.
 #[tokio::test]
 async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         const QUESTION_MARKER: &str = "mid-turn-prompt-guided-request-marker";
         const OLDER_TURN_MARKER: &str = "mid-turn-prompt-guided-older-turn-marker";
 
@@ -1578,7 +1578,7 @@ async fn the_mid_turn_trim_keeps_a_prompt_guided_request_for_the_next_iteration(
 /// envelope and the results answering it.
 #[tokio::test]
 async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         const QUESTION_MARKER: &str = "mid-turn-native-request-marker";
         const OLDER_TURN_MARKER: &str = "mid-turn-native-older-turn-marker";
 
@@ -1729,9 +1729,9 @@ async fn the_mid_turn_trim_keeps_a_native_request_and_its_tool_round_paired() {
 /// of the request, no message moved, nothing freed.
 #[tokio::test]
 async fn an_unsaturated_mid_turn_window_leaves_history_exactly_as_it_was() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         // Q45: Unsaturated context window preserves history unchanged.
-        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(async {
+        Box::pin(async {
             const QUESTION_MARKER: &str = "mid-turn-control-request-marker";
             const OLDER_TURN_MARKER: &str = "mid-turn-control-older-turn-marker";
 
@@ -1882,7 +1882,7 @@ fn role_sequence(messages: &[ChatMessage]) -> Vec<&str> {
 /// strict chat templates reject outright.
 #[tokio::test]
 async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_question() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         const QUESTION_MARKER: &str = "preflight-position-prompt-guided-marker";
         const OLDER_TURN_MARKER: &str = "preflight-position-prompt-guided-older-turn-marker";
 
@@ -2011,7 +2011,7 @@ async fn a_trim_only_preflight_opens_the_prompt_guided_second_request_on_the_que
 /// reject — rather than an adjacent `user` pair.
 #[tokio::test]
 async fn a_trim_only_preflight_opens_the_native_second_request_on_the_question() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         const QUESTION_MARKER: &str = "preflight-position-native-marker";
         const OLDER_TURN_MARKER: &str = "preflight-position-native-older-turn-marker";
 

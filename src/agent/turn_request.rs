@@ -189,8 +189,8 @@ impl ToolLoopMemory {
 /// Source-owned admission required for every model turn, including disabled mode.
 /// Only the owning service can validate the context against the ingress proof.
 pub(crate) struct TurnDecision<'a> {
-    pub(crate) service: &'a Arc<crate::runtime::turn_decision::TurnDecisionService>,
-    pub(crate) context: &'a Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    pub(crate) service: &'a Arc<crate::runtime::turn_publication::TurnRuntimeService>,
+    pub(crate) context: &'a Arc<crate::runtime::turn_context::OpenedTurn>,
     /// The turn's execution-owned runtime context (R26). It is the one the
     /// decision context was opened with; Part 2 keeps it and drops the
     /// service and the decision context.

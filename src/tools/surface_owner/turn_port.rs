@@ -10,12 +10,12 @@ use std::sync::atomic::AtomicBool;
 
 use crate::providers::catalog::ResolvedModel;
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogView, SurfacePolicy};
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use crate::tools::capability::search_tool::DiscoveryState;
 use crate::tools::capability::turn_state::TrustedParts;
 use crate::tools::execution::ToolExecutionService;
+use crate::tools::surface_owner::facts::PublicationFacts;
 
 use super::publication::PublicationRules;
 
@@ -33,7 +33,7 @@ pub(crate) trait TurnSurfacePort {
     fn config(&self) -> &crate::config::Config;
     /// The trusted scope pinned when the turn opened.
     fn trusted(&self) -> &TrustedParts;
-    fn facts(&self) -> &AdmissionFactsV1;
+    fn facts(&self) -> &PublicationFacts;
     fn routing_input(&self) -> &str;
     /// The surface published when the turn opened.
     fn execution_refs(&self) -> &BTreeSet<CapabilityRef>;

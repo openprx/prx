@@ -4,9 +4,9 @@ use crate::config::ConfigGeneration;
 use crate::decision_engine::prediction::factory::DecisionBackendFactory;
 use crate::decision_engine::prediction::factory::FactoryDeps;
 use crate::memory::Memory;
-use crate::runtime::turn_decision::TurnDecisionService;
-use crate::runtime::turn_decision::pinned_policy_version;
 use crate::runtime::turn_publication::PublicationLoopRuntime;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::pinned_policy_version;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::security::SecurityPolicy;
 use crate::security::runtime_key::DecisionKey;
@@ -23,14 +23,14 @@ use std::sync::Arc;
 /// is not limited by it, R51). The child still needs its own source/lifetime
 /// admission and per-call policy/approval checks.
 pub(crate) struct OperatorChildPublication {
-    service: Arc<TurnDecisionService>,
+    service: Arc<TurnRuntimeService>,
     source: crate::runtime::turn_source::OwnedTurnSourceProof,
     authority: crate::runtime::child_source::ParentAuthority,
 }
 
 impl OperatorChildPublication {
     pub(crate) fn capture(
-        service: Arc<TurnDecisionService>,
+        service: Arc<TurnRuntimeService>,
         runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
         source: &dyn TurnSourceProof,
         generation: &Arc<ConfigGeneration>,
@@ -85,7 +85,7 @@ impl OperatorChildPublication {
     }
 
     fn from_authority(
-        service: Arc<TurnDecisionService>,
+        service: Arc<TurnRuntimeService>,
         source: &dyn TurnSourceProof,
         authority: crate::runtime::child_source::ParentAuthority,
     ) -> Self {
@@ -154,7 +154,7 @@ impl OperatorChildPublication {
         &self,
         task: Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>,
         registry: Arc<Vec<Box<dyn Tool>>>,
-    ) -> anyhow::Result<Arc<TurnDecisionService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         anyhow::ensure!(
             std::ptr::eq(self, task.publication()),
             "operator task publication differs"
@@ -216,7 +216,7 @@ impl OperatorChildPublication {
                 events: Arc::clone(&parent.events),
             },
         )?;
-        let service = Arc::new(TurnDecisionService {
+        let service = Arc::new(TurnRuntimeService {
             runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
                 Arc::new(crate::runtime::ingress_recovery::RecoveryScope {
                     surface: TurnSurfaceKind::Worker,
@@ -327,5 +327,49 @@ impl OperatorChildPublication {
             config_generation: self.service.generation.bind_process(key)?,
             catalog: self.service.catalog.bind_process(key)?,
         })
+    }
+}
+
+impl TurnRuntimeService {
+    /// Local operator commands retain the actual Interactive publication.
+    /// This validates source provenance without inventing a model decision.
+    pub(crate) fn verify_operator_spawn_source(
+        &self,
+        source: &dyn TurnSourceProof,
+        generation: &Arc<ConfigGeneration>,
+        memory: &Arc<dyn Memory>,
+        security: &Arc<SecurityPolicy>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.surface == TurnSurfaceKind::Interactive
+                && Arc::ptr_eq(&self.generation, generation)
+                && Arc::ptr_eq(&self.memory, memory)
+                && Arc::ptr_eq(&self.security, security)
+                && self.child_scope().is_none()
+                && source.policy_channel() == "terminal"
+                && source.policy_sender() == "local-user",
+            "operator spawn differs from its actual runtime publication"
+        );
+        crate::runtime::turn_context::validate_agent_turn_origin(&self.generation, self.surface, source)?;
+        self.check_live_parity()?;
+        let entry = self
+            .catalog
+            .entry_for_public_name("sessions_spawn")
+            .context("operator spawn capability is absent from its publication")?;
+        anyhow::ensure!(
+            self.catalog_view().contains(&entry.id)
+                && entry.availability.level >= CapabilityAvailabilityLevel::Configured
+                && crate::tools::execution::decide_tool_execution(
+                    &self.security,
+                    entry.policy_tool_name(),
+                    source.policy_sender(),
+                    source.policy_channel(),
+                    source.policy_chat_type(),
+                ) != crate::tools::execution::ToolExecutionDecision::Deny,
+            "operator spawn capability is unavailable or denied by publication policy"
+        );
+        // Ask still requires the explicit command's resource-operation grant
+        // at the existing spawn gate; source validation never mints approval.
+        Ok(())
     }
 }

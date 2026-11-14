@@ -69,7 +69,7 @@ pub(super) fn attach_ledger_only(ctx: &mut super::ChannelRuntimeContext) {
     type Registry = std::collections::HashMap<usize, Weak<RecordedChannelFixtureMemory>>;
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 
-    let slot = Arc::as_ptr(&ctx.decisions) as usize;
+    let slot = Arc::as_ptr(&ctx.publication_slot) as usize;
     let registry = REGISTRY.get_or_init(|| Mutex::new(Registry::new()));
     let existing = registry
         .lock()

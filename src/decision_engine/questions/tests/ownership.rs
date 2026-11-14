@@ -15,8 +15,6 @@ fn original_compile(
     let CandidateSet::Legal {
         candidates,
         exact_mentions,
-        approval_scopes,
-        ..
     } = candidate_set
     else {
         return Err(CompileError::NoLegalPath);
@@ -202,7 +200,7 @@ fn original_compile(
     }
     omitted.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let candidate_set_hash = hash_candidate_set(candidates, exact_mentions, approval_scopes);
+    let candidate_set_hash = hash_candidate_set(candidates, exact_mentions);
     let trusted = state.trusted.parts();
     let mut parts = RequestParts {
         state: projection.clone(),
@@ -215,7 +213,7 @@ fn original_compile(
         policy_version: Arc::clone(&trusted.policy_version),
         catalog_generation: trusted.catalog_generation.to_hex(),
         omitted_questions: omitted,
-        approval_pending: trusted.approval_pending || !approval_scopes.is_empty(),
+        approval_pending: trusted.approval_pending,
     };
     loop {
         parts.state = projection.clone();
@@ -393,35 +391,21 @@ fn compiler_budget_and_invalid_model_match_original() {
 
 #[test]
 fn compiler_mention_approval_bindings_and_forced_choices_match_original() {
-    use crate::tools::capability::contract::OpId;
     let key = fixtures::key();
     let mut state = fixture(&key, 1, SideEffectClass::LocalWrite);
     let mut derived = state.derived.candidates().to_vec();
     let mentioned = derived.first_mut().expect("nonempty component candidates");
     mentioned.exact_mention = true;
-    let candidate = mentioned.candidate.clone();
-    let id = candidate.candidate_id().clone();
+    let id = mentioned.candidate.candidate_id().clone();
     state.derived = DerivedState::new(derived).unwrap();
     let mut trusted = state.trusted.parts().clone();
     trusted.approval_pending = true;
     state.trusted = TrustedState::from_runtime(trusted);
     let mut set = legal(&state);
-    let CandidateSet::Legal {
-        exact_mentions,
-        approval_scopes,
-        ..
-    } = &mut set
-    else {
+    let CandidateSet::Legal { exact_mentions, .. } = &mut set else {
         panic!("legal component fixture")
     };
-    exact_mentions.insert(id.clone());
-    approval_scopes.insert(
-        id,
-        vec![PendingApproval {
-            candidate,
-            op_ids: vec![OpId::new("prx_write_b"), OpId::new("prx_write_a")],
-        }],
-    );
+    exact_mentions.insert(id);
     let policy = CompilerPolicy {
         key: &key,
         model: Some("prx_model"),

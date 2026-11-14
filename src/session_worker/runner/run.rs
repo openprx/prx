@@ -171,7 +171,7 @@ enum WorkerSegmentSource {
 
 struct WorkerChildSegments {
     source: WorkerSegmentSource,
-    service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+    service: Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     /// The worker publication's runtime holder (R26): every segment turn must
     /// open its runtime context from this holder. The service stays until
     /// Part 2.
@@ -663,7 +663,7 @@ async fn run_owned_manifest(
             config.tool_tiering.always_exclude.iter().cloned().collect();
         excluded_names.extend(manifest.channel_excluded_tools.iter().cloned());
         Some(
-            crate::runtime::turn_publication::OrdinaryProcessDecisionPublication {
+            crate::runtime::turn_publication::OrdinaryProcessPublication {
                 authority: Arc::clone(authority),
                 registry: Arc::clone(&tools_registry),
                 security: Arc::clone(&security),
@@ -692,7 +692,7 @@ async fn run_owned_manifest(
             config.tool_tiering.always_exclude.iter().cloned().collect();
         excluded_names.extend(manifest.channel_excluded_tools.iter().cloned());
         Some(
-            crate::runtime::turn_publication::OperatorProcessDecisionPublication {
+            crate::runtime::turn_publication::OperatorProcessPublication {
                 authority: Arc::clone(authority),
                 registry: Arc::clone(&tools_registry),
                 security: Arc::clone(&security),

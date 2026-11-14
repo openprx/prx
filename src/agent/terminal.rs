@@ -727,6 +727,7 @@ pub(crate) mod persistence_probe {
 mod tests {
     use std::time::{Duration, Instant};
     mod persistence;
+    mod terminal_scope;
     use super::*;
     use crate::llm::route_decision::RouteDecision;
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
@@ -844,7 +845,7 @@ mod tests {
     fn boxed_terminal_fixture_setup<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Arc<crate::runtime::turn_decision::TurnDecisionService>>,
+        Fut: std::future::Future<Output = Arc<crate::runtime::turn_publication::TurnRuntimeService>>,
     {
         Box::pin(make_work())
     }
@@ -854,7 +855,7 @@ mod tests {
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
-    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+    ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
         bind_terminal_fixture_mode(workspace, memory, draft, cost_config, true, None).await
     }
 
@@ -865,7 +866,7 @@ mod tests {
         cost_config: &CostConfig,
         enabled: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
-    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+    ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
         bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, enabled, ingress_memory, false).await
     }
 
@@ -874,7 +875,7 @@ mod tests {
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
-    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+    ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
         bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, true, None, true).await
     }
 
@@ -886,7 +887,7 @@ mod tests {
         enabled: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
         capture_parameters: bool,
-    ) -> Arc<crate::runtime::turn_decision::TurnDecisionService> {
+    ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
         boxed_terminal_fixture_setup(move || async move {
             let scoped_retrieval = !memory.requires_scoped_execution() && memory.name() != "postgres";
             let input = if scoped_retrieval {
@@ -936,7 +937,7 @@ mod tests {
             ]);
             let observer = Arc::new(crate::observability::NoopObserver {});
             let hooks = Arc::new(crate::hooks::HookManager::new(workspace.to_path_buf()));
-            let service = crate::runtime::turn_publication::TurnDecisionPublication {
+            let service = crate::runtime::turn_publication::TurnPublication {
                 generation: Arc::clone(&generation),
                 registry: Arc::clone(&registry),
                 mcp_tool: None,
@@ -1533,9 +1534,7 @@ mod tests {
     /// A replay that carries a genuinely different settlement (other token
     /// counts, hence another amount) is rejected, leaving the ledger untouched.
     /// The provider outcome is part of the terminal decision claim, so the
-    /// claim fingerprint refuses it before any cost-settlement comparison runs;
-    /// the settlement comparison itself is covered by the unit tests in
-    /// `causal_tree::outcome`.
+    /// claim fingerprint refuses it before any cost-settlement comparison runs.
     #[tokio::test]
     async fn priced_replay_with_a_different_settlement_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
@@ -2224,7 +2223,7 @@ mod tests {
         MemoryFabric,
         CostConfig,
         TurnTerminalDraft,
-        Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     ) {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), temp.to_string_lossy());

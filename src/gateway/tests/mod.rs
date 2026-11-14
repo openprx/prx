@@ -393,7 +393,7 @@ where
             Arc::clone(&state.provider),
             resolved,
         ))),
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(
             crate::runtime::bootstrap::build_security_policy(config),
             0,
         )),
@@ -404,7 +404,7 @@ where
         tools_registry: Arc::clone(&state.tools_registry),
         mcp_tool: state.mcp_tool.clone(),
     };
-    let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+    let cleanup = Arc::clone(&runtime.publication_slot.cleanup);
     let owner = Arc::new(GatewayTurnRuntimeOwner::new(
         runtime,
         Arc::clone(&state.config),
@@ -517,7 +517,7 @@ where
                     Arc::clone(&provider),
                     resolved,
                 ))),
-                decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+                publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(security, 0)),
                 config_generation: state.config.pin(),
                 provider,
                 model,
@@ -525,7 +525,7 @@ where
                 tools_registry: Arc::clone(&state.tools_registry),
                 mcp_tool: None,
             };
-            let cleanup = Arc::clone(&runtime.decision_slot.cleanup);
+            let cleanup = Arc::clone(&runtime.publication_slot.cleanup);
             let owner = Arc::new(GatewayTurnRuntimeOwner::new(
                 runtime,
                 Arc::clone(&state.config),
@@ -813,7 +813,7 @@ fn install_webhook_turn_runtime(state: &mut AppState) {
             Arc::clone(&state.provider),
             resolved,
         ))),
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::new(security, 0)),
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::new(security, 0)),
         config_generation: generation,
         provider: Arc::clone(&state.provider),
         model: model.clone(),

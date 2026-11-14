@@ -2,7 +2,8 @@
 use crate::agent::context_budget::{estimate_history_tokens_with_source, estimate_request_tokens};
 use crate::agent::turn_context::measure_native_tool_payload_for;
 use crate::providers::ChatMessage;
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::execution::admission::CallTokenBudget;
 use crate::tools::{ToolSchemaDialect, ToolSpec};
@@ -51,7 +52,7 @@ impl Drop for HookReset {
 }
 
 /// Live remaining G6 tokens of one turn. Shared by send and dispatch admission.
-pub(crate) fn live_g6_tokens(context: &TurnDecisionContext) -> u64 {
+pub(crate) fn live_g6_tokens(context: &OpenedTurn) -> u64 {
     context.runtime().remaining_g6_tokens().min(send_token_cap())
 }
 
@@ -68,8 +69,8 @@ const fn send_token_cap() -> u64 {
 /// The called-tool budget for one model turn: the live G6 tokens and the
 /// candidate estimator over the pinned route's model and pricing.
 pub(crate) fn call_token_budget(
-    service: &TurnDecisionService,
-    context: &Arc<TurnDecisionContext>,
+    service: &TurnRuntimeService,
+    context: &Arc<OpenedTurn>,
     proof: &dyn TurnSourceProof,
 ) -> Result<CallTokenBudget> {
     // Fail closed: if the route budget cannot be read, the model turn fails
@@ -113,7 +114,7 @@ pub(crate) fn call_token_budget(
 /// Refuses first, as [`admit_provider_send`] would, when the served model has
 /// no usable price, so a turn whose main send will be refused never pays for
 /// an auxiliary call.
-pub(crate) fn protected_first_send(service: &TurnDecisionService, proof: &dyn TurnSourceProof) -> Result<(u64, u64)> {
+pub(crate) fn protected_first_send(service: &TurnRuntimeService, proof: &dyn TurnSourceProof) -> Result<(u64, u64)> {
     let limits = service
         .send_limits(proof)
         .context("provider send budget cannot be established")?;
@@ -181,8 +182,8 @@ fn unpriced_refusal(
 /// The request size and the response reserve feed only the priced estimate, so
 /// an unknown price, measurement or ledger also refuses.
 pub(crate) fn admit_provider_send(
-    service: &TurnDecisionService,
-    context: &TurnDecisionContext,
+    service: &TurnRuntimeService,
+    context: &OpenedTurn,
     proof: &dyn TurnSourceProof,
     messages: &[ChatMessage],
     tools: Option<&[ToolSpec]>,

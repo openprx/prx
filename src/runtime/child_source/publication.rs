@@ -7,9 +7,11 @@ mod ordinary_process;
 pub(crate) use ordinary_process::OrdinaryProcessLaunch;
 
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
+use crate::runtime::turn_context::OpenedTurn;
 use crate::runtime::turn_context::validate_agent_turn_origin;
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService, pinned_policy_version};
 use crate::runtime::turn_publication::PublicationLoopRuntime;
+use crate::runtime::turn_publication::TurnRuntimeService;
+use crate::runtime::turn_publication::service::pinned_policy_version;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
@@ -27,10 +29,10 @@ use std::sync::atomic::Ordering;
 pub(crate) struct OrdinaryChildPublication(Arc<OrdinaryChildPublicationInner>);
 
 struct OrdinaryChildPublicationInner {
-    context: Arc<TurnDecisionContext>,
+    context: Arc<OpenedTurn>,
     authority: crate::runtime::child_source::ParentAuthority,
     scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-    service: Arc<TurnDecisionService>,
+    service: Arc<TurnRuntimeService>,
     source: crate::runtime::turn_source::OwnedTurnSourceProof,
 }
 
@@ -70,8 +72,8 @@ impl OrdinaryChildPublication {
     }
 
     pub(in crate::runtime) fn capture(
-        service: &Arc<TurnDecisionService>,
-        context: &Arc<TurnDecisionContext>,
+        service: &Arc<TurnRuntimeService>,
+        context: &Arc<OpenedTurn>,
         source: &dyn TurnSourceProof,
         authority: crate::runtime::child_source::ParentAuthority,
         requested: &[CapabilityRef],
@@ -162,7 +164,7 @@ impl OrdinaryChildPublication {
         &self,
         caller: &crate::tools::ToolExecutionContext,
         allowed_tools: Option<BTreeSet<String>>,
-    ) -> anyhow::Result<Arc<TurnDecisionService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         self.verify_caller(caller)?;
         self.derive_child_service(allowed_tools, None, None, &[])
     }
@@ -173,7 +175,7 @@ impl OrdinaryChildPublication {
         registry: Arc<Vec<Box<dyn Tool>>>,
         allowed_tools: Option<BTreeSet<String>>,
         excluded_tools: &[String],
-    ) -> anyhow::Result<Arc<TurnDecisionService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         anyhow::ensure!(self == task.publication(), "ordinary task publication differs");
         task.verify()?;
         self.derive_child_service(allowed_tools, Some(task), Some(registry), excluded_tools)
@@ -185,7 +187,7 @@ impl OrdinaryChildPublication {
         task: Option<Arc<super::ordinary_task::OrdinaryTaskAuthority>>,
         task_registry: Option<Arc<Vec<Box<dyn Tool>>>>,
         excluded_tools: &[String],
-    ) -> anyhow::Result<Arc<TurnDecisionService>> {
+    ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         let runtime = self.loop_runtime()?.clone();
         let parent = &self.0.service;
         let (registry, execution) = task_registry.map_or_else(
@@ -235,7 +237,7 @@ impl OrdinaryChildPublication {
             },
         )?
         .with_unproven_budget_gate();
-        Ok(Arc::new(TurnDecisionService {
+        Ok(Arc::new(TurnRuntimeService {
             runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
                 Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
                     Arc::clone(&parent.memory),

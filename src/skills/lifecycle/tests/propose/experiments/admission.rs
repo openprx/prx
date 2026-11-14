@@ -21,7 +21,7 @@ fn native(config: &Config) -> Result<(tempfile::TempDir, AgentCaseExecutor)> {
 #[tokio::test]
 async fn durable_reference_blocks_concurrent_regular_writers_before_first_handoff_then_terminal_allows_finish()
 -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -175,7 +175,7 @@ async fn durable_reference_blocks_concurrent_regular_writers_before_first_handof
 
 #[tokio::test]
 async fn uncertain_two_write_admission_never_sends_refunds_or_automatically_retries() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let server = Server::start(false).await?;
         let result = async {
             for (point, indexed) in [
@@ -296,7 +296,7 @@ async fn uncertain_two_write_admission_never_sends_refunds_or_automatically_retr
 
 #[tokio::test]
 async fn controlled_pre_handoff_cancel_records_terminal_zero_cases_without_refunding_attempt() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -389,7 +389,7 @@ impl CaseExecutor for FailedCleanup {
 
 #[tokio::test]
 async fn valid_failed_cleanup_receipt_retains_own_lease_without_global_history_block() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;
@@ -475,7 +475,7 @@ async fn valid_failed_cleanup_receipt_retains_own_lease_without_global_history_b
 
 #[tokio::test]
 async fn holdout_refuses_a_successful_verifier_with_the_wrong_persisted_pin() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

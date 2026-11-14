@@ -1730,7 +1730,7 @@ pub(crate) async fn run_with_runtime_envelope(
     if scheduled_admission.is_some() {
         let cleanup = crate::runtime::turn_cleanup::current_tracker()
             .ok_or_else(|| anyhow::anyhow!("scheduled cleanup owner is missing"))?;
-        if let Some(service) = &ctx.turn_decisions {
+        if let Some(service) = &ctx.turn_service {
             cleanup.retain_service(Arc::clone(service));
         }
     }
@@ -1928,7 +1928,7 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 let decision_turn = {
                     let service = ctx
-                        .turn_decisions
+                        .turn_service
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("agent decision service is missing"))?;
                     let proof = if let Some(admission) = &scheduled_admission {
@@ -2429,7 +2429,7 @@ pub(crate) async fn run_with_runtime_envelope(
 
                 let decision_turn = {
                     let service = ctx
-                        .turn_decisions
+                        .turn_service
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("interactive agent decision service is missing"))?;
                     let proof = issue_cli_agent_turn_proof_for_session(
@@ -2756,7 +2756,7 @@ pub(crate) async fn run_with_runtime_envelope(
         None => work.await,
     };
     if scheduled_admission.is_none() {
-        if let Some(service) = &ctx.turn_decisions {
+        if let Some(service) = &ctx.turn_service {
             service
                 .shutdown(Instant::now() + std::time::Duration::from_secs(2))
                 .await;

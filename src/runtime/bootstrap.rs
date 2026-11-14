@@ -118,7 +118,7 @@ pub struct AppContext {
     pub(crate) mcp_tool: Option<Arc<tools::McpTool>>,
     /// AgentLoop's decision service published from the same finalized tool
     /// registry. Interactive appends tools later and publishes at that point.
-    pub(crate) turn_decisions: Option<Arc<super::turn_decision::TurnDecisionService>>,
+    pub(crate) turn_service: Option<Arc<crate::runtime::turn_publication::TurnRuntimeService>>,
     /// Owned base tool registry for the `Interactive` (chat) profile only.
     ///
     /// `Box<dyn Tool>` is not `Clone`, so a shared `Arc<Vec<…>>` cannot be
@@ -272,12 +272,12 @@ impl AppContext {
     /// Publish from the finalized registry owned by the ingress. Interactive
     /// chat calls this only after appending its session tools; the base registry
     /// is not a capability authority for a running chat session.
-    pub(crate) async fn publish_turn_decisions(
+    pub(crate) async fn publish_turn_runtimes(
         &self,
         registry: Arc<Vec<Box<dyn Tool>>>,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
-    ) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
-        super::turn_publication::TurnDecisionPublication {
+    ) -> Result<Arc<crate::runtime::turn_publication::TurnRuntimeService>> {
+        super::turn_publication::TurnPublication {
             generation: Arc::clone(&self.config_generation),
             registry,
             mcp_tool: self.mcp_tool.clone(),
@@ -650,7 +650,7 @@ impl RuntimeBootstrap {
             memory,
             tools,
             mcp_tool,
-            turn_decisions: None,
+            turn_service: None,
             base_tools,
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime,
@@ -662,9 +662,9 @@ impl RuntimeBootstrap {
                 .tools
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("AgentLoop decision publication requires its tool registry"))?;
-            context.turn_decisions = Some(
+            context.turn_service = Some(
                 context
-                    .publish_turn_decisions(Arc::clone(registry), agent_surface)
+                    .publish_turn_runtimes(Arc::clone(registry), agent_surface)
                     .await?,
             );
         }
@@ -803,7 +803,7 @@ mod tests {
             "AgentLoop must retain its registry MCP instance"
         );
         assert!(
-            ctx.turn_decisions.is_some(),
+            ctx.turn_service.is_some(),
             "AgentLoop must publish its decision service"
         );
         assert!(

@@ -37,7 +37,7 @@ use super::loop_prompt::{
     prompt_guided_tool_protocol_has_one_production_owner, runtime_prompt_has_no_parallel_tool_description_catalog,
 };
 use super::loop_requests::{
-    every_loop_engine_call_receives_a_turn_decision_context, production_turns_pass_a_context_budget_to_the_loop_engine,
+    every_loop_engine_call_receives_an_opened_turn, production_turns_pass_a_context_budget_to_the_loop_engine,
 };
 use super::memory::{
     every_memory_read_principal_built_from_a_context_carries_the_owner_scope,
@@ -63,6 +63,7 @@ use super::tool_tests::{
     every_non_tool_execute_call_site_shows_its_type_evidence, non_tool_closure_providers_match_their_definitions,
     non_tool_execute_call_sites_match_their_declared_occurrences,
 };
+use super::turn_state::trust_bearing_turn_state_is_built_only_by_the_turn_opening;
 use std::fs;
 /// Tree scanners that deliberately inventory test code as well, with the
 /// reason. Every other function that walks the source tree must separate
@@ -354,16 +355,43 @@ planted_violation_probes! {
     probe_outbound_owner: outbound_middleware_has_one_production_owner,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_outbound() {\n    let _ = MiddlewareStage::Outbound;\n}\n";
-    probe_decision_required: every_loop_engine_call_receives_a_turn_decision_context,
+    probe_trusted_state_caller: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_trust(parts: TrustedParts) -> TrustedState {\n    TrustedState::from_runtime(parts)\n}\n";
+    probe_trusted_state_function_value: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_map(parts: Vec<TrustedParts>) -> Vec<TrustedState> {\n    parts.into_iter().map(TrustedState::from_runtime).collect()\n}\n";
+    probe_observed_step_caller: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_step(id: CandidateId) -> ObservedStep {\n    ObservedStep::recorded_by_runtime(kind, status, Some(id), None)\n}\n";
+    probe_observed_step_alias: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "use crate::decision_engine::state::ObservedStep as Step;\npub fn d0_planted_alias() -> Step {\n    Step::recorded_by_runtime(kind, status, None, None)\n}\n";
+    probe_observed_assignment: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_observed(state: &mut CausalState, observed: ObservedState) {\n    state.observed = observed;\n}\n";
+    probe_observed_mem_replace: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_replace(state: &mut CausalState, observed: ObservedState) {\n    let _ = std::mem::replace(&mut state.observed, observed);\n}\n";
+    probe_trusted_mem_swap: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_swap(state: &mut CausalState, trusted: &mut TrustedState) {\n    std::mem::swap(&mut state.trusted, trusted);\n}\n";
+    probe_trusted_parts_literal: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_parts() -> TrustedParts {\n    TrustedParts { workspace_id }\n}\n";
+    probe_trusted_parts_borrowed_literal: trust_bearing_turn_state_is_built_only_by_the_turn_opening,
+        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_borrow() {\n    let _ = &TrustedParts { workspace_id };\n}\n";
+    probe_decision_required: every_loop_engine_call_receives_an_opened_turn,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         planted_engine_call!(
             "a15",
             "TurnRouting::Routed { tiering: &config.tool_tiering, input: RoutingInput::LastUserMessage, unrouted: a2 }"
         );
-    probe_decision_none: every_loop_engine_call_receives_a_turn_decision_context,
+    probe_decision_none: every_loop_engine_call_receives_an_opened_turn,
         "src/agent/entry.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub async fn d0_planted_turn() { run_turn(&mut history, TurnRequest { decision: None }, services, delivery).await; }";
-    probe_decision_unreviewed_entry: every_loop_engine_call_receives_a_turn_decision_context,
+    probe_decision_unreviewed_entry: every_loop_engine_call_receives_an_opened_turn,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub async fn d0_planted_turn() { run_turn(&mut history, TurnRequest { decision: admitted_turn.routing() }, services, delivery).await; }";
     probe_budget_present: production_turns_pass_a_context_budget_to_the_loop_engine,
@@ -771,7 +799,7 @@ fn mutation_proof_compaction_producer_guard() {
     );
     assert_reviewed_source_mutation(
         forwarded_compaction_values_are_produced_from_the_effective_window,
-        "src/runtime/turn_decision.rs",
+        "src/runtime/turn_publication/service.rs",
         "self.publication_scope().agent_budget_snapshot(proof)",
         "unreviewed_budget_snapshot(self, proof)",
     );

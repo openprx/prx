@@ -969,9 +969,6 @@ fn access_spies_observe_actual_store_and_credential_sites() {
 /// state, question compiler, builtin prediction, turn analysis), repeatably.
 #[tokio::test]
 async fn analysis_is_identical_before_and_after_core_move() {
-    use crate::causal_tree::gates::GateInputs;
-    use crate::causal_tree::hard_gates_probe::HardGatesProbe;
-    use crate::decision_engine::admission_probe::{AdmissionProbe, AdvisoryProbe};
     use crate::decision_engine::candidate_generator::{
         CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
     };
@@ -981,7 +978,6 @@ async fn analysis_is_identical_before_and_after_core_move() {
     use crate::runtime::decision_advisory::DecisionAdvisory;
     use crate::runtime::decision_advisory::tests::{analysis_input, enabled_config};
     use crate::tools::capability::catalog::CatalogScope;
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1012,10 +1008,6 @@ async fn analysis_is_identical_before_and_after_core_move() {
         .catalog
         .view(&CatalogScope::default())
         .with_surface(&input.publication_policy);
-    let calls = BTreeMap::new();
-    let replayed = BTreeSet::new();
-    let gates: GateInputs<'_> =
-        crate::runtime::decision_advisory::gate_inputs(&input.facts, &calls, BTreeMap::new(), &replayed);
     let observed_latency = BTreeMap::new();
     let cost_model =
         crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &config, &observed_latency);
@@ -1029,20 +1021,7 @@ async fn analysis_is_identical_before_and_after_core_move() {
         cost_model: &cost_model,
         discovered_refs: &discovered,
     };
-    let probe = HardGatesProbe {
-        state: &input.state,
-        catalog: &view,
-        gates: &gates,
-    };
-    let candidates = CausalCandidateGenerator::generate(
-        &input.state,
-        &view,
-        &policy,
-        &AdvisoryProbe {
-            inner: &probe as &dyn AdmissionProbe,
-        },
-    )
-    .expect("test: candidates");
+    let candidates = CausalCandidateGenerator::generate(&input.state, &view, &policy).expect("test: candidates");
     let CandidateSet::Legal { candidates: legal, .. } = &candidates else {
         panic!("test: the fixture has a legal candidate set");
     };

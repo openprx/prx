@@ -82,7 +82,7 @@ async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() 
                         .await;
                         // Observe the actual admitted fixture before the original engine assertions.
                         let decision = admission.decision();
-                        let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
+                        let diagnostic = format!("{:?}", decision.context.runtime().trusted.budgets);
                         eprintln!(
                             "actual_parallel_admission={}",
                             serde_json::to_string(&diagnostic).unwrap()
@@ -494,7 +494,7 @@ async fn admitted_with_direct(
 
 #[tokio::test]
 async fn tool_loop_refreshes_only_published_dynamic_capabilities() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let skill_refreshes = Arc::new(AtomicUsize::new(0));
         let mcp_refreshes = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
@@ -675,7 +675,7 @@ async fn tool_loop_refreshes_only_published_dynamic_capabilities() {
 
 #[tokio::test]
 async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let provider = PayloadCapturingProvider {
             captured: Arc::clone(&captured),
@@ -771,7 +771,7 @@ async fn prompt_guided_provider_receives_only_the_compiled_turn_tool_snapshot() 
 
 #[tokio::test]
 async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let provider = ScriptedProvider::from_text_responses(vec![
             "<tool_call>\n{\"name\":\"mcp_status\",\"arguments\":{}}\n</tool_call>",
             "done",
@@ -858,7 +858,7 @@ async fn tool_loop_rejects_a_registered_tool_not_exposed_for_the_turn() {
 
 #[tokio::test]
 async fn turn_exposure_guard_preserves_unknown_tool_diagnostics() {
-    crate::runtime::turn_decision::with_scored_prediction(async {
+    Box::pin(async {
         let provider = ScriptedProvider::from_text_responses(vec![
             "<tool_call>\n{\"name\":\"invented_probe\",\"arguments\":{}}\n</tool_call>",
             "done",
@@ -974,77 +974,74 @@ impl Provider for HangingProvider {
 #[tokio::test(start_paused = true)]
 async fn production_turn_that_hangs_is_terminated_by_the_idle_detector() {
     // Q52: evidence prerequisite only; preserve idle watchdog failure and reason.
-    q79_boxed_fixture_work(
-        crate::runtime::turn_decision::evidence_fixture::with_evidence_sufficient(q79_boxed_fixture_work(async {
-            let provider = HangingProvider;
-            let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("hang please")];
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
-            let observer = NoopObserver;
+    q79_boxed_fixture_work(Box::pin(q79_boxed_fixture_work(async {
+        let provider = HangingProvider;
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("hang please")];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
 
-            let workspace = TempDir::new().expect("idle fixture workspace");
-            let admission =
-                crate::agent::turn_tests::admission::AdmittedTurn::empty(workspace.path(), "hang please").await;
+        let workspace = TempDir::new().expect("idle fixture workspace");
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::empty(workspace.path(), "hang please").await;
 
-            let guard = crate::agent::idle::IdleGuard {
-                idle: Some(Duration::from_millis(300)),
-            };
-            let error = crate::agent::idle::with_guard(guard, async {
-                run_turn(
-                    &mut history,
-                    crate::agent::turn_request::TurnRequest {
-                        advice: None,
-                        channel_name: "telegram",
-                        scope: None,
-                        // no document ingest
-                        mode: ChatMode::default(),
-                        silent: true,
-                        expose_stay_silent: false,
-                        multimodal: &crate::config::MultimodalConfig::default(),
-                        schedule: crate::agent::turn_request::TurnSchedule {
-                            read_only_tool_concurrency_window: 2,
-                            priority_scheduling_enabled: false,
-                            low_priority_tool_names: Vec::new(),
-                        },
-                        compaction: None,
-                        decision: admission.decision(),
+        let guard = crate::agent::idle::IdleGuard {
+            idle: Some(Duration::from_millis(300)),
+        };
+        let error = crate::agent::idle::with_guard(guard, async {
+            run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    advice: None,
+                    channel_name: "telegram",
+                    scope: None,
+                    // no document ingest
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
                     },
-                    crate::agent::turn_request::TurnServices {
-                        provider: &provider,
-                        provider_name: "ollama",
-                        model: "prx-local-model",
-                        temperature: 0.0,
-                        tools_registry: Arc::new(tools_registry),
-                        observer: &observer,
-                        hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
-                        approval: None,
-                        approval_resolver: None,
-                        runtime_adapter: Some(admission.adapter()),
-                        // no tool tiering
-                        memory: ToolLoopMemory::none(),
-                    },
-                    crate::agent::turn_request::TurnDelivery {
-                        cancellation: None,
-                        on_delta: None,
-                        // no scope context
-                        on_tool_call: None,
-                    },
-                )
-                .await
-                .map(|(outcome, _trace)| outcome.into_text())
-            })
+                    compaction: None,
+                    decision: admission.decision(),
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry: Arc::new(tools_registry),
+                    observer: &observer,
+                    hooks: &crate::hooks::HookManager::new(workspace.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    // no tool tiering
+                    memory: ToolLoopMemory::none(),
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    // no scope context
+                    on_tool_call: None,
+                },
+            )
             .await
-            .expect_err("a turn whose provider never responds must be terminated");
+            .map(|(outcome, _trace)| outcome.into_text())
+        })
+        .await
+        .expect_err("a turn whose provider never responds must be terminated");
 
-            assert!(
-                crate::agent::idle::is_hang_termination(&error),
-                "the production loop must surface a hang termination, got: {error}"
-            );
-            assert!(
-                error.to_string().contains("no observable progress"),
-                "the message must say why: {error}"
-            );
-        })),
-    )
+        assert!(
+            crate::agent::idle::is_hang_termination(&error),
+            "the production loop must surface a hang termination, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("no observable progress"),
+            "the message must say why: {error}"
+        );
+    })))
     .await;
 }
 

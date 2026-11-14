@@ -2,13 +2,13 @@
 //! source issuance, readback and normal decision admission, never a fake grant.
 use super::{ChatAdmissionMode, ChatProviderBinding, ChatSourceReceipt};
 use crate::memory::MemoryFabric;
-use crate::runtime::turn_publication::TurnDecisionPublication;
+use crate::runtime::turn_publication::TurnPublication;
 use crate::runtime::turn_source::TurnSourceProof as _;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
 pub(crate) async fn spawn(
-    publication: TurnDecisionPublication,
+    publication: TurnPublication,
     provider: Arc<dyn crate::providers::Provider>,
     arguments: serde_json::Value,
 ) -> Result<crate::tools::ToolResult> {

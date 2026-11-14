@@ -418,7 +418,7 @@ impl ChatOperatorSpawn {
         memory: Arc<dyn Memory>,
         session: &str,
         security: Arc<crate::security::SecurityPolicy>,
-        publication: Arc<crate::runtime::turn_decision::TurnDecisionService>,
+        publication: Arc<crate::runtime::turn_publication::TurnRuntimeService>,
     ) -> anyhow::Result<(serde_json::Value, crate::runtime::operator_spawn::OperatorSpawnSource)> {
         let generation = &self.binding.generation;
         let run = uuid::Uuid::new_v4().to_string();
@@ -529,8 +529,8 @@ struct CapturedChatTrace {
 
 pub(super) struct ChatDecision {
     pub(super) advice: Option<crate::decision_engine::IntentAnalysis>,
-    pub(super) service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
-    pub(super) context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
+    pub(super) service: Arc<crate::runtime::turn_publication::TurnRuntimeService>,
+    pub(super) context: Arc<crate::runtime::turn_context::OpenedTurn>,
 }
 
 impl std::fmt::Debug for ChatTurnBinding {

@@ -1,25 +1,21 @@
 #![cfg(test)]
-//! Golden: the execution-owned publication rules reproduce the pre-strip
-//! direct surface (`direct_answer_refs` over the hard gates' capability
-//! publication scope) in Supervised, read-only and Full turns.
+//! The execution-owned publication rules: turn scope and child-manifest
+//! membership per autonomy level.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::causal_tree::gates::{GateInputs, GateOutcome, HardGates};
-use crate::decision_engine::candidate::{CandidateSpec, CausalCandidate};
+use super::facts::PublicationFacts;
 use crate::decision_engine::state::fixtures;
 use crate::security::{AutonomyLevel, SecurityPolicy};
-use crate::tools::capability::admission_facts::AdmissionFactsV1;
-use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, Exposure, SurfacePolicy};
-use crate::tools::capability::contract::{CapabilityRef, CausalActionKind, CostEstimate, SideEffectClass};
-use crate::tools::capability::turn_state::{ConstraintCode, SideEffectMode, TrustedParts, TrustedState};
+use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
+use crate::tools::capability::contract::CostEstimate;
+use crate::tools::capability::turn_state::{ConstraintCode, SideEffectMode, TrustedParts};
 use crate::tools::traits::{Tool, ToolResult};
 
-use super::publication::{PublicationRules, entry_ref, is_delegator};
+use super::publication::{PublicationRules, entry_ref};
 
 struct FixtureTool(&'static str);
 
@@ -43,60 +39,6 @@ impl Tool for FixtureTool {
     }
 }
 
-/// The pre-strip `direct_answer_refs` for a turn without an outgoing child:
-/// Direct entries, minus turn restrictions, minus hard-gate publication
-/// blocks.
-fn pre_strip_direct_surface(
-    state: &crate::decision_engine::state::CausalState,
-    catalog: &crate::tools::capability::catalog::CatalogView<'_>,
-    gates: &GateInputs<'_>,
-) -> BTreeSet<CapabilityRef> {
-    if !gates.model_can_call_tools {
-        return BTreeSet::new();
-    }
-    let trusted = state.trusted.parts();
-    catalog
-        .iter_entries()
-        .filter_map(|entry| {
-            let delegation = is_delegator(&entry.public_name);
-            let reference = entry_ref(entry);
-            if !matches!(entry.exposure, Exposure::Direct) {
-                return None;
-            }
-            if trusted.constraints.iter().any(|code| {
-                code.as_str() == "tools_off" || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
-            }) || trusted.side_effect_mode == SideEffectMode::ReadOnly && entry.effect > SideEffectClass::ReadOnly
-            {
-                return None;
-            }
-            let candidate = CausalCandidate::new(
-                if delegation {
-                    CausalActionKind::Delegate
-                } else {
-                    CausalActionKind::UseTool
-                },
-                entry.family,
-                CandidateSpec {
-                    namespace: None,
-                    required_capabilities: vec![reference.clone()],
-                    side_effect: entry.effect,
-                    approval: entry.approval.clone(),
-                    // A zero-cost, zero-latency candidate passes G6-G8, so the
-                    // hard gates' outcome is exactly their G1-G5 publication
-                    // scope (the retired `check_capability_publication`).
-                    estimated_cost: Some(CostEstimate {
-                        tokens: 0,
-                        micro_usd: 0,
-                    }),
-                    estimated_latency_ms: Some(0),
-                },
-            );
-            let publication = HardGates::check_one(state, catalog, &candidate, gates);
-            (!matches!(publication, GateOutcome::Blocked { .. })).then_some(reference)
-        })
-        .collect()
-}
-
 fn trusted_for(catalog: &CapabilityCatalog, mode: SideEffectMode, constraints: &[&'static str]) -> TrustedParts {
     let mut trusted = fixtures::trusted();
     trusted.catalog_generation = *catalog.generation();
@@ -107,8 +49,8 @@ fn trusted_for(catalog: &CapabilityCatalog, mode: SideEffectMode, constraints: &
     trusted
 }
 
-fn facts_for(policy: Arc<SecurityPolicy>) -> AdmissionFactsV1 {
-    AdmissionFactsV1 {
+fn facts_for(policy: Arc<SecurityPolicy>) -> PublicationFacts {
+    PublicationFacts {
         policy,
         owner_id: Arc::from("owner-1"),
         sender: Arc::from("owner-1"),
@@ -120,87 +62,6 @@ fn facts_for(policy: Arc<SecurityPolicy>) -> AdmissionFactsV1 {
         child_scope: None,
         child_discovery: false,
         child_served: None,
-    }
-}
-
-#[test]
-fn publication_rules_match_pre_strip_direct_surface() {
-    // The fixture surface of `engine_switch::tool_surface_is_built_without_decision_service`
-    // and `default_config_discovered_tool_is_published_then_dispatched`:
-    // read-only, local-write, process and delegation capabilities.
-    let registry: Vec<Box<dyn Tool>> = vec![
-        Box::new(FixtureTool("memory_recall")),
-        Box::new(FixtureTool("file_read")),
-        Box::new(FixtureTool("file_write")),
-        Box::new(FixtureTool("shell")),
-        Box::new(FixtureTool("delegate")),
-    ];
-    let catalog = CapabilityCatalog::build(&registry, &CatalogSources::default(), &SurfacePolicy::default())
-        .expect("test: catalog");
-    let view = catalog.view(&CatalogScope::default());
-    let key = fixtures::key();
-    let cells: [(AutonomyLevel, SideEffectMode, &[&'static str]); 6] = [
-        (AutonomyLevel::Supervised, SideEffectMode::ApprovalRequired, &[]),
-        (
-            AutonomyLevel::Supervised,
-            SideEffectMode::ApprovalRequired,
-            &["intercepts_writes"],
-        ),
-        (
-            AutonomyLevel::Supervised,
-            SideEffectMode::ApprovalRequired,
-            &["tools_off"],
-        ),
-        (AutonomyLevel::ReadOnly, SideEffectMode::ReadOnly, &[]),
-        (AutonomyLevel::Full, SideEffectMode::GuardedWrite, &[]),
-        (
-            AutonomyLevel::Full,
-            SideEffectMode::GuardedWrite,
-            &["intercepts_writes"],
-        ),
-    ];
-    for (level, mode, constraints) in cells {
-        let policy = Arc::new(SecurityPolicy {
-            autonomy: level,
-            ..SecurityPolicy::default()
-        });
-        let trusted = trusted_for(&catalog, mode, constraints);
-        let facts = facts_for(Arc::clone(&policy));
-        let mut state = fixtures::state(&key, "neutral request");
-        state.trusted = TrustedState::from_runtime(trusted.clone());
-        let calls = BTreeMap::new();
-        let replayed = BTreeSet::new();
-        let gates = GateInputs {
-            policy: &policy,
-            owner_id: "owner-1",
-            sender: "owner-1",
-            policy_channel: "terminal",
-            chat_type: "dm",
-            model_ref: "anthropic:claude",
-            model_can_chat: true,
-            model_can_call_tools: true,
-            decision_endpoint_ready: true,
-            child_scope: None,
-            verified_approval_calls: BTreeMap::new(),
-            call_fingerprints: &calls,
-            failed_call_counts: BTreeMap::new(),
-            replayed_non_idempotent: &replayed,
-            retry_limit: None,
-        };
-        let expected = pre_strip_direct_surface(&state, &view, &gates);
-        let rules = PublicationRules {
-            trusted: &trusted,
-            facts: &facts,
-            catalog: &view,
-        };
-        let published = rules.direct_surface(false, &|_| None);
-        assert_eq!(
-            published, expected,
-            "direct surface differs for {level:?} / {constraints:?}"
-        );
-        assert!(rules.turn_scope_admits(), "turn scope refused for {level:?}");
-        // No resume and no outgoing child: the turn surface is the direct core.
-        assert_eq!(rules.surface(false, &|_| None), expected);
     }
 }
 

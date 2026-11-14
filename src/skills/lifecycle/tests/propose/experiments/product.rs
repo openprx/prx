@@ -34,7 +34,7 @@ fn instruction_plan(
 
 #[tokio::test]
 async fn product_between_stages_is_incomplete_and_only_the_owned_run_can_confirm_root_drain() -> Result<()> {
-    crate::runtime::turn_decision::with_scored_publication("skill", async {
+    Box::pin(async {
         let f = fixture();
         let pattern = usable_pattern(&f);
         let server = Server::start(false).await?;

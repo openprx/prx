@@ -152,7 +152,7 @@ async fn admit_start_turn_fixture(
     );
     let generation = crate::config::new_shared(config).pin();
     let ledger: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(&generation.effective.workspace_dir)?);
-    let service = crate::runtime::turn_publication::TurnDecisionPublication {
+    let service = crate::runtime::turn_publication::TurnPublication {
         generation: Arc::clone(&generation),
         registry,
         mcp_tool: None,

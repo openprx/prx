@@ -13,7 +13,7 @@ pub(super) fn compact_rust_tokens(expression: &str) -> String {
 }
 
 #[test]
-pub(super) fn every_loop_engine_call_receives_a_turn_decision_context() {
+pub(super) fn every_loop_engine_call_receives_an_opened_turn() {
     let mut actual = BTreeMap::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
@@ -54,7 +54,7 @@ pub(super) fn every_loop_engine_call_receives_a_turn_decision_context() {
             for binding in [
                 "let(source_receipt,gateway_user_event,mutadmission_guard)=pending_input.record(message.to_owned(),fabric_ctx.idempotency_key.clone()).await?;",
                 "letgateway_proof=source_receipt.bind(&turn_runtime,fabric_ctx)?;",
-                "letservice=turn_runtime.decision_slot.publish(&turn_runtime,state).await?;",
+                "letservice=turn_runtime.publication_slot.publish(&turn_runtime,state).await?;",
                 "letcontext=service.open_issued_turn_context(&gateway_proof,crate::runtime::turn_context::AgentTurnKind::SingleShot,&cancellation,).await?;",
             ] {
                 assert_eq!(

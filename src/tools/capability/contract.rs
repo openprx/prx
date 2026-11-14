@@ -23,7 +23,6 @@ pub(crate) enum CausalActionKind {
     UseTool,
     Delegate,
     Clarify,
-    RequestApproval,
     Refuse,
 }
 
@@ -35,14 +34,13 @@ pub(crate) mod causal_action_test_support {
 
     impl CausalActionKind {
         /// Every action kind, in declaration order.
-        pub(crate) const ALL: [Self; 8] = [
+        pub(crate) const ALL: [Self; 7] = [
             Self::Answer,
             Self::Retrieve,
             Self::Discover,
             Self::UseTool,
             Self::Delegate,
             Self::Clarify,
-            Self::RequestApproval,
             Self::Refuse,
         ];
     }
@@ -58,7 +56,6 @@ impl CausalActionKind {
             Self::UseTool => "use_tool",
             Self::Delegate => "delegate",
             Self::Clarify => "clarify",
-            Self::RequestApproval => "request_approval",
             Self::Refuse => "refuse",
         }
     }
@@ -170,7 +167,7 @@ pub(crate) enum ApprovalRequirement {
 
 impl ApprovalRequirement {
     /// The state v1 code: `none` or `required`. Live grants are verified per
-    /// call through `GateInputs`, never carried on the candidate.
+    /// call at dispatch, never carried on the candidate.
     pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::None => "none",

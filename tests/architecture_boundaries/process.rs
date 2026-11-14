@@ -659,7 +659,7 @@ pub(super) fn native_working_root_selection_sites_are_explicit() {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !["src/tools/", "src/security/", "src/runtime/turn_decision/"]
+        if !["src/tools/", "src/security/", "src/runtime/turn_context/"]
             .iter()
             .any(|prefix| relative.starts_with(*prefix))
         {

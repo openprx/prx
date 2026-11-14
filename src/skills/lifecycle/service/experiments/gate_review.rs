@@ -71,13 +71,13 @@ pub(super) struct GateReviewPending {
     judge_usage: Option<crate::skills::lifecycle::ReportedUsage>,
 }
 
-struct GateInputs {
+struct GateReviewInputs {
     proposal_stage: String,
     proposal: SkillProposal,
     epoch: ProposalEvaluationBinding,
     evaluations: Vec<EvaluationPin>,
 }
-impl GateInputs {
+impl GateReviewInputs {
     fn subject(&self, suite: &str) -> Result<GateReviewSubject> {
         Ok(GateReviewSubject {
             proposal_id: self.proposal.proposal_id.clone(),
@@ -165,7 +165,7 @@ impl SkillsLifecycleService {
         journal: &ExperimentJournal,
         stage: &str,
         operation: &ExperimentOperation,
-    ) -> Result<GateInputs> {
+    ) -> Result<GateReviewInputs> {
         let ExperimentOperation::GateReview {
             selection_stage,
             validation_stage,
@@ -254,7 +254,7 @@ impl SkillsLifecycleService {
         verifier_evidence(journal, validation_verifier, validation_stage, &validation_pin)?;
         verifier_evidence(journal, holdout_verifier, holdout_stage, &holdout_pin)?;
         let evaluations = vec![validation_pin, holdout_pin];
-        Ok(GateInputs {
+        Ok(GateReviewInputs {
             proposal_stage,
             proposal,
             epoch,

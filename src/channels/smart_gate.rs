@@ -3,7 +3,7 @@
 use super::history::merged_history;
 use super::inbound_policy::{ConversationKey, extract_group_identifier, strip_channel_metadata};
 use super::{
-    Arc, CancellationToken, ChannelRuntimeContext, decision_turn, pre_gate, providers, traits, truncate_with_ellipsis,
+    Arc, CancellationToken, ChannelRuntimeContext, pre_gate, providers, traits, truncate_with_ellipsis, turn_source,
 };
 
 /// Classify whether a channel message originated from a system source
@@ -132,7 +132,7 @@ impl AdmittedSmartPreGate {
 pub(super) async fn run_admitted_smart_pre_gate(
     ctx: &ChannelRuntimeContext,
     config_generation: &Arc<crate::config::ConfigGeneration>,
-    decision_turn: &mut decision_turn::ChannelDecisionTurn,
+    decision_turn: &mut turn_source::admitted_turn::ChannelAdmittedTurn,
     heuristic: pre_gate::Heuristic,
     recent_context: &[String],
     user_text: &str,

@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use crate::cost::decision_attempt::DecisionError;
-use crate::decision_engine::admission_probe::Admission;
 use crate::decision_engine::candidate_generator::CandidateSet;
 use crate::decision_engine::prediction::factory::PredictionResult;
 use crate::decision_engine::state::{DerivedCandidate, DerivedState, DuplicateCandidate};
@@ -34,8 +33,6 @@ pub(crate) fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Res
     let CandidateSet::Legal {
         candidates,
         exact_mentions,
-        report,
-        ..
     } = set
     else {
         return DerivedState::new(Vec::new());
@@ -68,11 +65,6 @@ pub(crate) fn derive_state(set: &CandidateSet, catalog: &CatalogView<'_>) -> Res
                 },
                 exact_mention: exact_mentions.contains(candidate.candidate_id()),
                 available: true,
-                effective_approval_required: match report.outcomes.get(candidate.candidate_id()) {
-                    Some(Admission::Passed) => Some(false),
-                    Some(Admission::ApprovalOnly { .. } | Admission::ApprovalDeferred) => Some(true),
-                    _ => None,
-                },
             })
             .collect(),
     )

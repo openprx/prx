@@ -2,15 +2,16 @@
 use crate::providers::catalog::ResolvedModel;
 use crate::providers::catalog::{Requirement, UnknownPolicy};
 use crate::runtime::auxiliary_call::{AuxiliaryAccounting, AuxiliaryPurpose};
-use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
+use crate::runtime::turn_context::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use std::sync::Arc;
 
 /// Auxiliary call accounting bound to the turn's admitted source (R25).
 pub(crate) fn auxiliary_accounting(
-    service: &TurnDecisionService,
+    service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
-    context: &TurnDecisionContext,
+    context: &OpenedTurn,
     purpose: AuxiliaryPurpose,
 ) -> anyhow::Result<Arc<AuxiliaryAccounting>> {
     anyhow::ensure!(
@@ -38,9 +39,9 @@ pub(crate) fn auxiliary_accounting(
 }
 
 pub(crate) fn smart_group_accounting(
-    service: &TurnDecisionService,
+    service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
-    context: &TurnDecisionContext,
+    context: &OpenedTurn,
     classifier_provider: &str,
     classifier_model: &str,
 ) -> anyhow::Result<Arc<AuxiliaryAccounting>> {
@@ -71,9 +72,9 @@ pub(crate) fn smart_group_accounting(
 }
 
 fn resolve_auxiliary_target(
-    service: &TurnDecisionService,
+    service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
-    context: &TurnDecisionContext,
+    context: &OpenedTurn,
     purpose: AuxiliaryPurpose,
     smart_group_selection: Option<(&str, &str)>,
 ) -> anyhow::Result<((String, String), ResolvedModel)> {
@@ -84,7 +85,7 @@ fn resolve_auxiliary_target(
     // Minted from `logical_clock::now()`. `Instant::now()` ignores a logical
     // advance at this site (see the accounted skip test).
     anyhow::ensure!(
-        crate::runtime::logical_clock::now() < context.engine.deadline,
+        crate::runtime::logical_clock::now() < context.deadline(),
         "auxiliary decision deadline expired"
     );
     let original = service
@@ -156,9 +157,9 @@ fn resolve_auxiliary_target(
 }
 
 fn bind_auxiliary_accounting(
-    service: &TurnDecisionService,
+    service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
-    context: &TurnDecisionContext,
+    context: &OpenedTurn,
     purpose: AuxiliaryPurpose,
     requested: (String, String),
     selected: ResolvedModel,
@@ -194,8 +195,8 @@ fn bind_auxiliary_accounting(
                     Arc::clone(&service.state_key),
                     cleanup,
                     scope_id,
-                    context.engine.state.trusted.parts().budgets,
-                    context.engine.deadline,
+                    context.runtime().trusted.budgets,
+                    context.deadline(),
                 )
                 .with_money(
                     context

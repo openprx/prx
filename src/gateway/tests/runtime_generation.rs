@@ -473,7 +473,7 @@ async fn a_generation_that_drops_an_mcp_server_stops_its_child() {
     let shared = crate::config::new_shared(Config::default());
     let generation = |tool: Arc<McpTool>| TurnRuntimeGeneration {
         provider_binding: None,
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
         config_generation: shared.pin(),
         provider: Arc::new(MockProvider::default()),
         model: "test-model".into(),
@@ -585,7 +585,7 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
     let generation_zero = manager.pin();
     let current = Arc::new(ArcSwap::from_pointee(TurnRuntimeGeneration {
         provider_binding: None,
-        decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
+        publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
         config_generation: Arc::clone(&generation_zero),
         provider: Arc::new(MockProvider::default()),
         model: "model-zero".to_string(),
@@ -608,7 +608,7 @@ fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
         previous: current.load_full(),
         generation: TurnRuntimeGeneration {
             provider_binding: None,
-            decision_slot: Arc::new(decision_runtime::GatewayDecisionSlot::default()),
+            publication_slot: Arc::new(turn_source::publication_slot::GatewayPublicationSlot::default()),
             config_generation: generation_one,
             provider: Arc::new(MockProvider::default()),
             model: "model-one".to_string(),

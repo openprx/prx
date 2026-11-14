@@ -2,14 +2,15 @@
 //!
 //! Paths in model arguments remain logical relative paths. The retained scope
 //! selects the physical namespace independently of arguments and approvals.
-use super::{TurnDecisionContext, TurnDecisionService};
+use super::OpenedTurn;
+use crate::runtime::turn_publication::TurnRuntimeService;
 use crate::runtime::turn_source::TurnSourceProof;
 use crate::security::approval_ledger::ApprovalReviewAdapter;
 use crate::tools::owner_filesystem::OwnerFilesystem;
 use anyhow::Context;
 use std::sync::Arc;
 
-impl TurnDecisionService {
+impl TurnRuntimeService {
     pub(super) async fn console_filesystem(
         &self,
         proof: &dyn TurnSourceProof,
@@ -64,19 +65,17 @@ impl TurnDecisionService {
     pub(super) fn verify_console_filesystem_context(
         &self,
         proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
+        context: &OpenedTurn,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             context
-                .engine
-                .state
+                .runtime()
                 .trusted
-                .parts()
                 .constraints
                 .iter()
                 .any(|code| code.as_str() == "owner_private_filesystem_v1")
                 == context.owner_filesystem.is_some()
-                && context.engine.state.trusted.parts().owner_isolated() == proof.owner_isolated()
+                && context.runtime().trusted.owner_isolated() == proof.owner_isolated()
                 && context.owner_filesystem.as_ref().is_none_or(|scope| {
                     proof.approval_review_adapter() == Some(ApprovalReviewAdapter::ConsoleOwnerReview)
                         && proof.owner_isolated()
@@ -135,7 +134,9 @@ mod working_root_tests {
             config.causal_tree.enabled = false;
             let generation = crate::config::new_shared(config.clone()).pin();
             let catalog = crate::providers::catalog::CatalogView::from_config(&config);
-            let service = super::super::tests::disabled_agent_service(&generation, &catalog).await;
+            let service =
+                crate::runtime::turn_publication::service::test_support::disabled_agent_service(&generation, &catalog)
+                    .await;
             std::fs::create_dir(root.path().join("state")).expect("test: state directory");
             let command = "printf x >> state/count";
             for (approve, expected) in [(false, ""), (true, "x")] {
