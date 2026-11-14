@@ -868,3 +868,62 @@ fn model_settings_controls_use_catalog_constraints_and_the_transaction_flow() {
         "late reads must not overwrite the active model"
     );
 }
+
+/// P2-R27: the intent-analysis page reads only `/api/decision-engine/*`; no
+/// Console source calls a retired `/api/causal/*` route or the deleted
+/// approval resume route, and the decision inspector page is gone.
+#[test]
+fn the_intent_analysis_page_reads_only_the_decision_engine_api() {
+    let api = read("console/src/lib/api.js");
+    for (name, path) in [
+        ("getDecisionEngineStatus", "'/api/decision-engine/status'"),
+        ("getDecisionEngineBackends", "'/api/decision-engine/backends'"),
+        ("getDecisionEngineAnalyses", "`/api/decision-engine/analyses?"),
+        ("storeDecisionEngineCredential", "'/api/decision-engine/credential'"),
+    ] {
+        let entry = api_entry(&api, name);
+        assert!(entry.contains(path), "{name} must call {path}: {entry}");
+    }
+    let credential = api_entry(&api, "storeDecisionEngineCredential");
+    assert!(
+        credential.contains("method: 'PUT'"),
+        "the credential must PUT: {credential}"
+    );
+    assert!(credential.contains("body: JSON.stringify({ value })"), "{credential}");
+
+    let page = read("console/src/pages/IntentAnalysisPage.svelte");
+    let calls = api_calls(&page);
+    let expected: BTreeSet<String> = [
+        "getDecisionEngineStatus",
+        "getDecisionEngineBackends",
+        "getDecisionEngineAnalyses",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(calls, expected, "the intent-analysis page calls only the engine reads");
+    assert!(page.contains("limit: ANALYSIS_LIMIT") && page.contains("const ANALYSIS_LIMIT = 20;"));
+
+    for (path, source) in console_sources() {
+        assert!(!source.contains("/api/causal/"), "{path} calls a retired causal route");
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.contains("/approvals/") && line.contains("/resume")),
+            "{path} calls the deleted approval resume route"
+        );
+        assert!(
+            !source.contains("DecisionInspectPage"),
+            "{path} references the deleted inspector"
+        );
+        assert!(
+            !source.contains("resumeDecisionApproval"),
+            "{path} references the deleted resume call"
+        );
+    }
+    assert!(
+        !repository_root()
+            .join("console/src/pages/DecisionInspectPage.svelte")
+            .exists()
+    );
+}

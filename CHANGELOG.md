@@ -9,15 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- BREAKING (operators): the legacy decision plane is gone and no decision
+  data is carried over. `decisions.db`, `self/causal_tree/.decision_key` and
+  `self/child_authority/journal.db` are never opened; if any exists, one
+  warning per process says it is ignored. To start clean, stop PRX and point
+  it at a new workspace, or delete `<ws>/self/causal_tree/`,
+  `<ws>/self/child_authority/` and `<ws>/memory/`. Keeping an old workspace is
+  harmless, but interrupted turns and pending approvals from before the
+  upgrade are not recovered or resumed. See
+  [docs/decision-engine.md](docs/decision-engine.md#runtime-key-and-legacy-files).
+- BREAKING (operators): a configuration that still contains a `[causal_tree]`
+  table is refused at load as an unknown configuration path; nothing imports,
+  warns about or strips it. Its three turn limits moved to `[decision_engine]`
+  as `latency_budget_ms`, `token_ratio_limit` and `max_candidates`, with the
+  same defaults (500, 0.35, 12) and bounds. When `[decision_engine.backend]`
+  is absent, the backend default applies (the same one `prx init` writes).
+- BREAKING (operators): restart recovery of interrupted turns needs a memory
+  backend with a recovery repository (SQLite, or Lucid's local store) and
+  recording on. On other backends a terminal is unrecorded and settled
+  directly; it is not recovered after a restart.
+- BREAKING (operators): `prx causal …` prints one deprecation line pointing at
+  `prx decision-engine` and exits 0. Every `/api/causal/*` route answers 410
+  with `{"error":"gone","see":"/api/decision-engine"}`. Use
+  `prx decision-engine` and `/api/decision-engine/*`; the Console page is
+  now **Intent analysis**, and the decision inspector page is removed.
+- BREAKING (operators): the historical approval resume route
+  `POST /api/sessions/{id}/approvals/{decision_id}/resume` is removed, along
+  with the Console's "Run approved call" action. Approvals are run-keyed; an
+  approved call is not re-executed from a saved snapshot.
+- BREAKING (operators): worker relaunch is removed. A worker that ends is not
+  relaunched from a recorded recipe; restart recovery handles absent workers.
+- BREAKING (operators): the session-worker transport secret is strict.
+  `SESSION_WORKER_SECRET` must be exactly 32 bytes; otherwise PRX uses one
+  persisted 32-byte file (`OPENPRX_SESSION_WORKER_SECRET_PATH`, else
+  `<config_dir>/keys/session_worker.secret`, mode 0600, owner-only). A
+  missing, malformed, symlinked or widened secret refuses the launch; there
+  is no process-local fallback key. Workers launched by an older build fail
+  to start.
+- BREAKING (operators): the runtime key moved to
+  `<ws>/self/runtime/runtime.key`. The old `self/causal_tree/.decision_key`
+  is not read; a new key is created at the new path.
+- BREAKING (operators): `allow_recursive_delegation` and the recursive depth
+  keys are removed (see Changed: recursive delegation is on by default).
 - BREAKING (operators): with `[decision_engine] enabled = true` the engine
   gives advice only. Every turn opens the same way whatever the engine
   setting; the engine no longer selects Clarify, Refuse, RequestApproval,
   Retrieve, Discover or Execute, never changes the published tool surface
   and never refuses a request. Its analysis is charged to the turn's own
   budget and is skipped when the budget is too tight. The legacy selection
-  pipeline (selector, scorer, rehearsal, exploration) is gone. Historical
-  approvals recorded before this change still resume their exact prepared
-  call.
+  pipeline (selector, scorer, rehearsal, exploration) is gone.
 - BREAKING (operators): Full autonomy has no permission limits. Identity
   scope ACLs, forced explicit-grant approvals and child manifest tool
   membership no longer restrict a Full turn. Integrity checks, budgets,
@@ -119,6 +159,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- BREAKING (operators): recursive delegation is on by default, so a child
+  session equals the main session. Omitting `allow_delegation` on
+  `sessions_spawn` gives a child that can spawn its own children, bounded only
+  by the sealed spawn depth, the funding carve from the parent's allowance and
+  integrity checks. Where the bound leaves no room, an omitted flag gives a
+  child that cannot spawn and an explicit `true` is refused; pass `false` for
+  a child that must never spawn. A Supervised task-mode child now asks the
+  parent run's approval resolver, as the root does.
 - BREAKING (operators): Kimi Code (`kimi-code` and its aliases) now honours the
   root `api_url` for chat, `prx models refresh` and `prx providers test --live`;
   it was ignored before. The URL must be `https`, or `http` only for loopback
@@ -140,11 +188,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installs disabled and returns `skill.enabled`.
 
 - **BREAKING (operators):** the decision plane no longer gates execution. The
-  decision engine is off by default. `[causal_tree]` backend keys are read as
-  fallback by `[decision_engine]`. G6's grouped native-file token-sum predicate
+  decision engine is off by default. G6's grouped native-file token-sum predicate
   is retired; per-call token admission enforces the called tool's own estimate.
-
-- Honor exact approved decision resumes, close expired or text-less decisions locally, and keep confidence fallback answers free of tool execution authority.
 
 - Catalog-backed model checks read the active release rows and aliases at
   runtime. Kimi Code still refuses a spelling outside that set, because its
@@ -224,14 +269,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workspace_only` remains `true`, `acknowledge_unrestricted_profile` remains
   `false`, and `forbidden_paths` keeps the built-in denylist. See
   [configuration](docs/configuration.md).
-- A bare unversioned `[causal_tree] enabled = false` no longer passes silently:
-  one warning names `causal_tree.enabled`, says it was ignored, and gives
-  `schema_version = 2` alongside `enabled = false` as the replacement. The
-  D-074 reading stays unchanged: that old default is unset in memory and the
-  plane inherits true. This includes old full `prx init` installations with
-  `config.d/agent.toml`; startup and `prx init --force` remain available.
-  Versioned disables and unversioned disables alongside modern settings
-  remain explicit, and loading does not rewrite files.
 
 - **BREAKING (operators):** Evolution now proposes prompt revisions exclusively
   through the skills lifecycle. Strategy and memory evolution layers are removed.

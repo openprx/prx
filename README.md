@@ -8,7 +8,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 - **Broad LLM provider catalog** — Anthropic (Console API key), OpenAI, Google Gemini (API key), Ollama, AWS Bedrock, GLM, OpenAI Codex via Sign in with ChatGPT, local runtimes, and compatible endpoints. GitHub Copilot login is disabled. Provider requests send `User-Agent: prx/<version>`.
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback)
-- **Causal Tree Engine** — admitted decisions with rehearsal, scoring, and circuit breaker; enabled by default with the built-in backend
+- **Advisory decision engine** — bounded intent analysis and turn-outcome records; off by default, never selects tools or grants approval
 - **Multi-channel messaging** — Signal, WhatsApp, Telegram, Discord, Slack, and more
 - **Built-in tools and integrations** — shell, MCP, memory, scheduling, remote nodes, and an integration catalog
 - **Xin, from the Chinese word for heart, task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 3 built-in maintenance tasks, durable Goal/Step execution, and SQLite persistence
@@ -23,32 +23,26 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - heuristic model routing is always available
 - semantic KNN scoring activates when embeddings and history are available
 
-### Causal Tree Engine Flags
-
-> **Enabled by default.** `auto` serves the built-in backend without a remote
-> endpoint. Remote processing requires explicit configuration and opt-in.
-
-- `causal_tree.enabled` — master switch (default: `true`); explicit versioned `false` stays disabled
-- `causal_tree.schema_version` — stored configuration schema (current: `2`)
-- `causal_tree.policy.max_candidates` — maximum candidates (default: `12`)
-- `causal_tree.policy.commit_threshold` — minimum commit score (default: `0.62`)
-- `causal_tree.policy.extra_latency_budget_ms` — additional decision budget (built-in default: `500` ms; hosted backend selection can adopt its catalog recommendation)
-- `causal_tree.rehearsal.timeout_ms` — rehearsal timeout (default: `100` ms)
-- `causal_tree.backend.circuit_breaker.failure_threshold` — consecutive failures (default: `5`)
-- `causal_tree.scoring.weights` — optional scorer-owned weight overrides
-
-See [decision-plane behavior](docs/decision-plane.md) and the
-[configuration reference](docs/configuration.md) for admission, defaults and
-legacy-key migration.
-
 ### Advisory Decision Engine
 
 The advisory engine (`[decision_engine]`) is **off by default**
 (`enabled = false`). Off means no analysis brief, telemetry store, or outcome
-writes. Tool selection, approval, and admission stay with the decision plane
-(`[causal_tree]`), the tool surface owner, and the approval ledger. Enable it
-only with an explicit `[decision_engine] enabled = true`. See
-[advisory decision engine](docs/decision-engine.md).
+writes. Tool selection, approval, and admission stay with the tool surface
+owner and the run's approval strategy. Enable it only with an explicit
+`[decision_engine] enabled = true`.
+
+Three turn limits live under `[decision_engine]` and apply whether or not the
+engine is enabled:
+
+- `latency_budget_ms` — extra latency one turn may spend on advisory work (default: `500`, range `50`–`5000`)
+- `token_ratio_limit` — extra tokens as a ratio of the turn's baseline (default: `0.35`, finite and greater than `0`)
+- `max_candidates` — most candidates a turn considers (default: `12`, range `1`–`32`)
+
+The optional `[decision_engine.backend]` table selects the analysis backend;
+without it the built-in backend serves and nothing leaves the machine. A
+`[causal_tree]` table is no longer accepted and is refused at load. See
+[advisory decision engine](docs/decision-engine.md) and the
+[configuration reference](docs/configuration.md).
 
 ## Quick Start
 

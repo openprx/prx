@@ -20,8 +20,7 @@
   import LoginPage from './pages/LoginPage.svelte';
   import OverviewPage from './pages/OverviewPage.svelte';
   import SessionsPage from './pages/SessionsPage.svelte';
-  import DecisionPlanePage from './pages/DecisionPlanePage.svelte';
-  import DecisionInspectPage from './pages/DecisionInspectPage.svelte';
+  import IntentAnalysisPage from './pages/IntentAnalysisPage.svelte';
   import ChatPage from './pages/ChatPage.svelte';
   import ChannelsPage from './pages/ChannelsPage.svelte';
   import ConfigPage from './pages/ConfigPage.svelte';
@@ -424,10 +423,8 @@
         <main id="console-main" class="min-w-0 max-w-full flex-1 p-4 sm:p-6" tabindex="-1">
           {#if activePath === '/overview'}
             <OverviewPage />
-          {:else if activePath === '/decision-plane'}
-            <DecisionPlanePage />
-          {:else if activePath === '/decisions'}
-            <DecisionInspectPage />
+          {:else if activePath === '/intent-analysis'}
+            <IntentAnalysisPage />
           {:else if activePath === '/sessions'}
             <SessionsPage />
           {:else if activePath === '/activity'}

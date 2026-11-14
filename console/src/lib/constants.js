@@ -11,8 +11,7 @@ export const NAV_GROUPS = [
       { labelKey: 'nav.sessions', path: '/sessions', activePrefix: '/chat/' },
       { labelKey: 'nav.activity', path: '/activity' },
       { labelKey: 'nav.approvals', path: '/approvals' },
-      { labelKey: 'nav.terminals', path: '/terminals' },
-      { labelKey: 'decisionInspect.title', path: '/decisions' }
+      { labelKey: 'nav.terminals', path: '/terminals' }
     ]
   },
   {
@@ -35,7 +34,7 @@ export const NAV_GROUPS = [
     labelKey: 'nav.groups.automation',
     items: [
       { labelKey: 'nav.hooks', path: '/hooks' },
-      { labelKey: 'decisionPlane.title', path: '/decision-plane' },
+      { labelKey: 'intentAnalysis.title', path: '/intent-analysis' },
       { labelKey: 'nav.schedules', path: '/schedules', activePrefix: '/schedules/' },
       { labelKey: 'nav.memory', path: '/memory' }
     ]

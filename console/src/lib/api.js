@@ -135,27 +135,13 @@ export const api = {
     const suffix = params.size > 0 ? `?${params.toString()}` : '';
     return request(`/api/sessions/${encodeURIComponent(sessionId)}/messages${suffix}`);
   },
-  testDecisionBackend: ({ backend = 'configured', live = false, confirmHighRisk = false, revision = null } = {}) =>
-    request(`/api/causal/test${confirmSuffix(confirmHighRisk)}`, {
-      method: 'POST', headers: revisionHeaders(revision), body: JSON.stringify({ backend, live })
-    }),
-  storeDecisionCredential: (value, revision) => request('/api/causal/credential', {
+  getDecisionEngineStatus: () => request('/api/decision-engine/status'),
+  getDecisionEngineBackends: () => request('/api/decision-engine/backends'),
+  getDecisionEngineAnalyses: ({ limit = 20 } = {}) =>
+    request(`/api/decision-engine/analyses?${new URLSearchParams({ limit: String(limit) })}`),
+  storeDecisionEngineCredential: (value, revision) => request('/api/decision-engine/credential', {
     method: 'PUT', headers: revisionHeaders(revision), body: JSON.stringify({ value })
-  }),
-  getDecisionReport: ({ from, to }) =>
-    request(`/api/causal/reports?${new URLSearchParams({ from, to })}`),
-  getSavedDecisionReports: () => request('/api/causal/reports/saved'),
-  getDecisionStatus: () => request('/api/causal/status'),
-  planDecisionChange: (mutations) => request('/api/causal/config/plans', {
-    method: 'POST', body: JSON.stringify({ mutations })
-  }),
-  applyDecisionChange: (mutations, { confirmHighRisk = false, revision = null } = {}) =>
-    request(`/api/causal/config/apply${confirmSuffix(confirmHighRisk)}`, {
-      method: 'POST', headers: revisionHeaders(revision), body: JSON.stringify({ mutations })
-    }),
-  getDecisions: ({ from, to, limit = 100 }) =>
-    request(`/api/causal/decisions?${new URLSearchParams({ from, to, limit: String(limit) })}`),
-  getDecision: (id) => request(`/api/causal/decisions/${encodeURIComponent(id)}`),
+  }, { withStatus: true }),
   getDecisionApproval: (sessionId, decisionId) =>
     request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}`),
   reviewDecisionApproval: (sessionId, decisionId, approved) =>
@@ -166,16 +152,6 @@ export const api = {
     request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}`, {
       method: 'DELETE'
     }),
-  resumeDecisionApproval: (sessionId, decisionId) =>
-    request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}/resume`, {
-      method: 'POST', body: JSON.stringify({})
-    }),
-  resumeDecisionApprovalAsync: (sessionId, decisionId) =>
-    request(`/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(decisionId)}/resume`, {
-      method: 'POST',
-      headers: { Prefer: 'respond-async' },
-      body: JSON.stringify({})
-    }, { withStatus: true }),
   listApprovals: ({ limit, cursor } = {}) => {
     const params = new URLSearchParams();
     if (limit) params.set('limit', String(limit));

@@ -41,10 +41,11 @@
     value = '';
     revision = null;
     try {
-      const receipt = await api.storeDecisionCredential(secret, expected);
+      // Write-only: success is a bare 204 and nothing is echoed back.
+      const response = await api.storeDecisionEngineCredential(secret, expected);
       if (!alive) return;
-      if (!receipt || typeof receipt.id !== 'string' || !receipt.id.startsWith('cred-')) throw new Error();
-      notice = t(receipt.previous_left ? 'decisionCredential.previousLeft' : 'decisionCredential.stored');
+      if (response?.status !== 204) throw new Error();
+      notice = t('decisionCredential.stored');
       try { await onstored(); }
       catch { if (alive) error = t('decisionCredential.refreshFailed'); }
     } catch {
@@ -64,7 +65,7 @@
     <form onsubmit={save} class="space-y-3">
       <SecretInput bind:value label={t('decisionCredential.value')} disabled={busy || disabled} />
       <button disabled={busy || disabled || !value.trim()} class="rounded-lg bg-amber-700 px-3 py-2 text-white disabled:opacity-50">{t('decisionCredential.save')}</button>
-      <button type="button" disabled={busy} onclick={() => { value = ''; revision = null; }} class="ml-2 rounded-lg border border-gray-400 px-3 py-2">{t('decisionTest.cancel')}</button>
+      <button type="button" disabled={busy} onclick={() => { value = ''; revision = null; }} class="ml-2 rounded-lg border border-gray-400 px-3 py-2">{t('decisionCredential.cancel')}</button>
     </form>
   {:else}
     <button disabled={busy || disabled} onclick={prepare} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionCredential.prepare')}</button>

@@ -6,7 +6,7 @@ browser, concurrency and independent acceptance remain pending. Consult
 [release model catalog](model-catalog.md),
 [configuration](configuration.md), [Console](web-console.md),
 [cost lifecycle](provider-routing-cost-lifecycle.md) and the
-[decision plane](decision-plane.md) for the related contracts.
+[decision engine](decision-engine.md) for the related contracts.
 
 ## Identity, operations and credentials
 

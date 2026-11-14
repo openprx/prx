@@ -68,7 +68,8 @@ test('listApprovals and job reads use the caller path', async () => {
   await api.getPools();
   await api.listChatSessions();
   await api.listChatResults({ afterSeq: 3, limit: 10 });
-  await api.resumeDecisionApprovalAsync('s1', 'd1');
+  await api.getDecisionEngineAnalyses();
+  await api.getDecisionEngineStatus();
   const urls = fetchMock.mock.calls.map((call) => call[0]);
   expect(urls[0]).toBe('/api/sessions/approvals?limit=20&cursor=4');
   expect(urls[1]).toBe('/api/jobs/job-1');
@@ -80,7 +81,9 @@ test('listApprovals and job reads use the caller path', async () => {
   expect(urls[6]).toBe('/api/runtime/pools');
   expect(urls[7]).toBe('/api/chat-sessions');
   expect(urls[8]).toBe('/api/chat-sessions/results?after_seq=3&limit=10');
-  expect(fetchMock.mock.calls[9][1].headers.Prefer).toBe('respond-async');
+  expect(urls[9]).toBe('/api/decision-engine/analyses?limit=20');
+  expect(urls[10]).toBe('/api/decision-engine/status');
+  expect(urls.some((url) => url.includes('/resume') || url.includes('/api/causal'))).toBe(false);
 });
 
 test('refuses a job path that is not a same-origin API path', async () => {

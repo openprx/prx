@@ -2,8 +2,8 @@
 
 OpenPRX uses `~/.openprx/config.toml` as the main configuration file.
 
-Turn work has several independent owners. Do not treat the causal plane or the
-advisory decision engine as owning everything:
+Turn work has several independent owners. Do not treat the advisory decision
+engine as owning everything:
 
 - **Prompt recall** is independent scoped recall (owner, workspace, session). It
   is not selected by the decision engine.
@@ -14,25 +14,21 @@ advisory decision engine as owning everything:
 - **Targeted gateway turns** (`[gateway] targeted_agents`, default `false`) use
   a named memory partition (`name` + incarnation), not Main's history. The
   switch is pre-release.
-- **Causal admission** (`[causal_tree]`) is separate from the **advisory
-  decision engine** (`[decision_engine]`, default `enabled = false`).
-- **Recovery** needs the original workspace decision key together with the
-  database. Keep those backups together.
+- **Advisory decision engine** (`[decision_engine]`, default `enabled = false`)
+  only advises; there is no `[causal_tree]` table any more.
+- **Recovery** needs the workspace database together with its `.recovery_keys`
+  and the runtime key (`self/runtime/runtime.key`). Keep those backups together.
 
-For decision admission, backend gates, inspection and rollback, see the
-[decision plane reference](decision-plane.md).
+For the engine, turn gates, approvals and restart recovery, see the
+[decision engine reference](decision-engine.md).
 
-When `[decision_engine] enabled = false`, `prx causal status` reports
-`engine_disabled` for a configured backend excluded by that switch. The separate
-`key_available` field still reports the workspace key's actual availability.
 The engine only advises. Every turn opens without a prediction hop, whether the
 engine is on or off: the serving model chooses tools from the published surface,
 and an enabled engine adds at most a brief. The engine never selects, delegates,
 retrieves, clarifies or refuses on its own, so a `refuse` or `clarify` prediction
 does not change the turn. Its analysis is charged to the turn's own budget and is
 skipped when that budget is tight; the request is never refused because of it.
-`prx init --decision-enable` enables causal recovery; advisory inference separately
-requires `[decision_engine] enabled = true`.
+Advisory inference requires `[decision_engine] enabled = true`.
 
 The embedded [model catalog](model-catalog.md) owns declared request parameter
 defaults and model levels. The existing Codex reasoning override remains an
@@ -55,13 +51,10 @@ exists. An empty `config.toml` parses with `default_temperature = 0.7`;
 omitted `default_provider` and `default_model` remain unset so saving does not
 pin a release catalog default. Security-posture defaults stay closed:
 `workspace_only = true`, `acknowledge_unrestricted_profile = false`, and
-`forbidden_paths` retains the built-in denylist. A bare unversioned
-`[causal_tree] enabled = false`, including the old full `prx init` template in
-`config.d/agent.toml`, still loads as unset and inherits the enabled default.
-The loader now emits one warning naming `causal_tree.enabled`, that it was
-ignored, and the versioned replacement: write `schema_version = 2` alongside
-`enabled = false` to keep the plane disabled. Loading does not rewrite the file;
-a structured save writes the canonical versioned form.
+`forbidden_paths` retains the built-in denylist. A `[causal_tree]` table is
+refused at load as an unknown configuration path; delete it and set the turn
+limits under `[decision_engine]` (see
+[the decision engine](decision-engine.md#configuration)).
 
 ## Section index
 
@@ -157,8 +150,8 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[nodes.server]` | `listen_addr = "127.0.0.1:8787"`; `bearer_token = ""`; `hmac_secret` unset; `sandbox_root = "."`; `exec_timeout_ms = 15000`; `max_output_bytes = 1048576`; `max_concurrent_tasks = 8`; `task_result_ttl_ms = 3600000`; `allowed_commands = ["echo"]`; `blocked_commands = []`; `tls_required = true`; `tls_cert`/`tls_key` unset |
 | `[agents.<name>]` | `provider`/`model` required; `system_prompt`/`api_key`/`credential_ref`/`temperature`/`identity_dir`/`memory_scope`/`spawn_enabled`/`autonomy` unset; `max_depth = 8`; `agentic = false`; `allowed_tools = []`; `enabled = true` |
 | `[media]` | `audio_provider = "none"`; `audio_model = "whisper"`; `audio_ollama_url = "http://localhost:11434"`; `video_provider = "none"`; `video_max_frames = 4`; `max_audio_size_mb = 20`; `max_video_size_mb = 50` |
-| `[causal_tree]` | local plane enabled by default; remote processing opt-in. Versioned `enabled = false` keeps it off. See [decision-plane.md](decision-plane.md) |
-| `[decision_engine]` | `enabled = false`; `mode = "pre"`; `prompt_budget_tokens = 300`; `candidates = 5`; `timeout_ms = 1500`; `telemetry_cap = 1000`; `observe_queue = 64`; `backend` unset |
+| `[decision_engine]` | `enabled = false`; `mode = "pre"`; `prompt_budget_tokens = 300`; `candidates = 5`; `timeout_ms = 1500`; `telemetry_cap = 1000`; `observe_queue = 64`; `latency_budget_ms = 500`; `token_ratio_limit = 0.35`; `max_candidates = 12`; `backend` unset |
+| `[decision_engine.backend]` | optional; absent = `kind = "auto"`, `remote_enabled = false`, `endpoint = ""`, `model = ""`, `pinned_snapshot = ""`, `credential_ref` unset, `timeout_ms = 250`, `max_request_bytes = 65536`, `max_response_bytes = 262144`, `circuit_breaker = { failure_threshold = 5, cooldown_secs = 60 }` |
 | `[security.audit]` | `log_path = "audit.log"`; `max_size_mb = 100` |
 | `[security]` | `workspace_hooks` omitted when off |
 | `[compliance.interaction_notice]` | `version = "1"`; default notice text; `applicability = "required"`; `exception_owner`/`exception_reviewed_at` unset |
@@ -280,18 +273,15 @@ the run's workspace is `<DIR>/workspace`, even when that environment variable
 names a different directory. Omit `--config-dir` (and `OPENPRX_CONFIG_DIR`) when
 you intend to select the workspace through `OPENPRX_WORKSPACE`.
 
-The session-worker transport key at `keys/session_worker.secret` is published
-atomically on first use. Concurrent minting and verification use the same
-complete 32-byte key. Existing key material is never overwritten by initialization;
-a malformed key is refused and must be restored before using it for worker
-capabilities. Existing valid keys remain compatible with older binaries.
-
-Worker transport signing keys are published without replacing a concurrent
-writer's key. On Unix, an existing valid key with group or other permissions is
-tightened to mode `0600` without rotating it. If shared key publication fails
-(for example, on a filesystem without hard links), a warning includes the
-filesystem error and identifies the process-local fallback; the key is never
-logged. Restarting processes cannot share that fallback key.
+The session-worker transport secret is strict. It is either the
+`SESSION_WORKER_SECRET` environment value, which must be exactly 32 bytes, or
+one persisted 32-byte file at `OPENPRX_SESSION_WORKER_SECRET_PATH`, else
+`<config_dir>/keys/session_worker.secret`. PRX creates that file once with mode
+`0600` (published atomically on first use, so concurrent minting and
+verification use the same complete key) and never rewrites it. A missing,
+malformed, symlinked or widened secret refuses the worker launch; there is no
+fallback key and no permission tightening. The key is never logged. See
+[Child sessions and delegation](decision-engine.md#child-sessions-and-delegation).
 
 `prx init` resolves its target directory in this order, highest first:
 
@@ -875,7 +865,7 @@ pinned execution security policy: `readonly` excludes side-effecting tools
 and delegation, `supervised` requires applicable approval, and `full` permits
 those candidates to be considered. This does not guarantee selection or bypass
 scope ACLs, model support, cost limits, structural restrictions, or inherited
-child capability limits. Rehearsal remains read-only in all three modes.
+child capability limits.
 
 Under `supervised`, a capability without exact call-scoped operation IDs cannot
 supply an approval grant. It can be deferred or excluded and the turn can close;
@@ -1322,7 +1312,7 @@ effect) and its response carries the same `warning`.
 | `security.audit.sign_events` | audit signing was never implemented; the setting had no effect |
 | `[security.resources]` (whole table) | never enforced by any code path |
 | `memory.events.retention_days` | never read by the hygiene pass |
-| `causal_tree.observability.decision_log`, `causal_tree.observability.metrics` (and the earlier `write_decision_log`, `write_metrics`) | never read; decision events follow the `[observability]` backend |
+| `[causal_tree]` (whole table, every key) | removed with the decision plane; refused at load as an unknown configuration path. The turn limits moved to `[decision_engine]` |
 
 The `sessions_spawn` tool also no longer accepts `max_iterations` or
 `timeout_seconds`; task-mode and process-mode sub-agents share the same
@@ -1369,41 +1359,19 @@ These files are automatically injected into the agent context at startup.
 | **PostgreSQL** | Scalable, multi-user |
 | **Markdown** | File-based, human-readable |
 
-An enabled causal decision plane for `prx agent` requires a memory backend
-that persists `message_events`: `sqlite`, `lucid`, or `postgres`. This storage
-requirement does not establish selected-retrieval support: the candidate's
-bounded Memory/Document/Session ports are implemented for SQLite and Lucid's
-local SQLite store; PostgreSQL ports still fail explicitly. See the
-[decision-plane backend support matrix](decision-plane.md#candidate-memory-backend-support).
-Startup
-refuses `memory.backend = "none"` or `"markdown"` while the plane is enabled,
-because neither backend can record the inbound event or causal telemetry.
-The plane also requires `memory.events.record_user_messages = true` so the
-inbound event can be linked to each decision. Choose a supported backend and
-enable user message recording, or disable `[causal_tree].enabled` before
-starting the agent. A disabled plane keeps the existing memory behavior.
-
-Decision-linked Agent terminal markers include a versioned authentication
-binding to the original inbound event, owner, workspace, decision chain,
-terminal claim, and assistant projection. Recovery verifies these records
-before reconstructing an outcome. It confirms the stored outcome after the
-writer drains; queue admission alone is not confirmation. A completed fixed
-reply can repair its missing directive-applied event using the original
-source's configuration generation and revision.
-
-Legacy decision-linked recovery requires the original workspace decision key
-and all referenced records. An unsigned marker, an older claim, a missing retained record, a
-changed row, or a replaced key causes recovery to fail explicitly. Keep the
-original key and database backup together when restoring a workspace. A
-rollback must preserve these records; do not remove authentication fields or
-rewrite old markers to make them replayable. Legacy recovery repairs telemetry and does not authorize another provider or
-tool execution.
+Run-keyed approvals and turn-terminal recovery need
+`memory.events.record_user_messages = true` and a memory backend with a
+recovery repository: `sqlite`, or `lucid` through its local SQLite store.
+PostgreSQL has dedicated read-only ports but no recovery repository, and
+`markdown`/`none` are unsupported. See the
+[backend support matrix](decision-engine.md#memory-backend-support) and
+[Terminal evidence and restart recovery](decision-engine.md#terminal-evidence-and-restart-recovery).
 
 With event recording enabled, SQLite, Lucid's local store, and encrypted
 SQLite scopes commit the terminal events, recovery attestation, and an
 authenticated cost outbox together. A metered terminal records
 `projection_pending`; cost projection follows the commit and retries at startup,
-including when the causal decision plane is disabled. Projection failures after
+including when the advisory decision engine is disabled. Projection failures after
 the durable commit are logged and deferred; they do not fail the committed turn.
 Repeated authenticated acknowledgements succeed. Projection reuses an
 identical settlement, leaves I/O failures retryable, and blocks conflicting or
@@ -1439,7 +1407,7 @@ The current turn’s semantic promotion is excluded by its autosave key and, whe
 available, its source message event ID. Scored and keyword recall apply these
 exclusions across CLI, chat, channels, gateway (webhook, WhatsApp and Linq), and
 child turns; custom-loader reads in agent turns apply both too. The key exclusion
-also applies when user-message recording or the causal tree is disabled or event
+also applies when user-message recording is disabled or event
 persistence fails. Recall never compares memory content with the live input, so a
 prior fact whose text equals the live input is kept. Historical user turns whose
 trimmed text equals the trimmed live input are still skipped in the current-session
@@ -1512,7 +1480,7 @@ embedding_provider = "none"   # keyword/FTS recall only
 settings. Recognized legacy settings first pass through the same migration used
 by the normal configuration loader. The previous tree is copied to
 `config.d.pre-<version>-<timestamp>/` before regeneration. Templates supply
-structure, comments and defaults; incompatible causal settings are refused.
+structure, comments and defaults; a `[causal_tree]` table is refused.
 
 The local candidate reads migration inputs from one consistent configuration
 generation and checks its revision again when committing. A concurrent change
@@ -1553,65 +1521,10 @@ of what the templates themselves produced, so `prx init` writes one next to
 ```
 
 Without the sidecar, ordinary template-default refresh treats existing values
-as explicit. The decision-plane migration has its own versioned contract:
-Schema 1 or current schema 2 with `enabled = false` remains explicitly disabled, even
-when the sidecar also records false. Recognized unversioned legacy-default
-signatures, including the old bare `enabled = false` template, are treated as
-unset by the existing loader migration. The bare-template case emits a warning
-naming `causal_tree.enabled`, that it was ignored, and `schema_version = 2`
-alongside `enabled = false` as the replacement. It does not stop startup or
-`prx init --force`. An unversioned false alongside modern
-non-legacy settings remains explicit. The staged candidate now defaults the
-local plane to true and writes the version marker in the full init template;
-adoption, behavioral migration and rollback acceptance remain pending.
-
+as explicit. 
 For other settings, a value equal to the previous shipped default is refreshed
 with that default because the sidecar cannot distinguish an explicit identical
 value from an untouched template.
-
-##### Decision-plane default and migration
-
-The staged source default and full `prx init` template change together:
-
-```toml
-[causal_tree]
-schema_version = 2
-enabled = true
-```
-
-Minimal/server templates inherit the same central default. Remote decision
-processing retains `remote_enabled = false`; `auto` plus an empty endpoint does
-not authorize a physical request. The 2026-10-05 source addendum requires
-source-owned token and monetary reservations at pinned PMM prices before each
-supported physical attempt. Missing ownership, pricing, accounting support or
-remaining budget refuses admission. This is an estimate, not a vendor billing
-cap; the default change grants no provider or credential permission.
-
-| Existing configuration | Candidate behavior |
-| --- | --- |
-| No causal section, or no `enabled` value | Inherits true |
-| Unversioned bare `enabled = false` from the old full init template | Warns that `causal_tree.enabled` was ignored, names `schema_version = 2` with `enabled = false`, then inherits true; ordinary load leaves the file unchanged |
-| Unversioned false with legacy-only keys | Legacy classification removes the default false and migrates compatible settings |
-| Unversioned false alongside modern non-legacy settings | Explicit false remains false |
-| Schema 1 or current schema 2 and false, including development snapshots | Explicit false remains false on load, save, JSON/management and `init --force`, even if its sidecar also records false |
-| Explicit true | Remains true; backend and cost gates still apply |
-| Incompatible legacy value or conflicting old/new keys | Migration refuses; `init --force` must not install an enabled template as fallback |
-
-The same loader migration handles the merged main file and supported managed
-fragments. Ordinary load normalizes in memory; saving or authorized regeneration
-writes canonical keys. `init --force` uses its existing consistent snapshot and
-revision-checked publication, and preserves recognized explicit disables before
-generic default refresh. The current schema marker is 2; it is not a rollout date
-or an expiry for development configurations. Existing policy-table serialization
-and explicit policy values are unchanged.
-
-To disable deliberately, retain the current schema version and set `enabled = false`
-through the existing management flow. Causal changes remain restart-required;
-the desired file revision and active runtime generation are separate. Preserve
-prior revisions, decision/source/terminal evidence, approval state and cost
-journals during rollback. Disabling cannot refund or cancel already dispatched
-work. This prepared source cutover neither changes a real configuration nor
-restarts a service. See [Decision plane](decision-plane.md#enable-disable-and-rollback).
 
 ##### Quoted keys and archives
 
@@ -1646,14 +1559,12 @@ tree is treated as yours.
 
 In the local candidate, malformed, unreadable or unstable configuration trees
 are refused before installation; `--force` no longer replaces them with bare
-templates. A tree containing causal settings also refuses migration,
-preservation or staged-validation failures. An archive already created before
+templates. An archive already created before
 refusal is retained. Correct the reported configuration problem before retrying.
 
-A successfully read tree with no causal settings retains the existing generic
-validation-repair fallback: it can install bare templates, print the archive
-and validation warning, and exit non-zero. Neither that fallback nor a failed
-revision check silently overrides a protected decision-plane setting.
+A successfully read tree retains the generic validation-repair fallback: it
+can install bare templates, print the archive and validation warning, and exit
+non-zero.
 
 #### Vector recall candidate cap
 
@@ -2510,16 +2421,16 @@ transaction layer: `POST /api/config`,
      on.
    - `remote_decision_enabled`: decision state is sent off this machine,
      or to a different remote backend. It is raised when
-     `causal_tree.backend.remote_enabled` is turned on, when
-     `causal_tree.enabled` is turned on while a remote decision backend is
+     `decision_engine.backend.remote_enabled` is turned on, when
+     `decision_engine.enabled` is turned on while a remote decision backend is
      configured, and, while decisions are sent remotely, when the backend
      `kind`, `endpoint`, `model` or `credential_ref` changes. Turning remote
      off, selecting `builtin`, and changes to a loopback backend are low. The
      decision endpoint also receives the backend's credential, so a new
      endpoint is `endpoint_changed`, and a new `credential_ref` is
-     `credential_changed`. `config.patch` never changes `[causal_tree]`; a
-     hand edit of the files is applied by a reload with a warning.
-   - `causal_tree.backend.endpoint` is the decision backend's base URL.
+     `credential_changed`. A hand edit of the files that turns decisions
+     towards remote is applied by a reload with a warning.
+   - `decision_engine.backend.endpoint` is the decision backend's base URL.
      Compatible HTTP and TypeSafe requests go to `{endpoint}/v1/systemone`.
      Leave `/v1` off (for example `http://127.0.0.1:8900`); an endpoint
      that already ends in `/v1` or `/v1/systemone` is accepted without
@@ -2652,7 +2563,7 @@ Gateway exposes authenticated `GET /api/config/history` and
 See [provider management](provider-management.md) for the management interfaces.
 
 **The decision backend check.** Every plan, rollback and reload checks the
-`[causal_tree]` decision backend: its model must be declared for
+`[decision_engine.backend]` decision backend: its model must be declared for
 `decision_endpoint`, and a `credential_ref` must exist and belong to the
 backend's provider. The hosted services (`kind = "typesafe"` or
 `"openrouter"`) take only a `cred-` reference owned by the service
@@ -2661,39 +2572,34 @@ backend's provider. The hosted services (`kind = "typesafe"` or
 with in `pinned_snapshot`; any other answering model falls back to the builtin.
 When a managed backend change selects a release-catalog decision model and
 omits the snapshot or timeout, the same transaction writes the catalog's pinned
-snapshot and recommended timeout. It also writes the catalog's recommended
-extra-latency budget when the policy still has its default value. Explicit
-command and policy values remain operator choices. Built-in decision-model
+snapshot and recommended timeout. It also raises `[decision_engine] latency_budget_ms` to the catalog's
+recommended budget when the stored value is lower. Explicit command values
+remain operator choices. Built-in decision-model
 pricing comes from the catalog; `[cost.prices]` is only an override.
 Automatic Router candidates and doctor use those configured price overrides
 when filtering active release rows with Router metadata.
-During migration, only schema-1's serialized 500 ms default becomes implicit.
-An unversioned pre-1.7 file used 300 ms as its default, so its stored 500 ms
-remains an explicit operator choice, as does 500 ms in schema 2. Loading an
-already-configured hosted backend does not raise its current ceiling: when it
-is below the model's catalog recommendation, configuration loading logs a
-warning, `prx causal status` shows it (also as `latency_budget_warning` in JSON),
-and `prx doctor` reports it. Set the policy explicitly to adopt a larger budget;
-the warning itself changes neither admission limits nor backend credentials.
+Loading an already-configured hosted backend does not raise its current
+ceiling: when it is below the model's catalog recommendation, `prx doctor`
+reports it (loading does not warn). Set `latency_budget_ms` explicitly to
+adopt a larger budget; the report itself changes neither admission limits nor
+backend credentials.
 An `endpoint` replaces a hosted service's base URL, and the backend stays
 remote, so it is used only with `remote_enabled`. The hosted credential
 belongs to the service, not to the URL: re-pointing the override sends that
 credential to the new host. The change is high risk (`endpoint_changed`),
 so it needs the confirmation that names the revision, and nothing is sent
-while `remote_enabled` is off. While the plane is
+while `remote_enabled` is off. While the engine is
 disabled, the credential is not resolved and the credential store is not
 opened. Only a change that owns a problem is refused: one that
-touches `[causal_tree]`, or one that makes a backend that passes the check
+touches `[decision_engine.backend]`, or one that makes a backend that passes the check
 fail it (removing its model declaration, for example). A change elsewhere
 that finds the section already refused, or the credential store unreadable,
-is applied with a warning, and the decision plane runs builtin-only until
+is applied with a warning, and the decision engine runs builtin-only until
 the section is fixed. Startup never fails for it either: `prx doctor` and the
-startup log say that the plane runs builtin-only, and why. `prx doctor` also
+startup log say that the engine runs builtin-only, and why. `prx doctor` also
 lists decision credentials (`cred-decision-...`) that nothing references,
 which a process stopped between storing a credential and applying it can
-leave; a rotation removes the credential it replaces. A calibration
-(`[causal_tree.policy.calibration_profile]`: `kind`, `endpoint`, `model`)
-holds only while the backend's kind, endpoint and model all match it.
+leave; a rotation removes the credential it replaces.
 
 Decision requests bind the retained backend's configured model before sealing;
 the main model remains part of the turn's provenance. A model mismatch is
@@ -3102,10 +3008,9 @@ categories = ["conversation"]
 
 For full examples, field-by-field reference, flow, and security boundaries, see [docs/router.md](router.md).
 
-CLI, chat and gateway turns use the shared turn decision service. With
-`[causal_tree]` disabled they still run a built-in conservative decision and
-constrained tool selection; they do not write causal settlement and they do
-not enable a remote decision backend. Prompt recall and the tool surface stay
+CLI, chat and gateway turns use the shared turn decision service. With the
+advisory engine disabled they still run a built-in conservative decision and
+constrained tool selection; they do not enable a remote decision backend. Prompt recall and the tool surface stay
 with their own owners (see the top of this page). Child-session capability
 parity and PRX-to-PRX messaging are planned; they are not current behaviour.
 
@@ -3352,11 +3257,9 @@ refused. `prx models migrate-retired` previews published replacements;
 See [catalog lifecycle and migration](model-catalog.md#release-catalog-lifecycle)
 for replacement conflicts, credential ownership and binary rollback.
 
-The hosted decision latency upgrade warning applies to an inherited legacy
-ceiling below the catalog recommendation. An explicit current-schema
-`causal_tree.policy.extra_latency_budget_ms` is operator-owned and does not
-emit that upgrade warning at load, status or doctor. Both paths preserve the
-configured ceiling.
+`prx doctor` reports a hosted decision backend whose configured
+`[decision_engine] latency_budget_ms` is below the catalog recommendation. The
+report never changes the configured ceiling.
 
 ### Brave credential intake
 
@@ -3422,8 +3325,8 @@ work failure as well as the unconfirmed-cleanup marker.
 
 ## Advisory decision engine
 
-`[decision_engine]` is default-off and is separate from causal admission
-(`[causal_tree]`). It does not own prompt recall or the tool surface. See the
+`[decision_engine]` is default-off. It does not own prompt recall or the tool
+surface. See the
 [decision engine reference](decision-engine.md) for modes, telemetry and cache cost.
 
 ```toml
@@ -3435,6 +3338,9 @@ candidates = 5               # 1–20
 timeout_ms = 1500            # 100–30000
 telemetry_cap = 1000         # 0–100000; 0 opens no store
 observe_queue = 64           # 1–1024; overflow drops and counts
+latency_budget_ms = 500      # 50–5000; extra latency one turn may spend
+token_ratio_limit = 0.35     # finite, > 0; extra tokens as a ratio of baseline
+max_candidates = 12          # 1–32; candidates and mentions a turn considers
 ```
 
 | Key | Default | Contract |
@@ -3446,11 +3352,20 @@ observe_queue = 64           # 1–1024; overflow drops and counts
 | `timeout_ms` | `1500` | 100–30000 ms; failed analysis yields no brief |
 | `telemetry_cap` | `1000` | 0–100000 FIFO outcomes; zero opens no store |
 | `observe_queue` | `64` | 1–1024 pending outcomes; overflow drops and counts |
-| `backend` | inherited | Optional decision backend table; explicit table wins over legacy |
+| `latency_budget_ms` | `500` | 50–5000 ms of extra latency per turn; also the ceiling for the backend transport timeout. Applies whether or not the engine is enabled |
+| `token_ratio_limit` | `0.35` | Finite number greater than 0: extra tokens as a ratio of the turn's baseline tokens |
+| `max_candidates` | `12` | 1–32 candidates and mentions a turn considers |
+| `backend` | absent | Optional `[decision_engine.backend]` table; absent means `kind = "auto"` with `remote_enabled = false` |
 
-An explicit empty backend table selects defaults. Existing causal admission,
-approvals and remote-processing restrictions continue to apply. Roll back by
-setting `enabled = false` and restarting; retained telemetry stays in the workspace.
+`[decision_engine.backend]` keys are `kind` (`auto`, `builtin`,
+`compatible_http`, `typesafe`, `openrouter`), `remote_enabled`, `endpoint`,
+`model`, `pinned_snapshot`, `credential_ref`, `timeout_ms` (default 250),
+`max_request_bytes` (65536), `max_response_bytes` (262144) and
+`circuit_breaker` (`failure_threshold` 5, `cooldown_secs` 60). An explicit empty
+backend table selects the same defaults. Decision state leaves the machine only
+with `remote_enabled = true`. A `[causal_tree]` table is refused at load; the
+three turn limits above replace its former limits. Roll back by setting
+`enabled = false` and restarting; retained telemetry stays in the workspace.
 
 ### Native tool working directory and Full autonomy
 

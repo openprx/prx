@@ -226,13 +226,13 @@ native-tool publication on the turn path. Compatible endpoints no longer infer
 vision from model-name or URL substrings; declare a custom endpoint's facts in
 `[[providers.models]]` when discovery cannot prove them.
 
-When `prx causal config set backend` selects a release-catalog decision model
-without explicit transport arguments, the transaction writes the catalog's
-pinned snapshot and recommended timeout and, while the policy still has its
-implicit latency budget, the catalog's recommended budget. A stored
-`extra_latency_budget_ms` remains explicit even when it equals the built-in
-default. Explicit command or policy values remain TOML choices. Rollback uses the normal configuration
-history; reverting the PRX binary reverts the embedded catalog.
+When `prx decision-engine config set backend.…` selects a release-catalog
+decision model without explicit transport arguments, the transaction writes the
+catalog's pinned snapshot and recommended timeout and raises
+`[decision_engine] latency_budget_ms` to the catalog's recommended budget when
+the stored value is lower; a larger stored budget is kept. Explicit command
+values remain TOML choices. Rollback uses the normal configuration history;
+reverting the PRX binary reverts the embedded catalog.
 
 ## Maintaining the release file
 

@@ -46,11 +46,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 // The real-parent harness is shared with `tests/ordinary_process_worker.rs`;
-// this binary uses the wire-test subset of it.
-#[allow(dead_code)]
+// its parent-restart controls live in that binary's own `restart.rs`.
 #[path = "ordinary_process_worker/parent.rs"]
 mod parent;
-#[allow(dead_code)]
 #[path = "ordinary_process_worker/provider.rs"]
 mod provider;
 

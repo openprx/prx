@@ -237,12 +237,11 @@ remain shared across owners.
 
 Recorded Console, gateway, verified h2 ingress and explicit operator `/bg` calls
 (in both task and process mode) carrying a persisted approval context use durable
-approval when no decision binding is present. Ordinary child calls do not opt in.
-With the causal plane enabled, a modelled side-effecting call under Supervised
-autonomy waits for review before execution. Unmodelled operations use the existing
-approval strategy. Foreground TUI, line-mode chat, and `prx agent` retain their
-interactive prompts, resolver and session allowlist. Decision binding preserves
-the approval routing chosen by each surface builder.
+approval. Ordinary child calls do not opt in.
+A side-effecting call under Supervised autonomy waits for review before
+execution. Foreground TUI, line-mode chat, and `prx agent` retain their
+interactive prompts, resolver and session allowlist. Each surface builder
+chooses its approval routing.
 Approval binds the source, capability and complete arguments; changing arguments
 requires a new review. A claimed approval can execute at most once, including across restart.
 Channel approval runs first, and tool policy and execution gates still apply.
@@ -252,11 +251,11 @@ collection path in recorded Chat and Console sessions. Under supervised
 policy, explicitly name `file_write` or `file_edit` in the request. When that
 operation is otherwise admissible, one main-model response supplies the exact
 proposal for durable owner review. The waiting reply contains its decision
-identifier. Inspect and review it, then explicitly resume the stored call;
-file contents change only after the fresh resume passes its execution checks.
+identifier. Review it through the run's approval surface; file contents change
+only after the approved call passes its execution checks.
 Plan mode and unsupported review adapters reject collection. Filesystem
 mutations remain outside capability discovery. See [Runtime security](security.md#approval-is-exact-durable-and-single-use)
-and [Console decision approval](web-console.md#decision-approval-and-resume).
+and [Console approvals](web-console.md#approvals).
 
 Console file paths refer to the authenticated owner's private space in the
 candidate runtime. Read, write and edit share that namespace; ordinary Chat
@@ -342,9 +341,8 @@ binds a selected capability, schema fingerprint, catalog generation and source
 scope; that binding is independent of the advisory engine. The original recorded
 input belongs to the source proof; recalled memory and later provider history
 do not replace it. Execution rechecks source, policy and the current definition.
-When `[causal_tree]` is enabled, admission still runs the decision plane; with
-the plane off, the same surface owner still publishes the tools. See
-[Decision plane](decision-plane.md) and
+With the advisory engine on or off, the same surface owner publishes the tools.
+See [Turn gates and evidence](decision-engine.md#turn-gates-and-evidence) and
 [Runtime security — tool surface owner](security.md#tool-surface-owner).
 
 `always_exclude` removes names from the eligible surface. `always_include`
@@ -399,7 +397,7 @@ after the same source, policy, generation and binding checks as other discovered
 capabilities. Memory enrichment likewise comes from selected Retrieve results
 rather than unconditional recall. Memory, Document and Session evidence retain
 distinct types and source-owned access scopes; see the
-[backend support matrix](decision-plane.md#candidate-memory-backend-support).
+[backend support matrix](decision-engine.md#memory-backend-support).
 
 IM channel sessions (Signal, Telegram, Discord, WhatsApp/wacli, Slack,
 Mattermost, iMessage …) additionally run under `channel_exclude`, which
@@ -440,28 +438,13 @@ Each child still obtains its own turn context within that inherited boundary.
 UI-owner controls such as attaching a TUI viewport remain in the UI process and
 are not agent execution capabilities.
 
-In the current candidate, process children carrying causal authority pass
-worker admission. Their transport binds
-the child capability subset, durable input identifier, and parent decision digest
-inside the worker signature. Parent constraints carry a separate decision-key
-signature. The worker loads existing authority without creating keys or repairing
-permissions, and verifies the strict subset and inner seals. New delegated
-launches persist an immutable, signed authority binding in the logical workspace's
-`self/child_authority/journal.db` before handing off the worker manifest, in one
-transaction with a signed `launch_parent` record that seals the parent identity,
-lineage and eligibility. Parent verification and source restoration use these
-records without reading the decision store. Journals are mandatory for version 3
-and later launches: such a worker refuses to start when its `authority` or
-`launch_parent` record is missing, corrupt, or differs from the signed manifest.
-The legacy owner-scoped parent decision and record digest path is selected only
-by the launch version (an authenticated launch that predates version 3), never by
-the absence of a journal file or row. Segment admission still runs the existing
-decision gate, and completion retains its admitted terminal settlement
-reference. Batch and process-terminal recovery replay the journal's batch,
-launch and terminal evidence rather than the decision store; the decision store
-projections that remain are non-gating and are never read for authority.
-Reverting this change restores the legacy reader; journal entries can remain in
-place. A separate
+Process children pass worker admission under a key derived from the strict
+session-worker transport secret (see
+[Child sessions and delegation](decision-engine.md#child-sessions-and-delegation)).
+Their transport binds the child capability subset, durable input identifier and
+parent digest inside the worker signature. The worker loads existing key
+material without creating keys or repairing permissions, and verifies the strict
+subset and inner seals. A separate
 keyed binding covers the parent's effective configuration, logical workspace,
 configuration path and generation metadata without transporting configuration
 values. A worker may restore that generation only when its loaded source and
@@ -592,7 +575,7 @@ dialects and route references. Worker grant assembly combines this evidence with
 the verified parent provenance, configuration, capability scope and durable input;
 it does not refresh discovery evidence from a newer cache. Actual provider and
 executor binding is still required before the worker can execute.
-The causal worker selection carries its original provider, model or hint, and
+The worker selection carries its original provider, model or hint, and
 credential reference. The parent resolves the sealed connection from that exact
 selection; the worker verifies target, credential and root-connection provenance
 against the restored PMM view before constructing its provider once. Its child
@@ -604,7 +587,7 @@ and dynamic bindings against actual executors; prompt tool eligibility uses the
 shared PMM gate. Incoming grant and provider binding remain in the worker context
 for nested operations. Segment execution and terminal wiring are still pending. Missing or inconsistent source/authority pairs are
 rejected; a transport signature alone does not authorize execution. Ordinary
-workers without causal authority retain their existing manifest format.
+workers retain their existing manifest format.
 
 When an explicit child allowlist names a dynamic alias that has not been
 discovered yet, PRX refreshes the dynamic registries before resolving the
@@ -699,7 +682,7 @@ external MCP caller runs owner-isolated (see "Owner-isolated reads for external
 MCP callers"), and the execution service refuses an owner-isolated caller any
 tool that does not enforce per-owner isolation, before policy and approval are
 evaluated. The list is explicit (`OWNER_ISOLATION_AWARE_TOOLS` in
-`src/causal_tree/capability_policy.rs`): `capability_search`, `web_search_tool`,
+`src/tools/capability/policy.rs`): `capability_search`, `web_search_tool`,
 `memory_search`, `memory_recall`, `memory_get`,
 `document_search`, `document_get_chunk`, `sessions_list`, `sessions_history`,
 `memory_forget`, `memory_store`, `document_ingest` and `skills_manage`. The name must also be
@@ -1509,8 +1492,8 @@ selected capability, source binding and reduced-depth authority. An empty list
 never means “inherit all.” Delegate task logs retain the parent tracing subscriber;
 provider endpoint userinfo remains redacted.
 
-In the current decision-plane candidate, every delegate model turn requires an
-admitted parent source, including when the decision plane is disabled. Agent
+Every delegate model turn requires an
+admitted parent source, including when the advisory engine is disabled. Agent
 configuration, provider override permissions, resolved model/credentials and
 multimodal settings come from that admission's configuration generation. Input
 and terminal events use its bound memory fabric. A configuration reload does not
@@ -1745,8 +1728,6 @@ This change adds no configuration and does not relax authorization, approval or
 budget checks. Rollback is a source change; no SQLite migration or stored-data
 rewrite is required.
 
-Chat supports `/approve --decision <uuid>` and `/deny --decision <uuid>` for a pending causal decision owned by the current chat. These commands record review through the signed decision-approval service; approval alone does not execute or resume the operation. Existing `/approve <seq>` and `/deny <seq>` still address child sessions. Use the canonical lowercase hyphenated decision UUID. Unknown, foreign, expired and failed reviews produce the same unconfirmed result and are not automatically retried.
-
 Argument collection can also finish without proposing an approval-bound operation.
 PRX records a source-bound decline receipt and returns a normal clarification in
 assistant history. The receipt binds the exact reply and an empty execution
@@ -1755,18 +1736,6 @@ clarification rather than a successful tool action. Existing pending receipts
 keep their verification format. New readers verify old terminal records; older
 readers may refuse verification of the new declined-collection terminal binding.
 
-Use `/approval --decision <uuid>` to inspect the pending call before review. It displays the existing owner-authorized DTO, including redacted arguments and original-call availability; large output is truncated with a marker. `/revoke --decision <uuid>` records revocation of reviewed grants and does not undo any effect already executed. Neither command invokes a provider or resumes a tool. Unknown or foreign decisions do not reveal their existence.
-
-`/resume-decision <uuid>` explicitly requests execution of the original stored call after approval. Chat records a fresh canonical request and run, rechecks its source and pending approval, and uses the existing one-use direct execution service. Ordinary JSON chat messages do not select resume mode. The resume runs as a foreground ordered turn without a main-provider call; terminal status reflects the tool outcome, and a failed or uncertain attempt is not automatically repeated. A closed decision is rendered without running a tool.
-
-After a resume completes, chat continues accepting messages and slash commands.
-A resume that cannot be admitted, including a consumed decision requested from
-a different chat, produces a refusal and leaves chat open after recording the
-failed request. It does not execute the operation or disclose another chat's
-decision details. Failure to persist that terminal record still stops the chat.
-Refused queued requests release their scheduler slot. Recognized infrastructure
-failures instead report that resume failed before execution and can be retried;
-chat does not retry automatically or display private error details.
 Catalog parity checks still apply. After an operation changes the skill catalog,
 chat waits for existing model turns to finish, then publishes the current catalog
 before admitting the next model turn. A fresh chat is not required. Existing
@@ -1780,18 +1749,9 @@ not. When that same capability backs a selected scoped retrieval, the runtime
 keeps the retrieval path so its evidence and ownership checks still run.
 Fresh-state requirements and all execution gates still apply.
 
-Decision records expose `gates.rejected_by_gate` for the current decision hop
-and `gates.turn_rejected_by_gate` for the cumulative turn prefix. The counters
-include totals and counts by gate and reason. A candidate is counted once at
-its first blocking gate within a hop, even when later gate passes repeat the
-same refusal. Approval waits are excluded. A candidate rejected again in a
-later hop is another observation; these totals are not independent bug counts.
-
 Chat prompt Skill metadata and tool selection no longer accumulate across turns. Each turn uses its current selection in canonical prompt order; decision-owned turns continue through the pinned constrained execution reader. Legacy routing uses its stateless fallback with the existing operator exclusions. Cache stability and performance remain subject to the unchanged centralized budgets.
 
-Pending decisions receive a display number from the same monotonic allocator as child sessions, with separate typed mappings. `/approve <seq>` and `/deny <seq>` can review these decisions through the signed service. Numbers are local to this Chat process, tied to the originating chat identity, never reassigned, and bounded to 1024 decision aliases. Inspecting an authenticated pending UUID registers its alias; UUID commands remain available when an alias cannot be allocated or after restart. Switching chats cannot redirect an old decision number to a child session. Every review still revalidates the durable record and grants.
-
-Chat approval, rejection, inspection, revocation and explicit resume commands require local terminal operator input, including child-session `/approve` and `/deny`. The same requirement applies to `/bg`, session kill/steer (including daemon targets), shell/PTY session commands, `/workers cancel` and `/workers stop`, and plain text steering an attached session. Daemon-assigned task text cannot exercise this operator authority. These checks also apply while a provider turn is active; read-only session navigation and worker status remain available.
+Chat approval, rejection and revocation commands require local terminal operator input, including child-session `/approve` and `/deny`. The same requirement applies to `/bg`, session kill/steer (including daemon targets), shell/PTY session commands, `/workers cancel` and `/workers stop`, and plain text steering an attached session. Daemon-assigned task text cannot exercise this operator authority. These checks also apply while a provider turn is active; read-only session navigation and worker status remain available.
 
 ### Chat Plan mode and decision admission
 
@@ -1804,15 +1764,13 @@ rules. Configured autonomy, approval, source and schema checks still apply.
 
 The plain Chat runner retains the admitted mode. A queued turn whose consumer
 mode differs fails before a fixed reply, provider request or tool execution; it
-must be submitted again under the intended mode. A fresh approval resume retains
+must be submitted again under the intended mode. An approved call retains
 both its exact-call restriction and the current admitted Plan restriction;
-approval does not remove Plan interception. This also applies when the decision
-plane is disabled, without enabling remote prediction or decision persistence.
+approval does not remove Plan interception.
 Explicit `/bg` remains an operator command under its existing authorization
 contract and cannot be reused as a model-turn admission.
 
-These changes are candidate behavior awaiting centralized validation, including
-an approved fresh-resume end-to-end case. They do not establish release or
+These changes are candidate behavior awaiting centralized validation. They do not establish release or
 performance acceptance. Rollback must preserve source and terminal evidence;
 reverting the decision projection leaves the existing late Plan interceptor in
 place but restores the known predecision policy mismatch.
@@ -1880,8 +1838,8 @@ share from the parent's remaining monetary allowance, just as recursive launches
 do. Each ordinary sibling atomically takes half of the smaller current balance
 and manifest ceiling, rounded down to cents. A failed launch keeps its reservation;
 no speculative refund can finance another child. Recursive ancestry still has its
-single-child rule. Cloned/reissued grants use the same parent balance. Disabled
-causal-plane publications also share the parent accounting owner. In-process
+single-child rule. Cloned/reissued grants use the same parent balance. Publications
+without a recursive grant also share the parent accounting owner. In-process
 ordinary and operator children retain run-rooted parent constraints; operator
 tasks reserve from their command's remaining allowance before launch. Process
 workers carry the narrowed ceiling in their authenticated manifest. A parent
@@ -1893,8 +1851,7 @@ not merge the distinct per-turn token/context windows or claim a vendor billing 
 Supervised chat displays the actual proposed tool and arguments in its
 interactive approval prompt. Denial never starts the backend. Approval runs the
 reviewed call once through the execution service, which rechecks the tool schema,
-source, policy and budget before dispatch. Repeated approval responses or a
-`/resume-decision` request cannot execute a completed ordinary chat call again.
+source, policy and budget before dispatch. Repeated approval responses cannot execute a completed ordinary chat call again.
 
 Full autonomy executes calls, including lifecycle imports and discovered tools,
 without forcing an approval prompt. Workspace boundaries, owner isolation,
@@ -1907,7 +1864,7 @@ HTTP private-host and allowlist checks still apply after approval.
 
 The plain `prx agent` CLI has no interactive approval-review adapter. A
 Supervised call that needs an unavailable resolver fails closed. Ordinary chat
-approval does not require a separate durable decision approval or resume command.
+approval does not require a separate durable approval step.
 
 Lifecycle reads have separate capabilities: `lifecycle_status`, `lifecycle_list`
 and `lifecycle_inspect`. Each requires its matching `action`; inspection also

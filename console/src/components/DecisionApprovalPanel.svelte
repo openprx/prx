@@ -1,12 +1,9 @@
 <script>
   import { onDestroy } from 'svelte';
-  import { ApiError, api } from '../lib/api';
-  import { createJobWatch } from '../lib/job-watch';
+  import { api } from '../lib/api';
   import { t } from '../lib/i18n';
-  import { isTerminalPhase, sameOriginApiPath } from '../lib/transport';
-  import TurnProgress from './TurnProgress.svelte';
 
-  let { sessionId, onsettled = () => {} } = $props();
+  let { sessionId } = $props();
   let decisionId = $state('');
   let reviewedId = $state('');
   let view = $state(null);
@@ -16,77 +13,9 @@
   let resolved = $state(false);
   let approvalExpires = $state('');
   let alive = true;
-  let turn = $state(null);
-  let watchHandle = null;
   onDestroy(() => {
     alive = false;
-    watchHandle?.stop();
   });
-
-  function startResumeWatch(accepted) {
-    watchHandle?.stop();
-    const origin = sessionId;
-    const pollPath = sameOriginApiPath(accepted.poll_url) || `/api/jobs/${encodeURIComponent(accepted.job_id)}`;
-    turn = {
-      phase: 'accepted',
-      elapsedMs: 0,
-      jobId: accepted.job_id,
-      workId: typeof accepted.work_id === 'string' ? accepted.work_id : '',
-      stillRunning: false,
-      pollStale: false,
-      jobMissing: false,
-      ack: ''
-    };
-    watchHandle = createJobWatch({
-      poll: () => api.getJobByPath(pollPath),
-      onUpdate(update) {
-        if (!alive || sessionId !== origin || !turn) {
-          return;
-        }
-        if (update.terminalUnknown) {
-          turn = { ...turn, pollStale: false, jobMissing: true, stillRunning: false };
-          return;
-        }
-        if (update.error) {
-          turn = { ...turn, pollStale: true, jobMissing: false };
-          return;
-        }
-        const snapshot = update.snapshot || {};
-        const phase = typeof snapshot.status === 'string' ? snapshot.status : turn.phase;
-        turn = {
-          ...turn,
-          phase,
-          elapsedMs: Number.isFinite(snapshot.elapsed_ms) ? snapshot.elapsed_ms : turn.elapsedMs,
-          stillRunning: update.stillRunning === true,
-          pollStale: false,
-          jobMissing: false
-        };
-        if (!isTerminalPhase(phase)) {
-          return;
-        }
-        resolved = true;
-        const result = snapshot.result;
-        notice = phase === 'succeeded' && result?.status === 'ok' && result?.execution_status === 'succeeded'
-          ? t('decisionApproval.completed')
-          : t('decisionApproval.notCompleted');
-        if (phase === 'succeeded') {
-          onsettled().catch(() => {
-            if (alive) error = t('decisionApproval.refreshFailed');
-          });
-        }
-      }
-    });
-  }
-
-  function checkProgressAgain() {
-    if (turn?.jobMissing) {
-      onsettled().catch(() => {
-        if (alive) error = t('decisionApproval.refreshFailed');
-      });
-      return;
-    }
-    watchHandle?.checkAgain();
-  }
 
   async function inspect(event) {
     event.preventDefault();
@@ -107,15 +36,11 @@
       const result = await api.getDecisionApproval(sessionId, id);
       if (!alive) return;
       if (result?.decision_id?.toLowerCase() !== id.toLowerCase()) throw new Error(t('decisionApproval.unavailable'));
-      watchHandle?.stop();
-      watchHandle = null;
-      turn = null;
       reviewedId = result.decision_id;
       view = {
         tool: result.tool, effect: result.effect, call_digest: result.call_digest,
         pending_expires_at: result.pending_expires_at, arguments: result.arguments,
         arguments_redacted: result.arguments_redacted === true,
-        original_call_available: result.original_call_available === true,
         single_use: result.single_use === true
       };
     } catch (failure) {
@@ -126,29 +51,12 @@
   }
 
   async function act(action) {
-    if (busy || !view || resolved || turn || !['approve', 'reject', 'revoke', 'resume'].includes(action)) return;
+    if (busy || !view || resolved || !['approve', 'reject', 'revoke'].includes(action)) return;
     busy = true;
     error = '';
     notice = '';
     try {
-      if (action === 'resume') {
-        if (!view.original_call_available) return;
-        // Send only the reviewed identifier. Display redaction is never call input.
-        const response = await api.resumeDecisionApprovalAsync(sessionId, reviewedId);
-        if (!alive) return;
-        const accepted = response?.status === 202 && response.body?.status === 'accepted' && typeof response.body.job_id === 'string';
-        if (accepted) {
-          notice = t('chat.accepted');
-          startResumeWatch(response.body);
-          return;
-        }
-        const result = response?.body;
-        resolved = true;
-        notice = result?.status === 'ok' && result?.execution_status === 'succeeded'
-          ? t('decisionApproval.completed') : t('decisionApproval.notCompleted');
-        try { await onsettled(); }
-        catch { if (alive) error = t('decisionApproval.refreshFailed'); }
-      } else if (action === 'revoke') {
+      if (action === 'revoke') {
         const receipt = await api.revokeDecisionApproval(sessionId, reviewedId);
         if (!alive) return;
         if (receipt?.decision_id?.toLowerCase() !== reviewedId.toLowerCase()
@@ -171,12 +79,10 @@
       }
     } catch (failure) {
       if (!alive) return;
-      // A transport failure cannot establish whether a one-shot call ran.
+      // A transport failure cannot establish whether the change was recorded.
       // Require a fresh inspection; never retry a mutation automatically.
       resolved = true;
-      error = action === 'resume'
-        ? (failure instanceof ApiError ? failure.message : t('decisionApproval.uncertain'))
-        : failure instanceof Error ? failure.message : t('decisionApproval.unavailable');
+      error = failure instanceof Error ? failure.message : t('decisionApproval.unavailable');
     } finally {
       if (alive) busy = false;
     }
@@ -203,19 +109,12 @@
       <p class="break-all font-mono text-xs">{t('decisionApproval.digest')}: {view.call_digest}</p>
       {#if view.arguments !== null}<pre class="whitespace-pre-wrap break-all rounded-lg bg-white p-3 text-xs dark:bg-gray-800">{JSON.stringify(view.arguments, null, 2)}</pre>{/if}
       {#if view.arguments_redacted}<p>{t('decisionApproval.redacted')}</p>{/if}
-      {#if !view.original_call_available}<p>{t('decisionApproval.noSnapshot')}</p>{/if}
       <p>{t('decisionApproval.separate')}</p>
       <div class="flex flex-wrap gap-2">
-        <button type="button" disabled={busy || resolved || turn} onclick={() => act('approve')} class="rounded-lg bg-sky-600 px-3 py-2 text-white disabled:opacity-50">{t('decisionApproval.approve')}</button>
-        <button type="button" disabled={busy || resolved || turn} onclick={() => act('reject')} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionApproval.reject')}</button>
-        <button type="button" disabled={busy || resolved || turn} onclick={() => act('revoke')} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionApproval.revoke')}</button>
-        <button type="button" disabled={busy || resolved || turn || !view.original_call_available} onclick={() => act('resume')} class="rounded-lg bg-amber-700 px-3 py-2 text-white disabled:opacity-50">{t('decisionApproval.resume')}</button>
+        <button type="button" disabled={busy || resolved} onclick={() => act('approve')} class="rounded-lg bg-sky-600 px-3 py-2 text-white disabled:opacity-50">{t('decisionApproval.approve')}</button>
+        <button type="button" disabled={busy || resolved} onclick={() => act('reject')} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionApproval.reject')}</button>
+        <button type="button" disabled={busy || resolved} onclick={() => act('revoke')} class="rounded-lg border border-gray-400 px-3 py-2 disabled:opacity-50">{t('decisionApproval.revoke')}</button>
       </div>
-    </div>
-  {/if}
-  {#if turn}
-    <div class="mt-3">
-      <TurnProgress phase={turn.phase} elapsedMs={turn.elapsedMs} jobId={turn.jobId} workId={turn.workId} stillRunning={turn.stillRunning} pollStale={turn.pollStale} jobMissing={turn.jobMissing} ack={turn.ack} onCheckAgain={checkProgressAgain} />
     </div>
   {/if}
   <div aria-live="polite" class="mt-2 text-gray-700 dark:text-gray-200">{busy ? t('common.loading') : notice}</div>

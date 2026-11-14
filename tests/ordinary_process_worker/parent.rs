@@ -129,7 +129,7 @@ type Drain = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 /// joins the drain threads (bounded; a stuck thread is detached and reported).
 pub struct OwnedParent {
     child: Child,
-    reaped: bool,
+    pub(crate) reaped: bool,
     stdout: Option<Drain>,
     stderr: Option<Drain>,
     started: Instant,
@@ -201,12 +201,6 @@ impl OwnedParent {
         ParentOutput { status, stdout, stderr }
     }
 
-    /// SIGKILL the parent and reap it (bounded). Its workers keep running.
-    pub fn kill(&mut self) {
-        self.kill_and_reap();
-        assert!(self.reaped, "killed parent was not reaped within bound");
-    }
-
     fn collect_stream(&mut self, stdout: bool) -> String {
         let drain = if stdout { self.stdout.take() } else { self.stderr.take() };
         let bytes = drain
@@ -220,7 +214,7 @@ impl OwnedParent {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn kill_and_reap(&mut self) {
+    pub(crate) fn kill_and_reap(&mut self) {
         if self.reaped {
             return;
         }

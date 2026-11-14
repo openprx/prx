@@ -164,8 +164,8 @@ Approval requirements are durable and bound to the original owner, session,
 operation and capability definition. A channel without an authenticated
 approval surface leaves the action pending or refuses it. A conversational
 reply such as "yes" does not manufacture a grant, and lack of an approval UI
-does not authorize automatic execution. Review/revoke/resume behavior is
-specified in the [decision-plane reference](decision-plane.md).
+does not authorize automatic execution. Review and revoke behavior is
+specified in [Approvals](decision-engine.md#approvals).
 
 A channel message is written by a conversation partner, not by the operator at
 the host, so a channel turn runs under a narrower tool policy than terminal chat

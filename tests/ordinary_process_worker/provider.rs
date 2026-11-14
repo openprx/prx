@@ -86,30 +86,30 @@ pub struct ProviderSpec {
 }
 
 #[derive(Default)]
-struct HoldState {
-    reached: bool,
+pub(crate) struct HoldState {
+    pub(crate) reached: bool,
     released: bool,
 }
 
 #[derive(Default)]
-struct Hold {
-    state: Mutex<HoldState>,
-    signal: Condvar,
+pub(crate) struct Hold {
+    pub(crate) state: Mutex<HoldState>,
+    pub(crate) signal: Condvar,
 }
 
 impl Hold {
-    fn release(&self) {
+    pub(crate) fn release(&self) {
         self.state.lock().released = true;
         self.signal.notify_all();
     }
 }
 
 #[derive(Default)]
-struct Shared {
+pub(crate) struct Shared {
     requests: Mutex<Vec<ProviderRequest>>,
     manifests: Mutex<BTreeMap<String, CapturedManifest>>,
     failures: Mutex<Vec<String>>,
-    hold: Hold,
+    pub(crate) hold: Hold,
     stop: AtomicBool,
 }
 
@@ -120,7 +120,7 @@ impl Shared {
 }
 
 pub struct OwnedProviderServer {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
     destination: String,
 }
@@ -154,22 +154,6 @@ impl OwnedProviderServer {
 
     pub fn manifest(&self, marker: &str) -> Option<CapturedManifest> {
         self.shared.manifests.lock().get(marker).cloned()
-    }
-
-    /// Wait until the held marker's request arrived, at most `timeout`.
-    pub fn wait_for_hold(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.shared.hold.state.lock();
-        while !state.reached {
-            if self.shared.hold.signal.wait_until(&mut state, deadline).timed_out() {
-                return state.reached;
-            }
-        }
-        true
-    }
-
-    pub fn release_hold(&self) {
-        self.shared.hold.release();
     }
 
     /// Every bound breach or fixture fault the server recorded.
@@ -289,6 +273,16 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String), RequestFault
     Ok((head, String::from_utf8_lossy(&body).into_owned()))
 }
 
+/// A harness fault answered as an exact-status JSON error, the same shape a
+/// script's `Reply::Raw` sends.
+fn fault(stream: &mut TcpStream, status: u16, reason: &str) {
+    let reply = Reply::Raw {
+        status,
+        body: serde_json::json!({"error": reason}).to_string(),
+    };
+    write_reply(stream, &reply, "");
+}
+
 fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
     let reason = match status {
         200 => "OK",
@@ -319,7 +313,7 @@ fn handle(mut stream: TcpStream, spec: &mut ProviderSpec, shared: &Shared) {
         Ok(request) => request,
         Err(RequestFault::Empty) => return,
         Err(RequestFault::TooLarge(reason)) => {
-            respond(&mut stream, 413, "text/plain", "too large");
+            fault(&mut stream, 413, "too large");
             shared.fail(reason);
             return;
         }
@@ -330,7 +324,7 @@ fn handle(mut stream: TcpStream, spec: &mut ProviderSpec, shared: &Shared) {
     };
     let own_input = request_own_input(&body);
     let Some(marker) = spec.markers.iter().copied().find(|marker| own_input.contains(marker)) else {
-        respond(&mut stream, 500, "text/plain", "no fixture marker");
+        fault(&mut stream, 500, "no fixture marker");
         shared.fail(format!("fixture request marker missing in own input: {own_input:?}"));
         return;
     };
@@ -347,7 +341,7 @@ fn handle(mut stream: TcpStream, spec: &mut ProviderSpec, shared: &Shared) {
         let mut requests = shared.requests.lock();
         if requests.len() >= MAX_CAPTURED_REQUESTS {
             drop(requests);
-            respond(&mut stream, 503, "text/plain", "request cap");
+            fault(&mut stream, 503, "request cap");
             shared.fail("MAX_CAPTURED_REQUESTS exceeded".into());
             return;
         }
@@ -362,7 +356,7 @@ fn handle(mut stream: TcpStream, spec: &mut ProviderSpec, shared: &Shared) {
             .count()
     };
     if spec.hold == Some(marker) && !hold_released(shared) {
-        respond(&mut stream, 503, "text/plain", "hold expired");
+        fault(&mut stream, 503, "hold expired");
         shared.fail(format!("HOLD_WAIT expired for {marker}"));
         return;
     }

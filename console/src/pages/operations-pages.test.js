@@ -32,8 +32,7 @@ const { api, ApiError } = vi.hoisted(() => {
       publishLifecycleProposal: vi.fn(),
       cancelLifecycleProposal: vi.fn(),
       rollbackLifecycle: vi.fn(),
-      postLifecycleExperiment: vi.fn(),
-      getDecisionStatus: vi.fn()
+      postLifecycleExperiment: vi.fn()
     }
   };
 });
@@ -45,7 +44,6 @@ vi.mock('../lib/router.js', () => ({
 }));
 
 import CostPage from './CostPage.svelte';
-import DecisionPlanePage from './DecisionPlanePage.svelte';
 import LogsPage from './LogsPage.svelte';
 import MemoryPage from './MemoryPage.svelte';
 import OverviewPage from './OverviewPage.svelte';
@@ -248,14 +246,6 @@ test('logs name the process socket and mark a disconnected stream stale', async 
   expect(screen.getByText('The process log socket is not connected. Lines on screen may be stale.')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: 'Export redacted lines' })).toBeInTheDocument();
 });
-
-test('decision plane shows a loading state before status arrives', async () => {
-  api.getDecisionStatus.mockReturnValue(new Promise(() => {}));
-  render(DecisionPlanePage);
-  expect(await screen.findByText('Loading...')).toBeInTheDocument();
-  expect(screen.getByText(/CLI evaluate stays on the command line/)).toBeInTheDocument();
-});
-
 
 test('overview sums prompt cache reported requests and prefix continuations', async () => {
   api.getStatus.mockResolvedValue({ prompt_cache: [

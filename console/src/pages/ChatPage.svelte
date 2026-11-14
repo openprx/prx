@@ -608,7 +608,7 @@
 
 <section class="flex h-[calc(100vh-10rem)] flex-col gap-4">
   {#key sessionId}
-    <DecisionApprovalPanel {sessionId} onsettled={refreshPreservingPin} />
+    <DecisionApprovalPanel {sessionId} />
   {/key}
   <div class="flex items-center justify-between">
     <div class="min-w-0">

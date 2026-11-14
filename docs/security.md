@@ -7,8 +7,8 @@ do not open a public issue.
 
 For configuration and secret handling, see
 [Configuration — Security](configuration.md#security). For related runtime
-behavior, see [Decision plane](decision-plane.md),
-[Advisory decision engine](decision-engine.md), [Tools](tools.md),
+behavior, see [Advisory decision engine](decision-engine.md),
+[Tools](tools.md),
 [Web Console](web-console.md) and
 [Provider routing and cost lifecycle](provider-routing-cost-lifecycle.md).
 
@@ -29,15 +29,12 @@ delegated and scheduled work retain their own source and inherited scope. A
 child must not acquire its parent's execution or approval authority by copying
 an identifier.
 
-Decision inspection is scoped by workspace and owner. Unknown and out-of-scope
-decisions share the absence behavior; inspecting a decision grants no execution
-permission. Imported ownerless legacy rows remain local-operator-only.
-
-Enabled decision admission requires the configured durable source
-prerequisites. Disabling message recording does not authorize inventing a
-source event or silently writing history to satisfy that requirement. A source
-path that cannot establish its required proof must refuse before provider/tool
-execution.
+Approval records are run-keyed and sealed under the runtime key; they are
+scoped by workspace and owner, and reading one grants no execution permission.
+Run-keyed approvals need user-message recording and a recovery repository (see
+[Approvals](decision-engine.md#approvals)). Disabling message recording does
+not authorize inventing a source event or silently writing history to satisfy
+that requirement.
 
 ## Tool surface owner
 
@@ -60,14 +57,9 @@ Approval binds workspace, owner, session, exact operation and call digest,
 capability/catalog identity and expiry. Model text such as “approved”, a
 decision backend's answer, or ordinary channel text is not an approval grant.
 
-Two durable namespaces exist and do not mix at the authority key:
-
-- **Decision-keyed** pending records, keyed by decision id.
-- **Run-keyed** exact-call records, keyed by run id and call digest, used when
-  there is no causal decision. A missing run id refuses the grant.
-
-Listings, claims and revocations keep those keys separate. The Console/gateway
-approval inbox merges both namespaces into one list.
+Approvals are run-keyed: exact-call records are keyed by run id and call
+digest. A missing run id refuses the grant. The Console/gateway approval inbox
+lists them.
 
 For a fresh supervised file operation, the runtime can collect a single
 `file_write` or `file_edit` argument proposal through the recorded Chat or
@@ -119,22 +111,20 @@ Acquiring a local file lock or a database advisory lock does not prove remote
 work stopped. Recovery must not create a new provider/tool attempt or
 fabricate a terminal result.
 
-## Disabled decision plane
+## Disabled decision engine
 
-`[causal_tree].enabled` defaults to true. `[decision_engine].enabled` defaults
-to false. Disabling the decision plane uses conservative builtin selection, no
-remote decision-backend I/O, no decision/outcome database writes, preservation
-of existing decision data for read-only inspection, and no full-registry
-publication. It is not a network kill switch. Ordinary chat provider traffic,
-conversation recording and terminal persistence have their own contracts.
+`[decision_engine].enabled` defaults to false. Disabled means no analysis, no
+advisory brief, no telemetry store open and no outcome writes. It is not a
+network kill switch. Ordinary chat provider traffic, conversation recording and
+terminal persistence have their own contracts. Admission never depends on the
+engine: tool selection stays with the tool surface owner and approval with the
+run's execution policy (see
+[Turn gates and evidence](decision-engine.md#turn-gates-and-evidence)).
 
-The loader preserves versioned explicit disables. Recognized unversioned
-legacy `enabled = false` defaults become unset and inherit true; keep the
-plane off with `schema_version = 2` and `enabled = false`. See
-[upgrade actions](migration-unreleased.md) and
-[Decision plane](decision-plane.md#enable-disable-and-rollback).
+A `[causal_tree]` table is refused at load as an unknown configuration path;
+see [upgrade actions](migration-unreleased.md).
 
-Disabling the plane or reverting code does not cancel dispatched work, refund
+Disabling the engine or reverting code does not cancel dispatched work, refund
 charges, make consumed grants reusable or authorize re-execution. Preserve the
 prior revision, decision data, authenticated source/approval/terminal evidence
 and cost journals.

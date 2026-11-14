@@ -20,6 +20,8 @@
 mod parent;
 #[path = "ordinary_process_worker/provider.rs"]
 mod provider;
+#[path = "ordinary_process_worker/restart.rs"]
+mod restart;
 #[path = "ordinary_process_worker/scan.rs"]
 mod scan;
 

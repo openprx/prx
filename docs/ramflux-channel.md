@@ -247,7 +247,7 @@ The live channel requires SQLite transactional erasure. Other backends return
 an unsupported capability error rather than claiming erasure. Channel content
 objects reside in the same database as their ownership index. Native memory, session and document tools select the same per-message
 capability. Conversation metadata and notices use this view as well. Queued
-causal telemetry retains its run's memory capability and configuration
+decision telemetry retains its run's memory capability and configuration
 generation across a shared decision writer. Unsupported scoped operations fail
 with a typed capability error.
 Memory event payloads and drafts use the same encryption view; `session_id` is keyed, and

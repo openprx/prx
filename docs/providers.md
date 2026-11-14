@@ -1331,7 +1331,7 @@ Successful provider round-trips in the main tool loop record raw prompt,
 cache-read and cache-creation token sums, reported/hit request counts, and
 system/tools prefix change counts per serving provider/model. Failed calls and
 auxiliary calls (SignalVision, smart-group classification, compaction summaries,
-decision-plane requests and approval-argument collection) are excluded. This
+decision-engine requests and approval-argument collection) are excluded. This
 observation does not change prompts, routing or billing.
 
 Anthropic, OpenRouter and OpenAI-compatible endpoints can report cache usage.
