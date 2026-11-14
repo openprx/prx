@@ -128,7 +128,7 @@ type Drain = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 /// A running parent. Dropping it kills and reaps the process (bounded) and
 /// joins the drain threads (bounded; a stuck thread is detached and reported).
 pub struct OwnedParent {
-    child: Child,
+    pub(crate) child: Child,
     pub(crate) reaped: bool,
     stdout: Option<Drain>,
     stderr: Option<Drain>,
@@ -156,9 +156,22 @@ pub fn spawn_parent(config_dir: &Path, home: &Path, line: &str) -> OwnedParent {
 /// open: the parent waits for the next line (a background child keeps running
 /// meanwhile) until the caller writes `/exit` or drops the handle.
 pub fn spawn_held_parent(config_dir: &Path, home: &Path, line: &str) -> (OwnedParent, std::process::ChildStdin) {
+    spawn_held_parent_with_env(config_dir, home, line, &[])
+}
+
+/// [`spawn_held_parent`] with `extra_env` applied over the parent environment.
+pub fn spawn_held_parent_with_env(
+    config_dir: &Path,
+    home: &Path,
+    line: &str,
+    extra_env: &[(&str, &str)],
+) -> (OwnedParent, std::process::ChildStdin) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
     command.arg("--config-dir").arg(config_dir).arg("chat").arg("--plain");
     parent_environment(&mut command, home);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

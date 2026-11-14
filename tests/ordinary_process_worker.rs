@@ -433,3 +433,61 @@ fn restarted_parent_recovers_and_verifies_ordinary_launch() {
     assert_completion_journal(&fixture.parent_workspace, &child.manifest);
     scan::assert_no_decision_records(fixture.root());
 }
+
+/// CF-R7: a live parent's restart sweep does not fight the live owner. The
+/// parent stays alive past one 30-second sweep after its process child
+/// completed; `chat.log` (at `warn`) never reports an unconfirmed
+/// reconciliation.
+#[test]
+fn live_parent_sweep_does_not_warn() {
+    const PARENT: &str = "PRX-LIVE-SWEEP-PARENT";
+    const CHILD: &str = "PRX-LIVE-SWEEP-CHILD";
+    /// One recovery sweep period (30 s) plus margin, observed after completion.
+    const SWEEP_WINDOW: std::time::Duration = std::time::Duration::from_secs(35);
+    let fixture = ParentFixture::new();
+    let mut parent_script = spawn_and_join(PARENT, serde_json::json!([CHILD]));
+    let server = start_server(
+        &fixture,
+        vec![PARENT, CHILD],
+        vec![PARENT],
+        None,
+        move |marker, index, body| {
+            parent_script(marker, index, body).unwrap_or_else(|| text_reply("PRX-LIVE-SWEEP-DONE"))
+        },
+    );
+    let (mut held, mut stdin) = parent::spawn_held_parent_with_env(
+        &fixture.config_dir,
+        &fixture.home,
+        &spawn_request(PARENT),
+        &[("RUST_LOG", "warn")],
+    );
+    let manifest = {
+        let deadline = std::time::Instant::now() + WORKER_DEADLINE;
+        loop {
+            if let Some(child) = server.manifest(CHILD) {
+                break child.manifest;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child manifest exceeded WORKER_DEADLINE"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    wait_for_completion(&fixture.parent_workspace, &manifest);
+    let observed_from = std::time::Instant::now();
+    while observed_from.elapsed() < SWEEP_WINDOW {
+        assert!(!held.has_exited(), "the parent must stay alive across the sweep");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    std::io::Write::write_all(&mut stdin, b"/exit\n").expect("test: parent exit line");
+    drop(stdin);
+    let output = held.wait();
+    output.assert_success("live sweep");
+    server.assert_no_failures();
+    let log = std::fs::read_to_string(fixture.config_dir.join("chat.log")).unwrap_or_default();
+    assert!(
+        !log.contains("reconciliation remains unconfirmed"),
+        "the live parent warned about its own child: {log}"
+    );
+}

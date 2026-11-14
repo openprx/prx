@@ -135,6 +135,26 @@ fn settle_deferred(
     }
 }
 
+/// A file-watcher reload refused because the process has no async runtime
+/// for the generation participants to run on.
+#[derive(Debug, thiserror::Error)]
+#[error("configuration reload refused: no async runtime is available to the configuration watcher")]
+pub struct ReloadRuntimeUnavailable;
+
+/// Reload the files inside the captured runtime's context, so participants
+/// that build runtime-bound components (`Handle::try_current`) can prepare.
+/// Without a runtime the reload is refused, never applied partially.
+fn reload_in_runtime(
+    shared: &SharedConfig,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> anyhow::Result<super::generation::ConfigApplyReport> {
+    let Some(runtime) = runtime else {
+        return Err(ReloadRuntimeUnavailable.into());
+    };
+    let _entered = runtime.enter();
+    shared.reload_from_disk(ConfigReloadTrigger::FileWatcher)
+}
+
 /// The outcome of a reload of the files, bound to the revision the reload
 /// evaluated: the loaded revision when it succeeded, the refused candidate's
 /// when it failed, and, when the files did not even load (no candidate
@@ -296,7 +316,7 @@ fn run_watcher(
                 }
 
                 let previous = shared.load_full();
-                let reloaded = shared.reload_from_disk(ConfigReloadTrigger::FileWatcher);
+                let reloaded = reload_in_runtime(&shared, runtime.as_ref());
                 // A new outcome replaces one still waiting: it is about newer
                 // content, and the older record is superseded by it.
                 pending = watcher_outcome(&shared, &reloaded, &content_hash)
@@ -376,6 +396,96 @@ fn log_diff(old: &Config, fresh: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A participant whose preparation builds a runtime-bound component.
+    struct RuntimeBoundParticipant {
+        prepared: Arc<AtomicU64>,
+    }
+
+    struct NoopPrepared;
+
+    impl super::super::generation::PreparedConfigGeneration for NoopPrepared {
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
+
+    impl super::super::generation::ConfigGenerationParticipant for RuntimeBoundParticipant {
+        fn name(&self) -> &'static str {
+            "runtime_bound_test"
+        }
+
+        fn supports_rebuild_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn prepare(
+            &self,
+            _generation: Arc<super::super::generation::ConfigGeneration>,
+            _changed_fields: &[String],
+        ) -> anyhow::Result<Box<dyn super::super::generation::PreparedConfigGeneration>> {
+            tokio::runtime::Handle::try_current()?;
+            self.prepared.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(NoopPrepared))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn participant_needing_runtime_context_applies() {
+        const RELOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: write");
+        let initial = crate::config::schema::Config::load_from_path(&config_path, dir.path().join("workspace"))
+            .expect("test: load");
+        let shared = new_shared(initial);
+        let prepared = Arc::new(AtomicU64::new(0));
+        let participant: Arc<dyn super::super::generation::ConfigGenerationParticipant> =
+            Arc::new(RuntimeBoundParticipant {
+                prepared: Arc::clone(&prepared),
+            });
+        shared.register_participant(&participant);
+        let manager = HotReloadManager::spawn(config_path.clone(), Arc::clone(&shared));
+        tokio::time::timeout(RELOAD_DEADLINE, async {
+            while !manager.is_ready() {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("test: watcher ready");
+
+        std::fs::write(&config_path, "default_temperature = 0.4\n").expect("test: rewrite");
+        tokio::time::timeout(RELOAD_DEADLINE, async {
+            while manager.reload_version() == 0 {
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .expect("test: the reload applied");
+        assert_eq!(
+            prepared.load(Ordering::SeqCst),
+            1,
+            "the participant prepared in runtime context"
+        );
+        assert!((shared.load_full().default_temperature - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reload_without_runtime_is_refused() {
+        let dir = tempfile::TempDir::new().expect("test: temp dir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").expect("test: write");
+        let initial = crate::config::schema::Config::load_from_path(&config_path, dir.path().join("workspace"))
+            .expect("test: load");
+        let shared = new_shared(initial);
+        std::fs::write(&config_path, "default_temperature = 0.4\n").expect("test: rewrite");
+        let error = reload_in_runtime(&shared, None).expect_err("test: refused without a runtime");
+        assert!(error.downcast_ref::<ReloadRuntimeUnavailable>().is_some(), "{error:#}");
+        assert!((shared.load_full().default_temperature - 0.7).abs() < f64::EPSILON);
+    }
     use crate::config::manage::{
         ApplyOptions, ConfigActor, ConfigChange, ConfigHistory, ConfigTransactions, RecordStatus,
     };

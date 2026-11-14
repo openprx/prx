@@ -22,6 +22,7 @@ mod lineage;
 mod liveness;
 mod owned_child;
 mod process_manifest;
+mod process_recovery;
 mod recursive;
 mod schema_matrix;
 mod spawn;

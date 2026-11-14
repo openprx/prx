@@ -14,6 +14,11 @@ impl OwnedParent {
         self.kill_and_reap();
         assert!(self.reaped, "killed parent was not reaped within bound");
     }
+
+    /// Whether the parent process has already exited.
+    pub fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
 }
 
 impl OwnedProviderServer {

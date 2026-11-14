@@ -13,6 +13,10 @@ pub(super) async fn run_restart_recovery(
     workspace: std::path::PathBuf,
     runs: std::sync::Arc<tokio::sync::RwLock<Vec<super::SubAgentRun>>>,
 ) {
+    // An unconfirmed reconciliation is reported once per launch per process,
+    // not again on every sweep; the set is bounded and restarts when full.
+    const MAX_WARNED_LAUNCHES: usize = 4096;
+    let mut warned = std::collections::HashSet::new();
     let mut cursor = 0;
     loop {
         let delay = match recover_restart_page(&fabric, &workspace, cursor, 128).await {
@@ -22,6 +26,12 @@ pub(super) async fn run_restart_recovery(
                     match outcome.result {
                         Ok(Some(recovered)) => {
                             if recovered.restore(&runs).await.is_err() {
+                                if warned.len() >= MAX_WARNED_LAUNCHES {
+                                    warned.clear();
+                                }
+                                if !warned.insert(outcome.launch_event_id) {
+                                    continue;
+                                }
                                 tracing::warn!(
                                     launch_event_id = outcome.launch_event_id,
                                     "worker restart registry reconciliation remains unconfirmed"
@@ -50,12 +60,12 @@ pub(super) async fn run_restart_recovery(
 }
 
 pub(super) struct RecoveredProcessRun {
-    source: MessageEvent,
-    batch_id: Option<String>,
-    outcome: RecoveredProcessOutcome,
+    pub(super) source: MessageEvent,
+    pub(super) batch_id: Option<String>,
+    pub(super) outcome: RecoveredProcessOutcome,
 }
 
-enum RecoveredProcessOutcome {
+pub(super) enum RecoveredProcessOutcome {
     OperatorComplete(operator::VerifiedOperatorWorkerCompletion),
     OperatorUnconfirmed(RecoveredWorkerUsage),
     OrdinaryComplete(ordinary::VerifiedOrdinaryWorkerCompletion),
@@ -155,18 +165,24 @@ impl RecoveredProcessRun {
         let existing_index = runs.iter().position(|run| run.id == run_id);
         if let Some(index) = existing_index {
             let existing = runs.get(index).context("recovered worker registry index disappeared")?;
+            let recovery_only = existing
+                .process_control
+                .as_ref()
+                .is_some_and(|control| control.recovery_only);
+            // A live row of the same owner is the sole owner of the run: its
+            // source is the parent turn's event while recovery reads the
+            // child input event, so the identities legitimately differ.
+            if !recovery_only && existing.owner_id == source.owner_id {
+                return Ok(false);
+            }
+            // Only an upgrade of a recovery-only projection must match the
+            // recovered source and ownership exactly.
             anyhow::ensure!(
-                existing.owner_id == source.owner_id
+                recovery_only
+                    && existing.owner_id == source.owner_id
                     && existing.source_message_event_id.as_deref() == Some(source.event_id.as_str()),
                 "recovered worker conflicts with registry ownership"
             );
-            if !existing
-                .process_control
-                .as_ref()
-                .is_some_and(|control| control.recovery_only)
-            {
-                return Ok(false);
-            }
             // A later sweep cannot discard or change an already authenticated
             // settlement, including while upgrading to a completed journal.
             anyhow::ensure!(
