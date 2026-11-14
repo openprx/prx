@@ -481,7 +481,7 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
                 let budgets = TurnBudgets {
                     tokens: 8_000,
                     micro_usd: 5_000,
-                    latency_ms: config.causal_tree.policy.extra_latency_budget_ms,
+                    latency_ms: config.decision_engine.latency_budget_ms,
                 };
                 assert_eq!(budgets.latency_ms, 500, "business deadline remains the default");
                 let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);

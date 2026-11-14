@@ -785,7 +785,6 @@ mod tests {
                 cache_read: 1.0,
             },
         );
-        config.causal_tree.enabled = false;
         config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
         Agent::builder()
             .runtime_config(config, "ollama")
@@ -803,7 +802,6 @@ mod tests {
     fn embedded_provider_builder(workspace: &std::path::Path) -> AgentBuilder {
         let mut builder = embedded_builder(workspace);
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
-        config.causal_tree.policy.max_decision_hops = 1;
         // G7 requires verified NativeTools even for a selected Memory read.
         // These declarations describe only the controlled fixture models.
         for model in ["prx-local-model", "prx-selected-model"] {
@@ -1259,19 +1257,26 @@ mod tests {
             .memory_loader(Box::new(CountingLoader(Arc::clone(&calls))));
         let selected_config = &mut builder.runtime_config.as_mut().expect("test: configured builder").0;
         selected_config.decision_engine.enabled = true;
-        selected_config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
+        selected_config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
         );
         // Both cases select Builtin; turns open prediction-free.
         if record_decisions {
             let config = &mut builder.runtime_config.as_mut().unwrap().0;
-            config.causal_tree.enabled = true;
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::Builtin,
-            );
-            config.causal_tree.backend.remote_enabled = false;
-            config.causal_tree.store.record_redacted_projection = true;
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::Builtin,
+                );
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .remote_enabled = false;
             config.cost.prices.insert(
                 "ollama/prx-local-model".to_owned(),
                 config.cost.prices["prx-local-model"].clone(),
@@ -1823,12 +1828,16 @@ mod tests {
         *provider_name = LABEL.to_owned();
         config.default_provider = Some(LABEL.to_owned());
         config.default_model = Some("model-a".to_owned());
-        config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
-        );
-        config.causal_tree.backend.remote_enabled = false;
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         config.providers.models.clear();
         config.providers.models.push(
             toml::from_str(&format!(
@@ -2048,12 +2057,16 @@ mod tests {
 
         let mut builder = embedded_provider_builder(workspace.path());
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
-        config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
-        );
-        config.causal_tree.backend.remote_enabled = false;
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         config.cost.prices.insert(
             "ollama/prx-local-model".to_owned(),
             config.cost.prices["prx-local-model"].clone(),
@@ -2617,12 +2630,16 @@ mod tests {
         let config = &mut builder.runtime_config.as_mut().unwrap().0;
         config.memory.auto_save = false;
         // Owned local fixture records the genuine Builtin decision chain; no remote backend.
-        config.causal_tree.enabled = true;
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
-        );
-        config.causal_tree.backend.remote_enabled = false;
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         config.tool_tiering.always_exclude.push("mcp_probe".to_owned());
         let memory = Arc::clone(builder.memory.as_ref().unwrap());
         let refreshes = Arc::new(AtomicUsize::new(0));

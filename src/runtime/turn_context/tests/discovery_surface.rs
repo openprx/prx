@@ -48,10 +48,9 @@ async fn named_memory_recall_is_reached_by_search_without_publishing_peers() {
             let workspace = tempfile::tempdir().unwrap();
             let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind = crate::config::schema::decision_engine::BackendSelection::Fixed(crate::config::schema::decision_engine::BackendKind::Builtin);
             config.workspace_dir = workspace.path().to_owned();
-            config.causal_tree.enabled = true;
-            config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+            config.decision_engine.latency_budget_ms = 5_000;
             config.providers.models.push(
                 toml::from_str(
                     "provider = \"ollama\"\nmodel = \"prx-local-model\"\noperations = [\"chat\"]\nnative_tools = true\n",
@@ -190,9 +189,10 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config.workspace_dir = workspace.path().to_owned();
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -309,12 +309,12 @@ async fn direct_native_write_can_discover_read_peers_through_search() {
         let workspace = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
-        );
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
         config.workspace_dir = workspace.path().to_owned();
-        config.causal_tree.enabled = true;
-        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.decision_engine.latency_budget_ms = 5_000;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
         config.providers.models.push(
             toml::from_str(
@@ -478,12 +478,12 @@ async fn discovery_turn(spec: DiscoveryTurnSpec<'_>) -> DiscoveryTurn {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config.workspace_dir = workspace.path().to_owned();
-    config.causal_tree.enabled = true;
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.decision_engine.latency_budget_ms = 5_000;
     config.autonomy.level = spec.autonomy;
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -1007,9 +1007,10 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     .unwrap();
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config.workspace_dir = workspace.path().to_owned();
     config.skills.open_skills_dir = Some(
         workspace
@@ -1025,7 +1026,7 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
             .to_string_lossy()
             .to_string(),
     );
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.decision_engine.latency_budget_ms = 5_000;
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
     config.cost.prices.insert(
         "prx-local-model".to_owned(),

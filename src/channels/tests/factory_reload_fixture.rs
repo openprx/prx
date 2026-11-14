@@ -534,8 +534,12 @@ pub(super) async fn run() {
         initial.config_path = tmp.path().join("config.toml");
         // The persisted-backend assertions deliberately require local prediction.
         initial.decision_engine.enabled = true;
-        initial.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
+        initial
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
         );
         initial.default_provider = Some("openai".to_owned());
         initial.default_model = Some(MODEL.to_owned());
@@ -543,7 +547,6 @@ pub(super) async fn run() {
         initial.api_key = Some(KEYS[0].to_owned());
         initial.api_url = Some(a.url.clone());
         initial.memory.auto_save = false;
-        assert!(initial.causal_tree.enabled);
         assert!(!initial.config_path.exists());
         let mut initial_ctx = context(
             &tmp,

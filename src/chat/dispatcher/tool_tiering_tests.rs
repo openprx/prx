@@ -255,11 +255,10 @@ async fn offered_tools_for(
     let cancellation = CancellationToken::new();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
-    config.causal_tree.enabled = false;
     // Publication is the subject of these fixtures. Leave room for decision
     // work plus the unchanged 500 ms Web family estimate so G6 measures a
     // genuine admitted capability instead of closing on fixture latency.
-    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
+    config.decision_engine.latency_budget_ms = 1_000;
     config.tool_tiering = tiering;
     let admitted = super::turn_characterization_tests::admit_chat_fixture_with_config(
         provider.clone(),
@@ -673,8 +672,7 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
     let cancellation = CancellationToken::new();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
-    config.causal_tree.enabled = false;
-    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
+    config.decision_engine.latency_budget_ms = 1_000;
     config.tool_tiering.always_include.push(CORE_TOOL.to_owned());
     let mut tools = probe_tools(false);
     tools.retain(|tool| tool.name() != CORE_TOOL);

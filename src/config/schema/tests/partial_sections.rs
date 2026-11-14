@@ -204,15 +204,13 @@ fn partial_channels_still_require_credentials_and_allowlists() {
     }
 }
 
-/// The three O6 cases in one document, read through the real loader: a
-/// partial `[autonomy]`, a partial `[memory]`, and a bare `[causal_tree]
-/// enabled = false`, which D-074 reads as unset and the load reports.
+/// The O6 cases in one document, read through the real loader: a partial
+/// `[autonomy]` and a partial `[memory]`.
 #[test]
-fn the_three_reported_partial_sections_load_together() {
+fn the_reported_partial_sections_load_together() {
     let text = "default_temperature = 0.7\n\n\
                 [autonomy]\nlevel = \"full\"\n\n\
-                [memory]\nbackend = \"sqlite\"\n\n\
-                [causal_tree]\nenabled = false\n";
+                [memory]\nbackend = \"sqlite\"\n";
     let (_dir, loaded) = load(text);
     let loaded = loaded.expect("test: the three reported partial sections load");
 
@@ -224,8 +222,4 @@ fn the_three_reported_partial_sections_load_together() {
     );
     assert_eq!(loaded.memory.backend, "sqlite");
     assert!(loaded.memory.auto_save);
-    assert!(
-        loaded.causal_tree.enabled,
-        "D-074: a bare unversioned disable is read as unset, so the plane keeps its default"
-    );
 }

@@ -15,7 +15,6 @@ fn open_store(dir: &Path) -> Arc<dyn Memory> {
 fn config_at(dir: &Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.workspace_dir = dir.to_path_buf();
-    config.causal_tree.enabled = true;
     config
 }
 

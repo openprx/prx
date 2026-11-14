@@ -303,7 +303,6 @@ impl Tool for FixtureTool {
 fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_path_buf();
-    config.causal_tree.enabled = false;
     // The shared success fixture deliberately exercises a model-issued tool
     // call. Make that one fixture capability part of the configured Direct
     // surface; an absent registry entry still publishes nothing.
@@ -323,9 +322,7 @@ fn admission_config(workspace: &std::path::Path) -> crate::config::Config {
 }
 
 fn enabled_builtin_admission_config(workspace: &std::path::Path) -> crate::config::Config {
-    let mut config = admission_config(workspace);
-    config.causal_tree.enabled = true;
-    config
+    admission_config(workspace)
 }
 
 fn assert_enabled_prediction_free_answer(decision: crate::agent::turn_request::TurnDecision<'_>) {
@@ -504,9 +501,9 @@ async fn admit_chat_fixture_with_mode(
             ),
             provider_catalog: &provider_catalog,
             transports: if matches!(
-                config.causal_tree.backend.kind,
-                crate::config::schema::causal_tree::BackendSelection::Fixed(
-                    crate::config::schema::causal_tree::BackendKind::CompatibleHttp
+                crate::config::schema::decision_engine::effective_engine_backend(&config).kind,
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::CompatibleHttp
                 )
             ) {
                 &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports

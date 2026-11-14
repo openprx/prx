@@ -21,10 +21,7 @@ pub const SPLIT_FILE_LAYOUT: &[(&str, &[&str])] = &[
     ("network.toml", &["gateway", "tunnel", "proxy"]),
     ("security.toml", &["security", "autonomy", "secrets"]),
     ("scheduler.toml", &["scheduler", "cron", "heartbeat", "xin"]),
-    (
-        "agent.toml",
-        &["agent", "sessions_spawn", "self_system", "causal_tree", "agents"],
-    ),
+    ("agent.toml", &["agent", "sessions_spawn", "self_system", "agents"]),
     (
         "identity.toml",
         &["identity", "identity_bindings", "user_policies", "auth"],

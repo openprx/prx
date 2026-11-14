@@ -600,7 +600,7 @@ pub(super) fn braced_block(text: &str, from: usize) -> Option<&str> {
 /// Where a crate-rooted path in a causal file starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PathRoot {
-    /// `crate::`, or `super::` in `src/causal_tree/mod.rs`, where it is the
+    /// `crate::`, or `super::` in a top-level module file, where it is the
     /// crate root.
     Crate,
     /// `super::super::`: the crate root from a top-level causal file, or the

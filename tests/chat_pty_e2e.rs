@@ -1800,7 +1800,7 @@ fn default_config_plain_turn_reaches_the_model_without_a_model_declaration() {
             cache_read: 0.0,
         },
     );
-    assert_eq!(config.causal_tree, defaults.causal_tree);
+    assert_eq!(config.decision_engine, defaults.decision_engine);
     assert_eq!(config.providers.models, defaults.providers.models);
     assert!(
         config.providers.models.is_empty(),

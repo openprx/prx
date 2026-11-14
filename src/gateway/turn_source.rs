@@ -32,10 +32,6 @@ impl GatewaySourceReceipt {
             return Self::issue(memory, generation, envelope, raw_input, recorded).await;
         }
         anyhow::ensure!(
-            !generation.effective.causal_tree.enabled,
-            "enabled gateway decision source was not recorded"
-        );
-        anyhow::ensure!(
             envelope.source == crate::runtime::envelope::RuntimeSource::Gateway
                 && envelope.workspace_id == generation.effective.workspace_dir.to_string_lossy()
                 && envelope.config_generation_id == Some(generation.id.0)
@@ -406,10 +402,6 @@ impl GatewaySourceReceipt {
                 .await?
         };
         let Some(recorded) = recorded else {
-            anyhow::ensure!(
-                !runtime.config_generation.effective.causal_tree.enabled,
-                "console source event is not durable"
-            );
             let mut local_envelope = envelope.clone();
             local_envelope.source_message_event_id = None;
             let has_conversation_history = memory

@@ -65,7 +65,6 @@ mod tests {
         ] {
             let (dir, fabric, binding) = fixture_with_advisory(
                 true,
-                true,
                 DecisionEngineConfig {
                     enabled,
                     mode,

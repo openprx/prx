@@ -277,7 +277,6 @@ impl OrdinaryChildPublication {
             events: Arc::clone(&parent.events),
             state_key: Arc::clone(&parent.state_key),
             policy_version,
-            durable_key: false,
             recordable: false,
             registry,
             execution,

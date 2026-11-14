@@ -56,17 +56,9 @@ pub(crate) async fn build_publication(
         return Err(TurnRuntimeBuildError::WorkerSurface);
     }
     let config = &build.generation.effective;
-    if config.causal_tree.enabled && !crate::memory::serves_tool_execution_ledger(build.memory.name()) {
-        return Err(TurnRuntimeBuildError::EventStoreUnsupported);
-    }
-    if config.causal_tree.enabled && !config.memory.events.record_user_messages {
-        return Err(TurnRuntimeBuildError::InboundEventsDisabled);
-    }
-    // The runtime key is the turn's state key always (OV-2). The legacy plane
-    // consumers still see it only while the plane is enabled.
+    // The runtime key is the turn's state key always (OV-2): persisted, never
+    // ephemeral, so it is also the key the backend factory receives.
     let runtime_key = load_runtime_key(Arc::clone(&build.generation)).await?;
-    let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
-    let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
     let events = Arc::clone(&build.events);
     let runtime = crate::runtime::turn_context::TurnRuntimeHolder::prepare(
@@ -79,6 +71,8 @@ pub(crate) async fn build_publication(
     .await
     .map_err(TurnRuntimeBuildError::RecoveryPreparation)?;
     let state_key = runtime_key;
+    // OV-13: recording on and an activated recovery repository.
+    let recordable = runtime.recovery_scope().recordable;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnRuntimeBuildError::PolicyFingerprint)?;
     let mut catalog_sources = build.catalog_sources;
@@ -96,7 +90,7 @@ pub(crate) async fn build_publication(
         config,
         FactoryDeps {
             catalog: build.provider_catalog,
-            key: workspace_key,
+            key: Some(Arc::clone(&state_key)),
             transports: build.transports,
             config_generation: build.generation.id.0,
             events: Arc::clone(&events),
@@ -135,8 +129,7 @@ pub(crate) async fn build_publication(
         events,
         state_key,
         policy_version,
-        durable_key,
-        recordable: durable_key,
+        recordable,
         registry: build.registry,
         execution: build.execution,
         memory: build.memory,

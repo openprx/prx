@@ -178,7 +178,7 @@ async fn open_turn_context_g6_slice_is_literal() {
     config.agent.compaction.max_context_tokens = 32_768;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 4_096;
-    config.causal_tree.policy.extra_token_ratio_limit = 1.0;
+    config.decision_engine.token_ratio_limit = 1.0;
     let admitted = AdmittedTurn::with_config(config, "open the turn context", Arc::new(Vec::new())).await;
     let decision = admitted.decision();
     let context = decision
@@ -369,7 +369,7 @@ async fn default_config_discovered_tool_is_published_then_dispatched() {
         !config.decision_engine.enabled,
         "this cell runs with the decision engine off"
     );
-    config.causal_tree.policy.extra_latency_budget_ms = 1_000;
+    config.decision_engine.latency_budget_ms = 1_000;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     let dispatches = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::agent::test_admission::registry_with_search(vec![Box::new(RecordingTool {
@@ -574,7 +574,7 @@ async fn drive_agent_entry_with_input(workspace: &std::path::Path, mut config: c
 }
 
 /// Disabled engine never constructs a factory, telemetry store, or credential
-/// resolution on any production entry. Recovery still follows `[causal_tree]`.
+/// resolution on any production entry.
 #[tokio::test]
 async fn disabled_engine_constructs_nothing() {
     fn assert_cell(name: &str, workspace: &std::path::Path, spy: &crate::decision_engine::access_spy::AccessSpy) {
@@ -621,17 +621,25 @@ async fn disabled_engine_constructs_nothing() {
     }
 
     for kind in [
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+        crate::config::schema::decision_engine::BackendKind::Builtin,
+        crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
     ] {
         let workspace = tempfile::tempdir().expect("test: local backend workspace");
         let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         let mut config = engine_off_config(workspace.path());
-        config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(kind);
-        if kind == crate::config::schema::causal_tree::BackendKind::CompatibleHttp {
-            config.causal_tree.backend.endpoint = "http://127.0.0.1:9/v1".into();
-            config.causal_tree.backend.model = "prx-decision-probe".into();
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(kind);
+        if kind == crate::config::schema::decision_engine::BackendKind::CompatibleHttp {
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .endpoint = "http://127.0.0.1:9/v1".into();
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .model = "prx-decision-probe".into();
             config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"custom:http://127.0.0.1:9/v1", "model":"prx-decision-probe", "operations":["decision_endpoint"]})).expect("test: declared loopback decision model"));
         }
         drive_agent_entry(workspace.path(), config).await;
@@ -644,15 +652,31 @@ async fn disabled_engine_constructs_nothing() {
     let workspace = tempfile::tempdir().expect("test: remote-keys workspace");
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     let mut config = engine_off_config(workspace.path());
-    config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
-    );
-    config.causal_tree.backend.remote_enabled = true;
-    config.causal_tree.backend.endpoint = "https://example.invalid/v1".into();
-    config.causal_tree.backend.model = "decision-model".into();
-    config.causal_tree.backend.credential_ref =
-        crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-engine-off".into());
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
+        );
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .remote_enabled = true;
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .endpoint = "https://example.invalid/v1".into();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .model = "decision-model".into();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .credential_ref =
+        crate::config::schema::decision_engine::CredentialRefSetting::Profile("cred-engine-off".into());
     config.providers.models.push(
         serde_json::from_value(serde_json::json!({
             "provider": "custom:https://example.invalid/v1",
@@ -662,7 +686,7 @@ async fn disabled_engine_constructs_nothing() {
         .expect("test: decision model declaration"),
     );
     drive_agent_entry(workspace.path(), config).await;
-    spy.assert_constructs_nothing("causal_tree remote keys");
+    spy.assert_constructs_nothing("decision engine remote keys");
     assert!(
         !workspace.path().join("self/causal_tree/decisions.db").exists(),
         "no decision database is created (P2-G5a)"
@@ -760,13 +784,12 @@ async fn run_plain_fallback_cell(input: &str) {
     let workspace = tempfile::tempdir().expect("test: plain workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
-    config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
+    config.decision_engine.latency_budget_ms = 5_000;
     // Pin confidence abstention even when the catalog makes Answer the clear winner.
-    config.causal_tree.policy.commit_threshold = 1.0;
     let spy = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
     // No metadata discovery: this cell must exercise confidence abstention,
     // rather than the separate committed Answer after a successful catalog read.
@@ -1263,9 +1286,9 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     use crate::runtime::decision_advisory::tests::{RecordingBackend, analysis_input, enabled_config};
     let temp = tempfile::tempdir().expect("test: budget workspace");
     let mut config = (*enabled_config(temp.path())).clone();
-    config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
-        kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Mock,
+    config.decision_engine.backend = Some(crate::config::schema::decision_engine::DecisionBackendConfig {
+        kind: crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Mock,
         ),
         model: "recording-model".into(),
         ..Default::default()
@@ -1278,7 +1301,7 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
         let factory = crate::decision_engine::prediction::factory::DecisionBackendFactory::from_slots(
             vec![Box::new(RecordingBackend {
                 identity: crate::cost::decision_attempt::BackendIdentity {
-                    kind: crate::config::schema::causal_tree::BackendKind::Mock,
+                    kind: crate::config::schema::decision_engine::BackendKind::Mock,
                     provider: None,
                     configured_model: Arc::from("recording-model"),
                 },
@@ -1352,9 +1375,9 @@ async fn tight_budget_skips_analysis_and_never_refuses_the_request() {
     // Served: an engine-on turn whose priced analysis cannot be afforded
     // (no price for the remote decision model) is answered without a brief.
     let served = Box::pin(open_agent_turn(true, |config| {
-        config.decision_engine.backend = Some(crate::config::schema::causal_tree::DecisionBackendConfig {
-            kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+        config.decision_engine.backend = Some(crate::config::schema::decision_engine::DecisionBackendConfig {
+            kind: crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
             ),
             remote_enabled: true,
             endpoint: "https://example.invalid/v1".into(),
@@ -1412,7 +1435,7 @@ async fn configured_backend_runs_on_a_production_opened_turn() {
     config.agent.compaction.max_context_tokens = 131_072;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 4_096;
-    config.causal_tree.policy.extra_token_ratio_limit = 1.0;
+    config.decision_engine.token_ratio_limit = 1.0;
     let admitted = AdmittedTurn::with_config(config, "analyse the opened turn", Arc::new(Vec::new())).await;
     let decision = admitted.decision();
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -1515,15 +1538,15 @@ impl ScriptedDecisionEndpoint {
     /// compatible-HTTP backend with a declared decision model, priced at one
     /// micro-USD per token.
     fn configure(&self, config: &mut crate::config::Config) {
-        let backend = crate::config::schema::causal_tree::DecisionBackendConfig {
-            kind: crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+        let backend = crate::config::schema::decision_engine::DecisionBackendConfig {
+            kind: crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
             ),
             endpoint: self.endpoint.clone(),
             model: Self::MODEL.into(),
             ..Default::default()
         };
-        let provider = crate::config::schema::causal_tree::configured_selection(&backend)
+        let provider = crate::config::schema::decision_engine::configured_selection(&backend)
             .expect("test: a fixed compatible backend is a configured selection")
             .provider;
         config.decision_engine.backend = Some(backend);

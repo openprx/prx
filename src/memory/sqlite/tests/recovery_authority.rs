@@ -113,7 +113,6 @@ async fn warm_handle_refuses_lost_historical_capsule_key() -> anyhow::Result<()>
     let db_path = memory.db_path.clone();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.clone();
-    config.causal_tree.enabled = true;
     let cell_input = |run: &str, key: &str| -> anyhow::Result<crate::memory::MessageEventInput> {
         Ok(serde_json::from_value(serde_json::json!({
             "workspace_id": workspace.to_string_lossy(), "owner_id": "prx_user",
@@ -579,7 +578,6 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
     })?;
     let mut config = crate::config::Config::default();
     config.workspace_dir = dir.path().to_owned();
-    config.causal_tree.enabled = true;
     for _ in 0..2 {
         let tracker = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
         let ticket = tracker.register(tokio_util::sync::CancellationToken::new())?;
@@ -622,7 +620,6 @@ async fn recovery_unavailable_key_is_shared_without_retry() -> anyhow::Result<()
     let db_path = cell_store.db_path.clone();
     let mut cell_config = crate::config::Config::default();
     cell_config.workspace_dir = workspace.clone();
-    cell_config.causal_tree.enabled = true;
     let cell_input = |run: &str, key: &str| -> anyhow::Result<crate::memory::MessageEventInput> {
         Ok(serde_json::from_value(serde_json::json!({
             "workspace_id": workspace.to_string_lossy(), "owner_id": "prx_user",

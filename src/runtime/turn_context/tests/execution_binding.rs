@@ -42,7 +42,6 @@ async fn discovered_spec_with_changed_schema_still_fails_bind() {
     let workspace = tempfile::tempdir().expect("test: schema-bind workspace");
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
-    config.causal_tree.enabled = true;
     config.tool_tiering.always_include.push("project_tool".into());
     let memory: Arc<dyn Memory> =
         Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: schema memory"));

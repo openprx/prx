@@ -49,7 +49,6 @@ async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
     config.default_provider = Some("ollama".to_owned());
     config.default_model = Some("prx-local-model".to_owned());
     config.api_url = Some(endpoint);
-    config.causal_tree.enabled = false;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.reliability.provider_retries = 0;
     config.cost.prices.insert(

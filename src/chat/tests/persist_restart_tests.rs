@@ -15,7 +15,6 @@ fn config_at(workspace: &Path) -> crate::config::Config {
     config.config_path = workspace.join("config.toml");
     config.default_provider = Some("ollama".into());
     config.default_model = Some("prx-local-model".into());
-    config.causal_tree.enabled = true;
     config.cost.prices.insert(
         "ollama/prx-local-model".into(),
         crate::config::schema::ModelPricing {
@@ -26,10 +25,10 @@ fn config_at(workspace: &Path) -> crate::config::Config {
         },
     );
     // Recovery fixtures persist a real completed provider turn.
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
-    config.causal_tree.policy.max_decision_hops = 1;
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config
 }
 
@@ -451,12 +450,11 @@ async fn forged_quarantine_marker_cannot_suppress_reconciliation() {
 
 #[tokio::test]
 async fn guarded_inbound_failure_returns_store_cause_and_recovery_hint() {
-    for enabled in [false, true] {
+    {
         let dir = tempfile::tempdir().unwrap();
         let memory = Arc::new(SqliteMemory::new(dir.path()).unwrap());
         memory.reject_user_events_for_test().unwrap();
-        let mut config = config_at(dir.path());
-        config.causal_tree.enabled = enabled;
+        let config = config_at(dir.path());
         let generation = crate::config::new_shared(config).pin();
         let result = guarded_input(memory, &generation, "prx-rejected-run").await;
         let text = match result {

@@ -132,7 +132,6 @@ impl Spec {
             None
         };
         let managed_defaults = render_managed_defaults(&main_toml, &fragments)?;
-        let mut causal_guard = false;
         let mut preserved_revision = if regenerating {
             Some(hex::encode(super::files::compute_config_fingerprint_gated(
                 &config_path,
@@ -144,7 +143,6 @@ impl Spec {
             let (merged_main, merged_fragments, outcome) =
                 preserve_previous_settings(&config_path, &main_toml, &fragments, previous_defaults.as_ref())?;
             report.record_preservation(&outcome, archive.as_deref());
-            causal_guard = outcome.causal_guard;
             preserved_revision = outcome.base_revision.or(preserved_revision);
             (merged_main, merged_fragments)
         } else {
@@ -157,11 +155,8 @@ impl Spec {
         let mut plan =
             match super::files::plan_mutation(&config_path, &workspace_dir, effective_main, effective_fragments) {
                 Ok(plan) => plan,
-                Err(error) if causal_guard => return Err(CausalRegenerationError(error).into()),
-                Err(error) if error.is::<crate::config::schema::causal_tree::MigrationError>() => return Err(error),
-                // A readable tree without decision-plane settings can retain the
-                // existing repair fallback for other invalid settings; it
-                // is not allowed to do so quietly. The operator's values are in the
+                // A readable tree can retain the existing repair fallback for
+                // invalid settings; it is not allowed to do so quietly. The operator's values are in the
                 // archive, the reason is printed, and `into_result` exits non-zero
                 // so neither a human nor a script can mistake this for a clean run.
                 Err(error) if regenerating => {
@@ -369,13 +364,6 @@ impl InitReport {
             self.notices
                 .push(format!("  Previous configuration archived to {}", path.display()));
         }
-        if !outcome.causal_moved.is_empty() || !outcome.causal_dropped.is_empty() {
-            self.notices.push(format!(
-                "  Normalized legacy decision-plane settings: moved [{}]; retired defaults [{}]",
-                outcome.causal_moved.join(", "),
-                outcome.causal_dropped.join(", ")
-            ));
-        }
         if outcome.kept.is_empty() {
             self.notices
                 .push("  No explicit settings differed from the regenerated templates".to_string());
@@ -484,15 +472,8 @@ struct PreservationOutcome {
     refreshed: BTreeSet<String>,
     dropped: BTreeSet<String>,
     unfoldable: BTreeSet<String>,
-    causal_guard: bool,
     base_revision: Option<String>,
-    causal_moved: Vec<&'static str>,
-    causal_dropped: Vec<&'static str>,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("Decision-plane configuration regeneration refused; existing configuration was not replaced: {0}")]
-struct CausalRegenerationError(#[source] anyhow::Error);
 
 /// Read the defaults the previous `prx init` recorded for this tree.
 ///
@@ -659,38 +640,18 @@ fn preserve_previous_settings(
 ) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
     super::files::with_consistent_config_snapshot(config_path, || {
         let revision = super::files::current_config_revision(config_path)?;
-        // An unreadable tree cannot prove that an explicit disable is absent.
-        // Never let a migration preflight failure install a fresh template.
-        let mut effective =
-            super::files::read_merged_toml_with_gate_once(config_path).map_err(CausalRegenerationError)?;
-        let causal_guard = effective.get("causal_tree").is_some();
-        let locate = |path: &[&str]| super::deprecations::file_holding(config_path, path);
-        let migration = crate::config::schema::causal_tree::migrate_legacy(&mut effective, &locate)?;
-        let result = preserve_normalized_settings(
+        let effective = super::files::read_merged_toml_with_gate_once(config_path)?;
+        preserve_normalized_settings(
             config_path,
             main_template,
             fragment_templates,
             previous_defaults,
             &effective,
-            &migration,
-            causal_guard,
         )
         .map(|(main, fragments, mut outcome)| {
             outcome.base_revision = Some(revision);
             (main, fragments, outcome)
-        });
-        if causal_guard {
-            result.map_err(|error| CausalRegenerationError(error).into())
-        } else {
-            result
-        }
-    })
-    .map_err(|error| {
-        if error.is::<crate::config::schema::causal_tree::MigrationError>() || error.is::<CausalRegenerationError>() {
-            error
-        } else {
-            CausalRegenerationError(error).into()
-        }
+        })
     })
 }
 
@@ -700,11 +661,8 @@ fn preserve_normalized_settings(
     fragment_templates: &[(String, String)],
     previous_defaults: Option<&BTreeMap<Vec<String>, toml::Value>>,
     effective: &toml::Value,
-    migration: &crate::config::schema::causal_tree::MigrationReport,
-    causal_guard: bool,
 ) -> Result<(String, Vec<(String, String)>, PreservationOutcome)> {
-    let mut main_previous = read_toml_document(config_path)?;
-    crate::config::schema::causal_tree::normalize_regeneration_document(&mut main_previous, migration, config_path)?;
+    let main_previous = read_toml_document(config_path)?;
     let mut fragment_previous: BTreeMap<String, toml::Value> = BTreeMap::new();
     for path in super::files::list_config_fragment_paths(config_path)? {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -713,18 +671,12 @@ fn preserve_normalized_settings(
         if super::files::should_skip_fragment(name) {
             continue;
         }
-        let mut value = read_toml_document(&path)?;
-        crate::config::schema::causal_tree::normalize_regeneration_document(&mut value, migration, &path)?;
+        let value = read_toml_document(&path)?;
         fragment_previous.insert(name.to_string(), value);
     }
 
     let empty = toml::Value::Table(toml::map::Map::new());
-    let mut outcome = PreservationOutcome {
-        causal_guard,
-        causal_moved: migration.moved.clone(),
-        causal_dropped: migration.dropped.clone(),
-        ..PreservationOutcome::default()
-    };
+    let mut outcome = PreservationOutcome::default();
     let merged_main = apply_previous_settings(
         main_template,
         &main_previous,
@@ -753,14 +705,6 @@ fn preserve_normalized_settings(
         }
         let merged = apply_previous_settings(template, previous, effective, previous_defaults, &mut outcome)?;
         merged_fragments.push((name.clone(), merged));
-    }
-    if outcome
-        .unfoldable
-        .iter()
-        .chain(&outcome.dropped)
-        .any(|path| path == "causal_tree" || path.starts_with("causal_tree."))
-    {
-        bail!("Cannot faithfully preserve decision-plane configuration in regenerated templates");
     }
     Ok((merged_main, merged_fragments, outcome))
 }
@@ -947,14 +891,9 @@ fn apply_previous_settings(
         // operator's if it also differs from the default the *previous* run of
         // `prx init` wrote; otherwise it is a stale shipped default and the
         // refreshed one takes effect, which is what `--force` promises.
-        // D-073/D-074: a disable that survived merged-tree X3
-        // normalization is operator intent, even if a sidecar also says false.
-        let explicit_disable =
-            path.iter().map(String::as_str).eq(["causal_tree", "enabled"]) && current.as_bool() == Some(false);
-        if !explicit_disable
-            && previous_defaults
-                .and_then(|defaults| defaults.get(path))
-                .is_some_and(|previous_default| previous_default == current)
+        if previous_defaults
+            .and_then(|defaults| defaults.get(path))
+            .is_some_and(|previous_default| previous_default == current)
         {
             outcome.refreshed.insert(render_key_path(path));
             continue;

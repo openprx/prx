@@ -41,15 +41,27 @@ async fn configured_http_wrong_model_is_refused_before_send() {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_path_buf();
     config.config_path = workspace.path().join("config.toml");
-    config.causal_tree.enabled = true;
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
-    config.causal_tree.backend.endpoint = endpoint.clone();
-    config.causal_tree.backend.model = "prx-decision-model".to_owned();
-    config.causal_tree.backend.timeout_ms = 1000;
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        BackendSelection::Fixed(BackendKind::CompatibleHttp);
     config
-        .causal_tree
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .endpoint = endpoint.clone();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .model = "prx-decision-model".to_owned();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .timeout_ms = 1000;
+    config.decision_engine.latency_budget_ms = 5_000;
+    config
+        .decision_engine
         .validate()
         .expect("legal configured decision fixture");
     config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":format!("custom:{endpoint}"),"model":"prx-decision-model","operations":["decision_endpoint"]})).expect("declared actual decision model"));
@@ -108,7 +120,7 @@ async fn configured_http_wrong_model_is_refused_before_send() {
     let sends = capture.sends.load(Ordering::SeqCst);
     println!(
         "PRX_CDP_MODEL_BINDING {}",
-        serde_json::json!({"kind":"configured-http-wrong-model-component","sends":sends,"captured":*capture.bodies.lock(),"request_model":request.model(),"configured_model":config.causal_tree.backend.model})
+        serde_json::json!({"kind":"configured-http-wrong-model-component","sends":sends,"captured":*capture.bodies.lock(),"request_model":request.model(),"configured_model":crate::config::schema::decision_engine::effective_engine_backend(&config).model})
     );
     assert_eq!(
         sends, 0,

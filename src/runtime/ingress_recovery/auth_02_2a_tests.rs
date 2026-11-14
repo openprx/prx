@@ -17,9 +17,8 @@ fn home_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, workspace)
 }
 
-fn cell_config(workspace: &Path, plane: bool, recording: bool) -> crate::config::Config {
+fn cell_config(workspace: &Path, recording: bool) -> crate::config::Config {
     let mut config = recovery_config(workspace);
-    config.causal_tree.enabled = plane;
     config.memory.events.record_user_messages = recording;
     config
 }
@@ -79,7 +78,7 @@ struct SettledSetup {
 async fn settled_setup_with(facts: SettledTerminalFacts, facts_bytes: Option<Vec<u8>>) -> SettledSetup {
     let (dir, workspace) = home_workspace();
     let memory: Arc<dyn Memory> = backend_memory("sqlite", &workspace).expect("test: sqlite");
-    let config = Arc::new(cell_config(&workspace, false, true));
+    let config = Arc::new(cell_config(&workspace, true));
     let (recorder, ticket) = recovery_recorder(Arc::clone(&memory), &config).await;
     let input = recorder
         .append(recovery_input(&workspace, "prx_run"))
@@ -181,7 +180,7 @@ fn sqlite(workspace: &Path) -> SqliteMemory {
 pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     let workspace_cell = settled_setup_with(default_facts(), None).await;
     let (other_dir, other_ws) = home_workspace();
-    let mut other_config = cell_config(&other_ws, false, true);
+    let mut other_config = cell_config(&other_ws, true);
     other_config.workspace_dir = other_ws.clone();
     let generation = crate::config::ConfigGenerationManager::new(other_config).pin();
     let tracker = Arc::new(CleanupTracker::default());

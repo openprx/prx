@@ -124,7 +124,6 @@ async fn ordinary_parent(
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
     config.config_path = workspace.join("config.toml");
-    config.causal_tree.enabled = false;
     config.decision_engine.enabled = engine_enabled;
     config.autonomy.level = level;
     let security = Arc::new(crate::security::SecurityPolicy::from_config(

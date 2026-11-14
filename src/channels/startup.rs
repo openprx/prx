@@ -510,7 +510,7 @@ pub async fn start_channels_with_config(
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool
             .with_event_recording(config.memory.event_recording_config())
-            .with_process_recovery(config.causal_tree.enabled)?;
+            .with_process_recovery(true)?;
         let handle = spawn_tool.tools_handle();
         crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
         crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(

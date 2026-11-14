@@ -139,11 +139,7 @@ async fn genuine_depth_denial_retains_parent_cleanup_ack_evidence() -> anyhow::R
             };
             config.agents.insert("deep-agent".to_owned(), depth_config);
             super::native_decision_fixture::configure(&mut config, &endpoint).unwrap();
-            assert_eq!(
-                config.causal_tree.rehearsal.timeout_ms,
-                super::native_decision_fixture::REHEARSAL_TIMEOUT_MS
-            );
-            assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+            assert_eq!(config.decision_engine.latency_budget_ms, 500);
             let delegate = DelegateTool::with_depth(
                 config.agents.clone(),
                 Arc::new(crate::security::SecurityPolicy::default()),

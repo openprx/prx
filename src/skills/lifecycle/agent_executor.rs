@@ -326,7 +326,7 @@ const PROVIDER_SECTIONS: [&str; 8] = [
     "secrets",
     "proxy",
     "model_routes",
-    "causal_tree",
+    "decision_engine",
 ];
 
 /// A default configuration carrying only the template's provider sections.

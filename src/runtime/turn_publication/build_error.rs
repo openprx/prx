@@ -24,8 +24,4 @@ pub(crate) enum TurnRuntimeBuildError {
     PreparationTask(#[from] tokio::task::JoinError),
     #[error("turn service preparation cleanup owner is unavailable")]
     PreparationOwner(#[source] anyhow::Error),
-    #[error("enabled causal decisions require a durable message-event memory backend")]
-    EventStoreUnsupported,
-    #[error("enabled causal decisions require user message event recording")]
-    InboundEventsDisabled,
 }

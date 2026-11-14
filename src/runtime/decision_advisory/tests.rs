@@ -240,8 +240,8 @@ impl crate::decision_engine::prediction::backend::DecisionBackend for RecordingB
     fn identity(&self) -> &crate::cost::decision_attempt::BackendIdentity {
         &self.identity
     }
-    fn locality(&self) -> crate::config::schema::causal_tree::BackendLocality {
-        crate::config::schema::causal_tree::BackendLocality::Builtin
+    fn locality(&self) -> crate::config::schema::decision_engine::BackendLocality {
+        crate::config::schema::decision_engine::BackendLocality::Builtin
     }
     fn version_policy(&self) -> crate::decision_engine::prediction::ModelVersionPolicy {
         crate::decision_engine::prediction::ModelVersionPolicy::ExactPinned(Arc::clone(&self.identity.configured_model))
@@ -383,7 +383,7 @@ async fn decision_advisory_runs_without_a_turn_runtime_service() {
         let factory = DecisionBackendFactory::from_slots(
             vec![Box::new(RecordingBackend {
                 identity: crate::cost::decision_attempt::BackendIdentity {
-                    kind: crate::config::schema::causal_tree::BackendKind::Mock,
+                    kind: crate::config::schema::decision_engine::BackendKind::Mock,
                     provider: None,
                     configured_model: Arc::from(model),
                 },
@@ -541,7 +541,6 @@ async fn late_advisory_drain_warns_exactly_once() {
         ..Default::default()
     };
     config.decision_engine.enabled = true;
-    config.causal_tree.enabled = false;
     let advisory = DecisionAdvisory::new(Arc::new(config), None);
     let cancellation = CancellationToken::new();
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -644,7 +643,7 @@ async fn engine_driver_analyses_the_structural_set() {
     let discovered = DiscoveredRefs::empty();
     let policy = CandidatePolicy {
         key: &key,
-        max_candidates: usize::from(config.causal_tree.policy.max_candidates),
+        max_candidates: usize::from(config.decision_engine.max_candidates),
         can_deliver_text: true,
         may_delegate: false,
         delegation_target: None,

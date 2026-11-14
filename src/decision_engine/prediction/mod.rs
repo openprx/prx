@@ -25,8 +25,8 @@
 //!   production [`factory::DecisionTransports`].
 //!
 //! The protocol, codec, validator and backends never depend on
-//! `causal_tree`, `runtime` or `agent`; the factory reads the
-//! `[causal_tree]` configuration section it is built from. No file here uses
+//! `runtime` or `agent`; the factory reads the `[decision_engine]`
+//! configuration section it is built from. No file here uses
 //! the chat `Provider` trait or its factories (AG-03).
 
 pub mod backend;

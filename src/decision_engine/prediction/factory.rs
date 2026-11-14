@@ -41,9 +41,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
-use crate::config::schema::causal_tree::{BackendSelection, DecisionBackendConfig};
-use crate::config::schema::causal_tree::{configured_kind, configured_selection, locality_of};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendSelection, DecisionBackendConfig};
+use crate::config::schema::decision_engine::{configured_kind, configured_selection, locality_of};
 use crate::cost::decision_attempt::BackendIdentity;
 use crate::cost::decision_attempt::error::DecisionError;
 use crate::decision_engine::prediction::backend::DecisionBackend;
@@ -297,7 +297,7 @@ pub(crate) struct SlotLimits {
 #[cfg(test)]
 impl Default for SlotLimits {
     fn default() -> Self {
-        let defaults = crate::config::schema::causal_tree::DecisionBackendConfig::default();
+        let defaults = crate::config::schema::decision_engine::DecisionBackendConfig::default();
         Self {
             timeout: Duration::from_millis(u64::from(defaults.timeout_ms)),
             failure_threshold: defaults.circuit_breaker.failure_threshold,
@@ -811,7 +811,7 @@ impl DecisionBackendFactory {
         secrets: OutboundSecrets,
         limits: SlotLimits,
     ) -> Self {
-        let defaults = crate::config::schema::causal_tree::DecisionBackendConfig::default();
+        let defaults = crate::config::schema::decision_engine::DecisionBackendConfig::default();
         Self {
             enabled: true,
             budget_unproven: false,
@@ -1261,8 +1261,14 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::config::schema::causal_tree::CausalTreeConfig;
-    use crate::config::schema::causal_tree::CredentialRefSetting;
+
+    /// The engine switch and backend a test configures.
+    #[derive(Default)]
+    struct Section {
+        enabled: bool,
+        backend: crate::config::schema::decision_engine::DecisionBackendConfig,
+    }
+    use crate::config::schema::decision_engine::CredentialRefSetting;
     use crate::cost::decision_attempt::error::{PolicyRule, ValidationRule};
     use crate::decision_engine::prediction::mock::{MockDecisionBackend, MockOutcome, MockStep};
     use crate::decision_engine::prediction::protocol::{
@@ -1613,14 +1619,18 @@ mod tests {
         }
     }
 
-    fn config(temp: &tempfile::TempDir, change: impl FnOnce(&mut CausalTreeConfig)) -> Config {
+    fn config(temp: &tempfile::TempDir, change: impl FnOnce(&mut Section)) -> Config {
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_path_buf();
         config.config_path = temp.path().join("config.toml");
         config.api_key = Some("sk-ROOT-FACTORY-SENTINEL".to_string());
-        config.decision_engine.enabled = true;
-        config.causal_tree.enabled = true;
-        change(&mut config.causal_tree);
+        let mut section = Section {
+            enabled: true,
+            ..Section::default()
+        };
+        change(&mut section);
+        config.decision_engine.enabled = section.enabled;
+        config.decision_engine.backend = Some(section.backend);
         config
     }
 
@@ -1649,7 +1659,7 @@ mod tests {
         )
     }
 
-    fn compatible(endpoint: &'static str, remote: bool) -> impl FnOnce(&mut CausalTreeConfig) {
+    fn compatible(endpoint: &'static str, remote: bool) -> impl FnOnce(&mut Section) {
         move |section| {
             section.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
             section.backend.endpoint = endpoint.to_string();
@@ -1661,8 +1671,8 @@ mod tests {
     /// The order table (SP-CDP-A 5.6 under D-040): pure, builtin last.
     #[test]
     fn the_backend_order_follows_the_table() {
-        let order = |change: &dyn Fn(&mut CausalTreeConfig), health: HealthView| {
-            let mut section = CausalTreeConfig::default();
+        let order = |change: &dyn Fn(&mut Section), health: HealthView| {
+            let mut section = Section::default();
             section.enabled = true;
             change(&mut section);
             DecisionBackendFactory::backend_order(&section.backend, section.enabled, &health)
@@ -1672,7 +1682,7 @@ mod tests {
         };
         let builtin = (BackendKind::Builtin, BackendLocality::Builtin, None);
         let set = |kind: BackendSelection, endpoint: &'static str, remote: bool| {
-            move |section: &mut CausalTreeConfig| {
+            move |section: &mut Section| {
                 section.backend.kind = kind;
                 section.backend.endpoint = endpoint.to_string();
                 section.backend.remote_enabled = remote;
@@ -1768,7 +1778,7 @@ mod tests {
                 [(hosted, BackendLocality::Remote, None), builtin]
             );
         }
-        let disabled = |section: &mut CausalTreeConfig| {
+        let disabled = |section: &mut Section| {
             section.enabled = false;
             section.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
             section.backend.endpoint = LOOPBACK.to_string();
@@ -2023,7 +2033,7 @@ mod tests {
             .expect("test: decide");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let mut section = CausalTreeConfig::default();
+        let mut section = Section::default();
         section.enabled = true;
         section.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
         section.backend.endpoint = LOOPBACK.to_string();
@@ -2135,8 +2145,11 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
         let mut disabled = config(&temp, compatible(LOOPBACK, false));
         disabled.decision_engine.enabled = false;
-        disabled.causal_tree.enabled = false;
-        disabled.causal_tree.backend.credential_ref = CredentialRefSetting::Profile("cred-decision-held".to_string());
+        disabled
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .credential_ref = CredentialRefSetting::Profile("cred-decision-held".to_string());
         // Declared in the configuration, which the configuration check reads.
         disabled.providers.models.push(
             serde_json::from_value(serde_json::json!({
@@ -2158,8 +2171,7 @@ mod tests {
             crate::config::manage::validate::check_decision_plane(None, &disabled),
             Ok(None)
         );
-        let mut recovery_only = disabled.clone();
-        recovery_only.causal_tree.enabled = true;
+        let recovery_only = disabled.clone();
         assert!(!recovery_only.decision_engine.enabled);
         build(&recovery_only, &declared, Some(held_key), &transports)
             .expect("test: engine-off recovery cannot resolve a stored loopback credential");
@@ -2187,7 +2199,6 @@ mod tests {
         // refuses the reference.
         std::fs::remove_file(&lock).expect("test: release");
         let mut enabled = disabled;
-        enabled.causal_tree.enabled = true;
         enabled.decision_engine.enabled = true;
         assert!(matches!(
             build(&enabled, &declared, Some(key(&temp)), &transports),
@@ -2789,8 +2800,18 @@ mod tests {
         let key = key(&temp);
         let request = request(&key);
         let mut loopback = config(&temp, compatible(LOOPBACK, false));
-        loopback.causal_tree.backend.circuit_breaker.failure_threshold = 1;
-        loopback.causal_tree.backend.circuit_breaker.cooldown_secs = 1;
+        loopback
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .circuit_breaker
+            .failure_threshold = 1;
+        loopback
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .circuit_breaker
+            .cooldown_secs = 1;
         let transports = CountingTransports::answering(vec![
             MockStep::now(MockOutcome::Fail(DecisionError::Transport)),
             MockStep::now(MockOutcome::Hang),

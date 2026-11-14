@@ -151,12 +151,12 @@ pub enum ResolutionError {
     CredentialLookup { provider: String, reason: String },
     #[error(
         "model '{model}' of decision service '{provider}' is not pinned: a hosted decision backend needs an exact \
-         model version, not an alias or an empty model; set `causal_tree.backend.model` to the version to pin"
+         model version, not an alias or an empty model; set `decision_engine.backend.model` to the version to pin"
     )]
     DecisionModelNotPinned { provider: String, model: String },
     #[error(
         "decision service '{provider}' is given {reference}: a hosted decision backend uses only an auth profile \
-         (`causal_tree.backend.credential_ref = \"profile:…\"`), never an inline key or the provider's own store"
+         (`decision_engine.backend.credential_ref = \"profile:…\"`), never an inline key or the provider's own store"
     )]
     DecisionCredentialNotProfile { provider: String, reference: String },
 }

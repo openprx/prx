@@ -130,14 +130,24 @@ async fn root_pwd(worker: bool, override_root: bool) {
         api_key: Some("prx-fixture-key".into()),
         ..openprx::config::Config::default()
     };
-    config.causal_tree.enabled = worker;
     if worker {
-        config.causal_tree.backend.kind =
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
             serde_json::from_value(json!("compatible_http")).expect("test: compatible decision backend");
-        config.causal_tree.backend.endpoint = format!("http://{address}");
-        config.causal_tree.backend.model = "prx-native-decision".into();
-        config.causal_tree.backend.remote_enabled = false;
-        config.causal_tree.rehearsal.timeout_ms = 450;
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = format!("http://{address}");
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "prx-native-decision".into();
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         let decision_provider = format!("custom:http://{address}");
         config.providers.models.push(
             serde_json::from_value(

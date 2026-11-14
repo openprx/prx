@@ -1,7 +1,7 @@
 //! Finding 84: the production sources of the skill lifecycle receipts. A turn
 //! that selects a managed skill leaves a selection receipt in its experience;
 //! restart recovery completes the experience with only the facts it can verify.
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
 use crate::cost::decision_attempt::BackendIdentity;
 use crate::cost::decision_attempt::error::DecisionError;
 use crate::decision_engine::prediction::backend::DecisionBackend;
@@ -162,13 +162,14 @@ fn managed_store(workspace: &std::path::Path, owner: &str) -> SkillLifecycleStor
 fn base_config(workspace: &std::path::Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config.workspace_dir = workspace.to_owned();
     config.skills.open_skills_dir = Some(workspace.join("missing-open-skills").to_string_lossy().to_string());
     config.skills.openclaw_skills_dir = Some(workspace.join("missing-openclaw-skills").to_string_lossy().to_string());
-    config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+    config.decision_engine.latency_budget_ms = 5_000;
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
     config.cost.prices.insert(
         "prx-local-model".to_owned(),
@@ -397,11 +398,11 @@ async fn crashed_after_marker(
     let workspace = tempfile::tempdir().expect("test: workspace");
     let mut config = crate::config::Config::default();
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::Builtin,
-    );
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::Builtin,
+        );
     config.workspace_dir = workspace.path().to_path_buf();
-    config.causal_tree.enabled = true;
     let generation = crate::config::new_shared(config.clone()).pin();
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: memory"));
     let provider_catalog = ProviderCatalogView::from_config(&config);

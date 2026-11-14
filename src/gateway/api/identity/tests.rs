@@ -4,7 +4,6 @@ async fn fixture() -> super::super::test_support::Served {
     let served = serve_config(|config| {
         config.skills_lifecycle.enabled = true;
         config.skills_lifecycle.owner_scope = Some("owner:prx:h2:identity".into());
-        config.causal_tree.enabled = true;
         config.memory.events.record_user_messages = true;
         config.runtime.kind = "native".into();
         config.memory.backend = "sqlite".into();

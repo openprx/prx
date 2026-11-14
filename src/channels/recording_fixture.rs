@@ -46,7 +46,6 @@ pub(super) fn attach(ctx: &mut super::ChannelRuntimeContext, workspace: &Path) -
     config.memory.events.record_assistant_messages = ctx.memory_event_recording.record_assistant_messages;
     config.memory.events.record_tool_events = ctx.memory_event_recording.record_tool_events;
     assert!(ctx.memory_event_recording.enabled);
-    assert!(config.causal_tree.enabled);
     let memory = Arc::new(RecordedChannelFixtureMemory {
         original: Arc::clone(&ctx.memory),
         local: SqliteMemory::new(workspace).expect("channel fixture event ledger"),

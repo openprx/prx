@@ -375,13 +375,20 @@ fn history_partition(
     })
 }
 
+/// OV-13: console turns are recorded, recovered and approved run-keyed only
+/// with event recording on and a recovery repository present.
+fn console_recordable(config: &crate::config::Config, memory: &dyn crate::memory::Memory) -> bool {
+    let recording = config.memory.event_recording_config();
+    recording.enabled && recording.record_user_messages && memory.recovery_repository().is_some()
+}
+
 async fn recover_console_history(
     state: &AppState,
     runtime: &crate::gateway::TurnRuntimeGeneration,
     _authenticated: &super::ApiPrincipal,
     session_key: &str,
 ) -> anyhow::Result<()> {
-    if !runtime.config_generation.effective.causal_tree.enabled {
+    if !console_recordable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return Ok(());
     }
     let workspace = runtime.config_generation.effective.workspace_dir.to_string_lossy();
@@ -1262,7 +1269,7 @@ pub(super) async fn get_session_approvals(
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
     let runtime = state.pin_turn_runtime();
-    if !runtime.config_generation.effective.causal_tree.enabled {
+    if !console_recordable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
     }
     let after_id = match parse_inbox_cursor(query.cursor.as_deref()) {
@@ -1591,7 +1598,7 @@ impl ConsolePendingInput {
                     None,
                 ));
                 if recording.enabled && recording.record_user_messages {
-                    if self.runtime.config_generation.effective.causal_tree.enabled {
+                    if console_recordable(&self.runtime.config_generation.effective, self.state.mem.as_ref()) {
                         self.state.mem.project_console_message(&event).await?;
                     } else {
                         self.state
@@ -2160,7 +2167,7 @@ async fn run_console_message_job_work(
             }
         };
 
-        if !config.causal_tree.enabled {
+        if !console_recordable(config, state.mem.as_ref()) {
             let record_event = matches!(
                 turn.envelope.agent_partition.as_ref().map(|partition| &partition.key),
                 Some(crate::memory::PartitionKey::Named { .. })
@@ -2575,7 +2582,6 @@ mod tests {
     fn test_app_state(mut config: Config, provider: Arc<dyn Provider>) -> AppState {
         config.default_provider.get_or_insert_with(|| "ollama".to_owned());
         config.default_model.get_or_insert_with(|| "test-model".to_owned());
-        config.causal_tree.enabled = false;
         test_app_state_with_config(config, provider)
     }
 
@@ -2913,9 +2919,9 @@ mod tests {
                     },
                 );
                 assert_eq!(
-                    config.causal_tree,
-                    crate::config::schema::causal_tree::CausalTreeConfig::default(),
-                    "the Console proof must retain the default causal configuration"
+                    config.decision_engine,
+                    crate::config::schema::decision_engine::DecisionEngineConfig::default(),
+                    "the Console proof must retain the default decision engine configuration"
                 );
 
                 let provider_impl = Arc::new(CapturingProvider::default());
@@ -3849,7 +3855,6 @@ mod tests {
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_owned();
         config.config_path = temp.path().join("config.toml");
-        config.causal_tree.enabled = true;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
@@ -3985,7 +3990,6 @@ mod tests {
         let mut config = Config::default();
         config.workspace_dir = temp.path().to_owned();
         config.config_path = temp.path().join("config.toml");
-        config.causal_tree.enabled = true;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
@@ -4020,7 +4024,7 @@ async fn call_approval_action(
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid call id"),
     };
     let runtime = state.pin_turn_runtime();
-    if !runtime.config_generation.effective.causal_tree.enabled {
+    if !console_recordable(&runtime.config_generation.effective, state.mem.as_ref()) {
         return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
     }
     if change.is_some() {

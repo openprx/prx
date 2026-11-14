@@ -111,16 +111,11 @@ impl ListenerOwner {
 fn build_agent<'a>(
     workspace: &'a std::path::Path,
     listener: &'a ListenerOwner,
-    recording: bool,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = anyhow::Result<Agent>> + 'a>> {
-    Box::pin(build_agent_work(workspace, listener, recording))
+    Box::pin(build_agent_work(workspace, listener))
 }
 
-async fn build_agent_work(
-    workspace: &std::path::Path,
-    listener: &ListenerOwner,
-    recording: bool,
-) -> anyhow::Result<Agent> {
+async fn build_agent_work(workspace: &std::path::Path, listener: &ListenerOwner) -> anyhow::Result<Agent> {
     let url = format!("http://{}", listener.address);
     let label = format!("custom:{url}");
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace)?);
@@ -158,10 +153,8 @@ async fn build_agent_work(
     config.workspace_dir = workspace.to_path_buf();
     config.config_path = workspace.join("config.toml");
     config.default_model = Some(CHEAP.into());
-    config.causal_tree.enabled = recording;
     // A stricter supported retrieval fixture; never increase the default 500ms allowance.
-    config.causal_tree.policy.max_decision_hops = 1;
-    assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+    assert_eq!(config.decision_engine.latency_budget_ms, 500);
     config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
     config.router = policy;
     for model in [CHEAP, PREMIUM] {
@@ -222,13 +215,13 @@ fn turn(agent: &mut Agent) -> std::pin::Pin<Box<impl std::future::Future<Output 
     Box::pin(agent.turn(INPUT))
 }
 
-async fn check_legacy_input(recording: bool, turns: usize) -> anyhow::Result<()> {
+async fn check_legacy_input(turns: usize) -> anyhow::Result<()> {
     use futures::FutureExt;
     let workspace = tempfile::tempdir()?;
     let listener = ListenerOwner::start().await?;
     let result = Box::pin(
         std::panic::AssertUnwindSafe(async {
-            let mut agent = build_agent(workspace.path(), &listener, recording).await?;
+            let mut agent = build_agent(workspace.path(), &listener).await?;
             for _ in 0..turns {
                 let reply = tokio::time::timeout(Duration::from_secs(5), turn(&mut agent)).await??;
                 agent.cleanup_state.confirm().await?;
@@ -331,14 +324,11 @@ async fn check_legacy_input(recording: bool, turns: usize) -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn legacy_reply_policy_serves_cheap_reply_once_with_and_without_recording() -> anyhow::Result<()> {
-    for recording in [true, false] {
-        Box::pin(check_legacy_input(recording, 1)).await?;
-    }
-    Ok(())
+async fn legacy_reply_policy_serves_cheap_reply_once() -> anyhow::Result<()> {
+    Box::pin(check_legacy_input(1)).await
 }
 
 #[tokio::test]
 async fn repeated_actual_turns_have_unique_cost_and_learning_receipts() -> anyhow::Result<()> {
-    Box::pin(check_legacy_input(true, 5)).await
+    Box::pin(check_legacy_input(5)).await
 }

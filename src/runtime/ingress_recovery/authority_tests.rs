@@ -20,7 +20,6 @@ fn input(workspace: &std::path::Path, run: &str) -> anyhow::Result<MessageEventI
 async fn recorder(memory: Arc<dyn Memory>, workspace: &std::path::Path) -> anyhow::Result<Arc<IngressRecorder>> {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
-    config.causal_tree.enabled = true;
     let owner = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
     let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
     let result = IngressRecorder::prepare(memory, &config, &ticket)
@@ -274,8 +273,6 @@ pub(crate) fn backend_memory(backend: &str, workspace: &std::path::Path) -> anyh
 struct Admission<'a> {
     key: &'a str,
     owner: &'a str,
-    /// `causal_tree.enabled`. Recording plus a repository still recover with the plane off.
-    plane: bool,
     /// The best-effort issuer path that gateway, scheduled, CLI and channel share.
     best_effort: bool,
 }
@@ -283,7 +280,6 @@ struct Admission<'a> {
 const ADMISSION: Admission<'static> = Admission {
     key: "prx_stable_key",
     owner: "prx_user",
-    plane: true,
     best_effort: false,
 };
 
@@ -298,7 +294,6 @@ async fn admit_as(
 ) -> (anyhow::Result<Option<MessageEvent>>, bool) {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_owned();
-    config.causal_tree.enabled = how.plane;
     let config = Arc::new(config);
     let owner = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
     let ticket = owner
@@ -680,10 +675,7 @@ async fn recovery_missing_key_after_erasure_never_readmits() -> anyhow::Result<(
         // K1 is back, the plane is off (plain path, no recorder).
         restore_keys(&workspace)?;
         let plain = backend_memory(backend, &workspace)?;
-        let off = Admission {
-            plane: false,
-            ..ADMISSION
-        };
+        let off = Admission { ..ADMISSION };
         let (retry, duplicate) = admit_as(&plain, &workspace, "different", &dispatched, off).await;
         anyhow::ensure!(
             is_already_accepted(&retry) && duplicate,
@@ -746,7 +738,6 @@ async fn recovery_plane_off_tombstone_fence() -> anyhow::Result<()> {
     // (i) Keys present, plane off: the erased key is still spent, through the
     // best-effort path that every issuer shares.
     let off = Admission {
-        plane: false,
         best_effort: true,
         ..ADMISSION
     };

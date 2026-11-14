@@ -361,7 +361,6 @@ mod static_publication_tests {
     fn publication(workspace: &std::path::Path, probe: PublicationProbe) -> TurnPublication {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.to_owned();
-        config.causal_tree.enabled = false;
         let security = Arc::new(crate::security::SecurityPolicy::from_config(
             &config.autonomy,
             workspace,

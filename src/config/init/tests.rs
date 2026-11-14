@@ -1273,26 +1273,6 @@ async fn scaffold_skips_existing_md_files() {
     assert_eq!(soul, "# My custom soul\n", "existing .md files must not be overwritten");
 }
 
-/// D-074 with X-3: the frozen full template from BASE `8a5d160d`
-/// contains the old serialized default. The migration reads its bare
-/// `enabled = false` as unset, so the CDP-31 default flip reaches installs
-/// that were never saved.
-#[test]
-fn the_base_full_template_disable_reads_as_unset() {
-    let mut root: toml::Value =
-        toml::from_str(include_str!("../fixtures/agent-full-base-8a5d160d.toml")).expect("test: template parses");
-    assert_eq!(
-        root.get("causal_tree")
-            .and_then(|table| table.as_table())
-            .map(|table| table.keys().cloned().collect::<Vec<_>>()),
-        Some(vec!["enabled".to_string()]),
-        "the template writes a bare disable"
-    );
-    let report = crate::config::schema::causal_tree::migrate_legacy(&mut root, &|_| None).expect("test: migrates");
-    assert_eq!(report.dropped, ["enabled"]);
-    assert!(root.get("causal_tree").and_then(|table| table.get("enabled")).is_none());
-}
-
 /// Mutation: retain a raw reset reason or post-commit error in InitReport.
 #[test]
 fn init_report_hides_nested_error_credentials() {

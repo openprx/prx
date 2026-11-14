@@ -249,13 +249,16 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
             let provider = format!("custom:{endpoint}");
             let mut config = Config::default();
             assert_eq!(
-                config.causal_tree.policy.extra_latency_budget_ms, 500,
+                config.decision_engine.latency_budget_ms, 500,
                 "test: the production source-decision deadline must remain 500 ms"
             );
             // Real loopback and SQLite need the same fixture budget as Signal vision.
-            config.causal_tree.policy.extra_latency_budget_ms = 5_000;
-            config.causal_tree.backend.timeout_ms = 5_000;
-            config.causal_tree.rehearsal.timeout_ms = 5_000;
+            config.decision_engine.latency_budget_ms = 5_000;
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .timeout_ms = 5_000;
             config.workspace_dir = workspace.path().to_owned();
             config.config_path = workspace.path().join("config.toml");
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;

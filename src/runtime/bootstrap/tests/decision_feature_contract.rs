@@ -17,7 +17,8 @@ async fn decision_service_present_in_every_model_turn_build() {
     for enabled in [false, true] {
         let workspace = tempfile::tempdir().expect("feature contract workspace");
         let mut config = super::test_config(workspace.path());
-        config.causal_tree.enabled = enabled;
+        // OV-13: recording on and a repository make the publication recordable.
+        config.memory.events.record_user_messages = enabled;
         config.memory.backend = "sqlite".to_owned();
         let context = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
             .await
@@ -26,7 +27,6 @@ async fn decision_service_present_in_every_model_turn_build() {
             .turn_service
             .as_ref()
             .expect("model-turn bootstrap must publish the decision service");
-        assert_eq!(service.status().durable_key, enabled);
         assert_eq!(service.status().recordable, enabled);
         let proof = if enabled {
             test_recorded_cli_agent_turn_proof(
@@ -45,8 +45,8 @@ async fn decision_service_present_in_every_model_turn_build() {
         assert!(service.drain_writes(Instant::now() + Duration::from_secs(2)).await);
         let key = workspace.path().join("self/causal_tree/.decision_key");
         let store = workspace.path().join("self/causal_tree/decisions.db");
-        assert_eq!(key.exists(), enabled, "off publication must not create a key");
-        assert_eq!(store.exists(), enabled, "off decision must not create a store");
+        assert!(!key.exists(), "no publication creates the legacy decision key");
+        assert!(!store.exists(), "no publication creates the legacy decision store");
         // Source/context/service owners leave scope before their temporary DB.
         drop(decision);
         drop(proof);

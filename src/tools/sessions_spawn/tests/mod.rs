@@ -791,7 +791,6 @@ async fn execute_admitted_spawn_with_plane(
     config.config_path = workspace.join("config.toml");
     config.default_provider = Some(tool.provider_name.clone());
     config.default_model = Some(tool.model.clone());
-    config.causal_tree.enabled = decision_enabled;
     config.autonomy.level = tool.security.autonomy;
     config.autonomy.workspace_only = tool.security.workspace_only;
     config

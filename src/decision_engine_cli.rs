@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::config::manage::mutation::decision_engine::CausalMutation;
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality, CredentialRefSetting};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality, CredentialRefSetting};
 
 /// The one line `prx causal` prints (OV-7).
 pub const CAUSAL_DEPRECATION: &str =
@@ -110,7 +110,7 @@ pub fn backend_rows(config: &Config) -> Vec<BackendRow> {
         credential_configured: false,
         circuit: "closed",
     };
-    let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) else {
+    let Some(selection) = crate::config::schema::decision_engine::configured_selection(backend) else {
         return vec![builtin];
     };
     let configured = BackendRow {
@@ -248,7 +248,9 @@ impl DecisionSetup {
             timeout_ms: None,
         }];
         if self.enable {
-            mutations.push(CausalMutation::SetEnabled(true));
+            mutations.push(CausalMutation::SetEngine(
+                crate::config::manage::mutation::decision_engine::EngineSetting::Enabled(true),
+            ));
         }
         Ok(mutations)
     }
@@ -450,7 +452,9 @@ impl DecisionSetup {
                 CausalMutation::SetCredentialRef(CredentialRefSetting::Profile(id.clone())),
             ];
             if self.enable {
-                mutations.push(CausalMutation::SetEnabled(true));
+                mutations.push(CausalMutation::SetEngine(
+                    crate::config::manage::mutation::decision_engine::EngineSetting::Enabled(true),
+                ));
             }
             self.apply_mutations(config, mutations, true).await
         }
@@ -527,17 +531,12 @@ impl DecisionSetup {
         reasons.iter().all(|reason| match reason {
             crate::config::manage::RiskReason::EndpointChanged { path } => {
                 loopback
-                    && (path == "causal_tree.backend.endpoint"
-                        || path == "decision_engine.backend.endpoint"
+                    && (path == "decision_engine.backend.endpoint"
                         || (path.starts_with("providers.models[") && path.ends_with("].provider")))
             }
             // The hosted flow stored this credential itself, one step before.
             crate::config::manage::RiskReason::CredentialChanged { path } => {
-                hosted
-                    && matches!(
-                        path.as_str(),
-                        "causal_tree.backend.credential_ref" | "decision_engine.backend.credential_ref"
-                    )
+                hosted && path == "decision_engine.backend.credential_ref"
             }
             _ => false,
         })

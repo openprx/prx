@@ -124,7 +124,7 @@ impl<'a> PublicationScope<'a> {
         let _model = self.resolve_agent_model(proof)?;
         let config = &self.generation.effective;
         let effective = self.effective_compaction(proof.provider_name(), proof.model_name());
-        let extra_token_ratio_limit = config.causal_tree.policy.extra_token_ratio_limit;
+        let extra_token_ratio_limit = config.decision_engine.token_ratio_limit;
         let reservation =
             DecisionTokenReservation::from_effective_compaction(&effective.config, extra_token_ratio_limit)?;
         let main_compaction = reservation.reserved_compaction(&effective.config, extra_token_ratio_limit)?;
@@ -136,7 +136,7 @@ impl<'a> PublicationScope<'a> {
         Ok(AgentDecisionBudget {
             budgets: TurnBudgets {
                 tokens: u64::try_from(reservation.decision_tokens).unwrap_or(u64::MAX),
-                latency_ms: config.causal_tree.policy.extra_latency_budget_ms,
+                latency_ms: config.decision_engine.latency_budget_ms,
                 micro_usd: remaining,
             },
             main_compaction,

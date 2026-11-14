@@ -123,7 +123,7 @@ pub(super) fn only_the_factory_validates_answers_with_the_builtin_or_builds_a_ba
 /// endpoint is loopback is decided in one place, `providers::loopback`, from
 /// the host as written. Configuration validation, the factory's locality and
 /// the HTTP client share it. Elsewhere in `src/decision_engine/prediction/**` and in
-/// `src/config/schema/causal_tree.rs` (+ `causal_tree/`) and `src/providers/loopback.rs`:
+/// `src/config/schema/decision_engine.rs` (+ `decision_engine/`) and `src/providers/loopback.rs`:
 ///
 /// - no parsed host is consulted (`host_str`, which normalizes `127.1` and
 ///   `0x7f000001` to `127.0.0.1`);
@@ -155,7 +155,7 @@ pub(super) fn loopback_is_decided_only_by_the_shared_predicate() {
     for path in rust_source_files() {
         let relative = relative_path(&path);
         if !relative.starts_with("src/decision_engine/prediction/")
-            && !relative.starts_with("src/config/schema/causal_tree")
+            && !relative.starts_with("src/config/schema/decision_engine")
             && relative != "src/providers/loopback.rs"
         {
             continue;

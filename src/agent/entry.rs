@@ -315,27 +315,15 @@ impl CliPendingInput {
         let experiment_stage = crate::runtime::experiment_stage::current();
         tokio::spawn(async move {
             let operation = crate::runtime::experiment_stage::retain(experiment_stage, async {
-                let event = if self.generation.effective.causal_tree.enabled {
-                    Some(
-                        self.fabric
-                            .record_inbound_user_message(
-                                self.scope.clone(),
-                                self.input.clone(),
-                                Some(self.key.clone()),
-                                None,
-                            )
-                            .await?,
+                let event = self
+                    .fabric
+                    .record_inbound_user_message_best_effort(
+                        self.scope.clone(),
+                        self.input.clone(),
+                        Some(self.key.clone()),
+                        "CLI",
                     )
-                } else {
-                    self.fabric
-                        .record_inbound_user_message_best_effort(
-                            self.scope.clone(),
-                            self.input.clone(),
-                            Some(self.key.clone()),
-                            "CLI",
-                        )
-                        .await?
-                };
+                    .await?;
                 let proof = self.issue(event.as_ref()).await?;
                 Ok::<_, anyhow::Error>((event, proof))
             });
@@ -786,9 +774,6 @@ fn issue_cli_agent_turn_proof_for_session(
             }
             Some(event.event_id.as_str())
         }
-        Some(_) | None if generation.effective.causal_tree.enabled => {
-            return Err(AgentTurnOriginError::Mismatch("missing_recorded_event"));
-        }
         Some(_) | None => None,
     };
     Ok(AgentTurnProof {
@@ -1112,7 +1097,6 @@ mod agent_turn_origin_tests {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
-        config.causal_tree.enabled = true;
         config.memory.events.record_user_messages = false;
         let generation = crate::config::new_shared(config).pin();
         let envelope =
@@ -1179,7 +1163,6 @@ mod agent_turn_origin_tests {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
-        config.causal_tree.enabled = false;
         config.memory.events.record_user_messages = false;
         let generation = crate::config::new_shared(config).pin();
         let envelope =

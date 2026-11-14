@@ -623,23 +623,8 @@ pub static ENDPOINT_PATHS: &[EndpointPath] = &[
     // The decision backend's credential is sent to it, so re-pointing it is
     // an endpoint change (high risk).
     recipient_url(
-        "causal_tree.backend.endpoint",
-        &[Key("causal_tree"), Key("backend"), Key("endpoint")],
-    ),
-    recipient_url(
         "decision_engine.backend.endpoint",
         &[Key("decision_engine"), Key("backend"), Key("endpoint")],
-    ),
-    // The endpoint a calibration was applied to (D-094 C-7): its userinfo is
-    // redacted like the backend's, and it receives nothing.
-    userinfo(
-        "causal_tree.policy.calibration_profile.endpoint",
-        &[
-            Key("causal_tree"),
-            Key("policy"),
-            Key("calibration_profile"),
-            Key("endpoint"),
-        ],
     ),
 ];
 
@@ -1774,9 +1759,6 @@ http_url = "http://signal:userinfo-sentinel-signal@127.0.0.1:25"
 
 [channels_config.whatsapp]
 ws_url = "ws://wa:userinfo-sentinel-whatsapp@127.0.0.1:26"
-
-[causal_tree.backend]
-endpoint = "https://decider:userinfo-sentinel-decision@127.0.0.1:27/v1"
 
 [decision_engine.backend]
 endpoint = "https://decider:userinfo-sentinel-engine@127.0.0.1:28/v1"
@@ -2969,11 +2951,6 @@ bot_token = "***"
         ("config/schema/agent.rs", include_str!("schema/agent.rs")),
         ("config/schema/atomic.rs", include_str!("schema/atomic.rs")),
         ("config/schema/autonomy.rs", include_str!("schema/autonomy.rs")),
-        ("config/schema/causal_tree.rs", include_str!("schema/causal_tree.rs")),
-        (
-            "config/schema/causal_tree/backend_kind.rs",
-            include_str!("schema/causal_tree/backend_kind.rs"),
-        ),
         ("config/schema/channels.rs", include_str!("schema/channels.rs")),
         ("config/schema/chat.rs", include_str!("schema/chat.rs")),
         ("config/schema/codex_effort.rs", include_str!("schema/codex_effort.rs")),
@@ -2982,6 +2959,14 @@ bot_token = "***"
         (
             "config/schema/decision_engine.rs",
             include_str!("schema/decision_engine.rs"),
+        ),
+        (
+            "config/schema/decision_engine/backend.rs",
+            include_str!("schema/decision_engine/backend.rs"),
+        ),
+        (
+            "config/schema/decision_engine/backend_kind.rs",
+            include_str!("schema/decision_engine/backend_kind.rs"),
         ),
         ("config/schema/gateway.rs", include_str!("schema/gateway.rs")),
         ("config/schema/integrations.rs", include_str!("schema/integrations.rs")),
@@ -3063,9 +3048,9 @@ bot_token = "***"
         for entry in std::fs::read_dir(split_dir).expect("read schema split sources") {
             let path = entry.expect("schema source entry").path();
             if path.extension().is_some_and(|ext| ext == "rs")
-                && path.file_name().is_none_or(|name| {
-                    name != "causal_tree_config_tests.rs" && name != "decision_engine_config_tests.rs"
-                })
+                && path
+                    .file_name()
+                    .is_none_or(|name| name != "decision_engine_config_tests.rs")
             {
                 let relative = format!("config/schema/{}", path.file_name().unwrap().to_string_lossy());
                 assert!(
@@ -3399,7 +3384,7 @@ bot_token = "***"
     fn the_decision_endpoint_is_redacted_on_every_read_surface() {
         const SENTINEL: &str = "userinfo-sentinel-cdp04";
         let dir = tempfile::TempDir::new().expect("test: temp config dir");
-        let overlay = format!("[causal_tree.backend]\nendpoint = \"https://decider:{SENTINEL}@127.0.0.1:27/v1\"\n");
+        let overlay = format!("[decision_engine.backend]\nendpoint = \"https://decider:{SENTINEL}@127.0.0.1:27/v1\"\n");
         let config = fixture::config_from_overlay(dir.path(), &overlay);
         let rendered = redacted_stored_toml(&config)
             .expect("test: config show rendering")
@@ -3411,10 +3396,10 @@ bot_token = "***"
         assert!(!json.to_string().contains(SENTINEL), "GET /api/config leaked: {json}");
         let found = scan(&toml::from_str::<toml::Value>(&overlay).expect("test: overlay"));
         assert!(!found.scrub(&overlay).contains(SENTINEL));
-        let debug = format!("{:?}", config.causal_tree);
+        let debug = format!("{:?}", config.decision_engine);
         assert!(!debug.contains(SENTINEL), "{debug}");
         assert!(is_credential_recipient_endpoint(&[
-            PathElem::Key("causal_tree".to_string()),
+            PathElem::Key("decision_engine".to_string()),
             PathElem::Key("backend".to_string()),
             PathElem::Key("endpoint".to_string()),
         ]));
@@ -3754,7 +3739,6 @@ classifier_provider = "custom:http://grace:userinfo-sentinel-classifier@127.0.0.
             nodes,
             agents,
             media,
-            causal_tree,
             decision_engine,
             security,
             compliance,
@@ -3867,7 +3851,6 @@ output = 1.0
             "tunnel.ngrok" => d(c.tunnel.ngrok.as_ref()?),
             "tunnel.custom" => d(c.tunnel.custom.as_ref()?),
             "chat.daemon" => d(&c.chat.daemon),
-            "causal_tree.backend" => d(&c.causal_tree.backend),
             "decision_engine.backend" => d(c.decision_engine.backend.as_ref()?),
             "nodes.nodes[0]" => d(c.nodes.nodes.first()?),
             "nodes.server" => d(&c.nodes.server),

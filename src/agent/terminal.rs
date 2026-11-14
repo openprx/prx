@@ -864,10 +864,11 @@ mod tests {
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
-        enabled: bool,
+        recording: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
     ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
-        bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, enabled, ingress_memory, false).await
+        bind_terminal_fixture_with_capture(workspace, memory, draft, cost_config, recording, ingress_memory, false)
+            .await
     }
 
     pub(crate) async fn bind_terminal_parameter_fixture(
@@ -884,7 +885,7 @@ mod tests {
         memory: Arc<dyn Memory>,
         draft: &mut TurnTerminalDraft,
         cost_config: &CostConfig,
-        enabled: bool,
+        recording: bool,
         ingress_memory: Option<Arc<dyn Memory>>,
         capture_parameters: bool,
     ) -> Arc<crate::runtime::turn_publication::TurnRuntimeService> {
@@ -904,12 +905,17 @@ mod tests {
             let mut config = crate::config::Config::default();
             config.workspace_dir = workspace.to_path_buf();
             config.config_path = workspace.join("config.toml");
-            config.causal_tree.enabled = enabled;
-            config.causal_tree.policy.max_decision_hops = 1;
-            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::Builtin,
-            );
-            config.causal_tree.backend.remote_enabled = false;
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::Builtin,
+                );
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .remote_enabled = false;
+            // OV-13: an unrecorded terminal has user-message recording off.
+            config.memory.events.record_user_messages = recording;
             config.cost = cost_config.clone();
             config
                 .providers

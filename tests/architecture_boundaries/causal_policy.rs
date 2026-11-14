@@ -4,18 +4,19 @@ use super::helpers::{
 };
 use super::helpers::{is_test_code_file, test_module_files};
 use super::tool_scanner::contains_identifier;
-/// The only production files that may write the decision-plane
-/// configuration (CDP-04, SP-CDP-A 5.4): its own module, for the legacy
-/// migration and the derived legacy view. CDP-12 adds the typed mutation
-/// service (`src/config/manage/mutation/decision_engine.rs`).
+/// The only production files that may write the decision engine
+/// configuration (CDP-04, SP-CDP-A 5.4): its own module and the typed
+/// mutation service (`src/config/manage/mutation/decision_engine.rs`).
 const CAUSAL_POLICY_WRITERS: &[&str] = &[
-    "src/config/schema/causal_tree.rs",
+    "src/config/schema/decision_engine.rs",
+    "src/config/schema/decision_engine/backend.rs",
+    "src/config/schema/decision_engine/backend_kind.rs",
     // CDP-12: the one decision-plane mutation service (AG-13).
     "src/config/manage/mutation/decision_engine.rs",
 ];
 
 /// Methods that only read a value, and so may be called on a
-/// `.causal_tree` chain outside [`CAUSAL_POLICY_WRITERS`].
+/// `.decision_engine` chain outside [`CAUSAL_POLICY_WRITERS`].
 const CAUSAL_READ_ONLY_METHODS: &[&str] = &[
     "clone",
     "as_str",
@@ -46,30 +47,20 @@ const CAUSAL_READ_ONLY_METHODS: &[&str] = &[
     "unwrap_or_default",
 ];
 
-/// The typed sections of `[causal_tree]`; a literal of one outside the
+/// The typed sections of `[decision_engine]`; a literal of one outside the
 /// writers builds a policy nobody reviewed.
-const CAUSAL_CONFIG_TYPES: [&str; 9] = [
-    "CausalTreeConfig",
-    "CausalPolicy",
-    "DecisionBackendConfig",
-    "CircuitBreakerConfig",
-    "RehearsalConfig",
-    "ScoringConfig",
-    "WeightOverrides",
-    "DecisionStoreConfig",
-    "EvaluationConfig",
-];
+const CAUSAL_CONFIG_TYPES: [&str; 3] = ["DecisionEngineConfig", "DecisionBackendConfig", "CircuitBreakerConfig"];
 
 /// CDP-04 (SP-CDP-C V8.05 `runtime_never_rewrites_thresholds`, CDP 15 "no
 /// auto-threshold rewrite"): no production code outside
 /// [`CAUSAL_POLICY_WRITERS`] writes decision policy. It never
 ///
-/// - assigns (`=`, or a compound `+=` and the like) to `.causal_tree` or to
-///   any field under it;
-/// - borrows `.causal_tree` or a field under it mutably (`&mut`, which
+/// - assigns (`=`, or a compound `+=` and the like) to `.decision_engine` or
+///   to any field under it;
+/// - borrows `.decision_engine` or a field under it mutably (`&mut`, which
 ///   `std::mem::replace`, `swap` and `take` need);
 /// - writes a literal of a [`CAUSAL_CONFIG_TYPES`] type;
-/// - fills a `causal_tree:` field with anything but the section's default.
+/// - fills a `decision_engine:` field with anything but the section's default.
 ///
 /// A whole `Config` still changes through the transaction layer (AG-13),
 /// whose plan classifies a decision-plane change (`RiskReason`).
@@ -88,20 +79,20 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
         }
         let production = strip_cfg_test_items(&blank_comments_and_literals(&source));
         // Whitespace-normalized, with a method or field chain split over
-        // lines (`config\n    .causal_tree\n    .backend`) joined back.
+        // lines (`config\n    .decision_engine\n    .backend`) joined back.
         let compact = production
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .replace(" .", ".");
         let mut search = 0;
-        while let Some(found) = compact[search..].find(".causal_tree") {
+        while let Some(found) = compact[search..].find(".decision_engine") {
             let start = search + found;
-            search = start + ".causal_tree".len();
+            search = start + ".decision_engine".len();
             if compact[search..].chars().next().is_some_and(is_ident_char) {
                 continue;
             }
-            // The field chain under the section: `.policy.commit_threshold`,
+            // The field chain under the section: `.backend.remote_enabled`,
             // including index segments (`.weights[0]`, D-082 N-10).
             let mut chain_end = search;
             loop {
@@ -131,7 +122,7 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
                 .rfind(|character: char| !(is_ident_char(character) || matches!(character, '.' | '(' | ')')))
                 .map_or(0, |index| index + 1);
             let borrowed = compact[..path_start].trim_end().ends_with("&mut");
-            // A method called on the chain (`.causal_tree.normalize()`,
+            // A method called on the chain (`.decision_engine.normalize()`,
             // `.backend.endpoint.push_str(..)`) may take `&mut self`: only
             // read-only methods are allowed.
             let method = rest.starts_with('(')
@@ -141,7 +132,7 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
                     .is_some_and(|name| !CAUSAL_READ_ONLY_METHODS.contains(&name));
             if assigned || borrowed || method {
                 violations.push(format!(
-                    "{relative}: writes .causal_tree{}",
+                    "{relative}: writes .decision_engine{}",
                     &compact[search..chain_end]
                 ));
             }
@@ -167,30 +158,30 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
             }
         }
         // Field shorthand in a `Config` pattern or literal
-        // (`let Config { causal_tree, .. } = &mut config;`,
-        // `Config { causal_tree, ..x }`) binds or fills the section by name.
+        // (`let Config { decision_engine, .. } = &mut config;`,
+        // `Config { decision_engine, ..x }`) binds or fills the section by name.
         let mut search = 0;
-        while let Some(found) = compact[search..].find("causal_tree") {
+        while let Some(found) = compact[search..].find("decision_engine") {
             let start = search + found;
-            search = start + "causal_tree".len();
+            search = start + "decision_engine".len();
             let preceding = compact[..start].chars().next_back();
             if preceding.is_some_and(|character| is_ident_char(character) || character == '.' || character == ':') {
                 continue;
             }
             let following = compact[search..].trim_start();
             if following.starts_with(',') || following.starts_with('}') {
-                violations.push(format!("{relative}: binds or fills causal_tree by shorthand"));
+                violations.push(format!("{relative}: binds or fills decision_engine by shorthand"));
             }
         }
         let mut search = 0;
-        while let Some(found) = compact[search..].find("causal_tree:") {
+        while let Some(found) = compact[search..].find("decision_engine:") {
             let start = search + found;
-            search = start + "causal_tree:".len();
+            search = start + "decision_engine:".len();
             // Not a field value: a module path
             // (`crate::config::schema::decision_engine::`), or the field's
-            // declaration (`pub causal_tree: CausalTreeConfig`). An
-            // attribute before a field value (`#[cfg(x)] causal_tree: v`) is
-            // no declaration.
+            // declaration (`pub decision_engine: DecisionEngineConfig`). An
+            // attribute before a field value (`#[cfg(x)] decision_engine: v`)
+            // is no declaration.
             let before = compact[..start].trim_end();
             let declared = ["pub", "pub(crate)", "pub(super)", "pub(self)"]
                 .iter()
@@ -203,14 +194,15 @@ pub(super) fn causal_policy_is_written_only_by_the_mutation_service() {
             }
             let value = compact[search..].trim_start();
             let value = &value[..value.find([',', '}']).unwrap_or(value.len())];
-            if !(value.trim_end().ends_with("CausalTreeConfig::default()") || value.trim() == "Default::default()") {
-                violations.push(format!("{relative}: fills causal_tree with `{}`", value.trim()));
+            if !(value.trim_end().ends_with("DecisionEngineConfig::default()") || value.trim() == "Default::default()")
+            {
+                violations.push(format!("{relative}: fills decision_engine with `{}`", value.trim()));
             }
         }
     }
     assert!(
         violations.is_empty(),
-        "decision policy is written only by the decision-plane configuration module (CDP-04): {violations:?}"
+        "decision policy is written only by the decision engine configuration module (CDP-04): {violations:?}"
     );
 }
 

@@ -243,7 +243,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.api_key = Some("sk-ROOT-OUTBOUND-SENTINEL".to_string());
         let mut secrets = OutboundSecrets::of_config(&config);
-        secrets.add("causal_tree.backend.credential_ref", "decision-profile-sentinel");
+        secrets.add("decision_engine.backend.credential_ref", "decision-profile-sentinel");
         assert!(check_outbound(b"x sk-ROOT-OUTBOUND-SENTINEL x".to_vec(), 1024, &secrets).is_err());
         assert!(check_outbound(b"x decision-profile-sentinel x".to_vec(), 1024, &secrets).is_err());
         assert!(check_outbound(b"x nothing x".to_vec(), 1024, &secrets).is_ok());

@@ -343,7 +343,7 @@ impl DecisionAdvisory {
         let backend = effective_engine_backend(&self.config);
         // Builtin and cache hits spend nothing; a configured backend runs
         // only inside an allowance that leaves the first send admissible.
-        let accounting = match crate::config::schema::causal_tree::configured_selection(backend) {
+        let accounting = match crate::config::schema::decision_engine::configured_selection(backend) {
             Some(selection) => {
                 let Some(bounded) = bounded_accounting(&input, &selection.provider, backend.model.trim()) else {
                     tracing::debug!("decision engine analysis skipped: the turn budget is too tight");
@@ -391,7 +391,7 @@ impl DecisionAdvisory {
         let discovered = DiscoveredRefs::empty();
         let policy = CandidatePolicy {
             key: &input.state_key,
-            max_candidates: usize::from(self.config.causal_tree.policy.max_candidates),
+            max_candidates: usize::from(self.config.decision_engine.max_candidates),
             can_deliver_text: true,
             may_delegate: false,
             delegation_target: None,

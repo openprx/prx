@@ -5,7 +5,7 @@
 //! compatible transport ([`crate::decision_engine::prediction::compatible_http::CompatibleHttpBackend`])
 //! with these differences:
 //!
-//! - the base URL defaults to [`DEFAULT_BASE`]; `causal_tree.backend.endpoint`
+//! - the base URL defaults to [`DEFAULT_BASE`]; `decision_engine.backend.endpoint`
 //!   overrides it (COORD-6), and the backend stays remote whatever the URL
 //!   says, so `remote_enabled` gates it even against a loopback stub;
 //! - the model is pinned: the response must name exactly the configured

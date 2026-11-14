@@ -14,14 +14,12 @@ use crate::tools::capability::contract::CatalogGeneration;
 pub(crate) struct DecisionPlaneStatus {
     pub(crate) backend: BackendPlaneStatus,
     pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) durable_key: bool,
     pub(crate) recordable: bool,
 }
 
 /// The recovery and journal attachment of one publication.
 pub(crate) struct JournalAttachment {
     pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) durable_key: bool,
     pub(crate) recordable: bool,
 }
 
@@ -31,7 +29,6 @@ pub(crate) const fn plane_status(backend: BackendPlaneStatus, journal: JournalAt
     DecisionPlaneStatus {
         backend,
         catalog_generation: journal.catalog_generation,
-        durable_key: journal.durable_key,
         recordable: journal.recordable,
     }
 }

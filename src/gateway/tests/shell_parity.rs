@@ -229,7 +229,6 @@ async fn generation_swap_changes_git_outcome_between_calls() {
         config.config_path = root.path().join("config.toml");
         config.default_provider = Some("ollama".into());
         config.default_model = Some("prx-shell-parity".into());
-        config.causal_tree.enabled = false;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
         config.providers.models.push(serde_json::from_value(serde_json::json!({"provider":"ollama","model":"prx-shell-parity","operations":["chat"],"native_tools":true})).expect("test: model"));
         config.cost.prices.insert("ollama/prx-shell-parity".into(), crate::config::schema::ModelPricing { input: 1.0, output: 1.0, cache_write: 1.0, cache_read: 1.0 });

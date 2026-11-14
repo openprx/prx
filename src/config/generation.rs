@@ -471,7 +471,7 @@ impl ConfigGenerationManager {
         if let Some(warning) = crate::config::manage::validate::decision_startup_check(&generation.effective) {
             tracing::warn!("{warning}");
         }
-        if generation.effective.causal_tree.enabled
+        if generation.effective.decision_engine.enabled
             && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(&generation.effective)
         {
             tracing::warn!("{warning}");
@@ -512,8 +512,8 @@ impl ConfigGenerationManager {
             tracing::warn!("{warning}");
         }
         // Decision credentials left unreferenced are reported (D-094 C-5);
-        // a disabled plane does not read the credential store.
-        if initial.causal_tree.enabled
+        // a disabled engine does not read the credential store.
+        if initial.decision_engine.enabled
             && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(&initial)
         {
             tracing::warn!("{warning}");
@@ -1160,7 +1160,6 @@ pub(crate) fn is_rebuild_and_swap(field: &str) -> bool {
             | "user_policies"
             | "secrets"
             | "media"
-            | "causal_tree"
             | "proxy"
     )
 }
@@ -1750,15 +1749,12 @@ mod tests {
     /// round trip (`preserve_deferred_fields`); configured values and the
     /// schema version survive the reload.
     #[test]
-    fn a_reload_keeps_the_causal_settings() {
+    fn a_reload_keeps_the_decision_engine_settings() {
         let dir = tempfile::TempDir::new().expect("test: temp dir");
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, CAUSAL_FIXTURE).expect("test: causal config");
         let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
         let manager = ConfigGenerationManager::new(initial);
-        // `causal_tree` is deferred to restart, so the new active generation
-        // carries the running section through `preserve_deferred_fields`'s
-        // JSON round trip.
         std::fs::write(
             &config_path,
             CAUSAL_FIXTURE.replace("default_temperature = 0.7", "default_temperature = 0.4"),
@@ -1771,11 +1767,10 @@ mod tests {
         assert!((manager.load_full().default_temperature - 0.4).abs() < f64::EPSILON);
 
         for config in [manager.load_full(), Arc::clone(&manager.desired().config)] {
-            let causal = &config.causal_tree;
-            assert_eq!(causal.schema_version, 2);
-            assert_eq!(causal.policy.max_candidates, 5);
-            assert_eq!(causal.rehearsal.timeout_ms, 80);
-            assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
+            let engine = &config.decision_engine;
+            assert_eq!(engine.latency_budget_ms, 3_000);
+            assert!((engine.token_ratio_limit - 0.5).abs() < f32::EPSILON);
+            assert_eq!(engine.max_candidates, 5);
         }
     }
 
@@ -1783,20 +1778,25 @@ mod tests {
     /// the reload can warn; a local edit is not.
     #[test]
     fn a_hand_edited_remote_enablement_is_reported() {
-        use crate::config::schema::causal_tree::BackendSelection;
+        use crate::config::schema::decision_engine::BackendSelection;
         let old = Config::default();
         let mut new = old.clone();
-        new.causal_tree.enabled = true;
-        new.causal_tree.backend.kind =
-            BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::CompatibleHttp);
-        new.causal_tree.backend.endpoint = "https://decisions.example.com/v1".to_string();
-        new.causal_tree.backend.remote_enabled = true;
+        new.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            BackendSelection::Fixed(crate::config::schema::decision_engine::BackendKind::CompatibleHttp);
+        new.decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "https://decisions.example.com/v1".to_string();
+        new.decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
         assert_eq!(
             hand_edited_remote_decisions(&old, &new),
-            vec!["causal_tree.backend.remote_enabled".to_string()]
+            vec!["decision_engine.backend.remote_enabled".to_string()]
         );
         let mut local = old.clone();
-        local.causal_tree.enabled = true;
+        local.decision_engine.enabled = true;
         assert!(
             hand_edited_remote_decisions(&old, &local).is_empty(),
             "expected an empty value"
@@ -1817,14 +1817,14 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "default_temperature = 0.7\n\n[causal_tree.backend]\nmodel = \"vendor/before-reload\"\n",
+            "default_temperature = 0.7\n\n[decision_engine.backend]\nmodel = \"vendor/before-reload\"\n",
         )
         .expect("test: config");
         let initial = Config::load_from_path(&config_path, dir.path().join("workspace")).expect("test: load");
         let allowlist = Arc::new(ModelAllowlist::default());
         let manager = ConfigGenerationManager::with_model_allowlist(initial, Arc::clone(&allowlist));
-        // A participant that rebuilds `[causal_tree]`, so the edit is applied
-        // rather than deferred to a restart.
+        // A participant that rebuilds, so every edit is applied rather than
+        // deferred to a restart.
         let events = Arc::new(Mutex::new(Vec::new()));
         let rebuilding = participant("decision", events, false, false);
         manager.register_participant(&rebuilding);
@@ -1832,7 +1832,7 @@ mod tests {
         assert_eq!(allowlist.label("vendor/after-reload"), UNLISTED_MODEL);
         std::fs::write(
             &config_path,
-            "default_temperature = 0.7\n\n[causal_tree.backend]\nmodel = \"vendor/after-reload\"\n",
+            "default_temperature = 0.7\n\n[decision_engine.backend]\nmodel = \"vendor/after-reload\"\n",
         )
         .expect("test: edit");
         manager
@@ -1862,7 +1862,7 @@ mod tests {
                 self.clone()
             }
         }
-        const REMOTE: &str = "default_temperature = 0.4\n\n[causal_tree]\nenabled = true\n\n[causal_tree.backend]\n\
+        const REMOTE: &str = "default_temperature = 0.4\n\n[decision_engine.backend]\n\
                               kind = \"compatible_http\"\nendpoint = \"https://decisions.example.com/v1\"\n\
                               model = \"decider-1\"\nremote_enabled = true\n\n[[providers.models]]\n\
                               provider = \"custom:https://decisions.example.com/v1\"\nmodel = \"decider-1\"\n\
@@ -1898,7 +1898,7 @@ mod tests {
         assert!(applied);
         assert!(
             logs.contains("sends decision state off this machine")
-                && logs.contains("causal_tree.backend.remote_enabled"),
+                && logs.contains("decision_engine.backend.remote_enabled"),
             "{logs}"
         );
         assert!(
@@ -1924,7 +1924,7 @@ mod tests {
         let active = manager.active_generation_id();
         std::fs::write(
             &config_path,
-            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+            "default_temperature = 0.4\n\n[decision_engine.backend]\nkind = \"compatible_http\"\n\
              endpoint = \"https://decisions.example.com/v1\"\n",
         )
         .expect("test: edit");
@@ -1936,7 +1936,7 @@ mod tests {
         assert!(!message.contains("decisions.example.com"), "{message}");
         assert_eq!(manager.active_generation_id(), active);
         assert!((manager.load_full().default_temperature - 0.7).abs() < f64::EPSILON);
-        assert!(!manager.load_full().causal_tree.backend.remote_enabled);
+        assert!(manager.load_full().decision_engine.backend.is_none());
     }
 
     /// CDP-12 (R-CXR P0-B t2): a hand edit to a decision backend the strict
@@ -1955,21 +1955,21 @@ mod tests {
         let active = manager.active_generation_id();
         std::fs::write(
             &config_path,
-            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+            "default_temperature = 0.4\n\n[decision_engine.backend]\nkind = \"compatible_http\"\n\
              endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n",
         )
         .expect("test: edit");
         let error = manager
             .reload_from_disk(ConfigReloadTrigger::Test)
             .expect_err("test: refused");
-        assert!(format!("{error:#}").contains("causal_tree.backend"), "{error:#}");
+        assert!(format!("{error:#}").contains("decision_engine.backend"), "{error:#}");
         assert_eq!(manager.active_generation_id(), active);
         assert!((manager.load_full().default_temperature - 0.7).abs() < f64::EPSILON);
 
         // Declared for decision_endpoint, the same backend activates.
         std::fs::write(
             &config_path,
-            "default_temperature = 0.4\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+            "default_temperature = 0.4\n\n[decision_engine.backend]\nkind = \"compatible_http\"\n\
              endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n\n\
              [[providers.models]]\nprovider = \"custom:http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n\
              operations = [\"decision_endpoint\"]\n",
@@ -1983,10 +1983,10 @@ mod tests {
 
     /// D-094 C-1: a daemon started with a decision section the check
     /// refuses starts, and a later reload that does not touch
-    /// `[causal_tree]` is applied; one that does is still refused.
+    /// `[decision_engine]` is applied; one that does is still refused.
     #[test]
     fn an_invalid_decision_section_never_blocks_startup_or_unrelated_reloads() {
-        const INVALID: &str = "\n[causal_tree]\nenabled = true\n\n[causal_tree.backend]\nkind = \"compatible_http\"\n\
+        const INVALID: &str = "\n[decision_engine.backend]\nkind = \"compatible_http\"\n\
                                endpoint = \"http://127.0.0.1:8900/v1\"\nmodel = \"undeclared-model\"\n";
         let dir = tempfile::TempDir::new().expect("test: temp dir");
         let config_path = dir.path().join("config.toml");
@@ -2016,24 +2016,16 @@ mod tests {
         let error = manager
             .reload_from_disk(ConfigReloadTrigger::Test)
             .expect_err("test: a change to the section is refused");
-        assert!(format!("{error:#}").contains("causal_tree.backend"), "{error:#}");
+        assert!(format!("{error:#}").contains("decision_engine.backend"), "{error:#}");
         assert_eq!(manager.active_generation_id(), active);
     }
 
     const CAUSAL_FIXTURE: &str = r#"default_temperature = 0.7
 
-[causal_tree]
-schema_version = 1
-enabled = false
-
-[causal_tree.policy]
+[decision_engine]
+latency_budget_ms = 3000
+token_ratio_limit = 0.5
 max_candidates = 5
-
-[causal_tree.rehearsal]
-timeout_ms = 80
-
-[causal_tree.scoring.weights]
-w_cost = 0.4
 "#;
 
     #[test]

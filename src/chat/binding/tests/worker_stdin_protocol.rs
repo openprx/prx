@@ -269,7 +269,6 @@ async fn run_protocol_case(case: TestWorkerProtocolCase) -> anyhow::Result<Worke
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
         config.memory.backend = "sqlite".to_owned();
-        config.causal_tree.enabled = true;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
         config.sessions_spawn.default_mode = "process".to_owned();
         config.sessions_spawn.process_memory_strategy = "isolated_private".to_owned();

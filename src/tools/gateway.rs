@@ -188,14 +188,14 @@ impl GatewayTool {
                     .to_string(),
             ));
         }
-        // A model never changes the decision plane: its backend, remote
-        // processing, policy, thresholds or exploration (CDP 15, CDP-04).
-        // The resulting section is compared, so a change to any key, and a
-        // deletion through `null` on it or a parent, are all refused.
-        if patched.causal_tree != desired.config.causal_tree {
+        // A model never changes the decision engine: its switch, backend,
+        // remote processing or turn limits (CDP 15, CDP-04). The resulting
+        // section is compared, so a change to any key, and a deletion through
+        // `null` on it or a parent, are all refused.
+        if patched.decision_engine != desired.config.decision_engine {
             return Ok(refused(
-                "config.patch does not change `[causal_tree]`, the decision plane: its backend, remote processing, \
-                 policy and thresholds are set by the operator with `prx decision-engine config set`. Nothing was written."
+                "config.patch does not change `[decision_engine]`: its switch, backend, remote processing and \
+                 limits are set by the operator with `prx decision-engine config set`. Nothing was written."
                     .to_string(),
             ));
         }
@@ -334,8 +334,8 @@ impl Tool for GatewayTool {
          'restart' (send SIGHUP for graceful restart). \
          'config.patch' and 'restart' are available only to the local operator in the terminal UI; \
          they are refused for remote channels, gateway/webhook, console and external MCP callers. \
-         'config.patch' never changes `[causal_tree]` (the decision plane: its backend, remote processing, \
-         policy and thresholds are the operator's)."
+         'config.patch' never changes `[decision_engine]` (its switch, backend, remote processing and \
+         limits are the operator's)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -782,11 +782,10 @@ mod tests {
         assert_eq!(parsed.gateway.port, 3300);
     }
 
-    /// D-074 P1-1: `config.patch` rebuilds the configuration from JSON; the
-    /// canonical causal settings survive the round trip, and the
-    /// saved configuration keeps `schema_version`.
+    /// `config.patch` rebuilds the configuration from JSON; the decision
+    /// engine settings survive the round trip.
     #[tokio::test]
-    async fn config_patch_keeps_the_causal_settings_and_the_version() {
+    async fn config_patch_keeps_the_decision_engine_settings() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let mut cfg = Config {
@@ -794,8 +793,8 @@ mod tests {
             config_path: config_path.clone(),
             ..Config::default()
         };
-        cfg.causal_tree.policy.max_candidates = 5;
-        cfg.causal_tree.scoring.weights.w_cost = Some(0.4);
+        cfg.decision_engine.max_candidates = 5;
+        cfg.decision_engine.latency_budget_ms = 3_000;
 
         cfg.save().await.unwrap();
         let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(
@@ -808,36 +807,20 @@ mod tests {
         let result = run_patch(&tool, json!({"gateway": {"port": 3301}})).await;
         assert!(result.success, "{:?}", result.error);
 
-        let causal = tool.config.desired().config.causal_tree.clone();
-        assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
+        let engine = tool.config.desired().config.decision_engine.clone();
+        assert_eq!(engine.max_candidates, 5);
+        assert_eq!(engine.latency_budget_ms, 3_000);
         let reloaded = Config::load_from_path(&config_path, tmp.path().join("workspace")).unwrap();
-        assert_eq!(reloaded.causal_tree, causal);
-        assert_eq!(
-            reloaded.causal_tree.schema_version,
-            crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
-        );
-        let mut stored = tokio::fs::read_to_string(&config_path).await.unwrap();
-        if let Ok(entries) = std::fs::read_dir(tmp.path().join("config.d")) {
-            for entry in entries.flatten() {
-                stored.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
-            }
-        }
-        assert!(
-            stored.contains(&format!(
-                "schema_version = {}",
-                crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
-            )),
-            "{stored}"
-        );
+        assert_eq!(reloaded.decision_engine, engine);
     }
 
     /// CDP-04 (V6.07 `config.patch` half, SP-CDP-A 5.4): a model never
-    /// changes the decision plane. Each change to the resulting
-    /// `[causal_tree]`, including enabling remote processing, a threshold,
-    /// exploration and a deletion through `null`, is refused with nothing
-    /// written, even when confirmed.
+    /// changes the decision engine. Each change to the resulting
+    /// `[decision_engine]`, including enabling it, remote processing, a limit
+    /// and a deletion through `null`, is refused with nothing written, even
+    /// when confirmed.
     #[tokio::test]
-    async fn config_patch_refuses_every_causal_tree_change() {
+    async fn config_patch_refuses_every_decision_engine_change() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let mut cfg = Config {
@@ -845,8 +828,7 @@ mod tests {
             config_path: config_path.clone(),
             ..Config::default()
         };
-        cfg.causal_tree.enabled = false;
-        cfg.causal_tree.policy.max_candidates = 5;
+        cfg.decision_engine.max_candidates = 5;
 
         cfg.save().await.unwrap();
         let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(
@@ -857,18 +839,17 @@ mod tests {
         ));
         let before = tokio::fs::read_to_string(&config_path).await.unwrap();
         for patch in [
-            json!({"causal_tree": {"backend": {"remote_enabled": true}}}),
-            json!({"causal_tree": {"enabled": true}}),
-            json!({"causal_tree": {"policy": {"commit_threshold": 0.1}}}),
-            json!({"causal_tree": {"evaluation": {"exploration": "read_only", "exploration_rate": 0.05}}}),
-            json!({"causal_tree": {"policy": null}}),
-            json!({"causal_tree": null}),
+            json!({"decision_engine": {"backend": {"remote_enabled": true}}}),
+            json!({"decision_engine": {"enabled": true}}),
+            json!({"decision_engine": {"max_candidates": 3}}),
+            json!({"decision_engine": {"latency_budget_ms": null}}),
+            json!({"decision_engine": null}),
         ] {
             let result = run_patch(&tool, patch.clone()).await;
             assert!(!result.success, "{patch} was written");
             let error = result.error.unwrap_or_default();
             assert!(
-                error.contains("[causal_tree]") && error.contains("prx decision-engine config set"),
+                error.contains("[decision_engine]") && error.contains("prx decision-engine config set"),
                 "{error}"
             );
             assert_eq!(

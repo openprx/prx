@@ -411,7 +411,7 @@ min_coverage = 0.60
         .into(),
 
         Spec::Full => r#"# Agent configuration (full)
-# Agent orchestration, sessions, self-system, causal tree, and delegates.
+# Agent orchestration, sessions, self-system, and delegates.
 # Context retention follows the model-aware token budget.
 
 # Context compaction to manage long conversations.
@@ -439,14 +439,6 @@ retention_days = 180
 max_backfill_days = 7
 min_samples = 5
 min_coverage = 0.60
-
-# Decision plane — enabled by default with conservative local builtin fallback.
-# Remote processing remains opt-in and requires proven prospective cost bounds.
-# Keep schema_version when setting enabled = false for an explicit disable.
-# Applied directives emit causal.directive.applied events.
-[causal_tree]
-schema_version = 2
-enabled = true
 
 # Delegate agents for multi-agent workflows
 # [agents.researcher]

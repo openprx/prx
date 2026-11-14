@@ -573,7 +573,7 @@ planted_violation_probes! {
         "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_local(url: &Url) -> bool {\n    url.host_str() == Some(name)\n}\n";
     probe_decision_address_match: loopback_is_decided_only_by_the_shared_predicate,
-        "src/config/schema/causal_tree.rs", Planted::AppendedTo, Reads::ProductionText,
+        "src/config/schema/decision_engine/backend_kind.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub fn d0_planted_v4(ip: std::net::Ipv4Addr) -> bool {\n    ip.is_loopback()\n}\n";
     probe_causal_metric_label: decision_metric_labels_come_from_bounded_allowlists,
         "src/observability/prometheus.rs", Planted::AppendedTo, Reads::ProductionText,
@@ -656,43 +656,43 @@ planted_violation_probes! {
         "fn d0_planted_delegate() { let _ = crate::tools::delegate::DelegateTool::new; }\n";
     probe_causal_policy_assignment: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_threshold(config: &mut Config) {\n    config.causal_tree.policy.commit_threshold = 0.1;\n}\n";
+        "pub fn d0_planted_threshold(config: &mut Config) {\n    config.decision_engine.token_ratio_limit = 0.1;\n}\n";
     probe_causal_policy_compound: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_widen(config: &mut Config) {\n    config.causal_tree.policy.max_candidates += 1;\n}\n";
+        "pub fn d0_planted_widen(config: &mut Config) {\n    config.decision_engine.max_candidates += 1;\n}\n";
     probe_causal_policy_remote_switch: causal_policy_is_written_only_by_the_mutation_service,
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_remote(config: &mut Config) {\n    config\n        .causal_tree\n        .backend\n        .remote_enabled = true;\n}\n";
+        "pub fn d0_planted_remote(config: &mut Config) {\n    config\n        .decision_engine\n        .backend\n        .remote_enabled = true;\n}\n";
     probe_causal_policy_mut_borrow: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_take(config: &mut Config) {\n    let _ = std::mem::take(&mut config.causal_tree.policy);\n}\n";
+        "pub fn d0_planted_take(config: &mut Config) {\n    let _ = std::mem::take(&mut config.decision_engine.backend);\n}\n";
     probe_causal_policy_literal: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_policy() -> CausalPolicy {\n    CausalPolicy { commit_threshold: 0.1, ..Default::default() }\n}\n";
+        "pub fn d0_planted_policy() -> DecisionEngineConfig {\n    DecisionEngineConfig { token_ratio_limit: 0.1, ..Default::default() }\n}\n";
     probe_causal_policy_turbofish: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_turbofish(config: &mut Config) {\n    config.causal_tree.policy.calibration_profile.get_or_insert_with::<Make>(make);\n}\n";
+        "pub fn d0_planted_turbofish(config: &mut Config) {\n    config.decision_engine.backend.get_or_insert_with::<Make>(make);\n}\n";
     probe_causal_policy_index_assignment: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_index(config: &mut Config) {\n    config.causal_tree.scoring.levels[0] = 1.0;\n}\n";
+        "pub fn d0_planted_index(config: &mut Config) {\n    config.decision_engine.levels[0] = 1.0;\n}\n";
     probe_causal_policy_normalize_call: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_normalize(config: &mut Config) {\n    config.causal_tree.normalize();\n}\n";
+        "pub fn d0_planted_normalize(config: &mut Config) {\n    config.decision_engine.normalize();\n}\n";
     probe_causal_policy_push_str: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_push(config: &mut Config) {\n    config.causal_tree.backend.endpoint.push_str(value);\n}\n";
+        "pub fn d0_planted_push(config: &mut Config) {\n    config.decision_engine.backend.endpoint.push_str(value);\n}\n";
     probe_causal_policy_destructure: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_bind(config: &mut Config) {\n    let Config { causal_tree, .. } = config;\n    causal_tree.enabled = true;\n}\n";
+        "pub fn d0_planted_bind(config: &mut Config) {\n    let Config { decision_engine, .. } = config;\n    decision_engine.enabled = true;\n}\n";
     probe_causal_policy_shorthand_init: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_fill(causal_tree: CausalTreeConfig, base: Config) -> Config {\n    Config { causal_tree, ..base }\n}\n";
+        "pub fn d0_planted_fill(decision_engine: DecisionEngineConfig, base: Config) -> Config {\n    Config { decision_engine, ..base }\n}\n";
     probe_causal_policy_attributed_field: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_attr(section: CausalTreeConfig, base: Config) -> Config {\n    Config {\n        #[cfg(unix)]\n        causal_tree: section,\n        ..base\n    }\n}\n";
+        "pub fn d0_planted_attr(section: DecisionEngineConfig, base: Config) -> Config {\n    Config {\n        #[cfg(unix)]\n        decision_engine: section,\n        ..base\n    }\n}\n";
     probe_causal_policy_config_field: causal_policy_is_written_only_by_the_mutation_service,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_config(section: CausalTreeConfig) -> Config {\n    Config { causal_tree: section, ..Config::default() }\n}\n";
+        "pub fn d0_planted_config(section: DecisionEngineConfig) -> Config {\n    Config { decision_engine: section, ..Config::default() }\n}\n";
 }
 
 // Destructive source substitutions cannot use the appended-item probe form.
@@ -846,7 +846,7 @@ fn out_of_line_test_ancestry_preserves_production_violation_probes() {
     for (scanner, violation) in [
         (
             causal_policy_is_written_only_by_the_mutation_service as fn(),
-            "fn forbidden() { config.causal_tree.enabled = true; }",
+            "fn forbidden() { config.decision_engine.enabled = true; }",
         ),
         (
             direct_tool_invocations_outside_the_execution_service_are_allowlisted as fn(),

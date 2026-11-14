@@ -1,8 +1,21 @@
-//! Default-off advisory engine configuration and raw-key migration.
-pub use crate::config::schema::causal_tree::DecisionBackendConfig;
-use crate::config::schema::causal_tree::DecisionBackendConfig as BackendConfig;
+//! The `[decision_engine]` configuration: the default-off advisory engine,
+//! its backend and the turn limits it reads.
+mod backend;
+mod backend_kind;
+
+pub(crate) use backend::DEFAULT_BACKEND;
+pub use backend::{
+    BackendConfigError, BackendSelection, CircuitBreakerConfig, CredentialRefSetting, DecisionBackendConfig,
+};
+pub use backend_kind::{
+    BackendKind, BackendLocality, ConfiguredSelection, configured_kind, configured_selection, locality_of,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_LATENCY_BUDGET_MS: u64 = 500;
+const DEFAULT_TOKEN_RATIO_LIMIT: f32 = 0.35;
+const DEFAULT_MAX_CANDIDATES: u8 = 12;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -13,7 +26,7 @@ pub enum DecisionMode {
     Both,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct DecisionEngineConfig {
     pub enabled: bool,
@@ -23,6 +36,14 @@ pub struct DecisionEngineConfig {
     pub timeout_ms: u32,
     pub telemetry_cap: u32,
     pub observe_queue: u32,
+    /// The extra latency one turn may spend deciding (50 to 5000 ms); also the
+    /// backend transport timeout ceiling while the engine is disabled.
+    pub latency_budget_ms: u64,
+    /// Maximum ratio of extra tokens to the turn's baseline tokens (a finite
+    /// number greater than 0).
+    pub token_ratio_limit: f32,
+    /// The most candidates a turn considers (1 to 32).
+    pub max_candidates: u8,
     #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_backend")]
     pub backend: Option<DecisionBackendConfig>,
 }
@@ -36,6 +57,9 @@ impl Default for DecisionEngineConfig {
             timeout_ms: 1_500,
             telemetry_cap: 1_000,
             observe_queue: 64,
+            latency_budget_ms: DEFAULT_LATENCY_BUDGET_MS,
+            token_ratio_limit: DEFAULT_TOKEN_RATIO_LIMIT,
+            max_candidates: DEFAULT_MAX_CANDIDATES,
             backend: None,
         }
     }
@@ -57,8 +81,10 @@ fn serialize_backend<S: serde::Serializer>(
 pub enum DecisionEngineConfigError {
     #[error("decision_engine.{key} must be between {min} and {max}")]
     OutOfRange { key: &'static str, min: u32, max: u32 },
+    #[error("decision_engine.{key} must be {rule}")]
+    Invalid { key: &'static str, rule: &'static str },
     #[error("invalid decision_engine.backend: {0}")]
-    Backend(#[source] crate::config::schema::causal_tree::CausalConfigError),
+    Backend(#[source] BackendConfigError),
 }
 
 fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(), DecisionEngineConfigError> {
@@ -71,14 +97,6 @@ fn ensure_range(key: &'static str, value: u32, min: u32, max: u32) -> Result<(),
 
 impl DecisionEngineConfig {
     pub fn validate(&self) -> Result<(), DecisionEngineConfigError> {
-        self.validate_with_latency_budget(
-            crate::config::schema::causal_tree::CausalTreeConfig::default()
-                .policy
-                .extra_latency_budget_ms,
-        )
-    }
-
-    pub(crate) fn validate_with_latency_budget(&self, latency_budget_ms: u64) -> Result<(), DecisionEngineConfigError> {
         for (key, value, min, max) in [
             ("prompt_budget_tokens", self.prompt_budget_tokens, 50, 2_000),
             ("candidates", self.candidates, 1, 20),
@@ -87,6 +105,24 @@ impl DecisionEngineConfig {
             ("observe_queue", self.observe_queue, 1, 1_024),
         ] {
             ensure_range(key, value, min, max)?;
+        }
+        if !(50..=5_000).contains(&self.latency_budget_ms) {
+            return Err(DecisionEngineConfigError::Invalid {
+                key: "latency_budget_ms",
+                rule: "between 50 and 5000",
+            });
+        }
+        if !(self.token_ratio_limit.is_finite() && self.token_ratio_limit > 0.0) {
+            return Err(DecisionEngineConfigError::Invalid {
+                key: "token_ratio_limit",
+                rule: "a finite number greater than 0 (a zero ratio refuses every Agent turn)",
+            });
+        }
+        if !(1..=32).contains(&self.max_candidates) {
+            return Err(DecisionEngineConfigError::Invalid {
+                key: "max_candidates",
+                rule: "between 1 and 32",
+            });
         }
         if let Some(backend) = &self.backend {
             for (key, value, min, max) in [
@@ -97,7 +133,7 @@ impl DecisionEngineConfig {
                     if self.enabled {
                         self.timeout_ms
                     } else {
-                        u32::try_from(latency_budget_ms).unwrap_or(u32::MAX)
+                        u32::try_from(self.latency_budget_ms).unwrap_or(u32::MAX)
                     },
                 ),
                 ("backend.max_request_bytes", backend.max_request_bytes, 4_096, 1_048_576),
@@ -128,8 +164,6 @@ impl DecisionEngineConfig {
     }
     /// Hosted backends remain excluded until remote processing is enabled.
     pub fn backend_available(&self) -> bool {
-        use crate::config::schema::causal_tree::BackendKind;
-        use crate::config::schema::causal_tree::BackendSelection;
         self.backend.as_ref().is_none_or(|b| {
             b.remote_enabled
                 || !matches!(
@@ -140,73 +174,9 @@ impl DecisionEngineConfig {
     }
 }
 
-/// Resolve the same inherited backend for disk migration and process seals.
-pub(crate) fn effective_backend<'a>(
-    explicit: Option<&'a DecisionBackendConfig>,
-    legacy: &'a DecisionBackendConfig,
-) -> &'a BackendConfig {
-    inherited_backend(explicit, Some(legacy)).unwrap_or(legacy)
-}
-
 /// The one backend every engine use reads (R55): `[decision_engine.backend]`
-/// when present (an explicitly empty table is "all defaults", not "absent"),
-/// otherwise the copied legacy `[causal_tree.backend]`. Neither
-/// `[causal_tree].enabled` nor `[causal_tree.backend]` selects, enables or
-/// limits the engine except through this copy rule.
-pub fn effective_engine_backend(config: &crate::config::Config) -> &BackendConfig {
-    effective_backend(config.decision_engine.backend.as_ref(), &config.causal_tree.backend)
-}
-
-fn inherited_backend<T>(explicit: Option<T>, legacy: Option<T>) -> Option<T> {
-    explicit.or(legacy)
-}
-
-pub(crate) fn migrate_backend(root: &mut toml::Value) -> anyhow::Result<()> {
-    let legacy = root.get("causal_tree").and_then(|v| v.get("backend")).cloned();
-    let explicit = root.get("decision_engine").and_then(|v| v.get("backend")).cloned();
-    let enabled = root
-        .get("decision_engine")
-        .and_then(|v| v.get("enabled"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    let warning = match (&legacy, &explicit) {
-        (Some(old), Some(new)) if old != new => {
-            Some("W2: decision_engine.backend overrides differing causal_tree.backend")
-        }
-        (Some(_), None) if enabled => Some("W1: copied legacy causal_tree.backend into decision_engine.backend"),
-        (Some(old), _)
-            if !enabled && old.clone().try_into::<DecisionBackendConfig>()? != DecisionBackendConfig::default() =>
-        {
-            Some("W3: legacy non-default backend retained while decision_engine is disabled")
-        }
-        _ => None,
-    };
-    // Materialize full defaults before empty-table pruning. An empty explicit
-    // table is still an override, and must never inherit a legacy backend.
-    if let Some(raw) = inherited_backend(explicit, legacy) {
-        let full = if empty_tables_only(&raw) {
-            toml::Value::try_from(DecisionBackendConfig::default())?
-        } else {
-            raw
-        };
-        if let Some(table) = root.as_table_mut() {
-            let engine = table
-                .entry("decision_engine")
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            if let Some(engine) = engine.as_table_mut() {
-                engine.insert("backend".into(), full);
-            }
-        }
-    }
-    if let Some(warning) = warning {
-        tracing::warn!(warning, "decision engine backend migration");
-    }
-    Ok(())
-}
-
-// Pruning nested empty tables must not erase a raw backend override either.
-fn empty_tables_only(value: &toml::Value) -> bool {
-    value
-        .as_table()
-        .is_some_and(|table| table.values().all(empty_tables_only))
+/// when present (an explicitly empty table is "all defaults"), otherwise the
+/// backend's own serde default.
+pub fn effective_engine_backend(config: &crate::config::Config) -> &DecisionBackendConfig {
+    config.decision_engine.backend.as_ref().unwrap_or(&DEFAULT_BACKEND)
 }

@@ -2134,7 +2134,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::Full;
         config.agents = tool.agents.as_ref().clone();
         tool.security = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
@@ -2235,7 +2234,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::ReadOnly;
         config.agents = single_agent("researcher", "mock", "test-model");
         let readonly = Arc::new(SecurityPolicy::from_config(&config.autonomy, workspace.path()));
@@ -2308,7 +2306,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = tmp.path().to_owned();
         config.config_path = tmp.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::Full;
         config.agents = agents.clone();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, tmp.path()));
@@ -3211,7 +3208,6 @@ pub(crate) mod tests {
         config.api_url = Some(endpoint.clone());
         config.default_provider = Some("ollama".to_owned());
         config.default_model = Some("prx-local-model".to_owned());
-        config.causal_tree.enabled = false;
         config.reliability.provider_retries = 0;
         config.autonomy.level = AutonomyLevel::Full;
         let mut agent = agentic_config(allowed_tools);
@@ -3911,7 +3907,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::Full;
         config.agents = single_agent("tester", "mock", "config-model");
         let tool = DelegateTool::new(
@@ -3948,7 +3943,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::Full;
         config.agents = single_agent("tester", "mock", "m");
         let tool = DelegateTool::new(
@@ -3977,7 +3971,6 @@ pub(crate) mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.autonomy.level = AutonomyLevel::Full;
         config.agents = single_agent("tester", "mock", "config-model");
         let tool = DelegateTool::new(

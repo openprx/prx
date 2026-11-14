@@ -97,7 +97,6 @@ pub(super) fn ordinary_process_publication(
         events: build.events,
         state_key: Arc::clone(&parent.key),
         policy_version,
-        durable_key: false,
         recordable: false,
         registry: build.registry,
         execution: build.execution,

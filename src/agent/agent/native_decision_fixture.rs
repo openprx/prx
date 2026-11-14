@@ -9,9 +9,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 const DECISION_MODEL: &str = "prx-native-decision";
-/// Leave the production turn budget unchanged while giving this local HTTP
-/// fixture enough of that budget to run under full-suite CPU contention.
-pub(crate) const REHEARSAL_TIMEOUT_MS: u32 = 450;
 /// A controlled preemption or deadline advance after the real child request.
 #[derive(Clone)]
 pub(crate) enum ChildResponseControl {
@@ -223,14 +220,25 @@ impl Driver {
 
 pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> Result<()> {
     config.decision_engine.enabled = true;
-    config.causal_tree.enabled = true;
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
-    );
-    config.causal_tree.backend.endpoint = endpoint.to_owned();
-    config.causal_tree.backend.model = DECISION_MODEL.to_owned();
-    config.causal_tree.backend.remote_enabled = false;
-    config.causal_tree.rehearsal.timeout_ms = REHEARSAL_TIMEOUT_MS;
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        crate::config::schema::decision_engine::BackendSelection::Fixed(
+            crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
+        );
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .endpoint = endpoint.to_owned();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .model = DECISION_MODEL.to_owned();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .remote_enabled = false;
     let provider = format!("custom:{endpoint}");
     config.providers.models.push(serde_json::from_value(json!({
         "provider":provider,"model":DECISION_MODEL,"operations":["decision_endpoint"]
@@ -244,7 +252,7 @@ pub(crate) fn configure(config: &mut crate::config::Config, endpoint: &str) -> R
             cache_read: 0.1,
         },
     );
-    assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+    assert_eq!(config.decision_engine.latency_budget_ms, 500);
     Ok(())
 }
 pub(crate) fn decision_answers(

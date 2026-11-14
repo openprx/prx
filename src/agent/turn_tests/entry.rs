@@ -344,10 +344,6 @@ async fn cli_single_shot_plain_message_reaches_provider_with_default_causal_conf
     let tmp = TempDir::new().expect("test: tempdir");
     let probe = CredentialProbe::start().await;
     let config = cli_agent_probe_config(tmp.path(), &probe);
-    assert_eq!(
-        config.causal_tree,
-        crate::config::schema::causal_tree::CausalTreeConfig::default()
-    );
 
     let reply = run_with_runtime_envelope(
         config,
@@ -563,8 +559,7 @@ async fn scheduled_retry_of_accepted_input_key_is_refused_with_plane_off() {
 
     let tmp = TempDir::new().expect("test: tempdir");
     let probe = CredentialProbe::start().await;
-    let mut config = cli_agent_probe_config(tmp.path(), &probe);
-    config.causal_tree.enabled = false;
+    let config = cli_agent_probe_config(tmp.path(), &probe);
     assert!(config.memory.event_recording_config().enabled);
     let (job, envelope, scope) = stored_creator_job_fixture(&config, "prx scheduled retry").await;
     let run = |envelope: RuntimeEnvelope, scope: crate::tools::execution::ScheduledToolScope| {
@@ -606,8 +601,7 @@ struct ScheduledIssuer {
 
 impl ScheduledIssuer {
     async fn new(root: &std::path::Path, probe: &crate::providers::credential_probe::CredentialProbe) -> Self {
-        let mut config = cli_agent_probe_config(root, probe);
-        config.causal_tree.enabled = false;
+        let config = cli_agent_probe_config(root, probe);
         assert!(config.memory.event_recording_config().enabled);
         std::fs::create_dir_all(&config.workspace_dir).expect("test: workspace");
         let (job, envelope, scope) = stored_creator_job_fixture(&config, SCHEDULED_PROMPT).await;
@@ -632,9 +626,7 @@ impl ScheduledIssuer {
         let workspace = &self.config.workspace_dir;
         let base: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace).expect("test: sqlite"));
         let view = base.with_erasure_origin(fixture::erasure_origin()).expect("test: view");
-        let mut on = self.config.clone();
-        on.causal_tree.enabled = true;
-        let on = Arc::new(on);
+        let on = Arc::new(self.config.clone());
         let owner = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
         let ticket = owner.register(CancellationToken::new()).expect("test: cleanup owner");
         let fabric = crate::memory::MemoryFabric::new(view, workspace.to_string_lossy())

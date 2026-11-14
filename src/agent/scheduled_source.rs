@@ -255,10 +255,6 @@ impl ScheduledAdmission {
             );
             Some(event.event_id.clone())
         } else {
-            anyhow::ensure!(
-                !generation.effective.causal_tree.enabled,
-                "enabled scheduled decision requires durable inbound input"
-            );
             None
         };
         Ok(event_id)

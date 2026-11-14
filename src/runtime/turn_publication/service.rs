@@ -53,7 +53,6 @@ pub(crate) struct TurnRuntimeService {
     pub(in crate::runtime) events: Arc<dyn CausalEventSink>,
     pub(in crate::runtime) state_key: Arc<DecisionKey>,
     pub(in crate::runtime) policy_version: Arc<str>,
-    pub(in crate::runtime) durable_key: bool,
     pub(in crate::runtime) recordable: bool,
     pub(in crate::runtime) registry: Arc<Vec<Box<dyn Tool>>>,
     pub(in crate::runtime) execution: Arc<ToolExecutionService>,
@@ -232,7 +231,7 @@ pub(in crate::runtime) fn pinned_policy_version(
     let encoded = serde_json::to_vec(&(
         "cdp-policy-semantics-v1",
         crate::decision_engine::cost_model::LATENCY_DEFAULT_VERSION,
-        &config.causal_tree,
+        &config.decision_engine,
         (
             &security.autonomy,
             &security.workspace_dir,
@@ -375,7 +374,6 @@ impl TurnRuntimeService {
             self.factory.status(),
             crate::runtime::ingress_recovery::status::JournalAttachment {
                 catalog_generation: *self.catalog.generation(),
-                durable_key: self.durable_key,
                 recordable: self.recordable,
             },
         )

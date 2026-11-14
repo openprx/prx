@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::decision_engine::BackendKind;
 use crate::cost::decision_attempt::BackendIdentity;
 use crate::cost::decision_attempt::error::DecisionError;
 use crate::decision_engine::prediction::protocol::{DecisionRequest, DecisionResponse};

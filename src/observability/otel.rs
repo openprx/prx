@@ -411,7 +411,7 @@ fn causal_metric_attributes(event: &crate::observability::causal_event::CausalEv
             "backend",
             fields
                 .backend
-                .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str),
+                .map_or("none", crate::config::schema::decision_engine::BackendKind::as_str),
         ),
         KeyValue::new("class", fields.error_class.unwrap_or("none")),
     ]
@@ -429,7 +429,7 @@ fn causal_span_attributes(event: &crate::observability::causal_event::CausalEven
             "causal.backend",
             fields
                 .backend
-                .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str),
+                .map_or("none", crate::config::schema::decision_engine::BackendKind::as_str),
         ),
         KeyValue::new("causal.class", fields.error_class.unwrap_or("none")),
     ];
@@ -493,7 +493,7 @@ mod tests {
                 ..CausalLineage::default()
             },
             fields: CausalEventFields {
-                backend: Some(crate::config::schema::causal_tree::BackendKind::CompatibleHttp),
+                backend: Some(crate::config::schema::decision_engine::BackendKind::CompatibleHttp),
                 configured_model: Some("HOSTILE-UNLISTED-MODEL-77".into()),
                 error_class: Some("transport"),
                 ..CausalEventFields::default()

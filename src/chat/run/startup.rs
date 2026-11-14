@@ -137,7 +137,7 @@ pub(super) fn session_tools(
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
     .with_approval_resolver_factory(approval_resolver_factory)
-    .with_process_recovery(controlled.is_none() && config.causal_tree.enabled)?;
+    .with_process_recovery(controlled.is_none())?;
     crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
     crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(
         Arc::clone(mem),

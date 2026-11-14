@@ -1530,36 +1530,23 @@ mod tests {
         server.abort();
     }
 
-    /// D-074 P1-1: `POST /api/config` rebuilds the configuration from JSON;
-    /// the canonical causal settings survive the round trip, and
-    /// the stored file keeps `schema_version`.
+    /// `POST /api/config` rebuilds the configuration from JSON; the decision
+    /// engine settings survive the round trip.
     #[tokio::test]
-    async fn post_config_keeps_the_causal_settings_and_the_version() {
+    async fn post_config_keeps_the_decision_engine_settings() {
         let (_dir, state, base, server) = on_disk(|config| {
-            config.causal_tree.policy.max_candidates = 5;
-            config.causal_tree.scoring.weights.w_cost = Some(0.4);
+            config.decision_engine.max_candidates = 5;
+            config.decision_engine.latency_budget_ms = 3_000;
         })
         .await;
         let (status, body) = post_config(&base, serde_json::json!({"default_temperature": 0.5})).await;
         assert_eq!(status, 200, "{body}");
-        let causal = state.config.desired().config.causal_tree.clone();
-        assert_eq!(causal.scoring.weights.w_cost, Some(0.4));
+        let engine = state.config.desired().config.decision_engine.clone();
+        assert_eq!(engine.max_candidates, 5);
+        assert_eq!(engine.latency_budget_ms, 3_000);
         let config = state.config.desired().config.clone();
         let reloaded = Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: reload");
-        assert_eq!(reloaded.causal_tree, causal);
-        let mut stored = disk(&state);
-        if let Ok(entries) = std::fs::read_dir(config.config_path.with_file_name("config.d")) {
-            for entry in entries.flatten() {
-                stored.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
-            }
-        }
-        assert!(
-            stored.contains(&format!(
-                "schema_version = {}",
-                crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION
-            )),
-            "{stored}"
-        );
+        assert_eq!(reloaded.decision_engine, engine);
         server.abort();
     }
 
@@ -3354,7 +3341,7 @@ mod tests {
         // The model is declared for decision_endpoint, so the decision
         // backend check (CDP-12) passes and the confirmation is what is left.
         let body = serde_json::json!({
-            "causal_tree": {"backend": {
+            "decision_engine": {"backend": {
                 "kind": "compatible_http",
                 "endpoint": "https://decisions.example.com/v1",
                 "model": "decider-1",
@@ -3369,13 +3356,16 @@ mod tests {
         let (status, reply) = post_config(&base, body.clone()).await;
         assert_eq!(status, 428, "unexpected response: {reply}");
         assert!(reply.contains("remote_decision_enabled"), "{reply}");
-        assert!(reply.contains("causal_tree.backend.remote_enabled"), "{reply}");
+        assert!(reply.contains("decision_engine.backend.remote_enabled"), "{reply}");
         assert!(reply.contains("endpoint_changed"), "{reply}");
         assert_eq!(disk(&state), before_disk, "nothing may be written");
 
         let (status, reply) = post_config_confirmed(&base, body).await;
         assert_eq!(status, 200, "unexpected response: {reply}");
-        assert!(state.config.desired().config.causal_tree.backend.remote_enabled);
+        assert!(
+            crate::config::schema::decision_engine::effective_engine_backend(&state.config.desired().config)
+                .remote_enabled
+        );
         server.abort();
     }
 
@@ -3386,7 +3376,7 @@ mod tests {
     async fn local_to_remote_through_a_raw_file_needs_remote_enabled_and_confirmation() {
         let (_dir, state, base, server) = on_disk(|_| {}).await;
         let before_disk = disk(&state);
-        let remote = "\n[causal_tree.backend]\nkind = \"compatible_http\"\nendpoint = \"https://decisions.example.com/v1\"\n\
+        let remote = "\n[decision_engine.backend]\nkind = \"compatible_http\"\nendpoint = \"https://decisions.example.com/v1\"\n\
                       model = \"decider-1\"\n";
         // The model is declared for decision_endpoint (the CDP-12 check).
         let declared = "\n[[providers.models]]\nprovider = \"custom:https://decisions.example.com/v1\"\n\

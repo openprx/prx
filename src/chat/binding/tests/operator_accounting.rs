@@ -83,9 +83,8 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = true;
         // Auto without a configured backend stays Direct.
-        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert_eq!(config.decision_engine.latency_budget_ms, 500);
         let priced_provider = format!("custom:{endpoint}");
         config.providers.models.push(serde_json::from_value(json!({
             "provider":priced_provider, "model":"prx-operator-decision", "operations":["decision_endpoint"]

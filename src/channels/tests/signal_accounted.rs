@@ -144,25 +144,22 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
     // is caught until the listener and real cleanup owner have been awaited.
     let outcome = std::panic::AssertUnwindSafe(async {
         let mut config = Config::default();
-        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500,
+        assert_eq!(config.decision_engine.latency_budget_ms, 500,
             "test: production source decision and auxiliary budget stays 500 ms");
         // Real sockets and SQLite cannot use paused Tokio time. Give this
         // accounting fixture the largest valid configured latency budget.
-        config.causal_tree.policy.extra_latency_budget_ms = 5_000;
+        config.decision_engine.latency_budget_ms = 5_000;
         // Keep decision transport and rehearsal stage caps from reintroducing
         // a shorter deadline elsewhere in this real-I/O fixture.
-        config.causal_tree.backend.timeout_ms = 5_000;
-        config.causal_tree.rehearsal.timeout_ms = 5_000;
+        config.decision_engine.backend.get_or_insert_with(Default::default).timeout_ms = 5_000;
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
         // These accounting fixtures require an actual selected private read;
         // the text-only case omits vision, not the explicit local prediction.
-        config.causal_tree.enabled = true;
-        config.decision_engine.enabled = true;        config.causal_tree.backend.kind =
-            crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
+        config.decision_engine.enabled = true;        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(crate::config::schema::decision_engine::BackendKind::Builtin);
         // Narrow the allowed hops: one genuine memory read, then the existing
         // fresh-evidence terminal gate. Scoring thresholds remain unchanged.
-        config.causal_tree.policy.max_decision_hops = 1;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         config.default_provider = Some(PROVIDER.to_owned());
         config.api_url = Some(endpoint.clone());

@@ -138,14 +138,6 @@
         }
       }
     },
-    "causal_tree": {
-      "description": "Decision-plane configuration (`[causal_tree]`).\nDefault: enabled locally; remote processing remains explicit opt-in.\nA versioned `enabled = false` preserves an explicit disable.",
-      "$ref": "#/$defs/CausalTreeConfig",
-      "default": {
-        "enabled": true,
-        "schema_version": 2
-      }
-    },
     "channels_config": {
       "description": "Channel configurations: Telegram, Discord, Slack, etc. (`[channels_config]`).",
       "$ref": "#/$defs/ChannelsConfig",
@@ -263,7 +255,10 @@
         "observe_queue": 64,
         "prompt_budget_tokens": 300,
         "telemetry_cap": 1000,
-        "timeout_ms": 1500
+        "timeout_ms": 1500,
+        "latency_budget_ms": 500,
+        "max_candidates": 12,
+        "token_ratio_limit": 0.3499999940395355
       }
     },
     "default_model": {
@@ -1350,167 +1345,6 @@
         }
       }
     },
-    "CalibrationProfile": {
-      "description": "A calibration applied from an evaluation report: the backend kind, the\nendpoint and the exact pinned model it was applied to\n(`[causal_tree.policy.calibration_profile]`). The endpoint is part of it\n(D-094 C-7): two servers that serve one model name do not share a\ncalibration.",
-      "type": "object",
-      "properties": {
-        "endpoint": {
-          "description": "The endpoint; empty for a backend without one.",
-          "type": "string",
-          "default": ""
-        },
-        "kind": {
-          "description": "The backend kind.",
-          "type": "string"
-        },
-        "model": {
-          "description": "The exact pinned model.",
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "kind",
-        "model"
-      ]
-    },
-    "CausalPolicy": {
-      "description": "Decision policy (`[causal_tree.policy]`).",
-      "type": "object",
-      "properties": {
-        "calibration_profile": {
-          "description": "The calibration in force, if an operator applied one.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CalibrationProfile"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "commit_threshold": {
-          "description": "Minimum score to commit a candidate.",
-          "type": "number",
-          "format": "float",
-          "default": 0.6200000047683716
-        },
-        "extra_latency_budget_ms": {
-          "description": "The extra latency one turn may spend deciding (50 to 5000 ms).",
-          "type": "integer",
-          "format": "uint64",
-          "default": 500,
-          "minimum": 0
-        },
-        "extra_token_ratio_limit": {
-          "description": "Maximum ratio of extra tokens to the turn's baseline tokens.",
-          "type": "number",
-          "format": "float",
-          "default": 0.3499999940395355
-        },
-        "max_candidates": {
-          "description": "The most candidates a decision considers (1 to 32).",
-          "type": "integer",
-          "format": "uint8",
-          "default": 12,
-          "maximum": 255,
-          "minimum": 0
-        },
-        "max_decision_hops": {
-          "description": "The most decision hops in one turn (1 to 4).",
-          "type": "integer",
-          "format": "uint8",
-          "default": 2,
-          "maximum": 255,
-          "minimum": 0
-        },
-        "minimum_choice_confidence": {
-          "description": "Minimum confidence of a Choice answer.",
-          "type": "number",
-          "format": "double",
-          "default": 0.55
-        },
-        "minimum_top_margin": {
-          "description": "Minimum margin between the best two options (0 to 0.5).",
-          "type": "number",
-          "format": "double",
-          "default": 0.1
-        }
-      }
-    },
-    "CausalTreeConfig": {
-      "description": "The `[causal_tree]` section.\n\nFile and JSON reloads share the same canonical keys and defaults.",
-      "type": "object",
-      "properties": {
-        "backend": {
-          "$ref": "#/$defs/DecisionBackendConfig",
-          "default": {
-            "circuit_breaker": {
-              "cooldown_secs": 60,
-              "failure_threshold": 5
-            },
-            "credential_ref": "",
-            "endpoint": "",
-            "kind": "auto",
-            "max_request_bytes": 65536,
-            "max_response_bytes": 262144,
-            "model": "",
-            "remote_enabled": false,
-            "timeout_ms": 250
-          }
-        },
-        "enabled": {
-          "description": "Whether the decision plane runs. Default `true`; explicit false is preserved.",
-          "type": "boolean",
-          "default": true
-        },
-        "evaluation": {
-          "$ref": "#/$defs/EvaluationConfig",
-          "default": {
-            "exploration": "off",
-            "exploration_rate": 0.0
-          }
-        },
-        "policy": {
-          "$ref": "#/$defs/CausalPolicy",
-          "default": {
-            "commit_threshold": 0.6200000047683716,
-            "extra_token_ratio_limit": 0.3499999940395355,
-            "max_candidates": 12,
-            "max_decision_hops": 2,
-            "minimum_choice_confidence": 0.55,
-            "minimum_top_margin": 0.1
-          }
-        },
-        "rehearsal": {
-          "$ref": "#/$defs/RehearsalConfig",
-          "default": {
-            "side_effect_mode": "read_only",
-            "timeout_ms": 100
-          }
-        },
-        "schema_version": {
-          "description": "The schema of this section; 1 is the CDP-PLAN 1.7 schema. Always\nwritten; a file without it predates that schema.",
-          "type": "integer",
-          "format": "uint32",
-          "default": 2,
-          "minimum": 0
-        },
-        "scoring": {
-          "$ref": "#/$defs/ScoringConfig",
-          "default": {
-            "weights": {}
-          }
-        },
-        "store": {
-          "$ref": "#/$defs/DecisionStoreConfig",
-          "default": {
-            "record_redacted_projection": false,
-            "retention_days": 0
-          }
-        }
-      }
-    },
     "ChannelsConfig": {
       "description": "Top-level channel configurations (`[channels_config]` section).\n\nEach channel sub-section (e.g. `telegram`, `discord`) is optional;\nsetting it to `Some(...)` enables that channel.",
       "type": "object",
@@ -1988,7 +1822,7 @@
       ]
     },
     "DecisionBackendConfig": {
-      "description": "The decision backend (`[decision_engine.backend]`; legacy alias `[causal_tree.backend]`).",
+      "description": "The decision backend (`[decision_engine.backend]`).",
       "type": "object",
       "properties": {
         "circuit_breaker": {
@@ -2101,6 +1935,27 @@
           "format": "uint32",
           "default": 1500,
           "minimum": 0
+        },
+        "latency_budget_ms": {
+          "description": "The extra latency one turn may spend deciding (50 to 5000 ms); also the\nbackend transport timeout ceiling while the engine is disabled.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 500,
+          "minimum": 0
+        },
+        "token_ratio_limit": {
+          "description": "Maximum ratio of extra tokens to the turn's baseline tokens (a finite\nnumber greater than 0).",
+          "type": "number",
+          "format": "float",
+          "default": 0.3499999940395355
+        },
+        "max_candidates": {
+          "description": "The most candidates a turn considers (1 to 32).",
+          "type": "integer",
+          "format": "uint8",
+          "default": 12,
+          "maximum": 255,
+          "minimum": 0
         }
       }
     },
@@ -2111,24 +1966,6 @@
         "post",
         "both"
       ]
-    },
-    "DecisionStoreConfig": {
-      "description": "The decision store (`[causal_tree.store]`).",
-      "type": "object",
-      "properties": {
-        "record_redacted_projection": {
-          "description": "Whether records keep the redacted state projection.",
-          "type": "boolean",
-          "default": false
-        },
-        "retention_days": {
-          "description": "Days to keep records (0 follows the fitness retention; at most 3650).",
-          "type": "integer",
-          "format": "uint32",
-          "default": 0,
-          "minimum": 0
-        }
-      }
     },
     "DeclarationOfConformityConfig": {
       "type": "object",
@@ -2761,39 +2598,6 @@
         "unclassified",
         "high_risk",
         "not_high_risk"
-      ]
-    },
-    "EvaluationConfig": {
-      "description": "Evaluation (`[causal_tree.evaluation]`).",
-      "type": "object",
-      "properties": {
-        "exploration": {
-          "description": "`off` or `read_only`.",
-          "$ref": "#/$defs/ExplorationMode",
-          "default": "off"
-        },
-        "exploration_rate": {
-          "description": "The exploration rate (0 to 0.10, non-zero only with `read_only`).",
-          "type": "number",
-          "format": "double",
-          "default": 0.0
-        }
-      }
-    },
-    "ExplorationMode": {
-      "description": "Whether exploration runs.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "off"
-          ]
-        },
-        {
-          "description": "Exploration only among read-only candidates.",
-          "type": "string",
-          "const": "read_only"
-        }
       ]
     },
     "FitnessConfig": {
@@ -4849,31 +4653,6 @@
       },
       "additionalProperties": false
     },
-    "ReadOnlyRehearsal": {
-      "description": "Rehearsal is read-only (CDP 9.3): the only accepted mode.",
-      "type": "string",
-      "enum": [
-        "read_only"
-      ]
-    },
-    "RehearsalConfig": {
-      "description": "Rehearsal (`[causal_tree.rehearsal]`).",
-      "type": "object",
-      "properties": {
-        "side_effect_mode": {
-          "description": "Always `read_only`.",
-          "$ref": "#/$defs/ReadOnlyRehearsal",
-          "default": "read_only"
-        },
-        "timeout_ms": {
-          "description": "One rehearsal's timeout (at most the extra latency budget).",
-          "type": "integer",
-          "format": "uint32",
-          "default": 100,
-          "minimum": 0
-        }
-      }
-    },
     "ReliabilityCircuitBreakerConfig": {
       "description": "Process-local provider circuit policy (`[reliability.circuit_breaker]`).",
       "type": "object",
@@ -5454,24 +5233,6 @@
             "string",
             "null"
           ]
-        }
-      }
-    },
-    "ScoringConfig": {
-      "description": "Scoring (`[causal_tree.scoring]`).",
-      "type": "object",
-      "properties": {
-        "version": {
-          "description": "The scorer version the weights were chosen for. When set, a scorer of\nanother version refuses the configuration rather than apply weights\nchosen for different scoring.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "weights": {
-          "description": "Weight overrides.",
-          "$ref": "#/$defs/WeightOverrides",
-          "default": {}
         }
       }
     },
@@ -6619,75 +6380,6 @@
       "required": [
         "port"
       ]
-    },
-    "WeightOverrides": {
-      "description": "Scorer weight overrides; each unset weight takes the scorer's default\n(D-040 OQ-A7: the scorer owns the defaults and the budget).",
-      "type": "object",
-      "properties": {
-        "w_applicable": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_choice": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_cost": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_gain": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_latency": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_rehearsal": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_risk": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_success": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "w_uncertainty": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        }
-      }
     },
     "WhatsAppConfig": {
       "description": "WhatsApp channel configuration (Cloud API or Web mode).\n\nSet `phone_number_id` for Cloud API mode, or `session_path` for Web mode.",

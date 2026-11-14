@@ -58,17 +58,9 @@ pub(super) async fn operator_process_publication(
         .catalog
         .check_published_parity(&build.execution, snapshots.publication.allowed())?;
     let config = &snapshots.generation.effective;
-    anyhow::ensure!(
-        !config.causal_tree.enabled
-            || (crate::memory::serves_tool_execution_ledger(build.memory.name())
-                && config.memory.events.record_user_messages),
-        "operator worker decision recording is unavailable"
-    );
-    // The runtime key is the turn's state key always (OV-2). The legacy plane
-    // consumers still see it only while the plane is enabled.
+    // The runtime key is the turn's state key always (OV-2): persisted, never
+    // ephemeral, so it is also the key the backend factory receives.
     let runtime_key = super::builder::load_runtime_key(Arc::clone(&build.generation)).await?;
-    let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
-    let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
     let events = Arc::clone(&build.events);
     let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
@@ -79,6 +71,8 @@ pub(super) async fn operator_process_publication(
     )
     .await?;
     let state_key = runtime_key;
+    // OV-13: recording on and an activated recovery repository.
+    let recordable = recovery.recordable;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(TurnRuntimeBuildError::PolicyFingerprint)?;
 
@@ -86,7 +80,7 @@ pub(super) async fn operator_process_publication(
         config,
         FactoryDeps {
             catalog: &snapshots.provider_catalog,
-            key: workspace_key,
+            key: Some(Arc::clone(&state_key)),
             transports: build.transports,
             config_generation: snapshots.generation.id.0,
             events: Arc::clone(&events),
@@ -128,8 +122,7 @@ pub(super) async fn operator_process_publication(
         events,
         state_key,
         policy_version,
-        durable_key,
-        recordable: durable_key,
+        recordable,
         registry: build.registry,
         execution: build.execution,
         memory: build.memory,

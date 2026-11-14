@@ -255,7 +255,11 @@ mod tests {
     fn the_configuration_names_its_models() {
         let mut config = crate::config::Config::default();
         config.default_model = Some("default-model".to_string());
-        config.causal_tree.backend.model = "decider-2026-09".to_string();
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "decider-2026-09".to_string();
         config
             .reliability
             .model_fallbacks

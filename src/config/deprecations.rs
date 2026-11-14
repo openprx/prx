@@ -376,29 +376,6 @@ pub(crate) fn locate(config_path: &Path, key: &DeprecatedKey) -> Option<Deprecat
     None
 }
 
-/// The file among `config.toml` and its `config.d` fragments that holds the
-/// key at `path` (dotted table path, e.g. `["causal_tree", "w_confidence"]`),
-/// so an error names the file the operator has to edit. Best effort like
-/// [`locate`]: `None` when no readable file holds it.
-pub(crate) fn file_holding(config_path: &Path, path: &[&str]) -> Option<PathBuf> {
-    candidate_files(config_path).into_iter().rev().find(|file| {
-        std::fs::read_to_string(file)
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok())
-            .is_some_and(|table| {
-                let mut value: Option<&toml::Value> = None;
-                for (index, key) in path.iter().enumerate() {
-                    value = if index == 0 {
-                        table.get(*key)
-                    } else {
-                        value.and_then(|v| v.get(key))
-                    };
-                }
-                value.is_some()
-            })
-    })
-}
-
 /// Exactly the loader's files in merge order. Callers search in reverse so
 /// diagnostics name the winning declaration, rather than a shadowed base key.
 fn candidate_files(config_path: &Path) -> Vec<PathBuf> {

@@ -1371,7 +1371,6 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
         let mut root = test_config(&tmp);
         std::fs::create_dir_all(&root.workspace_dir).expect("test: create delegate workspace");
-        root.causal_tree.enabled = false;
         root.autonomy.level = crate::security::AutonomyLevel::Full;
         root.default_provider = Some("litellm".to_string());
         root.api_key = Some(ROOT_SENTINEL.to_string());

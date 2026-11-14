@@ -56,7 +56,6 @@ pub fn prepare(
         default_model: Some("prx-local-model".to_owned()),
         ..Config::default()
     };
-    config.causal_tree.enabled = false;
     config.memory.auto_save = false;
     config.autonomy.level = openprx::security::AutonomyLevel::ReadOnly;
     config.cost.prices.insert(

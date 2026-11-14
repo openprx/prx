@@ -269,7 +269,7 @@ pub(super) fn setup_decision_plane() -> Result<
                 .default(true)
                 .interact()?;
             let setup = crate::decision_engine_cli::DecisionSetup {
-                kind: crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
+                kind: crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
                 endpoint: Some(endpoint.trim().to_string()),
                 model: Some(model.trim().to_string()),
                 enable,
@@ -283,8 +283,8 @@ pub(super) fn setup_decision_plane() -> Result<
                 "`prx decision-engine config set backend.remote_enabled true`; until then the builtin decides locally.",
             );
             let kinds = [
-                crate::config::schema::causal_tree::BackendKind::TypeSafe,
-                crate::config::schema::causal_tree::BackendKind::OpenRouter,
+                crate::config::schema::decision_engine::BackendKind::TypeSafe,
+                crate::config::schema::decision_engine::BackendKind::OpenRouter,
             ];
             let kind_labels = ["TypeSafe", "OpenRouter (Decisions API)"];
             let kind = Select::new()
@@ -295,7 +295,7 @@ pub(super) fn setup_decision_plane() -> Result<
             let kind = kinds
                 .get(kind)
                 .copied()
-                .unwrap_or(crate::config::schema::causal_tree::BackendKind::TypeSafe);
+                .unwrap_or(crate::config::schema::decision_engine::BackendKind::TypeSafe);
             let model: String = Input::new().with_prompt("  Model, one exact version").interact_text()?;
             let enable = Confirm::new()
                 .with_prompt("  Turn the decision plane on now?")

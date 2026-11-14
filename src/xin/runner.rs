@@ -2030,8 +2030,8 @@ mod tests {
         let provider = probe.custom_provider();
         let mut config = test_config(&tmp);
         assert_eq!(
-            config.causal_tree,
-            crate::config::schema::causal_tree::CausalTreeConfig::default()
+            config.decision_engine,
+            crate::config::schema::decision_engine::DecisionEngineConfig::default()
         );
         config.default_provider = Some(provider.clone());
         config.default_model = Some(PROBE_MODEL.to_string());

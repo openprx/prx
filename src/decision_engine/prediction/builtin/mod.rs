@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use self::features::{Action, CandidateFeatures, StateFeatures};
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
 use crate::cost::decision_attempt::error::DecisionError;
 use crate::cost::decision_attempt::{BackendIdentity, DecisionUsage};
 use crate::decision_engine::prediction::protocol::{

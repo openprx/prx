@@ -33,10 +33,7 @@ async fn agent_budget_uses_pinned_route_and_read_only_spend_snapshot() {
     let snapshot = service.agent_budget_snapshot(&proof).expect("source-owned budget");
     assert_eq!(snapshot.budgets.tokens, 3_584);
     assert_eq!(snapshot.budgets.micro_usd, 500_000);
-    assert_eq!(
-        snapshot.budgets.latency_ms,
-        config.causal_tree.policy.extra_latency_budget_ms
-    );
+    assert_eq!(snapshot.budgets.latency_ms, config.decision_engine.latency_budget_ms);
     assert_eq!(snapshot.main_compaction.max_context_tokens, 32_768);
     assert_eq!(snapshot.main_compaction.reserve_tokens, 7_680);
     assert_eq!(config.agent.compaction.reserve_tokens, 4_096);

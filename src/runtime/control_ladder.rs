@@ -80,7 +80,7 @@ impl ControlLadderSnapshot {
         }];
 
         layers.push(router_layer(config));
-        layers.push(causal_tree_layer(config));
+        layers.push(decision_engine_layer(config));
         layers.push(xin_layer(config));
         layers.push(self_system_layer(config));
         layers.push(task_pool_layer(config));
@@ -453,7 +453,7 @@ fn published_decision_layer(status: super::ingress_recovery::status::DecisionPla
         .collect();
     ControlLayerTrace {
         level: 2,
-        name: "causal_tree".to_string(),
+        name: "decision_engine".to_string(),
         enabled: status.backend.enabled,
         status: "published".to_string(),
         reason: Some("decision_service_published".to_string()),
@@ -461,7 +461,6 @@ fn published_decision_layer(status: super::ingress_recovery::status::DecisionPla
             "attachment": "service_snapshot",
             "config_generation": status.backend.config_generation,
             "catalog_generation": status.catalog_generation.to_hex(),
-            "durable_key": status.durable_key,
             "recordable": status.recordable,
             "backend_order": order,
             "excluded_backends": excluded,
@@ -471,19 +470,19 @@ fn published_decision_layer(status: super::ingress_recovery::status::DecisionPla
     }
 }
 
-fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
-    let requested = config.causal_tree.enabled;
+fn decision_engine_layer(config: &Config) -> ControlLayerTrace {
+    let requested = config.decision_engine.enabled;
     let enabled = requested;
     // This configuration-only snapshot cannot prove a service is attached.
     // Applied directives have separate causal events; service status must be
     // read from the exact attached generation, not inferred from configuration.
     ControlLayerTrace {
         level: 2,
-        name: "causal_tree".to_string(),
+        name: "decision_engine".to_string(),
         enabled,
         status: if enabled { "config_declared" } else { "fallback" }.to_string(),
         reason: if enabled {
-            Some("causal_tree_enabled".to_string())
+            Some("decision_engine_enabled".to_string())
         } else {
             Some("config_disabled".to_string())
         },
@@ -495,7 +494,7 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
             "attachment": "config_snapshot",
             "runtime_evidence": "observer:causal.directive.applied",
             "experimental": true,
-            "max_candidates": config.causal_tree.policy.max_candidates,
+            "max_candidates": config.decision_engine.max_candidates,
             // Keep the existing JSON key: this is the configured autonomy
             // projection only, not attached execution authority or a per-turn
             // Chat mode restriction. Rehearsal remains independently read-only.
@@ -601,7 +600,6 @@ mod tests {
                 cached: 0,
             },
             catalog_generation: crate::tools::capability::contract::CatalogGeneration([7; 32]),
-            durable_key: false,
             recordable: false,
         };
         let layer = published_decision_layer(status);
@@ -622,14 +620,13 @@ mod tests {
 
     #[test]
     fn snapshot_records_independent_disabled_layers_with_fallback_reasons() {
-        let mut config = Config::default();
-        config.causal_tree.enabled = false;
+        let config = Config::default();
 
         let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", Some("run-1".to_string()));
 
         assert_eq!(layer(&trace, "runtime").status, "active");
         assert_eq!(layer(&trace, "router").status, "configured");
-        assert_eq!(layer(&trace, "causal_tree").status, "fallback");
+        assert_eq!(layer(&trace, "decision_engine").status, "fallback");
         assert_eq!(layer(&trace, "xin").reason.as_deref(), Some("xin_enabled"));
         assert_eq!(
             layer(&trace, "self_system").reason.as_deref(),
@@ -641,12 +638,12 @@ mod tests {
     /// Configuration intent is available independently of the router feature;
     /// it does not establish service publication or directive execution.
     #[test]
-    fn causal_tree_layer_declares_config_snapshot_when_enabled() {
+    fn decision_engine_layer_declares_config_snapshot_when_enabled() {
         let mut config = Config::default();
-        config.causal_tree.enabled = true;
+        config.decision_engine.enabled = true;
 
         let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
-        let cte = layer(&trace, "causal_tree");
+        let cte = layer(&trace, "decision_engine");
 
         assert_eq!(
             cte.status, "config_declared",
@@ -675,14 +672,14 @@ mod tests {
                 (crate::security::AutonomyLevel::Full, "GuardedWrite"),
             ] {
                 let mut config = Config::default();
-                config.causal_tree.enabled = enabled;
+                config.decision_engine.enabled = enabled;
                 config.autonomy.level = autonomy;
                 let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
                 // Check the actual serialized trace contract, including the
                 // existing field spelling and enum wire values.
                 let wire = serde_json::to_string(&trace).unwrap();
                 let restored: ControlLadderTrace = serde_json::from_str(&wire).unwrap();
-                let causal = layer(&restored, "causal_tree");
+                let causal = layer(&restored, "decision_engine");
                 assert_eq!(
                     causal.detail.get("default_side_effect_mode").and_then(Value::as_str),
                     Some(expected)
@@ -714,14 +711,14 @@ mod tests {
         let captured = snapshot.build_trace("test", None);
         let later = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
         assert_eq!(
-            layer(&captured, "causal_tree")
+            layer(&captured, "decision_engine")
                 .detail
                 .get("default_side_effect_mode")
                 .and_then(Value::as_str),
             Some("GuardedWrite")
         );
         assert_eq!(
-            layer(&later, "causal_tree")
+            layer(&later, "decision_engine")
                 .detail
                 .get("default_side_effect_mode")
                 .and_then(Value::as_str),

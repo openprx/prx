@@ -321,17 +321,14 @@ impl TurnRuntimeService {
 
 /// The turn's one accounting scope, created at opening (R9). The scope is
 /// bound to the source run exactly as the retired prediction hop bound it.
-/// `None` when the turn cannot be charged: an enabled plane without durable
-/// recording, an unverifiable origin, or no cleanup owner.
+/// `None` when the turn cannot be charged: an unverifiable origin or no
+/// cleanup owner.
 fn accounting_scope(
     service: &TurnRuntimeService,
     proof: &dyn TurnSourceProof,
     budgets: TurnBudgets,
     deadline: Instant,
 ) -> Option<Arc<AccountingScope>> {
-    if service.generation.effective.causal_tree.enabled && (!service.durable_key || !service.recordable) {
-        return None;
-    }
     validate_agent_turn_origin(&service.generation, service.surface, proof).ok()?;
     let cleanup = crate::runtime::turn_cleanup::current_tracker()?;
     let key = &service.state_key;

@@ -714,7 +714,6 @@ async fn config_toml_roundtrip() {
         nodes: NodesConfig::default(),
         agents: HashMap::new(),
         media: MediaConfig::default(),
-        causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
         decision_engine: Default::default(),
         security: SecurityConfig::default(),
         compliance: ComplianceConfig::default(),
@@ -840,25 +839,6 @@ reasoning_enabled = false
 
     let parsed: Config = toml::from_str(raw).unwrap();
     assert_eq!(parsed.runtime.reasoning_enabled, Some(false));
-}
-
-#[test]
-async fn hosted_latency_warning_does_not_change_the_configured_ceiling() {
-    let mut config = Config::default();
-    config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-        crate::config::schema::causal_tree::BackendKind::OpenRouter,
-    );
-    config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
-    let warning = config
-        .decision_latency_budget_warning()
-        .expect("test: below catalog recommendation");
-    assert!(warning.contains("500") && warning.contains("3000"), "{warning}");
-    assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
-    config.causal_tree.policy.extra_latency_budget_ms = 3_000;
-    assert!(config.decision_latency_budget_warning().is_none());
-    config.causal_tree.policy.extra_latency_budget_ms = 500;
-    config.causal_tree.enabled = false;
-    assert!(config.decision_latency_budget_warning().is_none());
 }
 
 #[test]

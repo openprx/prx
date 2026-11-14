@@ -902,7 +902,6 @@ mod tests {
             config.config_path = workspace.join("config.toml");
             config.default_provider = Some("custom:http://127.0.0.1:1/v1".to_owned());
             config.default_model = Some("test-model".to_owned());
-            config.causal_tree.enabled = false;
             config.providers.models.push(
                 serde_json::from_value(serde_json::json!({
                     "provider": "custom:http://127.0.0.1:1/v1",

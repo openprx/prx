@@ -1402,13 +1402,10 @@ fn check_persisted_selections(config: &Config, items: &mut Vec<DiagItem>) {
 /// The decision plane reports refused backends and orphaned references.
 fn check_decision_plane(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "decision";
-    if let Some(warning) = config.decision_latency_budget_warning() {
-        items.push(DiagItem::warn(cat, warning));
-    }
     if let Some(warning) = crate::config::manage::validate::decision_startup_check(config) {
         items.push(DiagItem::warn(cat, warning));
     }
-    if config.causal_tree.enabled
+    if config.decision_engine.enabled
         && let Some(warning) = crate::config::manage::validate::decision_orphans_warning(config)
     {
         items.push(DiagItem::warn(cat, warning));
@@ -2762,10 +2759,15 @@ mod tests {
             workspace_dir: temp.path().join("workspace"),
             ..Config::default()
         };
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::OpenRouter,
-        );
-        config.causal_tree.backend.model = "typesafe/jev-1.13".to_owned();
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::OpenRouter,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "typesafe/jev-1.13".to_owned();
         let mut items = Vec::new();
         check_decision_plane(&config, &mut items);
         assert!(items.iter().any(|item| {
@@ -2773,7 +2775,7 @@ mod tests {
                 && item.message.contains("500")
                 && item.message.contains("3000")
         }));
-        assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
+        assert_eq!(config.decision_engine.latency_budget_ms, 500);
     }
 
     /// D-094 C-1, C-5: the doctor names a refused decision backend (which
@@ -2787,12 +2789,20 @@ mod tests {
             workspace_dir: temp.path().join("workspace"),
             ..Config::default()
         };
-        config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
-        );
-        config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".to_string();
-        config.causal_tree.backend.model = "undeclared-model".to_string();
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
+            );
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "http://127.0.0.1:8900/v1".to_string();
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "undeclared-model".to_string();
         let orphan = crate::config::manage::credentials::CredentialReferences::for_config(&config)
             .unwrap()
             .set(
@@ -2813,7 +2823,6 @@ mod tests {
         assert!(text.contains("prx providers credential remove <id>"), "{text}");
         // Disabled, the credential store is not opened: a held lock does not
         // delay the doctor, and nothing is reported from the store.
-        config.causal_tree.enabled = false;
         std::fs::write(temp.path().join("auth-profiles.lock"), "pid=1\n").unwrap();
         let started = std::time::Instant::now();
         let mut items = Vec::new();

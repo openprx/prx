@@ -913,10 +913,6 @@ impl ChatSourceReceipt {
             return Self::issue(memory, generation, session_key, run_id, raw_input, recorded).await;
         }
         anyhow::ensure!(
-            !generation.effective.causal_tree.enabled,
-            "enabled chat decision source was not recorded"
-        );
-        anyhow::ensure!(
             !session_key.is_empty() && !run_id.is_empty(),
             "chat source identity is missing"
         );

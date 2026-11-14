@@ -46,7 +46,6 @@ fn admitted_config(temp: &tempfile::TempDir, agents: HashMap<String, DelegateAge
     config.config_path = temp.path().join("config.toml");
     config.default_provider = Some("ollama".to_owned());
     config.default_model = Some("prx-local-model".to_owned());
-    config.causal_tree.enabled = false;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.reliability.provider_retries = 0;
     for agent in agents.values() {
@@ -640,7 +639,6 @@ async fn sibling_lane(
     sentinel: &str,
 ) -> crate::memory::MessageEvent {
     let config = admitted_config(temp, agents.clone());
-    assert!(!config.causal_tree.enabled);
     let tool = DelegateTool::new(agents.clone(), security(temp)).with_shared_memory(Arc::clone(memory));
     let args = json!({"agent": "a", "prompt": "lane a", "context": sentinel});
     let result = super::tests::dispatch_admitted_delegate(config, tool, args).await;

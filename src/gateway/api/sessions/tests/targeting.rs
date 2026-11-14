@@ -93,7 +93,7 @@ async fn fixture(config: impl FnOnce(&mut Config)) -> Fixture {
 /// Like [`fixture`], but keeps a caller-configured decision backend and the
 /// Console private-filesystem layout `drive()` uses.
 ///
-/// `test_app_state` (`sessions.rs`, `causal_tree.enabled = false`) would drop
+/// `test_app_state` (`sessions.rs`) would drop
 /// the native-tool surface this POST needs, even after `configure(...)`.
 /// Default `config_path` is the user config dir; without a temp private root,
 /// `console_filesystem` stays `None` and owner-isolated `file_read` is gated.

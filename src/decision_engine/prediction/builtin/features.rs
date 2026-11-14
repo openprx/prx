@@ -414,7 +414,7 @@ pub fn text_signals(text: &str) -> TextSignals {
 
 /// The action kinds of the state v1 contract (the `as_str` codes of
 /// `CausalActionKind`, CDP-PLAN 1.9). The decision module does not depend on
-/// `causal_tree`, so it reads the codes itself.
+/// the action contract, so it reads the codes itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Action {
     /// `answer`

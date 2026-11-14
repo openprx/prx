@@ -165,10 +165,6 @@ fn bind_auxiliary_accounting(
     selected: ResolvedModel,
     provider: Arc<dyn crate::providers::Provider>,
 ) -> anyhow::Result<Arc<AuxiliaryAccounting>> {
-    anyhow::ensure!(
-        !service.generation.effective.causal_tree.enabled || (service.durable_key && service.recordable),
-        "enabled auxiliary accounting requires durable source recording"
-    );
     // Never pay for an auxiliary call of a turn whose main send will be
     // refused as unpriced (G6): the refusal runs before any paid call. The
     // call then reserves only what the first serving send leaves (P1-03).

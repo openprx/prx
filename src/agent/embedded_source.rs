@@ -383,10 +383,6 @@ impl EmbeddedAgentBinding {
             }
             envelope = envelope.with_source_message_event_id(event.event_id);
         } else {
-            anyhow::ensure!(
-                !self.generation.effective.causal_tree.enabled,
-                "enabled embedded Agent requires durable original input"
-            );
         }
         Ok(EmbeddedAgentSource {
             owner: envelope.resolved_owner_id(),
@@ -887,7 +883,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.to_owned();
         config.config_path = workspace.join("config.toml");
-        config.causal_tree.enabled = false;
         config.memory.auto_save = auto_save;
         config.memory.semantic.auto_promote_user_messages = promote;
         config.memory.semantic.min_chars = min_chars;
@@ -990,7 +985,6 @@ mod tests {
     fn routing_binding(workspace: &std::path::Path, mut config: crate::config::Config) -> Arc<EmbeddedAgentBinding> {
         config.workspace_dir = workspace.to_owned();
         config.config_path = workspace.join("config.toml");
-        config.causal_tree.enabled = false;
         EmbeddedAgentBinding::capture(
             crate::config::new_shared(config).pin(),
             Arc::new(LocalProvider),
@@ -1036,7 +1030,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
             settings: Default::default(),
             hint: "fast".to_owned(),
@@ -1069,7 +1062,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
             settings: Default::default(),
             hint: "private_route".to_owned(),
@@ -1105,7 +1097,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         config.model_routes.push(crate::config::ModelRouteConfig {
             settings: Default::default(),
             hint: "other".to_owned(),
@@ -1220,7 +1211,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace.path().to_owned();
         config.config_path = workspace.path().join("config.toml");
-        config.causal_tree.enabled = false;
         let generation = crate::config::new_shared(config.clone()).pin();
         let provider: Arc<dyn crate::providers::Provider> = Arc::new(LocalProvider);
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).unwrap());

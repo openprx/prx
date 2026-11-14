@@ -84,13 +84,11 @@ impl Drop for SkipInline {
 async fn prepare_scope(
     workspace: &Path,
     memory: Arc<dyn Memory>,
-    plane: bool,
     recording: bool,
     cost: CostConfig,
 ) -> (Arc<RecoveryScope>, Arc<CleanupTracker>) {
     let mut config = recovery_config(workspace);
     config.workspace_dir = workspace.to_path_buf();
-    config.causal_tree.enabled = plane;
     config.memory.events.record_user_messages = recording;
     config.cost = cost;
     let generation = crate::config::ConfigGenerationManager::new(config).pin();
@@ -556,7 +554,7 @@ pub(super) async fn recovery_terminal_commit_wrapped_backends_contract() {
             "test: replaying a committed terminal must not duplicate its charge"
         );
         let owner = commit.scope.owner_id.clone().expect("test: owner");
-        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, true, cost.clone()).await;
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, cost.clone()).await;
         recovery
             .rejoin_terminal(&terminal_id, &owner)
             .await
@@ -908,8 +906,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
                 &serde_json::to_vec(&receipt.usage_settlement).expect("test: typed usage serialization"),
             )
             .expect("test: outbox binds the typed usage bytes");
-        let (disabled, disabled_tracker) =
-            prepare_scope(&workspace, Arc::clone(&memory), false, false, cost.clone()).await;
+        let (disabled, disabled_tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, cost.clone()).await;
         drop(disabled);
         disabled_tracker
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -925,7 +922,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             0,
             "test: recording disabled must not append pending usage to the ledger"
         );
-        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), false, true, cost.clone()).await;
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, cost.clone()).await;
         drop(recovery);
         tracker
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -1070,7 +1067,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .open(&lock_path)
             .expect("test: open ledger lock");
         lock_file.lock().expect("test: hold ledger lock");
-        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, true, cost.clone()).await;
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, cost.clone()).await;
         drop(lock_file);
         drop(recovery);
         tracker
@@ -1188,7 +1185,7 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         drop(fabric);
         drop(memory);
         let reopened = backend_memory(backend, &workspace).expect("test: reopen backend");
-        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&reopened), false, true, cost).await;
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&reopened), true, cost).await;
         recovery
             .rejoin_terminal(&terminal_id, &owner)
             .await
@@ -1502,8 +1499,7 @@ pub(super) async fn fresh_process_recovery_child() {
         .with_erasure_origin(tombstone_fixture::erasure_origin())
         .expect("test: process erase scope");
     if std::env::var("PRX_RECOVERY_TEST_PHASE").as_deref() == Ok("repair") {
-        let (recovery, tracker) =
-            prepare_scope(&workspace, Arc::clone(&memory), false, true, priced_cost_config()).await;
+        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, priced_cost_config()).await;
         drop(recovery);
         tracker
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))

@@ -6,7 +6,7 @@
 //! compatible transport ([`crate::decision_engine::prediction::compatible_http::CompatibleHttpBackend`])
 //! with these differences:
 //!
-//! - the base URL defaults to [`DEFAULT_BASE`]; `causal_tree.backend.endpoint`
+//! - the base URL defaults to [`DEFAULT_BASE`]; `decision_engine.backend.endpoint`
 //!   overrides it (COORD-6), and the backend stays remote;
 //! - the request carries only `model`, `questions` and `state`: never
 //!   `provider`, `session_id`, `trace` or `user`, and no `x-session-id`

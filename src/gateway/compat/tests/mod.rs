@@ -313,7 +313,6 @@ fn production_mcp_test_config(workspace: &Path) -> crate::config::Config {
 
 fn production_spawn_test_config(workspace: &Path) -> crate::config::Config {
     let mut config = production_mcp_test_config(workspace);
-    config.causal_tree.enabled = false;
     config.tool_tiering.always_include.push("sessions_spawn".to_owned());
     config.default_model = Some("prx-gateway-owner-vis".to_owned());
     let provider_name = crate::providers::selection::default_provider(&config).to_owned();

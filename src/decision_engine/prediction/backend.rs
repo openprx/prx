@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::config::schema::causal_tree::BackendLocality;
+use crate::config::schema::decision_engine::BackendLocality;
 use crate::cost::decision_attempt::BackendIdentity;
 use crate::cost::decision_attempt::error::DecisionError;
 use crate::decision_engine::prediction::outbound::GuardedBody;

@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::{openrouter, typesafe};
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
 use crate::cost::decision_attempt::BackendIdentity;
 use crate::cost::decision_attempt::error::{DecisionError, PolicyRule, RequestRule, ValidationRule};
 use crate::cost::decision_attempt::{AttemptBinding, DecisionAttemptAccounting};

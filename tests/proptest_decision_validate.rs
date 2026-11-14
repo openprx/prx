@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use openprx::config::schema::causal_tree::BackendKind;
+use openprx::config::schema::decision_engine::BackendKind;
 use openprx::cost::decision_attempt::error::{DecisionError, ValidationRule};
 use openprx::cost::decision_attempt::{BackendIdentity, DecisionUsage};
 use openprx::decision_engine::prediction::protocol::MAX_CHOICE_OPTIONS;

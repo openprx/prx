@@ -61,18 +61,14 @@ struct LinkedFixture {
 
 impl LinkedFixture {
     async fn new() -> Self {
-        Self::with_enabled(true).await
-    }
-
-    async fn with_enabled(enabled: bool) -> Self {
         let workspace = tempfile::tempdir().expect("owned workspace");
         let mut config = crate::config::Config::default();
         config.decision_engine.enabled = true;
-        config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-            crate::config::schema::causal_tree::BackendKind::Builtin,
-        );
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::Builtin,
+            );
         config.workspace_dir = workspace.path().to_path_buf();
-        config.causal_tree.enabled = enabled;
         let generation = crate::config::new_shared(config.clone()).pin();
         let changed = Arc::new(AtomicBool::new(false));
         let dispatches = Arc::new(AtomicUsize::new(0));

@@ -237,7 +237,11 @@ async fn decision_engine_status_reports_configuration_without_secrets() -> anyho
     let mut config = config(&temp);
     config.decision_engine.enabled = true;
     config.decision_engine.mode = crate::config::schema::decision_engine::DecisionMode::Post;
-    config.causal_tree.backend.endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
     let Json(response) = get_status(State(super::super::test_support::app_state(config))).await;
     let body = serde_json::to_value(response)?;
     let row = body.get("decision_engine").context("missing engine status")?;

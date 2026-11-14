@@ -210,7 +210,7 @@ impl OperatorChildPublication {
             &parent.generation.effective,
             FactoryDeps {
                 catalog: &parent.provider_catalog,
-                key: parent.durable_key.then(|| Arc::clone(&parent.state_key)),
+                key: Some(Arc::clone(&parent.state_key)),
                 transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
                 config_generation: parent.generation.id.0,
                 events: Arc::clone(&parent.events),
@@ -255,7 +255,6 @@ impl OperatorChildPublication {
             events: Arc::clone(&parent.events),
             state_key: Arc::clone(&parent.state_key),
             policy_version,
-            durable_key: parent.durable_key,
             recordable: parent.recordable,
             registry,
             execution,

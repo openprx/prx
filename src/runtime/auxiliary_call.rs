@@ -143,7 +143,7 @@ impl AuxiliaryProviderCall {
             )
             .await?;
         anyhow::ensure!(
-            !config.causal_tree.enabled || event.id > 0,
+            !fabric.records_recovery_terminal() || event.id > 0,
             "auxiliary call receipt is not durable"
         );
         if event.id > 0 {

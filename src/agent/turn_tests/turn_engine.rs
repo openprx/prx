@@ -1317,9 +1317,10 @@ async fn compiled_request_event_accounts_for_prompt_and_tool_payload_sizes() {
             // Prediction-free opening (R9, R28): the fixture tool is configured Direct.
             config.tool_tiering.always_include.push("wide_schema_probe".to_owned());
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::Builtin,
-            );
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::Builtin,
+                );
             let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
                 config,
                 &history.last().expect("source input").content,

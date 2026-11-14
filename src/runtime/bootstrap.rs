@@ -720,7 +720,6 @@ mod tests {
         config.workspace_dir = workspace.to_path_buf();
         config.config_path = workspace.join("config.toml");
         // These profile fixtures assert the explicitly disabled/off contract.
-        config.causal_tree.enabled = false;
         // Keep the observer cheap and deterministic in tests.
         config.observability.backend = "noop".into();
         config

@@ -157,7 +157,7 @@ impl TurnRuntimeService {
             crate::tools::capability::search::CatalogSearch::exact_mentions(
                 catalog,
                 input,
-                usize::from(self.generation.effective.causal_tree.policy.max_candidates),
+                usize::from(self.generation.effective.decision_engine.max_candidates),
             )?
         } else {
             Vec::new()

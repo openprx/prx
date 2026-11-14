@@ -293,12 +293,6 @@ pub struct Config {
     #[serde(default)]
     pub media: MediaConfig,
 
-    /// Decision-plane configuration (`[causal_tree]`).
-    /// Default: enabled locally; remote processing remains explicit opt-in.
-    /// A versioned `enabled = false` preserves an explicit disable.
-    #[serde(default)]
-    pub causal_tree: crate::config::schema::causal_tree::CausalTreeConfig,
-
     /// Optional advisory decision engine, disabled by default.
     #[serde(default)]
     pub decision_engine: crate::config::schema::decision_engine::DecisionEngineConfig,
@@ -492,7 +486,6 @@ impl Default for Config {
             agents: HashMap::new(),
             query_classification: QueryClassificationConfig::default(),
             media: MediaConfig::default(),
-            causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
             decision_engine: crate::config::schema::decision_engine::DecisionEngineConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
@@ -576,7 +569,6 @@ pub use credentials::*;
 
 mod lifecycle;
 
-pub mod causal_tree;
 pub mod decision_engine;
 
 mod atomic;
@@ -584,12 +576,6 @@ pub(crate) use atomic::*;
 
 #[cfg(test)]
 mod tests;
-
-/// The decision-plane configuration through the real load, validate and save
-/// paths (CDP-03; SP-CDP-A 5.3 red-before rows; V8.06).
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-mod causal_tree_config_tests;
 
 #[cfg(test)]
 mod decision_engine_config_tests;

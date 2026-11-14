@@ -22,7 +22,7 @@
 //!   root or provider-store key is never accepted.
 //!
 //! Only a change that owns the problem is refused (D-094 C-1): one that
-//! touches `[causal_tree]`, or one that makes a backend that passes the
+//! touches `[decision_engine]`, or one that makes a backend that passes the
 //! check now fail it (a declaration removed, say). A change elsewhere that
 //! finds the section already refused, or the credential store unreadable,
 //! is accepted with a warning: the decision plane then runs builtin-only,
@@ -33,21 +33,18 @@
 //! credential store's owner of a reference. While the decision engine is
 //! disabled the credential is not resolved: only the rules the configuration
 //! alone decides run, so a disabled engine never opens the credential store
-//! (D-082 N-9), even when recovery (`[causal_tree].enabled`) is on. Enabling
-//! the engine is a `[decision_engine]` change, checked in full. Nothing is
-//! sent anywhere.
+//! (D-082 N-9). Enabling the engine is a `[decision_engine]` change, checked
+//! in full. Nothing is sent anywhere.
 
 use crate::config::Config;
-use crate::config::schema::causal_tree::BackendKind;
-use crate::config::schema::causal_tree::BackendSelection;
+use crate::config::schema::decision_engine::BackendKind;
+use crate::config::schema::decision_engine::BackendSelection;
 
 /// Whether the decision plane of `candidate` differs from `current` in
 /// what the check reads.
 fn changed(current: Option<&Config>, candidate: &Config) -> bool {
     current.is_none_or(|current| {
-        current.causal_tree != candidate.causal_tree
-            || current.decision_engine.enabled != candidate.decision_engine.enabled
-            || current.decision_engine.backend != candidate.decision_engine.backend
+        current.decision_engine != candidate.decision_engine
             || super::rendering_changed(&current.providers, &candidate.providers)
     })
 }
@@ -64,16 +61,16 @@ fn check_section(config: &Config) -> Result<(), String> {
     };
     if backend.remote_enabled && nothing_remote {
         return Err(
-            "causal_tree.backend.remote_enabled is on but no remote decision backend is configured; it would \
-             enable nothing: pair the change with SetRemote(false) (causal_tree.backend.remote_enabled = false)"
+            "decision_engine.backend.remote_enabled is on but no remote decision backend is configured; it would \
+             enable nothing: pair the change with SetRemote(false) (decision_engine.backend.remote_enabled = false)"
                 .to_string(),
         );
     }
-    let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) else {
+    let Some(selection) = crate::config::schema::decision_engine::configured_selection(backend) else {
         return Ok(());
     };
     let catalog = crate::providers::catalog::CatalogView::from_config(config);
-    // Recovery may remain enabled without permitting credential resolution.
+    // A disabled engine never resolves a credential.
     // Public loopback slots need no stored credential to compile predictions.
     let checked = if config.decision_engine.enabled {
         crate::providers::selection::check_decision_backend(
@@ -92,7 +89,7 @@ fn check_section(config: &Config) -> Result<(), String> {
             &selection.credential,
         )
     };
-    checked.map_err(|error| format!("the decision backend (causal_tree.backend) is refused: {error}"))
+    checked.map_err(|error| format!("the decision backend (decision_engine.backend) is refused: {error}"))
 }
 
 /// Check `candidate`'s decision backend when the change from `current`
@@ -110,10 +107,7 @@ pub(crate) fn check_decision_plane(current: Option<&Config>, candidate: &Config)
     let Err(refusal) = check_section(candidate) else {
         return Ok(None);
     };
-    let Some(current) = current.filter(|current| {
-        current.causal_tree == candidate.causal_tree
-            && current.decision_engine.backend == candidate.decision_engine.backend
-    }) else {
+    let Some(current) = current.filter(|current| current.decision_engine == candidate.decision_engine) else {
         return Err(refusal);
     };
     // An unreadable credential store fails the current configuration too,
@@ -124,7 +118,7 @@ pub(crate) fn check_decision_plane(current: Option<&Config>, candidate: &Config)
         ));
     }
     Ok(Some(format!(
-        "{refusal}; the change does not touch [causal_tree] and is accepted, and the decision plane runs \
+        "{refusal}; the change does not touch [decision_engine] and is accepted, and the decision plane runs \
          builtin-only until the section is fixed"
     )))
 }
@@ -153,12 +147,12 @@ pub(crate) fn orphaned_credentials_warning(config: &Config) -> Option<String> {
     }
 }
 
-/// The startup check (D-094 C-1): an enabled decision plane whose backend
+/// The startup check (D-094 C-1): an enabled decision engine whose backend
 /// the check refuses runs builtin-only, with a warning; startup never
-/// fails for it. `None` when the plane is disabled or passes.
+/// fails for it. `None` when the engine is disabled or passes.
 #[must_use]
 pub(crate) fn startup_check(config: &Config) -> Option<String> {
-    if !config.causal_tree.enabled {
+    if !config.decision_engine.enabled {
         return None;
     }
     check_section(config)
@@ -176,17 +170,30 @@ mod tests {
     #[test]
     fn remote_enabled_without_a_remote_backend_is_refused() {
         let mut config = Config::default();
-        config.causal_tree.backend.remote_enabled = true;
-        config.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::Builtin);
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            BackendSelection::Fixed(BackendKind::Builtin);
         let refusal = check_decision_plane(None, &config).unwrap_err();
         assert!(refusal.contains("remote_enabled"), "{refusal}");
-        config.causal_tree.backend.kind = BackendSelection::Auto;
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind = BackendSelection::Auto;
         assert!(check_decision_plane(None, &config).is_err(), "auto without an endpoint");
-        config.causal_tree.backend.remote_enabled = false;
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         assert!(check_decision_plane(None, &config).is_ok());
         // Unchanged, it is not checked again.
         let mut current = config;
-        current.causal_tree.backend.remote_enabled = true;
+        current
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
         assert!(check_decision_plane(Some(&current), &current).is_ok());
     }
 
@@ -204,10 +211,18 @@ mod tests {
     /// An enabled loopback backend whose model is declared.
     fn loopback_plane() -> Config {
         let mut config = Config::default();
-        config.causal_tree.enabled = true;
-        config.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
-        config.causal_tree.backend.endpoint = LOOPBACK.to_string();
-        config.causal_tree.backend.model = "decider-1".to_string();
+        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+            BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = LOOPBACK.to_string();
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "decider-1".to_string();
         config.providers.models.push(declaration(
             &format!("custom:{LOOPBACK}"),
             "decider-1",
@@ -217,12 +232,16 @@ mod tests {
     }
 
     /// D-094 C-1: a section already refused does not hold back a change
-    /// that does not touch `[causal_tree]`; the change is accepted with a
+    /// that does not touch `[decision_engine]`; the change is accepted with a
     /// warning naming the refusal.
     #[test]
     fn an_invalid_section_does_not_block_an_unrelated_change() {
         let mut current = Config::default();
-        current.causal_tree.backend.remote_enabled = true;
+        current
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
         let mut candidate = current.clone();
         candidate
             .providers
@@ -237,11 +256,11 @@ mod tests {
         );
         // The same section in a change that touches it is refused.
         let mut touching = candidate.clone();
-        touching.causal_tree.policy.max_candidates = 4;
+        touching.decision_engine.max_candidates = 4;
         assert!(check_decision_plane(Some(&current), &touching).is_err());
     }
 
-    /// D-094 C-1: a change outside `[causal_tree]` that makes a valid
+    /// D-094 C-1: a change outside `[decision_engine]` that makes a valid
     /// backend invalid (its declaration removed) is refused, naming the
     /// decision backend.
     #[test]
@@ -252,22 +271,26 @@ mod tests {
         candidate.providers.models.clear();
         let refusal = check_decision_plane(Some(&current), &candidate).unwrap_err();
         assert!(
-            refusal.contains("causal_tree.backend")
+            refusal.contains("decision_engine.backend")
                 && refusal.contains("makes the configured decision backend invalid"),
             "{refusal}"
         );
     }
 
     /// D-094 C-1: an unreadable credential store never blocks a change that
-    /// does not touch `[causal_tree]`; a change that does is refused.
+    /// does not touch `[decision_engine]`; a change that does is refused.
     #[test]
     fn an_unreadable_credential_store_never_blocks_unrelated_changes() {
         let temp = tempfile::TempDir::new().unwrap();
         let mut current = loopback_plane();
         current.decision_engine.enabled = true;
         current.config_path = temp.path().join("config.toml");
-        current.causal_tree.backend.credential_ref =
-            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decider".to_string());
+        current
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .credential_ref =
+            crate::config::schema::decision_engine::CredentialRefSetting::Profile("cred-decider".to_string());
         std::fs::write(temp.path().join("auth-profiles.json"), "not json").unwrap();
         let mut candidate = current.clone();
         candidate
@@ -277,9 +300,13 @@ mod tests {
         let warning = check_decision_plane(Some(&current), &candidate)
             .expect("not blocked")
             .expect("with a warning");
-        assert!(warning.contains("causal_tree.backend"), "{warning}");
+        assert!(warning.contains("decision_engine.backend"), "{warning}");
         let mut touching = candidate.clone();
-        touching.causal_tree.backend.timeout_ms = 300;
+        touching
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .timeout_ms = 300;
         assert!(check_decision_plane(Some(&current), &touching).is_err());
     }
 
@@ -303,12 +330,19 @@ mod tests {
                 config_path: temp.path().join("config.toml"),
                 ..Config::default()
             };
-            config.causal_tree.enabled = true;
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind = BackendSelection::Fixed(kind);
-            config.causal_tree.backend.model = model.to_string();
-            config.causal_tree.backend.pinned_snapshot = snapshot.to_string();
-            config.causal_tree.validate().unwrap();
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind = BackendSelection::Fixed(kind);
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .model = model.to_string();
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(Default::default)
+                .pinned_snapshot = snapshot.to_string();
+            config.decision_engine.validate().unwrap();
             config
                 .providers
                 .models
@@ -324,12 +358,16 @@ mod tests {
             let other = references
                 .set("openai", "chat-key", "sk-HOSTED-OTHER-SENTINEL-02")
                 .unwrap();
-            let with = |reference: crate::config::schema::causal_tree::CredentialRefSetting| {
+            let with = |reference: crate::config::schema::decision_engine::CredentialRefSetting| {
                 let mut config = config.clone();
-                config.causal_tree.backend.credential_ref = reference;
+                config
+                    .decision_engine
+                    .backend
+                    .get_or_insert_with(Default::default)
+                    .credential_ref = reference;
                 check_decision_plane(None, &config)
             };
-            use crate::config::schema::causal_tree::CredentialRefSetting as Ref;
+            use crate::config::schema::decision_engine::CredentialRefSetting as Ref;
             assert_eq!(with(Ref::Profile(own.id.clone())), Ok(None), "{provider}");
             for refused in [
                 Ref::Profile(other.id.clone()),
@@ -338,7 +376,7 @@ mod tests {
                 Ref::None,
             ] {
                 let message = with(refused.clone()).expect_err("refused");
-                assert!(message.contains("causal_tree.backend"), "{refused:?}: {message}");
+                assert!(message.contains("decision_engine.backend"), "{refused:?}: {message}");
                 assert!(!message.contains("SENTINEL"), "{message}");
             }
         }
@@ -349,24 +387,28 @@ mod tests {
     #[test]
     fn startup_reports_a_refused_plane_and_never_fails() {
         let mut config = loopback_plane();
+        config.decision_engine.enabled = true;
         assert_eq!(startup_check(&config), None);
         config.providers.models.clear();
         let warning = startup_check(&config).expect("a refused backend is reported");
         assert!(warning.contains("builtin-only"), "{warning}");
-        config.causal_tree.enabled = false;
+        config.decision_engine.enabled = false;
         assert_eq!(startup_check(&config), None);
     }
 
-    /// Engine off: recovery may keep `[causal_tree]` on, but the credential
-    /// store is never opened (D-082 N-9).
+    /// Engine off: the credential store is never opened (D-082 N-9).
     #[test]
     fn disabled_engine_never_opens_the_credential_store() {
         let temp =
             tempfile::TempDir::new().expect("test: disabled_engine_never_opens_the_credential_store fixture operation");
         let mut config = loopback_plane();
         config.config_path = temp.path().join("config.toml");
-        config.causal_tree.backend.credential_ref =
-            crate::config::schema::causal_tree::CredentialRefSetting::Profile("cred-decider".to_string());
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .credential_ref =
+            crate::config::schema::decision_engine::CredentialRefSetting::Profile("cred-decider".to_string());
         std::fs::write(temp.path().join("auth-profiles.json"), "not json")
             .expect("test: disabled_engine_never_opens_the_credential_store fixture operation");
         assert_eq!(check_decision_plane(None, &config), Ok(None));

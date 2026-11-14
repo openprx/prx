@@ -420,10 +420,6 @@ impl ChannelSourceReceipt {
             );
             envelope = envelope.with_source_message_event_id(recorded.event_id.clone());
         } else {
-            anyhow::ensure!(
-                !generation.effective.causal_tree.enabled,
-                "enabled channel decision source was not recorded"
-            );
         }
         Ok(Self {
             message_id: message.id.clone(),
@@ -561,38 +557,6 @@ impl crate::runtime::turn_source::TurnSourceProof for ChannelTurnProof {
 /// constructors for ChannelTurnProof or inventing a durable event identity.
 #[cfg(test)]
 pub(crate) async fn recorded_fixture_source(
-    generation: &Arc<ConfigGeneration>,
-    memory: Arc<dyn Memory>,
-    message: &super::traits::ChannelMessage,
-    run_id: &str,
-    selection: (&str, &str),
-) -> anyhow::Result<(ChannelTurnProof, RuntimeEnvelope)> {
-    anyhow::ensure!(
-        !generation.effective.causal_tree.enabled,
-        "fixture requires disabled plane"
-    );
-    recorded_fixture_source_inner(generation, memory, message, run_id, selection).await
-}
-
-/// The same recorded channel source for tests of the default enabled builtin
-/// path. Keeping a separate constructor preserves the disabled-fixture guard.
-#[cfg(test)]
-pub(crate) async fn recorded_enabled_fixture_source(
-    generation: &Arc<ConfigGeneration>,
-    memory: Arc<dyn Memory>,
-    message: &super::traits::ChannelMessage,
-    run_id: &str,
-    selection: (&str, &str),
-) -> anyhow::Result<(ChannelTurnProof, RuntimeEnvelope)> {
-    anyhow::ensure!(
-        generation.effective.causal_tree.enabled,
-        "fixture requires enabled plane"
-    );
-    recorded_fixture_source_inner(generation, memory, message, run_id, selection).await
-}
-
-#[cfg(test)]
-async fn recorded_fixture_source_inner(
     generation: &Arc<ConfigGeneration>,
     memory: Arc<dyn Memory>,
     message: &super::traits::ChannelMessage,

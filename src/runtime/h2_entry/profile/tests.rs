@@ -14,7 +14,6 @@ impl Fixture {
         let mut config = Config::default();
         config.workspace_dir = workspace.clone();
         config.config_path = PathBuf::new();
-        config.causal_tree.enabled = true;
         config.memory.events.record_user_messages = true;
         config.skills_lifecycle.enabled = true;
         config.skills_lifecycle.owner_scope = Some("owner:prx:h2:test".into());

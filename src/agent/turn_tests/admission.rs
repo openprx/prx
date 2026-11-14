@@ -47,7 +47,7 @@ impl DecisionTransports for LoopbackOnlyTransport {
         Box<dyn crate::decision_engine::prediction::backend::DecisionBackend>,
         crate::cost::decision_attempt::DecisionError,
     > {
-        if spec.locality == crate::config::schema::causal_tree::BackendLocality::Loopback {
+        if spec.locality == crate::config::schema::decision_engine::BackendLocality::Loopback {
             crate::decision_engine::prediction::compatible_http::HttpDecisionTransports.build(spec)
         } else {
             NoExternalTransport.build(spec)
@@ -122,12 +122,11 @@ impl AdmittedTurn {
     }
 
     pub(crate) async fn with_prediction_memory(
-        mut config: crate::config::Config,
+        config: crate::config::Config,
         input: &str,
         registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
         memory: Arc<dyn crate::memory::Memory>,
     ) -> Self {
-        config.causal_tree.enabled = true;
         Self::with_enabled_builtin_model(config, input, registry, memory, ("ollama", "prx-local-model")).await
     }
 
@@ -165,10 +164,6 @@ impl AdmittedTurn {
         memory: Arc<dyn crate::memory::Memory>,
         selection: (&str, &str),
     ) -> Self {
-        assert!(
-            config.causal_tree.enabled,
-            "enabled-builtin fixture requires causal tree"
-        );
         Self::build_mode(
             config,
             input,
@@ -203,7 +198,6 @@ impl AdmittedTurn {
         memory: Arc<dyn crate::memory::Memory>,
         selection: (&str, &str),
     ) -> Self {
-        assert!(!config.causal_tree.enabled, "ordinary child fixture starts disabled");
         let input = message.content.clone();
         Self::build(
             config,
@@ -227,10 +221,6 @@ impl AdmittedTurn {
         memory: Arc<dyn crate::memory::Memory>,
         selection: (&str, &str),
     ) -> Self {
-        assert!(
-            config.causal_tree.enabled,
-            "builtin channel fixture requires causal tree"
-        );
         let input = message.content.clone();
         Self::build_mode(
             config,
@@ -258,10 +248,6 @@ impl AdmittedTurn {
         memory: Arc<dyn crate::memory::Memory>,
         selection: (&str, &str),
     ) -> Self {
-        assert!(
-            !generation.effective.causal_tree.enabled,
-            "ordinary child fixture starts disabled"
-        );
         let config = generation.effective.as_ref().clone();
         let input = message.content.clone();
         Self::build_mode(
@@ -438,7 +424,7 @@ impl AdmittedTurn {
             .expect("owned mechanics decision endpoint");
         // configure checked the production default; mechanics must reach Execute
         // even when another nextest process monopolizes the runner's CPUs.
-        config.causal_tree.policy.extra_latency_budget_ms = 10_000;
+        config.decision_engine.latency_budget_ms = 10_000;
         let admitted = Self::build_mode(
             config,
             input,
@@ -553,13 +539,12 @@ impl AdmittedTurn {
         let workspace = workspace_path.as_path();
         if keep_builtin_enabled {
             config.decision_engine.enabled = true;
-            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::Builtin,
-            );
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::Builtin,
+                );
         }
-        if configured_native_tools.is_none() && !keep_builtin_enabled {
-            config.causal_tree.enabled = false;
-        }
+        if configured_native_tools.is_none() && !keep_builtin_enabled {}
         if !config
             .providers
             .models
@@ -578,9 +563,10 @@ impl AdmittedTurn {
         if ordinary_controlled {
             // The engine switch is the caller's: an ordinary turn opens
             // prediction-free either way (R9), so the fixture never forces it.
-            config.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
-                crate::config::schema::causal_tree::BackendKind::Builtin,
-            );
+            config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+                crate::config::schema::decision_engine::BackendSelection::Fixed(
+                    crate::config::schema::decision_engine::BackendKind::Builtin,
+                );
         }
         let channel_surface = matches!(
             &origin,
@@ -670,25 +656,14 @@ impl AdmittedTurn {
                 // A new admission is a distinct run, including fixtures that
                 // share /tmp or one channel session while children stay live.
                 let run_id = format!("prx_channel_parent_{}", uuid::Uuid::new_v4());
-                let source = if generation.effective.causal_tree.enabled {
-                    crate::channels::turn_source::recorded_enabled_fixture_source(
-                        &generation,
-                        Arc::clone(&memory),
-                        &message,
-                        &run_id,
-                        selection,
-                    )
-                    .await
-                } else {
-                    crate::channels::turn_source::recorded_fixture_source(
-                        &generation,
-                        Arc::clone(&memory),
-                        &message,
-                        &run_id,
-                        selection,
-                    )
-                    .await
-                };
+                let source = crate::channels::turn_source::recorded_fixture_source(
+                    &generation,
+                    Arc::clone(&memory),
+                    &message,
+                    &run_id,
+                    selection,
+                )
+                .await;
                 let (proof, envelope) = source.expect("actual recorded channel fixture source");
                 (Box::new(proof), envelope)
             }
@@ -919,9 +894,8 @@ async fn channel_admission_retains_recorded_transport_identity() {
 fn mechanics_http_stall() -> std::time::Duration {
     std::time::Duration::from_millis(
         crate::config::Config::default()
-            .causal_tree
-            .policy
-            .extra_latency_budget_ms
+            .decision_engine
+            .latency_budget_ms
             .saturating_add(1),
     )
 }

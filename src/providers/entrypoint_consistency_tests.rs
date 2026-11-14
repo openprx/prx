@@ -63,8 +63,7 @@ fn refusal<T>(result: anyhow::Result<T>) -> String {
 #[test]
 fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let temp = tempfile::tempdir().expect("test: temp config dir");
-    let mut config = cross_dialect_config(&temp);
-    config.causal_tree.enabled = false;
+    let config = cross_dialect_config(&temp);
     let provider = config.default_provider.as_deref().expect("test: provider");
     let options = provider_runtime_options_from_config(&config);
 

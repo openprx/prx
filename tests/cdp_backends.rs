@@ -35,12 +35,27 @@ async fn plane() -> Plane {
         config_path: home.path().join("config.toml"),
         ..openprx::config::Config::default()
     };
-    config.causal_tree.enabled = true;
     config.decision_engine.enabled = true;
-    config.causal_tree.backend.kind = serde_json::from_value(serde_json::json!("compatible_http")).unwrap();
-    config.causal_tree.backend.endpoint.clone_from(&endpoint);
-    "jev-1.13.0".clone_into(&mut config.causal_tree.backend.model);
-    config.causal_tree.backend.remote_enabled = false;
+    config.decision_engine.backend.get_or_insert_with(Default::default).kind =
+        serde_json::from_value(serde_json::json!("compatible_http")).unwrap();
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .endpoint
+        .clone_from(&endpoint);
+    "jev-1.13.0".clone_into(
+        &mut config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model,
+    );
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .remote_enabled = false;
     let catalog = CatalogView::from_config(&config).with_curated([CuratedModel {
         operations: Some(vec![ModelOperation::DecisionEndpoint]),
         ..CuratedModel::new(ProviderId::of(&format!("custom:{endpoint}")), Some("jev-1.13.0"))

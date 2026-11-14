@@ -261,7 +261,6 @@ async fn direct_turn_keeps_root_credential_beside_a_keyed_route() {
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
-    config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
         settings: Default::default(),
         hint: "fast".to_string(),
@@ -300,7 +299,6 @@ async fn second_same_provider_hint_uses_its_own_wire_key() {
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
-    config.causal_tree.enabled = false;
     for (hint, key) in [("first", "PRX-FIRST-KEY"), ("second", "PRX-SECOND-KEY")] {
         config.model_routes.push(crate::config::ModelRouteConfig {
             settings: Default::default(),
@@ -339,7 +337,6 @@ async fn keyed_hint_after_unkeyed_route_uses_its_own_key() {
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
-    config.causal_tree.enabled = false;
     config.model_routes = vec![
         crate::config::ModelRouteConfig {
             settings: Default::default(),
@@ -389,7 +386,6 @@ async fn keyed_primary_hint_retries_without_root_rotation_key() {
     let selected = probe.custom_provider();
     config.default_provider = Some(selected.clone());
     config.default_model = Some(PROBE_MODEL.to_string());
-    config.causal_tree.enabled = false;
     config.reliability.api_keys = vec![ROTATION_SENTINEL.to_string()];
     config.model_routes.push(crate::config::ModelRouteConfig {
         settings: Default::default(),
@@ -418,7 +414,6 @@ fn keyed_primary_hint_does_not_inherit_root_endpoint() {
     let temp = tempfile::tempdir().expect("test workspace");
     let mut config = isolated_config(&temp);
     config.api_url = Some("http://127.0.0.1:9/v1".to_string());
-    config.causal_tree.enabled = false;
     config.model_routes.push(crate::config::ModelRouteConfig {
         settings: Default::default(),
         hint: "fast".to_string(),
@@ -475,7 +470,6 @@ async fn root_url_without_root_key_uses_the_provider_profile() {
             .expect("loopback provider URL")
             .to_string(),
     );
-    config.causal_tree.enabled = false;
     config.secrets.encrypt = false;
     let store = crate::auth::profiles::AuthProfilesStore::new(temp.path(), false);
     store
@@ -586,7 +580,6 @@ async fn resolved_url_only_roots_restore_provider_profile_lookup_on_owned_wire()
         }));
         let outcome = std::panic::AssertUnwindSafe(async {
             let mut config = isolated_config(&temp);
-            config.causal_tree.enabled = false;
             config.api_key = None;
             config.api_url = Some(endpoint.clone());
             let provider_label = if label == "custom" {

@@ -152,7 +152,6 @@ fn provider_config(workspace: &std::path::Path, endpoint: &ProviderEndpoint, key
     config.default_temperature = 0.0;
     config.api_key = Some(key.to_owned());
     config.api_url = Some(endpoint.url.clone());
-    config.causal_tree.enabled = false;
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.reliability.provider_retries = 0;
     config.memory.auto_save = false;

@@ -300,26 +300,17 @@ async fn chat_production_save_excludes_live_input_without_useful_feedback() {
 }
 
 async fn fixture(record_input: bool) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
-    fixture_with_plane(record_input, false).await
-}
-
-async fn fixture_with_plane(
-    record_input: bool,
-    enabled: bool,
-) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
-    fixture_with_advisory(record_input, enabled, Default::default()).await
+    fixture_with_advisory(record_input, Default::default()).await
 }
 
 pub(in crate::chat) async fn fixture_with_advisory(
     record_input: bool,
-    enabled: bool,
     advisory: crate::config::schema::decision_engine::DecisionEngineConfig,
 ) -> (tempfile::TempDir, MemoryFabric, Arc<ChatTurnBinding>) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.decision_engine = advisory;
     config.workspace_dir = dir.path().to_path_buf();
-    config.causal_tree.enabled = enabled;
     config.memory.events.record_user_messages = record_input;
     let generation = crate::config::new_shared(config).pin();
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
@@ -472,7 +463,6 @@ async fn decided_binding_for_provider_retained(
     if provider_name == "anthropic" {
         config.api_key = Some("prx-test-only-credential".to_owned());
     }
-    config.causal_tree.enabled = false;
     let generation = crate::config::new_shared(config).pin();
     let session = super::super::session::ChatSession::new(provider_name, model_name);
     let event = super::super::record_chat_user_message_event_in_generation(
@@ -587,11 +577,11 @@ async fn h2_approval_ledger_requires_h2_origin() {
 }
 
 #[tokio::test]
-async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_and_off() {
+async fn guarded_plan_admission_preserves_mode_and_owned_capture() {
     use crate::agent::turn_contracts::ChatMode;
     use crate::runtime::turn_source::{OwnedTurnSourceProof, TurnSourceProof};
-    for enabled in [false, true] {
-        let (_dir, fabric, original) = fixture_with_plane(true, enabled).await;
+    {
+        let (_dir, fabric, original) = fixture(true).await;
         let provider =
             ChatProviderBinding::capture(&original.generation, &original.provider, "ollama", "prx-local-model")
                 .unwrap()

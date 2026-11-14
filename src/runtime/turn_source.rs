@@ -450,10 +450,6 @@ impl OwnedTurnSourceProof {
         };
         let generation = selection.generation;
         anyhow::ensure!(
-            !generation.effective.causal_tree.enabled,
-            "ordinary source requires disabled plane"
-        );
-        anyhow::ensure!(
             !delegate
                 || subject_task_id(scope.subject.as_ref()).is_some_and(|task| scope.run_id.as_deref() == Some(task)),
             "ordinary delegate task must be its own run"

@@ -28,31 +28,6 @@ impl Config {
         Some(EMBEDDING_DEFAULT_UPGRADE_NOTICE)
     }
 
-    /// Warn about inherited legacy ceilings below the release recommendation.
-    /// Explicit operator ceilings remain unchanged and do not emit this warning.
-    pub(crate) fn decision_latency_budget_warning(&self) -> Option<String> {
-        let section = &self.causal_tree;
-        if !section.enabled || section.policy.extra_latency_budget_ms_explicit {
-            return None;
-        }
-        let selection = crate::config::schema::causal_tree::configured_selection(&section.backend)?;
-        let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref()
-            .inspect_err(|error| tracing::warn!(%error, "cannot read the catalog latency recommendation"))
-            .ok()?;
-        let entry = catalog.model(
-            &crate::providers::ProviderId::of(&selection.provider),
-            section.backend.model.trim(),
-        )?;
-        let recommended = entry.transport.extra_latency_budget_ms?;
-        let configured = section.policy.extra_latency_budget_ms;
-        (configured < recommended).then(|| {
-            format!(
-                "causal_tree.policy.extra_latency_budget_ms={configured} is below the catalog recommendation {recommended} ms for {}; the configured ceiling is unchanged",
-                entry.id
-            )
-        })
-    }
-
     /// Turn a merged TOML tree into a `Config`.
     ///
     /// `config_path` is only used to tell an operator which file and line a
@@ -91,9 +66,6 @@ impl Config {
         }
         for warning in crate::config::model_settings::warnings(&config)? {
             tracing::warn!(%warning, "saved model settings need repair; using runtime compatibility values");
-        }
-        if let Some(warning) = config.decision_latency_budget_warning() {
-            tracing::warn!(warning = %warning, "decision latency budget is below the catalog recommendation");
         }
         Ok(config)
     }
@@ -528,9 +500,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         codex_effort::validate(self.runtime.codex_reasoning_effort.as_deref())?;
-        self.causal_tree.validate()?;
-        self.decision_engine
-            .validate_with_latency_budget(self.causal_tree.policy.extra_latency_budget_ms)?;
+        self.decision_engine.validate()?;
         // The JWKS URI is published in the public, signed Agent Card: a
         // `user:password@` there would be handed to every peer.
         if let Some(uri) = self.a2a.card_jwks_uri.as_deref() {

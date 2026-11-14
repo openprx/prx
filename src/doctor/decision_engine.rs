@@ -19,7 +19,11 @@ mod tests {
         let mut config = Config::default();
         config.decision_engine.enabled = true;
         config.decision_engine.mode = crate::config::schema::decision_engine::DecisionMode::Both;
-        config.causal_tree.backend.endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
+        config
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "https://prx_user:PRIVATE@example.test/?token=QUERYSECRET".into();
         let mut items = Vec::new();
         check(&config, &mut items);
         let text = format!("{items:?}");

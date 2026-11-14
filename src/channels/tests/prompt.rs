@@ -637,10 +637,6 @@ async fn channel_plain_greeting_and_follow_up_reach_provider_with_default_causal
 
     let provider_impl = Arc::new(HistoryCaptureProvider::default());
     let mut runtime_config = Config::default();
-    assert_eq!(
-        runtime_config.causal_tree,
-        crate::config::schema::causal_tree::CausalTreeConfig::default()
-    );
     runtime_config.default_provider = Some("test-provider".to_string());
     runtime_config.default_model = Some("test-model".to_string());
     let config_manager = crate::config::new_shared(runtime_config);
@@ -871,7 +867,6 @@ async fn assert_channel_dm_autosave_excludes_live_input(record_user_messages: bo
     config.memory.events.record_user_messages = record_user_messages;
     // Enabled decision admission requires a durable user event. Exercise the
     // supported recording-disabled turn with the decision plane disabled too.
-    config.causal_tree.enabled = record_user_messages;
     config.memory.auto_save = true;
     config.default_model = Some("test-model".into());
     let config = crate::config::new_shared(config);

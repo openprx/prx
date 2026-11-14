@@ -60,10 +60,6 @@ default_model = "mock"
 [observability]
 backend = "none"
 
-[causal_tree]
-schema_version = 2
-enabled = false
-
 [autonomy]
 level = "full"
 workspace_only = true

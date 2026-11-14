@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
 use crate::observability::{Observer, ObserverEvent};
 
 /// What happened (the CDP 18 names this stream owns).

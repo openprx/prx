@@ -1203,7 +1203,6 @@ async fn channel_retry_of_accepted_input_key_is_refused_with_plane_off() {
     let mut config = Config::default();
     config.workspace_dir = dir.path().to_path_buf();
     config.config_path = dir.path().join("config.toml");
-    config.causal_tree.enabled = false;
     assert!(config.memory.event_recording_config().enabled);
     let generation = crate::config::new_shared(config).pin();
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
@@ -1245,11 +1244,10 @@ async fn channel_retry_of_accepted_input_key_is_refused_with_plane_off() {
 
 const CHANNEL_MESSAGE: &str = "msg-erased-1";
 
-/// A channel context over `dir`, and a generation with the plane on or off.
+/// A channel context over `dir`, and its generation.
 fn channel_issuer(
     dir: &TempDir,
     memory: Option<Arc<dyn Memory>>,
-    plane: bool,
 ) -> (Arc<ChannelRuntimeContext>, Arc<crate::config::ConfigGeneration>) {
     let ctx = evidence_runtime_ctx(
         dir,
@@ -1267,7 +1265,6 @@ fn channel_issuer(
     let mut config = Config::default();
     config.workspace_dir = dir.path().to_path_buf();
     config.config_path = dir.path().join("config.toml");
-    config.causal_tree.enabled = plane;
     assert!(config.memory.event_recording_config().enabled);
     (ctx, crate::config::new_shared(config).pin())
 }
@@ -1306,7 +1303,7 @@ async fn channel_erased_workspace() -> TempDir {
     let dir = fixture::home_dir();
     let base: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).expect("test: sqlite"));
     let view = base.with_erasure_origin(fixture::erasure_origin()).expect("test: view");
-    let (ctx, generation) = channel_issuer(&dir, Some(view), true);
+    let (ctx, generation) = channel_issuer(&dir, Some(view));
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let (event, _source, guard) = channel_admit(&ctx, &generation, &cleanup, "admit me once", "prx-channel-run-1")
         .await
@@ -1327,7 +1324,7 @@ async fn channel_plane_off_erased_key_retry_is_refused_as_already_accepted() {
     let rows = fixture::row_count(dir.path(), "message_events");
     let keys = fixture::key_snapshot(dir.path());
     assert!(keys.as_ref().is_some_and(|keys| !keys.is_empty()), "no recovery keys");
-    let (ctx, generation) = channel_issuer(&dir, None, false);
+    let (ctx, generation) = channel_issuer(&dir, None);
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     for (content, run) in [
         ("admit me once", "prx-channel-run-2"),
@@ -1357,7 +1354,7 @@ async fn channel_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
     let dir = channel_erased_workspace().await;
     let rows = fixture::row_count(dir.path(), "message_events");
     fixture::stash_keys(dir.path());
-    let (ctx, generation) = channel_issuer(&dir, None, false);
+    let (ctx, generation) = channel_issuer(&dir, None);
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let retry = channel_admit(&ctx, &generation, &cleanup, "something else", "prx-channel-run-2").await;
     assert!(
@@ -1392,7 +1389,7 @@ async fn channel_plane_off_erased_key_without_key_file_is_a_typed_refusal() {
 async fn channel_plane_off_fence_creates_no_recovery_state() {
     use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
     let dir = fixture::home_dir();
-    let (ctx, generation) = channel_issuer(&dir, None, false);
+    let (ctx, generation) = channel_issuer(&dir, None);
     let recorded = fixture::fence_only_record(Arc::clone(&ctx.memory), dir.path(), "fence-only", "prx-fence-only-key")
         .await
         .expect("test: fence-only");

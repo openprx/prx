@@ -179,8 +179,6 @@ async fn fresh_process_ingress_child() {
     config.workspace_dir = workspace.clone();
     config.config_path = workspace.join("config.toml");
     config.default_model = Some(MODEL.into());
-    config.causal_tree.enabled = true;
-    config.causal_tree.policy.max_decision_hops = 1;
     if mode.starts_with("float-") {
         config.cost.prices.insert(
             format!("ollama/{MODEL}"),
@@ -505,7 +503,6 @@ fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
 fn recovery_config(workspace: &Path) -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.to_path_buf();
-    config.causal_tree.enabled = true;
     config
 }
 

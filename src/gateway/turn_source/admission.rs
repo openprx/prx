@@ -366,7 +366,6 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.workspace_dir = dir.path().to_path_buf();
         config.config_path = dir.path().join("config.toml");
-        config.causal_tree.enabled = false;
         let generation = crate::config::new_shared(config).pin();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
         let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
@@ -406,7 +405,7 @@ mod tests {
 
     const ERASED_KEY: &str = "prx-gateway-stable-key";
 
-    /// One gateway issuer over one workspace, with the decision plane on or off.
+    /// One gateway issuer over one workspace.
     struct GatewayIssuer {
         generation: Arc<crate::config::ConfigGeneration>,
         fabric: MemoryFabric,
@@ -415,11 +414,10 @@ mod tests {
     }
 
     impl GatewayIssuer {
-        fn new(workspace: &std::path::Path, plane: bool, memory: Arc<dyn Memory>) -> Self {
+        fn new(workspace: &std::path::Path, memory: Arc<dyn Memory>) -> Self {
             let mut config = crate::config::Config::default();
             config.workspace_dir = workspace.to_path_buf();
             config.config_path = workspace.join("config.toml");
-            config.causal_tree.enabled = plane;
             let generation = crate::config::new_shared(config).pin();
             let fabric = MemoryFabric::new(memory, workspace.to_string_lossy());
             let envelope = RuntimeEnvelope::gateway(
@@ -478,7 +476,7 @@ mod tests {
         let workspace = dir.path().to_path_buf();
         let base: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&workspace).unwrap());
         let view = base.with_erasure_origin(fixture::erasure_origin()).unwrap();
-        let issuer = GatewayIssuer::new(&workspace, true, view);
+        let issuer = GatewayIssuer::new(&workspace, view);
         let (_receipt, event, guard) = issuer.admit("prx input").await.expect("test: first admission");
         assert!(event.is_some_and(|event| event.id > 0), "first input was not recorded");
         let (ticket, _acknowledgement) = guard.into_terminal_parts().expect("test: hand off the admission");
@@ -502,7 +500,7 @@ mod tests {
         let (_dir, workspace) = gateway_erased_workspace().await;
         let keys = fixture::key_snapshot(&workspace);
         assert!(keys.as_ref().is_some_and(|keys| !keys.is_empty()), "no recovery keys");
-        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        let issuer = GatewayIssuer::new(&workspace, fresh_memory(&workspace));
         for content in ["prx input", "prx different input"] {
             let retry = issuer.admit(content).await;
             assert!(
@@ -527,7 +525,7 @@ mod tests {
         use crate::runtime::ingress_recovery::tombstone_fixture as fixture;
         let (_dir, workspace) = gateway_erased_workspace().await;
         fixture::stash_keys(&workspace);
-        let issuer = GatewayIssuer::new(&workspace, false, fresh_memory(&workspace));
+        let issuer = GatewayIssuer::new(&workspace, fresh_memory(&workspace));
         let retry = issuer.admit("prx different input").await;
         assert!(
             retry.as_ref().err().is_some_and(fixture::is_fence_unavailable),
@@ -571,7 +569,7 @@ mod tests {
             "fence-only input was not recorded"
         );
         fixture::assert_fence_created_nothing(&workspace);
-        let issuer = GatewayIssuer::new(&workspace, false, memory);
+        let issuer = GatewayIssuer::new(&workspace, memory);
         let (_receipt, event, guard) = issuer.admit("prx input").await.expect("test: admission");
         assert!(event.is_some_and(|event| event.id > 0), "input was not recorded");
         let (ticket, _acknowledgement) = guard.into_terminal_parts().expect("test: hand off the admission");

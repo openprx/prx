@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! Literal pre-optimization sealing order; never call the revised helpers.
 use super::*;
-use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::decision_engine::BackendKind;
 use crate::cost::decision_attempt::BackendIdentity;
 
 pub(crate) fn original_seal(

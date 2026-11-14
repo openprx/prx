@@ -1478,7 +1478,7 @@ fn register_gateway_turn_tools(
         .with_channels(Arc::clone(&channels_registry))
         .with_shared_memory(Arc::clone(memory))
         .with_event_recording(config.memory.event_recording_config())
-        .with_process_recovery(config.causal_tree.enabled)?;
+        .with_process_recovery(true)?;
         let handle = spawn_tool.tools_handle();
         crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
         crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(

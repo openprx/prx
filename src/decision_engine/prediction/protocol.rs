@@ -42,7 +42,7 @@ pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_SCORE_LEVELS: usize = 10;
 /// The longest backend or model identity claim, in characters.
 pub const MAX_CLAIM_CHARS: usize = 128;
-/// The default request byte budget (`causal_tree.backend.max_request_bytes`).
+/// The default request byte budget (`decision_engine.backend.max_request_bytes`).
 pub const DEFAULT_MAX_REQUEST_BYTES: u32 = 64 * 1024;
 
 /// The longest run of base64-alphabet characters without whitespace that a

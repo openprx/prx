@@ -34,7 +34,7 @@ pub enum EndpointError {
     #[error("is not an absolute URL")]
     Unparseable,
     /// `user:password@` in the URL. Credentials go through `credential_ref`.
-    #[error("carries user information; credentials go through `causal_tree.backend.credential_ref`, never the URL")]
+    #[error("carries user information; credentials go through `decision_engine.backend.credential_ref`, never the URL")]
     Userinfo,
     /// A query or a fragment.
     #[error("carries a query or a fragment")]

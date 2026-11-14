@@ -266,7 +266,7 @@ impl PrometheusObserver {
         let fields = &event.fields;
         let backend = fields
             .backend
-            .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str);
+            .map_or("none", crate::config::schema::decision_engine::BackendKind::as_str);
         match event.kind {
             CausalEventKind::SnapshotCreated
             | CausalEventKind::CandidatesGenerated
@@ -283,7 +283,7 @@ impl PrometheusObserver {
             CausalEventKind::PredictionSucceeded => {
                 let locality = fields
                     .locality
-                    .map_or("none", crate::config::schema::causal_tree::BackendLocality::as_str);
+                    .map_or("none", crate::config::schema::decision_engine::BackendLocality::as_str);
                 let served = fields
                     .served
                     .map_or("none", crate::observability::causal_event::ServedLabel::as_str);
@@ -304,7 +304,7 @@ impl PrometheusObserver {
             CausalEventKind::BackendFallback => {
                 let to = fields
                     .to_backend
-                    .map_or("none", crate::config::schema::causal_tree::BackendKind::as_str);
+                    .map_or("none", crate::config::schema::decision_engine::BackendKind::as_str);
                 self.causal_fallbacks.with_label_values(&[backend, to]).inc();
             }
             CausalEventKind::BackendCircuitOpened => {
@@ -426,7 +426,7 @@ mod tests {
     /// the lineage and the configured model are never labels.
     #[test]
     fn causal_events_land_on_their_metrics() {
-        use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+        use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
         use crate::observability::causal_event::{
             CausalEvent, CausalEventFields, CausalEventKind, CausalLineage, CircuitState, IncompleteReason, ServedLabel,
         };

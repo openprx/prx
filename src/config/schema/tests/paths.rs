@@ -60,61 +60,6 @@ max_context = 1000000
     assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
 }
 
-#[test]
-async fn load_path_treats_the_pre_catalog_serialized_latency_default_as_unset() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-default_temperature = 0.7
-
-[causal_tree]
-schema_version = 1
-enabled = true
-"#,
-    )
-    .unwrap();
-
-    let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
-    assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
-
-    std::fs::write(
-        &config_path,
-        r#"
-default_temperature = 0.7
-
-[causal_tree]
-schema_version = 1
-enabled = true
-
-[causal_tree.policy]
-extra_latency_budget_ms = 500
-"#,
-    )
-    .unwrap();
-
-    let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
-    assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
-    assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
-
-    let upgraded = crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(
-        &loaded,
-        &[
-            crate::config::manage::mutation::decision_engine::CausalMutation::SetBackend {
-                kind: crate::config::schema::causal_tree::BackendKind::OpenRouter,
-                endpoint: None,
-                model: Some("typesafe/jev-1.13".to_owned()),
-                pinned_snapshot: None,
-                timeout_ms: None,
-            },
-        ],
-    )
-    .expect("a stored old default adopts the hosted catalog budget");
-    assert_eq!(upgraded.causal_tree.policy.extra_latency_budget_ms, 3_000);
-    assert!(upgraded.causal_tree.policy.extra_latency_budget_ms_explicit);
-}
-
 #[tokio::test]
 async fn sync_directory_handles_existing_directory() {
     let dir = std::env::temp_dir().join(format!("openprx_test_sync_directory_{}", uuid::Uuid::new_v4()));

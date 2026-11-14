@@ -3,50 +3,6 @@
 use super::*;
 use tokio::test;
 
-#[test]
-async fn explicit_hosted_latency_ceiling_loads_without_an_upgrade_warning() {
-    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("config.toml");
-    let version = crate::config::schema::causal_tree::CAUSAL_CONFIG_SCHEMA_VERSION;
-    std::fs::write(&path, format!("default_temperature = 0.7\n[auth]\ncodex_auth_json_auto_import = false\n[causal_tree]\nschema_version = {version}\nenabled = true\n[causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\npinned_snapshot = \"typesafe/jev-1.13-20260917\"\n[causal_tree.policy]\nextra_latency_budget_ms = 500\n")).unwrap();
-    let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
-    let config = loaded.unwrap();
-    assert!(config.causal_tree.policy.extra_latency_budget_ms_explicit);
-    assert_eq!(config.causal_tree.policy.extra_latency_budget_ms, 500);
-    assert!(config.decision_latency_budget_warning().is_none());
-    assert!(!logs.contains("below the catalog recommendation"), "{logs}");
-    assert!(
-        !crate::doctor::diagnose(&config)
-            .items
-            .iter()
-            .any(|item| item.message.contains("below the catalog recommendation"))
-    );
-}
-
-#[test]
-async fn schema_one_hosted_backend_warns_on_load_without_raising_the_latency_budget() {
-    let _serial = crate::config::secret_paths::fixture::LOG_CALLSITE_LOCK.lock().await;
-    let dir = tempfile::TempDir::new().expect("test: private config directory");
-    let path = dir.path().join("config.toml");
-    std::fs::write(
-        &path,
-        "default_temperature = 0.7\n\
-             [auth]\ncodex_auth_json_auto_import = false\n\
-             [causal_tree]\nschema_version = 1\nenabled = true\n\
-             [causal_tree.backend]\nkind = \"openrouter\"\nmodel = \"typesafe/jev-1.13\"\n\
-             pinned_snapshot = \"typesafe/jev-1.13-20260917\"\n\
-             [causal_tree.policy]\nextra_latency_budget_ms = 500\n",
-    )
-    .expect("test: write old hosted configuration");
-    let (loaded, logs) = capture_logs(|| Config::load_from_path(&path, dir.path().join("workspace")));
-    let loaded = loaded.expect("test: old hosted config loads");
-    assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
-    assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
-    assert!(logs.contains("below the catalog recommendation"), "{logs}");
-    assert!(logs.contains("500") && logs.contains("3000"), "{logs}");
-}
-
 #[tokio::test]
 async fn config_save_and_load_tmpdir() {
     let dir = std::env::temp_dir().join("openprx_test_config");
@@ -110,7 +66,6 @@ async fn config_save_and_load_tmpdir() {
         nodes: NodesConfig::default(),
         agents: HashMap::new(),
         media: MediaConfig::default(),
-        causal_tree: crate::config::schema::causal_tree::CausalTreeConfig::default(),
         decision_engine: Default::default(),
         security: SecurityConfig::default(),
         compliance: ComplianceConfig::default(),

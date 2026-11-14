@@ -162,8 +162,8 @@ impl ControlledH2Profile {
         Self::validate_trial_config(config)?;
         ensure!(config.skills_lifecycle.enabled, "controlled lifecycle is disabled");
         ensure!(
-            config.causal_tree.enabled && config.memory.events.record_user_messages,
-            "controlled entry requires enabled source admission and durable user events"
+            config.memory.events.record_user_messages,
+            "controlled entry requires durable user events"
         );
         Ok(())
     }

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::config::schema::causal_tree::{BackendKind, BackendLocality};
+use crate::config::schema::decision_engine::{BackendKind, BackendLocality};
 use crate::cost::decision_attempt::error::DecisionError;
 
 /// The longest connect timeout.

@@ -128,7 +128,6 @@ fn embedded_work_box_has_one_constructor_allocation_and_unpolled_drop_is_lazy() 
     config.workspace_dir = workspace.path().to_path_buf();
     config.config_path = workspace.path().join("config.toml");
     config.default_model = Some("prx-local-model".to_owned());
-    config.causal_tree.enabled = false;
     config.memory.backend = "sqlite".to_owned();
     let calls = Arc::new(AtomicUsize::new(0));
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(workspace.path()).expect("actual SQLite"));

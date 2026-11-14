@@ -407,7 +407,11 @@ fn process_seal_matches_inherited_backend_and_rejects_changed_override() {
         workspace_dir: dir.path().join("workspace"),
         ..Default::default()
     };
-    config.causal_tree.backend.timeout_ms = 2_000;
+    config
+        .decision_engine
+        .backend
+        .get_or_insert_with(Default::default)
+        .timeout_ms = 2_000;
     let generation = crate::config::new_shared(config.clone()).pin();
     let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"prx-engine-seal-fixture");
     let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
@@ -418,7 +422,8 @@ fn process_seal_matches_inherited_backend_and_rejects_changed_override() {
     )
     .unwrap();
     let binding = generation.bind_process(&key).unwrap();
-    config.decision_engine.backend = Some(config.causal_tree.backend.clone());
+    config.decision_engine.backend =
+        Some(crate::config::schema::decision_engine::effective_engine_backend(&config).clone());
     crate::config::ConfigGeneration::restore_process(config.clone(), &binding, &key).unwrap();
     let mut changed_advice = config.clone();
     changed_advice.decision_engine.prompt_budget_tokens += 1;
@@ -1014,7 +1019,7 @@ async fn analysis_is_identical_before_and_after_core_move() {
     let discovered = DiscoveredRefs::empty();
     let policy = CandidatePolicy {
         key: &key,
-        max_candidates: usize::from(config.causal_tree.policy.max_candidates),
+        max_candidates: usize::from(config.decision_engine.max_candidates),
         can_deliver_text: true,
         may_delegate: false,
         delegation_target: None,

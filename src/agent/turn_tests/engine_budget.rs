@@ -68,7 +68,7 @@ async fn configured_extra_token_ratio_caps_real_turn_admission() {
     config.agent.compaction.max_context_tokens = 32_768;
     config.agent.compaction.max_context_tokens_explicit = true;
     config.agent.compaction.reserve_tokens = 4_096;
-    config.causal_tree.policy.extra_token_ratio_limit = 0.01;
+    config.decision_engine.token_ratio_limit = 0.01;
 
     let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(Vec::new());
     let admission =
@@ -263,7 +263,6 @@ async fn small_native_schema_fixture(excluded: bool) {
             let mut admission_config = crate::config::Config::default();
             admission_config.workspace_dir = tmp.path().to_path_buf();
             admission_config.agent.compaction = config.clone();
-            admission_config.causal_tree.enabled = false;
             admission_config.tool_tiering.always_include = vec!["file_read".to_owned()];
             if excluded {
                 admission_config
@@ -474,7 +473,6 @@ async fn configured_small_native_schema_fixture() {
                 let mut admission_config = crate::config::Config::default();
                 admission_config.workspace_dir = tmp.to_path_buf();
                 admission_config.agent.compaction = config.clone();
-                admission_config.causal_tree.enabled = false;
                 admission_config.tool_tiering.always_include = vec!["file_read".to_owned()];
                 if excluded {
                     admission_config

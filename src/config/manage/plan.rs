@@ -104,7 +104,7 @@ pub enum RiskReason {
     /// replaced or removed.
     AccessGrantChanged { path: String },
     /// Decision state may leave this machine, or goes somewhere else (CDP
-    /// 13.1, CXR 4.4): `causal_tree.backend.remote_enabled` turned on, or,
+    /// 13.1, CXR 4.4): `decision_engine.backend.remote_enabled` turned on, or,
     /// while it is on, the backend `kind`, `endpoint`, `model` or
     /// `credential_ref` changed. Turning it off or selecting `builtin`
     /// narrows and stays low.
@@ -260,13 +260,15 @@ impl ConfigChangeSummary {
         access_paths.dedup();
         let mut secret_writes = written.iter().map(|leaf| leaf.display.clone()).collect::<Vec<_>>();
         secret_writes.extend(attached_reference_paths);
+        let after_reference = &crate::config::schema::decision_engine::effective_engine_backend(after).credential_ref;
         let decision_reference_added = matches!(
-            &after.causal_tree.backend.credential_ref,
-            crate::config::schema::causal_tree::CredentialRefSetting::Profile(_)
-        ) && before
-            .is_none_or(|before| before.causal_tree.backend.credential_ref != after.causal_tree.backend.credential_ref);
+            after_reference,
+            crate::config::schema::decision_engine::CredentialRefSetting::Profile(_)
+        ) && before.is_none_or(|before| {
+            &crate::config::schema::decision_engine::effective_engine_backend(before).credential_ref != after_reference
+        });
         if decision_reference_added {
-            secret_writes.push("causal_tree.backend.credential_ref".to_string());
+            secret_writes.push("decision_engine.backend.credential_ref".to_string());
         }
         secret_writes.sort();
         secret_writes.dedup();
@@ -707,7 +709,7 @@ fn diff(
                 !value.is_empty() && value != "none"
             });
             if names_credential
-                && path != "causal_tree.backend.credential_ref"
+                && path != "decision_engine.backend.credential_ref"
                 && matches!(raw.last(), Some(PathElem::Key(key)) if key == "credential_ref")
             {
                 ctx.credential_paths.push(path.clone());
@@ -914,11 +916,19 @@ fn widenings(before: &Config, after: &Config) -> Vec<RiskReason> {
 /// [`secret_paths::ENDPOINT_PATHS`], so re-pointing it is an
 /// [`RiskReason::EndpointChanged`] from the tree walk above.
 fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskReason> {
-    let default_section = crate::config::schema::causal_tree::CausalTreeConfig::default();
-    let old_section = before.map_or(&default_section, |before| &before.causal_tree);
-    let (old, new) = (&old_section.backend, &after.causal_tree.backend);
+    let default_section = crate::config::schema::decision_engine::DecisionEngineConfig::default();
+    let old_section = before.map_or(&default_section, |before| &before.decision_engine);
+    let new_section = &after.decision_engine;
+    let old = old_section
+        .backend
+        .as_ref()
+        .unwrap_or(&crate::config::schema::decision_engine::DEFAULT_BACKEND);
+    let new = new_section
+        .backend
+        .as_ref()
+        .unwrap_or(&crate::config::schema::decision_engine::DEFAULT_BACKEND);
     let mut reasons = Vec::new();
-    let path = |field: &str| format!("causal_tree.backend.{field}");
+    let path = |field: &str| format!("decision_engine.backend.{field}");
     let target_changes = [
         ("kind", old.kind != new.kind),
         ("endpoint", old.endpoint.trim() != new.endpoint.trim()),
@@ -930,8 +940,8 @@ fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskRe
         reasons.push(RiskReason::RemoteDecisionEnabled {
             path: path("remote_enabled"),
         });
-    } else if sends_remotely(&after.causal_tree) {
-        if sends_remotely(old_section) {
+    } else if sends_remotely(new_section.enabled, new) {
+        if sends_remotely(old_section.enabled, old) {
             // Still remote: a change to where or how decisions are sent.
             reasons.extend(
                 target_changes
@@ -940,10 +950,10 @@ fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskRe
                     .map(|(field, _)| RiskReason::RemoteDecisionEnabled { path: path(field) }),
             );
         } else if !old_section.enabled {
-            // L-1: enabling the plane starts remote I/O to a configured
+            // L-1: enabling the engine starts remote I/O to a configured
             // remote target.
             reasons.push(RiskReason::RemoteDecisionEnabled {
-                path: "causal_tree.enabled".to_string(),
+                path: "decision_engine.enabled".to_string(),
             });
         } else {
             // The target became remote.
@@ -964,18 +974,18 @@ fn decision_plane_changes(before: Option<&Config>, after: &Config) -> Vec<RiskRe
     reasons
 }
 
-/// Whether `section` sends decision state off this machine (D-079 M-2): the
-/// plane is enabled, remote processing is on, and the configured backend is
+/// Whether a backend sends decision state off this machine (D-079 M-2): the
+/// engine is enabled, remote processing is on, and the configured backend is
 /// remote by the factory's own rule (`configured_kind`, `locality_of`;
 /// D-082 N-5): a hosted kind, or a compatible endpoint that is not a literal
 /// loopback address. The builtin, `auto` without an endpoint and a loopback
 /// endpoint are local.
-fn sends_remotely(section: &crate::config::schema::causal_tree::CausalTreeConfig) -> bool {
-    section.enabled
-        && section.backend.remote_enabled
-        && crate::config::schema::causal_tree::configured_kind(&section.backend).is_some_and(|kind| {
-            crate::config::schema::causal_tree::locality_of(kind, section.backend.endpoint.trim())
-                == crate::config::schema::causal_tree::BackendLocality::Remote
+fn sends_remotely(enabled: bool, backend: &crate::config::schema::decision_engine::DecisionBackendConfig) -> bool {
+    enabled
+        && backend.remote_enabled
+        && crate::config::schema::decision_engine::configured_kind(backend).is_some_and(|kind| {
+            crate::config::schema::decision_engine::locality_of(kind, backend.endpoint.trim())
+                == crate::config::schema::decision_engine::BackendLocality::Remote
         })
 }
 
@@ -1521,8 +1531,8 @@ mod tests {
     /// low.
     #[test]
     fn remote_decision_processing_changes_are_high_risk_and_narrowing_is_low() {
-        use crate::config::schema::causal_tree::BackendKind;
-        use crate::config::schema::causal_tree::{BackendSelection, CredentialRefSetting};
+        use crate::config::schema::decision_engine::BackendKind;
+        use crate::config::schema::decision_engine::{BackendSelection, CredentialRefSetting};
         let reasons = |before: &Config, after: &Config| {
             let summary = ConfigChangeSummary::between(Some(before), after).expect("test: summary");
             assert_eq!(
@@ -1536,19 +1546,31 @@ mod tests {
             summary.risk_reasons
         };
         let remote = |field: &str| RiskReason::RemoteDecisionEnabled {
-            path: format!("causal_tree.backend.{field}"),
+            path: format!("decision_engine.backend.{field}"),
         };
         let local = Config::default();
         let mut remote_on = local.clone();
-        remote_on.causal_tree.enabled = true;
-        remote_on.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
-        remote_on.causal_tree.backend.endpoint = "https://decisions.example.com/v1".into();
-        remote_on.causal_tree.backend.remote_enabled = true;
+        remote_on.decision_engine.enabled = true;
+        remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "https://decisions.example.com/v1".into();
+        remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
         let turned_on = reasons(&local, &remote_on);
         assert!(turned_on.contains(&remote("remote_enabled")), "{turned_on:?}");
         assert!(
             turned_on.contains(&RiskReason::EndpointChanged {
-                path: "causal_tree.backend.endpoint".into()
+                path: "decision_engine.backend.endpoint".into()
             }),
             "{turned_on:?}"
         );
@@ -1562,16 +1584,30 @@ mod tests {
         for (field, change) in [
             (
                 "model",
-                (|config: &mut Config| config.causal_tree.backend.model = "decider-2".into()) as fn(&mut Config),
+                (|config: &mut Config| {
+                    config
+                        .decision_engine
+                        .backend
+                        .get_or_insert_with(Default::default)
+                        .model = "decider-2".into()
+                }) as fn(&mut Config),
             ),
             ("kind", |config| {
-                config.causal_tree.backend.kind = BackendSelection::Auto
+                config.decision_engine.backend.get_or_insert_with(Default::default).kind = BackendSelection::Auto
             }),
             ("endpoint", |config| {
-                config.causal_tree.backend.endpoint = "https://other.example.com/v1".into();
+                config
+                    .decision_engine
+                    .backend
+                    .get_or_insert_with(Default::default)
+                    .endpoint = "https://other.example.com/v1".into();
             }),
             ("credential_ref", |config| {
-                config.causal_tree.backend.credential_ref = CredentialRefSetting::None
+                config
+                    .decision_engine
+                    .backend
+                    .get_or_insert_with(Default::default)
+                    .credential_ref = CredentialRefSetting::None
             }),
         ] {
             let mut after = remote_on.clone();
@@ -1582,24 +1618,47 @@ mod tests {
 
         // Narrowing: remote off, and builtin, are low.
         let mut off = remote_on.clone();
-        off.causal_tree.backend.remote_enabled = false;
+        off.decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = false;
         assert_eq!(reasons(&remote_on, &off), Vec::new());
         // D-079 M-2: with remote on, a move to the builtin, and a change on a
         // local target, send nothing off the machine and stay low.
         let mut to_builtin = remote_on.clone();
-        to_builtin.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::Builtin);
+        to_builtin
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = BackendSelection::Fixed(BackendKind::Builtin);
         assert_eq!(
             reasons(&remote_on, &to_builtin),
             Vec::new(),
             "kind -> builtin is a narrowing"
         );
         let mut local_remote_on = local.clone();
-        local_remote_on.causal_tree.enabled = true;
-        local_remote_on.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
-        local_remote_on.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".into();
-        local_remote_on.causal_tree.backend.remote_enabled = true;
+        local_remote_on.decision_engine.enabled = true;
+        local_remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        local_remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "http://127.0.0.1:8900/v1".into();
+        local_remote_on
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .remote_enabled = true;
         let mut local_model = local_remote_on.clone();
-        local_model.causal_tree.backend.model = "decider-3".into();
+        local_model
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "decider-3".into();
         assert_eq!(
             reasons(&local_remote_on, &local_model),
             Vec::new(),
@@ -1609,51 +1668,75 @@ mod tests {
         // nothing off the machine; only the re-pointed credential recipient
         // is high.
         let mut to_loopback = remote_on.clone();
-        to_loopback.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".into();
+        to_loopback
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "http://127.0.0.1:8900/v1".into();
         assert_eq!(
             reasons(&remote_on, &to_loopback),
             vec![RiskReason::EndpointChanged {
-                path: "causal_tree.backend.endpoint".into()
+                path: "decision_engine.backend.endpoint".into()
             }]
         );
         // A local target that becomes remote while the switch is on is high.
         let mut becomes_remote = local_remote_on.clone();
-        becomes_remote.causal_tree.backend.endpoint = "https://decisions.example.com/v1".into();
+        becomes_remote
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "https://decisions.example.com/v1".into();
         assert!(reasons(&local_remote_on, &becomes_remote).contains(&remote("endpoint")));
-        // D-079 L-1: enabling the plane with a remote target configured is
+        // D-079 L-1: enabling the engine with a remote target configured is
         // high; disabling it is low.
         let mut disabled = remote_on.clone();
-        disabled.causal_tree.enabled = false;
+        disabled.decision_engine.enabled = false;
         assert_eq!(reasons(&remote_on, &disabled), Vec::new());
         assert_eq!(
             reasons(&disabled, &remote_on),
             vec![RiskReason::RemoteDecisionEnabled {
-                path: "causal_tree.enabled".into()
+                path: "decision_engine.enabled".into()
             }]
         );
         let mut builtin = local.clone();
-        builtin.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::Builtin);
+        builtin
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = BackendSelection::Fixed(BackendKind::Builtin);
         assert_eq!(reasons(&local, &builtin), Vec::new());
         let mut enabled = local.clone();
-        enabled.causal_tree.enabled = true;
-        assert_eq!(reasons(&local, &enabled), Vec::new(), "the local decision plane is low");
+        enabled.decision_engine.enabled = true;
+        assert_eq!(
+            reasons(&local, &enabled),
+            Vec::new(),
+            "the local decision engine is low"
+        );
 
         // With remote off: a new endpoint re-points the backend's credential,
         // and a credential reference change is a credential change.
         let mut endpoint = local.clone();
-        endpoint.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".into();
+        endpoint
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = "http://127.0.0.1:8900/v1".into();
         assert_eq!(
             reasons(&local, &endpoint),
             vec![RiskReason::EndpointChanged {
-                path: "causal_tree.backend.endpoint".into()
+                path: "decision_engine.backend.endpoint".into()
             }]
         );
         let mut credential = local.clone();
-        credential.causal_tree.backend.credential_ref = CredentialRefSetting::None;
+        credential
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .credential_ref = CredentialRefSetting::None;
         assert_eq!(
             reasons(&local, &credential),
             vec![RiskReason::CredentialChanged {
-                path: "causal_tree.backend.credential_ref".into()
+                path: "decision_engine.backend.credential_ref".into()
             }]
         );
     }

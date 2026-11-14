@@ -1,6 +1,6 @@
 //! Typed decision-plane mutations (SP-CDP-A 5.5 under D-040; CDP-12).
 //!
-//! The one mutation service of `[causal_tree]`: the CLI (`prx decision-engine
+//! The one mutation service of `[decision_engine]`: the CLI (`prx decision-engine
 //! config`), init and onboarding (CDP-14) and the Gateway (CDP-15) all build
 //! their change here, so the plan and the refusal text are the same on every
 //! surface. [`CausalConfigService::mutate`] is pure; [`CausalConfigService::plan`]
@@ -18,7 +18,9 @@
 //!   `decision_endpoint`, because `operations` is a complete list and a
 //!   shorter one would take the others away. Declarations are never
 //!   removed: a declaration enables nothing by itself.
-//! - `SetEngine` sets one key of the `[decision_engine]` allowlist
+//! - `SetEngine` sets one key of the `[decision_engine]` allowlist, the
+//!   turn limits `latency_budget_ms`, `token_ratio_limit` and
+//!   `max_candidates` included
 //!   ([`engine_setting`]); any other key, a secret-bearing key and the
 //!   retired `apply-calibration` are refused with [`EngineKeyError`].
 //! - `store_credential` stores a decision credential write-only under a new
@@ -40,16 +42,14 @@ use super::super::transaction::{
 };
 use crate::config::Config;
 use crate::config::files::ConfigRevisionConflict;
-use crate::config::schema::causal_tree::BackendKind;
-use crate::config::schema::causal_tree::{BackendSelection, CausalPolicy, CredentialRefSetting};
+use crate::config::schema::decision_engine::BackendKind;
+use crate::config::schema::decision_engine::{BackendSelection, CredentialRefSetting, DecisionBackendConfig};
 use crate::config::schema::{ModelOperationSetting, ProviderModelConfig};
 use crate::providers::catalog::{ModelOperation, Support};
 
 /// One change to the decision plane's configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CausalMutation {
-    /// Turn the decision plane on or off.
-    SetEnabled(bool),
     /// Choose the backend: its kind and, when given, its endpoint, pinned
     /// model, pinned snapshot (hosted kinds; D-043 C-8) and timeout. The
     /// model is declared for `decision_endpoint`. A kind that is not hosted
@@ -71,25 +71,9 @@ pub enum CausalMutation {
     SetRemote(bool),
     /// Set the credential reference (`""`, `"none"` or `cred-<name>`).
     SetCredentialRef(CredentialRefSetting),
-    /// Change explicit policy fields.
-    SetPolicy(PolicyPatch),
     /// Set one allowlisted `[decision_engine]` key (`prx decision-engine
     /// config set`, the Gateway's `/api/decision-engine/config/*`).
     SetEngine(EngineSetting),
-    /// Put every policy field back to its default.
-    ResetPolicyToDefaults,
-}
-
-/// Explicit policy fields; `None` keeps the current value.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PolicyPatch {
-    pub max_candidates: Option<u8>,
-    pub max_decision_hops: Option<u8>,
-    pub extra_latency_budget_ms: Option<u64>,
-    pub commit_threshold: Option<f32>,
-    pub minimum_choice_confidence: Option<f64>,
-    pub minimum_top_margin: Option<f64>,
-    pub extra_token_ratio_limit: Option<f32>,
 }
 
 /// One allowlisted `[decision_engine]` setting with its parsed value
@@ -103,6 +87,9 @@ pub enum EngineSetting {
     TimeoutMs(u32),
     TelemetryCap(u32),
     ObserveQueue(u32),
+    LatencyBudgetMs(u64),
+    TokenRatioLimit(f32),
+    MaxCandidates(u8),
     BackendKind(BackendSelection),
     BackendEndpoint(String),
     BackendModel(String),
@@ -128,12 +115,15 @@ impl EngineSetting {
                 | Self::TimeoutMs(_)
                 | Self::TelemetryCap(_)
                 | Self::ObserveQueue(_)
+                | Self::LatencyBudgetMs(_)
+                | Self::TokenRatioLimit(_)
+                | Self::MaxCandidates(_)
         )
     }
 
     fn apply(&self, config: &mut Config) {
         let engine = &mut config.decision_engine;
-        let backend = &mut config.causal_tree.backend;
+        let backend = engine.backend.get_or_insert_with(DecisionBackendConfig::default);
         match self {
             Self::Enabled(value) => engine.enabled = *value,
             Self::Mode(value) => engine.mode = *value,
@@ -142,6 +132,9 @@ impl EngineSetting {
             Self::TimeoutMs(value) => engine.timeout_ms = *value,
             Self::TelemetryCap(value) => engine.telemetry_cap = *value,
             Self::ObserveQueue(value) => engine.observe_queue = *value,
+            Self::LatencyBudgetMs(value) => engine.latency_budget_ms = *value,
+            Self::TokenRatioLimit(value) => engine.token_ratio_limit = *value,
+            Self::MaxCandidates(value) => engine.max_candidates = *value,
             Self::BackendKind(value) => backend.kind = *value,
             Self::BackendEndpoint(value) => backend.endpoint.clone_from(value),
             Self::BackendModel(value) => backend.model.clone_from(value),
@@ -210,6 +203,19 @@ pub fn engine_setting(key: &str, value: &str) -> Result<EngineSetting, EngineKey
         "timeout_ms" => EngineSetting::TimeoutMs(number()?),
         "telemetry_cap" => EngineSetting::TelemetryCap(number()?),
         "observe_queue" => EngineSetting::ObserveQueue(number()?),
+        "latency_budget_ms" => {
+            EngineSetting::LatencyBudgetMs(value.parse::<u64>().map_err(|_| invalid("an unsigned integer"))?)
+        }
+        "token_ratio_limit" => EngineSetting::TokenRatioLimit(
+            value
+                .parse::<f32>()
+                .ok()
+                .filter(|ratio| ratio.is_finite())
+                .ok_or_else(|| invalid("a finite number"))?,
+        ),
+        "max_candidates" => {
+            EngineSetting::MaxCandidates(value.parse::<u8>().map_err(|_| invalid("an integer from 0 to 255"))?)
+        }
         "backend.kind" => EngineSetting::BackendKind(
             BackendSelection::try_from(value.to_string()).map_err(|_| invalid("a backend kind"))?,
         ),
@@ -359,12 +365,9 @@ impl CausalConfigService {
     pub fn mutate(config: &Config, mutations: &[CausalMutation]) -> Result<Config, CausalMutationError> {
         let mut next = config.clone();
         for mutation in mutations {
-            apply_one(&mut next, mutation)?;
+            apply_one(&mut next, mutation);
         }
 
-        next.causal_tree
-            .validate()
-            .map_err(|error| CausalMutationError::Invalid(error.to_string()))?;
         next.decision_engine
             .validate()
             .map_err(|error| CausalMutationError::Invalid(error.to_string()))?;
@@ -415,7 +418,7 @@ impl CausalConfigService {
             .into());
         }
         let backend = crate::config::schema::decision_engine::effective_engine_backend(&desired);
-        let Some(selection) = crate::config::schema::causal_tree::configured_selection(backend) else {
+        let Some(selection) = crate::config::schema::decision_engine::configured_selection(backend) else {
             return Err(CausalMutationError::Invalid(
                 "no decision backend that takes a credential is configured".to_string(),
             ));
@@ -505,9 +508,9 @@ pub fn paired(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMuta
 /// Apply one mutation to `config`.
 ///
 /// A backend change starts from the effective engine backend (R55) and
-/// leaves `[decision_engine.backend]` and the legacy `[causal_tree.backend]`
-/// identical, so the change is the one the engine builds from.
-fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), CausalMutationError> {
+/// writes `[decision_engine.backend]`, so the change is the one the engine
+/// builds from.
+fn apply_one(config: &mut Config, mutation: &CausalMutation) {
     let backend_change = matches!(
         mutation,
         CausalMutation::ResetBackendToAuto
@@ -516,29 +519,11 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             | CausalMutation::SetBackend { .. }
     ) || matches!(mutation, CausalMutation::SetEngine(setting) if setting.is_backend());
     if backend_change {
-        config.causal_tree.backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
+        config.decision_engine.backend =
+            Some(crate::config::schema::decision_engine::effective_engine_backend(config).clone());
     }
-    apply_section(config, mutation)?;
-    if backend_change {
-        config.decision_engine.backend = Some(config.causal_tree.backend.clone());
-    }
-    Ok(())
-}
-
-fn apply_section(config: &mut Config, mutation: &CausalMutation) -> Result<(), CausalMutationError> {
-    let section = &mut config.causal_tree;
     match mutation {
-        CausalMutation::SetEnabled(enabled) => section.enabled = *enabled,
-        CausalMutation::ResetBackendToAuto => {
-            section.backend.kind = BackendSelection::Auto;
-            section.backend.endpoint.clear();
-            section.backend.model.clear();
-            section.backend.pinned_snapshot.clear();
-            section.backend.credential_ref = CredentialRefSetting::Unset;
-            section.backend.remote_enabled = false;
-        }
-        CausalMutation::SetRemote(remote) => section.backend.remote_enabled = *remote,
-        CausalMutation::SetCredentialRef(reference) => section.backend.credential_ref = reference.clone(),
+        CausalMutation::SetEngine(setting) => setting.apply(config),
         CausalMutation::SetBackend {
             kind,
             endpoint,
@@ -546,23 +531,27 @@ fn apply_section(config: &mut Config, mutation: &CausalMutation) -> Result<(), C
             pinned_snapshot,
             timeout_ms,
         } => {
-            section.backend.kind = BackendSelection::Fixed(*kind);
+            let backend = config
+                .decision_engine
+                .backend
+                .get_or_insert_with(DecisionBackendConfig::default);
+            backend.kind = BackendSelection::Fixed(*kind);
             if let Some(snapshot) = pinned_snapshot {
-                section.backend.pinned_snapshot = snapshot.trim().to_string();
+                backend.pinned_snapshot = snapshot.trim().to_string();
             } else if !matches!(kind, BackendKind::TypeSafe | BackendKind::OpenRouter) {
-                section.backend.pinned_snapshot.clear();
+                backend.pinned_snapshot.clear();
             }
             if let Some(endpoint) = endpoint {
-                section.backend.endpoint = endpoint.trim().to_string();
+                backend.endpoint = endpoint.trim().to_string();
             }
             if let Some(model) = model {
-                section.backend.model = model.trim().to_string();
+                backend.model = model.trim().to_string();
             }
             if let Some(timeout_ms) = timeout_ms {
-                section.backend.timeout_ms = *timeout_ms;
+                backend.timeout_ms = *timeout_ms;
             }
-            if let Some(selection) = crate::config::schema::causal_tree::configured_selection(&section.backend) {
-                let model = section.backend.model.trim().to_string();
+            if let Some(selection) = crate::config::schema::decision_engine::configured_selection(backend) {
+                let model = backend.model.trim().to_string();
                 if let Ok(catalog) = crate::providers::catalog::ReleaseCatalog::embedded_ref()
                     && let Some(entry) = catalog.model(&crate::providers::ProviderId::of(&selection.provider), &model)
                 {
@@ -570,63 +559,53 @@ fn apply_section(config: &mut Config, mutation: &CausalMutation) -> Result<(), C
                         && matches!(kind, BackendKind::TypeSafe | BackendKind::OpenRouter)
                         && let Some(snapshot) = &entry.pinned_snapshot
                     {
-                        section.backend.pinned_snapshot.clone_from(snapshot);
+                        backend.pinned_snapshot.clone_from(snapshot);
                     }
                     if timeout_ms.is_none()
                         && let Some(recommended) = entry.transport.recommended_timeout_ms
                         && let Ok(recommended) = u32::try_from(recommended)
                     {
-                        section.backend.timeout_ms = recommended;
+                        backend.timeout_ms = recommended;
                     }
-                    if let Some(recommended) = entry.transport.extra_latency_budget_ms {
-                        if !section.policy.extra_latency_budget_ms_explicit {
-                            section.policy.extra_latency_budget_ms = recommended;
-                            section.policy.extra_latency_budget_ms_explicit = true;
-                        } else if section.policy.extra_latency_budget_ms < recommended {
-                            tracing::warn!(
-                                configured_ms = section.policy.extra_latency_budget_ms,
-                                recommended_ms = recommended,
-                                provider = %selection.provider,
-                                model = %model,
-                                "the configured decision latency budget is below the release catalog recommendation"
-                            );
-                        }
+                    // The release catalog's latency recommendation raises a
+                    // lower budget; a larger configured budget is kept.
+                    if let Some(recommended) = entry.transport.extra_latency_budget_ms
+                        && config.decision_engine.latency_budget_ms < recommended
+                    {
+                        config.decision_engine.latency_budget_ms = recommended;
                     }
                 }
                 declare_decision_model(config, &selection.provider, &model);
             }
         }
-        CausalMutation::SetPolicy(patch) => {
-            let policy = &mut section.policy;
-            if let Some(value) = patch.max_candidates {
-                policy.max_candidates = value;
-            }
-            if let Some(value) = patch.max_decision_hops {
-                policy.max_decision_hops = value;
-            }
-            if let Some(value) = patch.extra_latency_budget_ms {
-                policy.extra_latency_budget_ms = value;
-                policy.extra_latency_budget_ms_explicit = true;
-            }
-            if let Some(value) = patch.commit_threshold {
-                policy.commit_threshold = value;
-            }
-            if let Some(value) = patch.minimum_choice_confidence {
-                policy.minimum_choice_confidence = value;
-            }
-            if let Some(value) = patch.minimum_top_margin {
-                policy.minimum_top_margin = value;
-            }
-            if let Some(value) = patch.extra_token_ratio_limit {
-                policy.extra_token_ratio_limit = value;
-            }
+        CausalMutation::ResetBackendToAuto => {
+            let backend = config
+                .decision_engine
+                .backend
+                .get_or_insert_with(DecisionBackendConfig::default);
+            backend.kind = BackendSelection::Auto;
+            backend.endpoint.clear();
+            backend.model.clear();
+            backend.pinned_snapshot.clear();
+            backend.credential_ref = CredentialRefSetting::Unset;
+            backend.remote_enabled = false;
         }
-        CausalMutation::ResetPolicyToDefaults => section.policy = CausalPolicy::default(),
-        CausalMutation::SetEngine(setting) => setting.apply(config),
+        CausalMutation::SetRemote(remote) => {
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(DecisionBackendConfig::default)
+                .remote_enabled = *remote;
+        }
+        CausalMutation::SetCredentialRef(reference) => {
+            config
+                .decision_engine
+                .backend
+                .get_or_insert_with(DecisionBackendConfig::default)
+                .credential_ref = reference.clone();
+        }
     }
-    Ok(())
 }
-
 /// The setting that names `operation`.
 const fn operation_setting(operation: ModelOperation) -> ModelOperationSetting {
     match operation {
@@ -739,7 +718,7 @@ mod tests {
             )]
         );
         assert_eq!(
-            next.causal_tree.backend.kind,
+            crate::config::schema::decision_engine::effective_engine_backend(&next).kind,
             BackendSelection::Fixed(BackendKind::CompatibleHttp)
         );
 
@@ -803,9 +782,12 @@ mod tests {
             ],
         )
         .expect("hosted backend");
-        assert!(matches!(hosted.causal_tree.backend.kind, BackendSelection::Fixed(_)));
+        assert!(matches!(
+            crate::config::schema::decision_engine::effective_engine_backend(&hosted).kind,
+            BackendSelection::Fixed(_)
+        ));
         let auto = CausalConfigService::mutate(&hosted, &[CausalMutation::ResetBackendToAuto]).expect("back to auto");
-        let backend = &auto.causal_tree.backend;
+        let backend = crate::config::schema::decision_engine::effective_engine_backend(&auto);
         assert_eq!(backend.kind, BackendSelection::Auto);
         assert!(backend.endpoint.is_empty() && backend.model.is_empty() && backend.pinned_snapshot.is_empty());
         assert_eq!(backend.credential_ref, CredentialRefSetting::Unset);
@@ -831,18 +813,17 @@ mod tests {
         .expect("catalog defaults produce a valid hosted backend");
 
         assert_eq!(
-            next.causal_tree.backend.pinned_snapshot,
+            crate::config::schema::decision_engine::effective_engine_backend(&next).pinned_snapshot,
             entry.pinned_snapshot.as_deref().expect("catalog snapshot")
         );
         assert_eq!(
-            u64::from(next.causal_tree.backend.timeout_ms),
+            u64::from(crate::config::schema::decision_engine::effective_engine_backend(&next).timeout_ms),
             entry.transport.recommended_timeout_ms.expect("catalog timeout")
         );
         assert_eq!(
-            next.causal_tree.policy.extra_latency_budget_ms,
+            next.decision_engine.latency_budget_ms,
             entry.transport.extra_latency_budget_ms.expect("catalog latency budget")
         );
-        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
         assert!(next.cost.prices.is_empty(), "built-in prices stay in the catalog");
         assert!(matches!(
             crate::llm::route_decision::usage_cost_resolution(
@@ -858,27 +839,23 @@ mod tests {
         ));
     }
 
+    /// The release catalog's latency recommendation raises a lower budget
+    /// and keeps a larger configured one.
     #[test]
-    fn set_backend_preserves_an_explicit_latency_budget_equal_to_the_default() {
-        let mut config = Config::default();
-        let default_budget = CausalPolicy::default().extra_latency_budget_ms;
-        config.causal_tree.policy.extra_latency_budget_ms = default_budget;
-        config.causal_tree.policy.extra_latency_budget_ms_explicit = true;
-
-        let next = CausalConfigService::mutate(
-            &config,
-            &[CausalMutation::SetBackend {
-                kind: BackendKind::OpenRouter,
-                endpoint: None,
-                model: Some("typesafe/jev-1.13".to_string()),
-                pinned_snapshot: None,
-                timeout_ms: Some(default_budget as u32),
-            }],
-        )
-        .expect("explicit operator budget remains valid");
-
-        assert_eq!(next.causal_tree.policy.extra_latency_budget_ms, default_budget);
-        assert!(next.causal_tree.policy.extra_latency_budget_ms_explicit);
+    fn set_backend_raises_only_a_lower_latency_budget() {
+        let hosted = CausalMutation::SetBackend {
+            kind: BackendKind::OpenRouter,
+            endpoint: None,
+            model: Some("typesafe/jev-1.13".to_string()),
+            pinned_snapshot: None,
+            timeout_ms: None,
+        };
+        let raised = CausalConfigService::mutate(&Config::default(), std::slice::from_ref(&hosted)).unwrap();
+        assert!(raised.decision_engine.latency_budget_ms > Config::default().decision_engine.latency_budget_ms);
+        let mut larger = Config::default();
+        larger.decision_engine.latency_budget_ms = 5_000;
+        let kept = CausalConfigService::mutate(&larger, &[hosted]).unwrap();
+        assert_eq!(kept.decision_engine.latency_budget_ms, 5_000);
     }
 
     /// D-094 C-2: a model-scoped entry without its own list (here one
@@ -931,34 +908,43 @@ mod tests {
         );
     }
 
-    /// Policy patches set only the named fields; reset restores every
-    /// default; an invalid value is refused by the section's validation.
+    /// The three turn limits are written under `[decision_engine]` through
+    /// the allowlist and validated with today's bounds.
     #[test]
-    fn policy_patches_are_explicit_and_validated() {
+    fn turn_limits_are_engine_settings_and_validated() {
         let next = CausalConfigService::mutate(
             &Config::default(),
-            &[CausalMutation::SetPolicy(PolicyPatch {
-                minimum_top_margin: Some(0.2),
-                ..PolicyPatch::default()
-            })],
+            &[
+                CausalMutation::SetEngine(engine_setting("latency_budget_ms", "3000").unwrap()),
+                CausalMutation::SetEngine(engine_setting("token_ratio_limit", "0.5").unwrap()),
+                CausalMutation::SetEngine(engine_setting("max_candidates", "4").unwrap()),
+            ],
         )
         .unwrap();
-        assert!((next.causal_tree.policy.minimum_top_margin - 0.2).abs() < f64::EPSILON);
-        assert_eq!(
-            next.causal_tree.policy.max_candidates,
-            CausalPolicy::default().max_candidates
-        );
-        let reset = CausalConfigService::mutate(&next, &[CausalMutation::ResetPolicyToDefaults]).unwrap();
-        assert_eq!(reset.causal_tree.policy, CausalPolicy::default());
+        assert_eq!(next.decision_engine.latency_budget_ms, 3_000);
+        assert!((next.decision_engine.token_ratio_limit - 0.5).abs() < f32::EPSILON);
+        assert_eq!(next.decision_engine.max_candidates, 4);
+        for (key, value) in [
+            ("latency_budget_ms", "49"),
+            ("latency_budget_ms", "5001"),
+            ("token_ratio_limit", "0"),
+            ("max_candidates", "0"),
+            ("max_candidates", "33"),
+        ] {
+            assert!(
+                matches!(
+                    CausalConfigService::mutate(
+                        &Config::default(),
+                        &[CausalMutation::SetEngine(engine_setting(key, value).unwrap())],
+                    ),
+                    Err(CausalMutationError::Invalid(_))
+                ),
+                "{key} = {value}"
+            );
+        }
         assert!(matches!(
-            CausalConfigService::mutate(
-                &Config::default(),
-                &[CausalMutation::SetPolicy(PolicyPatch {
-                    minimum_top_margin: Some(0.9),
-                    ..PolicyPatch::default()
-                })]
-            ),
-            Err(CausalMutationError::Invalid(_))
+            engine_setting("token_ratio_limit", "NaN"),
+            Err(EngineKeyError::InvalidValue { .. })
         ));
     }
 
@@ -974,6 +960,9 @@ mod tests {
             ("timeout_ms", "1500"),
             ("telemetry_cap", "0"),
             ("observe_queue", "64"),
+            ("latency_budget_ms", "500"),
+            ("token_ratio_limit", "0.35"),
+            ("max_candidates", "12"),
             ("backend.kind", "builtin"),
             ("backend.endpoint", LOOPBACK),
             ("backend.model", "decider-1"),
@@ -1083,9 +1072,9 @@ mod tests {
         let refused = apply(
             &service,
             &[
-                // An enabled plane: a disabled one never opens the credential
+                // An enabled engine: a disabled one never opens the credential
                 // store (D-082 N-9).
-                CausalMutation::SetEnabled(true),
+                CausalMutation::SetEngine(EngineSetting::Enabled(true)),
                 loopback_backend("decider-1"),
                 CausalMutation::SetCredentialRef(CredentialRefSetting::Profile("cred-chat-key".to_string())),
             ],
@@ -1116,7 +1105,6 @@ mod tests {
                 workspace_dir: temp.path().join("workspace"),
                 ..Config::default()
             };
-            config.causal_tree.enabled = false;
             config.secrets.encrypt = false;
             crate::config::files::write_split_config(&config, false)
                 .await
@@ -1130,13 +1118,16 @@ mod tests {
         };
         let first = apply(
             &service,
-            &[CausalMutation::SetEnabled(true), loopback_backend("decider-1")],
+            &[
+                CausalMutation::SetEngine(EngineSetting::Enabled(true)),
+                loopback_backend("decider-1"),
+            ],
         )
         .await
         .expect("test: applied");
-        // `[causal_tree]` activates on the next start without a rebuilding
+        // The engine activates on the next start without a rebuilding
         // participant; the desired configuration holds the change.
-        assert!(shared.desired().config.causal_tree.enabled);
+        assert!(shared.desired().config.decision_engine.enabled);
         let record = first.record_id.expect("test: recorded");
         let revision = ConfigTransactions::base_revision(&shared.desired()).expect("test: revision");
         service
@@ -1151,8 +1142,11 @@ mod tests {
             .await
             .expect("test: rolled back");
         let desired = shared.desired().config.clone();
-        assert!(!desired.causal_tree.enabled);
-        assert_eq!(desired.causal_tree.backend.kind, BackendSelection::Auto);
+        assert!(!desired.decision_engine.enabled);
+        assert_eq!(
+            crate::config::schema::decision_engine::effective_engine_backend(&desired).kind,
+            BackendSelection::Auto
+        );
         let history = service.transactions.history().unwrap();
         assert_eq!(history.get(&record).unwrap().status, RecordStatus::Activated);
     }
@@ -1184,7 +1178,7 @@ mod tests {
             "the stored credential was removed"
         );
         assert_eq!(
-            shared.desired().config.causal_tree.backend.credential_ref,
+            crate::config::schema::decision_engine::effective_engine_backend(&shared.desired().config).credential_ref,
             CredentialRefSetting::Unset
         );
 
@@ -1203,7 +1197,7 @@ mod tests {
         assert!(stored.outcome.record_id.is_some());
         let desired = shared.desired().config.clone();
         assert_eq!(
-            desired.causal_tree.backend.credential_ref,
+            crate::config::schema::decision_engine::effective_engine_backend(&desired).credential_ref,
             CredentialRefSetting::Profile(stored.id.clone())
         );
         let listed = CredentialReferences::for_config(&desired).unwrap().list().unwrap();
@@ -1373,9 +1367,21 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let (service, shared) = service(temp.path()).await;
         let mut candidate = shared.desired().config.as_ref().clone();
-        candidate.causal_tree.backend.kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
-        candidate.causal_tree.backend.endpoint = LOOPBACK.to_string();
-        candidate.causal_tree.backend.model = "undeclared".to_string();
+        candidate
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .kind = BackendSelection::Fixed(BackendKind::CompatibleHttp);
+        candidate
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .endpoint = LOOPBACK.to_string();
+        candidate
+            .decision_engine
+            .backend
+            .get_or_insert_with(Default::default)
+            .model = "undeclared".to_string();
         let before = std::fs::read(temp.path().join("config.toml")).unwrap();
         let plan = service
             .transactions
@@ -1388,7 +1394,7 @@ mod tests {
             .apply(plan, ConfigActor::GatewayConfigApi, confirmed(revision.as_deref()))
             .await;
         assert!(
-            matches!(refused, Err(ConfigTransactionError::Invalid(ref error)) if format!("{error:#}").contains("causal_tree.backend")),
+            matches!(refused, Err(ConfigTransactionError::Invalid(ref error)) if format!("{error:#}").contains("decision_engine.backend")),
             "{refused:?}"
         );
         assert_eq!(std::fs::read(temp.path().join("config.toml")).unwrap(), before);

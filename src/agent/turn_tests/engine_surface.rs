@@ -1115,11 +1115,7 @@ async fn production_turn_far_longer_than_the_idle_window_survives_on_progress() 
         .await
         .expect("owned mechanics decision listener");
     driver.stall_next_response(Duration::from_millis(
-        mechanics_config
-            .causal_tree
-            .policy
-            .extra_latency_budget_ms
-            .saturating_add(1),
+        mechanics_config.decision_engine.latency_budget_ms.saturating_add(1),
     ));
     let endpoint = driver.endpoint().to_owned();
     driver
@@ -1307,11 +1303,7 @@ async fn production_turn_whose_tool_goes_silent_past_the_window_is_terminated() 
         .expect("owned mechanics decision listener");
 
     driver.stall_next_response(Duration::from_millis(
-        mechanics_config
-            .causal_tree
-            .policy
-            .extra_latency_budget_ms
-            .saturating_add(1),
+        mechanics_config.decision_engine.latency_budget_ms.saturating_add(1),
     ));
     let endpoint = driver.endpoint().to_owned();
     driver

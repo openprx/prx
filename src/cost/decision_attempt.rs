@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 pub use error::DecisionError;
 
-use crate::config::schema::causal_tree::BackendKind;
+use crate::config::schema::decision_engine::BackendKind;
 use crate::providers::ProviderId;
 
 /// Token and cost accounting reported by a backend. Accounting only: a

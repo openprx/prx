@@ -131,7 +131,6 @@ mod working_root_tests {
             config.autonomy.level = crate::security::AutonomyLevel::Supervised;
             config.autonomy.workspace_only = false;
             config.autonomy.forbidden_paths = vec![root.path().join("blocked").to_string_lossy().into_owned()];
-            config.causal_tree.enabled = false;
             let generation = crate::config::new_shared(config.clone()).pin();
             let catalog = crate::providers::catalog::CatalogView::from_config(&config);
             let service =
