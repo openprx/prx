@@ -1128,7 +1128,7 @@ mod tests {
                         approval: None,
                         approval_resolver: None,
                         runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-                            verify_chat_completion: false,
+                            guarded_delivery: false,
                             provider_trace: None,
                             events: None,
                             stream_provider: false,

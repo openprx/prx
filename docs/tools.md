@@ -138,56 +138,7 @@ deadline, interactive shell session, or permission setting is added by this
 result contract. These facts establish what executed; they do not establish
 that the user's whole task succeeded or validate arbitrary assistant prose.
 
-## Chat request intent and completion
-
-Tool-enabled `prx chat` resolves the current request's execution requirement
-before its first ordinary tool batch. The configured provider and model return
-strict JSON: execution_required, informational or uncertain. The original
-source-bound request is explicit; conversation is context data. The result is
-reused for the turn and is not permission to bypass source, model, scope, cost
-or approval gates. Exact-call collection retains its non-executing path.
-
-An informational tool proposal is discarded and the model retries without
-executable tools. Repeated proposals cannot reopen execution. An uncertain
-request receives clarification without dispatch; an invalid assessment fails
-without dispatch. Assessment calls use the existing physical accounting and
-turn trace, and their configured event record identifies the pre-dispatch phase.
-
-A tool-free final draft still receives the same assessment when none exists.
-Required execution triggers one corrective tool round through the existing
-executor. Earlier conversation is serialized as context data on text-only
-retries, preserving current policy and preventing imitation of old approvals.
-A second draft without a required tool result remains explicitly unverified.
-Rejected drafts are not recorded or streamed as final answers.
-
-Tool-backed final replies also receive a bounded review against the original
-request, proposed answer and observed tool results. The review checks support for
-completion claims, including requested reusable source files, validation evidence
-and established metric definitions. An unsupported draft gets one corrective
-attempt through the normal tool path, followed by another review. A second
-rejection, invalid JSON or uncertain evidence ends with an explicit unverified
-error. Honest failures, partial results and refusals can be reported without
-claiming completion; the review does not grant permission or require repeating
-completed side effects. Explicit command/call limits remain binding.
-
-The review must also return structured execution restrictions quoted from the
-current request: whole-tool bans, maximum call counts, exact shell commands, and
-other semantic restrictions. An action-specific restriction such as not installing
-dependencies must not become a ban on every shell command; semantic restrictions
-inform the model's verdict, while the other shapes have mechanical checks.
-PRX checks those extracted restrictions against complete per-tool execution counts
-and command hashes, even when detailed evidence has been evicted. Runtime backend
-identities accompany public aliases, so a skill alias backed by `skill_read` is
-recognized as that execution. Alias and backend counts overlap and are not added
-together when counting all calls. A detected
-violation ends the turn as unverified without another execution retry; later
-successful calls cannot erase it. The extraction is still model-based and may
-miss a restriction; it is an acceptance check, not a new permission boundary.
-Missing or malformed restriction data fails closed. A structurally valid review
-with an invalid quoted extraction gets at most one auxiliary repair, using the
-same execution evidence and no tools. A valid detected violation takes precedence
-over invalid extractions and cannot enter that repair path. A second invalid
-extraction ends the turn without delivering the draft.
+## Chat tool discovery and delivery
 
 A uniquely named read-only operation can acquire its own evidence before generic
 context retrieval, even if the request also mentions a tool with side effects.
@@ -200,20 +151,10 @@ after the loader narrows the slice. Neither path grants execution: the same
 publication, exclusion, read-only, child-scope and execution checks apply.
 The request snapshot identifies discovery as the way to obtain a missing schema.
 
-The configured provider/model performs the review. Evidence retains at most 24
-tool records, with bounded argument/result excerpts and explicit truncation and
-omission markers. Reviews are input-budget checked, cancellable and accounted
-for in provider usage. Chat final text is buffered until accepted; tool progress
-remains visible. Expect one extra model request for an eligible final reply,
-plus one further review if a tool-backed draft needs correction. Each review can
-make one additional request to repair invalid constraint extraction. Plan mode and
-other hosts retain their existing behavior. Approval and sandbox rules are
-unchanged.
-
-Both classification and review are model predictions and can be wrong. A review
-acceptance is not an independent artifact verifier or a guarantee that the whole
-task succeeded. Keep task-specific external checks for file delivery, numeric
-contracts, replay and other acceptance criteria.
+Tool-enabled `prx chat` buffers the final reply until response guards and
+outbound middleware accept it, so the rendered text equals the persisted reply;
+tool progress remains visible. The model decides whether to use tools; approval,
+policy and the executor are the only enforcement.
 
 ## Chat execution colors
 

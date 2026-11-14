@@ -1098,7 +1098,7 @@ async fn read_only_autonomy_denies_an_act_tool_before_approval_or_execution() {
     )
     .with_idempotency_memory(ledger);
     let adapter = ToolLoopRuntimeAdapter {
-        verify_chat_completion: false,
+        guarded_delivery: false,
         provider_trace: None,
         events: None,
         stream_provider: false,

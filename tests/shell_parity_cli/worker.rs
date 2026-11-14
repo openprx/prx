@@ -64,14 +64,9 @@ async fn root_pwd(worker: bool, override_root: bool) {
         let captured = captured_for_server.clone();
         async move {
             let messages = request.get("messages").and_then(Value::as_array).expect("test: request messages");
-            let text = request.to_string();
             let child = messages.iter().rev().find(|message| message.get("role").and_then(Value::as_str) == Some("user")).and_then(|message| message.get("content").and_then(Value::as_str)).is_some_and(|input| input.contains("PRX-PWD-CHILD"));
             let tool_call = |name: &str, arguments: Value| json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call-{}", uuid::Uuid::new_v4()),"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]});
-            let assistant = if text.contains("Review the proposed final reply against the CURRENT request") {
-                json!({"role":"assistant","content":r#"{"decision":"accept","reason":"fixture evidence","constraints":[]}"#})
-            } else if text.contains("Classify the execution requirement of current_request") {
-                json!({"role":"assistant","content":r#"{"requirement":"execution_required"}"#})
-            } else if child || !worker {
+            let assistant = if child || !worker {
                 if child_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     tool_call("shell", json!({"command":"pwd"}))
                 } else {

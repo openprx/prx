@@ -66,6 +66,10 @@ use expectrl::session::Session;
 use serial_test::serial;
 use tempfile::TempDir;
 
+#[path = "chat_pty_e2e/guarded_delivery.rs"]
+mod guarded_delivery;
+#[path = "support/loopback_openai.rs"]
+mod loopback_openai;
 #[path = "chat_pty_e2e/search_reachability.rs"]
 mod search_reachability;
 
@@ -192,32 +196,9 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
                 .lock()
                 .expect("request sink")
                 .iter()
-                .filter(|(_, body)| {
-                    body.contains("PRX_CHAT_PARENT")
-                        && !body.contains("Classify the execution requirement of current_request")
-                        && !body.contains("Review the proposed final reply against")
-                })
+                .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
                 .count();
-            let request: serde_json::Value = serde_json::from_str(&body).expect("JSON request");
-            let completion_review = request["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["role"] == "system"
-                        && message["content"]
-                            .as_str()
-                            .is_some_and(|content| content.starts_with("Review the proposed final reply against"))
-                })
-            });
-            let intent_review = body.contains("Classify the execution requirement of current_request");
-            let message = if intent_review {
-                let requirement = if body.contains("PRX_CHAT_PARENT") {
-                    "execution_required"
-                } else {
-                    "informational"
-                };
-                serde_json::json!({"role":"assistant","content":serde_json::json!({"requirement":requirement}).to_string()})
-            } else if completion_review {
-                serde_json::json!({"role":"assistant","content":r#"{"decision":"accept","reason":"Observed spawn and join results","constraints":[]}"#})
-            } else if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
+            let message = if body.contains("PRX_CHAT_PARENT") && parent_count == 1 {
                 serde_json::json!({"role":"assistant","content":null,"tool_calls":[{
                     "id":"call-prx-chat-spawn","type":"function","function":{
                         "name":"sessions_spawn","arguments":serde_json::json!({
@@ -342,9 +323,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         "parent did not observe one completed child; parent requests={}, total requests={}, tool results={observed_results:?}, stdout={}, stderr={}",
         requests
             .iter()
-            .filter(|(_, body)| body.contains("PRX_CHAT_PARENT")
-                && !body.contains("Classify the execution requirement of current_request")
-                && !body.contains("Review the proposed final reply against"))
+            .filter(|(_, body)| body.contains("PRX_CHAT_PARENT"))
             .count(),
         requests.len(),
         String::from_utf8_lossy(&output.stdout),
@@ -550,10 +529,21 @@ fn build_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &
 }
 
 fn build_unprepared_chat_command_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Command {
+    build_provider_chat_command_in(guard, "mock", "mock", extra_args, extra_env)
+}
+
+/// `prx chat -p <provider> --model <model>` with the hermetic environment.
+fn build_provider_chat_command_in(
+    guard: &HarnessGuard,
+    provider: &str,
+    model: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Command {
     let mut cmd = Command::new(prx_binary());
     cmd.arg("chat");
-    cmd.arg("-p").arg("mock");
-    cmd.arg("--model").arg("mock");
+    cmd.arg("-p").arg(provider);
+    cmd.arg("--model").arg(model);
     for a in extra_args {
         cmd.arg(a);
     }
@@ -2866,39 +2856,4 @@ fn test_chat_re_enrols_by_itself_after_the_daemon_forgets_its_session() {
 
     session.send("/exit\r").expect("send /exit");
     assert!(wait_for_exit(session, EXIT_TIMEOUT), "chat should exit cleanly");
-}
-
-/// A fabricated completion must not leak through either terminal delivery path.
-/// The fixture supplies a structured execution-required verdict and repeats the
-/// same final draft; the production loop must exhaust one correction and fail.
-#[test]
-#[serial(prx_chat_pty)]
-fn unexecuted_completion_is_not_delivered_in_plain_or_fullscreen_chat() {
-    for tui in ["0", "1"] {
-        let sentinel = "UNEXECUTED_COMPLETION_MUST_NOT_APPEAR";
-        let (mut sg, _guard) = spawn_chat(
-            &[],
-            &[
-                ("PRX_TUI", tui),
-                ("OPENPRX_MOCK_RESPONSE", sentinel),
-                (
-                    "OPENPRX_MOCK_EXECUTION_ASSESSMENT",
-                    r#"{"requirement":"execution_required"}"#,
-                ),
-            ],
-        );
-        let session = sg.session();
-        read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
-        drain_with_dsr(session, Duration::from_millis(200));
-        session
-            .send("Use shell to run exactly printf ACTUAL_EXECUTION_REQUIRED and report its output.\r")
-            .expect("send actual execution request");
-        let captured = read_until_with_dsr(session, "unverified", TURN_TIMEOUT);
-        assert!(
-            !captured.contains(sentinel),
-            "rejected draft reached the terminal: {captured}"
-        );
-        session.send("/exit\r").expect("send /exit");
-        assert!(wait_for_exit(session, EXIT_TIMEOUT), "rejected turn must exit cleanly");
-    }
 }

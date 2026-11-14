@@ -12,7 +12,6 @@ pub(super) struct ObservedToolResult {
     pub content: String,
     pub status: crate::tools::ToolExecutionStatus,
     pub executed: bool,
-    pub backend_name: Option<String>,
 }
 
 impl ObservedToolResult {
@@ -21,7 +20,6 @@ impl ObservedToolResult {
             content,
             status,
             executed: false,
-            backend_name: None,
         }
     }
 

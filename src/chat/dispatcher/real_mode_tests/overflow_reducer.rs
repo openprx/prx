@@ -62,14 +62,6 @@ impl Provider for OverflowProvider {
         )
     }
     async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-        let requirement = if self.rounds > 0 {
-            super::super::assessment_fixture::EXECUTION_REQUIRED
-        } else {
-            super::super::assessment_fixture::INFORMATIONAL
-        };
-        if let Some(response) = super::super::assessment_fixture::response(&request, requirement) {
-            return Ok(response);
-        }
         self.response(request.messages)
     }
     fn stream_chat_with_history(

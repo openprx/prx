@@ -742,7 +742,7 @@ async fn run_console_runtime_turn(
             approval: None,
             approval_resolver: None,
             runtime_adapter: Some(crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-                verify_chat_completion: false,
+                guarded_delivery: false,
                 provider_trace: decision
                     .provider_trace
                     .as_ref()

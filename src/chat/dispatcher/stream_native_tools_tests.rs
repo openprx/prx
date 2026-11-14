@@ -392,27 +392,6 @@ mod tests {
             post(move |Json(request): Json<serde_json::Value>| {
                 let sink = Arc::clone(&sink);
                 async move {
-                    if request["stream"] != true {
-                        let text = super::super::assessment_fixture::reply(
-                            &wire.system_text(&request),
-                            super::super::assessment_fixture::EXECUTION_REQUIRED,
-                        )
-                        .expect("non-streaming request is a reply assessment");
-                        assert!(request["tools"].as_array().is_none_or(Vec::is_empty));
-                        sink.lock().push(request);
-                        let body = match wire {
-                            Wire::OpenAi => serde_json::json!({
-                                "choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
-                                "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
-                            }),
-                            Wire::Anthropic => serde_json::json!({
-                                "id":"assessment", "type":"message", "role":"assistant", "model":FIXTURE_MODEL,
-                                "content":[{"type":"text","text":text}], "stop_reason":"end_turn",
-                                "usage":{"input_tokens":3,"output_tokens":2}
-                            }),
-                        };
-                        return ([(header::CONTENT_TYPE, "application/json")], body.to_string());
-                    }
                     let reply = {
                         let mut requests = sink.lock();
                         let reply = if !requests.is_empty() {
@@ -679,9 +658,9 @@ mod tests {
             Some("x")
         );
 
-        // 3. One result follow-up and one bounded completion assessment.
-        assert_completion_assessment(wire, run);
-        let second = run.requests.get(2).expect("test: tool-result follow-up request");
+        // 3. Exactly one result follow-up and no auxiliary request.
+        assert_main_requests_only(run);
+        let second = run.requests.get(1).expect("test: tool-result follow-up request");
         assert!(
             result_carried(second),
             "the second request must carry the tool result; body: {second}"
@@ -782,24 +761,15 @@ mod tests {
     // STREAM-f: a half-received tool call never executes
     // -----------------------------------------------------------------
 
-    fn assert_completion_assessment(wire: Wire, run: &ChatRun) {
+    fn assert_main_requests_only(run: &ChatRun) {
         assert_eq!(
             run.requests.len(),
-            4,
-            "two task requests plus intent and completion assessments"
+            2,
+            "the offering request plus the tool-result follow-up"
         );
-        let review = run.requests.get(3).expect("completion assessment request");
-        assert_ne!(review["stream"], true);
-        assert!(review["tools"].as_array().is_none_or(Vec::is_empty));
-        assert_eq!(
-            super::super::assessment_fixture::reply(
-                &wire.system_text(review),
-                super::super::assessment_fixture::EXECUTION_REQUIRED
-            ),
-            Some(super::super::assessment_fixture::ACCEPT),
-        );
-        let body = review.to_string();
-        assert!(body.contains("observed_tools") && body.contains("proposed_final_reply"));
+        for request in &run.requests {
+            assert_eq!(request["stream"], true, "every request is a streamed main turn request");
+        }
     }
 
     fn stream_failures(run: &ChatRun) -> Vec<&str> {
@@ -937,12 +907,11 @@ mod tests {
 
         async fn chat(
             &self,
-            request: crate::providers::traits::ChatRequest<'_>,
+            _: crate::providers::traits::ChatRequest<'_>,
             _: &str,
             _: f64,
         ) -> anyhow::Result<crate::providers::traits::ChatResponse> {
-            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
-                .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
+            anyhow::bail!("test: the streaming fixture serves only streamed requests")
         }
 
         fn supports_streaming(&self) -> bool {
@@ -1194,7 +1163,7 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("x")
         );
-        assert_completion_assessment(Wire::OpenAi, &run);
+        assert_main_requests_only(&run);
         assert_eq!(stream_completions(&run), ["done"]);
     }
 
@@ -1246,8 +1215,8 @@ mod tests {
             server.abort();
 
             assert_eq!(run.tool_calls, 0, "the refused call never runs");
-            assert_completion_assessment(wire, &run);
-            let second = run.requests.get(2).expect("test: tool-result follow-up request");
+            assert_main_requests_only(&run);
+            let second = run.requests.get(1).expect("test: tool-result follow-up request");
             let replayed: Vec<serde_json::Value> = second["messages"]
                 .as_array()
                 .into_iter()
@@ -1313,8 +1282,8 @@ mod tests {
                 server.abort();
 
                 assert_eq!(run.tool_calls, 0, "{arguments}: the call never runs");
-                assert_completion_assessment(wire, &run);
-                let second = run.requests.get(2).expect("test: tool-result follow-up request");
+                assert_main_requests_only(&run);
+                let second = run.requests.get(1).expect("test: tool-result follow-up request");
                 let replayed: Vec<serde_json::Value> = second["messages"]
                     .as_array()
                     .into_iter()

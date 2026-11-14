@@ -520,12 +520,6 @@ async fn run_turn_unguarded(
     // claims tool use (`[Used tools: ...]`) while this is still false is a
     // fabrication, and the only case worth spending a corrective retry on.
     let mut executed_any_tool_call = false;
-    let assessment_source = runtime_adapter.verify_chat_completion.then(|| history.clone());
-    let mut observed_tool_results = false;
-    let mut completion_evidence = super::completion_review::CompletionEvidence::default();
-    let mut completion_correction: Option<String> = None;
-    let mut execution_requirement = None;
-    let mut inject_execution_retry = false;
     let mut overflow_recovery_passes: usize = 0;
     let mut empty_response_retry_attempted = false;
     let mut inject_empty_response_retry_instruction = false;
@@ -700,12 +694,6 @@ async fn run_turn_unguarded(
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
-        if matches!(
-            execution_requirement,
-            Some(super::execution_requirement::ExecutionRequirement::Informational)
-        ) {
-            tool_specs.clear();
-        }
         let mut tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
         let mut tool_surface_counts =
             RequestToolSurfaceCounts::measure(tools_registry.len(), selected_tools.len(), &tool_catalog, &tool_specs);
@@ -816,50 +804,15 @@ async fn run_turn_unguarded(
         // one by `coalesce_system_messages_at_front` below, which appends bytes
         // to the system prefix and misses the provider-side prefix cache for
         // the whole conversation — on the one turn that is already paying for a
-        // wasted provider call. The execution retry separately serializes text
-        // history as data to prevent imitation of earlier runtime notices. Both
-        // paths keep the leading system policy unchanged and the "exactly one
-        // system message, at index 0" shape that strict chat templates require.
-        let verify_chat_completion = runtime_adapter.verify_chat_completion
-            && !chat_mode.intercepts_writes()
-            && (!tool_specs.is_empty() || execution_requirement.is_some());
-        if matches!(
-            execution_requirement,
-            Some(super::execution_requirement::ExecutionRequirement::Informational)
-        ) {
-            append_corrective_aside(
-                &mut prepared_messages.messages,
-                super::execution_requirement::INFORMATIONAL_REPLY_MESSAGE,
-            );
-        }
-        if inject_execution_retry && image_marker_count == 0 {
-            prepared_messages.messages = super::execution_requirement::retry_messages(&prepared_messages.messages);
-        }
-        if verify_chat_completion {
-            append_corrective_aside(
-                &mut prepared_messages.messages,
-                super::completion_review::COMPLETION_INSTRUCTIONS,
-            );
-            if let Some(correction) = &completion_correction {
-                append_corrective_aside(&mut prepared_messages.messages, correction);
-            }
-        }
-        if inject_execution_retry {
-            append_corrective_aside(
-                &mut prepared_messages.messages,
-                super::execution_requirement::RETRY_MESSAGE,
-            );
-            if let Some(config) = compaction_config {
-                anyhow::ensure!(
-                    estimate_request_tokens(
-                        estimate_history_tokens_with_source(&prepared_messages.messages),
-                        tool_surface.native_payload.measurement
-                    ) <= config.max_context_tokens.saturating_sub(config.reserve_tokens),
-                    "execution correction exceeds the request budget; execution is unverified"
-                );
-            }
-            inject_execution_retry = false;
-        }
+        // wasted provider call. This keeps the leading system policy unchanged
+        // and the "exactly one system message, at index 0" shape that strict
+        // chat templates require.
+        //
+        // Guarded delivery: an interactive chat turn with tools buffers the
+        // provider stream so response guards and outbound middleware run before
+        // any text renders; the rendered text then equals the persisted reply.
+        let guarded_delivery =
+            runtime_adapter.guarded_delivery && !chat_mode.intercepts_writes() && !tool_specs.is_empty();
         if inject_tool_summary_retry_instruction {
             append_corrective_aside(&mut prepared_messages.messages, TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE);
             inject_tool_summary_retry_instruction = false;
@@ -914,16 +867,6 @@ async fn run_turn_unguarded(
         if let Some(required) = required_lookup_spec {
             tool_specs.retain(|spec| spec.name != crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME);
             tool_specs.push(required);
-        }
-        if matches!(
-            execution_requirement,
-            Some(super::execution_requirement::ExecutionRequirement::Informational)
-        ) {
-            tool_specs.clear();
-            #[cfg(feature = "wasm-plugins")]
-            {
-                tool_specs_rewritten = true;
-            }
         }
         if !tool_specs.iter().any(|spec| spec.name == "skill_read")
             && prepared_messages
@@ -1232,7 +1175,7 @@ async fn run_turn_unguarded(
                     temperature,
                     cancellation_token.as_ref(),
                     &runtime_adapter,
-                    !verify_chat_completion,
+                    !guarded_delivery,
                 ))
                 .await
         } else {
@@ -1332,7 +1275,6 @@ async fn run_turn_unguarded(
                     tokens_used: TokenUsage::default(),
                     execution_trace: None,
                 };
-                completion_evidence.record_serving_model(model, &last_turn_trace);
                 if let Some(retained) = &runtime_adapter.provider_trace {
                     retained.completed(
                         &last_turn_trace,
@@ -1478,7 +1420,7 @@ async fn run_turn_unguarded(
 
         // Recover from at most three provider overflows per turn, and only
         // retry when the restored request view makes measurable progress.
-        let (mut response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
+        let (response_text, parsed_text, mut tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
                 // A stream that failed after model output is never compacted
                 // and replayed: the unsafe-replay refusal it carries stands.
@@ -1645,83 +1587,6 @@ async fn run_turn_unguarded(
             parsed_text
         };
 
-        // A provider tool call is only a proposal until the current request's
-        // execution requirement has been resolved. Reuse that result for the
-        // whole turn; a model reply cannot change it after dispatch starts.
-        if verify_chat_completion && !tool_calls.is_empty() {
-            use super::execution_requirement::ExecutionRequirement;
-            let already_resolved = execution_requirement.is_some();
-            if !already_resolved {
-                let budget = compaction_config.map_or(8192, |config| {
-                    config.max_context_tokens.saturating_sub(config.reserve_tokens)
-                });
-                let source = assessment_source.as_deref().unwrap_or(history);
-                let messages =
-                    super::execution_requirement::assessment_messages(source, proof.routing_input(), budget)?;
-                if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                    Box::pin(record_assessment_request(
-                        fabric,
-                        scope.clone(),
-                        provider_name,
-                        model,
-                        "execution_requirement",
-                        &messages,
-                    ))
-                    .await?;
-                }
-                super::send_admission::admit_provider_send(
-                    service,
-                    context,
-                    proof,
-                    &messages,
-                    None,
-                    runtime_adapter.tool_execution_context.schema_dialect,
-                )?;
-                let trace = Box::pin(
-                    super::turn_assessment::AssessmentCall {
-                        provider,
-                        provider_name,
-                        model,
-                        observer,
-                        hooks,
-                        runtime_adapter: &runtime_adapter,
-                        execution_trace: execution_adapter.tool_execution_context.execution_trace.as_ref(),
-                        parameter_capture: &parameter_capture,
-                        cancellation_token: cancellation_token.as_ref(),
-                        last_turn_trace: &mut last_turn_trace,
-                        usage_accumulator: &mut usage_accumulator,
-                        any_turn_had_fallback: &mut any_turn_had_fallback,
-                    }
-                    .chat(&messages, "execution_requirement"),
-                )
-                .await?;
-                let requirement = super::execution_requirement::parse_assessment(&trace.response)?;
-                super::turn_assessment::record_outcome(
-                    event_fabric.as_ref(),
-                    request_event_scope.as_ref(),
-                    &super::completion_review::ReplyAssessment::Execution(requirement),
-                    &trace,
-                    "pre_dispatch",
-                )
-                .await?;
-                execution_requirement = Some(requirement);
-            }
-            let Some(requirement) = execution_requirement else {
-                anyhow::bail!("execution requirement was not resolved; nothing was dispatched");
-            };
-            match requirement {
-                ExecutionRequirement::ExecutionRequired => {}
-                ExecutionRequirement::Informational if !already_resolved => continue,
-                ExecutionRequirement::Informational | ExecutionRequirement::Uncertain => {
-                    // Do not put the discarded native call into history or the
-                    // executor. Repeated proposals cannot reopen this turn.
-                    tool_calls.clear();
-                    response_text = super::execution_requirement::CLARIFICATION_REPLY.to_string();
-                    display_text.clone_from(&response_text);
-                }
-            }
-        }
-
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
             if is_tool_summary_only_response(&response_text) {
@@ -1779,130 +1644,6 @@ async fn run_turn_unguarded(
                     anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
                 }
             }
-            if verify_chat_completion {
-                use super::completion_review::{CompletionDecision, ReplyAssessment};
-                use super::execution_requirement::{ExecutionRequirement, assessment_messages, parse_assessment};
-                let assessment = if !observed_tool_results && let Some(requirement) = execution_requirement {
-                    ReplyAssessment::Execution(requirement)
-                } else {
-                    // Keep the assessment and persistence future off the turn's
-                    // already large stack frame, including debug/PTY builds.
-                    Box::pin(async {
-                    let budget = compaction_config.map_or(8192, |config| {
-                        config.max_context_tokens.saturating_sub(config.reserve_tokens)
-                    });
-                    let source = assessment_source.as_deref().unwrap_or(history);
-                    let mut assessment_messages = if observed_tool_results {
-                        completion_evidence.messages(source, &display_text, budget)?
-                    } else {
-                        assessment_messages(source, proof.routing_input(), budget)?
-                    };
-                    let purpose = if observed_tool_results { "completion_review" } else { "execution_requirement" };
-                    let mut review_repair_attempted = false;
-                    loop {
-                    super::send_admission::admit_provider_send(
-                        service,
-                        context,
-                        proof,
-                        &assessment_messages,
-                        None,
-                        runtime_adapter.tool_execution_context.schema_dialect,
-                    )?;
-                    if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                        Box::pin(record_assessment_request(fabric, scope.clone(), provider_name, model, purpose, &assessment_messages)).await?;
-                    }
-                    let trace = Box::pin(super::turn_assessment::AssessmentCall {
-                        provider, provider_name, model, observer, hooks,
-                        runtime_adapter: &runtime_adapter,
-                        execution_trace: execution_adapter.tool_execution_context.execution_trace.as_ref(),
-                        parameter_capture: &parameter_capture,
-                        cancellation_token: cancellation_token.as_ref(),
-                        last_turn_trace: &mut last_turn_trace,
-                        usage_accumulator: &mut usage_accumulator,
-                        any_turn_had_fallback: &mut any_turn_had_fallback,
-                    }.chat(&assessment_messages, purpose)).await?;
-                    let assessment = if observed_tool_results {
-                        let review = match super::completion_review::parse_review(&trace.response) {
-                            Ok(review) => review,
-                            Err(error) => {
-                                super::turn_assessment::record_rejected_review(
-                                    event_fabric.as_ref(), request_event_scope.as_ref(), &trace.response,
-                                    None, review_repair_attempted,
-                                ).await?;
-                                return Err(error);
-                            }
-                        };
-                        if let Err(error) = completion_evidence.validate_review(&review, source) {
-                            super::turn_assessment::record_rejected_review(
-                                event_fabric.as_ref(), request_event_scope.as_ref(), &trace.response,
-                                Some(super::completion_review::review_diagnostics(&review, source)),
-                                review_repair_attempted,
-                            ).await?;
-                            use super::completion_review::ReviewValidationError;
-                            if review_repair_attempted || matches!(error, ReviewValidationError::Violation(_)) {
-                                return Err(error.into());
-                            }
-                            super::completion_review::repair_messages(
-                                &mut assessment_messages, &trace.response, &error, budget,
-                            )?;
-                            review_repair_attempted = true;
-                            tracing::warn!(%error, "Repairing invalid completion review once without executing tools");
-                            if let (Some(fabric), Some(scope)) = (event_fabric.as_ref(), request_event_scope.as_ref()) {
-                                fabric.record_runtime_event(
-                                    scope.clone(), "turn.completion_review.repair_requested",
-                                    "Invalid completion review requires one auxiliary repair".to_string(),
-                                    Some(serde_json::json!({"error":error.to_string()}).to_string()),
-                                ).await?;
-                            }
-                            continue;
-                        }
-                        ReplyAssessment::Completion(review)
-                    } else {
-                        ReplyAssessment::Execution(parse_assessment(&trace.response)?)
-                    };
-                    if let Err(error) = super::turn_assessment::record_outcome(
-                        event_fabric.as_ref(), request_event_scope.as_ref(), &assessment, &trace, "reply_review",
-                    ).await {
-                        tracing::warn!(%error, "Failed to record execution requirement assessment");
-                    }
-                        break Ok::<_, anyhow::Error>(assessment);
-                    }
-                    }).await?
-                };
-                match assessment {
-                    ReplyAssessment::Execution(ExecutionRequirement::ExecutionRequired) => {
-                        anyhow::ensure!(
-                            execution_requirement.is_none(),
-                            "request requires execution but no tool result was produced after one corrective retry; execution is unverified"
-                        );
-                        execution_requirement = Some(ExecutionRequirement::ExecutionRequired);
-                        inject_execution_retry = true;
-                        continue;
-                    }
-                    ReplyAssessment::Execution(ExecutionRequirement::Uncertain) => {
-                        // Do not release the unverified draft or claim an action
-                        // occurred. Ask the operator to disambiguate the turn.
-                        display_text = super::execution_requirement::CLARIFICATION_REPLY.to_string();
-                    }
-                    ReplyAssessment::Execution(ExecutionRequirement::Informational) => {}
-                    ReplyAssessment::Completion(review) => match review.decision {
-                        CompletionDecision::Accept => {}
-                        CompletionDecision::Revise => {
-                            anyhow::ensure!(
-                                completion_correction.is_none(),
-                                "completion remains unverified after one corrective attempt: {}",
-                                review.reason
-                            );
-                            completion_correction = Some(super::completion_review::corrective_message(&review.reason));
-                            continue;
-                        }
-                        CompletionDecision::Uncertain => anyhow::bail!(
-                            "completion evidence is uncertain; completion is unverified: {}",
-                            review.reason
-                        ),
-                    },
-                }
-            }
             // One outbound middleware pass per accepted, delivered turn. Every
             // retry, repair and marker guard above has accepted this response,
             // and nothing below can replace it: the next statements stream it,
@@ -1940,7 +1681,7 @@ async fn run_turn_unguarded(
             }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
-            if runtime_adapter.stream_provider && verify_chat_completion {
+            if runtime_adapter.stream_provider && guarded_delivery {
                 emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::TextDelta(display_text.clone())).await?;
             }
             if let Some(ref tx) = on_delta {
@@ -2165,12 +1906,6 @@ async fn run_turn_unguarded(
                 return Err(error);
             }
         };
-        observed_tool_results |= !individual_results.is_empty();
-        if runtime_adapter.verify_chat_completion {
-            for (call, result) in tool_calls.iter().zip(&individual_results) {
-                completion_evidence.record(call, result);
-            }
-        }
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
         // Only a batch that actually produced a result counts as real tool use.
@@ -2368,50 +2103,3 @@ async fn run_turn_unguarded(
 
 #[path = "turn_tests/turn_engine.rs"]
 mod tests;
-
-/// Account for the separate, tool-free assessment request as well as task
-/// requests. Persist only measurements and purpose, never the supplied evidence.
-async fn record_assessment_request(
-    fabric: &crate::memory::MemoryFabric,
-    scope: crate::memory::MessageEventScope,
-    provider: &str,
-    model: &str,
-    purpose: &str,
-    messages: &[ChatMessage],
-) -> anyhow::Result<()> {
-    use super::context_budget::{budgeted_tokens, estimate_history_tokens_with_source, token_source_label};
-    let measurement = estimate_history_tokens_with_source(messages);
-    let tokens = budgeted_tokens(measurement);
-    let bytes = messages.iter().fold(0usize, |total, message| {
-        total
-            .saturating_add(message.role.len())
-            .saturating_add(message.content.len())
-    });
-    fabric
-        .record_runtime_event(
-            scope.with_recipient(format!("{provider}/{model}")),
-            "llm.request.context.compiled",
-            format!("{purpose}; no executable capabilities"),
-            Some(
-                serde_json::json!({
-                    "schema_version": 1,
-                    "purpose": purpose,
-                    "provider": crate::providers::redact_endpoint_userinfo(provider),
-                    "model": model,
-                    "messages_count": messages.len(),
-                    "tool_snapshot": {"count": 0, "native_tools": false, "tools": []},
-                    "request_estimate": {
-                        "messages_bytes": bytes,
-                        "messages_tokens": tokens,
-                        "native_tool_bytes": 0,
-                        "native_tool_tokens": 0,
-                        "total_tokens": tokens,
-                        "token_source": token_source_label(measurement.source),
-                    },
-                })
-                .to_string(),
-            ),
-        )
-        .await?;
-    Ok(())
-}

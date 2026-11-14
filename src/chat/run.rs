@@ -4122,7 +4122,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 approval: Some(Arc::clone(&approval_manager)),
                                 approval_resolver: None,
                                 runtime_adapter: chat_turn_binding.as_ref().map(|binding| crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-                                    verify_chat_completion: true,
+                                    guarded_delivery: true,
                                     provider_trace: binding.retained_provider_trace(),
                                     events: None, stream_provider: false, tool_execution_service: None,
                                     tool_execution_context: super::approval_context::line_mode(binding.envelope().clone())

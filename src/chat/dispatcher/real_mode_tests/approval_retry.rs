@@ -79,9 +79,8 @@ async fn interactive_exact_call(approved: bool) {
             Ok(String::new())
         }
 
-        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
-                .ok_or_else(|| anyhow::anyhow!("expected execution assessment"))
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("test: only streamed main requests are expected")
         }
         fn supports_streaming(&self) -> bool {
             true

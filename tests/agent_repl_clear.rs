@@ -101,12 +101,7 @@ fn serve_loopback(listener: TcpListener) {
             let (content_type, body) = if head.contains("/chat/completions") {
                 let request: serde_json::Value =
                     serde_json::from_slice(bytes.get(head_end..).expect("body")).expect("provider JSON");
-                let request_text = request.to_string();
-                let content = if request_text.contains("Classify the execution requirement of current_request") {
-                    r#"{"requirement":"informational"}"#.to_string()
-                } else if request_text.contains("Review the proposed final reply against") {
-                    r#"{"decision":"accept","reason":"Fixture observation recorded","constraints":[]}"#.to_string()
-                } else {
+                let content = {
                     let input = request
                         .get("messages")
                         .and_then(serde_json::Value::as_array)

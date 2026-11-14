@@ -193,18 +193,6 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
         .filter_map(|message| message.get("content").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
-    if system.contains("Classify the execution requirement of current_request") {
-        let informational = state.no_tools.load(Ordering::Acquire)
-            && request.get("model").and_then(Value::as_str) != Some(PARENT_MODEL);
-        return Ok(json!({"role":"assistant","content":if informational {
-            r#"{"requirement":"informational"}"#
-        } else { r#"{"requirement":"execution_required"}"# }}));
-    }
-    if system.contains("Review the proposed final reply against the CURRENT request") {
-        return Ok(
-            json!({"role":"assistant","content":r#"{"decision":"accept","reason":"actual probe tool completed","constraints":[]}"#}),
-        );
-    }
     if let Some(mode) = state.parent_mode
         && request.get("model").and_then(Value::as_str) == Some(PARENT_MODEL)
         && messages.iter().any(|message| {

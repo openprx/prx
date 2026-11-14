@@ -59,8 +59,8 @@ pub enum Reply {
     Raw { status: u16, body: String },
 }
 
-/// One non-assessment request: its marker, its 1-based index among that
-/// marker's non-assessment requests, and its body.
+/// One request: its marker, its 1-based index among that marker's requests,
+/// and its body.
 pub struct Call<'a> {
     pub marker: &'a str,
     pub index: usize,
@@ -74,8 +74,6 @@ pub struct ProviderSpec {
     pub markers: Vec<&'static str>,
     /// Markers of real parent turns; their requests capture no manifest.
     pub parents: Vec<&'static str>,
-    /// Markers whose requests are classified `execution_required`.
-    pub execution: Vec<&'static str>,
     /// Root of the worker workspaces holding the live manifest snapshots.
     pub manifest_root: PathBuf,
     /// Worker task text for a marker whose spawned task differs from it.
@@ -350,35 +348,18 @@ fn handle(mut stream: TcpStream, spec: &mut ProviderSpec, shared: &Shared) {
             head,
             body: body.clone(),
         });
-        requests
-            .iter()
-            .filter(|request| request.marker == marker && !is_assessment_body(&request.body))
-            .count()
+        requests.iter().filter(|request| request.marker == marker).count()
     };
     if spec.hold == Some(marker) && !hold_released(shared) {
         fault(&mut stream, 503, "hold expired");
         shared.fail(format!("HOLD_WAIT expired for {marker}"));
         return;
     }
-    let reply = if body.contains("Review the proposed final reply against the CURRENT request") {
-        review_reply(&body, shared)
-    } else if body.contains("Classify the execution requirement of current_request") {
-        let requirement = if spec.execution.contains(&marker) {
-            "execution_required"
-        } else {
-            "informational"
-        };
-        Reply::Assistant(serde_json::json!({
-            "role": "assistant",
-            "content": serde_json::json!({"requirement": requirement}).to_string()
-        }))
-    } else {
-        (spec.script)(&Call {
-            marker,
-            index,
-            body: &body,
-        })
-    };
+    let reply = (spec.script)(&Call {
+        marker,
+        index,
+        body: &body,
+    });
     write_reply(&mut stream, &reply, &body);
 }
 
@@ -399,18 +380,6 @@ fn hold_released(shared: &Shared) -> bool {
         }
     }
     true
-}
-
-fn review_reply(body: &str, shared: &Shared) -> Reply {
-    let tools_empty = serde_json::from_str::<serde_json::Value>(body)
-        .is_ok_and(|request| request["tools"].as_array().is_none_or(Vec::is_empty));
-    if !(tools_empty && body.contains("observed_tools") && body.contains("proposed_final_reply")) {
-        shared.fail("final-reply review request changed shape".into());
-    }
-    Reply::Assistant(serde_json::json!({
-        "role": "assistant",
-        "content": r#"{"decision":"accept","reason":"fixture evidence accepted","constraints":[]}"#
-    }))
 }
 
 fn write_reply(stream: &mut TcpStream, reply: &Reply, request_body: &str) {
@@ -561,15 +530,6 @@ pub fn request_own_input(request_body: &str) -> String {
         .unwrap_or_default()
 }
 
-fn is_assessment_body(body: &str) -> bool {
-    body.contains("Classify the execution requirement of current_request")
-        || body.contains("Review the proposed final reply against the CURRENT request")
-}
-
-pub fn is_assessment_request(request: &ProviderRequest) -> bool {
-    is_assessment_body(&request.body)
-}
-
 /// The last tool result of a request, parsed as JSON.
 pub fn last_tool_summary(request: &ProviderRequest) -> Option<serde_json::Value> {
     let body: serde_json::Value = serde_json::from_str(&request.body).ok()?;
@@ -587,7 +547,7 @@ pub fn last_tool_summary(request: &ProviderRequest) -> Option<serde_json::Value>
 pub fn post_join_request<'a>(requests: &'a [ProviderRequest], marker: &str) -> &'a ProviderRequest {
     requests
         .iter()
-        .filter(|request| request.marker == marker && !is_assessment_request(request))
+        .filter(|request| request.marker == marker)
         .find(|request| last_tool_summary(request).is_some_and(|summary| summary.get("total").is_some()))
         .expect("test: parent post-join request carrying a join summary")
 }

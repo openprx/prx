@@ -386,10 +386,6 @@ pub(crate) struct MockEnvProvider {
     response: String,
     #[cfg(feature = "test-mock")]
     response_hook: Option<MockResponseHook>,
-    /// Scripted verdict for the separate no-result assessment request. This is
-    /// fixture data, not a semantic classifier; it exists only in test/mock builds.
-    execution_assessment: Option<String>,
-    completion_assessment: String,
     /// 5a-6: when `OPENPRX_MOCK_TOOL_CALL=name:args_json` is set, the first streaming call
     /// emits a `ToolCallChunk`(name, args) and later calls return the `response` text.
     /// This lets PTY E2E verify the driver's full tool turn loop (call → execute → continue → final).
@@ -684,9 +680,6 @@ impl MockEnvProvider {
             response,
             #[cfg(feature = "test-mock")]
             response_hook: MOCK_RESPONSE_HOOK.get().cloned(),
-            execution_assessment: std::env::var("OPENPRX_MOCK_EXECUTION_ASSESSMENT").ok(),
-            completion_assessment: std::env::var("OPENPRX_MOCK_COMPLETION_ASSESSMENT")
-                .unwrap_or_else(|_| r#"{"decision":"accept","reason":"fixture result","constraints":[]}"#.to_string()),
             tool_call_spec,
             call_counter: Arc::new(AtomicUsize::new(0)),
             native_tool_state: AtomicUsize::new(0),
@@ -758,56 +751,6 @@ impl Provider for MockEnvProvider {
     /// request names it. A sole proposal schema also supports argument collection.
     /// Unoffered tools and later unrelated input retain the plain text outcome.
     async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
-        // The assessment is a distinct request, so it must not consume the
-        // reply sentinel or advance the tool/stream script's counter.
-        if request.tools.is_none()
-            && request.messages.first().is_some_and(|message| {
-                message.role == "system"
-                    && (message
-                        .content
-                        .starts_with("Classify the execution requirement of current_request")
-                        || message
-                            .content
-                            .starts_with("Review the proposed final reply against the CURRENT request"))
-            })
-        {
-            if let Some(error) = &self.error {
-                anyhow::bail!("{error}");
-            }
-            return Ok(ChatResponse {
-                text: Some(
-                    if request
-                        .messages
-                        .first()
-                        .is_some_and(|message| message.content.starts_with("Review the proposed final reply"))
-                    {
-                        self.completion_assessment.clone()
-                    } else {
-                        self.execution_assessment.clone().unwrap_or_else(|| {
-                            // A declared positive tool script needs an independent
-                            // intent reply before its first dispatch. Later plain
-                            // turns keep the informational fixture. Explicit verdicts
-                            // still drive refusal/malicious-proposal tests unchanged.
-                            let scripted_tool = self.tool_call_spec.is_some()
-                                || self
-                                    .script
-                                    .as_ref()
-                                    .is_some_and(|script| script.chunks.iter().any(|chunk| chunk.tool.is_some()));
-                            if scripted_tool
-                                && (self.call_counter.load(Ordering::SeqCst) == 1
-                                    || self.native_tool_state.load(Ordering::SeqCst) == 1)
-                            {
-                                r#"{"requirement":"execution_required"}"#.to_string()
-                            } else {
-                                r#"{"requirement":"informational"}"#.to_string()
-                            }
-                        })
-                    },
-                ),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            });
-        }
         if let (Some(spec), Some(offered)) = (self.tool_call_spec.as_ref(), request.tools)
             && offered.iter().any(|tool| tool.name == spec.name)
             && (offered.len() == 1
@@ -1615,7 +1558,6 @@ mod tests {
         let mut provider = MockEnvProvider::from_env();
         provider.response = "PRX_NATIVE_REPLY".to_owned();
         provider.error = None;
-        provider.execution_assessment = None;
         provider.tool_call_spec = Some(MockToolCallSpec {
             name: "prx_fixture_tool".to_owned(),
             args: "{}".to_owned(),
@@ -1667,24 +1609,6 @@ mod tests {
         assert_eq!(
             proposed.tool_calls.first().expect("test: one proposal").name,
             "prx_fixture_tool"
-        );
-        let assessment = [
-            ChatMessage::system("Classify the execution requirement of current_request"),
-            request.first().expect("test: request").clone(),
-        ];
-        let assessed = provider
-            .chat(
-                ChatRequest {
-                    messages: &assessment,
-                    tools: None,
-                },
-                "mock",
-                0.0,
-            )
-            .await?;
-        assert_eq!(
-            assessed.text.as_deref(),
-            Some(r#"{"requirement":"execution_required"}"#)
         );
         let completed = provider
             .chat(

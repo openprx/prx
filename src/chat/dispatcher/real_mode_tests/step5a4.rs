@@ -391,9 +391,8 @@ async fn driver_executes_tool_call_chunk_and_continues_to_completion() {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
-        async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
-                .ok_or_else(|| anyhow::anyhow!("expected reply assessment"))
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("test: only streamed main requests are expected")
         }
         fn supports_streaming(&self) -> bool {
             true
@@ -608,9 +607,8 @@ async fn driver_seeds_spawn_execution_context_for_tool_calls() {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
-        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
-                .ok_or_else(|| anyhow::anyhow!("expected execution assessment"))
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("test: only streamed main requests are expected")
         }
         fn supports_streaming(&self) -> bool {
             true
@@ -765,9 +763,8 @@ async fn driver_stops_early_on_repeated_unrecoverable_tool_failure() {
         async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
             Ok(String::new())
         }
-        async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
-            super::super::assessment_fixture::response(&request, super::super::assessment_fixture::EXECUTION_REQUIRED)
-                .ok_or_else(|| anyhow::anyhow!("expected execution assessment"))
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("test: only streamed main requests are expected")
         }
         fn supports_streaming(&self) -> bool {
             true

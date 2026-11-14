@@ -418,8 +418,9 @@ pub(crate) trait ToolLoopEventSink: Send + Sync {
 /// outcome remain inside `turn_engine::run_turn`.
 #[derive(Clone)]
 pub(crate) struct ToolLoopRuntimeAdapter {
-    /// Opt-in for interactive chat; other hosts retain their completion contract.
-    pub verify_chat_completion: bool,
+    /// Interactive chat buffers provider text until response guards and outbound
+    /// middleware accept it, so rendered text equals the persisted reply.
+    pub guarded_delivery: bool,
     pub provider_trace: Option<Arc<RetainedProviderTrace>>,
     pub events: Option<Arc<dyn ToolLoopEventSink>>,
     pub stream_provider: bool,

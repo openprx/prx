@@ -103,7 +103,6 @@ fn start_server(
 ) -> OwnedProviderServer {
     let server = OwnedProviderServer::start(ProviderSpec {
         markers,
-        execution: parents.clone(),
         parents,
         manifest_root: fixture.worker_root.clone(),
         tasks: BTreeMap::new(),
@@ -418,7 +417,7 @@ fn restarted_parent_recovers_and_verifies_ordinary_launch() {
         let requests = server.requests();
         let history = requests
             .iter()
-            .filter(|request| request.marker == HISTORY && !provider::is_assessment_request(request))
+            .filter(|request| request.marker == HISTORY)
             .find_map(last_tool_text)
             .expect("test: restarted parent history tool result");
         assert!(

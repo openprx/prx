@@ -2582,7 +2582,7 @@ async fn drive_start_turn_stream(
         reasoning_progress: Arc::clone(&reasoning_progress),
     });
     let runtime_adapter = crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
-        verify_chat_completion: true,
+        guarded_delivery: true,
         provider_trace: binding.retained_provider_trace(),
         events: Some(events),
         stream_provider: true,
@@ -3212,9 +3212,6 @@ mod tool_tiering_tests;
 
 #[cfg(test)]
 mod stream_native_tools_tests;
-
-#[cfg(test)]
-mod assessment_fixture;
 
 // ─── S4-A Commit 3: dispatcher snapshot push ────────────────────────────────
 

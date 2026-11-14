@@ -124,12 +124,6 @@ impl Server {
                                     3 => "malformed fixture judge response",
                                     _ => r#"{"verdict":"approve"}"#,
                                 })
-                            } else if messages.iter().any(|message| message["role"] == "system"
-                                && message["content"].as_str().is_some_and(|text| text.starts_with("Classify the execution requirement of current_request"))) {
-                                Some(r#"{"requirement":"execution_required"}"#)
-                            } else if messages.iter().any(|message| message["role"] == "system"
-                                && message["content"].as_str().is_some_and(|text| text.starts_with("Review the proposed final reply against"))) {
-                                Some(r#"{"decision":"accept","reason":"Scripted native results are present","constraints":[]}"#)
                             } else { None };
                             let is_editor = messages.iter().any(|message| message["content"].as_str().is_some_and(|value| value.contains("You revise one instruction skill")));
                             let editor_number = if is_editor { Some(editor_count.fetch_add(1, Ordering::SeqCst)) } else { None };

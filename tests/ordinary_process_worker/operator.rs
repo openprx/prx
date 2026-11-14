@@ -10,8 +10,7 @@
 use super::parent::{ParentFixture, assert_completion_journal, spawn_held_parent};
 use super::provider::{
     CapturedManifest, OwnedProviderServer, ProviderRequest, ProviderSpec, assert_join_summary,
-    assert_ordinary_manifest, is_assessment_request, last_tool_summary, scripted_join_call, scripted_spawn_call,
-    text_reply,
+    assert_ordinary_manifest, last_tool_summary, scripted_join_call, scripted_spawn_call, text_reply,
 };
 use std::io::Write as _;
 use std::path::Path;
@@ -36,7 +35,7 @@ fn child_task(case: &Case) -> String {
 fn post_join(requests: &[ProviderRequest], marker: &str) -> Option<ProviderRequest> {
     requests
         .iter()
-        .filter(|request| request.marker == marker && !is_assessment_request(request))
+        .filter(|request| request.marker == marker)
         .find(|request| last_tool_summary(request).is_some_and(|summary| summary.get("total").is_some()))
         .cloned()
 }
@@ -62,14 +61,7 @@ fn request_trail(server: &OwnedProviderServer) -> Vec<String> {
     server
         .requests()
         .iter()
-        .map(|request| {
-            format!(
-                "{} assessment={} tool={:?}",
-                request.marker,
-                is_assessment_request(request),
-                super::last_tool_text(request)
-            )
-        })
+        .map(|request| format!("{} tool={:?}", request.marker, super::last_tool_text(request)))
         .collect()
 }
 
@@ -122,7 +114,6 @@ fn run_case(case: &Case) {
     let mut server = OwnedProviderServer::start(ProviderSpec {
         markers: vec![child, leaf],
         parents,
-        execution: vec![child],
         manifest_root: fixture.worker_root.clone(),
         tasks: std::iter::once((child, child_task(case))).collect(),
         hold: None,

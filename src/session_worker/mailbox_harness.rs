@@ -238,17 +238,6 @@ impl crate::providers::Provider for ParentModel {
         model: &str,
         temperature: f64,
     ) -> Result<crate::providers::ChatResponse> {
-        if request
-            .messages
-            .first()
-            .is_some_and(|message| message.content.starts_with("Classify the execution requirement"))
-        {
-            return Ok(crate::providers::ChatResponse {
-                text: Some(r#"{"requirement":"execution_required"}"#.into()),
-                tool_calls: Vec::new(),
-                reasoning_content: None,
-            });
-        }
         self.inner.chat(request, model, temperature).await
     }
 }

@@ -76,19 +76,15 @@ struct FixtureProvider {
     captured_histories: Mutex<Vec<Vec<ChatMessage>>>,
     stream_calls: AtomicUsize,
     traced_calls: AtomicUsize,
-    assessment_calls: AtomicUsize,
-    requires_execution: bool,
 }
 
 impl FixtureProvider {
     fn new(steps: Vec<FixtureStep>) -> Self {
         Self {
-            requires_execution: steps.iter().any(|step| matches!(step, FixtureStep::Tool { .. })),
             steps: Mutex::new(steps.into()),
             captured_histories: Mutex::new(Vec::new()),
             stream_calls: AtomicUsize::new(0),
             traced_calls: AtomicUsize::new(0),
-            assessment_calls: AtomicUsize::new(0),
         }
     }
 
@@ -228,18 +224,6 @@ impl Provider for FixtureProvider {
         _model: &str,
         _temperature: f64,
     ) -> anyhow::Result<ChatTrace> {
-        if let Some(trace) = super::assessment_fixture::trace(
-            &request,
-            _model,
-            if self.requires_execution {
-                super::assessment_fixture::EXECUTION_REQUIRED
-            } else {
-                super::assessment_fixture::INFORMATIONAL
-            },
-        ) {
-            self.assessment_calls.fetch_add(1, Ordering::SeqCst);
-            return Ok(trace);
-        }
         self.traced_calls.fetch_add(1, Ordering::SeqCst);
         self.capture(request.messages);
         let step = self.next_step();
@@ -852,8 +836,6 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
         "shared Agent owner must preserve Chat's real streaming adapter"
     );
     assert_eq!(chat_provider.traced_calls(), 0);
-    assert_eq!(chat_provider.assessment_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(agent_provider.assessment_calls.load(Ordering::SeqCst), 0);
     assert_eq!(agent_provider.stream_calls(), 0);
     assert_eq!(
         agent_provider.traced_calls(),
@@ -964,17 +946,8 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
     assert_eq!(agent_histories.len(), 2);
     let chat_follow_up = chat_histories.get(1).expect("Chat follow-up provider history");
     let agent_follow_up = agent_histories.get(1).expect("Agent follow-up provider history");
-    assert_eq!(
-        message_roles(chat_follow_up),
-        ["system", "user", "assistant", "tool", "user"]
-    );
-    let reminder = chat_follow_up.get(4).expect("chat completion reminder");
-    assert!(
-        reminder
-            .content
-            .starts_with(crate::agent::response_guard::CORRECTIVE_ASIDE_PREFIX)
-    );
-    assert!(reminder.content.contains("Before reporting completion"));
+    // No completion reminder is appended: both adapters send the same shape.
+    assert_eq!(message_roles(chat_follow_up), ["system", "user", "assistant", "tool"]);
     assert_eq!(message_roles(agent_follow_up), ["system", "user", "assistant", "tool"]);
     let chat_tool_message = chat_follow_up.get(3).expect("Chat tool result history");
     let agent_tool_message = agent_follow_up.get(3).expect("Agent tool result history");

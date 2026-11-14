@@ -150,7 +150,7 @@ fn write_wire_config(config: &openprx::config::Config) {
 #[test]
 fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     use openprx::providers::credentials::{CredentialRef, LegacySlot};
-    use provider::{assert_join_summary, assert_parent_join, is_assessment_request};
+    use provider::{assert_join_summary, assert_parent_join};
 
     let fixture = parent::ParentFixture::new();
     let config_dir = fixture.config_dir.clone();
@@ -159,11 +159,6 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
     let mut server = provider::OwnedProviderServer::start(provider::ProviderSpec {
         markers: WIRE_MARKERS.to_vec(),
         parents: WIRE_PARENTS.to_vec(),
-        execution: WIRE_PARENTS
-            .iter()
-            .copied()
-            .chain(["PRX-NESTED-CHILD", "PRX-FANOUT-CHILD"])
-            .collect(),
         manifest_root: fixture.worker_root.clone(),
         tasks: [
             ("PRX-NESTED-CHILD", RECURSIVE_CHILD_TASK.to_owned()),
@@ -394,7 +389,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.marker == "PRX-NESTED-LEAF" && !is_assessment_request(request))
+                .filter(|request| request.marker == "PRX-NESTED-LEAF")
                 .count(),
             1,
             "{WIRE_UNCHANGED}"
@@ -464,7 +459,7 @@ fn sealed_route_worker_sends_only_its_route_key_on_wire() {
         assert_parent_join(&requests, "PRX-FANOUT-PARENT", 1);
         let child: Vec<_> = requests
             .iter()
-            .filter(|request| request.marker == "PRX-FANOUT-CHILD" && !is_assessment_request(request))
+            .filter(|request| request.marker == "PRX-FANOUT-CHILD")
             .collect();
         assert_eq!(
             child.len(),
@@ -592,7 +587,7 @@ fn assert_sealed_child(manifest: &WorkerManifest, requests: &[provider::Provider
     );
     let request = requests
         .iter()
-        .find(|request| request.marker == marker && !provider::is_assessment_request(request))
+        .find(|request| request.marker == marker)
         .expect("test: sealed child provider request");
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("test: sealed child request JSON");
     let lists_spawn = body["tools"].as_array().is_some_and(|tools| {
@@ -1216,7 +1211,6 @@ async fn assert_mailbox_worker_frames(turns: usize) -> anyhow::Result<()> {
         .env_remove("OPENPRX_MOCK_TOOL_CALL")
         .env_remove("OPENPRX_MOCK_SCRIPT")
         .env_remove("OPENPRX_MOCK_ERROR")
-        .env_remove("OPENPRX_MOCK_EXECUTION_ASSESSMENT")
         .kill_on_drop(true);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
