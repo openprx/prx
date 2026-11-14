@@ -282,9 +282,9 @@ pub(in crate::runtime) fn initial_observations(
 mod tests {
     use super::{SegmentObservation, initial_observations, project_trace};
     use crate::decision_engine::state::{ObservedStepKind, ObservedStepStatus};
-    use crate::runtime::decision_journal::store::{RecordedOutcomeAttempt, RecordedToolCall};
     use crate::runtime::envelope::RuntimeEnvelope;
     use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
+    use crate::tools::capability::execution_trace::{RecordedOutcomeAttempt, RecordedToolCall};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;

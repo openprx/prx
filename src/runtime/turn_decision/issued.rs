@@ -1,9 +1,7 @@
-//! Persist and read back the source-bound result of one bounded admission.
+//! Admit an opened turn: the run allowance and the delegation scope.
 use super::{
-    AgentDecisionError, Arc, CancellationToken, Context, DecisionRecordBuilder, Ordering, TurnDecisionContext,
-    TurnDecisionService, TurnSourceProof,
+    AgentDecisionError, Arc, CancellationToken, Context, TurnDecisionContext, TurnDecisionService, TurnSourceProof,
 };
-use crate::runtime::child_source::authority_journal;
 
 impl TurnDecisionService {
     pub(crate) async fn record_opened_context(
@@ -46,45 +44,6 @@ impl TurnDecisionService {
         context.runtime().issue_recursive_allowance(proof);
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
-        }
-        if self.durable_key && self.recordable && self.generation.effective.causal_tree.enabled {
-            let records = DecisionRecordBuilder::build_enabled_chain(&context, &self.state_key, true)?;
-            if cancellation.is_cancelled() {
-                return Err(AgentDecisionError::Cancelled);
-            }
-            // Replay evidence is durable before admission. Its physical write
-            // runs on a blocking thread and is always awaited, so cancellation
-            // cannot drop it midway.
-            let store_workspace = self.store.workspace_id().ok_or_else(|| {
-                AgentDecisionError::DecisionEvidence(anyhow::anyhow!("decision store has no workspace id"))
-            })?;
-            let evidence = authority_journal::decision_evidence_rows(&records, &store_workspace)
-                .map_err(AgentDecisionError::DecisionEvidence)?;
-            let workspace = self.generation.effective.workspace_dir.clone();
-            let key = Arc::clone(&self.state_key);
-            let ticket = crate::runtime::turn_cleanup::current_tracker()
-                .map(|owner| owner.register(CancellationToken::new()))
-                .transpose()
-                .map_err(AgentDecisionError::DecisionEvidence)?;
-            let written = crate::runtime::blocking::spawn_blocking(move || {
-                let result = authority_journal::write_decision_evidence(&workspace, &key, &evidence);
-                if let Some(ticket) = ticket {
-                    ticket.finish(result.is_ok());
-                }
-                result
-            })
-            .await
-            .map_err(|error| AgentDecisionError::DecisionEvidence(error.into()))?;
-            written.map_err(AgentDecisionError::DecisionEvidence)?;
-            if cancellation.is_cancelled() {
-                return Err(AgentDecisionError::Cancelled);
-            }
-            let writer = self.store.writer().ok_or(AgentDecisionError::RecordWriterUnavailable)?;
-            // Admission to the bounded queue is not a durability receipt.
-            // The writer reports a dropped chain through its incomplete event.
-            if writer.record_chain(records) == crate::runtime::decision_journal::store::Enqueue::Queued {
-                context.record_admitted.store(true, Ordering::Release);
-            }
         }
         // A published delegator makes delegation storage reachable (R28).
         let admits_delegation = context.execution_refs().iter().any(|reference| {

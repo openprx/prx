@@ -227,44 +227,38 @@ pub(super) fn decision_http_clients_come_only_from_the_pinned_builder() {
     );
 }
 
-/// AG-10 (SP-CDP-A 5.10): the decision store's database is named, and so
-/// opened, only by `runtime/decision_journal/store.rs`. Its `store/` child modules are
-/// scanned like any other file; test-only files are empty production text.
-/// Comments may mention it.
+/// AG-10 (SP-CDP-A 5.10, inverted by P2-R25): no production file opens the
+/// deleted decision store or the child authority journal. The artifact names
+/// live once, in `decision_engine::LEGACY_DECISION_ARTIFACTS`; the legacy-file
+/// warning in `runtime/cost_recovery.rs` is the only production file that
+/// names them. Comments may mention them.
 #[test]
-pub(super) fn the_decision_store_database_is_opened_only_by_the_store() {
-    const STORE: &str = "src/runtime/decision_journal/store.rs";
-    const SCANNED_CHILDREN: [&str; 2] = [
-        "src/runtime/decision_journal/store/child_outcome.rs",
-        "src/runtime/decision_journal/store/child_recovery.rs",
-    ];
+pub(super) fn no_production_file_opens_a_legacy_decision_database() {
+    const WARNING: &str = "src/runtime/cost_recovery.rs";
+    let databases: Vec<&str> = super::decision_engine::LEGACY_DECISION_ARTIFACTS
+        .iter()
+        .copied()
+        .filter(|artifact| artifact.ends_with(".db"))
+        .collect();
+    assert_eq!(databases.len(), 2, "the store and the journal are both checked");
     let mut violations = Vec::new();
-    let mut scanned_children = 0_usize;
     for path in rust_source_files() {
         let relative = relative_path(&path);
-        if !relative.starts_with("src/") || relative == STORE {
+        if !relative.starts_with("src/") || relative == WARNING {
             continue;
         }
-        if SCANNED_CHILDREN.contains(&relative.as_str()) {
-            scanned_children += 1;
-        }
         let production = strip_cfg_test_items(&read_source(&path));
-        let names_the_database = production.lines().any(|line| {
+        let names_a_database = production.lines().any(|line| {
             let code = line.split_once("//").map_or(line, |(code, _)| code);
-            code.contains("decisions.db")
+            databases.iter().any(|database| code.contains(database))
         });
-        if names_the_database {
+        if names_a_database {
             violations.push(relative);
         }
     }
-    assert_eq!(
-        scanned_children,
-        SCANNED_CHILDREN.len(),
-        "the store child modules must be scanned, not exempted"
-    );
     assert!(
         violations.is_empty(),
-        "only the decision store opens decisions.db (AG-10): {violations:?}"
+        "no production file opens a legacy decision database (AG-10): {violations:?}"
     );
 }
 

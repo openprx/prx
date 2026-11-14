@@ -401,14 +401,9 @@ async fn crashed_after_marker(
         prepared_parameters: Vec::new(),
     });
     let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
-    crate::agent::terminal::finalize_turn_stop_after_marker(
+    crate::agent::terminal::finalize_turn(
         &fabric,
         crate::agent::terminal::TurnTerminalDraft {
-            decision: Some(
-                service
-                    .terminal_settlement_ref(Arc::clone(&context))
-                    .expect("test: link"),
-            ),
             binding: Some(service.terminal_binding(&context).expect("test: binding")),
             terminal_id: terminal_id.to_owned(),
             scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)

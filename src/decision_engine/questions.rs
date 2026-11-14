@@ -599,12 +599,7 @@ mod tests {
             QuestionCompiler::compile(&state, &set, &policy),
             Err(CompileError::CandidateMismatch)
         ));
-        let no_legal = CandidateSet::NoLegalPath {
-            terminals: Vec::new(),
-            report: GateReport {
-                outcomes: BTreeMap::new(),
-            },
-        };
+        let no_legal = CandidateSet::NoLegalPath;
         assert!(matches!(
             QuestionCompiler::compile(&state, &no_legal, &policy),
             Err(CompileError::NoLegalPath)

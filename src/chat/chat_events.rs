@@ -169,9 +169,6 @@ pub(super) async fn finalize_chat_success_turn(
     workspace_dir: &std::path::Path,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
     let binding = turn_binding.context("chat terminal binding is missing")?;
-    let decision = binding
-        .settlement_ref(chat_run_id)?
-        .context("chat terminal decision has not been issued")?;
     let terminal_binding = binding
         .terminal_binding(chat_run_id)?
         .context("chat terminal binding has not been issued")?;
@@ -193,7 +190,6 @@ pub(super) async fn finalize_chat_success_turn(
         .commit_terminal(
             fabric,
             crate::agent::terminal::TurnTerminalDraft {
-                decision: Some(decision),
                 binding: Some(terminal_binding),
                 terminal_id: chat_run_id.to_string(),
                 scope: route_scope,
@@ -214,7 +210,6 @@ pub(super) async fn finalize_chat_success_turn(
             workspace_dir,
         )
         .await?;
-    binding.rejoin_recovery_terminal(chat_run_id).await?;
     Ok(receipt)
 }
 
@@ -232,7 +227,7 @@ pub(super) async fn finalize_chat_non_success_turn(
     workspace_dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let binding = turn_binding.context("chat terminal binding is missing")?;
-    let Some(decision) = binding.settlement_ref(chat_run_id)? else {
+    let Some(terminal_binding) = binding.terminal_binding(chat_run_id)? else {
         anyhow::ensure!(
             provider_outcome.is_none(),
             "pre-decision failure cannot settle a provider outcome"
@@ -241,9 +236,6 @@ pub(super) async fn finalize_chat_non_success_turn(
             .record_predecision_failure(fabric, chat_run_id, status, summary)
             .await;
     };
-    let terminal_binding = binding
-        .terminal_binding(chat_run_id)?
-        .context("chat terminal binding has not been issued")?;
     let route_scope = binding.envelope().message_scope();
 
     // `finalize_turn` redacts the provider outcome (with its error text)
@@ -255,7 +247,6 @@ pub(super) async fn finalize_chat_non_success_turn(
         .commit_terminal(
             fabric,
             crate::agent::terminal::TurnTerminalDraft {
-                decision: Some(decision),
                 binding: Some(terminal_binding),
                 terminal_id: chat_run_id.to_string(),
                 scope: route_scope,
@@ -276,7 +267,6 @@ pub(super) async fn finalize_chat_non_success_turn(
             workspace_dir,
         )
         .await?;
-    binding.rejoin_recovery_terminal(chat_run_id).await?;
     Ok(())
 }
 

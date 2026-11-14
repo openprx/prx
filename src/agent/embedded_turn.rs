@@ -102,7 +102,6 @@ impl Terminal<'_> {
         outcome: Option<crate::llm::route_decision::ProviderExecutionOutcome>,
     ) -> anyhow::Result<TurnTerminalDraft> {
         Ok(TurnTerminalDraft {
-            decision: Some(self.service.terminal_settlement_ref(Arc::clone(self.decision))?),
             binding: Some(self.service.terminal_binding(self.decision)?),
             terminal_id: self.source.run_id().to_owned(),
             scope: self.source.envelope().message_scope(),

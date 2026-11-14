@@ -1,8 +1,5 @@
 //! Bounded content-free observations from the actual execution service.
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
-use crate::runtime::decision_journal::store::{
-    MAX_RECORDED_PROVIDER_ATTEMPTS, RecordedOutcomeAttempt, RecordedToolCall,
-};
 use crate::tools::execution::ToolExecutionStatus;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -12,6 +9,22 @@ mod exact_calls;
 use crate::tools::capability::turn_state::exact_calls::ExactCallObservations;
 
 const MAX_CALLS: usize = 64;
+pub(crate) const MAX_RECORDED_PROVIDER_ATTEMPTS: usize = 128;
+
+/// Metadata from an actual provider attempt; error messages and response text are excluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedOutcomeAttempt {
+    pub(crate) seq: u32,
+    pub(crate) status: String,
+    pub(crate) error_class: Option<String>,
+}
+
+/// Canonical capability and outcome code only; never tool arguments or results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedToolCall {
+    pub(crate) capability_id: String,
+    pub(crate) status: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

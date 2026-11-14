@@ -283,10 +283,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                     0,
                     "a prediction-free opening sends nothing to the decision backend"
                 );
-                assert!(
-                    turn.routing().context.engine().prediction.is_none(),
-                    "test: direct admission has no prediction"
-                );
                 drop(turn);
                 Ok::<_, anyhow::Error>(())
             })

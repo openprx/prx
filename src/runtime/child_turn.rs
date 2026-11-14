@@ -21,7 +21,6 @@ pub(crate) struct ChildSegmentTurn {
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     execution: crate::tools::ToolExecutionContext,
     terminal: super::turn_terminal::TurnTerminalGuard,
-    settlement: crate::agent::terminal::DecisionSettlementRef,
     binding: crate::agent::terminal::TerminalBinding,
     provider_trace: Arc<crate::agent::turn_contracts::RetainedProviderTrace>,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -139,7 +138,6 @@ impl ChildSegmentTurn {
         // This owner is outside the segment's child-drain scope. Registering
         // inside that scope would make it wait for its own terminal guard.
         let provider_trace = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
-        let settlement = service.terminal_settlement_ref(Arc::clone(&decision))?;
         let binding = service.terminal_binding(&decision)?;
         let terminal = super::turn_terminal::TurnTerminalGuard::new(
             owner.register(cancellation.clone())?,
@@ -160,7 +158,6 @@ impl ChildSegmentTurn {
             runtime,
             execution,
             terminal,
-            settlement,
             binding,
             provider_trace,
             started_at: chrono::Utc::now(),
@@ -254,7 +251,6 @@ impl ChildSegmentTurn {
         provider_outcome: Option<crate::llm::route_decision::ProviderExecutionOutcome>,
     ) -> TurnTerminalDraft {
         TurnTerminalDraft {
-            decision: Some(self.settlement.clone()),
             binding: Some(self.binding.clone()),
             terminal_id: self.proof.run_id().to_owned(),
             scope: self.execution.envelope.message_scope(),

@@ -98,8 +98,8 @@ impl OrdinaryChildPublication {
         let envelope = &caller.envelope;
         validate_agent_turn_origin(&self.0.service.generation, self.0.service.surface, source)?;
         anyhow::ensure!(
-            !self.0.context.execution_closed.load(Ordering::Acquire)
-                && caller.execution_trace.as_ref() == self.0.context.execution_trace.get()
+            !self.0.context.runtime().execution_closed.load(Ordering::Acquire)
+                && caller.execution_trace.as_ref() == self.0.context.runtime().execution_trace.get()
                 && envelope.workspace_id == source.workspace_id()
                 && envelope.resolved_owner_id() == source.owner_id()
                 && envelope.session_key == source.session_key()
@@ -128,10 +128,11 @@ impl OrdinaryChildPublication {
     /// A child cannot outlive the parent execution that selected its manifest.
     pub(in crate::runtime) fn verify_live(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.0.context.execution_closed.load(Ordering::Acquire)
+            !self.0.context.runtime().execution_closed.load(Ordering::Acquire)
                 && self
                     .0
                     .context
+                    .runtime()
                     .execution_trace
                     .get()
                     .is_some_and(|trace| !trace.is_sealed()),
@@ -257,7 +258,6 @@ impl OrdinaryChildPublication {
                     events: Arc::clone(&parent.events),
                 },
             )?,
-            child_recovery: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
@@ -281,8 +281,6 @@ impl OrdinaryChildPublication {
             execution,
             memory: Arc::clone(&parent.memory),
             security: Arc::clone(&parent.security),
-            store: Arc::clone(&parent.store),
-            durable_events: None,
         }))
     }
 

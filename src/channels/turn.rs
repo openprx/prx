@@ -561,7 +561,6 @@ pub(super) async fn run_channel_turn(
         if let Some(provider_outcome) = pre_gate.silence_provider_outcome() {
             if let Err(error) = decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
-                    decision: None,
                     binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: channel_source.envelope().message_scope(),
@@ -1328,7 +1327,6 @@ pub(super) async fn run_channel_turn(
                 crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
             let terminal_committed = match decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
-                    decision: None,
                     binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: runtime_envelope.message_scope().with_sender("prx"),
@@ -1475,7 +1473,6 @@ pub(super) async fn run_channel_turn(
                 crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
             if let Err(error) = decision_turn
                 .commit(crate::agent::terminal::TurnTerminalDraft {
-                    decision: None,
                     binding: None,
                     terminal_id: turn_run_id.clone(),
                     scope: runtime_envelope.message_scope(),

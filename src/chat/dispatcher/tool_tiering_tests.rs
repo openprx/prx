@@ -272,16 +272,7 @@ async fn offered_tools_for(
     )
     .await;
     let routing = admitted.binding.decision_routing().expect("tiering routing");
-    let audit = routing
-        .context
-        .audit_hops()
-        .map(|hop| {
-            format!(
-                "candidates={:?} selection={:?} prediction={:?} scores={:?} gates={:?}",
-                hop.candidates, hop.selection, hop.prediction, hop.scores, hop.pre_commit.outcomes
-            )
-        })
-        .collect::<Vec<_>>();
+    let audit = format!("{:?}", routing.context.engine().state.trusted.parts().budgets);
     assert!(
         admitted
             .binding
@@ -362,10 +353,6 @@ async fn plain_answer_offers_for(
     )
     .await;
     let decision = admitted.binding.decision_routing().expect("plain turn decision");
-    assert!(
-        decision.context.engine().prediction.is_none(),
-        "plain turn uses open_turn_context with no prediction port"
-    );
     let has_child_manifest = decision.context.engine().outgoing_child.is_some();
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     drive_start_turn_stream(
@@ -510,17 +497,6 @@ async fn plain_direct_answer_does_not_execute_a_direct_tool_without_approval() {
         cancellation.clone(),
     )
     .await;
-    assert!(
-        admitted
-            .binding
-            .decision_routing()
-            .expect("plain approval decision")
-            .context
-            .engine()
-            .prediction
-            .is_none(),
-        "plain approval uses open_turn_context with no prediction port"
-    );
     let approval_router = Arc::clone(&admitted.approval_router);
     let history = vec![ChatMessage::system("tiering system"), ChatMessage::user("hello")];
     let driver = tokio::spawn(drive_start_turn_stream(
@@ -719,18 +695,10 @@ async fn default_config_named_tool_chat_publishes_and_dispatches_the_tool() {
         cancellation.clone(),
     )
     .await;
-    let routing = admitted
+    let _routing = admitted
         .binding
         .decision_routing()
         .expect("test: named-tool chat decision");
-    assert!(
-        routing.context.engine().prediction.is_none(),
-        "chat decide uses open_turn_context with no prediction port"
-    );
-    assert!(
-        routing.context.engine().prediction.is_none(),
-        "named-tool chat uses open_turn_context with no prediction port"
-    );
     assert!(
         admitted
             .binding

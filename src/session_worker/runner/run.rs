@@ -1124,7 +1124,6 @@ async fn run_owned_manifest(
         .finalize(
             terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
-                decision: None,
                 binding: None,
                 terminal_id: manifest.run_id.clone(),
                 scope: logical_task_scope.clone(),

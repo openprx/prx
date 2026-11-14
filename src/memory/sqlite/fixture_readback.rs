@@ -1,7 +1,6 @@
 pub(crate) struct TerminalRow {
     #[cfg(feature = "llm-router")]
     pub(crate) run_id: String,
-    pub(crate) owner_id: Option<String>,
     pub(crate) raw_payload: String,
 }
 pub(crate) fn terminal_rows(workspace: &std::path::Path) -> rusqlite::Result<Vec<TerminalRow>> {
@@ -10,7 +9,7 @@ pub(crate) fn terminal_rows(workspace: &std::path::Path) -> rusqlite::Result<Vec
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     connection.prepare("SELECT run_id, owner_id, raw_payload_json FROM message_events WHERE event_type='turn.finalized' ORDER BY id")?
-        .query_map([], |row| Ok(TerminalRow { #[cfg(feature = "llm-router")] run_id: row.get(0)?, owner_id: row.get(1)?, raw_payload: row.get(2)? }))?
+        .query_map([], |row| Ok(TerminalRow { #[cfg(feature = "llm-router")] run_id: row.get(0)?, raw_payload: row.get(2)? }))?
         .collect()
 }
 pub(crate) fn tool_event_count(workspace: &std::path::Path) -> rusqlite::Result<i64> {

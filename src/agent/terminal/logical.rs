@@ -68,7 +68,6 @@ impl LogicalTaskTerminalRef {
                     .history_scope
                     .as_ref()
                     .is_none_or(|scope| terminal_semantic_scope(scope) == terminal_semantic_scope(&self.scope))
-                && draft.decision.is_none()
                 && draft.binding.is_none()
                 && draft.provider_outcome.is_none(),
             "logical completion differs from issued source or attempts model settlement"
@@ -202,7 +201,6 @@ mod tests {
         let authority = LogicalTaskTerminalRef::issued(fabric.clone(), scope.clone()).expect("writer fixture");
         let now = chrono::Utc::now();
         let draft = TurnTerminalDraft {
-            decision: None,
             binding: None,
             terminal_id: "prx_task".to_owned(),
             scope,

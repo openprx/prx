@@ -551,11 +551,7 @@ mod tests {
         )
         .await;
         let routing = admitted.binding.decision_routing().expect("stream fixture routing");
-        let audit = routing
-            .context
-            .audit_hops()
-            .map(|hop| format!("candidates={:?} gates={:?}", hop.candidates, hop.pre_commit.outcomes))
-            .collect::<Vec<_>>();
+        let audit = format!("{:?}", routing.context.engine().state.trusted.parts().budgets);
         assert!(
             admitted
                 .binding

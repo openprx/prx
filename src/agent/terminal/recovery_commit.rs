@@ -1,13 +1,10 @@
 //! AUTH-02-3a/3b terminal commit: claim v3, authenticated outbox, cost projection.
 
 use super::oversized_reply::{ReplyReference, compact_reply};
-use super::replay::PreparedReplay;
 use super::{
     TurnTerminalCommit, TurnTerminalPayload, TurnTerminalReceipt, TurnTerminalStatus, ensure_runtime_authority,
-    redact_persisted_json, replay_requires_journal, skill_awaiting_approval, skill_observations, skill_task_key,
-    terminal_semantic_scope, verify_terminal_replay, verify_terminal_replay_journal,
+    redact_persisted_json, skill_awaiting_approval, skill_observations, skill_task_key, terminal_semantic_scope,
 };
-use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
 use crate::config::schema::CostConfig;
 use crate::cost::types::CostSettlement;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, UsagePrice, usage_cost_resolution};
@@ -18,9 +15,7 @@ use crate::memory::recovery_authority::{
 };
 use crate::memory::{Memory, MessageEventInput, MessageEventScope};
 use crate::runtime::cost_recovery::{is_blocked, usage_from_facts};
-use crate::runtime::decision_journal::store::Enqueue;
 use crate::runtime::ingress_recovery::{SettledTerminalFacts, SkillObservation};
-use crate::security::runtime_key::KeyDomain;
 use anyhow::Context;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -67,9 +62,6 @@ pub(super) async fn finalize_recovery_terminal(
     commit: TurnTerminalCommit,
     cost_config: &CostConfig,
     workspace_dir: &Path,
-    stop_after_marker: bool,
-    execution_trace: Option<crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
-    mut prepared_replay: Option<PreparedReplay>,
     reply_and_usage: ReplyAndUsage,
 ) -> anyhow::Result<TurnTerminalReceipt> {
     let ReplyAndUsage {
@@ -101,19 +93,14 @@ pub(super) async fn finalize_recovery_terminal(
             .context("recovery terminal claim payload is invalid")
         })
         .transpose()?;
-    let link = commit.link()?.clone();
-    let recorded = link.is_recorded();
-
-    if !recorded {
-        anyhow::ensure!(
-            commit
-                .scope
-                .causation_event_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty()),
-            "unrecorded terminal claim requires causation_event_id"
-        );
-    }
+    anyhow::ensure!(
+        commit
+            .scope
+            .causation_event_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty()),
+        "unrecorded terminal claim requires causation_event_id"
+    );
 
     let prepared_parameters = commit.binding.runtime().prepared_main_parameters();
     let redacted_usage = usage_settlement
@@ -123,98 +110,75 @@ pub(super) async fn finalize_recovery_terminal(
     let usage_json = serde_json::to_vec(&redacted_usage)?;
     let mac_memory = std::sync::Arc::clone(&memory);
     let mac_workspace = fabric.workspace_id().to_owned();
-    let (
-        commit,
-        mut execution_trace,
-        prepared_parameters,
-        key_id,
-        semantic,
-        reply_reference,
-        semantic_bytes,
-        semantic_mac_v3,
-        usage_digest,
-    ) = crate::runtime::blocking::spawn_blocking(move || {
-        let repository = mac_memory
-            .recovery_repository()
-            .context("recovery repository unavailable")?;
-        let active_id = repository.activate_recovery_authority()?;
-        let key_id = match existing_payload.as_ref() {
-            Some(payload) => payload
-                .get("recovery_key_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .context("recovery terminal claim key is missing")?,
-            None => active_id,
-        };
-        // E2 concatenates the semantic bytes and the key id without a
-        // separator, so only a canonical 36-character UUID is accepted.
-        anyhow::ensure!(
-            key_id.len() == 36 && uuid::Uuid::parse_str(&key_id).is_ok_and(|id| id.to_string() == key_id),
-            "recovery terminal claim key id is not canonical"
-        );
-        let (semantic, reply_reference) = claim_semantic(
-            &commit,
-            &mac_workspace,
-            recorded,
-            execution_trace.as_ref(),
-            &prepared_parameters,
-            &key_id,
-            original_reference,
-        )?;
-        let semantic_bytes = serde_json::to_vec(&semantic)?;
-        let mut claim_preimage = semantic_bytes.clone();
-        claim_preimage.extend_from_slice(key_id.as_bytes());
-        if let Some(payload) = existing_payload.as_ref() {
-            let bytes = hex::decode(
-                payload
-                    .get("semantic_mac_v3")
+    let (commit, prepared_parameters, key_id, semantic, reply_reference, semantic_mac_v3, usage_digest) =
+        crate::runtime::blocking::spawn_blocking(move || {
+            let repository = mac_memory
+                .recovery_repository()
+                .context("recovery repository unavailable")?;
+            let active_id = repository.activate_recovery_authority()?;
+            let key_id = match existing_payload.as_ref() {
+                Some(payload) => payload
+                    .get("recovery_key_id")
                     .and_then(serde_json::Value::as_str)
-                    .context("recovery terminal claim mac is missing")?,
-            )?;
-            let tag = crate::memory::recovery_authority::RecoveryTag {
-                key_id: key_id.clone(),
-                tag: bytes
-                    .as_slice()
-                    .try_into()
-                    .context("recovery terminal claim mac length")?,
+                    .map(str::to_owned)
+                    .context("recovery terminal claim key is missing")?,
+                None => active_id,
             };
-            repository
-                .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
-                .context("recovery terminal commit conflict")?;
-        }
-        let claim = hex::encode(
-            repository
-                .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
-                .tag,
-        );
-        let usage = hex::encode(
-            repository
-                .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
-                .tag,
-        );
-        Ok::<_, anyhow::Error>((
-            commit,
-            execution_trace,
-            prepared_parameters,
-            key_id,
-            semantic,
-            reply_reference,
-            semantic_bytes,
-            claim,
-            usage,
-        ))
-    })
-    .await??;
-    let semantic_mac_v2 = if recorded {
-        let recorded_link = link.recorded.as_ref().context("recorded decision is missing")?;
-        Some(hex::encode(recorded_link.key.hmac(
-            KeyDomain::TerminalClaim,
-            &[b"terminal-claim-v2", &semantic_bytes],
-        )))
-    } else {
-        None
-    };
-
+            // E2 concatenates the semantic bytes and the key id without a
+            // separator, so only a canonical 36-character UUID is accepted.
+            anyhow::ensure!(
+                key_id.len() == 36 && uuid::Uuid::parse_str(&key_id).is_ok_and(|id| id.to_string() == key_id),
+                "recovery terminal claim key id is not canonical"
+            );
+            let (semantic, reply_reference) = claim_semantic(
+                &commit,
+                &mac_workspace,
+                &prepared_parameters,
+                &key_id,
+                original_reference,
+            )?;
+            let semantic_bytes = serde_json::to_vec(&semantic)?;
+            let mut claim_preimage = semantic_bytes.clone();
+            claim_preimage.extend_from_slice(key_id.as_bytes());
+            if let Some(payload) = existing_payload.as_ref() {
+                let bytes = hex::decode(
+                    payload
+                        .get("semantic_mac_v3")
+                        .and_then(serde_json::Value::as_str)
+                        .context("recovery terminal claim mac is missing")?,
+                )?;
+                let tag = crate::memory::recovery_authority::RecoveryTag {
+                    key_id: key_id.clone(),
+                    tag: bytes
+                        .as_slice()
+                        .try_into()
+                        .context("recovery terminal claim mac length")?,
+                };
+                repository
+                    .verify_recovery_mac(&tag, RecoveryMacDomain::ClaimV3, &claim_preimage)
+                    .context("recovery terminal commit conflict")?;
+            }
+            let claim = hex::encode(
+                repository
+                    .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &claim_preimage)?
+                    .tag,
+            );
+            let usage = hex::encode(
+                repository
+                    .recovery_mac(Some(&key_id), RecoveryMacDomain::UsageDigestV1, &usage_json)?
+                    .tag,
+            );
+            Ok::<_, anyhow::Error>((
+                commit,
+                prepared_parameters,
+                key_id,
+                semantic,
+                reply_reference,
+                claim,
+                usage,
+            ))
+        })
+        .await??;
     let claim_id = terminal_event_id(
         memory.as_ref(),
         fabric.workspace_id(),
@@ -240,18 +204,6 @@ pub(super) async fn finalize_recovery_terminal(
             "semantic_mac_v3": semantic_mac_v3,
             "recovery_key_id": key_id,
         });
-        if recorded {
-            payload.as_object_mut().context("claim payload")?.insert(
-                "decision_id".into(),
-                serde_json::Value::String(link.decision_id.to_string()),
-            );
-        }
-        if let Some(mac) = semantic_mac_v2 {
-            payload
-                .as_object_mut()
-                .context("claim payload")?
-                .insert("semantic_mac_v2".into(), serde_json::Value::String(mac));
-        }
         // The semantic preimage is always persisted so that a restart can
         // authenticate it with E2 instead of reconstructing it (OV-9).
         payload
@@ -274,10 +226,9 @@ pub(super) async fn finalize_recovery_terminal(
         RecoveryPricing::Unknown => usage_settlement.is_some().then_some(CostSettlement::UnknownPricing),
     };
 
-    let decision_id = recorded.then(|| link.decision_id.to_string());
     let payload = TurnTerminalPayload {
         terminal_id: &commit.terminal_id,
-        decision_id: decision_id.as_deref(),
+        decision_id: None,
         model_catalog_revision: commit
             .binding
             .runtime()
@@ -291,7 +242,7 @@ pub(super) async fn finalize_recovery_terminal(
         status: commit.status,
         history: &commit.history,
         history_scope: commit.history_scope.as_ref().map(terminal_semantic_scope),
-        execution_trace: execution_trace.as_ref(),
+        execution_trace: None,
         assistant_event_id: assistant_id.as_deref(),
         provider_outcome: &commit.provider_outcome,
         prepared_parameters: &prepared_parameters,
@@ -364,7 +315,8 @@ pub(super) async fn finalize_recovery_terminal(
     // The pinned trusted surface of the turn (R22), byte-identical to the
     // former final-hop value.
     let surface = commit.binding.runtime().trusted.surface.as_str().to_owned();
-    let (skill_status, awaiting_approval, verified) = recovered_skill(&commit, execution_trace.as_ref());
+    // Unrecorded terminals carry no verified decision signals.
+    let (skill_status, awaiting_approval, verified) = (commit.status, false, false);
     let settled = SettledTerminalFacts {
         v: 1,
         terminal_id: commit.terminal_id.clone(),
@@ -427,34 +379,7 @@ pub(super) async fn finalize_recovery_terminal(
     };
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let outcome = if let Some(prepared) = prepared_replay.take() {
-        let recorded_link = link.recorded.as_ref().context("recorded decision is missing")?;
-        let key = recorded_link.key.clone();
-        crate::memory::sqlite::with_after_prefix_async(
-            Box::new(move |prefix, final_input| {
-                let claim = prefix
-                    .iter()
-                    .find(|event| event.event_type == "turn.decision.claimed")
-                    .context("recovery terminal claim is missing")?;
-                let assistant = prefix.iter().find(|event| event.role == "assistant");
-                let mut prepared = prepared;
-                prepared.bind_claim(&key, claim)?;
-                let mut payload: serde_json::Value = serde_json::from_str(
-                    final_input
-                        .raw_payload_json
-                        .as_deref()
-                        .context("terminal marker has no payload")?,
-                )?;
-                prepared.seal(&key, &mut payload, assistant)?;
-                final_input.raw_payload_json = Some(serde_json::to_string(&payload)?);
-                Ok(())
-            }),
-            memory.commit_recovery_terminal(terminal_commit, deadline),
-        )
-        .await?
-    } else {
-        memory.commit_recovery_terminal(terminal_commit, deadline).await?
-    };
+    let outcome = memory.commit_recovery_terminal(terminal_commit, deadline).await?;
 
     let events = match outcome {
         RecoveryTerminalOutcome::Committed { events, .. } | RecoveryTerminalOutcome::Replayed { events, .. } => events,
@@ -517,52 +442,8 @@ pub(super) async fn finalize_recovery_terminal(
         .context("recovery terminal marker is missing")?;
     let assistant_event = events.iter().find(|event| event.role == "assistant").cloned();
 
-    let mut journal_selected = None;
-    if recorded {
-        let recorded_link = link.recorded.as_ref().context("recorded decision is missing")?;
-        let owner = terminal_event
-            .owner_id
-            .as_deref()
-            .context("terminal owner is missing")?;
-        let journal = replay_requires_journal(&recorded_link.key, &terminal_event, None)?;
-        let verified_replay = if journal {
-            verify_terminal_replay_journal(
-                fabric.memory().as_ref(),
-                workspace_dir,
-                &recorded_link.key,
-                &recorded_link.store_workspace_id,
-                fabric.workspace_id(),
-                owner,
-                &commit.terminal_id,
-                &terminal_event,
-            )
-            .await?
-        } else {
-            verify_terminal_replay(
-                fabric.memory().as_ref(),
-                &recorded_link.reader,
-                &recorded_link.key,
-                &recorded_link.store_workspace_id,
-                fabric.workspace_id(),
-                owner,
-                &commit.terminal_id,
-                &terminal_event,
-            )
-            .await?
-        };
-        anyhow::ensure!(
-            journal || verified_replay.source().source != crate::memory::MessageEventSource::SessionWorker,
-            "worker segment requires launch provenance for legacy selection"
-        );
-        journal_selected = Some(journal);
-        recorded_link
-            .child_outcome_hook
-            .persist(&verified_replay, &terminal_event, None, None)
-            .await?;
-    }
-
-    let awaiting = skill_awaiting_approval(&link, execution_trace.as_ref());
-    let observations = skill_observations(&link, execution_trace.as_ref(), commit.provider_outcome.as_ref());
+    let awaiting = skill_awaiting_approval(commit.binding.runtime());
+    let observations = skill_observations(commit.binding.runtime(), commit.provider_outcome.as_ref());
     if !awaiting {
         commit.binding.runtime().retire_recursive_allowance();
     }
@@ -585,41 +466,7 @@ pub(super) async fn finalize_recovery_terminal(
         cost_settlement,
         delivery_intent: commit.delivery_intent.clone(),
     };
-    if stop_after_marker {
-        return Ok(receipt);
-    }
-    if recorded {
-        let recorded_link = link.recorded.as_ref().context("recorded decision is missing")?;
-        let facts = TerminalFacts::from_receipt(&link.context, &receipt)?;
-        let queued = OutcomeCorrelator::settle(&recorded_link.writer, &link.context, &facts)? == Enqueue::Queued;
-        if journal_selected == Some(true) {
-            if !queued {
-                tracing::warn!("decision outcome projection could not be queued after terminal commit");
-            }
-        } else {
-            anyhow::ensure!(queued, "decision outcome could not be queued after terminal commit");
-        }
-    }
-    let _ = execution_trace.take();
     Ok(receipt)
-}
-
-fn recovered_skill(
-    commit: &TurnTerminalCommit,
-    trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
-) -> (TurnTerminalStatus, bool, bool) {
-    if !commit.is_recorded() {
-        return (commit.status, false, false);
-    }
-    let facts = TerminalFacts::from_live(
-        commit.terminal_id.clone(),
-        commit.status,
-        commit.provider_outcome.clone(),
-        trace.cloned(),
-    );
-    // A live hop is always a committed selection since R9; only a
-    // RequestApproval selection carried a recovery kind.
-    facts.recovered_signals("")
 }
 
 fn recovery_pricing(usage: Option<&MeteredTokenUsageRecord>, cost_config: &CostConfig) -> RecoveryPricing {
@@ -644,8 +491,6 @@ fn recovery_pricing(usage: Option<&MeteredTokenUsageRecord>, cost_config: &CostC
 fn claim_semantic(
     commit: &TurnTerminalCommit,
     fabric_workspace: &str,
-    recorded: bool,
-    execution_trace: Option<&crate::tools::capability::execution_trace::ExecutionTraceSnapshot>,
     prepared_parameters: &[crate::providers::catalog::parameters::ResolvedParameters],
     key_id: &str,
     original_reference: Option<ReplyReference>,
@@ -654,59 +499,26 @@ fn claim_semantic(
     if let Some(outcome) = claim_outcome.as_mut() {
         outcome.redact_provider_labels();
     }
-    let semantic = if recorded {
-        let link = commit.link()?;
-        let trusted = link
-            .context
-            .audit_hops()
-            .last()
-            .context("decision has no final hop")?
-            .state
-            .trusted
-            .parts();
-        redact_persisted_json(serde_json::json!({
-            "version": 2,
-            "terminal_id": commit.terminal_id,
-            "decision_id": link.decision_id.to_string(),
-            "execution_trace": execution_trace,
-            "decision_chain": link.context.hop_ids().iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "workspace_id": trusted.workspace_id,
-            "source_event_id": trusted.source_event_id,
-            "catalog_generation": trusted.catalog_generation.to_hex(),
-            "model_catalog_revision": commit.binding.runtime().model_catalog().map(|catalog| catalog.revision.as_str()),
-            "model_catalog_content_sha256": commit.binding.runtime().model_catalog().map(crate::providers::catalog::ReleaseCatalog::content_sha256),
-            "policy_version": trusted.policy_version,
-            "status": commit.status,
-            "scope": terminal_semantic_scope(&commit.scope),
-            "history": commit.history,
-            "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
-            "provider_outcome": claim_outcome,
-            "telemetry": commit.telemetry,
-            "delivery_intent": commit.delivery_intent,
-        }))
-    } else {
-        redact_persisted_json(serde_json::json!({
-            "version": 2,
-            "terminal_id": commit.terminal_id,
-            "decision_id": serde_json::Value::Null,
-            "execution_trace": serde_json::Value::Null,
-            "decision_chain": serde_json::Value::Null,
-            "workspace_id": fabric_workspace,
-            "source_event_id": commit.scope.causation_event_id,
-            "catalog_generation": serde_json::Value::Null,
-            "model_catalog_revision": serde_json::Value::Null,
-            "model_catalog_content_sha256": serde_json::Value::Null,
-            "policy_version": serde_json::Value::Null,
-            "status": commit.status,
-            "scope": terminal_semantic_scope(&commit.scope),
-            "history": commit.history,
-            "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
-            "provider_outcome": claim_outcome,
-            "telemetry": commit.telemetry,
-            "delivery_intent": commit.delivery_intent,
-        }))
-    };
-    let mut semantic = semantic;
+    let mut semantic = redact_persisted_json(serde_json::json!({
+        "version": 2,
+        "terminal_id": commit.terminal_id,
+        "decision_id": serde_json::Value::Null,
+        "execution_trace": serde_json::Value::Null,
+        "decision_chain": serde_json::Value::Null,
+        "workspace_id": fabric_workspace,
+        "source_event_id": commit.scope.causation_event_id,
+        "catalog_generation": serde_json::Value::Null,
+        "model_catalog_revision": serde_json::Value::Null,
+        "model_catalog_content_sha256": serde_json::Value::Null,
+        "policy_version": serde_json::Value::Null,
+        "status": commit.status,
+        "scope": terminal_semantic_scope(&commit.scope),
+        "history": commit.history,
+        "history_scope": commit.history_scope.as_ref().map(terminal_semantic_scope),
+        "provider_outcome": claim_outcome,
+        "telemetry": commit.telemetry,
+        "delivery_intent": commit.delivery_intent,
+    }));
     if !prepared_parameters.is_empty() {
         semantic
             .as_object_mut()
@@ -747,10 +559,9 @@ fn claim_semantic(
 #[cfg(test)]
 pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalDraft) {
     draft
-        .decision
+        .binding
         .as_ref()
-        .expect("test: issued decision")
-        .context
+        .expect("test: issued binding")
         .runtime()
         .capture_main_parameters(true)
         .scope(async {
@@ -762,10 +573,9 @@ pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalD
         })
         .await;
     let parameters = draft
-        .decision
+        .binding
         .as_ref()
-        .expect("test: issued decision")
-        .context
+        .expect("test: issued binding")
         .runtime()
         .prepared_main_parameters();
     draft
@@ -779,22 +589,10 @@ pub(crate) async fn capture_parameters_for_test(draft: &mut super::TurnTerminalD
 pub(crate) fn claim_semantic_for_test(
     commit: &super::TurnTerminalCommit,
     fabric_workspace: &str,
-    recorded: bool,
     key_id: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let prepared_parameters = commit.binding.runtime().prepared_main_parameters();
-    let link = commit.link()?;
-    let trace = recorded.then(|| link.context.terminal_execution_trace());
-    Ok(claim_semantic(
-        commit,
-        fabric_workspace,
-        recorded,
-        trace.as_ref(),
-        &prepared_parameters,
-        key_id,
-        None,
-    )?
-    .0)
+    Ok(claim_semantic(commit, fabric_workspace, &prepared_parameters, key_id, None)?.0)
 }
 
 fn runtime_event(

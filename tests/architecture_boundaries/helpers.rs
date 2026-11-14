@@ -253,30 +253,6 @@ fn the_strip_memo_returns_the_exact_computation() {
 // Open Causal Decision Plane: decision protocol guards (CDP-01; SP-CDP-C 3.4)
 // ---------------------------------------------------------------------------
 
-/// Occurrences of `Name {` in `production` that build a value of `name`: a
-/// struct literal, not the type's own `struct`/`impl` header or a function's
-/// `-> Name {` return type.
-pub(super) fn struct_literal_count(production: &str, name: &str) -> usize {
-    let needle = format!("{name} {{");
-    production
-        .match_indices(&needle)
-        .filter(|(start, _)| {
-            let before = &production[..*start];
-            if before
-                .chars()
-                .next_back()
-                .is_some_and(|character| is_ident_char(character) || character == ':')
-            {
-                return false;
-            }
-            let previous = before.trim_end();
-            !["struct", "impl", "enum", "for", "trait", "->", "dyn", "<", "&"]
-                .iter()
-                .any(|token| previous.ends_with(token))
-        })
-        .count()
-}
-
 /// Locate a top-level method inside its exact impl, ignoring literal/comment braces.
 pub(super) fn impl_method_body(source: &str, implementation: &str, name: &str) -> String {
     let masked = blank_comments_and_literals(source);

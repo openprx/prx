@@ -24,8 +24,6 @@ struct Report {
     pid: u32,
     calls: usize,
     historical_resends: usize,
-    key_sha256: String,
-    store_workspace_id: String,
     events: Vec<MessageEvent>,
 }
 
@@ -76,15 +74,6 @@ async fn report(memory: &Arc<dyn Memory>, workspace: &Path, calls: usize, histor
         pid: std::process::id(),
         calls,
         historical_resends,
-        store_workspace_id: crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(
-            workspace,
-        )
-        .workspace_id()
-        .expect("actual decision Store UUID must already exist")
-        .to_string(),
-        key_sha256: hex::encode(Sha256::digest(
-            std::fs::read(workspace.join("self/causal_tree/.decision_key")).unwrap(),
-        )),
         events,
     }
 }
@@ -383,8 +372,6 @@ fn verify_recovery(completed: bool) {
         after.historical_resends, 0,
         "test: no historical provider call may be resent"
     );
-    assert_eq!(before.key_sha256, after.key_sha256);
-    assert_eq!(before.store_workspace_id, after.store_workspace_id);
     let restored = source(&after, INPUT);
     assert_eq!(
         serde_json::to_value(original).unwrap(),
@@ -413,12 +400,6 @@ fn verify_recovery(completed: bool) {
             .get("provider_outcome")
             .is_some_and(|value| !value.is_null()),
         "test: the probe terminal retains its own provider outcome"
-    );
-    assert_eq!(
-        probe_payload
-            .pointer("/terminal_replay_v1/store_workspace_id")
-            .and_then(serde_json::Value::as_str),
-        Some(after.store_workspace_id.as_str())
     );
     let state = if completed { "reconciled" } else { "unconfirmed" };
     let recovery_key = format!("ingress:{}:{state}", original.event_id);
@@ -451,13 +432,6 @@ fn verify_recovery(completed: bool) {
             serde_json::to_value(old_final).unwrap()
         );
         let old: serde_json::Value = serde_json::from_str(old_final.raw_payload_json.as_ref().unwrap()).unwrap();
-        let probe_final = final_for(&after, probe).unwrap();
-        let new: serde_json::Value = serde_json::from_str(probe_final.raw_payload_json.as_ref().unwrap()).unwrap();
-        assert!(
-            old.get("terminal_replay_mac_v1")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|tag| !tag.is_empty())
-        );
         assert_eq!(
             old.pointer("/provider_outcome/tokens_used/prompt_tokens")
                 .and_then(serde_json::Value::as_u64),
@@ -472,16 +446,6 @@ fn verify_recovery(completed: bool) {
             old.pointer("/provider_outcome/tokens_used/total_tokens")
                 .and_then(serde_json::Value::as_u64),
             Some(22)
-        );
-        let store = old
-            .pointer("/terminal_replay_v1/store_workspace_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("original store namespace");
-        assert!(!store.is_empty(), "expected a non-empty value");
-        assert_eq!(
-            new.pointer("/terminal_replay_v1/store_workspace_id")
-                .and_then(serde_json::Value::as_str),
-            Some(store)
         );
     } else {
         assert!(
@@ -523,8 +487,6 @@ fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
     next.finish(false);
     assert_eq!(after.calls, 1, "the next agent turn must reach the provider");
     assert_ne!(before.pid, after.pid);
-    assert_eq!(before.key_sha256, after.key_sha256);
-    assert_eq!(before.store_workspace_id, after.store_workspace_id);
     assert!(
         after
             .events
@@ -538,46 +500,6 @@ fn normally_completed_agent_float_turn_restarts_and_accepts_the_next_turn() {
             .iter()
             .any(|row| row.event_type == "turn.ingress.quarantined")
     );
-}
-
-#[tokio::test]
-#[ignore = "requires an explicitly copied historical workspace"]
-async fn copied_workspace_terminals_verify_through_the_real_store() {
-    let workspace = PathBuf::from(std::env::var_os("PRX_REPLAY_TEST_WORKSPACE").expect("scratch workspace"));
-    let memory = SqliteMemory::new(&workspace).unwrap();
-    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(&workspace);
-    let namespace = store.workspace_id().expect("preserved decision namespace");
-    let key = DecisionKey::load_existing(&workspace).unwrap();
-    let rows = crate::memory::sqlite::fixture_readback::terminal_rows(&workspace).unwrap();
-    assert!(!rows.is_empty() && rows.len() <= 32, "bounded historical evidence");
-    let verified = rows.len();
-    for row in rows {
-        let payload: serde_json::Value = serde_json::from_str(&row.raw_payload).unwrap();
-        let workspace_id = payload
-            .pointer("/terminal_replay_v1/workspace_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap();
-        let run = payload.get("terminal_id").and_then(serde_json::Value::as_str).unwrap();
-        let owner = row.owner_id.unwrap();
-        let event = memory
-            .find_owned_message_event_by_idempotency_key(workspace_id, &owner, &format!("turn:{run}:final"))
-            .await
-            .unwrap()
-            .unwrap();
-        crate::agent::terminal::verify_terminal_replay(
-            &memory,
-            &store.reader(),
-            &key,
-            &namespace,
-            workspace_id,
-            &owner,
-            event.run_id.as_deref().unwrap(),
-            &event,
-        )
-        .await
-        .unwrap();
-    }
-    println!("historical terminal replay verified: {verified}");
 }
 
 fn recovery_config(workspace: &Path) -> crate::config::Config {
@@ -613,157 +535,6 @@ async fn recovery_recorder(
 }
 
 #[tokio::test]
-async fn ingress_recovery_unchanged_by_switch() {
-    async fn prepared(
-        plane: bool,
-        engine: bool,
-    ) -> (
-        tempfile::TempDir,
-        Arc<IngressRecorder>,
-        Arc<RecoveryScope>,
-        super::super::turn_cleanup::CleanupTicket,
-        Arc<super::super::turn_cleanup::CleanupTracker>,
-    ) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = recovery_config(dir.path());
-        config.causal_tree.enabled = plane;
-        config.decision_engine.enabled = engine;
-        let config = Arc::new(config);
-        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
-        let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
-        let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
-        let recorder = IngressRecorder::prepare(Arc::clone(&memory), &config, &ticket)
-            .await
-            .unwrap()
-            .expect("recording sqlite prepares a recorder");
-        let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-        let key = crate::security::runtime_key::DecisionKey::load_or_create(dir.path()).unwrap();
-        let advisory = if plane {
-            let observer = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(Arc::new(
-                crate::observability::NoopObserver,
-            )));
-            let (store, events) = super::open_advisory_store(&generation, Arc::clone(&memory), observer, &tracker)
-                .await
-                .unwrap();
-            super::PreparedAdvisory::opened(store, events).unwrap()
-        } else {
-            super::PreparedAdvisory::default()
-        };
-        let recovery = RecoveryScope::prepare(
-            &generation,
-            memory,
-            crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-            &tracker,
-            Some(key),
-            advisory,
-        )
-        .await
-        .unwrap();
-        (dir, recorder, recovery, ticket, tracker)
-    }
-
-    let (on_dir, on_recorder, on_recovery, on_ticket, on_tracker) = prepared(true, false).await;
-    assert!(
-        on_recorder.plane,
-        "recovery plane follows [causal_tree].enabled, not the engine switch"
-    );
-    assert!(on_recovery.ingress_recovery_enabled());
-    assert!(on_recovery.authority.legacy.is_some());
-    assert!(on_recovery.legacy_store().is_some());
-    on_ticket.finish(true);
-    on_tracker
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .unwrap();
-    drop(on_dir);
-
-    let (off_dir, off_recorder, off_recovery, off_ticket, off_tracker) = prepared(false, true).await;
-    assert!(
-        !off_recorder.plane,
-        "recovery plane stays off when [causal_tree].enabled is off"
-    );
-    assert!(off_recovery.authority.legacy.is_none());
-    assert!(off_recovery.legacy_store().is_none());
-    assert!(!off_dir.path().join("self/causal_tree/decisions.db").exists());
-    off_ticket.finish(true);
-    off_tracker
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store() {
-    let dir = tempfile::tempdir().unwrap();
-    // A populated legacy database (no key): the plane-off path must not open it.
-    {
-        let store = crate::runtime::decision_journal::store::testing::open_private(
-            dir.path(),
-            Arc::new(crate::observability::causal_event::testing::RecordingSink::default()),
-        );
-        let record = crate::runtime::decision_journal::store::testing::record(
-            crate::security::decision_id::DecisionId::new_runtime(),
-            &dir.path().to_string_lossy(),
-            None,
-            1,
-        );
-        let writer = store.writer().expect("test: read-write store has a writer");
-        let _ = writer.record_chain(vec![record]);
-    }
-    let legacy_db = crate::runtime::decision_journal::store::db_path(dir.path());
-    assert!(legacy_db.exists(), "test: the legacy database is populated");
-    let opens_before = crate::runtime::decision_journal::store::open_spy::opens_under(dir.path());
-    let mut config = recovery_config(dir.path());
-    config.causal_tree.enabled = false;
-    let config = Arc::new(config);
-    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
-    let tracker = Arc::new(super::super::turn_cleanup::CleanupTracker::default());
-    let ticket = tracker.register(tokio_util::sync::CancellationToken::new()).unwrap();
-    let fabric = crate::memory::MemoryFabric::new(memory.clone(), dir.path().to_string_lossy().into_owned())
-        .with_ingress_recovery(&config, &ticket)
-        .await
-        .unwrap();
-    assert!(
-        IngressRecorder::prepare(Arc::clone(&memory), &config, &ticket)
-            .await
-            .unwrap()
-            .is_some(),
-        "plane-off recording still prepares a repository recorder"
-    );
-    let _ = fabric;
-    let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-    let recovery = RecoveryScope::prepare(
-        &generation,
-        memory,
-        crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        &tracker,
-        None,
-        super::PreparedAdvisory::default(),
-    )
-    .await
-    .unwrap();
-    assert!(recovery.ingress_recovery_enabled());
-    assert!(recovery.authority.legacy.is_none());
-    assert!(recovery.legacy_store().is_none());
-    assert!(recovery.legacy_events().is_none());
-    assert!(!dir.path().join("self/causal_tree/.decision_key").exists());
-    assert_eq!(
-        crate::runtime::decision_journal::store::open_spy::opens_under(dir.path()),
-        opens_before,
-        "plane-off ingress recovery opens no decision store"
-    );
-    assert!(
-        dir.path().join("memory/.recovery_keys").exists(),
-        "plane-off first activation may create recovery keys"
-    );
-    ticket.finish(true);
-    tracker
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
 async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
     let dir = tempfile::tempdir().unwrap();
     let config = recovery_config(dir.path());
@@ -775,15 +546,10 @@ async fn recovery_with_unavailable_key_stays_unrecorded_without_retry() {
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         &tracker,
-        None,
-        super::PreparedAdvisory::default(),
     )
     .await
     .expect("missing decision key does not abort repository recovery");
     assert!(recovery.ingress_recovery_enabled());
-    assert!(recovery.authority.legacy.is_none());
-    assert!(recovery.legacy_store().is_none());
-    assert!(recovery.legacy_events().is_none());
     assert!(
         !dir.path().join("self/causal_tree/.decision_key").exists(),
         "decision key must not be created without a plane-on workspace key"
@@ -827,17 +593,98 @@ async fn crash_after_ingress_record_marks_interrupted_after_reopen_without_decis
     ticket.finish(true);
 }
 
+/// P2-R21: a pre-Part-2 (v1/v2) capsule is excluded by the recovery scan in
+/// SQL. Recovery reads no legacy key, writes no marker and leaves its state.
+#[tokio::test]
+async fn legacy_capsules_are_ignored_without_key_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = recovery_config(dir.path());
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(dir.path()).unwrap());
+    let (recorder, ticket) = recovery_recorder(memory.clone(), &config).await;
+    let run = "prx_legacy_run";
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let capsule = crate::memory::ingress_recovery::IngressCapsule {
+        version: 2,
+        key_id: None,
+        backend_namespace: recorder.backend_namespace().to_owned(),
+        scope: crate::memory::ingress_recovery::IngressRecoveryScope {
+            workspace_id: dir.path().to_string_lossy().into_owned(),
+            owner_id: "prx_user".into(),
+            source: crate::memory::MessageEventSource::Agent,
+        },
+        lifetime: uuid::Uuid::nil().to_string(),
+        input_event_id: event_id.clone(),
+        input_key: format!("turn:{run}:input"),
+        run_id: run.to_owned(),
+        input_digest: "00".repeat(32),
+        authentication: "00".repeat(32),
+    };
+    let capsule_json = serde_json::to_string(&capsule).unwrap();
+    let mut input = recovery_input(dir.path(), run);
+    input.event_id = Some(event_id.clone());
+    input.raw_payload_json =
+        Some(serde_json::json!({"prx_ingress_capsule": capsule, "original_payload_json": null}).to_string());
+    let planted = memory.append_message_event(input).await.unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("memory/brain.db")).unwrap();
+    conn.execute(
+        "INSERT INTO ingress_recovery(cursor, input_event_id, workspace_id, owner_id, source, input_key, lifetime,
+            capsule_json, state) VALUES(?1, ?2, ?3, 'prx_user', 'agent', ?4, ?5, ?6, 'pending')",
+        rusqlite::params![
+            planted.id,
+            event_id,
+            dir.path().to_string_lossy(),
+            capsule.input_key,
+            capsule.lifetime,
+            capsule_json
+        ],
+    )
+    .unwrap();
+    // An unreadable legacy key: any key read during recovery would fail it.
+    let key = dir.path().join("self/causal_tree/.decision_key");
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    std::fs::write(&key, [42_u8; 32]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    ticket.finish(true);
+    drop(recorder);
+
+    let (next, next_ticket) = recovery_recorder(memory.clone(), &config).await;
+    next.append(recovery_input(dir.path(), "prx_next_run")).await.unwrap();
+    for marker in ["unconfirmed", "reconciled", "quarantine"] {
+        assert!(
+            memory
+                .find_owned_message_event_by_idempotency_key(
+                    &dir.path().to_string_lossy(),
+                    "prx_user",
+                    &format!("ingress:{event_id}:{marker}"),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a legacy capsule gets no {marker} marker"
+        );
+    }
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM ingress_recovery WHERE input_event_id = ?1",
+            [&event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending", "the legacy row keeps its state");
+    next_ticket.finish(true);
+}
+
 fn terminal_scope(memory: Arc<dyn Memory>, workspace: &Path) -> RecoveryScope {
     RecoveryScope {
         memory,
         workspace: workspace.to_path_buf(),
         recordable: true,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        authority: Arc::new(RecoveryAuthority {
-            repository: None,
-            legacy: None,
-        }),
-        spies: Arc::new(RepairSpies::default()),
+        authority: Arc::new(RecoveryAuthority { repository: None }),
     }
 }
 
@@ -897,22 +744,15 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
         .unwrap();
     fabric.verify_ingress_input(&event).unwrap();
     let generation = crate::config::ConfigGenerationManager::new(config.as_ref().clone()).pin();
-    // Supply durable authority so the recording opt-out is the deciding gate.
-    let key = DecisionKey::load_or_create(dir.path()).unwrap();
     let recovery = RecoveryScope::prepare(
         &generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         &tracker,
-        Some(key),
-        super::PreparedAdvisory::default(),
     )
     .await
     .unwrap();
     assert!(!recovery.ingress_recovery_enabled());
-    assert!(recovery.authority.legacy.is_none());
-    assert!(recovery.legacy_store().is_none());
-    assert!(recovery.legacy_events().is_none());
     assert!(!dir.path().join("self/causal_tree/decisions.db").exists());
     ticket.finish(true);
     tracker
@@ -925,46 +765,8 @@ async fn recovery_off_when_user_message_recording_is_disabled() {
 mod auth_02_2a_tests;
 
 #[tokio::test]
-async fn recovery_plane_recording_key_legacy_matrix() {
-    auth_02_2a_tests::recovery_plane_recording_key_legacy_matrix().await;
-}
-
-#[tokio::test]
-async fn recovery_off_never_writes_outcome_or_child_link() {
-    auth_02_2a_tests::recovery_off_never_writes_outcome_or_child_link().await;
-}
-
-#[tokio::test]
-async fn recovery_legacy_chain_writes_no_attestation() {
-    auth_02_2a_tests::recovery_legacy_chain_writes_no_attestation().await;
-}
-
-#[tokio::test]
 async fn recovery_settled_receipt_each_bound_field_is_refused() {
     auth_02_2a_tests::recovery_settled_receipt_each_bound_field_is_refused().await;
-}
-
-#[path = "auth_02_2b_tests.rs"]
-mod auth_02_2b_tests;
-
-#[tokio::test]
-async fn recovery_builder_repair_writes_outcome_through_passed_writer() {
-    auth_02_2b_tests::recovery_builder_repair_writes_outcome_through_passed_writer().await;
-}
-
-#[tokio::test]
-async fn recovery_failed_readwrite_open_leaves_drain_unclean() {
-    auth_02_2b_tests::recovery_failed_readwrite_open_leaves_drain_unclean().await;
-}
-
-#[tokio::test]
-async fn recovery_store_without_writer_rejoin_fails_closed() {
-    auth_02_2b_tests::recovery_store_without_writer_rejoin_fails_closed().await;
-}
-
-#[tokio::test]
-async fn recovery_legacy_reader_creates_no_files() {
-    auth_02_2b_tests::recovery_legacy_reader_creates_no_files().await;
 }
 
 #[path = "auth_02_3_tests.rs"]

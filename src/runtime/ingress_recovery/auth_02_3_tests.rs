@@ -100,8 +100,6 @@ async fn prepare_scope(
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         &tracker,
-        None,
-        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
     )
     .await
     .expect("test: recovery prepare");
@@ -289,20 +287,15 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
         .await
         .expect("test: claim winner");
     let commit: crate::agent::terminal::TurnTerminalCommit = draft.clone().try_into().expect("test: commit");
-    let recorded = commit.is_recorded();
     let payload: serde_json::Value = serde_json::from_str(&first_claim_payload(&workspace)).expect("test: claim json");
     let key_id = payload
         .get("recovery_key_id")
         .and_then(serde_json::Value::as_str)
         .expect("test: recovery_key_id")
         .to_owned();
-    let semantic = crate::agent::terminal::recovery_commit::claim_semantic_for_test(
-        &commit,
-        fabric.workspace_id(),
-        recorded,
-        &key_id,
-    )
-    .expect("test: semantic");
+    let semantic =
+        crate::agent::terminal::recovery_commit::claim_semantic_for_test(&commit, fabric.workspace_id(), &key_id)
+            .expect("test: semantic");
     let mac = hex::decode(
         payload
             .get("semantic_mac_v3")
@@ -402,13 +395,9 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
     let mut oversized = commit.clone();
     let reply = "π".repeat(crate::memory::recovery_authority::MAX_SERIALIZED_RECOVERY_FACTS);
     oversized.history.as_mut().expect("test: history").assistant_content = reply.clone();
-    let bounded = crate::agent::terminal::recovery_commit::claim_semantic_for_test(
-        &oversized,
-        fabric.workspace_id(),
-        recorded,
-        &key_id,
-    )
-    .expect("test: bounded reply semantics");
+    let bounded =
+        crate::agent::terminal::recovery_commit::claim_semantic_for_test(&oversized, fabric.workspace_id(), &key_id)
+            .expect("test: bounded reply semantics");
     assert!(!bounded.to_string().contains(&reply), "claim retained oversized text");
     assert_eq!(
         bounded

@@ -1,7 +1,6 @@
 pub(crate) mod auxiliary_call;
 pub mod blocking;
 pub mod bootstrap;
-pub(crate) mod causal_events;
 pub mod chat_sessions;
 pub(crate) mod child_source;
 pub(crate) mod child_turn;
@@ -9,7 +8,6 @@ pub mod control_ladder;
 pub(crate) mod cost_recovery;
 pub(crate) mod decision_accounting;
 pub(crate) mod decision_advisory;
-pub(crate) mod decision_journal;
 pub mod docker;
 pub mod envelope;
 pub(crate) mod evolution_model;

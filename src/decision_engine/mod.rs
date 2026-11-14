@@ -11,7 +11,6 @@ pub mod causal_adapter;
 pub use crate::config::schema::decision_engine as config;
 pub mod contract;
 pub(crate) mod cost_model;
-pub(crate) mod decision_score;
 pub mod noop;
 pub mod observe;
 pub mod prediction;

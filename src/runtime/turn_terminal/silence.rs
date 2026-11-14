@@ -34,6 +34,7 @@ pub(crate) fn record_agent_silence(
         "silence dependency changed after provider request"
     );
     context
+        .runtime()
         .execution_trace
         .get()
         .context("silence has no actual execution trace")?

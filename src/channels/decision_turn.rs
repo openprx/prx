@@ -294,7 +294,6 @@ impl ChannelDecisionTurn {
     }
 
     pub(super) async fn commit(&self, mut proposal: TurnTerminalDraft) -> anyhow::Result<TurnTerminalReceipt> {
-        proposal.decision = Some(self.service.terminal_settlement_ref(Arc::clone(&self.context))?);
         proposal.binding = Some(self.service.terminal_binding(&self.context)?);
         // Terminal provenance belongs to the admitted sender; assistant history
         // has a separate projection scope and cannot replace source authority.

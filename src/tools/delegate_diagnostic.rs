@@ -1,8 +1,5 @@
 #![cfg(all(test, unix))]
 //! Opt-in, bounded, fixed-field evidence for one neutral delegate fixture.
-use crate::causal_tree::decision_select::Selection;
-use crate::causal_tree::gates::{GateOutcome, GateReport};
-use crate::decision_engine::candidate_generator::CandidateSet;
 use anyhow::Context;
 use futures::FutureExt;
 use serde_json::{Value, json};
@@ -163,80 +160,13 @@ fn code(value: &str) -> anyhow::Result<&str> {
     Ok(value)
 }
 
-fn gates(report: &GateReport) -> anyhow::Result<Vec<Value>> {
-    anyhow::ensure!(report.outcomes.len() <= 128, "gate diagnostic bound");
-    report
-        .outcomes
-        .iter()
-        .enumerate()
-        .map(|(ordinal, (candidate, outcome))| {
-            let value = match outcome {
-                GateOutcome::Passed => json!({"outcome":"passed"}),
-                GateOutcome::Blocked { gate, reason_code } => {
-                    json!({"outcome":"blocked","gate":gate,"reason":code(reason_code)?})
-                }
-                GateOutcome::ApprovalOnly { op_ids } => {
-                    json!({"outcome":"approval_only","operation_count":op_ids.len()})
-                }
-                GateOutcome::ApprovalDeferred => json!({"outcome":"approval_deferred"}),
-            };
-            Ok(json!({"ordinal_in_report":ordinal,"action":candidate.action().as_str(),"gate":value}))
-        })
-        .collect()
-}
-
 pub(super) fn admission(
     context: &crate::runtime::turn_decision::TurnDecisionContext,
     capabilities: crate::providers::ProviderCapabilities,
 ) {
     record("admission.json", || {
-        let mut hops = Vec::new();
-        for hop in context.audit_hops() {
-            anyhow::ensure!(hops.len() < 16, "hop diagnostic bound");
-            let (kind, candidates, pre) = match &hop.candidates {
-                CandidateSet::Legal { candidates, report, .. } => ("legal", candidates, report),
-                CandidateSet::NoLegalPath { terminals, report, .. } => ("no_legal_path", terminals, report),
-            };
-            anyhow::ensure!(candidates.len() <= 128, "candidate diagnostic bound");
-            let Selection::Commit { candidate_id, .. } = &hop.selection;
-            let selection = json!({"kind":"commit","action":candidate_id.action().as_str()});
-            let prediction = if let Some(prediction) = &hop.prediction {
-                anyhow::ensure!(prediction.attempts.len() <= 32, "prediction diagnostic bound");
-                use crate::decision_engine::prediction::factory::{AttemptOutcome, FallbackReason, ServedBy};
-                let served = match prediction.served_by {
-                    ServedBy::Primary => "primary",
-                    ServedBy::Fallback => "fallback",
-                    ServedBy::Cache => "cache",
-                    ServedBy::Builtin => "builtin",
-                };
-                let reason = prediction.reason.map(|reason| match reason {
-                    FallbackReason::DeadlineExhausted => "deadline",
-                    FallbackReason::AllFailed => "all_failed",
-                    FallbackReason::Disabled => "disabled",
-                    FallbackReason::BudgetUnproven => "budget_unproven",
-                });
-                let attempts: Vec<_> = prediction
-                    .attempts
-                    .iter()
-                    .map(|attempt| match &attempt.outcome {
-                        AttemptOutcome::Served => "served",
-                        AttemptOutcome::Cached => "cached",
-                        AttemptOutcome::Failed(_) => "failed",
-                        AttemptOutcome::Skipped(_) => "skipped",
-                    })
-                    .collect();
-                json!({"served":served,"reason":reason,"attempts":attempts})
-            } else {
-                Value::Null
-            };
-            let actions: Vec<_> = candidates.iter().enumerate().map(|(ordinal,candidate)|
-                json!({"ordinal_in_candidates":ordinal,"action":candidate.action().as_str(),"required_capability_count":candidate.required_capabilities().len()})).collect();
-            hops.push(json!({"ordinal":hops.len(),"candidate_set":kind,"candidates":actions,
-                "selection":selection,"prediction":prediction,"request_compiled":hop.request_compiled,
-                "pre_prediction":gates(pre)?,
-                "post_rehearsal":gates(&hop.post_rehearsal)?,"pre_commit":gates(&hop.pre_commit)?}));
-        }
-        Ok(json!({"stage":"admission_returned","hops":hops,
+        Ok(json!({"stage":"admission_returned",
+            "published_refs":context.execution_refs().len(),
             "parent_native":capabilities.native_tool_calling,"parent_vision":capabilities.vision,
             "cleanup_owner_present":crate::runtime::turn_cleanup::current_tracker().is_some()}))
     });

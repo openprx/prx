@@ -154,10 +154,12 @@ fn hard_gates_probe_reproduces_pre_separation_candidate_sets() {
                     gates,
                 };
                 let set = CausalCandidateGenerator::generate(state, view, policy, &probe).unwrap();
-                let (kept, report) = match &set {
-                    CandidateSet::Legal { candidates, report, .. } => (candidates.clone(), report.clone()),
-                    CandidateSet::NoLegalPath { terminals, report, .. } => (terminals.clone(), report.clone()),
+                // A terminal-only proposal carries no report since the
+                // legacy refusal classifier was deleted (P2-G5a).
+                let CandidateSet::Legal { candidates, report, .. } = &set else {
+                    return;
                 };
+                let (kept, report) = (candidates.clone(), report.clone());
                 // Every analysed candidate is exactly what the pre-separation
                 // hard gates admit, and the report is the hard gates' report.
                 let direct = HardGates::apply(state, view, &kept, gates).unwrap();
@@ -488,10 +490,15 @@ fn is_target(fixture: &Fixture, view: &CatalogView<'_>, candidate: &CausalCandid
         })
 }
 
+/// The kept candidates and their report. A terminal-only proposal carries
+/// neither since the legacy refusal classifier was deleted (P2-G5a).
 fn kept_and_report(set: &CandidateSet) -> (&[CausalCandidate], &ProbeReport) {
+    static EMPTY: std::sync::LazyLock<ProbeReport> = std::sync::LazyLock::new(|| ProbeReport {
+        outcomes: std::collections::BTreeMap::new(),
+    });
     match set {
         CandidateSet::Legal { candidates, report, .. } => (candidates, report),
-        CandidateSet::NoLegalPath { terminals, report } => (terminals, report),
+        CandidateSet::NoLegalPath => (&[], &EMPTY),
     }
 }
 

@@ -10,7 +10,6 @@ use crate::decision_engine::prediction::factory::{DecisionBackendFactory, Decisi
 use crate::memory::Memory;
 use crate::observability::causal_event::CausalEventSink;
 use crate::providers::catalog::CatalogView as ProviderCatalogView;
-use crate::runtime::decision_journal::store::StoreMode;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
@@ -65,56 +64,16 @@ pub(crate) async fn build_publication(
     }
     // The runtime key is the turn's state key always (OV-2). The legacy plane
     // consumers still see it only while the plane is enabled.
-    let runtime_key = crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
+    let runtime_key = load_key(Arc::clone(&build.generation)).await?;
     let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
     let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
-    let opened = if durable_key {
-        Some(
-            crate::runtime::ingress_recovery::open_advisory_store(
-                &build.generation,
-                Arc::clone(&build.memory),
-                Arc::clone(&build.events),
-                &recovery_owner,
-            )
-            .await
-            .map_err(PublicationBuildError::RecoveryPreparation)?,
-        )
-    } else {
-        None
-    };
-    let store = match &opened {
-        Some((store, _)) => Arc::clone(store),
-        None => {
-            crate::runtime::turn_decision::store_preparation::open_store(
-                Arc::clone(&build.generation),
-                Arc::clone(&build.events),
-                None,
-                false,
-            )
-            .await?
-        }
-    };
-    let durable_events = opened.as_ref().map(|(_, events)| Arc::clone(events));
-    let events: Arc<dyn CausalEventSink> = durable_events.as_ref().map_or_else(
-        || Arc::clone(&build.events),
-        |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
-    );
+    let events = Arc::clone(&build.events);
     let runtime = crate::runtime::turn_context::TurnRuntimeHolder::prepare(
         &build.generation,
         Arc::clone(&build.memory),
         surface,
-        crate::runtime::turn_context::RecoveryPreparation {
-            owner: recovery_owner,
-            workspace_key: workspace_key.clone(),
-            advisory: match &opened {
-                Some((store, events)) => {
-                    crate::runtime::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))
-                        .map_err(PublicationBuildError::RecoveryPreparation)?
-                }
-                None => crate::runtime::ingress_recovery::PreparedAdvisory::default(),
-            },
-        },
+        crate::runtime::turn_context::RecoveryPreparation { owner: recovery_owner },
         &build.security,
     )
     .await
@@ -176,11 +135,9 @@ pub(crate) async fn build_publication(
             events: Arc::clone(&events),
         },
     )?;
-    let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     Ok(Arc::new(TurnDecisionService {
         runtime: Arc::new(runtime),
         advisory,
-        child_recovery: Default::default(),
         memory_loader: None,
         loop_runtime: None,
         publication_policy: build.surface_policy,
@@ -199,12 +156,33 @@ pub(crate) async fn build_publication(
         state_key,
         policy_version,
         durable_key,
-        recordable,
+        recordable: durable_key,
         registry: build.registry,
         execution: build.execution,
         memory: build.memory,
         security: build.security,
-        store,
-        durable_events,
     }))
+}
+
+/// The turn's state key: the workspace runtime key at
+/// `<ws>/self/runtime/runtime.key` (OV-2), loaded or created off the Tokio
+/// workers. There is no plane condition and no ephemeral fallback: an
+/// unavailable runtime key refuses the publication.
+pub(in crate::runtime) async fn load_key(
+    generation: Arc<ConfigGeneration>,
+) -> Result<Arc<crate::security::runtime_key::DecisionKey>, PublicationBuildError> {
+    let ticket = crate::runtime::turn_cleanup::current_tracker()
+        .map(|owner| owner.register(tokio_util::sync::CancellationToken::new()))
+        .transpose()
+        .map_err(PublicationBuildError::PreparationOwner)?;
+    let key = tokio::task::spawn_blocking(move || {
+        crate::runtime::decision_accounting::initialize_tokenizers();
+        let key = crate::security::runtime_key::DecisionKey::load_or_create(&generation.effective.workspace_dir);
+        if let Some(ticket) = ticket {
+            ticket.finish(true);
+        }
+        key
+    })
+    .await?;
+    key.map_err(PublicationBuildError::RuntimeKey)
 }

@@ -215,7 +215,7 @@ fn bind_auxiliary_accounting(
         Arc::clone(&service.state_key),
         scope,
         purpose,
-        context.execution_trace.get_or_init(Default::default).clone(),
+        context.runtime().execution_trace.get_or_init(Default::default).clone(),
         protected,
     )
 }

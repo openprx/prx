@@ -212,7 +212,6 @@ async fn ordinary_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> a
             let decision = parent.admitted.decision();
             let runtime = Arc::clone(decision.context.runtime());
             let binding = decision.service.terminal_binding(decision.context)?;
-            let link = decision.service.terminal_settlement_ref(Arc::clone(decision.context))?;
             let other_decision = other.admitted.decision();
             let foreign = other_decision.service.terminal_binding(other_decision.context)?;
 
@@ -275,13 +274,11 @@ async fn ordinary_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> a
             let executed = calls.load(Ordering::SeqCst);
 
             // Terminal binding: the binding issued for this turn shares its
-            // runtime context and decision link; another turn's binding is
+            // runtime context; another turn's binding is
             // refused, also after the service handles are gone.
             assert!(Arc::ptr_eq(binding.runtime(), &runtime));
             assert!(binding.same_turn(&binding.clone()));
             assert!(!binding.same_turn(&foreign));
-            link.validate_binding(&binding)?;
-            assert!(link.validate_binding(&foreign).is_err());
 
             // Recursive money: an exhausted parent allowance cannot fund a
             // strict child share, in Full as in Supervised; nothing dispatches.

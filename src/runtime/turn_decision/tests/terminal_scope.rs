@@ -3,13 +3,41 @@
 
 use super::*;
 
+struct DriftingCatalogTool {
+    changed: Arc<AtomicBool>,
+    dispatches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for DriftingCatalogTool {
+    fn name(&self) -> &str {
+        "prx_drift_tool"
+    }
+
+    fn description(&self) -> &str {
+        if self.changed.load(Ordering::SeqCst) {
+            "changed PRX fixture description"
+        } else {
+            "initial PRX fixture description"
+        }
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{}})
+    }
+
+    async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("catalog drift must not dispatch a tool")
+    }
+}
+
 struct LinkedFixture {
     workspace: tempfile::TempDir,
     config: crate::config::Config,
     memory: Arc<dyn Memory>,
     service: Arc<TurnDecisionService>,
     proof: AgentTurnProof,
-    context: Arc<TurnDecisionContext>,
     commit: crate::agent::terminal::TurnTerminalDraft,
     transports: CountingTransports,
     dispatches: Arc<AtomicUsize>,
@@ -77,25 +105,10 @@ impl LinkedFixture {
             .open_issued_turn_context(&proof, AgentTurnKind::Repl, &CancellationToken::new())
             .await
             .expect("genuine catalog drift terminal");
-        if enabled {
-            // After R9 the opening is prediction-free: catalog drift no longer
-            // selects a recorded Clarify, and every turn takes the terminal
-            // Answer path on the answer candidate with no capability target.
-            assert_eq!(
-                context.terminal_outcome_action(),
-                Some(crate::tools::capability::contract::CausalActionKind::Answer),
-                "test: the drift turn settles as a plain answer"
-            );
-            assert_eq!(
-                context.terminal_outcome_target(),
-                Some("none"),
-                "test: the plain answer binds no capability target"
-            );
-            assert!(
-                context.execution_refs().is_empty(),
-                "test: the drifted catalog grants nothing to the plain answer"
-            );
-        }
+        assert!(
+            context.execution_refs().is_empty(),
+            "test: the drifted catalog grants nothing to the plain answer"
+        );
         let now = chrono::Utc::now();
         let mut scope = crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
             .with_owner_id(proof.owner_id())
@@ -110,7 +123,7 @@ impl LinkedFixture {
             &crate::llm::route_decision::RouteDecision::single_candidate("ollama", "prx-local-model"),
             now,
         );
-        let trace = context.execution_trace.get_or_init(Default::default);
+        let trace = context.runtime().execution_trace.get_or_init(Default::default);
         trace
             .bind_exact_call_key(Arc::clone(&service.state_key))
             .expect("serving trace binds the decision key");
@@ -120,11 +133,6 @@ impl LinkedFixture {
             .finish(Some(&outcome.attempts));
         let served = Some(outcome);
         let commit = crate::agent::terminal::TurnTerminalDraft {
-            decision: Some(
-                service
-                    .terminal_settlement_ref(Arc::clone(&context))
-                    .expect("actual source-bound link"),
-            ),
             binding: Some(service.terminal_binding(&context).expect("actual source-bound binding")),
             terminal_id: "prx_scope_terminal".to_owned(),
             scope: scope.clone(),
@@ -148,7 +156,6 @@ impl LinkedFixture {
             memory,
             service,
             proof,
-            context,
             commit,
             transports,
             dispatches,
@@ -161,30 +168,7 @@ impl LinkedFixture {
         MemoryFabric::new(memory, self.workspace.path().to_string_lossy())
     }
 
-    async fn outcome_count(&self) -> usize {
-        if !self.config.causal_tree.enabled {
-            assert!(self.service.store.writer().is_none());
-            return 0;
-        }
-        let writer = self.service.store.writer().expect("owning writer");
-        assert!(writer.drain(Instant::now() + Duration::from_secs(5)).await);
-        let scope = DecisionScope::Owner {
-            workspace_id: self.service.store.workspace_id().expect("owning decision scope"),
-            owner_id: Arc::from(self.proof.owner_id()),
-        };
-        let row = self
-            .service
-            .store
-            .reader()
-            .get(&scope, &self.context.decision_id())
-            .expect("read genuine chain")
-            .expect("genuine durable decision");
-        assert_eq!(row.decision_id, self.context.decision_id());
-        row.outcomes.len()
-    }
-
     async fn assert_no_outcome(&self) {
-        assert_eq!(self.outcome_count().await, 0);
         assert_eq!(self.transports.0.load(Ordering::SeqCst), 0);
         assert_eq!(self.dispatches.load(Ordering::SeqCst), 0);
     }
@@ -214,9 +198,8 @@ impl LinkedFixture {
             crate::agent::terminal::finalize_turn(fabric, commit, &self.config.cost, self.workspace.path()).await;
         // Keep metadata-only red evidence from the genuine stores, not a fake result.
         let marker_presence = self.marker_presence(fabric).await;
-        let outcomes = self.outcome_count().await;
         eprintln!(
-            "PRX_FOUNDATION_TERMINAL_SCOPE accepted={} markers={marker_presence:?} outcomes={outcomes}",
+            "PRX_FOUNDATION_TERMINAL_SCOPE accepted={} markers={marker_presence:?}",
             result.is_ok()
         );
         assert!(
@@ -311,7 +294,6 @@ async fn linked_finalizer_accepts_own_memory_and_same_scope_presentation() {
         first.assistant_event.as_ref().expect("actual history").id,
         second.assistant_event.as_ref().expect("same actual history").id
     );
-    assert_eq!(fixture.outcome_count().await, 1);
     assert_eq!(fixture.marker_presence(&fabric).await, [true, true, false, true]);
     let history = first
         .assistant_event
@@ -328,289 +310,4 @@ async fn linked_finalizer_accepts_own_memory_and_same_scope_presentation() {
     assert_eq!(fixture.transports.0.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.dispatches.load(Ordering::SeqCst), 0);
     fixture.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
-}
-
-#[tokio::test]
-async fn terminal_guard_binding_restores_omitted_link_and_rejects_foreign_context() {
-    let fixture = LinkedFixture::new().await;
-    let owned = fixture.commit.decision.clone().expect("issued terminal link");
-    let owned_binding = fixture.commit.binding.clone().expect("issued terminal binding");
-    let mut proposal = fixture.commit.clone();
-    proposal.decision = None;
-    proposal.binding = None;
-    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, &owned_binding)
-        .expect("guard restores its own link");
-    assert!(proposal.decision.as_ref().expect("restored").same_context(&owned));
-    assert!(
-        proposal
-            .binding
-            .as_ref()
-            .expect("restored binding")
-            .same_turn(&owned_binding)
-    );
-    crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, &owned_binding)
-        .expect("same context remains accepted");
-
-    let foreign = LinkedFixture::new().await;
-    let foreign_link = foreign.commit.decision.as_ref().expect("foreign issued link");
-    let foreign_binding = foreign.commit.binding.as_ref().expect("foreign issued binding");
-    assert!(
-        crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, foreign_link, &owned_binding).is_err()
-    );
-    // R29: a foreign binding in the proposal, or a guard binding of another
-    // turn, is refused even when the decision link is the guard's own.
-    let mut foreign_bound = proposal.clone();
-    foreign_bound.binding = Some(foreign_binding.clone());
-    assert!(crate::runtime::turn_terminal::bind_terminal_decision(&mut foreign_bound, &owned, &owned_binding).is_err());
-    assert!(crate::runtime::turn_terminal::bind_terminal_decision(&mut proposal, &owned, foreign_binding).is_err());
-    let mut unbound = fixture.commit.clone();
-    unbound.binding = None;
-    assert!(crate::agent::terminal::TurnTerminalCommit::try_from(unbound).is_err());
-    assert!(
-        proposal
-            .decision
-            .as_ref()
-            .expect("unchanged on rejection")
-            .same_context(&owned)
-    );
-    fixture.assert_no_outcome().await;
-    foreign.assert_no_outcome().await;
-}
-
-#[tokio::test]
-async fn disabled_terminal_validates_source_without_decision_store_writes() {
-    let fixture = LinkedFixture::with_enabled(false).await;
-    let fabric = fixture.fabric(Arc::clone(&fixture.memory));
-    let mut foreign = fixture.commit.clone();
-    foreign.scope.owner_id = Some("prx_foreign_owner".to_owned());
-    fixture.reject_before_writes(&fabric, foreign).await;
-    assert!(
-        fixture
-            .commit
-            .decision
-            .as_ref()
-            .expect("disabled source link")
-            .validate_durable_chain()
-            .await
-            .is_err()
-    );
-    let receipt = crate::agent::terminal::finalize_turn(
-        &fabric,
-        fixture.commit.clone(),
-        &fixture.config.cost,
-        fixture.workspace.path(),
-    )
-    .await
-    .expect("disabled terminal retains ordinary history behavior");
-    assert!(receipt.assistant_event.is_some());
-    assert_eq!(fixture.marker_presence(&fabric).await, [true, true, false, true]);
-    assert!(fixture.service.store.writer().is_none());
-    assert!(!fixture.workspace.path().join("self/causal_tree/.decision_key").exists());
-    assert!(!fixture.workspace.path().join("self/causal_tree/decisions.db").exists());
-    // Plane off still enables recovery when recording and sqlite authority are ready.
-    assert!(
-        fixture
-            .service
-            .runtime_holder()
-            .recovery_scope()
-            .ingress_recovery_enabled()
-    );
-    fixture.assert_no_outcome().await;
-}
-
-/// Where the persisted issued-state fingerprint is tampered.
-#[derive(Clone, Copy)]
-enum FingerprintTamper {
-    /// The decision-store row. Capture no longer reads it, so it cannot reject.
-    StoreRow,
-    /// The journal `decision_evidence` row, resealed so only the fingerprint differs.
-    JournalEvidence,
-}
-
-fn tampered_fingerprint(stored: &str, double_encoded: bool) -> String {
-    let changed = if double_encoded {
-        hex::encode(stored.as_bytes())
-    } else {
-        let mut changed = stored.to_owned();
-        changed.replace_range(..1, if stored.starts_with('0') { "1" } else { "0" });
-        changed
-    };
-    assert_ne!(changed, stored);
-    changed
-}
-
-/// Replaces the sealed journal evidence of one decision with `fingerprint`.
-fn reseal_journal_fingerprint(fixture: &LinkedFixture, owner: &str, decision: &str, double_encoded: bool) {
-    let workspace_id = fixture.service.store.workspace_id().expect("owned store namespace");
-    let key = &fixture.service.state_key;
-    let columns = crate::runtime::child_source::authority_journal::read_decision_evidence(
-        fixture.workspace.path(),
-        &workspace_id,
-        owner,
-        decision,
-        key,
-    )
-    .expect("authenticated journal evidence")
-    .expect("journal evidence row of the issued hop");
-    let mut named = Vec::with_capacity(columns.len());
-    for (name, value) in columns {
-        let name = crate::runtime::decision_journal::store::replay_column_names()
-            .into_iter()
-            .find(|candidate| *candidate == name)
-            .expect("known replay column");
-        named.push((name, value));
-    }
-    let slot = named
-        .iter_mut()
-        .find(|(name, _)| *name == "state_fingerprint")
-        .expect("state_fingerprint column");
-    let rusqlite::types::Value::Text(stored) = &slot.1 else {
-        panic!("state_fingerprint evidence is not text");
-    };
-    assert_eq!(stored.len(), 64);
-    slot.1 = rusqlite::types::Value::Text(tampered_fingerprint(stored, double_encoded));
-    let journal = rusqlite::Connection::open(crate::runtime::child_source::authority_journal::path(
-        fixture.workspace.path(),
-    ))
-    .expect("authority journal");
-    assert_eq!(
-        journal
-            .execute(
-                "DELETE FROM decision_evidence WHERE workspace = ?1 AND owner = ?2 AND decision = ?3",
-                (workspace_id.as_ref(), owner, decision),
-            )
-            .expect("remove exactly the actual evidence row"),
-        1
-    );
-    drop(journal);
-    crate::runtime::child_source::authority_journal::write_decision_evidence(fixture.workspace.path(), key, &[named])
-        .expect("reseal the tampered evidence row");
-}
-
-#[tokio::test]
-async fn linked_finalizer_rejects_changed_or_double_encoded_persisted_fingerprint_before_writes() {
-    for tamper in [FingerprintTamper::JournalEvidence, FingerprintTamper::StoreRow] {
-        for double_encoded in [false, true] {
-            let fixture = LinkedFixture::new().await;
-            let workspace_id = fixture.service.store.workspace_id().expect("owned store namespace");
-            let hop = fixture.context.audit_hops().next().expect("actual issued hop");
-            let decision_id = hop.decision_id.to_string();
-            let owner = fixture.proof.owner_id().to_owned();
-            let expected = hop
-                .state
-                .material_fingerprint(&fixture.service.state_key)
-                .expect("test: canonical state serializes");
-            let connection = rusqlite::Connection::open(fixture.workspace.path().join("self/causal_tree/decisions.db"))
-                .expect("actual decision store");
-            let stored: String = connection
-                .query_row(
-                    "SELECT state_fingerprint FROM decisions WHERE workspace_id=?1 AND decision_id=?2",
-                    rusqlite::params![workspace_id.as_ref(), &decision_id],
-                    |row| row.get(0),
-                )
-                .expect("durable issued fingerprint");
-            assert_eq!(stored, expected);
-            assert_eq!(stored.len(), 64);
-            assert!(stored.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            match tamper {
-                FingerprintTamper::StoreRow => {
-                    let changed = tampered_fingerprint(&stored, double_encoded);
-                    assert_eq!(
-                        connection
-                            .execute(
-                                "UPDATE decisions SET state_fingerprint=?1 WHERE workspace_id=?2 AND decision_id=?3",
-                                rusqlite::params![changed, workspace_id.as_ref(), decision_id],
-                            )
-                            .expect("change exactly the actual owned row"),
-                        1
-                    );
-                }
-                FingerprintTamper::JournalEvidence => {
-                    reseal_journal_fingerprint(&fixture, &owner, &decision_id, double_encoded);
-                }
-            }
-            drop(connection);
-            let fabric = fixture.fabric(Arc::clone(&fixture.memory));
-            let result = crate::agent::terminal::finalize_turn(
-                &fabric,
-                fixture.commit.clone(),
-                &fixture.config.cost,
-                fixture.workspace.path(),
-            )
-            .await;
-            match tamper {
-                FingerprintTamper::JournalEvidence => {
-                    let error = result.expect_err("altered journal fingerprint must reject terminal capture");
-                    assert_eq!(
-                        error.to_string(),
-                        "persisted decision replay binding differs from the issued context"
-                    );
-                    assert_eq!(fixture.marker_presence(&fabric).await, [false; 4]);
-                    fixture.assert_no_outcome().await;
-                    assert!(!fixture.workspace.path().join("state/costs.jsonl").exists());
-                }
-                FingerprintTamper::StoreRow => {
-                    // Journal authority never reads the store row, so its tamper
-                    // is inert: capture still binds to the sealed journal evidence.
-                    result.expect("store row is not terminal evidence under journal authority");
-                    assert!(fixture.marker_presence(&fabric).await[3], "final marker committed");
-                }
-            }
-            fixture.service.shutdown(Instant::now() + Duration::from_secs(5)).await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery() {
-    let fixture = LinkedFixture::new().await;
-    let fabric = fixture.fabric(Arc::clone(&fixture.memory));
-    let receipt = crate::agent::terminal::finalize_turn(
-        &fabric,
-        fixture.commit.clone(),
-        &fixture.config.cost,
-        fixture.workspace.path(),
-    )
-    .await
-    .expect("authenticated historical terminal");
-    let generation = Arc::clone(&fixture.service.generation);
-    let service = Arc::downgrade(&fixture.service);
-    drop(fixture.service);
-    assert!(
-        service.upgrade().is_none(),
-        "recovery must not retain the decision service"
-    );
-    let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
-    let key = DecisionKey::load_existing(&generation.effective.workspace_dir).unwrap();
-    let observer = Arc::new(RecordingSink::default());
-    let (store, events) = crate::runtime::ingress_recovery::open_advisory_store(
-        &generation,
-        Arc::clone(&fixture.memory),
-        observer,
-        &cleanup,
-    )
-    .await
-    .expect("independent advisory store");
-    let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
-        &generation,
-        Arc::clone(&fixture.memory),
-        TurnSurfaceKind::AgentLoop,
-        &cleanup,
-        Some(key),
-        crate::runtime::ingress_recovery::PreparedAdvisory::opened(store, events).expect("independent advisory writer"),
-    )
-    .await
-    .expect("independent recovery initialization");
-    assert_eq!(
-        recovery
-            .rejoin_terminal(&receipt.terminal_id, fixture.proof.owner_id())
-            .await
-            .expect("authenticated terminal rejoins without a decision service"),
-        Enqueue::Queued,
-    );
-    drop(recovery);
-    cleanup
-        .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-        .await
-        .expect("independently retained recovery queues drain");
 }

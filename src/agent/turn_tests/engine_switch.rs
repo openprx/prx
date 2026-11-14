@@ -580,8 +580,8 @@ async fn disabled_engine_constructs_nothing() {
     fn assert_cell(name: &str, workspace: &std::path::Path, spy: &crate::decision_engine::access_spy::AccessSpy) {
         spy.assert_constructs_nothing(name);
         assert!(
-            workspace.join("self/causal_tree/decisions.db").is_file(),
-            "{name}: recovery database exists"
+            !workspace.join("self/causal_tree/decisions.db").exists(),
+            "{name}: no decision database is created"
         );
         assert!(
             !workspace.join("decision-engine.sqlite").exists(),
@@ -637,8 +637,8 @@ async fn disabled_engine_constructs_nothing() {
         drive_agent_entry(workspace.path(), config).await;
         assert_cell(&format!("local backend {kind:?}"), workspace.path(), &spy);
         assert!(
-            workspace.path().join("self/causal_tree/decisions.db").is_file(),
-            "test: recovery decisions database exists"
+            !workspace.path().join("self/causal_tree/decisions.db").exists(),
+            "test: no decision database is created (P2-G5a)"
         );
     }
     let workspace = tempfile::tempdir().expect("test: remote-keys workspace");
@@ -664,8 +664,8 @@ async fn disabled_engine_constructs_nothing() {
     drive_agent_entry(workspace.path(), config).await;
     spy.assert_constructs_nothing("causal_tree remote keys");
     assert!(
-        workspace.path().join("self/causal_tree/decisions.db").exists(),
-        "recovery stays on when [causal_tree].enabled is true"
+        !workspace.path().join("self/causal_tree/decisions.db").exists(),
+        "no decision database is created (P2-G5a)"
     );
 }
 
@@ -1559,5 +1559,219 @@ impl ScriptedDecisionEndpoint {
         {
             task.abort();
         }
+    }
+}
+
+/// Legacy decision artifacts of a workspace: none may exist after a turn.
+fn assert_no_legacy_decision_files(workspace: &std::path::Path, cell: &str) {
+    for artifact in [
+        "self/causal_tree/decisions.db",
+        "self/causal_tree/.decision_key",
+        "self/child_authority/journal.db",
+    ] {
+        assert!(!workspace.join(artifact).exists(), "{cell}: {artifact} was created");
+    }
+}
+
+fn ledger_lines(workspace: &std::path::Path, terminal_id: &str) -> usize {
+    std::fs::read_to_string(workspace.join("state/costs.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(terminal_id))
+        .count()
+}
+
+async fn claim_present(fabric: &crate::memory::MemoryFabric, terminal_id: &str) -> bool {
+    fabric
+        .memory()
+        .find_message_event_by_idempotency_key(fabric.workspace_id(), &format!("turn:{terminal_id}:decision-claim"))
+        .await
+        .expect("test: claim lookup")
+        .is_some()
+}
+
+/// P2-R22: after the decision store is deleted every terminal commits without
+/// decision rows. With a repository and recording on it is the recovery
+/// terminal and rejoins; with no repository, or recording off, it is the
+/// unrecorded, non-replayable terminal settled directly exactly once; a
+/// differing binding is refused; a pre-Part-2 replay final is ignored.
+#[tokio::test]
+async fn post_deletion_turn_commits_terminal_without_decision_rows() {
+    use crate::agent::terminal::{bind_terminal_fixture, bind_terminal_fixture_mode, completed_commit, finalize_turn};
+    let cost = crate::agent::terminal::priced_cost_config();
+
+    // (a) Fresh repository, recording on: the recovery terminal commits and rejoins.
+    {
+        let workspace = tempfile::tempdir().expect("test: workspace a");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite a"));
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
+        assert!(fabric.records_recovery_terminal(), "(a) recovery terminal path");
+        let mut draft = completed_commit("prx_cell_a");
+        let service = bind_terminal_fixture(workspace.path(), Arc::clone(&memory), &mut draft, &cost).await;
+        let first = finalize_turn(&fabric, draft.clone(), &cost, workspace.path())
+            .await
+            .expect("(a) terminal commits");
+        let replay = finalize_turn(&fabric, draft, &cost, workspace.path())
+            .await
+            .expect("(a) same terminal replays");
+        assert_eq!(first.terminal_event.event_id, replay.terminal_event.event_id);
+        let payload: serde_json::Value =
+            serde_json::from_str(first.terminal_event.raw_payload_json.as_deref().expect("(a) payload"))
+                .expect("(a) payload json");
+        assert!(payload.get("decision_id").is_none_or(serde_json::Value::is_null));
+        let owner = first.terminal_event.owner_id.clone().expect("(a) owner");
+        service
+            .runtime_holder()
+            .recovery_scope()
+            .rejoin_terminal("prx_cell_a", &owner)
+            .await
+            .expect("(a) the settled terminal rejoins");
+        assert_no_legacy_decision_files(workspace.path(), "(a)");
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    // (b) No repository: unrecorded, not replayable, settled directly.
+    {
+        let workspace = tempfile::tempdir().expect("test: workspace b");
+        let memory = crate::runtime::ingress_recovery::backend_memory("postgres_class", workspace.path())
+            .expect("test: repository-less backend");
+        assert!(memory.recovery_repository().is_none(), "(b) backend has no repository");
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
+        assert!(!fabric.records_recovery_terminal(), "(b) unrecorded terminal path");
+        let mut draft = completed_commit("prx_cell_b");
+        let service =
+            bind_terminal_fixture_mode(workspace.path(), Arc::clone(&memory), &mut draft, &cost, false, None).await;
+        let receipt = finalize_turn(&fabric, draft, &cost, workspace.path())
+            .await
+            .expect("(b) the turn is never refused");
+        assert!(receipt.usage_settlement.is_some(), "(b) cost settles directly");
+        assert!(!claim_present(&fabric, "prx_cell_b").await, "(b) no recovery claim");
+        assert_eq!(ledger_lines(workspace.path(), "prx_cell_b"), 1, "(b) settled once");
+        assert!(
+            !service.runtime_holder().recovery_scope().ingress_recovery_enabled(),
+            "(b) nothing is replayable without a repository"
+        );
+        assert_no_legacy_decision_files(workspace.path(), "(b)");
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    // (b2) Repository present but recording off: unrecorded, direct settlement exactly once.
+    {
+        let workspace = tempfile::tempdir().expect("test: workspace b2");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite b2"));
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy())
+            .with_event_recording(crate::memory::fabric::MemoryEventRecording {
+                record_user_messages: false,
+                ..Default::default()
+            });
+        assert!(!fabric.records_recovery_terminal(), "(b2) recording off");
+        let mut draft = completed_commit("prx_cell_b2");
+        let service = bind_terminal_fixture(workspace.path(), Arc::clone(&memory), &mut draft, &cost).await;
+        let first = finalize_turn(&fabric, draft.clone(), &cost, workspace.path())
+            .await
+            .expect("(b2) the turn is never refused");
+        let again = finalize_turn(&fabric, draft, &cost, workspace.path())
+            .await
+            .expect("(b2) an idempotent retry");
+        assert_eq!(first.terminal_event.event_id, again.terminal_event.event_id);
+        assert!(!claim_present(&fabric, "prx_cell_b2").await, "(b2) no recovery claim");
+        assert_eq!(
+            ledger_lines(workspace.path(), "prx_cell_b2"),
+            1,
+            "(b2) settled exactly once"
+        );
+        assert_no_legacy_decision_files(workspace.path(), "(b2)");
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    // (c) A differing TerminalBinding workspace, cost or memory is refused.
+    {
+        let workspace = tempfile::tempdir().expect("test: workspace c");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite c"));
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
+        let mut draft = completed_commit("prx_cell_c");
+        let service = bind_terminal_fixture(workspace.path(), Arc::clone(&memory), &mut draft, &cost).await;
+        let other_workspace = tempfile::tempdir().expect("test: other workspace c");
+        assert!(
+            finalize_turn(&fabric, draft.clone(), &cost, other_workspace.path())
+                .await
+                .is_err(),
+            "(c) a differing workspace is refused"
+        );
+        let mut other_cost = cost.clone();
+        other_cost.daily_limit_usd += 1.0;
+        assert!(
+            finalize_turn(&fabric, draft.clone(), &other_cost, workspace.path())
+                .await
+                .is_err(),
+            "(c) a differing cost configuration is refused"
+        );
+        let foreign: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: foreign sqlite c"));
+        let foreign_fabric = crate::memory::MemoryFabric::new(foreign, workspace.path().to_string_lossy());
+        assert!(
+            finalize_turn(&foreign_fabric, draft, &cost, workspace.path())
+                .await
+                .is_err(),
+            "(c) a differing memory is refused"
+        );
+        assert!(!claim_present(&fabric, "prx_cell_c").await, "(c) nothing was written");
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+    }
+
+    // (d) A pre-Part-2 replay final is ignored and no legacy file is opened.
+    {
+        let workspace = tempfile::tempdir().expect("test: workspace d");
+        let memory: Arc<dyn crate::memory::Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: sqlite d"));
+        let mut draft = completed_commit("prx_cell_d");
+        let service = bind_terminal_fixture(workspace.path(), Arc::clone(&memory), &mut draft, &cost).await;
+        let owner = draft.scope.owner_id.clone().expect("test: owner d");
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), workspace.path().to_string_lossy());
+        fabric
+            .record_runtime_event_idempotent(
+                draft.scope.clone(),
+                "turn.finalized",
+                "terminal_id=prx_cell_d status=Completed".to_owned(),
+                Some(
+                    serde_json::json!({
+                        "terminal_id": "prx_cell_d",
+                        "status": "completed",
+                        "terminal_replay_v1": {"store_workspace_id": "prx-legacy-store"},
+                        "terminal_replay_mac_v1": "00",
+                    })
+                    .to_string(),
+                ),
+                "turn:prx_cell_d:final".to_owned(),
+            )
+            .await
+            .expect("test: legacy final");
+        let error = service
+            .runtime_holder()
+            .recovery_scope()
+            .rejoin_terminal("prx_cell_d", &owner)
+            .await
+            .expect_err("(d) a legacy final has no settled facts");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::runtime::ingress_recovery::LegacyUnconfirmed>()),
+            "(d) the legacy final stays unconfirmed: {error:#}"
+        );
+        assert_no_legacy_decision_files(workspace.path(), "(d)");
+        service
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
     }
 }

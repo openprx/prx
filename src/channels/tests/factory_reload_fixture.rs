@@ -529,13 +529,22 @@ pub(super) async fn run() {
             calls: Arc::clone(&cached_calls),
         });
         let histories = Arc::new(Mutex::new(HashMap::new()));
-        let mut initial = Config::default(); initial.workspace_dir = tmp.path().to_owned(); initial.config_path = tmp.path().join("config.toml");
+        let mut initial = Config::default();
+        initial.workspace_dir = tmp.path().to_owned();
+        initial.config_path = tmp.path().join("config.toml");
         // The persisted-backend assertions deliberately require local prediction.
-        initial.decision_engine.enabled = true;        initial.causal_tree.backend.kind =
-            crate::config::schema::causal_tree::BackendSelection::Fixed(crate::config::schema::causal_tree::BackendKind::Builtin);
-        initial.default_provider = Some("openai".to_owned()); initial.default_model = Some(MODEL.to_owned()); initial.default_temperature = 0.0;
-        initial.api_key = Some(KEYS[0].to_owned()); initial.api_url = Some(a.url.clone()); initial.memory.auto_save = false;
-        assert!(initial.causal_tree.enabled); assert!(!initial.config_path.exists());
+        initial.decision_engine.enabled = true;
+        initial.causal_tree.backend.kind = crate::config::schema::causal_tree::BackendSelection::Fixed(
+            crate::config::schema::causal_tree::BackendKind::Builtin,
+        );
+        initial.default_provider = Some("openai".to_owned());
+        initial.default_model = Some(MODEL.to_owned());
+        initial.default_temperature = 0.0;
+        initial.api_key = Some(KEYS[0].to_owned());
+        initial.api_url = Some(a.url.clone());
+        initial.memory.auto_save = false;
+        assert!(initial.causal_tree.enabled);
+        assert!(!initial.config_path.exists());
         let mut initial_ctx = context(
             &tmp,
             crate::config::new_shared(initial),
@@ -544,7 +553,10 @@ pub(super) async fn run() {
             Arc::clone(&cache),
             Arc::clone(&histories),
         );
-        let recording = super::super::recording_fixture::attach(Arc::get_mut(&mut initial_ctx).expect("unshared initial context"), tmp.path());
+        let recording = super::super::recording_fixture::attach(
+            Arc::get_mut(&mut initial_ctx).expect("unshared initial context"),
+            tmp.path(),
+        );
         let config = Arc::clone(&initial_ctx.config);
         let g0 = config.pin();
         cache.lock().insert(
@@ -594,53 +606,108 @@ pub(super) async fn run() {
             "plain G0 turn must finish without memory retrieval"
         );
         let recorded: Arc<dyn Memory> = recording.clone();
-        run_owned_channel_probe(context(&tmp, Arc::clone(&config), Arc::clone(&recorded), channel.clone(), Arc::clone(&cache), Arc::clone(&histories)), message(1), CancellationToken::new()).await;
-        assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G1 turn must not retrieve memory");
-        assert_eq!(*a.calls.lock(), vec![0, 1]); assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
+        run_owned_channel_probe(
+            context(
+                &tmp,
+                Arc::clone(&config),
+                Arc::clone(&recorded),
+                channel.clone(),
+                Arc::clone(&cache),
+                Arc::clone(&histories),
+            ),
+            message(1),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            memory.selected.load(Ordering::SeqCst),
+            0,
+            "plain G1 turn must not retrieve memory"
+        );
+        assert_eq!(*a.calls.lock(), vec![0, 1]);
+        assert!(b.calls.lock().is_empty(), "endpoint B must remain unused");
         let g2 = reload(&config, KEYS[2], &b.url, &["api_key", "api_url"]);
-        run_owned_channel_probe(context(&tmp, Arc::clone(&config), recorded, channel.clone(), Arc::clone(&cache), histories), message(2), CancellationToken::new()).await;
-        assert_eq!(memory.selected.load(Ordering::SeqCst), 0, "plain G2 turn must not retrieve memory");
-        assert_eq!(memory.prompt_reads.load(Ordering::SeqCst), 3, "each generation performs one independent scoped prompt read");
-        assert_eq!(*a.calls.lock(), vec![0, 1]); assert_eq!(*b.calls.lock(), vec![2]);
-        assert_eq!(a.invalid.load(Ordering::SeqCst), 0); assert_eq!(b.invalid.load(Ordering::SeqCst), 0);
-        assert_eq!(cached_calls.load(Ordering::SeqCst), 0, "admitted turns must build the provider from each pinned selection");
+        run_owned_channel_probe(
+            context(
+                &tmp,
+                Arc::clone(&config),
+                recorded,
+                channel.clone(),
+                Arc::clone(&cache),
+                histories,
+            ),
+            message(2),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            memory.selected.load(Ordering::SeqCst),
+            0,
+            "plain G2 turn must not retrieve memory"
+        );
+        assert_eq!(
+            memory.prompt_reads.load(Ordering::SeqCst),
+            3,
+            "each generation performs one independent scoped prompt read"
+        );
+        assert_eq!(*a.calls.lock(), vec![0, 1]);
+        assert_eq!(*b.calls.lock(), vec![2]);
+        assert_eq!(a.invalid.load(Ordering::SeqCst), 0);
+        assert_eq!(b.invalid.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cached_calls.load(Ordering::SeqCst),
+            0,
+            "admitted turns must build the provider from each pinned selection"
+        );
         assert_eq!(*committed.lock(), vec![g1.id.0, g2.id.0]);
-        let principal = crate::runtime::envelope::RuntimeEnvelope::channel(tmp.path().to_string_lossy().to_string(), "telegram", "prx_user", Some("prx_channel".to_owned())).memory_principal();
-        let events = recording.list_message_events_recent(&principal, 100).await.expect("actual generation event history");
-        let decisions = rusqlite::Connection::open_with_flags(tmp.path().join("self/causal_tree/decisions.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect("durable decision evidence");
+        let principal = crate::runtime::envelope::RuntimeEnvelope::channel(
+            tmp.path().to_string_lossy().to_string(),
+            "telegram",
+            "prx_user",
+            Some("prx_channel".to_owned()),
+        )
+        .memory_principal();
+        let events = recording
+            .list_message_events_recent(&principal, 100)
+            .await
+            .expect("actual generation event history");
         for (phase, generation) in [g0, g1, g2].iter().enumerate() {
-            let users: Vec<_> = events.iter().filter(|event| event.role == "user" && event.content == INPUT && event.config_generation_id == Some(generation.id.0)).collect();
+            let users: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    event.role == "user"
+                        && event.content == INPUT
+                        && event.config_generation_id == Some(generation.id.0)
+                })
+                .collect();
             assert_eq!(users.len(), 1);
             let user = users.first().expect("unique generation-owned input");
-            assert_eq!(user.config_source_revision.as_deref(), Some(generation.source_revision.fingerprint_sha256.as_str()));
-            assert!(user.owner_id.is_some()); assert!(user.run_id.is_some());
-            let mut query = decisions.prepare("SELECT candidates_json, selected_candidate_id, backend_kind, protocol_version, abstention_reason FROM decisions WHERE run_id = ?1 AND source_event_id = ?2 AND enabled_snapshot = 1 LIMIT 33").expect("scoped persisted decision query");
-            let rows = query.query_map(rusqlite::params![user.run_id.as_deref(), user.event_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, u32>(3)?, row.get::<_, Option<String>>(4)?))).expect("persisted decision rows").collect::<rusqlite::Result<Vec<_>>>().expect("persisted decision decode");
-            assert!(!rows.is_empty() && rows.len() <= 32, "bounded complete per-input decision evidence");
-            // Prediction-free opening (R9): each input persists its one
-            // Answer row; no backend-produced prediction row precedes it.
-            assert!(
-                rows.len() == 1
-                    && rows
-                        .iter()
-                        .all(|(_, _, backend, protocol, abstention)| backend == "none" && *protocol == 0 && abstention.is_none()),
-                "generation {phase} persisted a prediction row: {rows:?}"
+            assert_eq!(
+                user.config_source_revision.as_deref(),
+                Some(generation.source_revision.fingerprint_sha256.as_str())
             );
-            assert!(rows.iter().any(|(candidates, selected, _, _, _)| {
-                let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
-                candidates.iter().any(|candidate| Some(candidate.id.as_str()) == selected.as_deref() && candidate.action == "answer")
-            }), "plain input must persist a selected direct answer");
-            assert!(rows.iter().all(|(candidates, selected, _, _, _)| {
-                let candidates: Vec<crate::runtime::decision_journal::store::RecordedCandidate> = serde_json::from_str(candidates).expect("stored actual candidates");
-                candidates.iter().all(|candidate| Some(candidate.id.as_str()) != selected.as_deref() || candidate.action != "retrieve")
-            }), "plain input must not select memory retrieval");
+            assert!(user.owner_id.is_some());
+            assert!(user.run_id.is_some());
             let marker = format!("prx-factory-generation-{phase}");
-            assert!(events.iter().any(|event| event.role == "assistant" && event.content.contains(&marker) && event.run_id == user.run_id && event.config_generation_id == user.config_generation_id && event.config_source_revision == user.config_source_revision));
-            assert!(channel.sent_messages.lock().await.iter().any(|message| message.contains(&marker)));
+            assert!(events.iter().any(|event| event.role == "assistant"
+                && event.content.contains(&marker)
+                && event.run_id == user.run_id
+                && event.config_generation_id == user.config_generation_id
+                && event.config_source_revision == user.config_source_revision));
+            assert!(
+                channel
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|message| message.contains(&marker))
+            );
         }
         assert!(recording.owned_readbacks() >= 3);
         drop(participant);
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     // Join both owned servers even on assertion panic.
     let (closed_a, closed_b) = tokio::join!(a.close(), b.close());
     if let Err(panic) = outcome {

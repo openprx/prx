@@ -1,9 +1,8 @@
 //! Read-only status of one published runtime surface (R25): the recovery and
-//! journal attachment owned here, plus the engine's backend fields taken from
+//! attachment owned here, plus the engine's backend fields taken from
 //! the engine status owner.
 
 use crate::decision_engine::prediction::factory::BackendPlaneStatus;
-use crate::runtime::decision_journal::store::StoreMode;
 use crate::tools::capability::contract::CatalogGeneration;
 
 /// Read-only status of the exact generation attached to a runtime surface.
@@ -15,7 +14,6 @@ use crate::tools::capability::contract::CatalogGeneration;
 pub(crate) struct DecisionPlaneStatus {
     pub(crate) backend: BackendPlaneStatus,
     pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) store_mode: StoreMode,
     pub(crate) durable_key: bool,
     pub(crate) recordable: bool,
 }
@@ -23,7 +21,6 @@ pub(crate) struct DecisionPlaneStatus {
 /// The recovery and journal attachment of one publication.
 pub(crate) struct JournalAttachment {
     pub(crate) catalog_generation: CatalogGeneration,
-    pub(crate) store_mode: StoreMode,
     pub(crate) durable_key: bool,
     pub(crate) recordable: bool,
 }
@@ -34,7 +31,6 @@ pub(crate) const fn plane_status(backend: BackendPlaneStatus, journal: JournalAt
     DecisionPlaneStatus {
         backend,
         catalog_generation: journal.catalog_generation,
-        store_mode: journal.store_mode,
         durable_key: journal.durable_key,
         recordable: journal.recordable,
     }

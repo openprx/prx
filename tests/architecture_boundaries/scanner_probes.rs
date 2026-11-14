@@ -1,8 +1,3 @@
-use super::causal_domain::{
-    decision_answers_never_become_chat_messages, decision_domain_has_no_constant_timeout_or_approval_grant_constructor,
-    mock_decision_backend_is_compiled_only_for_tests, the_causal_domain_imports_no_backend_and_no_network,
-    the_decision_validator_never_repairs_a_value,
-};
 use super::causal_policy::{
     causal_policy_is_written_only_by_the_mutation_service, decision_code_never_uses_a_chat_provider,
 };
@@ -16,19 +11,12 @@ use super::config::{
 };
 use super::decision_backend::{
     decision_http_clients_come_only_from_the_pinned_builder, decision_metric_labels_come_from_bounded_allowlists,
-    loopback_is_decided_only_by_the_shared_predicate,
+    loopback_is_decided_only_by_the_shared_predicate, no_production_file_opens_a_legacy_decision_database,
     only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend,
-    the_decision_store_database_is_opened_only_by_the_store,
 };
 use super::decision_engine::{
     decision_engine_never_imports_agent_or_tool_execution, shared_types_are_not_engine_owned,
 };
-use super::decision_seals::{
-    decision_compiler_uses_typed_ids_and_only_redacted_state, only_reviewed_production_sites_seal_decision_requests,
-    trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-    validation_requires_the_sealed_request_manifest,
-};
-use super::decision_terminals::execution_guard_is_unconditional_and_decision_clock_has_one_owner;
 use super::helpers::{PLANTED_SOURCES, repository_root};
 use super::ingress::{
     embedded_user_input_cannot_bypass_reserved_marker_neutralization,
@@ -530,129 +518,6 @@ planted_violation_probes! {
     probe_provider_construction: provider_construction_outside_the_provider_module_is_pinned,
         "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_chain() {\n    let _ = ReliableProvider::new(Vec::new(), 0, 0);\n}\n";
-    probe_decision_mock: mock_decision_backend_is_compiled_only_for_tests,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_mock() {\n    let _ = MockDecisionBackend::identity();\n}\n";
-    probe_decision_text: decision_answers_never_become_chat_messages,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_prompt(answer: &DecisionAnswer) -> ChatMessage {\n    ChatMessage::system(answer.text())\n}\n";
-    probe_decision_repair: the_decision_validator_never_repairs_a_value,
-        "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_fix(value: f64, total: f64) -> f64 {\n    renormalize(value, total)\n}\n";
-    probe_decision_mutation: validation_requires_the_sealed_request_manifest,
-        "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "impl DecisionRequest {\n    pub fn d0_planted_reseal(&mut self) {}\n}\n";
-    probe_decision_manifest: validation_requires_the_sealed_request_manifest,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_decision() -> ValidatedDecision {\n    ValidatedDecision { answers: Default::default() }\n}\n";
-    probe_decision_seal_new_caller: only_reviewed_production_sites_seal_decision_requests,
-        "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_request() { let _ = DecisionRequest::seal(parts, key, expiry, limits); }\n";
-    probe_decision_recoverable_seal_new_caller: only_reviewed_production_sites_seal_decision_requests,
-        "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "fn planted() { DecisionRequest::seal_recovering_parts(parts, audit, key, expiry, limits); }\n";
-    probe_decision_recoverable_seal_extra_allowed_caller: only_reviewed_production_sites_seal_decision_requests,
-        "src/decision_engine/questions.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn planted() { DecisionRequest::seal_recovering_parts(parts, audit, key, expiry, limits); }\n";
-    probe_decision_unchecked_constructor_visibility: validation_requires_the_sealed_request_manifest,
-        "src/decision_engine/prediction/protocol.rs", Planted::AppendedTo, Reads::ProductionText,
-        "pub(crate) fn from_validated_parts() {}\n";
-    probe_decision_compiler_untrusted_option: decision_compiler_uses_typed_ids_and_only_redacted_state,
-        "src/decision_engine/questions.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn d0_planted_option(state: &CausalState) { let _ = OptionId::code(state.routing_input.as_str()); }\n";
-    probe_causal_child_replay_memory_neighbor: the_causal_domain_imports_no_backend_and_no_network,
-        "src/runtime/decision_journal/store/child_outcome.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn planted_memory() { let _ = crate::memory::MemoryFabric::new; }\n";
-    probe_causal_outcome_finalizer: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn d0_planted_finalize() { let _ = crate::agent::terminal::finalize_turn; }\n";
-    probe_causal_outcome_service_builder: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn d0_planted_service() { let _ = crate::runtime::turn_publication::build_publication; }\n";
-    probe_causal_outcome_memory_io: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/outcome.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn d0_planted_memory() { let _ = crate::memory::MemoryFabric::new; }\n";
-    probe_causal_engine_search_glob: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/decision_engine.rs", Planted::AppendedTo, Reads::ProductionText,
-        "use crate::tools::capability::search::*;\n";
-    probe_causal_engine_backend: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/decision_engine.rs", Planted::AppendedTo, Reads::ProductionText,
-        "use crate::decision_engine::prediction::CompatibleHttpBackend;\n";
-    probe_causal_network: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub async fn d0_planted_fetch() {\n    let _ = reqwest::get(url).await;\n}\n";
-    probe_causal_proxy_client: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub async fn d0_planted_proxy() {\n    let _ = crate::config::build_runtime_proxy_client(name);\n}\n";
-    probe_causal_backend_type: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "use crate::decision_engine::prediction::CompatibleHttpBackend;\npub fn d0_planted_backend() {}\n";
-    probe_causal_gate_rejects_execution_service: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/gates.rs", Planted::AppendedTo, Reads::ProductionText,
-        "use crate::tools::execution::ToolExecutionService;\n";
-    probe_causal_question_rejects_http_backend: the_causal_domain_imports_no_backend_and_no_network,
-        "src/decision_engine/questions.rs", Planted::AppendedTo, Reads::ProductionText,
-        "use crate::decision_engine::prediction::compatible_http::CompatibleHttpBackend;\n";
-    probe_causal_module_alias: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "use crate::decision as d;\npub fn d0_planted_alias() {\n    let _ = d::http::send();\n}\n";
-    probe_causal_provider: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_provider() {\n    let _ = crate::providers::create_provider(name, None);\n}\n";
-    probe_causal_socket: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub async fn d0_planted_socket() {\n    let _ = tokio::net::TcpStream::connect(address).await;\n}\n";
-    probe_causal_path_attribute: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "#[path = \"../net.rs\"]\nmod d0_planted_net;\n";
-    probe_causal_glob: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "use crate::decision_engine::prediction::*;\npub fn d0_planted_glob() {}\n";
-    probe_causal_mod_super: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/mod.rs", Planted::AppendedTo, Reads::ProductionText,
-        "use super::providers::compatible::OpenAiCompatibleProvider;\n";
-    probe_causal_subprocess: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_curl() {\n    let _ = std::process::Command::new(program);\n}\n";
-    probe_decision_constant_timeout: decision_domain_has_no_constant_timeout_or_approval_grant_constructor,
-        "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub async fn d0_planted_timeout() { let _ = tokio::time::timeout(wait, future).await; }\n";
-    probe_causal_approval_grant: decision_domain_has_no_constant_timeout_or_approval_grant_constructor,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_grant() { let _ = ApprovalGrantV2::issue_one_shot(subject); }\n";
-    probe_causal_websocket: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub async fn d0_planted_socket() {\n    let _ = tokio_tungstenite::connect_async(url).await;\n}\n";
-    probe_causal_crate_named_like_a_module: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "use crate::state::Anything;\npub fn d0_planted_state() {}\n";
-    probe_trusted_state_caller: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_trust(parts: TrustedParts) -> TrustedState {\n    TrustedState::from_runtime(parts)\n}\n";
-    probe_trusted_state_function_value: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_map(parts: Vec<TrustedParts>) -> Vec<TrustedState> {\n    parts.into_iter().map(TrustedState::from_runtime).collect()\n}\n";
-    probe_observed_step_caller: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_step(id: CandidateId) -> ObservedStep {\n    ObservedStep::recorded_by_runtime(kind, status, Some(id), None)\n}\n";
-    probe_observed_step_alias: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "use crate::decision_engine::state::ObservedStep as Step;\npub fn d0_planted_alias() -> Step {\n    Step::recorded_by_runtime(kind, status, None, None)\n}\n";
-    probe_observed_assignment: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_observed(state: &mut CausalState, observed: ObservedState) {\n    state.observed = observed;\n}\n";
-    probe_observed_mem_replace: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_replace(state: &mut CausalState, observed: ObservedState) {\n    let _ = std::mem::replace(&mut state.observed, observed);\n}\n";
-    probe_trusted_mem_swap: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_swap(state: &mut CausalState, trusted: &mut TrustedState) {\n    std::mem::swap(&mut state.trusted, trusted);\n}\n";
-    probe_trusted_parts_literal: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_parts() -> TrustedParts {\n    TrustedParts { workspace_id }\n}\n";
-    probe_trusted_parts_borrowed_literal: trust_bearing_turn_state_is_built_only_by_the_turn_decision_service,
-        "src/agent/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_borrow() {\n    let _ = &TrustedParts { workspace_id };\n}\n";
     probe_decision_chat_provider: decision_code_never_uses_a_chat_provider,
         "src/decision_engine/prediction/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_chat(name: &str) {\n    let _ = crate::providers::create_provider(name, None);\n}\n";
@@ -688,9 +553,9 @@ planted_violation_probes! {
     probe_causal_metric_lineage: decision_metric_labels_come_from_bounded_allowlists,
         "src/observability/prometheus.rs", Planted::AppendedTo, Reads::ProductionText,
         "impl D0Planted {\n    fn record_causal(&self, event: &CausalEvent) {\n        let _ = &event.lineage;\n    }\n}\n";
-    probe_decision_store_opened_elsewhere: the_decision_store_database_is_opened_only_by_the_store,
+    probe_decision_store_opened_elsewhere: no_production_file_opens_a_legacy_decision_database,
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"decisions.db\"));\n}\n";
+        "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"journal.db\"));\n}\n";
     probe_causal_metric_helper: decision_metric_labels_come_from_bounded_allowlists,
         "src/observability/prometheus.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn d0_planted_label(event: &CausalEvent) -> &str {\n    event.lineage.workspace_id.as_ref()\n}\n";
@@ -814,7 +679,6 @@ macro_rules! source_mutation_probes {
 }
 
 source_mutation_probes! {
-    execution_guard_is_unconditional_and_decision_clock_has_one_owner => mutation_proof_decision_clock,
     provider_label_sinks_redact_url_userinfo => terminal_provider_label_guard_rejects_bypass_missing_calls_and_literal_decoys,
     embedded_user_input_cannot_bypass_reserved_marker_neutralization => mutation_proof_embedded_input_guard,
     every_non_tool_execute_call_site_shows_its_type_evidence => mutation_proof_execution_binding_guard,
@@ -990,15 +854,6 @@ fn out_of_line_test_ancestry_preserves_production_violation_probes() {
             "an undeclared file called tests.rs must remain production"
         );
     }
-}
-
-fn mutation_proof_decision_clock() {
-    assert_reviewed_source_mutation(
-        execution_guard_is_unconditional_and_decision_clock_has_one_owner,
-        "src/agent/turn_engine.rs",
-        "execution_requirement.is_none(),",
-        "true,",
-    );
 }
 
 #[test]

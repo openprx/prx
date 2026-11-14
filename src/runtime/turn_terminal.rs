@@ -4,15 +4,11 @@ pub(crate) mod restart_verify;
 pub(crate) mod settlement;
 pub(crate) mod silence;
 
-use crate::causal_tree::outcome::{OutcomeCorrelator, TerminalFacts};
-use crate::runtime::child_source::completion::{ChildOutcomeHook, JournalChildOutcomeHook};
-use crate::runtime::decision_journal::store::{DecisionScope, Enqueue};
 use crate::runtime::turn_decision::TurnDecisionService;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use anyhow::Context;
-use settlement::VerifiedDirectiveApplication;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Observer-owned projection of confirmed segment usage, bounded by this task's
 /// completed segments rather than the workspace event catalog.
@@ -279,9 +275,7 @@ pub(crate) struct TurnTerminalGuard {
     cleanup_ticket: Option<crate::runtime::turn_cleanup::CleanupTicket>,
     usage_collector: Option<Arc<TerminalUsageCollector>>,
     cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
-    service: Arc<TurnDecisionService>,
     context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
-    settlement: crate::agent::terminal::DecisionSettlementRef,
     binding: crate::agent::terminal::TerminalBinding,
     fabric: crate::memory::MemoryFabric,
     config: Arc<crate::config::Config>,
@@ -311,16 +305,13 @@ impl TurnTerminalGuard {
         envelope: crate::runtime::envelope::RuntimeEnvelope,
         cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> anyhow::Result<Self> {
-        let settlement = service.terminal_settlement_ref(Arc::clone(&context))?;
         let binding = service.terminal_binding(&context)?;
         Ok(Self {
             child_cleanup: None,
             cleanup_ticket: Some(cleanup_ticket),
             usage_collector: None,
             cleanup_ack,
-            service,
             context,
-            settlement,
             binding,
             fabric,
             config,
@@ -384,7 +375,6 @@ impl TurnTerminalGuard {
             trace.map(|trace| crate::agent::terminal::provider_outcome_from_trace(route, self.started_at, trace))
         });
         crate::agent::terminal::TurnTerminalDraft {
-            decision: Some(self.settlement.clone()),
             binding: Some(self.binding.clone()),
             terminal_id: self.envelope.run_id.clone().unwrap_or_default(),
             scope: self.envelope.message_scope(),
@@ -407,7 +397,7 @@ impl TurnTerminalGuard {
         &self,
         mut proposal: crate::agent::terminal::TurnTerminalDraft,
     ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
-        bind_terminal_decision(&mut proposal, &self.settlement, &self.binding)?;
+        bind_terminal_decision(&mut proposal, &self.binding)?;
         // A failed foreground caller may have lost its return trace after a
         // real provider reply. Use the same observed evidence as abort_commit;
         // the single terminal writer still owns settlement and replay.
@@ -465,7 +455,7 @@ impl TurnTerminalGuard {
         }
         // Keep the canonical writer in its existing owner, with a bounded
         // heap await state rather than adding another terminal task owner.
-        let receipt = Box::pin(finalize_and_rejoin(&self.service, &self.fabric, &self.config, proposal)).await?;
+        let receipt = Box::pin(finalize_terminal(&self.fabric, &self.config, proposal)).await?;
         if let Some(collector) = &self.usage_collector {
             collector
                 .record_with_recovery(&receipt, &self.context, &self.envelope)
@@ -585,7 +575,6 @@ mod auxiliary_registration_tests {
     fn draft(scope: crate::memory::MessageEventScope) -> crate::agent::terminal::TurnTerminalDraft {
         let now = chrono::Utc::now();
         crate::agent::terminal::TurnTerminalDraft {
-            decision: None,
             binding: None,
             terminal_id: "prx_aux_terminal".to_owned(),
             scope,
@@ -683,33 +672,17 @@ mod auxiliary_registration_tests {
 }
 
 /// Commit through the shared finalizer before rejoining the decision journal.
-async fn finalize_and_rejoin(
-    service: &TurnDecisionService,
+/// The single terminal writer of a guarded turn. Restart recovery rejoins
+/// the committed terminal from its settled facts, never from this path.
+async fn finalize_terminal(
     fabric: &crate::memory::MemoryFabric,
     config: &crate::config::Config,
     proposal: crate::agent::terminal::TurnTerminalDraft,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
     #[cfg(test)]
-    let mut stage =
+    let stage =
         super::turn_cleanup::diagnostic::Stage::current(super::turn_cleanup::diagnostic::StageName::TerminalFinalize);
-    let recorded = proposal.decision.as_ref().is_some_and(|link| link.is_recorded());
     let receipt = crate::agent::terminal::finalize_turn(fabric, proposal, &config.cost, &config.workspace_dir).await?;
-    #[cfg(test)]
-    stage.next(super::turn_cleanup::diagnostic::StageName::TerminalReceiptOwner);
-    let owner = receipt
-        .terminal_event
-        .owner_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("runtime terminal owner missing"))?;
-    #[cfg(test)]
-    stage.next(super::turn_cleanup::diagnostic::StageName::TerminalRejoin);
-    if recorded {
-        service
-            .runtime_holder()
-            .recovery_scope()
-            .rejoin_terminal(&receipt.terminal_id, owner)
-            .await?;
-    }
     #[cfg(test)]
     stage.finish();
     Ok(receipt)
@@ -738,7 +711,6 @@ impl Drop for TurnTerminalGuard {
                 "runtime turn future ended before terminal acknowledgement".to_owned(),
             )
         });
-        let service = Arc::clone(&self.service);
         let fabric = self.fabric.clone();
         let config = Arc::clone(&self.config);
         let cleanup_ack = self.cleanup_ack.take();
@@ -763,7 +735,7 @@ impl Drop for TurnTerminalGuard {
                         if let Some(cleanup) = child_cleanup {
                             cleanup.wait().await?;
                         }
-                        let receipt = finalize_and_rejoin(&service, &fabric, &config, proposal).await?;
+                        let receipt = finalize_terminal(&fabric, &config, proposal).await?;
                         if let Some(collector) = &usage_collector {
                             let envelope = observation_envelope
                                 .as_ref()
@@ -807,27 +779,18 @@ impl Drop for TurnTerminalGuard {
     }
 }
 
-/// The guard owns the terminal decision link. Draft omission cannot bypass
-/// its settlement, and a supplied foreign link fails before retaining a draft.
+/// The guard owns the terminal binding. Draft omission cannot bypass it, and
+/// a supplied foreign binding fails before retaining a draft.
 pub(crate) fn bind_terminal_decision(
     proposal: &mut crate::agent::terminal::TurnTerminalDraft,
-    owned: &crate::agent::terminal::DecisionSettlementRef,
     binding: &crate::agent::terminal::TerminalBinding,
 ) -> anyhow::Result<()> {
-    if let Some(supplied) = proposal.decision.as_ref() {
-        anyhow::ensure!(
-            owned.same_context(supplied),
-            "terminal proposal decision differs from its guard"
-        );
-    }
     if let Some(supplied) = proposal.binding.as_ref() {
         anyhow::ensure!(
             binding.same_turn(supplied),
             "terminal proposal binding differs from its guard"
         );
     }
-    owned.validate_binding(binding)?;
-    proposal.decision = Some(owned.clone());
     proposal.binding = Some(binding.clone());
     Ok(())
 }
@@ -846,7 +809,7 @@ pub(crate) async fn commit_terminal(
     }
 }
 
-// Authenticated historical decision evidence remains readable during migration.
+// Restart rejoin authenticates only the settled facts of the repository.
 impl super::ingress_recovery::RecoveryScope {
     pub(super) async fn rejoin_terminal_inner(
         &self,
@@ -857,9 +820,7 @@ impl super::ingress_recovery::RecoveryScope {
             Instant,
             &Arc<super::turn_cleanup::CleanupTracker>,
         )>,
-    ) -> anyhow::Result<Enqueue> {
-        #[cfg(test)]
-        self.spies().note_rejoin();
+    ) -> anyhow::Result<()> {
         #[cfg(test)]
         let mut stage = super::turn_cleanup::diagnostic::Stage::current(
             super::turn_cleanup::diagnostic::StageName::RejoinPreconditions,
@@ -909,277 +870,9 @@ impl super::ingress_recovery::RecoveryScope {
             event.workspace_id == workspace_id && event.owner_id.as_deref() == Some(owner_id),
             "terminal replay scope does not match its owner"
         );
-        if self.authority.legacy.is_none() {
-            return self.rejoin_without_legacy(&event, terminal_id, owner_id).await;
-        }
-        let legacy = self
-            .authority
-            .legacy
-            .as_ref()
-            .context("legacy evidence missing after plane-on gate")?;
-        let state_key = &legacy.key;
-        let journal = crate::agent::terminal::replay_requires_journal(state_key, &event, None)?;
-        let store = if journal { None } else { Some(&legacy.store) };
-        let reader = &legacy.reader;
-        let store_workspace_id: Arc<str> = match store {
-            Some(store) => store.workspace_id().context("store workspace scope is missing")?,
-            None => Arc::from(crate::agent::terminal::authenticated_replay_store_workspace(
-                state_key, &event,
-            )?),
-        };
-        let replay = match (store, bounded) {
-            (Some(_store), Some((_, deadline, owner))) => {
-                crate::agent::terminal::verify_terminal_replay_until(
-                    self.memory.as_ref(),
-                    reader,
-                    state_key,
-                    &store_workspace_id,
-                    &workspace_id,
-                    owner_id,
-                    terminal_id,
-                    &event,
-                    deadline,
-                    owner,
-                )
-                .await?
-            }
-            (Some(_store), None) => {
-                crate::agent::terminal::verify_terminal_replay(
-                    self.memory.as_ref(),
-                    reader,
-                    state_key,
-                    &store_workspace_id,
-                    &workspace_id,
-                    owner_id,
-                    terminal_id,
-                    &event,
-                )
-                .await?
-            }
-            (None, Some((_, deadline, owner))) => {
-                crate::agent::terminal::verify_terminal_replay_journal_until(
-                    self.memory.as_ref(),
-                    &self.workspace,
-                    state_key,
-                    &store_workspace_id,
-                    &workspace_id,
-                    owner_id,
-                    terminal_id,
-                    &event,
-                    deadline,
-                    owner,
-                )
-                .await?
-            }
-            (None, None) => {
-                crate::agent::terminal::verify_terminal_replay_journal(
-                    self.memory.as_ref(),
-                    &self.workspace,
-                    state_key,
-                    &store_workspace_id,
-                    &workspace_id,
-                    owner_id,
-                    terminal_id,
-                    &event,
-                )
-                .await?
-            }
-        };
-        anyhow::ensure!(
-            journal || replay.source().source != crate::memory::MessageEventSource::SessionWorker,
-            "worker segment requires launch provenance for legacy selection"
-        );
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinReplayScope);
-        anyhow::ensure!(
-            super::turn_source::ingress_event_surface(
-                &replay.source().source,
-                replay.source().channel.as_deref(),
-                &replay.source().visibility
-            ) == Some(self.surface),
-            "terminal replay belongs to another ingress surface"
-        );
-        anyhow::ensure!(
-            replay.parent_decision_id().is_none(),
-            "terminal replay belongs to a delegated parent decision"
-        );
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinFacts);
-        let decision = replay.decision();
-        let facts = TerminalFacts::from_persisted_marker(&event, decision, owner_id, &workspace_id)?
-            .with_verified_resume(&replay);
-        let writer = store
-            .map(|_| legacy.writer.clone().context("terminal rejoin writer is missing"))
-            .transpose()?;
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinCorrelator);
-        let expected = OutcomeCorrelator::persisted_record(decision, &facts)?;
-        #[cfg(test)]
-        stage.next(super::turn_cleanup::diagnostic::StageName::RejoinRecord);
-        let (child_owner, child_deadline) = match bounded {
-            Some((_, deadline, owner)) => (Some(owner), Some(deadline)),
-            None => (None, None),
-        };
-        JournalChildOutcomeHook::new(
-            self.workspace.clone(),
-            Arc::clone(state_key),
-            Arc::clone(&store_workspace_id),
-        )
-        .persist(&replay, &event, child_owner, child_deadline)
-        .await?;
-        let scope = DecisionScope::Owner {
-            workspace_id: store_workspace_id,
-            owner_id: Arc::from(owner_id),
-        };
-        // Journal mode: the hook's FULL commit and readback above settled the
-        // child. The projection below is store-only and is not authority.
-        let projection = store.zip(writer.as_ref());
-        if let Some((store, writer)) = projection {
-            anyhow::ensure!(
-                writer.record_outcome(expected.clone()) == Enqueue::Queued,
-                "rejoined outcome could not be queued"
-            );
-            #[cfg(test)]
-            stage.next(super::turn_cleanup::diagnostic::StageName::RejoinDrain);
-            anyhow::ensure!(
-                writer
-                    .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
-                    .await,
-                "rejoined outcome persistence timed out"
-            );
-            #[cfg(test)]
-            stage.next(super::turn_cleanup::diagnostic::StageName::RejoinConfirmAndRepairs);
-            anyhow::ensure!(
-                if let Some((_, deadline, owner)) = bounded {
-                    let reader = store.reader();
-                    let scope = scope.clone();
-                    let expected = expected.clone();
-                    super::ingress_recovery::owned_store_read(owner, move || {
-                        Ok(reader.outcome_matches_until(&scope, &expected, deadline)?)
-                    })
-                    .await?
-                } else {
-                    store.reader().outcome_matches(&scope, &expected)?
-                },
-                "rejoined outcome is absent or conflicts with the authenticated terminal"
-            );
-        }
-        let (terminal_status, awaiting_approval, verified) = facts.recovered_signals(&decision.directive_kind);
-        crate::skills::lifecycle::spawn_settle_task_terminal(
-            self.workspace.clone(),
-            Some(owner_id.to_owned()),
-            crate::skills::lifecycle::task_key(
-                super::turn_source::subject_task_id(event.subject.as_ref()),
-                event.run_id.as_deref(),
-                event.parent_run_id.as_deref(),
-            ),
-            terminal_id.to_owned(),
-            crate::skills::lifecycle::TerminalObservation {
-                recovered: true,
-                root: event.parent_run_id.is_none(),
-                ..terminal_status.skill_observation(awaiting_approval, verified)
-            },
-        );
-        if let (Some((store, writer)), true) = (projection, replay.parent_decision_id().is_some()) {
-            let link = crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
-                .context("child outcome lineage is inconsistent")?;
-            anyhow::ensure!(
-                writer.record_child_outcome(link) == Enqueue::Queued,
-                "child outcome link could not be queued"
-            );
-            anyhow::ensure!(
-                writer
-                    .drain(bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline))
-                    .await,
-                "child outcome link persistence timed out"
-            );
-            let expected_link =
-                crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
-                    .context("child outcome lineage changed")?;
-            anyhow::ensure!(
-                if let Some((_, deadline, owner)) = bounded {
-                    let reader = store.reader();
-                    let scope = scope.clone();
-                    super::ingress_recovery::owned_store_read(owner, move || {
-                        Ok(reader.child_outcome_matches_until(&scope, &expected_link, deadline)?)
-                    })
-                    .await?
-                } else {
-                    store.reader().child_outcome_matches(&scope, &expected_link)?
-                },
-                "child outcome link is absent or conflicts with authenticated facts"
-            );
-        }
-        if replay.fixed_close()
-            || facts.has_completed_run_evidence(decision, replay.run_capabilities())
-            || (decision
-                .selected()
-                .is_some_and(|candidate| candidate.action == "use_tool")
-                && facts.has_completed_resume_evidence(replay.run_capabilities()))
-        {
-            anyhow::ensure!(
-                !replay.fixed_close() || facts.is_completed_local_close(),
-                "replay is not a completed local close"
-            );
-            let application = VerifiedDirectiveApplication::from_replay(&replay)?;
-            #[cfg(test)]
-            self.spies().note_directive_repair();
-            let sink = legacy.events.as_ref().context("applied replay sink is unavailable")?;
-            if let Some((_, deadline, _)) = bounded {
-                sink.repair_applied_until(application, deadline).await?;
-            } else {
-                anyhow::ensure!(
-                    sink.repair_applied(application, Instant::now() + Duration::from_secs(5))
-                        .await,
-                    "rejoined applied event is absent or conflicts with the authenticated terminal"
-                );
-            }
-        }
-        if replay.source().source == crate::memory::MessageEventSource::Console {
-            // Only authenticated replay reaches this projection. Each event is
-            // rechecked in the backend transaction; replay cannot duplicate it.
-            if let Some((_, deadline, _)) = bounded {
-                self.memory
-                    .project_console_message_until(replay.source(), deadline)
-                    .await?;
-                if let Some(assistant) = replay.assistant() {
-                    self.memory.project_console_message_until(assistant, deadline).await?;
-                }
-            } else {
-                self.memory.project_console_message(replay.source()).await?;
-                if let Some(assistant) = replay.assistant() {
-                    self.memory.project_console_message(assistant).await?;
-                }
-            }
-        }
-        if journal {
-            // Non-gating store projection: the journal rows above are the authority,
-            // so every failure here is logged and never refuses the rejoin.
-            match legacy.writer.as_ref() {
-                Some(writer) => {
-                    if writer.record_outcome(expected.clone()) != Enqueue::Queued {
-                        tracing::warn!("rejoined outcome projection could not be queued");
-                    }
-                    if replay.parent_decision_id().is_some() {
-                        let queued =
-                            crate::runtime::decision_journal::store::ChildOutcomeLink::from_replay(&replay, &expected)
-                                .is_some_and(|link| writer.record_child_outcome(link) == Enqueue::Queued);
-                        if !queued {
-                            tracing::warn!("child outcome link projection could not be queued");
-                        }
-                    }
-                    let deadline =
-                        bounded.map_or_else(|| Instant::now() + Duration::from_secs(5), |(_, deadline, _)| deadline);
-                    if !writer.drain(deadline).await {
-                        tracing::warn!("rejoined outcome projection drain timed out");
-                    }
-                }
-                None => tracing::warn!("rejoined outcome projection has no store writer"),
-            }
-        }
         #[cfg(test)]
         stage.finish();
-        Ok(Enqueue::Queued)
+        self.rejoin_without_legacy(&event, terminal_id, owner_id).await
     }
 
     /// Plane-off rejoin: settled skill settle, zero decision writes. Unattested
@@ -1189,7 +882,7 @@ impl super::ingress_recovery::RecoveryScope {
         event: &crate::memory::MessageEvent,
         terminal_id: &str,
         owner_id: &str,
-    ) -> anyhow::Result<Enqueue> {
+    ) -> anyhow::Result<()> {
         let facts = self
             .load_settled_facts(event, terminal_id, owner_id)
             .await?
@@ -1212,8 +905,7 @@ impl super::ingress_recovery::RecoveryScope {
                     .skill_observation(observation.awaiting_approval, observation.verified)
             },
         );
-        tracing::debug!("plane-off recovery skips the child outcome link");
-        Ok(Enqueue::Queued)
+        Ok(())
     }
 
     async fn load_settled_facts(

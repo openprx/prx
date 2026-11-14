@@ -251,7 +251,7 @@ async fn check_legacy_input(recording: bool, turns: usize) -> anyhow::Result<()>
                 let payload: Value = serde_json::from_str(&terminal.raw_payload)?;
                 assert_eq!(payload.pointer("/provider_outcome/final_model"), Some(&json!(CHEAP)));
                 assert!(payload.get("served_auxiliary").is_none());
-                assert_eq!(payload.get("terminal_replay_v1").is_some(), recording);
+                assert!(payload.get("decision_id").is_none_or(serde_json::Value::is_null));
             }
             let costs: Vec<Value> = std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?
                 .lines()

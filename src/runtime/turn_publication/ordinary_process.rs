@@ -5,7 +5,6 @@ use anyhow::Context;
 
 use super::{PublicationInputs, PublicationLoopRuntime};
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
-use crate::runtime::decision_journal::store::CausalDecisionStore;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -55,7 +54,6 @@ pub(super) fn ordinary_process_publication(
         },
     )?
     .with_unproven_budget_gate();
-    let store = CausalDecisionStore::open_unshared_read_only(&config.workspace_dir);
     let service = Arc::new(TurnDecisionService {
         runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
             Arc::new(crate::runtime::ingress_recovery::RecoveryScope::unrecorded(
@@ -81,7 +79,6 @@ pub(super) fn ordinary_process_publication(
                 events: Arc::clone(&build.events),
             },
         )?,
-        child_recovery: Default::default(),
         memory_loader: None,
         loop_runtime: Some(runtime),
         publication_policy: build.surface_policy,
@@ -105,8 +102,6 @@ pub(super) fn ordinary_process_publication(
         execution: build.execution,
         memory: build.memory,
         security: build.security,
-        store,
-        durable_events: None,
     });
     service.check_live_parity()?;
     Ok(service)

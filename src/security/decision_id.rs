@@ -13,11 +13,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct DecisionId(Uuid);
 
-/// A string that is not a decision id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("not a decision id")]
-pub(crate) struct InvalidDecisionId;
-
 impl DecisionId {
     /// The UUID carried by a runtime-owned hop lineage.
     pub(crate) const fn as_uuid(self) -> Uuid {
@@ -29,14 +24,17 @@ impl DecisionId {
     pub(crate) fn new_runtime() -> Self {
         Self(Uuid::now_v7())
     }
+}
 
-    /// Parse the hyphenated form an operator types.
-    ///
-    /// # Errors
-    ///
-    /// [`InvalidDecisionId`] for anything that is not a UUID.
-    pub(crate) fn parse(text: &str) -> Result<Self, InvalidDecisionId> {
-        Uuid::parse_str(text.trim()).map(Self).map_err(|_| InvalidDecisionId)
+/// Test-support constructor for fixed fixture ids; production code only
+/// mints runtime ids.
+#[cfg(test)]
+pub(crate) mod test_support {
+    impl super::DecisionId {
+        /// Parse the hyphenated form of a fixture id.
+        pub(crate) fn parse(text: &str) -> Result<Self, uuid::Error> {
+            uuid::Uuid::parse_str(text.trim()).map(Self)
+        }
     }
 }
 
@@ -56,6 +54,5 @@ mod tests {
         let second = DecisionId::new_runtime();
         assert_ne!(first, second);
         assert_eq!(first.0.get_version_num(), 7);
-        assert_eq!(DecisionId::parse(&first.to_string()), Ok(first));
     }
 }

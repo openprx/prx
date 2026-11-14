@@ -89,10 +89,6 @@ mod tests {
                 // Chat decide no longer runs a prediction port; advice copies
                 // whatever answers the opened context has (none when engine-off
                 // construction is used).
-                assert!(
-                    context.engine().prediction.is_none(),
-                    "chat decide uses open_turn_context"
-                );
             } else {
                 assert!(advice.is_none());
             }

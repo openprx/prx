@@ -19,7 +19,6 @@ const COMPATIBILITY: &[(&str, &str)] = &[
         "src/agent/agent/retired_escalation_tests.rs",
         "embedded legacy TOML fixture",
     ),
-    ("src/agent/terminal/served_auxiliary.rs", "read-only v1 event identity"),
     (
         "tests/fixtures/served-reply-v1.json",
         "immutable pre-removal committed records",

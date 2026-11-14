@@ -734,15 +734,6 @@ mod tests {
                     }.publish(crate::tools::capability::turn_state::TurnSurfaceKind::Server).await?;
                     crate::runtime::turn_cleanup::current_tracker().context("gateway fixture cleanup owner missing")?.retain_service(Arc::clone(&service));
                     let context = service.open_issued_turn_context(&proof, crate::runtime::turn_context::AgentTurnKind::SingleShot, &cancellation).await?;
-                    anyhow::ensure!(
-                        matches!(
-                            context.engine().selection,
-                            crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                                if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
-                        ),
-                        "gateway fixture parent must commit Answer: {:?}",
-                        context.engine().selection
-                    );
                     assert!(
                         context
                             .engine()
@@ -751,7 +742,6 @@ mod tests {
                             .is_some_and(|manifest| manifest.allowed.is_empty()),
                         "the answer surface must retain the actual model-only child grant"
                     );
-                    assert_eq!(context.audit_hops().count(), 1, "fixture must not discover additional work");
                     let specs = service.agent_execution_specs(&proof, &context)?;
                     assert_eq!(specs.specs.len(), 1);
                     assert_eq!(specs.specs.first().expect("one selected spawn spec").name, "sessions_spawn");

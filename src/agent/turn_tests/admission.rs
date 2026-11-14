@@ -410,39 +410,9 @@ impl AdmittedTurn {
             .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
             .is_err()
         {
-            let engine = admitted.context.engine();
-            let blocked: Vec<u8> = engine
-                .pre_commit
-                .outcomes
-                .values()
-                .filter_map(|outcome| match outcome {
-                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
-                    _ => None,
-                })
-                .collect();
-            let attempt_ms: Vec<u128> = engine
-                .prediction
-                .as_ref()
-                .map(|prediction| {
-                    prediction
-                        .attempts
-                        .iter()
-                        .map(|attempt| attempt.latency.as_millis())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let clock_ahead_ms = tokio::time::Instant::now()
-                .into_std()
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
-                engine.selection,
-                engine.fallback_cause,
-                engine.elapsed_ms,
-                engine.request_compiled,
-                admitted.context.hop_ids().len(),
-                engine.state.trusted.parts().budgets,
+                "mechanics fixture must genuinely reach Execute; budget={:?}",
+                admitted.context.engine().state.trusted.parts().budgets,
             );
         }
         admitted
@@ -487,39 +457,9 @@ impl AdmittedTurn {
             .agent_execution_specs(admitted.proof.as_ref(), &admitted.context)
             .is_err()
         {
-            let engine = admitted.context.engine();
-            let blocked: Vec<u8> = engine
-                .pre_commit
-                .outcomes
-                .values()
-                .filter_map(|outcome| match outcome {
-                    crate::causal_tree::gates::GateOutcome::Blocked { gate, .. } => Some(*gate),
-                    _ => None,
-                })
-                .collect();
-            let attempt_ms: Vec<u128> = engine
-                .prediction
-                .as_ref()
-                .map(|prediction| {
-                    prediction
-                        .attempts
-                        .iter()
-                        .map(|attempt| attempt.latency.as_millis())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let clock_ahead_ms = tokio::time::Instant::now()
-                .into_std()
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis();
             panic!(
-                "mechanics fixture must genuinely reach Execute; selection={:?} fallback={:?} elapsed_ms={} compiled={} blocked_gates={blocked:?} clock_ahead_ms={clock_ahead_ms} hops={} budget={:?} attempt_ms={attempt_ms:?}",
-                engine.selection,
-                engine.fallback_cause,
-                engine.elapsed_ms,
-                engine.request_compiled,
-                admitted.context.hop_ids().len(),
-                engine.state.trusted.parts().budgets,
+                "mechanics fixture must genuinely reach Execute; budget={:?}",
+                admitted.context.engine().state.trusted.parts().budgets,
             );
         }
         admitted

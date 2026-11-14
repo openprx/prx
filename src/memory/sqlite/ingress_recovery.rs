@@ -601,11 +601,13 @@ pub(super) async fn list(
                 CASE WHEN length(CAST(input_key AS BLOB))<=4096 THEN input_key ELSE NULL END,
                 CASE WHEN length(CAST(lifetime AS BLOB))<=36 THEN lifetime ELSE NULL END";
             // Two explicit indexed lifetime ranges exclude the entire current
-            // owner's history before materialization or cursor ordering.
+            // owner's history before materialization or cursor ordering. Only
+            // v3 capsules are candidates: earlier rows are skipped in SQL,
+            // with no key read and no state change.
             let sql=format!("SELECT * FROM (
-                SELECT {projection} FROM ingress_recovery INDEXED BY ingress_recovery_scope_cursor WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND state IN ('pending',?8) AND state<>'reconciled' AND lifetime<?7 AND cursor>?4
+                SELECT {projection} FROM ingress_recovery INDEXED BY ingress_recovery_scope_cursor WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND state IN ('pending',?8) AND state<>'reconciled' AND lifetime<?7 AND cursor>?4 AND json_extract(capsule_json,'$.version')=3
                 UNION ALL
-                SELECT {projection} FROM ingress_recovery INDEXED BY ingress_recovery_scope_cursor WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND state IN ('pending',?8) AND state<>'reconciled' AND lifetime>?7 AND cursor>?4
+                SELECT {projection} FROM ingress_recovery INDEXED BY ingress_recovery_scope_cursor WHERE workspace_id=?1 AND owner_id=?2 AND source=?3 AND state IN ('pending',?8) AND state<>'reconciled' AND lifetime>?7 AND cursor>?4 AND json_extract(capsule_json,'$.version')=3
                 ) ORDER BY cursor LIMIT ?5");
             let mut statement=transaction.prepare(&sql)?;
             let mut rows=statement.query(params![scope.workspace_id,scope.owner_id,scope.source.as_str(),after_id,i64::try_from(limit)?,MAX_CAPSULE_BYTES as i64,current.token(),other_state])?;

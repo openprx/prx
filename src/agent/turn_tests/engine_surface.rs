@@ -82,19 +82,7 @@ async fn run_tool_call_loop_executes_read_only_tools_with_bounded_parallelism() 
                         .await;
                         // Observe the actual admitted fixture before the original engine assertions.
                         let decision = admission.decision();
-                        let diagnostic = decision
-                            .context
-                            .audit_hops()
-                            .map(|hop| {
-                                serde_json::json!({
-                                    "selection": format!("{:?}", hop.selection),
-                                    "prediction": format!("{:?}", hop.prediction),
-                                    "candidates": format!("{:?}", hop.candidates),
-                                    "post_rehearsal": format!("{:?}", hop.post_rehearsal),
-                                    "pre_commit": format!("{:?}", hop.pre_commit),
-                                })
-                            })
-                            .collect::<Vec<_>>();
+                        let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
                         eprintln!(
                             "actual_parallel_admission={}",
                             serde_json::to_string(&diagnostic).unwrap()

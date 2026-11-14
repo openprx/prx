@@ -204,7 +204,6 @@ impl TurnDecisionPublication {
                 .await;
             anyhow::bail!("MCP capability state changed during decision publication");
         }
-        super::ingress_recovery::register_service(&service)?;
         super::ingress_recovery::service_ready(&service).await?;
         super::control_ladder::report_decision_service_status(&service);
         Ok(service)

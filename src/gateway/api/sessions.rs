@@ -417,10 +417,7 @@ async fn recover_console_history(
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("Console terminal payload missing"))?,
                 )?;
-                if payload.get("decision_id").is_none_or(serde_json::Value::is_null)
-                    && payload.get("terminal_replay_v1").is_none()
-                    && payload.get("terminal_replay_mac_v1").is_none()
-                {
+                if payload.get("decision_id").is_none_or(serde_json::Value::is_null) {
                     // A stripped marker must not masquerade as a legacy turn
                     // when a durable decision claim still identifies the run.
                     let claim = if let Some(run) = event.run_id.as_deref() {
@@ -2118,10 +2115,6 @@ async fn run_console_message_job_work(
             .ok_or_else(|| "Console admitted run missing".to_owned())?;
         let terminal_fabric = MemoryFabric::new(state.mem.clone(), turn.envelope.workspace_id.clone());
         let config = &turn_runtime.config_generation.effective;
-        let settlement = decision
-            .service
-            .terminal_settlement_ref(std::sync::Arc::clone(&decision.context))
-            .map_err(|error| error.to_string())?;
         let terminal_binding = decision
             .service
             .terminal_binding(&decision.context)
@@ -2130,7 +2123,6 @@ async fn run_console_message_job_work(
             Some(&terminal_guard),
             &terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
-                decision: Some(settlement),
                 binding: Some(terminal_binding),
                 terminal_id,
                 scope: turn.envelope.message_scope(),
@@ -2935,15 +2927,6 @@ mod tests {
                         &cancellation,
                     )
                     .await?;
-                assert!(
-                    matches!(
-                        context.engine().selection,
-                        crate::causal_tree::decision_select::Selection::Commit { ref candidate_id, .. }
-                            if candidate_id.action() == crate::tools::capability::contract::CausalActionKind::Answer
-                    ),
-                    "console plain message must commit Answer: {:?}",
-                    context.engine().selection
-                );
                 let decision = ConsoleDecisionTurn {
                     service: Arc::clone(&service),
                     context,

@@ -1,10 +1,5 @@
 #![cfg(test)]
-mod agent_decision;
-mod catalog_drift;
 mod discovery_surface;
-mod enabled_service;
-mod execution;
-mod recorded_chain;
 mod skill_receipts;
 mod terminal_scope;
 
@@ -28,14 +23,13 @@ use crate::memory::{MemoryFabric, NoneMemory};
 use crate::observability::causal_event::CausalEvent;
 use crate::observability::causal_event::testing::RecordingSink;
 use crate::security::SecurityPolicy;
-use crate::security::runtime_key::KeyDomain;
+
 use crate::tools::execution::{
     AdapterOwnedPreparation, DenyApprovalStrategy, SecurityEffectPolicy, TracingToolExecutionAudit,
 };
-use crate::tools::traits::{ToolResult, ToolSpec};
+use crate::tools::traits::ToolResult;
 
 use async_trait::async_trait;
-use catalog_drift::DriftingCatalogTool;
 
 pub(crate) struct SilentEvents;
 

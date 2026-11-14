@@ -932,31 +932,12 @@ fn assert_cli_redaction_answer_receipts(workspace: &std::path::Path, status: &st
     assert_eq!(terminals.len(), 1, "one actual CLI whole-turn terminal");
     let terminal: serde_json::Value = serde_json::from_str(&terminals.first().unwrap().raw_payload).unwrap();
     assert_eq!(terminal.get("status").and_then(serde_json::Value::as_str), Some(status));
-    let decision_id = terminal
-        .get("decision_id")
-        .and_then(serde_json::Value::as_str)
-        .expect("actual CLI decision identity");
+    assert!(
+        terminal.get("decision_id").is_none_or(serde_json::Value::is_null),
+        "terminals carry no decision record after P2-G5a"
+    );
     let tool_events = crate::memory::sqlite::fixture_readback::tool_event_count(workspace).unwrap();
     assert_eq!(tool_events, 0, "Answer redaction fixture must execute no tools");
-    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace);
-    let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
-        workspace_id: store.workspace_id().unwrap(),
-        owner_id: std::sync::Arc::from(terminals[0].owner_id.as_deref().expect("actual terminal owner")),
-    };
-    let decision = store
-        .reader()
-        .get(
-            &scope,
-            &crate::security::decision_id::DecisionId::parse(decision_id).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-    let (directive, backend) = (decision.directive_kind, decision.backend_kind);
-    assert_eq!(directive, "answer", "the actual service must record the Answer path");
-    assert_eq!(
-        backend, "none",
-        "the turn opens prediction-free (R9): no backend answers at opening"
-    );
 }
 
 #[test]

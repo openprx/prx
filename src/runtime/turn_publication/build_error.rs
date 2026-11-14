@@ -1,6 +1,5 @@
 //! Failures while building one publication (R26).
 use crate::decision_engine::prediction::factory::FactoryBuildError;
-use crate::runtime::decision_journal::store::StoreError;
 use crate::tools::capability::catalog::{CatalogError, ParityError};
 
 #[derive(Debug, thiserror::Error)]
@@ -11,8 +10,6 @@ pub(crate) enum PublicationBuildError {
     ChildAuthority,
     #[error("catalog sources do not match the pinned configuration generation")]
     SourceGeneration,
-    #[error(transparent)]
-    Store(#[from] StoreError),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
     #[error(transparent)]

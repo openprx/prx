@@ -10,7 +10,7 @@ use super::helpers::{
 /// The neutral homes (R15-R17, R52, OV-14). There is no exception for
 /// `src/config`: the engine configuration schema lives there and the
 /// dependency is engine -> config only.
-const NEUTRAL_HOMES: [&str; 9] = [
+const NEUTRAL_HOMES: [&str; 8] = [
     "src/tools/",
     "src/security/",
     "src/providers/",
@@ -19,7 +19,6 @@ const NEUTRAL_HOMES: [&str; 9] = [
     "src/session_worker/",
     "src/config/",
     "src/cost/",
-    "src/runtime/decision_journal",
 ];
 
 /// Whether `compact` (whitespace removed) names the engine module from the
@@ -159,4 +158,81 @@ pub(super) fn decision_engine_never_imports_agent_or_tool_execution() {
         violations.is_empty(),
         "the decision engine never imports agent, chat, channels, gateway, runtime or tool execution (R41): {violations:?}"
     );
+}
+
+/// Workspace paths and markers of the deleted decision store, child authority
+/// journal, legacy decision key and terminal replay binding (P2-I1). The
+/// legacy-file warning in `runtime/cost_recovery.rs` is the only production
+/// file that may name them.
+pub(super) const LEGACY_DECISION_ARTIFACTS: [&str; 4] = [
+    "decisions.db",
+    "child_authority/journal.db",
+    "causal_tree/.decision_key",
+    "terminal_replay_v1",
+];
+
+const LEGACY_ARTIFACT_WARNING: &str = "src/runtime/cost_recovery.rs";
+
+/// Production files (test items stripped, comments ignored) that name a
+/// legacy decision artifact, outside the one legacy-file warning.
+fn legacy_artifact_violations(files: &[(String, String)]) -> Vec<String> {
+    let test_modules = super::helpers::test_module_files_of(files);
+    files
+        .iter()
+        .filter(|(relative, _)| relative.starts_with("src/") && relative != LEGACY_ARTIFACT_WARNING)
+        .filter(|(relative, source)| !is_test_code_file(relative, source, &test_modules))
+        .filter(|(_, source)| {
+            strip_cfg_test_items(source).lines().any(|line| {
+                let code = line.split_once("//").map_or(line, |(code, _)| code);
+                LEGACY_DECISION_ARTIFACTS.iter().any(|artifact| code.contains(artifact))
+            })
+        })
+        .map(|(relative, _)| relative.clone())
+        .collect()
+}
+
+/// P2-R25: no production code opens, creates or names the deleted decision
+/// store, child authority journal, legacy decision key or terminal replay
+/// binding. Only the legacy-file warning names them.
+#[test]
+pub(super) fn no_legacy_decision_artifacts() {
+    let files: Vec<(String, String)> = rust_source_files()
+        .into_iter()
+        .map(|path| (relative_path(&path), read_source(&path)))
+        .collect();
+    let violations = legacy_artifact_violations(&files);
+    assert!(
+        violations.is_empty(),
+        "production code names a legacy decision artifact: {violations:?}"
+    );
+}
+
+#[test]
+fn no_legacy_decision_artifacts_rejects_a_planted_file() {
+    for artifact in LEGACY_DECISION_ARTIFACTS {
+        let planted = vec![(
+            "src/runtime/legacy_planted_probe.rs".to_owned(),
+            format!("pub fn planted(dir: &std::path::Path) {{\n    let _ = dir.join(\"self/{artifact}\");\n}}\n"),
+        )];
+        assert_eq!(
+            legacy_artifact_violations(&planted),
+            vec!["src/runtime/legacy_planted_probe.rs".to_owned()],
+            "{artifact}"
+        );
+    }
+    let allowed = vec![
+        (
+            LEGACY_ARTIFACT_WARNING.to_owned(),
+            "const LEGACY: &str = \"self/causal_tree/decisions.db\";\n".to_owned(),
+        ),
+        (
+            "src/runtime/commented_probe.rs".to_owned(),
+            "// the deleted decisions.db is never opened\nfn kept() {}\n".to_owned(),
+        ),
+        (
+            "src/runtime/test_item_probe.rs".to_owned(),
+            "#[cfg(test)]\nmod tests {\n    const OLD: &str = \"terminal_replay_v1\";\n}\n".to_owned(),
+        ),
+    ];
+    assert!(legacy_artifact_violations(&allowed).is_empty());
 }

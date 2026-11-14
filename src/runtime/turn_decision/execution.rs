@@ -150,7 +150,7 @@ impl TurnDecisionService {
                 crate::agent::send_admission::call_token_budget(self, context, proof).context("called-tool budget")?,
             );
         }
-        let trace = context.execution_trace.get_or_init(Default::default);
+        let trace = context.runtime().execution_trace.get_or_init(Default::default);
         trace.bind_exact_call_key(Arc::clone(&self.state_key))?;
         execution_context.execution_trace = Some(trace.clone());
         Ok((Arc::clone(&self.execution), execution_context))

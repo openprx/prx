@@ -1634,7 +1634,6 @@ impl SessionsSpawnTool {
                 );
                 match driver_terminal_journal
                     .commit(crate::agent::terminal::TurnTerminalDraft {
-                        decision: None,
                         binding: None,
                         terminal_id: rid.clone(),
                         scope: task_result_scope.clone(),

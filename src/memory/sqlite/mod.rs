@@ -27,7 +27,7 @@ pub(crate) use recovery_outbox::{
 };
 #[cfg(test)]
 pub(crate) use recovery_terminal::crash_before_commit;
-pub(crate) use recovery_terminal::{map_after_prefix, with_after_prefix_async};
+pub(crate) use recovery_terminal::map_after_prefix;
 mod router_history;
 mod router_learning;
 mod rows;

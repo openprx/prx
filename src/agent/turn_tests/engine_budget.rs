@@ -306,15 +306,7 @@ async fn small_native_schema_fixture(excluded: bool) {
                 assert!(decision.context.execution_refs().is_empty());
                 assert!(decision.context.is_run());
             } else {
-                let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
-                    "selection":format!("{:?}", hop.selection),
-                    "factory_prediction":format!("{:?}", hop.prediction),
-                    "factory_attempts":hop.prediction.as_ref().map(|prediction| format!("{:?}", prediction.attempts)),
-                    "request_compiled":hop.request_compiled,
-                    "candidates":format!("{:?}", hop.candidates),
-                    "post_rehearsal":format!("{:?}", hop.post_rehearsal),
-                    "pre_commit":format!("{:?}", hop.pre_commit),
-                })).collect::<Vec<_>>();
+                let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
                 eprintln!(
                     "actual_small_native_admission={}",
                     serde_json::to_string(&diagnostic).unwrap()
@@ -537,15 +529,7 @@ async fn configured_small_native_schema_fixture() {
                     );
                     assert!(!decision.context.is_run());
                 } else {
-                    let diagnostic = decision.context.audit_hops().map(|hop| serde_json::json!({
-                    "selection":format!("{:?}", hop.selection),
-                    "factory_prediction":format!("{:?}", hop.prediction),
-                    "factory_attempts":hop.prediction.as_ref().map(|prediction| format!("{:?}", prediction.attempts)),
-                    "request_compiled":hop.request_compiled,
-                    "candidates":format!("{:?}", hop.candidates),
-                    "post_rehearsal":format!("{:?}", hop.post_rehearsal),
-                    "pre_commit":format!("{:?}", hop.pre_commit),
-                })).collect::<Vec<_>>();
+                    let diagnostic = format!("{:?}", decision.context.engine().state.trusted.parts().budgets);
                     eprintln!(
                         "actual_small_native_admission={}",
                         serde_json::to_string(&diagnostic).unwrap()

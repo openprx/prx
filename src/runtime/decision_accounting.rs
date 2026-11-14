@@ -37,7 +37,10 @@ mod cl100k_prefix_bound;
 /// Whether the turn's execution is still open (R25 owner; the context
 /// method delegates until Part 2).
 pub(crate) fn is_run(context: &crate::runtime::turn_decision::TurnDecisionContext) -> bool {
-    !context.execution_closed.load(std::sync::atomic::Ordering::Acquire)
+    !context
+        .runtime()
+        .execution_closed
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Initialize local CPU-heavy accounting tables at runtime construction,

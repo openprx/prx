@@ -461,10 +461,6 @@ fn published_decision_layer(status: super::ingress_recovery::status::DecisionPla
             "attachment": "service_snapshot",
             "config_generation": status.backend.config_generation,
             "catalog_generation": status.catalog_generation.to_hex(),
-            "store_mode": match status.store_mode {
-                crate::runtime::decision_journal::store::StoreMode::ReadOnly => "read_only",
-                crate::runtime::decision_journal::store::StoreMode::ReadWrite => "read_write",
-            },
             "durable_key": status.durable_key,
             "recordable": status.recordable,
             "backend_order": order,
@@ -605,7 +601,6 @@ mod tests {
                 cached: 0,
             },
             catalog_generation: crate::tools::capability::contract::CatalogGeneration([7; 32]),
-            store_mode: crate::runtime::decision_journal::store::StoreMode::ReadOnly,
             durable_key: false,
             recordable: false,
         };
@@ -621,7 +616,6 @@ mod tests {
             *layer.detail.get("catalog_generation").expect("snapshot field"),
             "07".repeat(32)
         );
-        assert_eq!(*layer.detail.get("store_mode").expect("snapshot field"), "read_only");
         assert_eq!(*layer.detail.get("recordable").expect("snapshot field"), false);
         assert!(layer.detail.get("admitted").is_none());
     }

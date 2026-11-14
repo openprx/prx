@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::causal_tree::decision_engine::EngineError;
-use crate::causal_tree::outcome::RecordBuildError;
 use crate::config::ConfigGeneration;
 use crate::decision_engine::state::{ObservedState, RawRoutingInput};
 use crate::providers::catalog::ReleaseCatalog;
@@ -67,12 +66,9 @@ impl SpendCeiling {
     }
 }
 
-/// Recovery inputs of a root publication: the cleanup owner, the prepared
-/// workspace key and the advisory store opened for recovery.
+/// Recovery inputs of a root publication: the cleanup owner.
 pub(crate) struct RecoveryPreparation {
     pub(crate) owner: Arc<crate::runtime::turn_cleanup::CleanupTracker>,
-    pub(crate) workspace_key: Option<Arc<DecisionKey>>,
-    pub(crate) advisory: crate::runtime::ingress_recovery::PreparedAdvisory,
 }
 
 /// Publication-scoped runtime state shared by every turn of one publication:
@@ -113,15 +109,7 @@ impl TurnRuntimeHolder {
         recovery: RecoveryPreparation,
         security: &crate::security::SecurityPolicy,
     ) -> anyhow::Result<Self> {
-        let scope = RecoveryScope::prepare(
-            generation,
-            memory,
-            surface,
-            &recovery.owner,
-            recovery.workspace_key,
-            recovery.advisory,
-        )
-        .await?;
+        let scope = RecoveryScope::prepare(generation, memory, surface, &recovery.owner).await?;
         Ok(Self::new(scope, None, &generation.effective, security))
     }
 
@@ -215,9 +203,34 @@ pub(crate) struct TurnRuntimeContext {
     pub(crate) model_catalog: Option<Arc<ReleaseCatalog>>,
     pub(crate) main_parameters: OnceLock<Capture>,
     pub(in crate::runtime) recursive_allowance: OnceLock<ContextAllowance>,
+    /// The actual execution trace of this turn, created on first binding.
+    pub(crate) execution_trace: OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
+    /// Set once at the terminal; later execution and discovery are refused.
+    pub(crate) execution_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TurnRuntimeContext {
+    /// Close execution and seal the turn's execution trace (R25 terminal row).
+    pub(crate) fn terminal_execution_trace(&self) -> crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
+        crate::runtime::turn_terminal::execution_close::terminal_execution_trace(
+            &self.execution_closed,
+            &self.discovery,
+            &self.execution_trace,
+        )
+    }
+
+    /// Canonical ids of every capability this turn could execute: the issued
+    /// references and those admitted by discovery without an approval.
+    pub(crate) fn executable_capability_ids(&self) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = self
+            .published
+            .iter()
+            .map(|reference| reference.id.as_str().to_owned())
+            .collect();
+        ids.extend(self.discovery.unprompted_ids());
+        ids
+    }
+
     /// Remaining G6 tokens: the opening slice narrowed by everything the
     /// turn's accounting scope has already charged.
     pub(crate) fn remaining_g6_tokens(&self) -> u64 {
@@ -368,16 +381,8 @@ pub(crate) enum AgentDecisionError {
     Retrieval(#[from] AgentRetrievalError),
     #[error(transparent)]
     Discovery(#[from] AgentDiscoveryError),
-    #[error(transparent)]
-    Record(#[from] RecordBuildError),
-    #[error("recordable decision store has no writer")]
-    RecordWriterUnavailable,
-    #[error("decision evidence could not be durably recorded")]
-    DecisionEvidence(#[source] anyhow::Error),
     #[error("ordinary delegation scope could not be verified")]
     DelegationScope(#[source] anyhow::Error),
-    #[error("decision event memory could not be bound to its source")]
-    EventMemory(#[source] anyhow::Error),
     #[error("durable ingress recovery is not ready")]
     IngressRecovery(#[source] anyhow::Error),
 

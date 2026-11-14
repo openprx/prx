@@ -167,14 +167,14 @@ async fn rehomed_security_items_preserve_refusal() -> anyhow::Result<()> {
         Err(TurnOriginMismatch)
     );
 
-    // Settlement: only the token holder issues a terminal link, and never
+    // Settlement: only the token holder issues a terminal binding, and never
     // for a context another publication opened.
     assert!(matches!(
-        one.service.terminal_settlement_ref(Arc::clone(two.context)),
+        one.service.terminal_binding(two.context),
         Err(crate::runtime::turn_decision::SettlementRefUnavailable)
     ));
     assert!(matches!(
-        two.service.terminal_settlement_ref(Arc::clone(one.context)),
+        two.service.terminal_binding(one.context),
         Err(crate::runtime::turn_decision::SettlementRefUnavailable)
     ));
     Ok(())

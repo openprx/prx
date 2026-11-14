@@ -706,10 +706,6 @@ pub(super) fn native_working_root_selection_sites_are_explicit() {
             "src/tools/mod.rs::default_tools_with_runtime::effective_root=1",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::effective_root=1",
             "src/tools/mod.rs::all_tools_with_runtime_ext_and_extensions::.workdir=1",
-            "src/runtime/turn_decision/owner_filesystem.rs::check_shell_path_arguments::effective_root=1",
-            "src/runtime/turn_decision/owner_filesystem.rs::check_shell_path_arguments::.workdir=1",
-            "src/runtime/turn_decision/owner_filesystem.rs::scoped_file_operation::effective_root=2",
-            "src/runtime/turn_decision/owner_filesystem.rs::scoped_file_operation::.workdir=2",
         ],
     );
 }

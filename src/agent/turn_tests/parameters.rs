@@ -165,30 +165,28 @@ async fn prepared_parameters_survive_scope_drop_without_fabricating_a_provider_o
             let scope = runtime.request_event_scope.unwrap();
             let terminal_id = scope.run_id.clone().unwrap();
             let decision = admission.decision();
-            let settlement = decision.service.terminal_settlement_ref(Arc::clone(decision.context))?;
             let binding = decision.service.terminal_binding(decision.context)?;
             let now = chrono::Utc::now();
             let draft = TurnTerminalDraft {
-                decision: Some(settlement), binding: Some(binding), terminal_id, scope, status,
+                binding: Some(binding), terminal_id, scope, status,
                 history: None, history_scope: None, provider_outcome: None,
                 telemetry: TurnTerminalTelemetry { summary: "prx prepared call interrupted".into(), started_at: now, finished_at: now },
                 delivery_intent: TurnDeliveryIntent::None,
             };
             let receipt = crate::agent::terminal::finalize_turn(&fabric, draft, &cost, workspace.path()).await?;
-            let rejoined = decision
+            decision
                 .service
                 .runtime_holder().recovery_scope()
                 .rejoin_terminal(&receipt.terminal_id, receipt.terminal_event.owner_id.as_deref().unwrap())
                 .await?;
             let events = memory.list_message_events_since(&admission.principal(), 0, 100).await?;
-            Ok::<_, anyhow::Error>((prepared, encoded.unwrap(), receipt, events, rejoined))
+            Ok::<_, anyhow::Error>((prepared, encoded.unwrap(), receipt, events))
         }).await;
         let drained = cleanup
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
-        let (prepared, body, receipt, events, rejoined) = result?;
+        let (prepared, body, receipt, events) = result?;
         drained?;
-        assert_eq!(rejoined, crate::runtime::decision_journal::store::Enqueue::Queued);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared.first().unwrap().model, "ollama/llama3.2");
         assert_eq!(body.pointer("/options/temperature"), Some(&json!(2.0)));

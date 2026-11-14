@@ -1,24 +1,19 @@
 #![cfg(test)]
 
-//! Candidate timeout diagnostics do not identify a historical failure without its error detail.
+//! Candidate timeout diagnostics (the decision-store timers went with the store, P2-G5a) do not identify a historical failure without its error detail.
 use super::*;
 use crate::skills::lifecycle::{CleanupState, RunObservation, RunReceipt, RunTerminal};
 
 #[tokio::test]
-async fn four_candidate_timers_report_their_actual_contended_failure_detail() -> Result<()> {
+async fn candidate_timers_report_their_actual_contended_failure_detail() -> Result<()> {
     let mut receipts = Vec::new();
-    for candidate in ["wal-switch", "bounded-busy", "cost-ledger", "terminal-drain"] {
+    for candidate in ["bounded-busy", "cost-ledger"] {
         let started = std::time::Instant::now();
         let detail = match candidate {
-            "wal-switch" => {
-                tokio::task::spawn_blocking(crate::runtime::decision_journal::store::timeout_probes::wal_switch)
-                    .await??
-            }
             "bounded-busy" => {
                 tokio::task::spawn_blocking(crate::runtime::sqlite_pool::probe_bounded_busy_contention).await??
             }
             "cost-ledger" => tokio::task::spawn_blocking(crate::cost::tracker::probe_ledger_lock_contention).await??,
-            "terminal-drain" => crate::runtime::decision_journal::store::timeout_probes::writer_drain().await?,
             _ => anyhow::bail!("test: unknown timer candidate"),
         };
         assert!(!detail.is_empty(), "test: candidate must retain its actual error");

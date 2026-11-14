@@ -114,11 +114,9 @@ pub(crate) enum CandidateSet {
         approval_scopes: BTreeMap<CandidateId, Vec<PendingApproval>>,
         report: ProbeReport,
     },
-    NoLegalPath {
-        /// Admitted terminal bodies retained for fresh post/pre-commit gates.
-        terminals: Vec<CausalCandidate>,
-        report: ProbeReport,
-    },
+    /// Only terminal bodies were proposed. Their probe report had one
+    /// reader, the legacy refusal classifier, deleted with terminal replay.
+    NoLegalPath,
 }
 
 #[derive(Debug, Clone)]
@@ -510,10 +508,7 @@ impl CausalCandidateGenerator {
             // be derived. CDPB-08 owns the non-executable proposal path.
             // Advisory (`legal == proposed`): reached only for structural
             // reasons, when nothing but terminals was proposed.
-            return Ok(CandidateSet::NoLegalPath {
-                terminals: legal,
-                report,
-            });
+            return Ok(CandidateSet::NoLegalPath);
         }
         let cap = policy.max_candidates;
         let mut kept = Vec::new();

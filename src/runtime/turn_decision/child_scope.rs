@@ -40,7 +40,7 @@ impl TurnDecisionService {
         context: &TurnDecisionContext,
     ) -> anyhow::Result<crate::tools::capability::child::VerifiedChildScope> {
         anyhow::ensure!(
-            !context.execution_closed.load(Ordering::Acquire)
+            !context.runtime().execution_closed.load(Ordering::Acquire)
                 && context.catalog_generation() == *self.catalog.generation(),
             "delegation scope is closed or belongs to another catalog"
         );

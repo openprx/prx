@@ -7,9 +7,7 @@ use crate::memory::ingress_recovery::{
 };
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryMacDomain, RecoveryRepository, RecoveryTag};
 use crate::memory::{Memory, MemoryVisibility, MessageEvent, MessageEventInput};
-use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,138 +18,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActivatedRepository;
 
-/// Per-scope repair counters. Instance-scoped so parallel tests cannot share counts.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct RepairSpies {
-    rejoin: std::sync::atomic::AtomicUsize,
-    child_recovery: std::sync::atomic::AtomicUsize,
-    directive_repair: std::sync::atomic::AtomicUsize,
-}
-
-#[cfg(test)]
-impl RepairSpies {
-    pub(crate) fn note_rejoin(&self) {
-        self.rejoin.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub(crate) fn note_child_recovery(&self) {
-        self.child_recovery.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub(crate) fn note_directive_repair(&self) {
-        self.directive_repair.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub(crate) fn rejoin(&self) -> usize {
-        self.rejoin.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub(crate) fn child_recovery(&self) -> usize {
-        self.child_recovery.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub(crate) fn directive_repair(&self) -> usize {
-        self.directive_repair.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// Plane-on decision evidence. Plane off never constructs this, so nothing
-/// opens `.decision_key` or `decisions.db`.
-#[derive(Clone)]
-pub(crate) struct LegacyEvidence {
-    pub(crate) key: Arc<DecisionKey>,
-    pub(crate) reader: crate::runtime::decision_journal::store::DecisionStoreReader,
-    pub(crate) writer: Option<crate::runtime::decision_journal::store::DecisionStoreWriter>,
-    pub(crate) events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
-    pub(crate) store: Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
-}
-
-/// Advisory ReadWrite store opened by a plane-on builder and passed into
-/// [`RecoveryScope::prepare`]. Recovery itself never opens ReadWrite.
-/// A store without a writer is not a valid construction: use [`Self::opened`].
-#[derive(Clone, Default)]
-pub(crate) struct PreparedAdvisory {
-    pub writer: Option<crate::runtime::decision_journal::store::DecisionStoreWriter>,
-    pub events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
-    pub store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-}
-
-impl PreparedAdvisory {
-    /// Pair the ReadWrite store with its writer. A store without a writer is refused.
-    pub(crate) fn opened(
-        store: Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
-        events: Arc<super::causal_events::DurableCausalEventSink>,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            writer: Some(store.writer().context("advisory store requires a writer")?),
-            events: Some(events),
-            store: Some(store),
-        })
-    }
-}
-
-impl LegacyEvidence {
-    pub(crate) fn owns_prepared_queues(
-        &self,
-        store: Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-        events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
-    ) -> bool {
-        store.is_some_and(|store| Arc::ptr_eq(store, &self.store))
-            && match (&self.events, events) {
-                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-                (None, None) => true,
-                _ => false,
-            }
-    }
-}
-
-/// Plane-on advisory builders open the ReadWrite store with the same ticket
-/// semantics as the former `prepare` path: `finish(result.is_ok())`.
-pub(crate) async fn open_advisory_store(
-    generation: &crate::config::ConfigGeneration,
-    memory: Arc<dyn Memory>,
-    observer: Arc<dyn crate::observability::causal_event::CausalEventSink>,
-    owner: &Arc<super::turn_cleanup::CleanupTracker>,
-) -> anyhow::Result<(
-    Arc<crate::runtime::decision_journal::store::CausalDecisionStore>,
-    Arc<super::causal_events::DurableCausalEventSink>,
-)> {
-    let config = &generation.effective;
-    let events = Arc::new(super::causal_events::DurableCausalEventSink::new(
-        generation, memory, observer,
-    )?);
-    let ticket = owner.register(tokio_util::sync::CancellationToken::new())?;
-    let prepared_events = Arc::clone(&events);
-    let store = crate::runtime::decision_journal::store_preparation::open_store(
-        config.workspace_dir.clone(),
-        crate::runtime::decision_journal::store::Retention::days(
-            config.causal_tree.store.retention_days,
-            config.self_system.fitness.retention_days,
-        ),
-        events.clone(),
-        Some(crate::runtime::decision_journal::store::StoreMode::ReadWrite),
-        move |result| {
-            ticket.retain_prepared_store(result.as_ref().ok().cloned(), Some(prepared_events));
-            ticket.finish(result.is_ok());
-        },
-    )
-    .await?;
-    if let Some(namespace) = store.workspace_id() {
-        events.bind_store_namespace(namespace)?;
-    }
-    Ok((store, events))
-}
-
-/// Recovery authentication plus optional plane-on legacy evidence.
+/// Recovery authentication: the activated repository, if any.
 #[derive(Clone)]
 pub(crate) struct RecoveryAuthority {
     pub(crate) repository: Option<ActivatedRepository>,
-    pub(crate) legacy: Option<LegacyEvidence>,
 }
 
-/// Pinned recovery authority. A decision store supplies historical evidence only;
-/// reception and interruption recovery do not require a decision service.
+/// Pinned recovery authority. Reception and interruption recovery do not
+/// require a decision service.
 #[derive(Clone)]
 pub(crate) struct RecoveryScope {
     pub(super) memory: Arc<dyn Memory>,
@@ -159,8 +33,6 @@ pub(crate) struct RecoveryScope {
     pub(super) recordable: bool,
     pub(super) surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     pub(super) authority: Arc<RecoveryAuthority>,
-    #[cfg(test)]
-    pub(crate) spies: Arc<RepairSpies>,
 }
 
 impl RecoveryScope {
@@ -174,53 +46,23 @@ impl RecoveryScope {
             workspace,
             recordable: false,
             surface,
-            authority: Arc::new(RecoveryAuthority {
-                repository: None,
-                legacy: None,
-            }),
-            #[cfg(test)]
-            spies: Arc::new(RepairSpies::default()),
+            authority: Arc::new(RecoveryAuthority { repository: None }),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn spies(&self) -> &RepairSpies {
-        &self.spies
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_store(&self) -> Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>> {
-        self.authority.legacy.as_ref().map(|legacy| &legacy.store)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_events(&self) -> Option<&Arc<super::causal_events::DurableCausalEventSink>> {
-        self.authority.legacy.as_ref().and_then(|legacy| legacy.events.as_ref())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn legacy_writer(&self) -> Option<&crate::runtime::decision_journal::store::DecisionStoreWriter> {
-        self.authority.legacy.as_ref().and_then(|legacy| legacy.writer.as_ref())
-    }
-
     /// Initialize durable recovery from pinned runtime inputs, without building
-    /// a decision engine, catalog, or execution service. The caller supplies its
-    /// single key-preparation result; missing authority never triggers a retry.
-    /// Plane-on builders pass the store they opened; this path never opens
-    /// ReadWrite and never calls [`DecisionKey::load_or_create`].
+    /// a decision engine, catalog, or execution service. Recording needs both
+    /// event recording and an activated recovery repository; without a
+    /// repository nothing is recorded or recovered.
     pub(crate) async fn prepare(
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn Memory>,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
-        workspace_key: Option<Arc<DecisionKey>>,
-        advisory: PreparedAdvisory,
     ) -> anyhow::Result<Arc<Self>> {
         let config = &generation.effective;
         let recording = config.memory.event_recording_config();
         let recording_on = recording.enabled && recording.record_user_messages;
-        let plane = config.causal_tree.enabled;
-        let ledger = crate::memory::serves_tool_execution_ledger(memory.name());
         let prepared_memory = Arc::clone(&memory);
         let repository_ready = owned_store_operation(owner, move || {
             prepared_memory.recovery_repository().map_or(Ok(false), |repository| {
@@ -232,21 +74,7 @@ impl RecoveryScope {
             })
         })
         .await?;
-        let has_repository = memory.recovery_repository().is_some();
-        let recordable = recording_on && (repository_ready || (plane && ledger && !has_repository));
-        let PreparedAdvisory { writer, events, store } = advisory;
-        let plane_on_legacy = plane && ledger && recording_on;
-        let legacy = match (plane_on_legacy, workspace_key, store) {
-            (true, Some(key), Some(store)) => Some(LegacyEvidence {
-                key,
-                reader: store.reader(),
-                writer,
-                events,
-                store,
-            }),
-            (true, _, None) => recovery_only_legacy(owner, config.workspace_dir.clone()).await?,
-            _ => None,
-        };
+        let recordable = recording_on && repository_ready;
         let scope = Arc::new(Self {
             memory,
             workspace: config.workspace_dir.clone(),
@@ -254,50 +82,11 @@ impl RecoveryScope {
             surface,
             authority: Arc::new(RecoveryAuthority {
                 repository: repository_ready.then_some(ActivatedRepository),
-                legacy,
             }),
-            #[cfg(test)]
-            spies: Arc::new(RepairSpies::default()),
         });
         owner.retain_recovery(Arc::clone(&scope))?;
         recovery_ready(Arc::clone(&scope)).await?;
         Ok(scope)
-    }
-
-    pub(super) fn owns_prepared_queues(
-        &self,
-        store: Option<&Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-        events: Option<&Arc<super::causal_events::DurableCausalEventSink>>,
-    ) -> bool {
-        self.authority
-            .legacy
-            .as_ref()
-            .is_some_and(|legacy| legacy.owns_prepared_queues(store, events))
-    }
-
-    pub(crate) async fn drain(&self, deadline: Instant) -> bool {
-        let mut drained = true;
-        let legacy = self.authority.legacy.as_ref();
-        if let Some(writer) = legacy.and_then(|legacy| legacy.writer.as_ref()) {
-            #[cfg(test)]
-            super::turn_cleanup::diagnostic::queue_presence("decision_writer_present", true);
-            let writer_drained = writer.drain(deadline).await;
-            #[cfg(test)]
-            super::turn_cleanup::diagnostic::queue("decision_writer_drained", writer_drained);
-            drained &= writer_drained;
-        }
-        #[cfg(test)]
-        super::turn_cleanup::diagnostic::queue_presence(
-            "event_queue_present",
-            legacy.is_some_and(|legacy| legacy.events.is_some()),
-        );
-        if let Some(events) = legacy.and_then(|legacy| legacy.events.as_ref()) {
-            let events_drained = events.drain(deadline).await;
-            #[cfg(test)]
-            super::turn_cleanup::diagnostic::queue("event_queue_drained", events_drained);
-            drained &= events_drained;
-        }
-        drained
     }
 
     pub(crate) fn ingress_recovery_enabled(&self) -> bool {
@@ -323,11 +112,7 @@ impl RecoveryScope {
 
     /// Reads only the pinned memory/workspace and authenticates the owner.
     /// It grants no execution authority.
-    pub(crate) async fn rejoin_terminal(
-        &self,
-        terminal_id: &str,
-        owner_id: &str,
-    ) -> anyhow::Result<crate::runtime::decision_journal::store::Enqueue> {
+    pub(crate) async fn rejoin_terminal(&self, terminal_id: &str, owner_id: &str) -> anyhow::Result<()> {
         self.rejoin_terminal_inner(terminal_id, owner_id, None).await
     }
 
@@ -336,7 +121,7 @@ impl RecoveryScope {
         capsule: &IngressCapsule,
         deadline: Instant,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
-    ) -> anyhow::Result<crate::runtime::decision_journal::store::Enqueue> {
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(
             capsule.scope.workspace_id == self.workspace.to_string_lossy(),
             "recovery service workspace differs from capsule"
@@ -364,17 +149,15 @@ pub(crate) struct IngressConflict;
 pub(crate) struct IngressRecoveryDiagnostic {
     pub(crate) run_id: String,
     pub(crate) memory_store: std::path::PathBuf,
-    pub(crate) decision_store: std::path::PathBuf,
 }
 
 impl std::fmt::Display for IngressRecoveryDiagnostic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "ingress recovery run={} memory_store={} decision_store={}",
+            "ingress recovery run={} memory_store={}",
             self.run_id,
-            self.memory_store.display(),
-            self.decision_store.display()
+            self.memory_store.display()
         )
     }
 }
@@ -395,8 +178,6 @@ pub(crate) struct IngressRecorder {
         IngressRecoveryScope,
         crate::tools::capability::turn_state::TurnSurfaceKind,
     )>,
-    /// `causal_tree.enabled` at prepare. Plane off never opens `.decision_key`.
-    plane: bool,
 }
 
 impl IngressRecorder {
@@ -409,14 +190,11 @@ impl IngressRecorder {
         if !recording.enabled || !recording.record_user_messages {
             return Ok(None);
         }
-        let plane = config.causal_tree.enabled;
-        let ledger = crate::memory::serves_tool_execution_ledger(memory.name());
-        let has_repository = memory.recovery_repository().is_some();
-        if !(has_repository || (plane && ledger)) {
+        // Repository-only recovery: without a repository nothing is recorded.
+        if memory.recovery_repository().is_none() {
             return Ok(None);
         }
         let deadline = Instant::now() + Duration::from_secs(15);
-        let workspace_path = config.workspace_dir.clone();
         let prepared_memory = Arc::clone(&memory);
         let activation = owned_store_operation(&ticket.owner(), move || {
             remaining(deadline)?;
@@ -430,10 +208,6 @@ impl IngressRecorder {
                     }
                     Err(error) => return Err(error),
                 }
-            } else if plane {
-                // Ledger backend without a repository: plane-on load-or-create only.
-                DecisionKey::load_or_create(&workspace_path)?;
-                true
             } else {
                 false
             };
@@ -462,7 +236,6 @@ impl IngressRecorder {
             warned_markers: Default::default(),
             barrier,
             source: Default::default(),
-            plane,
         })))
     }
     pub(crate) fn verify_receipt(&self, event: &MessageEvent) -> anyhow::Result<()> {
@@ -472,19 +245,14 @@ impl IngressRecorder {
     pub(crate) fn duplicate(&self) -> bool {
         self.duplicate.load(std::sync::atomic::Ordering::Acquire)
     }
-    fn input_digest(&self, input: &MessageEventInput) -> anyhow::Result<(Option<String>, String)> {
-        if let Some(repository) = self.memory.recovery_repository() {
-            input_within_bounds(input, MAX_RECOVERY_EVENT_BYTES - MAX_CAPSULE_BYTES)?;
-            let tag = repository.recovery_mac(None, RecoveryMacDomain::InputDigestV3, &serde_json::to_vec(input)?)?;
-            return Ok((Some(tag.key_id), hex::encode(tag.tag)));
-        }
-        Ok((
-            None,
-            hex::encode(self.legacy_key()?.hmac(
-                KeyDomain::IngressRecovery,
-                &[b"input-digest-v2", digest(input)?.as_bytes()],
-            )),
-        ))
+    fn input_digest(&self, input: &MessageEventInput) -> anyhow::Result<(String, String)> {
+        let repository = self
+            .memory
+            .recovery_repository()
+            .context("recovery repository unavailable")?;
+        input_within_bounds(input, MAX_RECOVERY_EVENT_BYTES - MAX_CAPSULE_BYTES)?;
+        let tag = repository.recovery_mac(None, RecoveryMacDomain::InputDigestV3, &serde_json::to_vec(input)?)?;
+        Ok((tag.key_id, hex::encode(tag.tag)))
     }
 
     fn sign(&self, capsule: &IngressCapsule) -> anyhow::Result<String> {
@@ -494,7 +262,6 @@ impl IngressRecorder {
         Ok(hex::encode(self.slot_mac(
             capsule,
             RecoveryMacDomain::CapsuleV3,
-            &[&serde_json::to_vec(&unsigned)?],
             &serde_json::to_vec(&unsigned)?,
         )?))
     }
@@ -511,28 +278,18 @@ impl IngressRecorder {
             self.verify_slot(
                 capsule,
                 RecoveryMacDomain::CapsuleV3,
-                &[&serde_json::to_vec(&unsigned)?],
                 &serde_json::to_vec(&unsigned)?,
                 &tag
             )?,
             "invalid ingress capsule authentication"
         );
         let normalized = original_input(input, capsule)?;
-        let digest_matches = if capsule.version == 1 {
-            anyhow::ensure!(
-                !self.memory.requires_scoped_execution(),
-                "legacy unkeyed ingress capsule cannot be recovered in a protected scope"
-            );
-            digest(&normalized)? == capsule.input_digest
-        } else {
-            self.verify_slot(
-                capsule,
-                RecoveryMacDomain::InputDigestV3,
-                &[b"input-digest-v2", digest(&normalized)?.as_bytes()],
-                &serde_json::to_vec(&normalized)?,
-                &hex::decode(&capsule.input_digest)?,
-            )?
-        };
+        let digest_matches = self.verify_slot(
+            capsule,
+            RecoveryMacDomain::InputDigestV3,
+            &serde_json::to_vec(&normalized)?,
+            &hex::decode(&capsule.input_digest)?,
+        )?;
         anyhow::ensure!(digest_matches, "ingress input digest differs from its capsule");
         Ok(normalized)
     }
@@ -553,16 +310,9 @@ impl IngressRecorder {
             .set(input.run_id.clone().context("durable ingress requires run identity")?);
         remaining(self.deadline)?;
         input_within_bounds(&input, MAX_RECOVERY_EVENT_BYTES - MAX_CAPSULE_BYTES)?;
-        let attempted_digest = transport_digest(&input)?;
-        // The keyed v3 preimage is the same transport tuple, serialized once.
-        let attempted_transport = if self.memory.recovery_repository().is_some() {
-            Some(crate::memory::ingress_recovery::transport_preimage(
-                &input,
-                input.raw_payload_json.as_deref(),
-            ))
-        } else {
-            None
-        };
+        // The keyed v3 preimage of the stable transport tuple, serialized once.
+        let attempted_transport =
+            crate::memory::ingress_recovery::transport_preimage(&input, input.raw_payload_json.as_deref());
         let scope = IngressRecoveryScope {
             workspace_id: input.workspace_id.clone(),
             owner_id: input.owner_id.clone().context("durable ingress owner missing")?,
@@ -582,8 +332,8 @@ impl IngressRecorder {
             self.owned_work(move |recorder| {
                 let (key_id, input_digest) = recorder.input_digest(&input)?;
                 let mut capsule = IngressCapsule {
-                    version: if key_id.is_some() { 3 } else { 2 },
-                    key_id,
+                    version: 3,
+                    key_id: Some(key_id),
                     backend_namespace: recorder.lifetime.namespace().to_owned(),
                     scope,
                     lifetime: recorder.lifetime.token().to_owned(),
@@ -598,16 +348,12 @@ impl IngressRecorder {
                 };
                 capsule.authentication = recorder.sign(&capsule)?;
                 capsule.validate_bounds()?;
-                let mut attestation = match (
-                    capsule.key_id.as_deref(),
-                    recorder.memory.recovery_repository(),
-                    &transport,
-                ) {
-                    (Some(key_id), Some(repository), Some(transport)) => Some(pending_attestation(
-                        repository, key_id, &capsule, &input, surface, transport,
-                    )?),
-                    _ => None,
-                };
+                let repository = recorder
+                    .memory
+                    .recovery_repository()
+                    .context("recovery repository unavailable")?;
+                let key_id = capsule.key_id.as_deref().context("missing recovery key id")?;
+                let mut attestation = pending_attestation(repository, key_id, &capsule, &input, surface, &transport)?;
                 #[derive(serde::Serialize)]
                 struct Payload<'a> {
                     prx_ingress_capsule: &'a IngressCapsule,
@@ -617,10 +363,8 @@ impl IngressRecorder {
                     prx_ingress_capsule: &capsule,
                     original_payload_json: input.raw_payload_json.take(),
                 })?);
-                if let Some(attestation) = attestation.as_mut().filter(|attestation| !attestation.is_verified()) {
-                    if let Some(repository) = recorder.memory.recovery_repository() {
-                        crate::memory::ingress_recovery::verify_transport(repository, &input, &capsule, attestation)?;
-                    }
+                if !attestation.is_verified() {
+                    crate::memory::ingress_recovery::verify_transport(repository, &input, &capsule, &mut attestation)?;
                 }
                 Ok((input, capsule, attestation))
             })
@@ -633,7 +377,7 @@ impl IngressRecorder {
                 capsule.clone(),
                 self.lifetime.clone(),
                 self.deadline,
-                attestation,
+                Some(attestation),
             )
             .await?
         {
@@ -655,13 +399,13 @@ impl IngressRecorder {
                 // A transport retry may have a fresh run UUID. Authenticate the
                 // OLD capsule first; compare stable transport content separately.
                 let old = capsule_from_event(&event)?;
-                let previous = {
+                {
                     let old = old.clone();
                     let event = event.clone();
-                    self.owned_work(move |recorder| recorder.verify(&old, &event)).await?
-                };
-                self.check_retry(&old, &previous, &attempted_digest, attempted_transport.as_deref())
-                    .await?;
+                    self.owned_work(move |recorder| recorder.verify(&old, &event).map(|_| ()))
+                        .await?;
+                }
+                self.check_retry(&old, &attempted_transport).await?;
                 Err(AlreadyAccepted.into())
             }
             IngressAppendOutcome::Tombstoned => {
@@ -673,18 +417,11 @@ impl IngressRecorder {
         }
     }
 
-    /// Compare a retry's stable transport content with the accepted input. A v3
-    /// capsule is compared through its authenticated attestation and the
-    /// repository's keyed transport tag; an earlier capsule keeps the digest
-    /// compare. Neither outcome executes anything.
-    async fn check_retry(
-        &self,
-        old: &IngressCapsule,
-        previous: &MessageEventInput,
-        attempted_digest: &str,
-        attempted_transport: Option<&[u8]>,
-    ) -> anyhow::Result<()> {
-        if old.version == 3 {
+    /// Compare a retry's stable transport content with the accepted v3 input
+    /// through its authenticated attestation and the repository's keyed
+    /// transport tag. Neither outcome executes anything.
+    async fn check_retry(&self, old: &IngressCapsule, attempted_transport: &[u8]) -> anyhow::Result<()> {
+        {
             let chain = RecoveryChain {
                 workspace_id: old.scope.workspace_id.clone(),
                 owner_id: old.scope.owner_id.clone(),
@@ -693,7 +430,7 @@ impl IngressRecorder {
             };
             let memory = Arc::clone(&self.memory);
             let old = old.clone();
-            let attempted = attempted_transport.map(<[u8]>::to_vec);
+            let attempted = attempted_transport.to_vec();
             return owned_store_read(&self.owner, move || {
                 let receipt = memory
                     .recovery_repository()
@@ -713,8 +450,7 @@ impl IngressRecorder {
                 let repository = memory
                     .recovery_repository()
                     .context("recovery repository unavailable")?;
-                let attempted = attempted.as_deref().context("transport content unavailable")?;
-                match repository.verify_recovery_mac(&tag, RecoveryMacDomain::TransportV3, attempted) {
+                match repository.verify_recovery_mac(&tag, RecoveryMacDomain::TransportV3, &attempted) {
                     Ok(()) => Ok(()),
                     // An unusable key is not a conflict: surface it unchanged.
                     Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
@@ -722,11 +458,6 @@ impl IngressRecorder {
                 }
             })
             .await;
-        }
-        if transport_digest(previous)? == attempted_digest {
-            Ok(())
-        } else {
-            Err(IngressConflict.into())
         }
     }
     async fn recover(
@@ -853,17 +584,10 @@ impl IngressRecorder {
                     }
                     .into();
                     let state_bytes = serde_json::to_vec(&(state_label, &capsule))?;
-                    let capsule_bytes = serde_json::to_vec(&capsule)?;
-                    let state_owned = state_label.to_owned();
                     let capsule_for_mac = capsule.clone();
                     let authentication = hex::encode(
                         self.owned_work(move |recorder| {
-                            recorder.slot_mac(
-                                &capsule_for_mac,
-                                RecoveryMacDomain::StateV3,
-                                &[b"recovery-state", state_owned.as_bytes(), &capsule_bytes],
-                                &state_bytes,
-                            )
+                            recorder.slot_mac(&capsule_for_mac, RecoveryMacDomain::StateV3, &state_bytes)
                         })
                         .await?,
                     );
@@ -959,7 +683,6 @@ impl IngressRecorder {
         IngressRecoveryDiagnostic {
             run_id: run.to_owned(),
             memory_store: self.workspace.join("memory/brain.db"),
-            decision_store: crate::runtime::decision_journal::store::db_path(&self.workspace),
         }
     }
 
@@ -967,7 +690,6 @@ impl IngressRecorder {
         let tag = self.slot_mac(
             capsule,
             RecoveryMacDomain::QuarantineKeyV3,
-            &[b"quarantine-key-v1", &serde_json::to_vec(capsule)?],
             &serde_json::to_vec(capsule)?,
         )?;
         Ok(format!("{}:{}", Self::quarantine_key(capsule), hex::encode(tag)))
@@ -1001,7 +723,6 @@ impl IngressRecorder {
             && self.verify_slot(
                 capsule,
                 RecoveryMacDomain::QuarantineV3,
-                &[b"quarantine-v1", &serde_json::to_vec(&payload)?],
                 &serde_json::to_vec(&payload)?,
                 &tag,
             )?)
@@ -1037,7 +758,6 @@ impl IngressRecorder {
                     tracing::warn!(run_id = %capsule.run_id,
                         marker_id = %event.event_id,
                         brain_db = %self.workspace.join("memory/brain.db").display(),
-                        decisions_db = %crate::runtime::decision_journal::store::db_path(&self.workspace).display(),
                         "ignored unauthenticated ingress quarantine marker; recovery will proceed; remove the unauthenticated marker row or rerun ingress recovery");
                 }
             }
@@ -1074,12 +794,7 @@ impl IngressRecorder {
         let capsule_for_mac = capsule.clone();
         let authentication = hex::encode(
             self.owned_work(move |recorder| {
-                recorder.slot_mac(
-                    &capsule_for_mac,
-                    RecoveryMacDomain::QuarantineV3,
-                    &[b"quarantine-v1", &payload_bytes],
-                    &payload_bytes,
-                )
+                recorder.slot_mac(&capsule_for_mac, RecoveryMacDomain::QuarantineV3, &payload_bytes)
             })
             .await?,
         );
@@ -1132,7 +847,6 @@ impl IngressRecorder {
         );
         tracing::error!(reason, run_id = %capsule.run_id,
             brain_db = %self.workspace.join("memory/brain.db").display(),
-            decisions_db = %crate::runtime::decision_journal::store::db_path(&self.workspace).display(),
             "quarantined unverifiable ingress record; startup recovery will continue");
         Ok(())
     }
@@ -1153,28 +867,6 @@ fn unverifiable_ingress(error: &anyhow::Error) -> Option<&'static str> {
         let text = cause.to_string();
         REASONS.iter().copied().find(|reason| text == *reason)
     })
-}
-
-fn digest_value(value: &impl serde::Serialize) -> anyhow::Result<String> {
-    struct DigestWriter(Sha256);
-    impl std::io::Write for DigestWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut writer = DigestWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, value)?;
-    Ok(hex::encode(writer.0.finalize()))
-}
-fn digest(input: &MessageEventInput) -> anyhow::Result<String> {
-    digest_value(input)
-}
-fn transport_digest(input: &MessageEventInput) -> anyhow::Result<String> {
-    digest_value(&transport_view(input))
 }
 
 /// The v3 attestation for a new input: the keyed transport and stable-key tags
@@ -1222,41 +914,6 @@ fn pending_attestation(
     ))
 }
 
-fn transport_view(input: &MessageEventInput) -> impl serde::Serialize {
-    // Local retry run and config generation may change; creator/lease and
-    // transport attribution never do. Hash borrowed fields without cloning.
-    (
-        &input.workspace_id,
-        &input.owner_id,
-        &input.source,
-        &input.channel,
-        &input.session_key,
-        (
-            &input.parent_session_key,
-            &input.parent_run_id,
-            &input.agent_id,
-            &input.persona_id,
-            &input.sender,
-            &input.recipient,
-        ),
-        (
-            &input.role,
-            &input.event_type,
-            &input.subject,
-            &input.goal_id,
-            &input.causation_event_id,
-            &input.correlation_id,
-        ),
-        (
-            &input.attempt_id,
-            &input.lease_epoch,
-            &input.content,
-            &input.raw_payload_json,
-            &input.visibility,
-            &input.idempotency_key,
-        ),
-    )
-}
 fn capsule_from_event(event: &MessageEvent) -> anyhow::Result<IngressCapsule> {
     let raw = event
         .raw_payload_json
@@ -1301,38 +958,6 @@ fn original_input(event: &MessageEvent, capsule: &IngressCapsule) -> anyhow::Res
         .context("original ingress payload missing")?
         .clone();
     Ok(serde_json::from_value(value)?)
-}
-
-/// Recovery-only path: load an existing key and a read-only store. Missing
-/// key or database leaves legacy unconfirmed. Never creates a key or opens
-/// ReadWrite.
-async fn recovery_only_legacy(
-    owner: &Arc<super::turn_cleanup::CleanupTracker>,
-    workspace: std::path::PathBuf,
-) -> anyhow::Result<Option<LegacyEvidence>> {
-    owned_store_operation(owner, move || recovery_only_legacy_sync(&workspace)).await
-}
-
-fn recovery_only_legacy_sync(workspace: &std::path::Path) -> anyhow::Result<Option<LegacyEvidence>> {
-    let key = match DecisionKey::load_existing(workspace) {
-        Ok(key) => key,
-        Err(error) => {
-            tracing::warn!("recovery legacy key unavailable: {error}");
-            return Ok(None);
-        }
-    };
-    let Some(store) = crate::runtime::decision_journal::store::CausalDecisionStore::open_recovery_read_only(workspace)?
-    else {
-        return Ok(None);
-    };
-    let store = Arc::new(store);
-    Ok(Some(LegacyEvidence {
-        key,
-        reader: store.reader(),
-        writer: None,
-        events: None,
-        store,
-    }))
 }
 
 /// Blocking operations remain registered until the actual closure exits.
@@ -1410,86 +1035,7 @@ pub(crate) async fn recovery_ready(recovery: Arc<RecoveryScope>) -> anyhow::Resu
 /// Called after real publication and again before source-bound admission, so a
 /// cold startup can consume final evidence that pre-proof reception could not.
 pub(crate) async fn service_ready(service: &super::turn_decision::TurnDecisionService) -> anyhow::Result<()> {
-    recovery_ready(service.runtime_holder().recovery_scope()).await?;
-    if !service.runtime_holder().recovery_scope().ingress_recovery_enabled() {
-        return Ok(());
-    }
-    let active = {
-        let mut registry = recorders().lock();
-        registry.retain(|item| item.strong_count() > 0);
-        registry.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    for recorder in active {
-        let Some((scope, surface)) = recorder.source.get() else {
-            continue;
-        };
-        if service.runtime_holder().recovery_scope().accepts_ingress_recovery(
-            &recorder.memory,
-            &scope.workspace_id,
-            *surface,
-        ) {
-            let service = {
-                let mut registry = services().lock();
-                registry.retain(|item| item.strong_count() > 0);
-                registry
-                    .iter()
-                    .filter_map(std::sync::Weak::upgrade)
-                    .find(|issued| std::ptr::eq(issued.as_ref(), service))
-                    .context("ingress recovery requires the published service owner")?
-            };
-            let scope = scope.clone();
-            let ownership = recorder.owner.register(tokio_util::sync::CancellationToken::new())?;
-            let (sent, received) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                let result = async {
-                    // Historical child repair is independent of the ordinary
-                    // ingress capsule state; its report cannot mark that input
-                    // reconciled or authorize execution of a child again.
-                    let report = service
-                        .reconcile_child_telemetry(&scope, &recorder.lifetime, &recorder.owner, deadline)
-                        .await?;
-                    tracing::debug!(
-                        scanned = report.scanned,
-                        repaired = report.repaired,
-                        already_recorded = report.already_recorded,
-                        unconfirmed = report.unconfirmed,
-                        no_final = report.no_final,
-                        other_verified_authority = report.other_verified_authority,
-                        deadline_reached = report.deadline_reached,
-                        wrapped = report.wrapped,
-                        scan_unavailable = report.scan_unavailable,
-                        deferred = report.deferred,
-                        "retained child telemetry reconciliation slice"
-                    );
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
-                ownership.finish(result.is_ok());
-                let _ = sent.send(result);
-            });
-            received
-                .await
-                .context("ingress recovery worker ended without a receipt")??;
-        }
-    }
-    Ok(())
-}
-fn services() -> &'static parking_lot::Mutex<Vec<std::sync::Weak<super::turn_decision::TurnDecisionService>>> {
-    static SERVICES: std::sync::OnceLock<
-        parking_lot::Mutex<Vec<std::sync::Weak<super::turn_decision::TurnDecisionService>>>,
-    > = std::sync::OnceLock::new();
-    SERVICES.get_or_init(Default::default)
-}
-pub(crate) fn register_service(service: &Arc<super::turn_decision::TurnDecisionService>) -> anyhow::Result<()> {
-    if !service.runtime_holder().recovery_scope().ingress_recovery_enabled() {
-        return Ok(());
-    }
-    let mut registry = services().lock();
-    registry.retain(|item| item.strong_count() > 0);
-    anyhow::ensure!(registry.len() < 128, "published recovery service capacity exhausted");
-    registry.push(Arc::downgrade(service));
-    Ok(())
+    recovery_ready(service.runtime_holder().recovery_scope()).await
 }
 
 fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<tokio::sync::Mutex<()>>> {
@@ -1513,26 +1059,10 @@ fn recovery_gate(lifetime: &Arc<dyn IngressLifetime>) -> anyhow::Result<Arc<toki
     Ok(gate)
 }
 
-/// Cleanup transfers temporary construction ownership to the published
-/// service under its existing retention lock, matching both actual queues.
-pub(crate) fn owns_prepared_queues(
-    service: &crate::runtime::turn_decision::TurnDecisionService,
-    store: Option<&std::sync::Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-    events: Option<&std::sync::Arc<crate::runtime::causal_events::DurableCausalEventSink>>,
-) -> bool {
-    store.is_some_and(|store| std::sync::Arc::ptr_eq(store, &service.store))
-        && match (service.durable_events.as_ref(), events) {
-            (Some(published), Some(prepared)) => std::sync::Arc::ptr_eq(published, prepared),
-            (None, None) => true,
-            _ => false,
-        }
-}
-
 #[cfg(test)]
 mod tests;
 
 mod authority;
-pub(crate) mod child_telemetry;
 pub(crate) mod status;
 pub(crate) use authority::{LegacyUnconfirmed, SettledTerminalFacts, SkillObservation};
 

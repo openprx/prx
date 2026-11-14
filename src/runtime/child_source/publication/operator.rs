@@ -238,7 +238,6 @@ impl OperatorChildPublication {
                     events: Arc::clone(&parent.events),
                 },
             )?,
-            child_recovery: Default::default(),
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
@@ -262,8 +261,6 @@ impl OperatorChildPublication {
             execution,
             memory: Arc::clone(&parent.memory),
             security: Arc::clone(&parent.security),
-            store: Arc::clone(&parent.store),
-            durable_events: parent.durable_events.clone(),
         });
         service.resolve_agent_model(task.as_ref())?;
         task.verify()?;

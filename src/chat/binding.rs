@@ -14,9 +14,6 @@ use std::sync::Arc;
 pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::Error {
     let cause = safe_persistence_cause(error);
     let diagnostic = error.downcast_ref::<crate::runtime::ingress_recovery::IngressRecoveryDiagnostic>();
-    let decision_store = diagnostic
-        .and_then(|context| context.decision_store.file_name())
-        .and_then(std::ffi::OsStr::to_str);
     let run_id = diagnostic.map(|context| {
         let run = context.run_id.as_str();
         if persistence_cause_is_public(run) {
@@ -26,12 +23,9 @@ pub(super) fn chat_input_persistence_failure(error: &anyhow::Error) -> anyhow::E
         }
     });
     let detail = crate::security::redaction::redact_provider_text(&format!("{error:#}"));
-    tracing::error!(store = "brain.db", decision_store, run_id, error = %detail, cause = %cause,
+    tracing::error!(store = "brain.db", run_id, error = %detail, cause = %cause,
         "chat input persistence failed; restart to retry ingress recovery");
-    let identifiers = match (decision_store, run_id) {
-        (Some(store), Some(run)) => format!("; decision_store={store}; run_id={run}"),
-        _ => String::new(),
-    };
+    let identifiers = run_id.map(|run| format!("; run_id={run}")).unwrap_or_default();
     anyhow::anyhow!(
         "chat input persistence failed (brain.db{identifiers}): {cause}. Restart to retry ingress recovery; if it persists, inspect the store error in chat.log."
     )
@@ -765,22 +759,6 @@ impl ChatTurnBinding {
         Ok(())
     }
 
-    pub(super) fn settlement_ref(
-        &self,
-        terminal_id: &str,
-    ) -> anyhow::Result<Option<crate::agent::terminal::DecisionSettlementRef>> {
-        let Some(decided) = self.decision.get() else {
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            self.envelope.run_id.as_deref() == Some(terminal_id),
-            "chat terminal id differs from its source"
-        );
-        Ok(Some(
-            decided.service.terminal_settlement_ref(Arc::clone(&decided.context))?,
-        ))
-    }
-
     pub(super) fn terminal_binding(
         &self,
         terminal_id: &str,
@@ -793,24 +771,6 @@ impl ChatTurnBinding {
             "chat terminal id differs from its source"
         );
         Ok(Some(decided.service.terminal_binding(&decided.context)?))
-    }
-
-    pub(super) async fn rejoin_recovery_terminal(&self, terminal_id: &str) -> anyhow::Result<()> {
-        if let Some(decided) = self.decision.get() {
-            anyhow::ensure!(
-                self.envelope.run_id.as_deref() == Some(terminal_id),
-                "chat terminal id differs from its source"
-            );
-            if self.settlement_ref(terminal_id)?.is_some_and(|link| link.is_recorded()) {
-                decided
-                    .service
-                    .runtime_holder()
-                    .recovery_scope()
-                    .rejoin_terminal(terminal_id, &self.owner_id)
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     /// Queue consumption may not replace the immutable admission mode.

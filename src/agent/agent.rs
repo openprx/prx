@@ -1923,24 +1923,6 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store =
-            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
-        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
-        let store_id = store.workspace_id().unwrap();
-        let replay = crate::agent::terminal::verify_terminal_replay(
-            agent.memory.as_ref(),
-            &store.reader(),
-            &key,
-            &store_id,
-            &terminal.workspace_id,
-            terminal.owner_id.as_deref().unwrap(),
-            terminal.run_id.as_deref().unwrap(),
-            terminal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(replay.source().event_id, inputs[0].event_id);
-        assert_eq!(replay.assistant().unwrap().content, "done");
         // Causal Router consumption is evidenced by its durable terminal receipt.
         let consumed = crate::memory::sqlite::fixture_readback::router_consumption_count(
             workspace.path(),
@@ -2134,24 +2116,6 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store =
-            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
-        let key = crate::security::runtime_key::DecisionKey::load_existing(workspace.path()).unwrap();
-        let store_id = store.workspace_id().unwrap();
-        let replay = crate::agent::terminal::verify_terminal_replay(
-            agent.memory.as_ref(),
-            &store.reader(),
-            &key,
-            &store_id,
-            &terminal.workspace_id,
-            terminal.owner_id.as_deref().unwrap(),
-            terminal.run_id.as_deref().unwrap(),
-            terminal,
-        )
-        .await
-        .unwrap();
-        assert_eq!(replay.source().event_id, inputs[0].event_id);
-        assert_eq!(replay.assistant().unwrap().content, "hello");
     }
 
     // Fixture-only authority is pinned into an owned runtime configuration.
@@ -2762,7 +2726,8 @@ mod tests {
         assert_eq!(assistant.content, "done");
         assert_eq!(assistant.owner_id, terminal.owner_id);
         assert_eq!(assistant.session_key, terminal.session_key);
-        let decision_id = payload.get("decision_id").and_then(serde_json::Value::as_str).unwrap();
+        // Terminals carry no decision record after the decision store was deleted (P2-G5a).
+        assert!(payload.get("decision_id").is_none_or(serde_json::Value::is_null));
         let outcome: crate::llm::route_decision::ProviderExecutionOutcome =
             serde_json::from_value(payload.get("provider_outcome").unwrap().clone()).unwrap();
         assert_eq!(outcome.final_provider, "ollama");
@@ -2775,45 +2740,6 @@ mod tests {
             outcome.attempts[0].status,
             crate::llm::route_decision::AttemptStatus::Success
         );
-        let store =
-            crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace.path());
-        let reader = store.reader();
-        let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
-            workspace_id: store.workspace_id().unwrap(),
-            owner_id: Arc::from(terminal.owner_id.as_deref().unwrap()),
-        };
-        let answer = reader
-            .replay_record(
-                &scope,
-                &crate::security::decision_id::DecisionId::parse(decision_id).unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        // Prediction-free opening (R9): the turn's one decision row is the
-        // Answer; no predicted retrieval precedes it. Recall ran on the turn
-        // path itself (the formatter count above).
-        assert_eq!(answer.decision.directive_kind, "answer");
-        assert!(answer.decision.enabled_snapshot);
-        assert!(
-            answer.decision.prior_decision_id.is_none(),
-            "no predicted retrieval precedes the Answer"
-        );
-        assert_eq!(
-            answer.decision.session_key.as_deref(),
-            Some(terminal.session_key.as_deref().unwrap())
-        );
-        assert_eq!(answer.source_event_id.as_deref(), Some(inputs[0].event_id.as_str()));
-        assert_eq!(answer.decision.run_id, terminal.run_id);
-        // Replay records deliberately exclude appended outcomes; read those
-        // through the same canonical owner scope and actual decision identity.
-        let settled = reader.get(&scope, &answer.decision.decision_id).unwrap().unwrap();
-        assert_eq!(settled.decision_id, answer.decision.decision_id);
-        let matched = settled
-            .outcomes
-            .iter()
-            .filter(|outcome| outcome.executed_action.as_deref() == Some("answer"))
-            .count();
-        assert_eq!(matched, 1);
     }
 
     #[tokio::test]

@@ -110,19 +110,11 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
     }
 
     fn execution_closed(&self) -> &Arc<std::sync::atomic::AtomicBool> {
-        &self.context.execution_closed
+        &self.context.runtime().execution_closed
     }
 
     fn discovery(&self) -> &DiscoveryState {
         &self.context.runtime().discovery
-    }
-}
-
-impl TurnDecisionContext {
-    /// Terminal evidence only; callers must not treat these retained refs as
-    /// authority after execution_closed. Live consumers recheck every offer.
-    pub(crate) fn discovered_execution_refs(&self) -> Vec<CapabilityRef> {
-        self.runtime().discovery.executable_refs()
     }
 }
 

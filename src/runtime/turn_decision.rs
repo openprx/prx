@@ -22,15 +22,12 @@ pub(crate) mod selected_loader_fixture;
 
 mod issued;
 mod opening;
-pub(in crate::runtime) mod store_preparation;
 
-use super::turn_publication::{PublicationBuildError, PublicationLoopRuntime};
+use super::turn_publication::PublicationLoopRuntime;
 #[cfg(test)]
 use super::turn_publication::{PublicationInputs, build_publication};
 
 mod call_approval;
-#[cfg(test)]
-pub(crate) use crate::runtime::ingress_recovery::child_telemetry::child_recovery_gate;
 mod child_scope;
 mod discovery;
 mod execution;
@@ -57,7 +54,6 @@ use crate::runtime::turn_context::{
 };
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 
-use crate::causal_tree::outcome::DecisionRecordBuilder;
 use crate::config::ConfigGeneration;
 use crate::decision_engine::prediction::factory::DecisionBackendFactory;
 #[cfg(test)]
@@ -66,9 +62,6 @@ use crate::decision_engine::state::{CausalState, DerivedState, HopLineage, RawRo
 use crate::memory::Memory;
 use crate::observability::causal_event::CausalEventSink;
 use crate::providers::catalog::{CatalogView as ProviderCatalogView, ResolvedModel};
-use crate::runtime::decision_journal::store::{CausalDecisionStore, Retention, StoreMode};
-#[cfg(test)]
-use crate::runtime::decision_journal::store::{DecisionScope, Enqueue};
 use crate::security::SecurityPolicy;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
@@ -88,7 +81,6 @@ pub(crate) struct TurnDecisionService {
     /// child funding, spend inputs) shared with every opened turn.
     pub(in crate::runtime) runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
     pub(in crate::runtime) advisory: crate::runtime::decision_advisory::DecisionAdvisory,
-    pub(in crate::runtime) child_recovery: crate::runtime::ingress_recovery::child_telemetry::ChildRecoveryState,
     pub(in crate::runtime) memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
     pub(in crate::runtime) loop_runtime: Option<PublicationLoopRuntime>,
     pub(in crate::runtime) publication_policy: SurfacePolicy,
@@ -114,8 +106,6 @@ pub(crate) struct TurnDecisionService {
     pub(in crate::runtime) execution: Arc<ToolExecutionService>,
     pub(in crate::runtime) memory: Arc<dyn Memory>,
     pub(in crate::runtime) security: Arc<SecurityPolicy>,
-    pub(in crate::runtime) store: Arc<CausalDecisionStore>,
-    pub(in crate::runtime) durable_events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 impl TurnDecisionService {
@@ -253,8 +243,7 @@ impl TurnDecisionService {
 
     /// Report queue acknowledgement to owners that must reject an incomplete exit.
     pub(crate) async fn drain_writes(&self, deadline: Instant) -> bool {
-        let decision_drained = self.drain_decision_work(deadline).await;
-        self.runtime.recovery_scope().drain(deadline).await && decision_drained
+        self.drain_decision_work(deadline).await
     }
 }
 
@@ -418,23 +407,14 @@ pub(crate) enum AgentDecisionBudgetError {
 /// The immutable result of one source-bound decision chain. Only the service
 /// constructs it; later record and execution streams consume these facts.
 pub(crate) struct TurnDecisionContext {
-    _event_memory: Arc<super::causal_events::routes::EventMemory>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
     /// The execution-owned runtime context of this turn (R60).
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     source_actor: (Arc<str>, Arc<str>),
     pub(in crate::runtime) service_id: uuid::Uuid,
-    pub(in crate::runtime) record_admitted: AtomicBool,
-    pub(in crate::runtime) execution_trace:
-        std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
-    pub(in crate::runtime) execution_closed: Arc<AtomicBool>,
 
     pub(in crate::runtime) engine: EngineDecision,
-    /// Completed dependent hops retained for the recorder. Nothing is
-    /// written until the whole chain returns successfully.
-    prior_hops: Vec<EngineDecision>,
     main_compaction: crate::config::AgentCompactionConfig,
-    hop_ids: Vec<DecisionId>,
 }
 
 impl TurnDecisionContext {
@@ -445,21 +425,9 @@ impl TurnDecisionContext {
         channel == Some(self.source_actor.0.as_ref()) && sender == Some(self.source_actor.1.as_ref())
     }
 
-    pub(crate) fn validate_silent_terminal(
-        &self,
-        status: crate::agent::terminal::TurnTerminalStatus,
-        outcome: Option<&crate::llm::route_decision::ProviderExecutionOutcome>,
-    ) -> anyhow::Result<()> {
-        crate::agent::terminal::binding::validate_silent_terminal(self.execution_trace.get(), status, outcome)
-    }
-
-    /// Delegates to the R25 owner in `runtime::turn_terminal::execution_close` (until Part 2).
+    /// Delegates to the R25 owner on the turn runtime context.
     pub(crate) fn terminal_execution_trace(&self) -> crate::tools::capability::execution_trace::ExecutionTraceSnapshot {
-        crate::runtime::turn_terminal::execution_close::terminal_execution_trace(
-            &self.execution_closed,
-            &self.runtime.discovery,
-            &self.execution_trace,
-        )
+        self.runtime.terminal_execution_trace()
     }
 
     #[cfg(test)]
@@ -475,30 +443,6 @@ impl TurnDecisionContext {
         self.engine.decision_id
     }
 
-    pub(crate) fn hop_ids(&self) -> &[DecisionId] {
-        &self.hop_ids
-    }
-
-    /// The complete bounded chain in decision order. CDP-22 consumes this
-    /// only after a successful service return, so cancellation drops it.
-    pub(crate) fn audit_hops(&self) -> impl Iterator<Item = &EngineDecision> {
-        self.prior_hops.iter().chain(std::iter::once(&self.engine))
-    }
-
-    /// The only actions CDP-22 can classify from the terminal receipt alone.
-    /// Tool and child actions need their execution trace before settlement.
-    pub(crate) const fn terminal_outcome_target(&self) -> Option<&'static str> {
-        let crate::causal_tree::decision_select::Selection::Commit { candidate_id, .. } = &self.engine.selection;
-        Some(candidate_id.target().as_str())
-    }
-
-    pub(crate) const fn terminal_outcome_action(&self) -> Option<crate::tools::capability::contract::CausalActionKind> {
-        use crate::tools::capability::contract::CausalActionKind;
-        // Every turn opens through the prediction-free path (R9): the
-        // committed selection is always the answer candidate.
-        Some(CausalActionKind::Answer)
-    }
-
     pub(crate) const fn catalog_generation(&self) -> CatalogGeneration {
         self.engine.state.trusted.parts().catalog_generation
     }
@@ -512,39 +456,8 @@ impl TurnDecisionContext {
         &self.runtime.published
     }
 
-    /// Canonical ids of every capability this turn could execute: the issued
-    /// references and those admitted by discovery without an approval.
-    /// Read-only; the skill lifecycle uses it to tell a skipped tool from one
-    /// that was never there.
-    pub(crate) fn executable_capability_ids(&self) -> BTreeSet<String> {
-        let mut ids: BTreeSet<String> = self
-            .runtime
-            .published
-            .iter()
-            .map(|reference| reference.id.as_str().to_owned())
-            .collect();
-        ids.extend(self.runtime.discovery.unprompted_ids());
-        ids
-    }
-
     pub(crate) fn is_run(&self) -> bool {
         crate::runtime::decision_accounting::is_run(self)
-    }
-}
-
-/// Delegation to the R25 owner in `runtime::ingress_recovery` (until Part 2).
-impl TurnDecisionService {
-    pub(crate) async fn reconcile_child_telemetry(
-        &self,
-        scope: &crate::memory::ingress_recovery::IngressRecoveryScope,
-        lifetime: &Arc<dyn crate::memory::ingress_recovery::IngressLifetime>,
-        owner: &Arc<crate::runtime::turn_cleanup::CleanupTracker>,
-        deadline: Instant,
-    ) -> anyhow::Result<crate::runtime::ingress_recovery::child_telemetry::ChildRecoveryReport> {
-        crate::runtime::ingress_recovery::child_telemetry::reconcile_child_telemetry(
-            self, scope, lifetime, owner, deadline,
-        )
-        .await
     }
 }
 
@@ -612,16 +525,6 @@ impl TurnDecisionContext {
 }
 
 impl TurnDecisionService {
-    /// Disabled decisions still constrain execution, but cannot authorize a
-    /// decision-store write. Enabled decisions retain strict receipt checks.
-    /// Body in `runtime::turn_terminal::settlement` (R25); delegates until Part 2.
-    pub(crate) fn terminal_settlement_ref(
-        &self,
-        context: Arc<TurnDecisionContext>,
-    ) -> Result<crate::agent::terminal::DecisionSettlementRef, SettlementRefUnavailable> {
-        super::turn_terminal::settlement::terminal_settlement_ref(self, context)
-    }
-
     /// The execution-owned terminal binding of a turn this service opened
     /// (R29). Body in `runtime::turn_terminal::settlement`.
     pub(crate) fn terminal_binding(
@@ -648,7 +551,7 @@ impl TurnDecisionService {
     }
 
     #[cfg(test)]
-    pub(crate) async fn rejoin_terminal(&self, terminal_id: &str, owner_id: &str) -> anyhow::Result<Enqueue> {
+    pub(crate) async fn rejoin_terminal(&self, terminal_id: &str, owner_id: &str) -> anyhow::Result<()> {
         self.runtime
             .recovery_scope()
             .rejoin_terminal(terminal_id, owner_id)
@@ -660,7 +563,6 @@ impl TurnDecisionService {
             self.factory.status(),
             crate::runtime::ingress_recovery::status::JournalAttachment {
                 catalog_generation: *self.catalog.generation(),
-                store_mode: self.store.mode(),
                 durable_key: self.durable_key,
                 recordable: self.recordable,
             },
@@ -706,19 +608,6 @@ impl TurnDecisionService {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
         }
-        let event_namespace = self
-            .store
-            .workspace_id()
-            .unwrap_or_else(|| Arc::from(self.generation.effective.workspace_dir.to_string_lossy().as_ref()));
-        let event_memory = super::causal_events::routes::register(
-            &event_namespace,
-            proof.workspace_id(),
-            proof.run_id(),
-            Arc::clone(&self.memory),
-            self.generation.id.0,
-            &self.generation.source_revision.fingerprint_sha256,
-        )
-        .map_err(AgentDecisionError::EventMemory)?;
         let model = self.resolve_agent_model(proof)?;
         super::ingress_recovery::service_ready(self)
             .await
@@ -898,19 +787,15 @@ impl TurnDecisionService {
             model_catalog: self.provider_catalog.release_pin(),
             main_parameters: std::sync::OnceLock::new(),
             recursive_allowance: self.runtime.recursive_allowances().retain(proof),
+            execution_trace: std::sync::OnceLock::new(),
+            execution_closed: Arc::new(AtomicBool::new(false)),
         });
         Ok(Arc::new(TurnDecisionContext {
-            _event_memory: event_memory,
             runtime,
             owner_filesystem,
             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
             service_id: self.service_id,
-            record_admitted: AtomicBool::new(false),
-            execution_trace: std::sync::OnceLock::new(),
-            execution_closed: Arc::new(AtomicBool::new(false)),
             engine,
-            hop_ids: vec![decision_id],
-            prior_hops: Vec::new(),
             main_compaction: budget.main_compaction,
         }))
     }

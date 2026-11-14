@@ -45,15 +45,8 @@ struct State {
     pending: BTreeMap<u64, CancellationToken>,
     services: Vec<Arc<TurnDecisionService>>,
     recovery_scopes: Vec<Arc<super::ingress_recovery::RecoveryScope>>,
-    prepared_stores: Vec<PreparedStoreQueues>,
     ingress_monitors: Vec<IngressMonitor>,
     ingress_lifetimes: BTreeMap<String, Arc<dyn crate::memory::ingress_recovery::IngressLifetime>>,
-}
-
-#[derive(Clone)]
-struct PreparedStoreQueues {
-    store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-    events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
 }
 
 struct IngressMonitor(tokio::task::JoinHandle<()>);
@@ -139,9 +132,6 @@ impl CleanupTracker {
     }
 
     fn retain_recovery_locked(state: &mut State, recovery: Arc<super::ingress_recovery::RecoveryScope>) {
-        state
-            .prepared_stores
-            .retain(|prepared| !recovery.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
         if !state
             .recovery_scopes
             .iter()
@@ -153,9 +143,6 @@ impl CleanupTracker {
 
     pub(crate) fn retain_service(&self, service: Arc<TurnDecisionService>) {
         let mut state = self.state.lock();
-        state
-            .prepared_stores
-            .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
         Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
         if service.has_decision_work() {
             state.services.push(service);
@@ -170,9 +157,6 @@ impl CleanupTracker {
             !state.closed && !state.failed,
             "child decision publication owner is closed or has unconfirmed failures"
         );
-        state
-            .prepared_stores
-            .retain(|prepared| !service.owns_prepared_queues(prepared.store.as_ref(), prepared.events.as_ref()));
         Self::retain_recovery_locked(&mut state, service.runtime_holder().recovery_scope());
         if service.has_decision_work() {
             state.services.push(service);
@@ -204,7 +188,7 @@ impl CleanupTracker {
         for cancel in cancellations {
             cancel.cancel();
         }
-        let (services, recovery_scopes, prepared_stores, failed) = loop {
+        let (services, failed) = loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -214,12 +198,7 @@ impl CleanupTracker {
                     #[cfg(test)]
                     self.diagnostic
                         .record("pending_empty", 0, 0, state.failed, Some(!state.failed));
-                    break (
-                        state.services.clone(),
-                        state.recovery_scopes.clone(),
-                        state.prepared_stores.clone(),
-                        state.failed,
-                    );
+                    break (state.services.clone(), state.failed);
                 }
             }
             tokio::time::timeout_at(deadline, changed).await.map_err(|_| {
@@ -246,17 +225,6 @@ impl CleanupTracker {
             self.diagnostic
                 .record("service_queues_drained", 0, 0, failed, Some(drained));
         }
-        for recovery in recovery_scopes {
-            queues_drained &= recovery.drain(deadline.into_std()).await;
-        }
-        for prepared in prepared_stores {
-            if let Some(writer) = prepared.store.and_then(|store| store.writer()) {
-                queues_drained &= writer.drain(deadline.into_std()).await;
-            }
-            if let Some(events) = prepared.events {
-                queues_drained &= events.drain(deadline.into_std()).await;
-            }
-        }
         #[cfg(test)]
         self.diagnostic
             .record("drain_completed", 0, 0, failed, Some(!failed && queues_drained));
@@ -267,20 +235,6 @@ impl CleanupTracker {
 }
 
 impl CleanupTicket {
-    /// Keep construction queues owned even if the awaiting publisher was
-    /// cancelled. This handoff precedes releasing its registered I/O ticket.
-    pub(crate) fn retain_prepared_store(
-        &self,
-        store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-        events: Option<Arc<super::causal_events::DurableCausalEventSink>>,
-    ) {
-        self.tracker
-            .state
-            .lock()
-            .prepared_stores
-            .push(PreparedStoreQueues { store, events });
-    }
-
     pub(crate) fn owner(&self) -> Arc<CleanupTracker> {
         Arc::clone(&self.tracker)
     }

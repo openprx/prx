@@ -207,7 +207,6 @@ async fn priced_streamed_turn_requests_usage_and_writes_cost_ledger() -> anyhow:
             let outcome = crate::agent::terminal::provider_outcome_from_trace(&route, started_at, trace);
             guard
                 .commit(TurnTerminalDraft {
-                    decision: None,
                     binding: None,
                     terminal_id: decision.proof.run_id().to_owned(),
                     scope: envelope.message_scope(),

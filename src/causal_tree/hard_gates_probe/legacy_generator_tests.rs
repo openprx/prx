@@ -367,19 +367,7 @@ fn provider_outage_with_no_legal_path_yields_typed_refusal() {
     };
     let view = catalog.view(&CatalogScope::default());
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }) && !offers_approval(&generated));
-}
-
-/// Whether a no-legal-path set proposed an approval request. The generator
-/// proposes one exactly when it found an action-bound approval-only scope.
-fn offers_approval(set: &CandidateSet) -> bool {
-    let CandidateSet::NoLegalPath { report, .. } = set else {
-        return false;
-    };
-    report
-        .outcomes
-        .keys()
-        .any(|id| id.as_str().starts_with("request_approval-"))
+    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }));
 }
 
 #[test]
@@ -666,7 +654,7 @@ fn approval_only_path_carries_concrete_operation_scope() {
     let view = catalog.view(&CatalogScope::default());
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
     assert!(
-        matches!(&generated, CandidateSet::NoLegalPath { .. }) && !offers_approval(&generated),
+        matches!(&generated, CandidateSet::NoLegalPath { .. }),
         "a proposed capability has no action-bound approval scope"
     );
     let calls_with = BTreeMap::from([(
@@ -674,30 +662,25 @@ fn approval_only_path_carries_concrete_operation_scope() {
         [3; 32],
     )]);
     gates.call_fingerprints = &calls_with;
+    // The approval proposal of a terminal-only set lived in its report,
+    // read only by the deleted refusal classifier (P2-G5a).
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(offers_approval(&generated));
+    assert!(matches!(&generated, CandidateSet::NoLegalPath));
     gates.model_can_chat = false;
     gates.decision_endpoint_ready = false;
-    let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(offers_approval(&generated));
-    let CandidateSet::NoLegalPath { report, .. } = generated else {
-        panic!("expected fixed-template closure");
-    };
-    let approval_id = CandidateId::new(CausalActionKind::RequestApproval, CapabilityTarget::Mcp, None);
-    assert_eq!(report.outcomes.get(&approval_id), Some(&GateOutcome::Passed));
     gates.model_can_chat = true;
     gates.decision_endpoint_ready = true;
     let mut restricted = state.trusted.parts().clone();
     restricted.delivery.approval_channel = false;
     state.trusted = TrustedState::from_runtime(restricted);
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }) && !offers_approval(&generated));
+    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }));
     let mut restored = state.trusted.parts().clone();
     restored.delivery.approval_channel = true;
     state.trusted = TrustedState::from_runtime(restored);
     gates.model_can_call_tools = false;
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }) && !offers_approval(&generated));
+    assert!(matches!(&generated, CandidateSet::NoLegalPath { .. }));
     gates.model_can_call_tools = true;
     let mut legal_cost = cost.clone();
     legal_cost.estimates.insert(
@@ -866,7 +849,7 @@ fn explicit_delegator_selects_only_requested_entrypoint_and_keeps_hard_gates() {
         let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
         let candidates = match generated {
             CandidateSet::Legal { candidates, .. } => candidates,
-            CandidateSet::NoLegalPath { terminals, .. } => terminals,
+            CandidateSet::NoLegalPath => Vec::new(),
         };
         assert!(
             candidates
@@ -965,18 +948,10 @@ fn delegate_without_an_action_scope_cannot_offer_approval() {
     };
     let view = catalog.view(&CatalogScope::default());
     let generated = CausalCandidateGenerator::generate(&state, &view, &policy, &gates).unwrap();
-    assert!(!offers_approval(&generated));
-    let CandidateSet::NoLegalPath { report, .. } = generated else {
-        panic!("expected a typed terminal path");
-    };
-    assert!(matches!(
-        report.outcomes.get(&CandidateId::new(
-            CausalActionKind::Delegate,
-            CapabilityTarget::Session,
-            None
-        )),
-        Some(GateOutcome::ApprovalOnly { .. })
-    ));
+    assert!(
+        matches!(&generated, CandidateSet::NoLegalPath),
+        "expected a typed terminal path"
+    );
 }
 
 struct ProbeTool(&'static str);

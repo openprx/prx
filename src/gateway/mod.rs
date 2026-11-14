@@ -2696,7 +2696,6 @@ async fn run_gateway_chat_with_multimodal(
         }
     };
     let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
-    let settlement = service.terminal_settlement_ref(Arc::clone(&context))?;
     let terminal_binding = service.terminal_binding(&context)?;
     let terminal_guard = decision_runtime::GatewayTerminalGuard::new(
         cleanup_ticket,
@@ -2957,7 +2956,6 @@ async fn run_gateway_chat_with_multimodal(
                         Some(&terminal_guard),
                         &fabric,
                         crate::agent::terminal::TurnTerminalDraft {
-                            decision: Some(settlement.clone()),
                             binding: Some(terminal_binding.clone()),
                             terminal_id,
                             scope: runtime_envelope.message_scope(),
@@ -3014,7 +3012,6 @@ async fn run_gateway_chat_with_multimodal(
                 Some(&terminal_guard),
                 &fabric,
                 crate::agent::terminal::TurnTerminalDraft {
-                    decision: Some(settlement.clone()),
                     binding: Some(terminal_binding.clone()),
                     terminal_id,
                     scope: runtime_envelope.message_scope(),

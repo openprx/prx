@@ -3,13 +3,11 @@ use super::IngressRecorder;
 use crate::agent::terminal::TurnTerminalStatus;
 use crate::memory::ingress_recovery::{IngressAttestationError, IngressCapsule};
 use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
-use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
-#[error("legacy ingress authority unavailable; outcome remains unconfirmed")]
+#[error("pre-v3 ingress evidence has no recovery authority; outcome remains unconfirmed")]
 pub(crate) struct LegacyUnconfirmed;
 
 const SETTLED_FACT_KEYS: [&str; 14] = [
@@ -94,13 +92,6 @@ impl SettledTerminalFacts {
 }
 
 impl IngressRecorder {
-    pub(super) fn legacy_key(&self) -> anyhow::Result<Arc<DecisionKey>> {
-        if !self.plane {
-            return Err(LegacyUnconfirmed.into());
-        }
-        DecisionKey::load_existing(&self.workspace).map_err(|_| LegacyUnconfirmed.into())
-    }
-
     #[cfg(test)]
     pub(crate) fn backend_namespace(&self) -> &str {
         self.lifetime.namespace()
@@ -110,45 +101,44 @@ impl IngressRecorder {
         &self,
         capsule: &IngressCapsule,
         domain: RecoveryMacDomain,
-        legacy: &[&[u8]],
         bytes: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        if capsule.version == 3 {
-            let repository = self
-                .memory
-                .recovery_repository()
-                .context("recovery repository unavailable")?;
-            let id = capsule.key_id.as_deref().context("missing recovery key id")?;
-            return Ok(repository.recovery_mac(Some(id), domain, bytes)?.tag.to_vec());
+        if capsule.version != 3 {
+            return Err(LegacyUnconfirmed.into());
         }
-        Ok(self.legacy_key()?.hmac(KeyDomain::IngressRecovery, legacy).to_vec())
+        let repository = self
+            .memory
+            .recovery_repository()
+            .context("recovery repository unavailable")?;
+        let id = capsule.key_id.as_deref().context("missing recovery key id")?;
+        Ok(repository.recovery_mac(Some(id), domain, bytes)?.tag.to_vec())
     }
 
     pub(super) fn verify_slot(
         &self,
         capsule: &IngressCapsule,
         domain: RecoveryMacDomain,
-        legacy: &[&[u8]],
         bytes: &[u8],
         tag: &[u8],
     ) -> anyhow::Result<bool> {
-        if capsule.version == 3 {
-            let repository = self
-                .memory
-                .recovery_repository()
-                .context("recovery repository unavailable")?;
-            let tag = RecoveryTag {
-                key_id: capsule.key_id.clone().context("missing recovery key id")?,
-                tag: tag.try_into().context("invalid recovery tag length")?,
-            };
-            // An unusable key is not a bad tag: propagate it so the candidate is
-            // left pending instead of being quarantined.
-            return match repository.verify_recovery_mac(&tag, domain, bytes) {
-                Ok(()) => Ok(true),
-                Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
-                Err(_) => Ok(false),
-            };
+        // Pre-v3 capsules have no repository key: they stay unconfirmed.
+        if capsule.version != 3 {
+            return Err(LegacyUnconfirmed.into());
         }
-        Ok(self.legacy_key()?.verify_hmac(KeyDomain::IngressRecovery, legacy, tag))
+        let repository = self
+            .memory
+            .recovery_repository()
+            .context("recovery repository unavailable")?;
+        let tag = RecoveryTag {
+            key_id: capsule.key_id.clone().context("missing recovery key id")?,
+            tag: tag.try_into().context("invalid recovery tag length")?,
+        };
+        // An unusable key is not a bad tag: propagate it so the candidate is
+        // left pending instead of being quarantined.
+        match repository.verify_recovery_mac(&tag, domain, bytes) {
+            Ok(()) => Ok(true),
+            Err(error) if crate::memory::recovery_authority::is_key_unavailable(&error) => Err(error),
+            Err(_) => Ok(false),
+        }
     }
 }

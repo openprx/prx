@@ -27,19 +27,28 @@ pub(crate) enum CausalActionKind {
     Refuse,
 }
 
-impl CausalActionKind {
-    /// Every action kind, in declaration order.
-    pub(crate) const ALL: [Self; 8] = [
-        Self::Answer,
-        Self::Retrieve,
-        Self::Discover,
-        Self::UseTool,
-        Self::Delegate,
-        Self::Clarify,
-        Self::RequestApproval,
-        Self::Refuse,
-    ];
+/// Test-support enumeration of every action kind; production code matches
+/// the enum exhaustively instead.
+#[cfg(test)]
+pub(crate) mod causal_action_test_support {
+    use super::CausalActionKind;
 
+    impl CausalActionKind {
+        /// Every action kind, in declaration order.
+        pub(crate) const ALL: [Self; 8] = [
+            Self::Answer,
+            Self::Retrieve,
+            Self::Discover,
+            Self::UseTool,
+            Self::Delegate,
+            Self::Clarify,
+            Self::RequestApproval,
+            Self::Refuse,
+        ];
+    }
+}
+
+impl CausalActionKind {
     /// The stable snake_case code.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {

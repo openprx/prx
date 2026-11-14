@@ -39,8 +39,6 @@ pub enum KeyDomain {
     WireSalt,
     /// Keyed fingerprints of the causal state.
     StateFingerprint,
-    /// The seed of read-only exploration.
-    ExplorationSeed,
     /// Private binding for a durable terminal decision claim.
     TerminalClaim,
     /// Authenticated pending approval metadata and original-input binding.
@@ -49,8 +47,6 @@ pub enum KeyDomain {
     /// evaluation reports that first used this label are deleted (P2-R11);
     /// the label stays byte-identical so these seals are unchanged.
     SkillRecordSeal,
-    /// Durable ingress reception and interruption evidence.
-    IngressRecovery,
 }
 
 impl KeyDomain {
@@ -60,11 +56,9 @@ impl KeyDomain {
             Self::AttemptAccounting => b"prx.decision.attempt_accounting.v1",
             Self::WireSalt => b"prx.decision.wire_salt.v1",
             Self::StateFingerprint => b"prx.decision.state_fingerprint.v1",
-            Self::ExplorationSeed => b"prx.decision.exploration_seed.v1",
             Self::TerminalClaim => b"prx.decision.terminal_claim.v1",
             Self::ApprovalState => b"prx.decision.approval_state.v1",
             Self::SkillRecordSeal => b"prx.decision.report_ownership.v1",
-            Self::IngressRecovery => b"prx.decision.ingress_recovery.v1",
         }
     }
 }

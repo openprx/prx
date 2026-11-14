@@ -41,12 +41,7 @@ async fn decision_service_present_in_every_model_turn_build() {
         let decision = Box::pin(service.open_issued_turn_context(&proof, AgentTurnKind::SingleShot, &cancellation))
             .await
             .expect("published service must return a source-bound directive");
-        assert!(
-            decision.engine().prediction.is_none(),
-            "test: engine-off bootstrap never predicts"
-        );
         assert!(decision.is_run());
-        assert_eq!(decision.hop_ids().last(), Some(&decision.decision_id()));
         assert!(service.drain_writes(Instant::now() + Duration::from_secs(2)).await);
         let key = workspace.path().join("self/causal_tree/.decision_key");
         let store = workspace.path().join("self/causal_tree/decisions.db");

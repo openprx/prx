@@ -160,25 +160,6 @@ impl Binding {
     }
 }
 tokio::task_local! { static CURRENT: Binding; }
-pub(crate) fn queue(stage: &'static str, drained: bool) {
-    let _ = CURRENT.try_with(|binding| binding.record(stage, 0, 0, false, Some(drained)));
-}
-
-pub(crate) fn queue_presence(stage: &'static str, present: bool) {
-    let _ = CURRENT.try_with(|binding| {
-        if let Some(recorder) = &binding.recorder {
-            recorder.record(Row {
-                owner: binding.owner,
-                stage,
-                ticket: 0,
-                pending: 0,
-                failed: false,
-                ok: None,
-                present: Some(present),
-            });
-        }
-    });
-}
 
 #[derive(Serialize)]
 pub(crate) struct FixtureSummary {
@@ -216,17 +197,9 @@ pub(crate) enum StageName {
     TerminalFlush,
     TerminalDropFinalize,
     TerminalFinalize,
-    TerminalReceiptOwner,
-    TerminalRejoin,
     RejoinPreconditions,
     RejoinLookup,
     RejoinReplay,
-    RejoinReplayScope,
-    RejoinFacts,
-    RejoinCorrelator,
-    RejoinRecord,
-    RejoinDrain,
-    RejoinConfirmAndRepairs,
 }
 impl StageName {
     const fn as_str(self) -> &'static str {
@@ -234,17 +207,9 @@ impl StageName {
             Self::TerminalFlush => "terminal_flush",
             Self::TerminalDropFinalize => "terminal_drop_finalize",
             Self::TerminalFinalize => "terminal_finalize",
-            Self::TerminalReceiptOwner => "terminal_receipt_owner",
-            Self::TerminalRejoin => "terminal_rejoin",
             Self::RejoinPreconditions => "rejoin_preconditions",
             Self::RejoinLookup => "rejoin_lookup",
             Self::RejoinReplay => "rejoin_replay",
-            Self::RejoinReplayScope => "rejoin_replay_scope",
-            Self::RejoinFacts => "rejoin_facts",
-            Self::RejoinCorrelator => "rejoin_correlator",
-            Self::RejoinRecord => "rejoin_record",
-            Self::RejoinDrain => "rejoin_drain",
-            Self::RejoinConfirmAndRepairs => "rejoin_confirm_and_repairs",
         }
     }
 }

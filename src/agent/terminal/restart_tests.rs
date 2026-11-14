@@ -139,11 +139,9 @@ async fn rejoin_restart_cell(cell: &RestartCell) -> anyhow::Result<()> {
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
         &tracker,
-        None,
-        crate::runtime::ingress_recovery::PreparedAdvisory::default(),
-)
+    )
     .await?;
-    recovery.rejoin_terminal(&cell.terminal_id, &cell.owner).await.map(|_| ())
+    recovery.rejoin_terminal(&cell.terminal_id, &cell.owner).await
 }
 
 fn no_legacy_files(workspace: &Path) {

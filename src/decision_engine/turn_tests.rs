@@ -984,11 +984,6 @@ async fn analysis_is_identical_before_and_after_core_move() {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    // Type identity across the forwarding bridge: no conversion exists.
-    fn legacy_reader_sees_engine_set(set: crate::causal_tree::candidate_generator::CandidateSet) -> CandidateSet {
-        set
-    }
-
     let temp = tempfile::tempdir().unwrap();
     let config = enabled_config(temp.path());
     let key = crate::decision_engine::state::fixtures::key();
@@ -1039,17 +1034,15 @@ async fn analysis_is_identical_before_and_after_core_move() {
         catalog: &view,
         gates: &gates,
     };
-    let candidates = legacy_reader_sees_engine_set(
-        CausalCandidateGenerator::generate(
-            &input.state,
-            &view,
-            &policy,
-            &AdvisoryProbe {
-                inner: &probe as &dyn AdmissionProbe,
-            },
-        )
-        .expect("test: candidates"),
-    );
+    let candidates = CausalCandidateGenerator::generate(
+        &input.state,
+        &view,
+        &policy,
+        &AdvisoryProbe {
+            inner: &probe as &dyn AdmissionProbe,
+        },
+    )
+    .expect("test: candidates");
     let CandidateSet::Legal { candidates: legal, .. } = &candidates else {
         panic!("test: the fixture has a legal candidate set");
     };

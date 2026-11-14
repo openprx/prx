@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use super::{PublicationBuildError, PublicationInputs, PublicationLoopRuntime};
 use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
-use crate::observability::causal_event::CausalEventSink;
-use crate::runtime::decision_journal::store::StoreMode;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
@@ -67,52 +65,16 @@ pub(super) async fn operator_process_publication(
     );
     // The runtime key is the turn's state key always (OV-2). The legacy plane
     // consumers still see it only while the plane is enabled.
-    let runtime_key = crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
+    let runtime_key = super::builder::load_key(Arc::clone(&build.generation)).await?;
     let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
     let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
-    let opened = if durable_key {
-        Some(
-            crate::runtime::ingress_recovery::open_advisory_store(
-                &build.generation,
-                Arc::clone(&build.memory),
-                Arc::clone(&build.events),
-                &recovery_owner,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let store = match &opened {
-        Some((store, _)) => Arc::clone(store),
-        None => {
-            crate::runtime::turn_decision::store_preparation::open_store(
-                Arc::clone(&build.generation),
-                Arc::clone(&build.events),
-                None,
-                false,
-            )
-            .await?
-        }
-    };
-    let durable_events = opened.as_ref().map(|(_, events)| Arc::clone(events));
-    let events: Arc<dyn CausalEventSink> = durable_events.as_ref().map_or_else(
-        || Arc::clone(&build.events),
-        |events| Arc::clone(events) as Arc<dyn CausalEventSink>,
-    );
+    let events = Arc::clone(&build.events);
     let recovery = crate::runtime::ingress_recovery::RecoveryScope::prepare(
         &build.generation,
         Arc::clone(&build.memory),
         TurnSurfaceKind::Worker,
         &recovery_owner,
-        workspace_key.clone(),
-        match &opened {
-            Some((store, events)) => {
-                crate::runtime::ingress_recovery::PreparedAdvisory::opened(Arc::clone(store), Arc::clone(events))?
-            }
-            None => crate::runtime::ingress_recovery::PreparedAdvisory::default(),
-        },
     )
     .await?;
     let state_key = runtime_key;
@@ -129,7 +91,6 @@ pub(super) async fn operator_process_publication(
             events: Arc::clone(&events),
         },
     )?;
-    let recordable = durable_key && store.mode() == StoreMode::ReadWrite;
     let service = Arc::new(TurnDecisionService {
         runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
             recovery,
@@ -149,7 +110,6 @@ pub(super) async fn operator_process_publication(
                 events: Arc::clone(&events),
             },
         )?,
-        child_recovery: Default::default(),
         memory_loader: None,
         loop_runtime: Some(runtime),
         publication_policy: build.surface_policy,
@@ -168,13 +128,11 @@ pub(super) async fn operator_process_publication(
         state_key,
         policy_version,
         durable_key,
-        recordable,
+        recordable: durable_key,
         registry: build.registry,
         execution: build.execution,
         memory: build.memory,
         security: build.security,
-        store,
-        durable_events,
     });
     service.resolve_agent_model(&authority.source_proof()?)?;
     service.check_live_parity()?;
