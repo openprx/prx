@@ -1596,9 +1596,29 @@ fn assert_no_legacy_decision_files(workspace: &std::path::Path, cell: &str) {
     }
 }
 
+/// The largest cost ledger a test reads back.
+const MAX_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The cost ledger entries of `terminal_id`. Only an absent ledger counts
+/// as no entries; any other read failure, and a ledger over
+/// [`MAX_LEDGER_BYTES`], fails the test.
 fn ledger_lines(workspace: &std::path::Path, terminal_id: &str) -> usize {
-    std::fs::read_to_string(workspace.join("state/costs.jsonl"))
-        .unwrap_or_default()
+    use std::io::Read as _;
+    let file = match std::fs::File::open(workspace.join("state/costs.jsonl")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => panic!("test: open the cost ledger: {error}"),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_LEDGER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .expect("test: read the cost ledger");
+    assert!(
+        bytes.len() as u64 <= MAX_LEDGER_BYTES,
+        "the cost ledger exceeded its test bound of {MAX_LEDGER_BYTES} bytes"
+    );
+    String::from_utf8(bytes)
+        .expect("test: the cost ledger is UTF-8")
         .lines()
         .filter(|line| line.contains(terminal_id))
         .count()
