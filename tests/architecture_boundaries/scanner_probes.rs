@@ -584,7 +584,10 @@ planted_violation_probes! {
         "impl D0Planted {\n    fn record_causal(&self, event: &CausalEvent) {\n        let _ = &event.lineage;\n    }\n}\n";
     probe_decision_store_opened_elsewhere: no_production_file_opens_a_legacy_decision_database,
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"self/child_authority/journal.db\"));\n}\n";
+        concat!(
+            "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"self/child_",
+            "authority/journal.db\"));\n}\n"
+        );
     probe_legacy_decision_artifact_named: no_legacy_decision_artifacts,
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_key(dir: &std::path::Path) -> std::path::PathBuf {\n    dir.join(\"self/causal_tree/.decision_key\")\n}\n";
