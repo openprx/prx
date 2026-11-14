@@ -12,7 +12,7 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().canonicalize().unwrap();
         let mut config = Config::default();
-        config.workspace_dir = workspace.clone();
+        config.workspace_dir = workspace;
         config.config_path = PathBuf::new();
         config.memory.events.record_user_messages = true;
         config.skills_lifecycle.enabled = true;
@@ -21,39 +21,7 @@ impl Fixture {
         config.runtime.kind = "native".into();
         config.tunnel.provider = "none".into();
         config.plugins.enabled = false;
-        ControlledH2Profile::validate_config(&config).unwrap();
-        let owner = config.skills_lifecycle.owner().unwrap().unwrap();
-        let store = SkillLifecycleStore::open(&workspace, owner.clone()).unwrap();
-        let principal = if kind == EntryKind::Terminal {
-            crate::runtime::envelope::RuntimeEnvelope::chat(workspace.to_string_lossy(), "h2-os-startup")
-                .with_recipient("terminal:user")
-                .resolved_owner_id()
-        } else {
-            "api:prx-existing-principal".into()
-        };
-        let profile = Arc::new(ControlledH2Profile {
-            boot: uuid::Uuid::new_v4().to_string(),
-            kind,
-            workspace,
-            owner,
-            principal: Some(principal),
-            configuration: ControlledH2Profile::config_digest(&config).unwrap(),
-            source_revision: None,
-            schema: ControlledH2Profile::schema_digest(store.root()).unwrap(),
-            digest: "a".repeat(64),
-            expires: Utc::now() + chrono::Duration::minutes(5),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
-            revoked: AtomicBool::new(false),
-            limits: EntryLimits {
-                max_roots: 2,
-                resources: resources(16),
-                elapsed_ms: 60_000,
-                max_concurrent: 2,
-            },
-            reader: parking_lot::Mutex::new(ReaderState::default()),
-            roots: parking_lot::Mutex::new(Default::default()),
-            reviews: parking_lot::Mutex::new(Default::default()),
-        });
+        let profile = profile_over(kind, &config);
         Self {
             directory,
             config,
@@ -64,31 +32,75 @@ impl Fixture {
         self.profile.roots.lock().len()
     }
     pub fn origin(&self) -> Arc<super::super::VerifiedEntryOrigin> {
-        Arc::new(super::super::VerifiedEntryOrigin {
-            profile: Arc::clone(&self.profile),
-            record: super::super::EntryOriginRecord {
-                version: 1,
-                authority_expires_at: self.profile.expires,
-                kind: if self.profile.kind == EntryKind::Gateway {
-                    "gateway"
-                } else {
-                    "terminal"
-                }
-                .into(),
-                boot: self.profile.boot.clone(),
-                profile: self.profile.digest.clone(),
-                actor: self.profile.principal.clone().unwrap(),
-                target_owner: self.profile.owner.as_str().into(),
-                workspace: self.profile.workspace.to_string_lossy().into_owned(),
-                session: "prx_session".into(),
-                run: "prx_run".into(),
-                event: "prx_actual_event".into(),
-                input: "b".repeat(64),
-                routing: "b".repeat(64),
-                sequence: Some(0),
-            },
-        })
+        origin_of(&self.profile)
     }
+}
+/// A controlled profile of `kind` over an existing, valid controlled
+/// configuration (its lifecycle store is opened, or created, in place).
+pub(in crate::runtime::h2_entry) fn profile_over(kind: EntryKind, config: &Config) -> Arc<ControlledH2Profile> {
+    ControlledH2Profile::validate_config(config).unwrap();
+    let workspace = config.workspace_dir.canonicalize().unwrap();
+    let owner = config.skills_lifecycle.owner().unwrap().unwrap();
+    let store = SkillLifecycleStore::open(&workspace, owner.clone()).unwrap();
+    let principal = if kind == EntryKind::Terminal {
+        crate::runtime::envelope::RuntimeEnvelope::chat(workspace.to_string_lossy(), "h2-os-startup")
+            .with_recipient("terminal:user")
+            .resolved_owner_id()
+    } else {
+        "api:prx-existing-principal".into()
+    };
+    Arc::new(ControlledH2Profile {
+        boot: uuid::Uuid::new_v4().to_string(),
+        kind,
+        workspace,
+        owner,
+        principal: Some(principal),
+        configuration: ControlledH2Profile::config_digest(config).unwrap(),
+        source_revision: ControlledH2Profile::source_digest(config).unwrap(),
+        schema: ControlledH2Profile::schema_digest(store.root()).unwrap(),
+        digest: "a".repeat(64),
+        expires: Utc::now() + chrono::Duration::minutes(5),
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        revoked: AtomicBool::new(false),
+        limits: EntryLimits {
+            max_roots: 2,
+            resources: resources(16),
+            elapsed_ms: 60_000,
+            max_concurrent: 2,
+        },
+        reader: parking_lot::Mutex::new(ReaderState::default()),
+        roots: parking_lot::Mutex::new(Default::default()),
+        reviews: parking_lot::Mutex::new(Default::default()),
+    })
+}
+/// The verified origin of one actual submitted message under `profile`.
+pub(in crate::runtime::h2_entry) fn origin_of(
+    profile: &Arc<ControlledH2Profile>,
+) -> Arc<super::super::VerifiedEntryOrigin> {
+    Arc::new(super::super::VerifiedEntryOrigin {
+        profile: Arc::clone(profile),
+        record: super::super::EntryOriginRecord {
+            version: 1,
+            authority_expires_at: profile.expires,
+            kind: if profile.kind == EntryKind::Gateway {
+                "gateway"
+            } else {
+                "terminal"
+            }
+            .into(),
+            boot: profile.boot.clone(),
+            profile: profile.digest.clone(),
+            actor: profile.principal.clone().unwrap(),
+            target_owner: profile.owner.as_str().into(),
+            workspace: profile.workspace.to_string_lossy().into_owned(),
+            session: "prx_session".into(),
+            run: "prx_run".into(),
+            event: "prx_actual_event".into(),
+            input: "b".repeat(64),
+            routing: "b".repeat(64),
+            sequence: Some(0),
+        },
+    })
 }
 fn resources(calls: u64) -> ExperimentResources {
     ExperimentResources {

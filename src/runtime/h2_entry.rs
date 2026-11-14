@@ -26,3 +26,6 @@ pub(crate) use origin::tests::recorded_terminal_approval_fixture;
 
 #[cfg(test)]
 pub(crate) use authority::tests::{test_exact_call_scope, test_recorded_terminal_scope, test_scope_root_claims};
+
+#[cfg(test)]
+pub(crate) mod test_support;

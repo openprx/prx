@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 mod admission;
 mod adoption;
 mod adoption_contract;
+mod controlled_annotate;
 mod development_probes;
 mod gate_review;
 mod holdout;
