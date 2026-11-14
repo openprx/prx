@@ -173,6 +173,12 @@ fn is_unknown_key(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<IngressAttestationError>() && cause.to_string().contains("unknown key"))
 }
 
+/// Whether any cause of `error` says `needle`: verification failures are
+/// `TerminalNotReplayable` with the step's error kept as a cause.
+fn chain_contains(error: &anyhow::Error, needle: &str) -> bool {
+    error.chain().any(|cause| cause.to_string().contains(needle))
+}
+
 fn sqlite(workspace: &Path) -> SqliteMemory {
     SqliteMemory::new(workspace).expect("test: sqlite accessor")
 }
@@ -190,7 +196,7 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .await
         .expect_err("workspace");
     assert!(
-        error.to_string().contains("committed terminal marker is missing") || is_mismatch(&error, "workspace"),
+        chain_contains(&error, "committed terminal marker is missing") || is_mismatch(&error, "workspace"),
         "workspace: {error}"
     );
     drop(other_dir);
@@ -202,10 +208,7 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .await
         .expect_err("owner");
     assert!(
-        error
-            .to_string()
-            .contains("terminal replay scope does not match its owner")
-            || is_mismatch(&error, "owner"),
+        chain_contains(&error, "terminal replay scope does not match its owner") || is_mismatch(&error, "owner"),
         "owner: {error}"
     );
 
@@ -221,8 +224,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
     assert!(
         error.chain().any(|cause| cause.is::<LegacyUnconfirmed>())
             || is_mismatch(&error, "source")
-            || error.to_string().contains("Query returned no rows"),
-        "source: {error}"
+            || chain_contains(&error, "Query returned no rows"),
+        "source: {error:#}"
     );
 
     let run_cell = settled_setup_with(default_facts(), None).await;
@@ -232,7 +235,7 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .await
         .expect_err("run");
     assert!(
-        error.to_string().contains("committed terminal marker is missing") || is_mismatch(&error, "run"),
+        chain_contains(&error, "committed terminal marker is missing") || is_mismatch(&error, "run"),
         "run: {error}"
     );
 
@@ -246,8 +249,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .expect_err("input event");
     assert!(
         is_mismatch(&error, "claim_event_id")
-            || error.to_string().contains("QueryReturnedNoRows")
-            || error.to_string().contains("no rows"),
+            || chain_contains(&error, "QueryReturnedNoRows")
+            || chain_contains(&error, "no rows"),
         "input event: {error:#}"
     );
 
@@ -261,8 +264,8 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .expect_err("terminal event");
     assert!(
         is_mismatch(&error, "final_event_id")
-            || error.to_string().contains("QueryReturnedNoRows")
-            || error.to_string().contains("no rows"),
+            || chain_contains(&error, "QueryReturnedNoRows")
+            || chain_contains(&error, "no rows"),
         "terminal event: {error:#}"
     );
 
@@ -276,7 +279,7 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .await
         .expect_err("terminal bytes");
     assert!(
-        error.to_string().contains("recovery evidence changed") || error.to_string().contains("invalid recovery"),
+        chain_contains(&error, "recovery evidence changed") || chain_contains(&error, "invalid recovery"),
         "terminal bytes: {error:#}"
     );
 

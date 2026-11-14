@@ -176,6 +176,38 @@ fn no_legacy_files(workspace: &Path) {
     );
 }
 
+/// Rewrite the stored receipt with `update`, as an attacker with write access
+/// to the database would: the receipt immutability trigger is lifted for the
+/// statement and restored verbatim afterwards.
+fn tamper_receipt(workspace: &Path, update: &str) {
+    let connection = rusqlite::Connection::open(workspace.join("memory/brain.db")).expect("test: db");
+    let trigger: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='recovery_settled_immutable'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("test: receipt trigger");
+    connection
+        .execute_batch("DROP TRIGGER recovery_settled_immutable")
+        .expect("test: lift trigger");
+    assert_eq!(connection.execute(update, []).expect("test: tamper receipt"), 1);
+    connection.execute_batch(&trigger).expect("test: restore trigger");
+}
+
+/// D§4.4: a refused restart verification is `TerminalNotReplayable`.
+fn assert_not_replayable(outcome: anyhow::Result<()>, cell: &str) {
+    match outcome {
+        Ok(()) => panic!("test: {cell} must be refused"),
+        Err(error) => assert!(
+            error
+                .downcast_ref::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()
+                .is_some(),
+            "test: {cell} must be refused as TerminalNotReplayable: {error:#}"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn restart_rejoin_verifies_every_terminal_status() {
     let cells = [
@@ -282,16 +314,17 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             }
         }),
         ("pending-domain receipt", |cell, _memory, _claim, _terminal| {
-            let connection = rusqlite::Connection::open(cell.workspace.join("memory/brain.db")).expect("test: db");
-            connection
-                .execute("UPDATE recovery_attestations SET state='pending'", [])
-                .expect("test: pending receipt");
+            tamper_receipt(
+                &cell.workspace,
+                "UPDATE recovery_attestations SET state='pending', terminal_event_id=NULL, \
+                 input_event_id=COALESCE(input_event_id, terminal_event_id)",
+            );
         }),
         ("unknown facts key", |cell, _memory, _claim, _terminal| {
-            let connection = rusqlite::Connection::open(cell.workspace.join("memory/brain.db")).expect("test: db");
-            connection
-                .execute("UPDATE recovery_attestations SET facts=CAST('{\"x\":1}' AS BLOB)", [])
-                .expect("test: unknown facts key");
+            tamper_receipt(
+                &cell.workspace,
+                "UPDATE recovery_attestations SET facts=CAST('{\"x\":1}' AS BLOB)",
+            );
         }),
         ("semantic edited", |cell, memory, claim, _terminal| {
             claim_semantic_edit(cell, memory, claim, |payload| {
@@ -311,11 +344,19 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             });
         }),
         (
-            "prepared parameters dropped from S",
+            "prepared parameters differ between S and F",
             |cell, memory, claim, _terminal| {
+                // Dropped from S when the terminal carries them, added to S
+                // only otherwise: either side of "absent in S <=> absent in F"
+                // is violated.
                 claim_semantic_edit(cell, memory, claim, |payload| {
-                    if let Some(object) = payload["semantic"].as_object_mut() {
-                        object.remove("prepared_parameters");
+                    if let Some(object) = payload["semantic"].as_object_mut()
+                        && object.remove("prepared_parameters").is_none()
+                    {
+                        object.insert(
+                            "prepared_parameters".to_owned(),
+                            serde_json::json!([{"temperature": 0.5}]),
+                        );
                     }
                 });
             },
@@ -349,10 +390,7 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             .expect("test: final");
         mutate(&cell, &memory, &claim, &terminal);
         drop(memory);
-        assert!(
-            rejoin_restart_cell(&cell).await.is_err(),
-            "test: {name} must be refused"
-        );
+        assert_not_replayable(rejoin_restart_cell(&cell).await, name);
         no_legacy_files(&cell.workspace);
     }
 
@@ -375,10 +413,7 @@ async fn restart_rejoin_verifies_every_terminal_status() {
         );
     });
     drop(memory);
-    assert!(
-        rejoin_restart_cell(&cell).await.is_err(),
-        "test: one-sided replay_unavailable must be refused"
-    );
+    assert_not_replayable(rejoin_restart_cell(&cell).await, "one-sided replay_unavailable");
 }
 
 fn walk_keys(workspace: &Path) -> Vec<std::path::PathBuf> {

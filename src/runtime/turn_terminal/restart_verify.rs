@@ -17,6 +17,21 @@ use serde_json::Value;
 #[error("terminal is not replayable: {0}")]
 pub(crate) struct TerminalNotReplayable(pub(crate) &'static str);
 
+/// A verification step's failure as [`TerminalNotReplayable`] naming the
+/// step, with the step's own error kept as the cause.
+pub(crate) fn refused<E: Into<anyhow::Error>>(reason: &'static str) -> impl FnOnce(E) -> anyhow::Error {
+    move |error| error.into().context(TerminalNotReplayable(reason))
+}
+
+/// A settled-facts identity field that differs from the terminal being
+/// rejoined, as [`TerminalNotReplayable`] with the typed mismatch as cause.
+pub(crate) fn identity_differs(field: &'static str) -> anyhow::Error {
+    anyhow::Error::from(crate::memory::ingress_recovery::IngressAttestationError::Mismatch(
+        field,
+    ))
+    .context(TerminalNotReplayable("settled facts identity differs"))
+}
+
 /// Claim semantic fields that must be JSON `null` on a repository terminal.
 const NULL_SEMANTIC_FIELDS: [&str; 7] = [
     "decision_id",

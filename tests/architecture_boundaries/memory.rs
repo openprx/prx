@@ -13,9 +13,8 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/agent/agent.rs::embedded_turn_routes_to_the_registered_instance_and_returns_to_default::let conn = rusqlite::Connection::open_with_flags(",
     "src/agent/embedded_source.rs::embedded_autosave_respects_configuration_and_keeps_original_source::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
     "src/agent/embedded_source.rs::embedded_cross_provider_selection_is_refused_before_input_recording::let conn = rusqlite::Connection::open(workspace.path().join(\"memory/brain.db\")).unwrap();",
-    // Restart cells edit the persisted claim to prove the verifier refuses it.
-    "src/agent/terminal/tests/restart.rs::claim_semantic_edit::let connection = rusqlite::Connection::open(cell.workspace.join(\"memory/brain.db\")).expect(\"test: db\");",
-    "src/agent/terminal/tests/restart.rs::claim_semantic_edit::let connection = rusqlite::Connection::open(cell.workspace.join(\"memory/brain.db\")).expect(\"test: db\");",
+    // Restart cells tamper with the persisted receipt to prove the verifier refuses it.
+    "src/agent/terminal/tests/restart.rs::tamper_receipt::let connection = rusqlite::Connection::open(workspace.join(\"memory/brain.db\")).expect(\"test: db\");",
     "src/agent/tests.rs::turn_returns_text_when_no_tools_called::let conn = rusqlite::Connection::open_with_flags(",
     "src/agent/turn_tests/context_recall.rs::build_agent_context_includes_document_evidence_with_source_ids::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/agent/turn_tests/compaction.rs::configurable_compaction_records_run_and_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",

@@ -836,9 +836,22 @@ impl super::ingress_recovery::RecoveryScope {
                     | TurnSurfaceKind::Xin
                     | TurnSurfaceKind::Worker
                     | TurnSurfaceKind::Channel
-            ) && self.recordable,
+            ),
             "terminal rejoin requires recording plus recovery authority"
         );
+        if !self.recordable {
+            let refusal = anyhow::anyhow!("terminal rejoin requires recording plus recovery authority");
+            // A store with a recovery repository holds repository terminals:
+            // without the authority (its key unavailable, or recording off)
+            // none can be verified, so none is replayable (D§4.4).
+            return Err(if self.memory.recovery_repository().is_some() {
+                refusal.context(restart_verify::TerminalNotReplayable(
+                    "no recovery authority to verify the terminal",
+                ))
+            } else {
+                refusal
+            });
+        }
         anyhow::ensure!(
             !terminal_id.is_empty() && !owner_id.is_empty(),
             "terminal rejoin scope is empty"
@@ -908,7 +921,30 @@ impl super::ingress_recovery::RecoveryScope {
         Ok(())
     }
 
+    /// The settled facts of a repository terminal, verified after restart
+    /// (D§4.4). `None`: no repository, or no receipt at all (an unrecorded or
+    /// pre-Part-2 terminal, which stays unconfirmed). Every verification
+    /// failure is [`restart_verify::TerminalNotReplayable`], with its cause
+    /// kept in the error chain for diagnostics.
     async fn load_settled_facts(
+        &self,
+        event: &crate::memory::MessageEvent,
+        terminal_id: &str,
+        owner_id: &str,
+    ) -> anyhow::Result<Option<super::ingress_recovery::SettledTerminalFacts>> {
+        self.verify_settled_facts(event, terminal_id, owner_id)
+            .await
+            .map_err(|error| {
+                if error.is::<restart_verify::TerminalNotReplayable>() {
+                    error
+                } else {
+                    error.context(restart_verify::TerminalNotReplayable("restart verification failed"))
+                }
+            })
+    }
+
+    /// Steps 1–7 of D§4.4; see [`Self::load_settled_facts`].
+    async fn verify_settled_facts(
         &self,
         event: &crate::memory::MessageEvent,
         terminal_id: &str,
@@ -945,32 +981,43 @@ impl super::ingress_recovery::RecoveryScope {
             let Some(repository) = read_memory.recovery_repository() else {
                 return Ok(None);
             };
-            repository.activate_recovery_authority()?;
-            let Some(receipt) = repository.read_recovery_receipt(&read_chain)? else {
+            repository
+                .activate_recovery_authority()
+                .map_err(restart_verify::refused("recovery authority unavailable"))?;
+            let Some(receipt) = repository
+                .read_recovery_receipt(&read_chain)
+                .map_err(restart_verify::refused("settled receipt does not authenticate"))?
+            else {
                 return Ok(None);
             };
             if receipt.state != "settled" {
-                return Ok(None);
+                return Err(restart_verify::TerminalNotReplayable("receipt is not settled").into());
             }
-            let facts = super::ingress_recovery::SettledTerminalFacts::parse(&receipt.settled_facts()?)?;
+            let facts = receipt
+                .settled_facts()
+                .map_err(restart_verify::refused("settled facts do not authenticate"))
+                .and_then(|bytes| {
+                    super::ingress_recovery::SettledTerminalFacts::parse(&bytes)
+                        .map_err(restart_verify::refused("settled facts do not parse"))
+                })?;
             if facts.terminal_id != terminal_id {
-                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("terminal_id").into());
+                return Err(restart_verify::identity_differs("terminal_id"));
             }
             if facts.surface != surface {
-                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("surface").into());
+                return Err(restart_verify::identity_differs("surface"));
             }
             // Delegated child issuance is removed (P2-G4): no settled
             // terminal carries a parent decision authority.
             if facts.parent_authority_id.is_some() {
-                return Err(
-                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("parent_authority_id").into(),
-                );
+                return Err(restart_verify::identity_differs("parent_authority_id"));
             }
             if facts.key_id != receipt.key_id {
-                return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("key_id").into());
+                return Err(restart_verify::identity_differs("key_id"));
             }
             for id in [&facts.claim_event_id, &facts.final_event_id] {
-                let evidence = repository.recovery_event_evidence(&read_chain, id)?;
+                let evidence = repository
+                    .recovery_event_evidence(&read_chain, id)
+                    .map_err(restart_verify::refused("chain event evidence does not verify"))?;
                 if &evidence.event_id != id {
                     return Err(
                         restart_verify::TerminalNotReplayable("chain event differs from the settled facts").into(),
@@ -978,7 +1025,9 @@ impl super::ingress_recovery::RecoveryScope {
                 }
             }
             if let Some(id) = &facts.assistant_event_id {
-                repository.recovery_event_evidence(&read_chain, id)?;
+                repository
+                    .recovery_event_evidence(&read_chain, id)
+                    .map_err(restart_verify::refused("assistant event evidence does not verify"))?;
             }
             Ok::<_, anyhow::Error>(Some(facts))
         })
