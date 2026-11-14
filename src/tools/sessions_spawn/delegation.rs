@@ -33,18 +33,19 @@ impl SpawnDelegationStatus {
 pub(super) fn request_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "boolean",
-        "default": false,
-        "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks."
+        "default": true,
+        "description": "For 'spawn' and 'spawn_batch', default true: let this child spawn its own children, as the parent can. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks. Set false for a child that cannot spawn."
     })
 }
 
-/// Read the recursive delegation opt-in. A missing or `false` opt-in keeps
-/// the captured child scope; `true` derives a scope that keeps
-/// `sessions_spawn`, under the same gates as a root spawn.
+/// Read the recursive delegation flag. A child session equals the main
+/// session, so a missing flag means `true`: the child gets a derived scope
+/// that keeps `sessions_spawn`, under the same gates as a root spawn. Only an
+/// explicit `false` keeps the captured, non-delegating child scope.
 pub(super) fn requested(args: &serde_json::Value) -> anyhow::Result<bool> {
     match args.get("allow_delegation") {
-        None | Some(serde_json::Value::Bool(false)) => Ok(false),
-        Some(serde_json::Value::Bool(true)) => Ok(true),
+        None | Some(serde_json::Value::Bool(true)) => Ok(true),
+        Some(serde_json::Value::Bool(false)) => Ok(false),
         Some(_) => anyhow::bail!("allow_delegation must be a boolean"),
     }
 }
@@ -73,7 +74,7 @@ mod tests {
 
     #[test]
     fn recursive_request_parses_only_booleans() {
-        assert!(!requested(&serde_json::json!({})).unwrap());
+        assert!(requested(&serde_json::json!({})).unwrap());
         assert!(!requested(&serde_json::json!({"allow_delegation": false})).unwrap());
         assert!(requested(&serde_json::json!({"allow_delegation": true})).unwrap());
         for invalid in [

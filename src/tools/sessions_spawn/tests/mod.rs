@@ -22,6 +22,7 @@ mod lineage;
 mod liveness;
 mod owned_child;
 mod process_manifest;
+mod recursive;
 mod schema_matrix;
 mod spawn;
 mod tool_setup;
@@ -354,7 +355,7 @@ impl Provider for TaskTraceParentProvider {
             format!(
                 "<tool_call>\n{}\n</tool_call>",
                 json!({"name":"sessions_spawn",
-                "arguments":{"task":"metered task", "mode":"task"}})
+                "arguments":{"task":"metered task", "mode":"task", "allow_delegation":false}})
             )
         };
         Ok(crate::providers::ChatResponse {

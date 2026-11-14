@@ -1535,14 +1535,16 @@ requirements above or bypass the normal launch and execution gates.
 
 ### Recursive child grants
 
-A parent can let a `sessions_spawn` child spawn its own children by setting
-`allow_delegation: true` on the spawn request or a batch entry. There is no
+A `sessions_spawn` child can spawn its own children by default: a child
+session equals the main session, so an omitted `allow_delegation` means `true`,
+on the spawn request and on a batch entry. Only an explicit
+`allow_delegation: false` makes a child that cannot spawn. There is no
 operator setting: a child's `sessions_spawn` passes exactly the same gates as a
 root session's `sessions_spawn` at the same autonomy level, and nothing
 recursion-specific is added. In Full autonomy there is no approval and no
 gate; in Supervised the ordinary side-effect approval applies, as for a root
-spawn; in ReadOnly the spawn is refused, as for a root spawn. Without the
-request, a spawn keeps its existing capability set. A non-boolean opt-in is
+spawn; in ReadOnly the spawn is refused, as for a root spawn. With an explicit
+`false`, a spawn keeps its existing capability set. A non-boolean opt-in is
 refused before any batch member is journaled or started.
 
 The only bounds are depth, funding and integrity:

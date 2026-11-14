@@ -647,6 +647,114 @@ async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> any
     Ok(())
 }
 
+/// G5b R4.8: a recursive derivation keeps the authenticated parent half of
+/// the captured publication and replaces only the selected scope. A real
+/// published parent turn binds `sessions_spawn` through the production
+/// execution binding, which captures the ordinary publication.
+#[tokio::test]
+async fn recursive_derivation_shares_the_authenticated_parent() -> anyhow::Result<()> {
+    use super::publication::{OrdinaryChildPublication, RecursiveDelegationRefused};
+    let workspace = tempfile::tempdir()?;
+    let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
+    let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
+    let result = cleanup
+        .scope(Box::pin(async {
+            let parent = ordinary_parent(
+                workspace.path(),
+                AutonomyLevel::Full,
+                Arc::clone(&memory),
+                "prx-recursive-parent",
+                false,
+            )
+            .await;
+            let other = ordinary_parent(
+                workspace.path(),
+                AutonomyLevel::Full,
+                Arc::clone(&memory),
+                "prx-recursive-other",
+                false,
+            )
+            .await;
+            let (_execution, bound) = parent.admitted.bind_selected("sessions_spawn")?;
+            let publication = bound
+                .ordinary_child_publication
+                .clone()
+                .context("ordinary parent binding captured no child publication")?;
+            let (_other_execution, other_bound) = other.admitted.bind_selected("sessions_spawn")?;
+            let foreign = other_bound
+                .ordinary_child_publication
+                .clone()
+                .context("second parent binding captured no child publication")?;
+            let constraints = &publication.parent_authority().constraints;
+
+            // (a) The derived manifest keeps sessions_spawn one level below
+            // the sealed parent, and its seal verifies against that parent.
+            let derived = publication.with_recursive_delegation(&bound)?;
+            let (manifest, sealed_parent) = derived.scope().gate_inputs();
+            assert!(
+                derived.allows_tool("sessions_spawn"),
+                "derived scope keeps sessions_spawn"
+            );
+            assert_eq!(
+                Some(manifest.authority.remaining_depth),
+                constraints.authority.remaining_depth.checked_sub(1),
+                "derived depth is the parent depth minus one"
+            );
+            manifest.verify(sealed_parent)?;
+            assert!(derived.same_parent(&publication), "derived shares the parent half");
+            assert!(derived != publication, "derived selects a different scope");
+            derived.verify_derived_from(&bound)?;
+
+            // (b) A publication bound in another turn is not the caller's own.
+            assert!(matches!(
+                foreign.with_recursive_delegation(&bound),
+                Err(RecursiveDelegationRefused::ForeignParent)
+            ));
+            let foreign_derived = foreign.with_recursive_delegation(&other_bound)?;
+            assert!(!foreign_derived.same_parent(&publication));
+            assert!(
+                foreign_derived.verify_derived_from(&bound).is_err(),
+                "a derivation from another parent cannot re-scope this caller"
+            );
+
+            // (c) A parent with one level left cannot fund a child that
+            // could still spawn.
+            let decision = parent.admitted.decision();
+            let mut shallow_constraints = constraints.clone();
+            shallow_constraints.authority.remaining_depth = 1;
+            let requested: Vec<_> = publication.scope().gate_inputs().0.allowed.iter().cloned().collect();
+            let shallow = OrdinaryChildPublication::capture(
+                decision.service,
+                decision.context,
+                decision.proof,
+                super::ParentAuthority {
+                    constraints: shallow_constraints,
+                    allowance: Arc::clone(&publication.parent_authority().allowance),
+                },
+                &requested,
+            )?;
+            let mut shallow_caller = bound.clone();
+            shallow_caller.ordinary_child_publication = Some(shallow.clone());
+            assert!(matches!(
+                shallow.with_recursive_delegation(&shallow_caller),
+                Err(RecursiveDelegationRefused::DepthExhausted)
+            ));
+
+            // (d) An explicit `allow_delegation: false` keeps the captured
+            // object itself; the default derives the recursive scope.
+            let kept = publication.select_for_spawn(&bound, false)?;
+            assert!(kept == publication, "opt-out keeps the captured object");
+            assert!(Arc::ptr_eq(kept.scope(), publication.scope()));
+            let selected = publication.select_for_spawn(&bound, true)?;
+            assert!(selected.same_parent(&publication) && selected != publication);
+            drop(other);
+            Ok::<(), anyhow::Error>(())
+        }))
+        .await;
+    cleanup.drain((Instant::now() + Duration::from_secs(5)).into()).await?;
+    result
+}
+
 /// HMAC-SHA256 over `lp(label) ‖ Σ lp(part)`, computed with `ring` directly.
 fn golden_state_fingerprint(key: &[u8], parts: &[&[u8]]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);

@@ -114,19 +114,21 @@ impl SessionsSpawnTool {
         if let Some(caller) = &caller {
             caller.verify_tool("sessions_spawn")?;
         }
-        // A recursive opt-in re-scopes the caller onto a derived publication
-        // that shares its authenticated parent, so task issuance, process
-        // launch and funding all read that one object. An operator source
-        // opens its children as roots, so the opt-in changes nothing there.
-        let caller = match (caller, delegation::requested(args)?) {
-            (Some(caller), true) => match caller.context().ordinary_child_publication.as_ref() {
+        // Recursive delegation (the default; only an explicit `false` opts
+        // out) re-scopes the caller onto a derived publication that shares
+        // its authenticated parent, so task issuance, process launch and
+        // funding all read that one object. An operator source opens its
+        // children as roots, so the flag changes nothing there.
+        let recursive = delegation::requested(args)?;
+        let caller = match caller {
+            Some(caller) => match caller.context().ordinary_child_publication.as_ref() {
                 Some(publication) => {
-                    let derived = publication.with_recursive_delegation(caller.context())?;
-                    Some(caller.with_ordinary_publication(derived)?)
+                    let selected = publication.select_for_spawn(caller.context(), recursive)?;
+                    Some(caller.with_ordinary_publication(selected)?)
                 }
                 None => Some(caller),
             },
-            (caller, _) => caller,
+            None => None,
         };
         let ordinary_publication = caller
             .as_ref()

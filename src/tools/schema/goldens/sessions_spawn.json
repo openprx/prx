@@ -142,8 +142,8 @@
       "type": "string"
     },
     "allow_delegation": {
-      "default": false,
-      "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks.",
+      "default": true,
+      "description": "For 'spawn' and 'spawn_batch', default true: let this child spawn its own children, as the parent can. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks. Set false for a child that cannot spawn.",
       "type": "boolean"
     },
     "announce": {
@@ -233,8 +233,8 @@
                 "type": "string"
               },
               "allow_delegation": {
-                "default": false,
-                "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks.",
+                "default": true,
+                "description": "For 'spawn' and 'spawn_batch', default true: let this child spawn its own children, as the parent can. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks. Set false for a child that cannot spawn.",
                 "type": "boolean"
               },
               "mode": {

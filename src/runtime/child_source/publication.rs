@@ -162,6 +162,21 @@ impl OrdinaryChildPublication {
         })
     }
 
+    /// The publication a `sessions_spawn` child issues from: the derived
+    /// recursive scope by default, or this captured object itself, unchanged,
+    /// for an explicit `allow_delegation: false`.
+    pub(crate) fn select_for_spawn(
+        &self,
+        caller: &crate::tools::ToolExecutionContext,
+        recursive: bool,
+    ) -> Result<Self, RecursiveDelegationRefused> {
+        if recursive {
+            self.with_recursive_delegation(caller)
+        } else {
+            Ok(self.clone())
+        }
+    }
+
     /// A re-scoped publication must share the caller's authenticated parent
     /// and pass the ordinary caller verification for its selected scope.
     pub(crate) fn verify_derived_from(&self, caller: &crate::tools::ToolExecutionContext) -> anyhow::Result<()> {

@@ -1251,8 +1251,10 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
-Recursive child delegation needs only an explicit `allow_delegation: true`
-spawn request; there is no operator setting. A child's `sessions_spawn` passes
+Recursive child delegation is the default: a child session equals the main
+session, so a spawn without `allow_delegation` (or with `true`) lets the child
+spawn its own children, and only an explicit `allow_delegation: false` makes a
+child that cannot. There is no operator setting. A child's `sessions_spawn` passes
 the same gates as a root session's at the same autonomy level (Full: no
 approval; Supervised: the ordinary side-effect approval; ReadOnly: refused).
 Only spawn depth, the funded budget and integrity checks bound nesting. See
