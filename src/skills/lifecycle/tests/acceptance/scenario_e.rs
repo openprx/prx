@@ -38,9 +38,9 @@ async fn the_agent_entry_leaves_the_selection_hydration_tool_terminal_and_side_e
     config.autonomy.level = crate::security::AutonomyLevel::Full;
     config.tool_tiering.always_include = ["skill_read", "file_read", "file_write"].map(str::to_string).to_vec();
 
-    // The selection receipt of this run (written off the turn path) is on
+    // The selection receipt of this run (recorded by its skill_read) is on
     // record before the turn can end.
-    world.loopback.set_hook(Some(Loopback::selection_gate(1, &world.store)));
+    world.loopback.set_hook(Some(Loopback::selection_gate(2, &world.store)));
     let answer = world
         .run_task(&config, "TASK[report] Write the release notes report for build 5.")
         .await

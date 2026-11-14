@@ -239,9 +239,11 @@ impl Loopback {
 
     /// Holds the chat request numbered `number` until one more experience of
     /// the owner store holds a selection receipt than it does now, so that the
-    /// receipt of the coming run (written off the turn path) is on record
-    /// before the turn can end. Without it the write could land after the
-    /// terminal and count as late evidence. Returns the hook; the caller
+    /// receipt of the coming run is on record before the turn can end.
+    /// `skill_read` records the selection when it loads the managed skill, so
+    /// `number` must be a request sent after that tool result (the run's
+    /// second request): gating the first request would wait for a receipt
+    /// that only its own answer can produce. Returns the hook; the caller
     /// installs it (alone, or inside a larger hook).
     pub fn selection_gate(number: usize, store: &Arc<SkillLifecycleStore>) -> Hook {
         let before = selection_count(store);
@@ -457,13 +459,12 @@ impl World {
     }
 
     /// [`Self::run_task`] for a task that selects a catalog skill, with the
-    /// selection receipt of the run on record before the turn can end. The
-    /// receipt is written off the turn path; left to race with the hydration
-    /// and the terminal of the same task for the experience's lock, a slow
-    /// disk could make one of their bounded lock waits expire.
+    /// selection receipt of the run on record before the turn can end: the
+    /// request carrying the `skill_read` result (the run's second) is held
+    /// until the receipt is there.
     pub async fn run_task_selected(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
         self.loopback.set_hook(Some(Loopback::selection_gate(
-            self.loopback.requests() + 1,
+            self.loopback.requests() + 2,
             &self.store,
         )));
         let result = self.run_task(config, prompt).await;
@@ -566,7 +567,7 @@ impl World {
     /// The experiences of `expected` real agent runs (they carry a run id and
     /// a hydration), oldest first, once their terminal is joined:
     /// the terminal join is awaited by the run itself. The selection receipt is
-    /// written off the turn path and depends on retrieval, so it is not waited for.
+    /// written only when the model loads the skill, so it is not waited for.
     pub async fn production_runs(&self, expected: usize) -> Vec<SkillExperience> {
         let ready = |record: &SkillExperience| {
             record.correlation.run_id.is_some() && !record.hydration_receipts.is_empty() && record.terminal.is_some()

@@ -87,8 +87,9 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
     let start = world.loopback.requests();
     let publisher = Arc::clone(&service);
     let id = proposal.proposal_id.clone();
-    // The selection receipt of this run is on record before B goes live.
-    let selected = Loopback::selection_gate(start + 1, &world.store);
+    // The selection receipt of this run (recorded by its first skill_read)
+    // is on record before B goes live.
+    let selected = Loopback::selection_gate(start + 2, &world.store);
     world.loopback.set_hook(Some(Arc::new(move |number| {
         selected(number);
         if number == start + 3 {
@@ -137,7 +138,7 @@ async fn a_bounded_revision_replaces_the_active_one_while_a_running_task_keeps_i
     let begin = world.loopback.requests();
     world
         .loopback
-        .set_hook(Some(Loopback::selection_gate(begin + 1, &world.store)));
+        .set_hook(Some(Loopback::selection_gate(begin + 2, &world.store)));
     let fresh = world
         .run_task(&auto, "TASK[release] Write the release notes for build 42.")
         .await

@@ -429,7 +429,45 @@ async fn operator_task_cells(
         .context("operator task cleanup owner missing")?
         .retain_child_service(Arc::clone(&service))?;
     let mut segments = authority.segments()?;
-    let (_, context) = segments.record(OPERATOR_TASK).await?;
+    let (proof, context) = segments.record(OPERATOR_TASK).await?;
+    use crate::runtime::turn_source::TurnSourceProof as _;
+    // Production admits the segment turn (which stamps the call budget) and
+    // binds its published specs under the turn surface before any dispatch.
+    let owner = crate::runtime::turn_cleanup::current_tracker().context("operator task cleanup owner missing")?;
+    let turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
+        Arc::clone(&service),
+        (Arc::clone(&proof), context),
+        claimed.fabric().clone(),
+        Arc::clone(&authority.generation().effective),
+        &owner,
+        &cancellation,
+        None,
+    )
+    .await?;
+    let routing = turn.routing();
+    let specs = service.agent_execution_specs(proof.as_ref(), routing.context)?;
+    let (executor, mut context) = service.bind_agent_execution(
+        proof.as_ref(),
+        routing.context,
+        &turn.adapter().tool_execution_context,
+        &specs.specs,
+    )?;
+    context.turn_surface = Some(Arc::new(crate::tools::surface_owner::build(
+        crate::tools::surface_owner::SurfaceParts {
+            execution: service.execution(),
+            catalog: service.catalog(),
+            publication_policy: service.publication_policy(),
+            tiering: service.tool_tiering(),
+            security: service.security(),
+            pinned_model: proof.model_binding().pinned_model(),
+            channel: service.channel_surface(),
+            inherited_exclusions: &[],
+            sender: proof.policy_sender(),
+            channel_name: proof.policy_channel(),
+            chat_type: proof.policy_chat_type(),
+            tool_calls_allowed: service.model_can_call_tools(proof.as_ref()),
+        },
+    )));
 
     // Membership: below Full the source ACL keeps the probe outside the frozen
     // operator capability set, so Supervised publishes only that set and
@@ -446,15 +484,14 @@ async fn operator_task_cells(
         .catalog()
         .view(&crate::tools::capability::catalog::CatalogScope::default());
     let visible = unscoped.with_surface(policy).contains(&probe);
-    let status = service
-        .execution()
+    let outcome = executor
         .execute(
             ToolExecutionCommand::new(PROBE, serde_json::json!({"value": 1})),
             context,
             None,
         )
-        .await
-        .status;
+        .await;
+    let status = outcome.status;
     if level == AutonomyLevel::Full {
         assert!(
             policy.allowed_tools.is_none(),
@@ -462,7 +499,7 @@ async fn operator_task_cells(
         );
         assert!(!policy.excluded_names.contains(PROBE));
         assert!(visible, "Full publishes the probe");
-        assert_eq!(status, ToolExecutionStatus::Succeeded);
+        assert_eq!(status, ToolExecutionStatus::Succeeded, "{}", outcome.model_content);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     } else {
         assert!(
@@ -474,10 +511,14 @@ async fn operator_task_cells(
         );
         assert!(policy.excluded_names.contains(PROBE));
         assert!(!visible, "Supervised does not publish the probe");
-        assert_ne!(status, ToolExecutionStatus::Succeeded);
+        assert_ne!(status, ToolExecutionStatus::Succeeded, "{}", outcome.model_content);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     let executed = calls.load(Ordering::SeqCst);
+    // The segment turn closes before the resource and parity cells change
+    // its funding and executor.
+    turn.fail(&anyhow::anyhow!("operator task cells close the segment"), false)
+        .await?;
 
     // Recursive money is a resource bound, not a permission: an exhausted
     // task or parent allowance funds no child share in Full as in

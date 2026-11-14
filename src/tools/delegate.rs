@@ -3057,6 +3057,10 @@ pub(crate) mod tests {
     tokio::task_local! {
         static DELEGATE_CHILD_RESPONSE: crate::agent::agent::native_decision_fixture::ChildResponseControl;
     }
+    // Set by a test whose child reaches its tool through `capability_search`
+    // first (R28: a child that owns the discovery control keeps deferred
+    // tools behind search).
+    tokio::task_local! { static DELEGATE_CHILD_SEARCHES_FIRST: (); }
 
     async fn run_configured_delegate_fixture(
         allowed_tools: Vec<String>,
@@ -3075,6 +3079,7 @@ pub(crate) mod tests {
         if let Ok(control) = DELEGATE_CHILD_RESPONSE.try_with(Clone::clone) {
             driver.control_child_response(control);
         }
+        let search_first = DELEGATE_CHILD_SEARCHES_FIRST.try_with(|()| ()).is_ok();
         let endpoint = driver.endpoint().to_owned();
         let clock =
             crate::runtime::logical_clock::capture().unwrap_or_else(crate::runtime::logical_clock::ManualClock::new);
@@ -3097,6 +3102,7 @@ pub(crate) mod tests {
                                     provider_error,
                                     custom_userinfo,
                                     context,
+                                    search_first,
                                 )
                             }),
                         )
@@ -3141,6 +3147,7 @@ pub(crate) mod tests {
                                             None,
                                             false,
                                             None,
+                                            false,
                                         )
                                     }),
                                 )
@@ -3305,6 +3312,7 @@ pub(crate) mod tests {
         provider_error: Option<&'static str>,
         custom_userinfo: bool,
         context: Option<&str>,
+        search_first: bool,
     ) -> (ToolResult, Vec<serde_json::Value>) {
         let requests = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
         let capture = Arc::clone(&requests);
@@ -3314,17 +3322,23 @@ pub(crate) mod tests {
             let capture = Arc::clone(&capture);
             let arguments = arguments.clone();
             async move {
-                let completed = request["messages"]
+                let results = request["messages"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|message| message["role"] == "tool");
+                    .filter(|message| message["role"] == "tool")
+                    .count();
                 capture.lock().push(request);
                 if let Some(error) = provider_error {
                     return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":error})));
                 }
+                let completed = results > usize::from(search_first);
                 let message = if completed {
                     json!({"role":"assistant", "content":"done"})
+                } else if search_first && results == 0 {
+                    json!({"role":"assistant", "content":"", "tool_calls":[{
+                        "function":{"name":"capability_search", "arguments":{"query":tool_name, "limit":1}}
+                    }]})
                 } else if custom_userinfo {
                     json!({"role":"assistant", "content":null, "tool_calls":[{
                         "id":"call_dynamic", "type":"function",
@@ -3779,29 +3793,53 @@ pub(crate) mod tests {
         assert!(!logs.contains("DELEGATE-SECRET-pw"), "{logs}");
     }
 
+    /// The `*`-inheriting child owns `capability_search`, so the inherited
+    /// deferred `echo_tool` stays behind search (R28): the child searches,
+    /// then calls the tool it found, then finishes.
     #[tokio::test]
     async fn agentic_mode_inherits_parent_tools_only_with_explicit_wildcard() {
         let executions = Arc::new(AtomicUsize::new(0));
-        let (result, requests) = run_configured_delegate_fixture(
-            vec!["*".to_owned()],
-            vec![
-                Arc::new(EchoTool {
-                    executions: Arc::clone(&executions),
-                }),
-                Arc::new(crate::tools::capability::search_tool::CapabilitySearchTool),
-                Arc::new(DelegateTool::new(HashMap::new(), test_security())),
-            ],
-            "echo_tool",
-            json!({"value":"fixture"}),
-            None,
-            false,
-            None,
-        )
-        .await;
+        let (result, requests) = DELEGATE_CHILD_SEARCHES_FIRST
+            .scope(
+                (),
+                run_configured_delegate_fixture(
+                    vec!["*".to_owned()],
+                    vec![
+                        Arc::new(EchoTool {
+                            executions: Arc::clone(&executions),
+                        }),
+                        Arc::new(crate::tools::capability::search_tool::CapabilitySearchTool),
+                        Arc::new(DelegateTool::new(HashMap::new(), test_security())),
+                    ],
+                    "echo_tool",
+                    json!({"value":"fixture"}),
+                    None,
+                    false,
+                    None,
+                ),
+            )
+            .await;
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("(ollama/prx-local-model, agentic)"));
         assert!(result.output.ends_with("\ndone"));
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3, "search, call, finish");
+        let offered = |request: &serde_json::Value| -> Vec<String> {
+            request["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let first = offered(&requests[0]);
+        assert!(first.iter().any(|name| name == "capability_search"), "{first:?}");
+        assert!(
+            first.iter().all(|name| name != "echo_tool"),
+            "the inherited deferred tool is not declared before search: {first:?}"
+        );
         assert_eq!(
             executions.load(Ordering::SeqCst),
             1,

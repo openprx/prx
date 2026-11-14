@@ -659,20 +659,32 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         assert!(execution_context.child_scope.is_some() && execution_context.child_pin.is_some());
         let mut unscoped = execution_context.clone();
         unscoped.child_scope = None;
-        // A Full child has no manifest membership limit (R51), so the
-        // capability outside its manifest is refused by the child's call
-        // budget, which has no share for it; an unscoped call is stale. Both
-        // are decided before resolution, approval or any backend entry.
-        let outside = child_service
-            .execution
-            .execute(
-                crate::tools::ToolExecutionCommand::new(HIDDEN_CHILD_CAPABILITY, serde_json::json!({})),
-                execution_context.clone(),
-                None,
-            )
-            .await;
-        assert_eq!(outside.status, ToolExecutionStatus::Denied, "{}", outside.model_content);
-        assert!(outside.model_content.contains("has no call budget"), "{}", outside.model_content);
+        // The adapter context has no call budget yet: the segment turn
+        // stamps it at admission. A model-turn dispatch without one is
+        // refused (R6b) for every tool, in or outside the manifest; an
+        // unscoped call is stale. All are decided before resolution,
+        // approval or any backend entry.
+        for name in [HIDDEN_CHILD_CAPABILITY, "file_read"] {
+            let unbudgeted = child_service
+                .execution
+                .execute(
+                    crate::tools::ToolExecutionCommand::new(name, serde_json::json!({})),
+                    execution_context.clone(),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                unbudgeted.status,
+                ToolExecutionStatus::Denied,
+                "{name}: {}",
+                unbudgeted.model_content
+            );
+            assert!(
+                unbudgeted.model_content.contains("has no call budget"),
+                "{name}: {}",
+                unbudgeted.model_content
+            );
+        }
         let outcome = child_service
             .execution
             .execute(
@@ -747,35 +759,48 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         let roundtrip: crate::tools::capability::execution_trace::ExecutionTraceSnapshot =
             serde_json::from_str(&legacy)?;
         assert_eq!(legacy, serde_json::to_string(&roundtrip)?);
+        // Full has no manifest membership limit (R51): the child publishes
+        // the Direct capability outside its sealed manifest that its own
+        // executor serves. Its catalog is the parent's pinned one, so the
+        // parent's interactive-only scheduler is there too, but the child's
+        // executor does not run it and the child never publishes it.
         let specs = child_service.agent_execution_specs(child_proof.as_ref(), routing.context)?;
         assert_eq!(
             specs.specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["file_read"]
+            ["file_read", HIDDEN_CHILD_CAPABILITY]
         );
         assert!(
             routing
                 .context
                 .execution_refs()
                 .iter()
-                .all(|reference| reference.id != hidden.id),
-            "the child engine must not publish the registered capability omitted from its sealed manifest"
+                .any(|reference| reference.id == hidden.id),
+            "a Full child publishes the served capability outside its sealed manifest"
         );
-        let hidden_descriptor = child_service
+        assert!(
+            routing
+                .context
+                .execution_refs()
+                .iter()
+                .all(|reference| reference.id != schedule.id),
+            "the child never publishes a pinned capability its executor does not serve"
+        );
+        let schedule_descriptor = service
             .execution
-            .current_descriptor(HIDDEN_CHILD_CAPABILITY)
-            .expect("the hidden backend remains registered for the negative control");
-        let hidden_spec = ToolSpec {
-            name: hidden_descriptor.public_name,
-            description: hidden_descriptor.description,
-            parameters: hidden_descriptor.parameters,
+            .current_descriptor("chat_schedule")
+            .expect("the parent serves the scheduler for the negative control");
+        let schedule_spec = ToolSpec {
+            name: schedule_descriptor.public_name,
+            description: schedule_descriptor.description,
+            parameters: schedule_descriptor.parameters,
         };
         let bind_error = match child_service.bind_agent_execution(
             child_proof.as_ref(),
             routing.context,
             &execution_context,
-            &[hidden_spec],
+            &[schedule_spec],
         ) {
-            Ok(_) => anyhow::bail!("the child rebound a capability outside its sealed manifest"),
+            Ok(_) => anyhow::bail!("the child bound a capability its executor does not serve"),
             Err(error) => error,
         };
         assert_eq!(bind_error.to_string(), "unknown runtime dependency");
@@ -843,6 +868,22 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
                 ],
             )
         };
+        // The child's call budget funds the capability outside its manifest
+        // (R51). Without an idempotency key it leaves no exact-call fact.
+        let outside = executor
+            .execute(
+                ToolExecutionCommand::new(HIDDEN_CHILD_CAPABILITY, serde_json::json!({})),
+                bound.clone(),
+                Some(cancellation.clone()),
+            )
+            .await;
+        assert_eq!(
+            outside.status,
+            ToolExecutionStatus::Succeeded,
+            "{}",
+            outside.model_content
+        );
+        assert_eq!(hidden_calls.load(Ordering::SeqCst), 1);
         let physical_fingerprint = expected_fingerprint(&physical_command);
         let cached_fingerprint = expected_fingerprint(&cached_command);
         let failed = executor
@@ -952,8 +993,8 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
         );
         assert_eq!(
             hidden_calls.load(Ordering::SeqCst),
-            0,
-            "the registered capability outside the sealed child manifest never executes"
+            1,
+            "inheritance never executes the capability outside the manifest again"
         );
         next.fail(&anyhow::anyhow!("fixture closes without another tool dispatch"), false)
             .await?;
