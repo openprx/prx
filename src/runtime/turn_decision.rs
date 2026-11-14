@@ -911,6 +911,9 @@ impl TurnDecisionService {
             }),
             child_discovery: proof.child_scope().is_some()
                 && self.execution.current_descriptor("capability_search").is_some(),
+            child_served: (proof.child_scope().is_some()
+                && self.security.autonomy == crate::security::AutonomyLevel::Full)
+                .then(|| Arc::new(self.child_served_entries(&catalog))),
         };
         // The published surface is an execution rule over the pinned scope,
         // the admission facts and the catalog (R28).
@@ -1011,6 +1014,26 @@ impl TurnDecisionService {
 
     pub(crate) fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool {
         self.publication_scope().model_can_call_tools(proof)
+    }
+
+    /// The pinned catalog entries this service's own executor serves with
+    /// descriptor parity. A child's catalog is its parent's pinned one, so it
+    /// can hold entries the child's executor does not run (interactive-only
+    /// tools of a process worker, tools the child host never registers).
+    fn child_served_entries(
+        &self,
+        catalog: &CatalogView<'_>,
+    ) -> std::collections::BTreeSet<crate::tools::capability::contract::CapabilityId> {
+        catalog
+            .iter_entries()
+            .filter(|entry| {
+                let reference = crate::tools::surface_owner::publication::entry_ref(entry);
+                self.catalog
+                    .check_published_parity(&self.execution, &std::collections::BTreeSet::from([reference]))
+                    .is_ok()
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 }
 

@@ -132,13 +132,19 @@ impl PublicationRules<'_, '_> {
                 && matches!(entry.public_name.as_str(), "file_read" | "file_write" | "file_edit"))
     }
 
-    /// The inherited child manifest admits `reference` (outside Full).
+    /// The inherited child manifest admits `reference`. A Full child has no
+    /// membership limit (R51) but reaches outside its manifest only what its
+    /// own executor serves.
     pub(crate) fn child_membership_admits(&self, reference: &CapabilityRef) -> bool {
-        self.full_autonomy()
-            || self
-                .facts
-                .child_scope()
-                .is_none_or(|(manifest, _)| manifest.allowed.contains(reference))
+        self.facts.child_scope().is_none_or(|(manifest, _)| {
+            manifest.allowed.contains(reference)
+                || (self.full_autonomy()
+                    && self
+                        .facts
+                        .child_served
+                        .as_ref()
+                        .is_none_or(|served| served.contains(&reference.id)))
+        })
     }
 
     /// Publication admission of one capability (scope, owner isolation, turn
@@ -279,6 +285,16 @@ impl PublicationRules<'_, '_> {
                         .child_scope()
                         .is_some_and(|(manifest, _)| manifest.allowed.contains(&reference));
                 if !directly_exposed && !minted_delegator && !manifest_member {
+                    return None;
+                }
+                // A Full child has no manifest membership limit (R51), but its
+                // catalog is the parent's pinned one: outside the manifest it
+                // publishes only what its own executor serves, so its call
+                // budget funds every tool it can actually see.
+                if let (Some(served), Some((manifest, _))) = (&self.facts.child_served, self.facts.child_scope())
+                    && !manifest.allowed.contains(&reference)
+                    && !served.contains(&entry.id)
+                {
                     return None;
                 }
                 // A child nests only through a sealed outgoing manifest

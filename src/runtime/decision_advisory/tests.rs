@@ -335,6 +335,7 @@ pub(crate) fn analysis_input(
             model_can_call_tools: true,
             child_scope: None,
             child_discovery: false,
+            child_served: None,
         },
         resume_evidence: None,
         state_key: Arc::clone(key),

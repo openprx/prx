@@ -6,10 +6,12 @@
 //! carries it separately in `resume_evidence::VerifiedResumeEvidenceV1`.
 //! Owned, read-only and cheap to clone; no interior mutability.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::security::SecurityPolicy;
 use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest};
+use crate::tools::capability::contract::CapabilityId;
 
 #[derive(Clone)]
 pub(crate) struct AdmissionFactsV1 {
@@ -28,6 +30,13 @@ pub(crate) struct AdmissionFactsV1 {
     /// control. With it, the child reaches its deferred manifest members
     /// through `capability_search` (R28); without it, they are published.
     pub(crate) child_discovery: bool,
+    /// For a Full child turn, the pinned catalog entries the child's own
+    /// executor serves with descriptor parity. Full has no manifest
+    /// membership limit (R51), but a child sees only what its executor runs,
+    /// so an entry outside the manifest is published only from this set.
+    /// `None` below Full and for non-child turns, where the manifest (or no
+    /// child scope) bounds publication.
+    pub(crate) child_served: Option<Arc<BTreeSet<CapabilityId>>>,
 }
 
 impl AdmissionFactsV1 {
