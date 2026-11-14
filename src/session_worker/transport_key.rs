@@ -289,7 +289,7 @@ mod tests {
         let dir = private_dir()?;
         let path = dir.path().join("session_worker.secret");
         rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::from_raw_mode(0o600))?;
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(existing_at(&path).map(|_| ()));
         });

@@ -135,7 +135,12 @@ fn parse_worker_manifest_line(raw: &str) -> Result<WorkerManifest> {
         #[cfg(not(unix))]
         anyhow::bail!("worker manifest references are unsupported on this platform")
     } else {
-        serde_json::from_str(raw).map_err(Into::into)
+        // An inline manifest that does not decode (a pre-strip delegated
+        // manifest with retired fields, or no source) is the typed refusal,
+        // exactly as the snapshot reader maps it (P2-R17, P2-I4).
+        // Decoded from the raw line, not the parsed value, so a duplicate key
+        // is refused too.
+        serde_json::from_str(raw).map_err(|_| crate::session_worker::protocol::WorkerManifestUnsupported.into())
     }
 }
 

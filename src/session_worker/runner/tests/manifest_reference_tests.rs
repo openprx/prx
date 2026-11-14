@@ -204,3 +204,27 @@ fn legacy_inline_manifest_still_decodes_without_reference_environment() -> Resul
     assert!(parse_worker_manifest_line(&duplicate).is_err());
     Ok(())
 }
+
+/// P2-R17/P2-I4: a pre-strip inline manifest (retired `child_source` or
+/// `capability_manifest`) is refused by the worker reader with the typed
+/// `WorkerManifestUnsupported`, as the snapshot reader refuses it.
+#[test]
+fn inline_pre_strip_manifest_is_worker_manifest_unsupported() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let manifest = base_manifest(workspace.path(), "prx_inline_capability");
+    for retired in ["child_source", "capability_manifest"] {
+        let mut value = serde_json::to_value(&manifest)?;
+        value
+            .as_object_mut()
+            .context("worker manifest serializes as an object")?
+            .insert(retired.to_owned(), serde_json::json!({}));
+        let error = parse_worker_manifest_line(&serde_json::to_string(&value)?)
+            .err()
+            .with_context(|| format!("a manifest with `{retired}` must be refused"))?;
+        assert!(
+            error.is::<crate::session_worker::protocol::WorkerManifestUnsupported>(),
+            "{retired}: {error:#}"
+        );
+    }
+    Ok(())
+}
