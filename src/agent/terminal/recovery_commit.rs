@@ -408,7 +408,7 @@ pub(super) async fn finalize_recovery_terminal(
             let crash_ack = CRASH_BEFORE_ACK.with(std::cell::Cell::get);
             #[cfg(test)]
             let before_projection = BEFORE_INLINE_PROJECTION.with(|cell| cell.borrow_mut().take());
-            crate::runtime::blocking::spawn_blocking(move || {
+            let inline = crate::runtime::blocking::spawn_blocking(move || {
                 #[cfg(test)]
                 let _faults = faults.install();
                 #[cfg(test)]
@@ -417,20 +417,32 @@ pub(super) async fn finalize_recovery_terminal(
                     .recovery_repository()
                     .context("recovery repository unavailable")?;
                 #[cfg(test)]
-                if let Some(hook) = before_projection { hook(); }
+                if let Some(hook) = before_projection {
+                    hook();
+                }
                 // The commit inserted the row; an authenticated finish can remove it from the retryable set.
-                find_pending_cost(repository, &workspace_id, &settlement_id)?.map_or_else(
-                    || Ok(()),
-                    |row| project_committed_usage(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &row),
-                )
+                find_pending_cost(repository, &workspace_id, &settlement_id)?
+                    .map_or(Ok(InlineProjection::Settled), |row| {
+                        project_committed_usage(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &row)
+                    })
             })
             .await
             .context("recovery cost projection worker failed")
-            .and_then(|result| result)
-            .unwrap_or_else(|_error| {
+            .and_then(|result| result);
+            // Any inline outcome that leaves the row retryable (a failure, an
+            // `Error` state, an unfinished projection) re-arms the projector.
+            let retryable = match &inline {
+                Ok(InlineProjection::Settled) => false,
+                Ok(InlineProjection::Retryable) => true,
+                Err(error) => {
+                    tracing::warn!(%error, settlement_id = %commit.terminal_id, "recovery cost projection failed");
+                    true
+                }
+            };
+            if retryable {
                 tracing::warn!(settlement_id = %commit.terminal_id, "recovery cost projection deferred to the cost outbox projector");
                 crate::runtime::cost_recovery::rearm();
-            });
+            }
         }
     }
 
@@ -701,38 +713,47 @@ fn find_pending_cost(
     }
 }
 
+/// Where the inline projection left the terminal's outbox row.
+enum InlineProjection {
+    /// Acknowledged, blocked, absent or carrying no metered usage: the
+    /// projector has nothing to retry for it.
+    Settled,
+    /// Still `pending` or `error`: the projector retries it.
+    Retryable,
+}
+
+impl InlineProjection {
+    const fn of(state: RecoveryCostState) -> Self {
+        match state {
+            RecoveryCostState::Acknowledged | RecoveryCostState::Blocked => Self::Settled,
+            RecoveryCostState::Pending | RecoveryCostState::Error => Self::Retryable,
+        }
+    }
+}
+
 fn project_committed_usage(
     memory: &dyn Memory,
     workspace_id: &str,
     workspace_dir: &Path,
     cost_config: &CostConfig,
     row: &RecoveryCostRow,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InlineProjection> {
     let repository = memory
         .recovery_repository()
         .context("recovery repository unavailable")?;
     let Some(usage) = usage_from_facts(&row.facts)? else {
-        return Ok(());
+        return Ok(InlineProjection::Settled);
     };
     let tracker = match crate::cost::tracker::CostTracker::for_workspace(cost_config.clone(), workspace_dir) {
         Ok(tracker) => tracker,
-        Err(error) if is_blocked(&error) => {
-            repository.finish_recovery_cost(
-                workspace_id,
-                &row.settlement_id,
-                &row.usage_digest,
-                RecoveryCostState::Blocked,
-            )?;
-            return Ok(());
-        }
-        Err(_) => {
-            repository.finish_recovery_cost(
-                workspace_id,
-                &row.settlement_id,
-                &row.usage_digest,
-                RecoveryCostState::Error,
-            )?;
-            return Ok(());
+        Err(error) => {
+            let state = if is_blocked(&error) {
+                RecoveryCostState::Blocked
+            } else {
+                RecoveryCostState::Error
+            };
+            repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)?;
+            return Ok(InlineProjection::of(state));
         }
     };
     let projected = tracker.project_recovery_usage(&usage);
@@ -747,21 +768,22 @@ fn project_committed_usage(
         }
     };
     if crash_before_ack {
-        return Ok(());
+        return Ok(InlineProjection::Retryable);
     }
     #[cfg(test)]
     if projected
         .as_ref()
         .is_err_and(|error| error.is::<crate::cost::tracker::TestCrash>())
     {
-        return Ok(());
+        return Ok(InlineProjection::Retryable);
     }
     let state = match projected {
         Ok(()) => RecoveryCostState::Acknowledged,
         Err(error) if is_blocked(&error) => RecoveryCostState::Blocked,
         Err(_) => RecoveryCostState::Error,
     };
-    repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)
+    repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)?;
+    Ok(InlineProjection::of(state))
 }
 
 async fn terminal_event_id(

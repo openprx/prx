@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{CostOutboxProjector, run_pass, warn_legacy_files};
+use super::{Cadence, CostOutboxProjector, PassReport, run_pass, warn_legacy_files};
 use crate::agent::terminal::{bind_terminal_fixture, completed_commit, finalize_turn, priced_cost_config};
 use crate::memory::fabric::MemoryFabric;
 use crate::memory::recovery_authority::RecoveryCostState;
@@ -28,12 +28,25 @@ fn workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// The cost ledger read is bounded; a larger ledger fails the test.
+const MAX_LEDGER_BYTES: u64 = 1 << 20;
+
 fn ledger_lines(workspace: &Path, settlement: &str) -> usize {
-    std::fs::read_to_string(workspace.join("state").join("costs.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.contains(settlement))
-        .count()
+    use std::io::Read as _;
+    let file = match std::fs::File::open(workspace.join("state").join("costs.jsonl")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => panic!("test: cost ledger: {error}"),
+    };
+    let mut text = String::new();
+    file.take(MAX_LEDGER_BYTES + 1)
+        .read_to_string(&mut text)
+        .expect("test: cost ledger read");
+    assert!(
+        u64::try_from(text.len()).expect("test: ledger length") <= MAX_LEDGER_BYTES,
+        "test: the cost ledger exceeds {MAX_LEDGER_BYTES} bytes"
+    );
+    text.lines().filter(|line| line.contains(settlement)).count()
 }
 
 async fn commit_metered(workspace: &Path, memory: &Arc<dyn Memory>, terminal_id: &str) {
@@ -67,7 +80,14 @@ async fn idle_restart_projects_every_pending_row() {
     );
     // Restart: a fresh handle; the projector never reads recording settings.
     let reopened: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&ws).expect("test: reopen"));
-    let report = run_pass(reopened.as_ref(), &ws.to_string_lossy(), &ws, &cost).expect("test: pass");
+    let report = run_pass(
+        reopened.as_ref(),
+        &ws.to_string_lossy(),
+        &ws,
+        &cost,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("test: pass");
     assert!(report.exhausted);
     assert_eq!(report.progressed, 150);
     for index in 0..150 {
@@ -131,8 +151,24 @@ async fn idle_restart_projects_every_pending_row() {
     }
     let workspace_id = ws3.to_string_lossy().into_owned();
     std::thread::scope(|scope| {
-        let first = scope.spawn(|| run_pass(memory3.as_ref(), &workspace_id, &ws3, &cost));
-        let second = scope.spawn(|| run_pass(memory3.as_ref(), &workspace_id, &ws3, &cost));
+        let first = scope.spawn(|| {
+            run_pass(
+                memory3.as_ref(),
+                &workspace_id,
+                &ws3,
+                &cost,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        });
+        let second = scope.spawn(|| {
+            run_pass(
+                memory3.as_ref(),
+                &workspace_id,
+                &ws3,
+                &cost,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+        });
         first.join().expect("test: first").expect("test: first pass");
         second.join().expect("test: second").expect("test: second pass");
     });
@@ -177,7 +213,14 @@ async fn idle_restart_projects_every_pending_row() {
         )
         .expect("test: invalid row");
     }
-    let report = run_pass(memory4.as_ref(), &workspace_id, &ws4, &cost).expect("test: pass");
+    let report = run_pass(
+        memory4.as_ref(),
+        &workspace_id,
+        &ws4,
+        &cost,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("test: pass");
     assert!(report.exhausted, "exhaustion only after the scan passes b000");
     assert_eq!(report.retryable_seen, 1);
     assert_eq!(report.progressed, 1);
@@ -205,7 +248,7 @@ fn legacy_files_warn_once_and_are_never_opened() {
         // A FIFO is the open spy: any open without O_NONBLOCK would block.
         rustix::fs::mkfifoat(rustix::fs::CWD, &path, rustix::fs::Mode::from_raw_mode(0o600)).expect("test: fifo");
     }
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let probe = ws.to_path_buf();
     std::thread::spawn(move || {
         let mut logged = Vec::new();
@@ -226,4 +269,147 @@ fn legacy_files_warn_once_and_are_never_opened() {
     let warned = std::sync::atomic::AtomicBool::new(false);
     assert!(!warn_legacy_files(&warned, clean.path()));
     assert!(!clean.path().join("self").exists(), "detection creates nothing");
+}
+
+/// The outbox state of `settlement` in `workspace`.
+fn outbox_state(workspace: &Path, settlement: &str) -> Option<String> {
+    fixture_readback::outbox_rows(workspace)
+        .into_iter()
+        .find(|row| row.settlement_id == settlement)
+        .map(|row| row.state)
+}
+
+/// Poll `ready` every 10 ms until it holds or `limit` passes.
+async fn eventually(limit: std::time::Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if ready() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A short cadence for the real background scheduler.
+const TEST_CADENCE: Cadence = Cadence {
+    retry: std::time::Duration::from_millis(50),
+    max: std::time::Duration::from_millis(200),
+};
+
+/// P2-R5/OV-11: the real background scheduler, idle after an empty startup
+/// pass, is re-armed when an inline projection leaves its row in `error`
+/// (here the ledger cannot be opened). While the failure lasts, the row stays
+/// retryable and the scheduler keeps retrying on its back-off; once the
+/// failure clears, the next scheduled pass acknowledges the row exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_scheduler_rearms_after_empty_pass_and_retries_transient_failures() {
+    let cost = priced_cost_config();
+    let (_dir, ws) = workspace();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&ws).expect("test: memory"));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let projector = CostOutboxProjector::spawn(
+        Arc::clone(&memory),
+        ws.clone(),
+        cost.clone(),
+        shutdown.child_token(),
+        TEST_CADENCE,
+    );
+    // The startup pass sees an empty outbox and the scheduler goes idle.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(fixture_readback::outbox_rows(&ws).is_empty());
+
+    // The turn is admitted against a healthy ledger; then a transient ledger
+    // failure (the ledger path becomes a directory) hits its terminal.
+    let fabric = MemoryFabric::new(Arc::clone(&memory), ws.to_string_lossy());
+    let mut commit = completed_commit("prx-rearm");
+    let _service = bind_terminal_fixture(&ws, Arc::clone(&memory), &mut commit, &cost).await;
+    let ledger = ws.join("state").join("costs.jsonl");
+    if ledger.exists() {
+        std::fs::remove_file(&ledger).expect("test: clear ledger");
+    }
+    std::fs::create_dir_all(&ledger).expect("test: ledger blocked by a directory");
+    finalize_turn(&fabric, commit, &cost, &ws)
+        .await
+        .expect("test: metered terminal commit");
+    assert_eq!(
+        outbox_state(&ws, "prx-rearm").as_deref(),
+        Some("error"),
+        "the inline projection left the row retryable"
+    );
+    // Several back-off passes run while the failure lasts; the row stays
+    // retryable and nothing reaches the ledger.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(outbox_state(&ws, "prx-rearm").as_deref(), Some("error"));
+
+    std::fs::remove_dir(&ledger).expect("test: clear the ledger failure");
+    assert!(
+        eventually(std::time::Duration::from_secs(10), || {
+            outbox_state(&ws, "prx-rearm").as_deref() == Some("acknowledged")
+        })
+        .await,
+        "the scheduler retried the row after the failure cleared"
+    );
+    assert_eq!(ledger_lines(&ws, "prx-rearm"), 1);
+    assert!(projector.stop().await);
+}
+
+/// A failed or deadline-cut pass is not exhaustion: the scheduler retries it
+/// on the back-off. Only a complete scan without a retryable row idles.
+#[test]
+fn failed_or_incomplete_passes_are_retried_on_the_back_off() {
+    let mut interval = TEST_CADENCE.retry;
+    let failed = PassReport::default();
+    assert_eq!(
+        TEST_CADENCE.next_wait(&failed, &mut interval),
+        Some(TEST_CADENCE.retry * 2)
+    );
+    assert_eq!(TEST_CADENCE.next_wait(&failed, &mut interval), Some(TEST_CADENCE.max));
+    assert_eq!(TEST_CADENCE.next_wait(&failed, &mut interval), Some(TEST_CADENCE.max));
+    let progressed = PassReport {
+        retryable_seen: 2,
+        progressed: 1,
+        retryable_left: 1,
+        exhausted: false,
+    };
+    assert_eq!(
+        TEST_CADENCE.next_wait(&progressed, &mut interval),
+        Some(TEST_CADENCE.retry)
+    );
+    let left = PassReport {
+        retryable_seen: 1,
+        progressed: 0,
+        retryable_left: 1,
+        exhausted: true,
+    };
+    assert_eq!(
+        TEST_CADENCE.next_wait(&left, &mut interval),
+        Some(TEST_CADENCE.retry * 2)
+    );
+    let idle = PassReport {
+        retryable_seen: 1,
+        progressed: 1,
+        retryable_left: 0,
+        exhausted: true,
+    };
+    assert_eq!(TEST_CADENCE.next_wait(&idle, &mut interval), None);
+    assert_eq!(interval, TEST_CADENCE.retry);
+}
+
+/// P2-R5: the projector ends when the process shutdown token is cancelled,
+/// and its completion handle is awaited within the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projector_ends_with_the_process_shutdown_token() {
+    let (_dir, ws) = workspace();
+    let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&ws).expect("test: memory"));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let projector = CostOutboxProjector::start(memory, ws, priced_cost_config(), &shutdown);
+    shutdown.cancel();
+    assert!(
+        eventually(std::time::Duration::from_secs(5), || projector.task.is_finished()).await,
+        "the shutdown token ends the task"
+    );
+    assert!(projector.stop().await);
 }

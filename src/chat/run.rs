@@ -281,6 +281,14 @@ async fn run_internal(
         base_tools_vec,
         ctx.controlled_entry.as_ref(),
     )?;
+    // The process cost outbox projector (P2-R5), cancelled with `shutdown`.
+    crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+    let cost_projector = crate::runtime::cost_recovery::CostOutboxProjector::start(
+        Arc::clone(&mem),
+        config.workspace_dir.clone(),
+        config.cost.clone(),
+        &shutdown,
+    );
 
     let mut turn_service = ctx
         .publish_turn_runtimes(
@@ -4724,5 +4732,6 @@ Retry with a compatible model: /provider {shown} <model>",
         .shutdown(std::time::Instant::now() + Duration::from_secs(2))
         .await;
     hooks.drain_for_shutdown().await;
+    cost_projector.stop().await;
     chat_result
 }

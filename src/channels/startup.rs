@@ -482,6 +482,8 @@ pub async fn start_channels_with_config(
     // after it's wrapped in Arc (resolves the chicken-and-egg registration problem).
     // Also extract the active_runs Arc so sessions_list, sessions_send,
     // subagents, and session_status can share the same run registry without duplication.
+    // The process cost outbox projector (P2-R5), cancelled with `shutdown`.
+    let mut cost_projector = None;
     let spawn_tools_handle = if let Some(first_channel) = channels.first().cloned() {
         // Per-turn announce/kill routing registry: every configured channel keyed
         // by name. sessions_spawn binds the *originating* channel name to each run
@@ -513,11 +515,12 @@ pub async fn start_channels_with_config(
             .with_process_recovery(true)?;
         let handle = spawn_tool.tools_handle();
         crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
-        crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(
+        cost_projector = Some(crate::runtime::cost_recovery::CostOutboxProjector::start(
             Arc::clone(&mem),
             config.workspace_dir.clone(),
             config.cost.clone(),
-        );
+            &shutdown,
+        ));
         let active_runs = spawn_tool.active_runs_arc();
 
         // sessions_list: dedicated listing tool (OpenClaw alignment)
@@ -785,5 +788,8 @@ pub async fn start_channels_with_config(
     }
 
     hooks_for_shutdown.drain_for_shutdown().await;
+    if let Some(projector) = cost_projector {
+        projector.stop().await;
+    }
     dispatch_result
 }

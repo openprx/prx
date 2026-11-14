@@ -1480,12 +1480,6 @@ fn register_gateway_turn_tools(
         .with_event_recording(config.memory.event_recording_config())
         .with_process_recovery(true)?;
         let handle = spawn_tool.tools_handle();
-        crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
-        crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(
-            Arc::clone(memory),
-            config.workspace_dir.clone(),
-            config.cost.clone(),
-        );
 
         // `sessions_list` / `sessions_history` read back what `sessions_spawn`
         // started, so they are bound to that tool's own run registry — the same
@@ -1893,6 +1887,17 @@ async fn run_gateway_inner(
         linq_channel.as_ref(),
         nextcloud_talk_channel.as_ref(),
     )?;
+    // The process cost outbox projector (P2-R5): started eagerly before the
+    // first turn and cancelled with the gateway's shutdown token.
+    let cost_projector = shared_config_for_reload.ensure_runtime_writable().is_ok().then(|| {
+        crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+        crate::runtime::cost_recovery::CostOutboxProjector::start(
+            Arc::clone(&mem),
+            config.workspace_dir.clone(),
+            config.cost.clone(),
+            &shutdown,
+        )
+    });
     // Publish the routing registry process-wide for as long as this gateway
     // runs, so `POST /api/channels/{name}/send` can address the channels the
     // gateway itself constructed. The channels supervisor publishes its own
@@ -2219,6 +2224,9 @@ async fn run_gateway_inner(
         .drain(tokio::time::Instant::now() + Duration::from_secs(15))
         .await;
     hooks_for_shutdown.drain_for_shutdown().await;
+    if let Some(projector) = cost_projector {
+        projector.stop().await;
+    }
     health_shutdown.cancel();
     let _ = health_heartbeat.await;
     serve_result?;

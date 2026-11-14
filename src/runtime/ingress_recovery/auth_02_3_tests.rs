@@ -666,6 +666,7 @@ async fn committed_turn_survives_concurrent_scan_and_tampered_outbox() {
                 &scan_workspace.to_string_lossy(),
                 &scan_workspace,
                 &scan_cost,
+                &tokio_util::sync::CancellationToken::new(),
             )
             .expect("test: scan wins before inline lookup");
         });
@@ -771,8 +772,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             0,
             "test: a crash before commit must not charge uncommitted usage"
         );
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: scan before commit");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: scan before commit");
         assert!(
             fixture_readback::outbox_rows(&workspace).is_empty(),
             "test: restart scan must not manufacture an outbox for an uncommitted terminal"
@@ -802,8 +809,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             0,
             "test: crash before append must not report usage as charged"
         );
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: scan after crash before append");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: scan after crash before append");
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
@@ -834,8 +847,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             1,
             "test: crash after append must preserve the already durable charge"
         );
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: scan after crash after append");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: scan after crash after append");
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
@@ -867,8 +886,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             1,
             "test: crash before acknowledgement must preserve the durable ledger entry"
         );
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: scan after crash before ack");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: scan after crash before ack");
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
@@ -953,8 +978,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             "error",
             "test: ledger I/O failure must retain a retryable error disposition"
         );
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: scan error row");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: scan error row");
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
@@ -1033,8 +1064,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         std::fs::create_dir_all(workspace.join("state")).expect("test: create ledger directory");
         std::fs::write(workspace.join("state").join("costs.jsonl"), "{\"usage\":{}}")
             .expect("test: seed incomplete ledger tail");
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: torn scan");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: torn scan");
         assert_eq!(
             first_outbox(&workspace).state,
             "blocked",
@@ -1099,10 +1136,22 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
         let right_cost = cost.clone();
         let left_id = workspace_id.clone();
         let handle = std::thread::spawn(move || {
-            crate::runtime::cost_recovery::run_pass(left.as_ref(), &left_id, &left_dir, &left_cost)
+            crate::runtime::cost_recovery::run_pass(
+                left.as_ref(),
+                &left_id,
+                &left_dir,
+                &left_cost,
+                &tokio_util::sync::CancellationToken::new(),
+            )
         });
-        crate::runtime::cost_recovery::run_pass(right.as_ref(), &workspace_id, &right_dir, &right_cost)
-            .expect("test: concurrent right");
+        crate::runtime::cost_recovery::run_pass(
+            right.as_ref(),
+            &workspace_id,
+            &right_dir,
+            &right_cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: concurrent right");
         handle
             .join()
             .expect("test: concurrent left")
@@ -1145,8 +1194,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .expect("test: append real conflicting settlement");
         let ledger = workspace.join("state/costs.jsonl");
         let before = std::fs::read(&ledger).expect("test: conflict bytes before");
-        crate::runtime::cost_recovery::run_pass(memory.as_ref(), &workspace.to_string_lossy(), &workspace, &cost)
-            .expect("test: conflict scan");
+        crate::runtime::cost_recovery::run_pass(
+            memory.as_ref(),
+            &workspace.to_string_lossy(),
+            &workspace,
+            &cost,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect("test: conflict scan");
         assert_eq!(
             first_outbox(&workspace).state,
             "blocked",

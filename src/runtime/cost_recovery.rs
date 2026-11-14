@@ -19,16 +19,48 @@ use tokio_util::sync::CancellationToken;
 /// Rows per keyset page.
 const PAGE: usize = 64;
 /// One pass stops at this deadline; the next pass restarts from the beginning.
+/// It also bounds how long [`CostOutboxProjector::stop`] waits.
 const PASS_DEADLINE: Duration = Duration::from_secs(15);
-/// Cadence while retryable rows remain and the last pass made progress.
-const RETRY_INTERVAL: Duration = Duration::from_secs(60);
-/// Back-off ceiling after passes without progress.
-const MAX_INTERVAL: Duration = Duration::from_mins(15);
 
-/// Re-arms the projector after an inline projection failure.
+/// The projector's cadence (OV-11).
+#[derive(Clone, Copy, Debug)]
+struct Cadence {
+    /// Interval while retryable rows remain and the last pass made progress.
+    retry: Duration,
+    /// Back-off ceiling after passes without progress.
+    max: Duration,
+}
+
+impl Cadence {
+    /// 60 s while retryable rows remain, doubling up to 15 min.
+    const PROCESS: Self = Self {
+        retry: Duration::from_secs(60),
+        max: Duration::from_mins(15),
+    };
+
+    /// The wait after `report`, updating the back-off `interval`. `None`
+    /// waits for an inline failure to re-arm: only a complete scan that left
+    /// no retryable row is idle. A failed or deadline-cut pass is not
+    /// exhaustion and is retried on the back-off.
+    fn next_wait(self, report: &PassReport, interval: &mut Duration) -> Option<Duration> {
+        if report.exhausted && report.retryable_left == 0 {
+            *interval = self.retry;
+            None
+        } else if report.progressed == 0 {
+            *interval = interval.saturating_mul(2).min(self.max);
+            Some(*interval)
+        } else {
+            *interval = self.retry;
+            Some(*interval)
+        }
+    }
+}
+
+/// Re-arms every projector after an inline projection left a retryable row.
+/// The epoch is bumped first, so a re-arm that lands while a pass runs is
+/// seen before the projector waits again.
 static REARM: tokio::sync::Notify = tokio::sync::Notify::const_new();
-/// The process projector; a later start replaces (and cancels) the earlier one.
-static PROCESS_PROJECTOR: parking_lot::Mutex<Option<CostOutboxProjector>> = parking_lot::Mutex::new(None);
+static REARM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// One legacy-file warning per process.
 static LEGACY_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -39,14 +71,20 @@ pub(crate) struct PassReport {
     pub(crate) retryable_seen: usize,
     /// Rows whose state the pass changed.
     pub(crate) progressed: usize,
-    /// The scan reached the end of the retryable set.
+    /// Metered rows the pass left retryable (`pending` or `error`).
+    pub(crate) retryable_left: usize,
+    /// The scan reached the end of the retryable set. A failed, cancelled or
+    /// deadline-cut pass is never exhausted.
     pub(crate) exhausted: bool,
 }
 
-/// The process-scoped projector task. Dropping it cancels the task; a
-/// cancelled pass leaves its unfinished rows `pending`.
+/// The process-scoped projector task, owned by the process entry that
+/// started it. It is cancelled with the process shutdown token (or by
+/// [`Self::stop`] or drop); a cancelled pass stops at its next row and leaves
+/// the unfinished rows retryable.
 pub(crate) struct CostOutboxProjector {
     cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for CostOutboxProjector {
@@ -56,68 +94,105 @@ impl Drop for CostOutboxProjector {
 }
 
 impl CostOutboxProjector {
-    /// Start the projector eagerly, before the first turn, and keep it for the
-    /// lifetime of the process. Must be called inside a Tokio runtime.
-    pub(crate) fn start_for_process(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_config: CostConfig) {
-        let projector = Self::spawn(memory, workspace_dir, cost_config);
-        // Replace without holding the lock across the old projector's drop.
-        let previous = PROCESS_PROJECTOR.lock().replace(projector);
-        drop(previous);
+    /// Start the projector eagerly, before the first turn, under the process
+    /// `shutdown` token. Must be called inside a Tokio runtime.
+    pub(crate) fn start(
+        memory: Arc<dyn Memory>,
+        workspace_dir: PathBuf,
+        cost_config: CostConfig,
+        shutdown: &CancellationToken,
+    ) -> Self {
+        Self::spawn(
+            memory,
+            workspace_dir,
+            cost_config,
+            shutdown.child_token(),
+            Cadence::PROCESS,
+        )
     }
 
-    fn spawn(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_config: CostConfig) -> Self {
-        let cancel = CancellationToken::new();
+    fn spawn(
+        memory: Arc<dyn Memory>,
+        workspace_dir: PathBuf,
+        cost_config: CostConfig,
+        cancel: CancellationToken,
+        cadence: Cadence,
+    ) -> Self {
         let task_cancel = cancel.clone();
-        tokio::spawn(async move {
-            let mut interval = RETRY_INTERVAL;
+        let task = tokio::spawn(async move {
+            let mut interval = cadence.retry;
             loop {
-                let report = tokio::select! {
-                    () = task_cancel.cancelled() => return,
-                    report = pass_off_runtime(Arc::clone(&memory), workspace_dir.clone(), cost_config.clone()) => report,
-                };
-                let wait = if report.retryable_seen == 0 {
-                    interval = RETRY_INTERVAL;
-                    None
-                } else if report.progressed == 0 {
-                    interval = interval.saturating_mul(2).min(MAX_INTERVAL);
-                    Some(interval)
-                } else {
-                    interval = RETRY_INTERVAL;
-                    Some(interval)
-                };
+                let epoch = REARM_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+                let report = pass_off_runtime(
+                    Arc::clone(&memory),
+                    workspace_dir.clone(),
+                    cost_config.clone(),
+                    task_cancel.clone(),
+                )
+                .await;
+                if task_cancel.is_cancelled() {
+                    return;
+                }
+                let wait = cadence.next_wait(&report, &mut interval);
+                let notified = REARM.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if REARM_EPOCH.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                    // An inline failure re-armed during the pass.
+                    continue;
+                }
                 match wait {
                     // Nothing retryable: wait for an inline failure to re-arm.
                     None => tokio::select! {
                         () = task_cancel.cancelled() => return,
-                        () = REARM.notified() => {}
+                        () = &mut notified => {}
                     },
                     Some(delay) => tokio::select! {
                         () = task_cancel.cancelled() => return,
                         () = tokio::time::sleep(delay) => {}
-                        () = REARM.notified() => {}
+                        () = &mut notified => {}
                     },
                 }
             }
         });
-        Self { cancel }
+        Self { cancel, task }
+    }
+
+    /// Cancel the task and wait for it to finish, at most one pass deadline
+    /// (a pass in flight stops at its next row). Returns whether it finished.
+    pub(crate) async fn stop(mut self) -> bool {
+        self.cancel.cancel();
+        let finished = tokio::time::timeout(PASS_DEADLINE, &mut self.task).await.is_ok();
+        if !finished {
+            tracing::warn!("recovery cost projector did not stop within the pass deadline");
+        }
+        finished
     }
 
     /// One pass with the 15 s deadline, for the one-shot `prx agent` entry
     /// before its turn.
     pub(crate) async fn run_once(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_config: CostConfig) {
-        pass_off_runtime(memory, workspace_dir, cost_config).await;
+        pass_off_runtime(memory, workspace_dir, cost_config, CancellationToken::new()).await;
     }
 }
 
-/// Signal the projector that an inline projection failed.
+/// Signal every projector that an inline projection left a retryable row.
 pub(crate) fn rearm() {
-    REARM.notify_one();
+    REARM_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    REARM.notify_waiters();
 }
 
-async fn pass_off_runtime(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_config: CostConfig) -> PassReport {
+/// One pass on the blocking pool. A failed pass reports no exhaustion, so
+/// the scheduler retries it.
+async fn pass_off_runtime(
+    memory: Arc<dyn Memory>,
+    workspace_dir: PathBuf,
+    cost_config: CostConfig,
+    cancel: CancellationToken,
+) -> PassReport {
     let workspace_id = workspace_dir.to_string_lossy().into_owned();
     match crate::runtime::blocking::spawn_blocking(move || {
-        run_pass(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config)
+        run_pass(memory.as_ref(), &workspace_id, &workspace_dir, &cost_config, &cancel)
     })
     .await
     {
@@ -135,14 +210,16 @@ async fn pass_off_runtime(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_
 
 /// One projection pass over every retryable row, keyset-paged by settlement
 /// id. It advances past rejected rows and stops only when the raw scan is
-/// exhausted or the pass deadline passes.
+/// exhausted, the pass deadline passes or `cancel` fires.
 pub(crate) fn run_pass(
     memory: &dyn Memory,
     workspace_id: &str,
     workspace_dir: &Path,
     cost_config: &CostConfig,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<PassReport> {
     let deadline = Instant::now() + PASS_DEADLINE;
+    let stopped = || cancel.is_cancelled() || Instant::now() >= deadline;
     let mut report = PassReport::default();
     let Some(repository) = memory.recovery_repository() else {
         report.exhausted = true;
@@ -155,21 +232,25 @@ pub(crate) fn run_pass(
     let mut tracker: Option<Result<Arc<crate::cost::tracker::CostTracker>, RecoveryCostState>> = None;
     let mut after: Option<String> = None;
     loop {
-        if Instant::now() >= deadline {
+        if stopped() {
             return Ok(report);
         }
         let scan = repository.scan_recovery_costs(workspace_id, after.as_deref(), PAGE)?;
         report.retryable_seen = report.retryable_seen.saturating_add(scan.rows.len());
         for row in &scan.rows {
-            if Instant::now() >= deadline {
+            if stopped() {
                 return Ok(report);
             }
             if row.pricing != RecoveryPricing::Metered {
                 continue;
             }
             let opened = tracker.get_or_insert_with(|| open_tracker(cost_config, workspace_dir));
-            if project_row(repository, opened, workspace_id, row) {
+            let projected = project_row(repository, opened, workspace_id, row);
+            if projected.progressed {
                 report.progressed = report.progressed.saturating_add(1);
+            }
+            if is_retryable(projected.state) {
+                report.retryable_left = report.retryable_left.saturating_add(1);
             }
         }
         if scan.exhausted {
@@ -178,6 +259,11 @@ pub(crate) fn run_pass(
         }
         after = scan.cursor;
     }
+}
+
+/// A row state the projector retries.
+const fn is_retryable(state: RecoveryCostState) -> bool {
+    matches!(state, RecoveryCostState::Pending | RecoveryCostState::Error)
 }
 
 fn open_tracker(
@@ -194,23 +280,32 @@ fn open_tracker(
     })
 }
 
-/// Project one metered row and record its state. Returns whether the row's
-/// state changed.
+/// The state a row is left in by one projection, and whether it changed.
+struct RowProjection {
+    state: RecoveryCostState,
+    progressed: bool,
+}
+
+/// Project one metered row and record its state.
 fn project_row(
     repository: &dyn RecoveryRepository,
     tracker: &Result<Arc<crate::cost::tracker::CostTracker>, RecoveryCostState>,
     workspace_id: &str,
     row: &RecoveryCostRow,
-) -> bool {
+) -> RowProjection {
+    let unchanged = RowProjection {
+        state: row.state,
+        progressed: false,
+    };
     let state = match tracker {
         Err(state) => *state,
         Ok(tracker) => {
             let usage = match usage_from_facts(&row.facts) {
                 Ok(Some(usage)) => usage,
-                Ok(None) => return false,
+                Ok(None) => return unchanged,
                 Err(error) => {
                     tracing::warn!(%error, settlement_id = %row.settlement_id, "recovery cost row facts are unreadable");
-                    return false;
+                    return unchanged;
                 }
             };
             let projected = tracker.project_recovery_usage(&usage);
@@ -219,7 +314,7 @@ fn project_row(
                 .as_ref()
                 .is_err_and(|error| error.is::<crate::cost::tracker::TestCrash>())
             {
-                return false;
+                return unchanged;
             }
             match projected {
                 Ok(()) => RecoveryCostState::Acknowledged,
@@ -229,13 +324,16 @@ fn project_row(
         }
     };
     if state == row.state {
-        return false;
+        return unchanged;
     }
     match repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state) {
-        Ok(()) => true,
+        Ok(()) => RowProjection {
+            state,
+            progressed: true,
+        },
         Err(error) => {
             tracing::warn!(%error, settlement_id = %row.settlement_id, "recovery cost finish failed");
-            false
+            unchanged
         }
     }
 }
