@@ -418,30 +418,34 @@ fn terminal_provider_labels_are_redacted() {
     let wrapper: String = wrapper.split_whitespace().collect();
     assert_eq!(
         wrapper,
-        "{letcommit=commit.try_into().map_err(Into::into)?;finalize_turn_impl(fabric,commit,cost_config,workspace_dir,false).await}",
+        "{letcommit=commit.try_into().map_err(Into::into)?;finalize_turn_impl(fabric,commit,cost_config,workspace_dir).await}",
         "public finalizer must forward directly to the sanitized implementation"
     );
-    let implementation = function_body(&production, "finalize_turn_impl");
-    let compact: String = implementation.split_whitespace().collect();
-    let claim_start = compact
+    // The repository claim semantic is built in `recovery_commit.rs`; its
+    // copy of the outcome redacts its own provider labels before the semantic
+    // is redacted and written.
+    let recovery = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
+        &repository_root().join("src/agent/terminal/recovery_commit.rs"),
+    )));
+    let claim: String = function_body(&recovery, "claim_semantic").split_whitespace().collect();
+    let claim_clone = claim
+        .find("letmutclaim_outcome=commit.provider_outcome.clone();")
+        .expect("claim outcome must be cloned from the actual commit");
+    let claim_start = claim
         .find("ifletSome(outcome)=claim_outcome.as_mut()")
         .expect("claim outcome mutable branch");
     assert_eq!(
-        braced_block(&compact, claim_start),
+        braced_block(&claim, claim_start),
         Some("{outcome.redact_provider_labels();}"),
         "claim outcome must redact its own provider labels"
     );
-    let claim_clone = compact
-        .find("letmutclaim_outcome=commit.provider_outcome.clone();")
-        .expect("claim outcome must be cloned from the actual commit");
-    let semantic = compact
-        .find("letsemantic=redact_persisted_json(")
-        .expect("redacted claim digest");
-    let claim_write = compact
-        .find("letclaim=fabric.record_runtime_event_idempotent(")
-        .expect("claim write");
-    assert!(claim_clone < claim_start && claim_start < semantic && semantic < claim_write);
+    let semantic = claim
+        .find("letmutsemantic=redact_persisted_json(")
+        .expect("redacted claim semantic");
+    assert!(claim_clone < claim_start && claim_start < semantic);
 
+    let implementation = function_body(&production, "finalize_turn_impl");
+    let compact: String = implementation.split_whitespace().collect();
     let persisted_start = compact
         .find("ifletSome(outcome)=commit.provider_outcome.as_mut()")
         .expect("persisted outcome mutable branch");
@@ -453,7 +457,7 @@ fn terminal_provider_labels_are_redacted() {
         "persisted outcome must redact its own labels and sensitive fields"
     );
     let settlement = compact.find("letusage_settlement=").expect("usage settlement");
-    assert!(claim_write < persisted_start && persisted_start < settlement);
+    assert!(persisted_start < settlement);
 }
 
 #[test]
@@ -464,20 +468,19 @@ pub(super) fn terminal_provider_label_guard_rejects_bypass_missing_calls_and_lit
     ));
     let path = "src/agent/terminal.rs";
     let source = fs::read_to_string(repository_root().join(path)).expect("read untouched terminal mutation control");
-    let forwarding = "finalize_turn_impl(fabric, commit, cost_config, workspace_dir, false).await";
+    let forwarding = "finalize_turn_impl(fabric, commit, cost_config, workspace_dir).await";
     assert_eq!(source.matches(forwarding).count(), 1);
     let bypass = source.replace(forwarding, &format!("return Ok(receipt); {forwarding}"));
     assert!(scanner_fails_with(
         provider_label_sinks_redact_url_userinfo,
         vec![(path.into(), bypass)]
     ));
-    assert_eq!(source.matches("outcome.redact_provider_labels();").count(), 2);
-    for occurrence in [0, 1] {
-        let start = source
-            .match_indices("outcome.redact_provider_labels();")
-            .nth(occurrence)
-            .expect("real branch")
-            .0;
+    // The persisted outcome (terminal.rs) and the claim copy (recovery_commit.rs)
+    // each redact once; removing or decoying either fails the guard.
+    for path in ["src/agent/terminal.rs", "src/agent/terminal/recovery_commit.rs"] {
+        let source = fs::read_to_string(repository_root().join(path)).expect("read untouched redaction control");
+        assert_eq!(source.matches("outcome.redact_provider_labels();").count(), 1, "{path}");
+        let start = source.find("outcome.redact_provider_labels();").expect("real branch");
         for replacement in [
             "",
             "// outcome.redact_provider_labels();\n",

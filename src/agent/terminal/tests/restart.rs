@@ -1,4 +1,8 @@
-// Included into `agent::terminal::tests` (D§4.5, D§4.6).
+#![cfg(test)]
+
+//! Golden repository-terminal vectors and restart rejoin cells (D§4.5, D§4.6).
+
+use super::*;
 
 /// E2–E7b through the production encoders; the key is installed under its
 /// real content-derived key id. Expected values are independent literals.
@@ -18,7 +22,10 @@ fn golden_repository_terminal_vectors() {
             || std::fs::read_dir(dir.path())
                 .expect("test: list")
                 .filter_map(Result::ok)
-                .any(|entry| entry.path().join(".recovery_keys/630dcd29-66c4-3366-9112-5448bbb25b4f.key").exists())
+                .any(|entry| entry
+                    .path()
+                    .join(".recovery_keys/630dcd29-66c4-3366-9112-5448bbb25b4f.key")
+                    .exists())
     );
 
     // E2: objects inserted in non-alphabetical order.
@@ -28,7 +35,10 @@ fn golden_repository_terminal_vectors() {
     let e2 = memory
         .recovery_mac(Some(&key_id), RecoveryMacDomain::ClaimV3, &preimage)
         .expect("test: E2");
-    assert_eq!(hex::encode(e2.tag), "6753707e3b4143a3fe912c32b01e9690182a4ffbbe51fcca400e8dc095267ca6");
+    assert_eq!(
+        hex::encode(e2.tag),
+        "6753707e3b4143a3fe912c32b01e9690182a4ffbbe51fcca400e8dc095267ca6"
+    );
 
     // E3 and E4.
     use rusqlite::types::Value as Column;
@@ -52,8 +62,14 @@ fn golden_repository_terminal_vectors() {
     // E5.
     assert_eq!(
         hex::encode(
-            golden_vectors::receipt_mac(&memory, &key_id, "00000000-0000-4000-8000-000000000002", "settled", b"{}")
-                .expect("test: E5")
+            golden_vectors::receipt_mac(
+                &memory,
+                &key_id,
+                "00000000-0000-4000-8000-000000000002",
+                "settled",
+                b"{}"
+            )
+            .expect("test: E5")
         ),
         "6e093173590e466b0b4ee7428e97fffc2f50c05ebe3849281d69eb55c1ae2036"
     );
@@ -67,7 +83,10 @@ fn golden_repository_terminal_vectors() {
             &serde_json::to_vec(&usage).expect("test: usage bytes"),
         )
         .expect("test: E6a");
-    assert_eq!(hex::encode(e6a.tag), "13d02222f37daa5592a5be4034c54405b193ce68e842c9b69b5b5623f6b2556e");
+    assert_eq!(
+        hex::encode(e6a.tag),
+        "13d02222f37daa5592a5be4034c54405b193ce68e842c9b69b5b5623f6b2556e"
+    );
 
     // E7a and E7b.
     let (e7a, e7b) = golden_vectors::outbox_macs(
@@ -79,8 +98,14 @@ fn golden_repository_terminal_vectors() {
         RecoveryCostState::Acknowledged,
     )
     .expect("test: E7");
-    assert_eq!(hex::encode(e7a), "7cfcb66554298962d718b1a9d658d65df6b25a4826275601abca9b171b741c3a");
-    assert_eq!(hex::encode(e7b), "4bce3d188eda9c8009348a44c57eff46890c0a9eff6ac35b4d3718ea7d6c9aa5");
+    assert_eq!(
+        hex::encode(e7a),
+        "7cfcb66554298962d718b1a9d658d65df6b25a4826275601abca9b171b741c3a"
+    );
+    assert_eq!(
+        hex::encode(e7b),
+        "4bce3d188eda9c8009348a44c57eff46890c0a9eff6ac35b4d3718ea7d6c9aa5"
+    );
 }
 
 /// One committed terminal of a restart cell.
@@ -141,8 +166,14 @@ async fn rejoin_restart_cell(cell: &RestartCell) -> anyhow::Result<()> {
 }
 
 fn no_legacy_files(workspace: &Path) {
-    assert!(!workspace.join("self/causal_tree").exists(), "no legacy decision store or key");
-    assert!(!workspace.join("self/child_authority").exists(), "no child authority journal");
+    assert!(
+        !workspace.join("self/causal_tree").exists(),
+        "no legacy decision store or key"
+    );
+    assert!(
+        !workspace.join("self/child_authority").exists(),
+        "no child authority journal"
+    );
 }
 
 #[tokio::test]
@@ -196,7 +227,8 @@ async fn restart_rejoin_verifies_every_terminal_status() {
     }
 
     // Negative cells, each against a reopened store.
-    type Mutation = fn(&RestartCell, &crate::memory::SqliteMemory, &crate::memory::MessageEvent, &crate::memory::MessageEvent);
+    type Mutation =
+        fn(&RestartCell, &crate::memory::SqliteMemory, &crate::memory::MessageEvent, &crate::memory::MessageEvent);
     /// Replace one field of the claim's persisted semantic object.
     fn set_semantic(payload: &mut serde_json::Value, key: &str, value: serde_json::Value) {
         payload
@@ -206,10 +238,16 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             .insert(key.to_owned(), value);
     }
 
-    fn claim_semantic_edit(cell: &RestartCell, memory: &crate::memory::SqliteMemory, claim: &crate::memory::MessageEvent, edit: fn(&mut serde_json::Value)) {
+    fn claim_semantic_edit(
+        cell: &RestartCell,
+        memory: &crate::memory::SqliteMemory,
+        claim: &crate::memory::MessageEvent,
+        edit: fn(&mut serde_json::Value),
+    ) {
         let _ = cell;
         let mut payload: serde_json::Value =
-            serde_json::from_str(claim.raw_payload_json.as_deref().expect("test: claim payload")).expect("test: claim JSON");
+            serde_json::from_str(claim.raw_payload_json.as_deref().expect("test: claim payload"))
+                .expect("test: claim JSON");
         edit(&mut payload);
         memory
             .replace_event_payload_for_test(&claim.event_id, &payload.to_string())
@@ -220,7 +258,11 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             claim_semantic_edit(cell, memory, claim, |payload| {
                 let tag = payload["semantic_mac_v3"].as_str().unwrap_or_default();
                 let rest = tag.get(1..).unwrap_or_default();
-                let flipped = if tag.starts_with('0') { format!("1{rest}") } else { format!("0{rest}") };
+                let flipped = if tag.starts_with('0') {
+                    format!("1{rest}")
+                } else {
+                    format!("0{rest}")
+                };
                 payload["semantic_mac_v3"] = serde_json::Value::String(flipped);
             });
         }),
@@ -268,16 +310,23 @@ async fn restart_rejoin_verifies_every_terminal_status() {
                 set_semantic(payload, "status", serde_json::json!("failed"));
             });
         }),
-        ("prepared parameters dropped from S", |cell, memory, claim, _terminal| {
-            claim_semantic_edit(cell, memory, claim, |payload| {
-                if let Some(object) = payload["semantic"].as_object_mut() {
-                    object.remove("prepared_parameters");
-                }
-            });
-        }),
-        ("metered facts without outbox row", |cell, _memory, _claim, _terminal| {
-            crate::memory::sqlite::remove_cost_for_test(&cell.workspace, &cell.terminal_id).expect("test: remove outbox");
-        }),
+        (
+            "prepared parameters dropped from S",
+            |cell, memory, claim, _terminal| {
+                claim_semantic_edit(cell, memory, claim, |payload| {
+                    if let Some(object) = payload["semantic"].as_object_mut() {
+                        object.remove("prepared_parameters");
+                    }
+                });
+            },
+        ),
+        (
+            "metered facts without outbox row",
+            |cell, _memory, _claim, _terminal| {
+                crate::memory::sqlite::remove_cost_for_test(&cell.workspace, &cell.terminal_id)
+                    .expect("test: remove outbox");
+            },
+        ),
     ];
     for (name, mutate) in mutations {
         let cell = commit_restart_cell("restart-negative", |_| {}, true).await;
@@ -300,7 +349,10 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             .expect("test: final");
         mutate(&cell, &memory, &claim, &terminal);
         drop(memory);
-        assert!(rejoin_restart_cell(&cell).await.is_err(), "test: {name} must be refused");
+        assert!(
+            rejoin_restart_cell(&cell).await.is_err(),
+            "test: {name} must be refused"
+        );
         no_legacy_files(&cell.workspace);
     }
 
@@ -323,7 +375,10 @@ async fn restart_rejoin_verifies_every_terminal_status() {
         );
     });
     drop(memory);
-    assert!(rejoin_restart_cell(&cell).await.is_err(), "test: one-sided replay_unavailable must be refused");
+    assert!(
+        rejoin_restart_cell(&cell).await.is_err(),
+        "test: one-sided replay_unavailable must be refused"
+    );
 }
 
 fn walk_keys(workspace: &Path) -> Vec<std::path::PathBuf> {
@@ -334,7 +389,10 @@ fn walk_keys(workspace: &Path) -> Vec<std::path::PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.parent().and_then(Path::file_name).is_some_and(|name| name == ".recovery_keys")
+            } else if path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == ".recovery_keys")
                 && path.extension().is_some_and(|extension| extension == "key")
             {
                 keys.push(path);

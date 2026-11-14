@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Finding 84: the production sources of the skill lifecycle receipts. A turn
 //! that selects a managed skill leaves a selection receipt in its experience;
 //! restart recovery completes the experience with only the facts it can verify.

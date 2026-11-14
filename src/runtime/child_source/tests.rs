@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! R29: child publications are admitted from the parent's pinned
 //! `TurnRuntimeContext` and keep every refusal after the test releases its
 //! handles on the parent's decision service.

@@ -15,7 +15,8 @@ use super::decision_backend::{
     only_the_factory_validates_answers_with_the_builtin_or_builds_a_backend,
 };
 use super::decision_engine::{
-    decision_engine_never_imports_agent_or_tool_execution, shared_types_are_not_engine_owned,
+    decision_engine_never_imports_agent_or_tool_execution, no_legacy_decision_artifacts,
+    shared_types_are_not_engine_owned,
 };
 use super::helpers::{PLANTED_SOURCES, repository_root};
 use super::ingress::{
@@ -583,7 +584,10 @@ planted_violation_probes! {
         "impl D0Planted {\n    fn record_causal(&self, event: &CausalEvent) {\n        let _ = &event.lineage;\n    }\n}\n";
     probe_decision_store_opened_elsewhere: no_production_file_opens_a_legacy_decision_database,
         "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
-        "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"journal.db\"));\n}\n";
+        "pub fn d0_planted_open(dir: &std::path::Path) {\n    let _ = rusqlite::Connection::open(dir.join(\"self/child_authority/journal.db\"));\n}\n";
+    probe_legacy_decision_artifact_named: no_legacy_decision_artifacts,
+        "src/runtime/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_key(dir: &std::path::Path) -> std::path::PathBuf {\n    dir.join(\"self/causal_tree/.decision_key\")\n}\n";
     probe_causal_metric_helper: decision_metric_labels_come_from_bounded_allowlists,
         "src/observability/prometheus.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn d0_planted_label(event: &CausalEvent) -> &str {\n    event.lineage.workspace_id.as_ref()\n}\n";

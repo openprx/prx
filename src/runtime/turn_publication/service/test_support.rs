@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test support for the turn service: fixture services and their inputs.
 use std::collections::BTreeMap;
 use std::sync::Arc;

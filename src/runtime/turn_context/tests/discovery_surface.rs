@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! V4.05: raw language does not grant the whole registry. A scripted model
 //! supplies an exact catalog query; runtime still gates the returned offer.
 //! Turns open prediction-free: discovery happens only through the model's

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! The publication-scoped model, budget and route owner (`PublicationScope`)
 //! read through a fixture turn service.
 use crate::providers::catalog::CatalogView as ProviderCatalogView;

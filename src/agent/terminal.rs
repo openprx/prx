@@ -727,13 +727,12 @@ pub(crate) mod persistence_probe {
 mod tests {
     use std::time::{Duration, Instant};
     mod persistence;
+    mod restart;
     mod terminal_scope;
     use super::*;
     use crate::llm::route_decision::RouteDecision;
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use std::sync::Arc;
-
-    include!("terminal/restart_tests.rs");
 
     pub(crate) fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
         let started_at = chrono::Utc::now();

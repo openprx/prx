@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Bind-loop schema pin for 03 R2. Drives `bind_agent_execution_with_runtime`.
 use std::sync::Arc;
 

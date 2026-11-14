@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::{CostOutboxProjector, run_pass, warn_legacy_files};
 use crate::agent::terminal::{bind_terminal_fixture, completed_commit, finalize_turn, priced_cost_config};
 use crate::memory::fabric::MemoryFabric;

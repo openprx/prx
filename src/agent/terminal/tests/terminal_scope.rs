@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use crate::memory::{Memory, MemoryFabric};
 use crate::observability::causal_event::testing::RecordingSink;
 use crate::providers::catalog::CatalogView as ProviderCatalogView;
