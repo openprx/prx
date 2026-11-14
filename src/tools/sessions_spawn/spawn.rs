@@ -114,6 +114,20 @@ impl SessionsSpawnTool {
         if let Some(caller) = &caller {
             caller.verify_tool("sessions_spawn")?;
         }
+        // A recursive opt-in re-scopes the caller onto a derived publication
+        // that shares its authenticated parent, so task issuance, process
+        // launch and funding all read that one object. An operator source
+        // opens its children as roots, so the opt-in changes nothing there.
+        let caller = match (caller, delegation::requested(args)?) {
+            (Some(caller), true) => match caller.context().ordinary_child_publication.as_ref() {
+                Some(publication) => {
+                    let derived = publication.with_recursive_delegation(caller.context())?;
+                    Some(caller.with_ordinary_publication(derived)?)
+                }
+                None => Some(caller),
+            },
+            (caller, _) => caller,
+        };
         let ordinary_publication = caller
             .as_ref()
             .and_then(|caller| caller.context().ordinary_child_publication.as_ref());
@@ -142,10 +156,6 @@ impl SessionsSpawnTool {
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
         let provider_options = &providers::provider_runtime_options_from_config(child_model_config);
         let spawn_config = &child_model_config.sessions_spawn;
-        // Recursive delegation required a decision-issued parent grant, which
-        // no longer exists (P2-G4); an opt-in is refused as on ordinary
-        // surfaces before.
-        delegation::refuse_recursive_request(args)?;
         let agents = &child_model_config.agents;
         let task = args
             .get("task")

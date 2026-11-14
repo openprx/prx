@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::approval::PendingApprovals;
-use crate::messaging::{ExecRef, InheritedProvenance, SessionAddr};
+use crate::messaging::{InheritedProvenance, SessionAddr};
 use crate::tools::sessions_spawn::HistoryEntry;
 
 /// Inbound mailbox consume cursor. MSG-CORE fills reconstruction.
@@ -146,23 +146,6 @@ pub struct ChildSessionMetadata {
     pub mailbox_projection: std::collections::BTreeMap<usize, Uuid>,
 }
 
-/// Refuse a caller manifest whose identity differs from the logical child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelaunchIdentityError {
-    Owner,
-    Agent,
-}
-
-impl std::fmt::Display for RelaunchIdentityError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Owner => "relaunch manifest owner differs from session address",
-            Self::Agent => "relaunch manifest agent differs from session address",
-        })
-    }
-}
-impl std::error::Error for RelaunchIdentityError {}
-
 #[derive(Serialize)]
 struct ScopedChatRecord {
     #[serde(flatten)]
@@ -288,7 +271,7 @@ impl ChildSessionRegistry {
     }
 
     /// Create a record or replace only metadata/history, retaining the record's
-    /// title, creation time, usage and summaries. Relaunch owns `last_run`.
+    /// title, creation time, usage and summaries. A stored `last_run` is kept.
     pub async fn insert(&self, child: &ChildSession) -> Result<()> {
         let metadata = child.metadata();
         let history = child.history.clone();
@@ -433,63 +416,6 @@ impl ChildSessionRegistry {
             _history_lease: Some(lease),
         })
     }
-
-    async fn relaunch_record(&self, addr: &SessionAddr) -> Result<ScopedChatRecord> {
-        let expected = addr.clone();
-        self.update_record(addr, move |old| {
-            let mut record = old.context("child session not in registry")?;
-            let recipe = record
-                .child_session
-                .as_mut()
-                .and_then(|metadata| metadata.recipe.as_mut())
-                .context("child session has no relaunch recipe")?;
-            anyhow::ensure!(recipe.addr == expected, "relaunch recipe address mismatch");
-            recipe.last_run = Some(Uuid::now_v7().to_string());
-            record.updated_at = chrono::Utc::now();
-            Ok(record)
-        })
-        .await
-    }
-
-    /// Change only the run identity and update time in one store transaction.
-    pub async fn relaunch(&self, addr: &SessionAddr) -> Result<ExecRef> {
-        let record = self.relaunch_record(addr).await?;
-        Ok(ExecRef {
-            run: record
-                .child_session
-                .as_ref()
-                .and_then(|metadata| metadata.recipe.as_ref())
-                .and_then(|recipe| recipe.last_run.clone()),
-        })
-    }
-
-    /// Build the relaunch manifest from registry provenance. The caller seals
-    /// the complete new manifest HMAC after supplying fresh worker authority.
-    pub async fn relaunch_worker(
-        &self,
-        addr: &SessionAddr,
-        mut manifest: crate::session_worker::protocol::WorkerManifest,
-    ) -> Result<crate::session_worker::protocol::WorkerManifest> {
-        if manifest.owner_id.as_deref() != Some(addr.owner.as_str()) {
-            return Err(RelaunchIdentityError::Owner.into());
-        }
-        if manifest.agent_id.as_deref().unwrap_or("main") != addr.agent {
-            return Err(RelaunchIdentityError::Agent.into());
-        }
-        let record = self.relaunch_record(addr).await?;
-        let recipe = record
-            .child_session
-            .as_ref()
-            .and_then(|metadata| metadata.recipe.clone())
-            .context("relaunch recipe missing")?;
-        manifest.run_id = recipe.last_run.context("relaunch returned no run")?;
-        // The durable key frames instance, owner, session and agent together.
-        manifest.session_scope_key = Self::record_id(addr)?;
-        manifest.session_addr = Some(recipe.addr);
-        manifest.inherited_provenance = recipe.inherited_provenance;
-        manifest.parent_capability = None;
-        Ok(manifest)
-    }
 }
 
 #[cfg(test)]
@@ -581,38 +507,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relaunch_keeps_session_addr_and_mints_new_run() {
-        let dir = tempfile::TempDir::new().expect("test: registry directory");
-        let registry = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("test: registry backend"),
-        ))
-        .with_workspace("prx_workspace".to_owned());
-        let session = ChildSession::new(addr("child-a"), None, None);
-        registry.insert(&session).await.expect("test: persist child");
-        let first = registry.relaunch(&addr("child-a")).await.expect("test: first");
-        let second = registry.relaunch(&addr("child-a")).await.expect("test: second");
-        assert_ne!(
-            first.run, second.run,
-            "relaunch keeps session addr and mints new run: expected messaging contract changed"
-        );
-        assert!(
-            first.run.is_some(),
-            "relaunch keeps session addr and mints new run: expected messaging contract changed"
-        );
-        let restored = registry.reconstruct(&addr("child-a")).await.expect("test: reconstruct");
-        assert_eq!(
-            restored.addr(),
-            &addr("child-a"),
-            "relaunch keeps session addr and mints new run: expected messaging contract changed"
-        );
-        assert_eq!(
-            restored.recipe().and_then(|r| r.last_run.clone()),
-            second.run,
-            "relaunch keeps session addr and mints new run: expected messaging contract changed"
-        );
-    }
-
-    #[tokio::test]
     async fn child_registry_is_excluded_from_picker_resume_and_latest() {
         let dir = tempfile::tempdir().expect("test: session database");
         let memory: Arc<dyn crate::memory::Memory> =
@@ -620,7 +514,6 @@ mod tests {
         let registry = ChildSessionRegistry::new(Arc::clone(&memory)).with_workspace("prx_workspace".to_owned());
         let child = ChildSession::new(addr("child-a"), None, None);
         registry.insert(&child).await.expect("test: insert child");
-        registry.relaunch(child.addr()).await.expect("test: relaunch child");
         assert!(
             memory
                 .list(Some(&crate::memory::MemoryCategory::Conversation), None)
@@ -664,10 +557,8 @@ mod tests {
         crate::chat::session_store::save_session(memory.as_ref(), &legacy)
             .await
             .expect("test: legacy blob");
-        registry
-            .relaunch(child.addr())
-            .await
-            .expect("test: newest child activity");
+        // The child record is now the newest activity in the store.
+        registry.insert(&child).await.expect("test: newest child activity");
         let picker = crate::chat::session_store::saved_chat_sessions(memory.as_ref())
             .await
             .expect("test: picker");
@@ -763,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relaunch_and_insert_preserve_complete_child_record() {
+    async fn insert_preserves_complete_child_record() {
         let dir = tempfile::tempdir().expect("test: session database");
         let registry = ChildSessionRegistry::new(Arc::new(
             crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite"),
@@ -771,95 +662,16 @@ mod tests {
         .with_workspace("prx_workspace".to_owned());
         let stale = rich_child(&registry).await;
         let before = registry.load_record(stale.addr()).await.expect("test: before");
-        let run = registry.relaunch(stale.addr()).await.expect("test: relaunch").run;
-        // A history snapshot predating relaunch must not overwrite its new run.
         registry.insert(&stale).await.expect("test: insert old snapshot");
         let after = registry.load_record(stale.addr()).await.expect("test: after");
-        assert_eq!(
-            after
-                .child_session
-                .as_ref()
-                .and_then(|metadata| metadata.recipe.as_ref())
-                .and_then(|recipe| recipe.last_run.clone()),
-            run,
-            "relaunch and insert preserve complete child record: expected messaging contract changed"
-        );
         let mut before = serde_json::to_value(before).expect("test: before JSON");
         let mut after = serde_json::to_value(after).expect("test: after JSON");
         for record in [&mut before, &mut after] {
             record.as_object_mut().expect("test: record").remove("updated_at");
-            let last_run = record
-                .get_mut("child_session")
-                .and_then(|metadata| metadata.get_mut("recipe"))
-                .and_then(|recipe| recipe.get_mut("last_run"))
-                .expect("test: stored recipe last_run field");
-            *last_run = serde_json::Value::Null;
         }
         assert_eq!(
             after, before,
             "title, creation, usage, summaries and full tool-call history must survive"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_history_insert_and_relaunch_keep_both_updates() {
-        let dir = tempfile::tempdir().expect("test: session database");
-        let first = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("test: first pool"),
-        ))
-        .with_workspace("prx_workspace".to_owned());
-        let second = ChildSessionRegistry::new(Arc::new(
-            crate::memory::SqliteMemory::new(dir.path()).expect("test: independent pool"),
-        ))
-        .with_workspace("prx_workspace".to_owned());
-        let mut child = rich_child(&first).await;
-        child.history.push(HistoryEntry {
-            role: "user".into(),
-            content: "prx appended turn".into(),
-            timestamp: chrono::Utc::now(),
-        });
-        let address = child.addr.clone();
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let insert_barrier = Arc::clone(&barrier);
-        let insert = tokio::spawn(async move {
-            insert_barrier.wait().await;
-            first.insert(&child).await
-        });
-        barrier.wait().await;
-        let run = second.relaunch(&address).await.expect("test: concurrent relaunch").run;
-        insert
-            .await
-            .expect("test: insert task")
-            .expect("test: concurrent insert");
-        let record = second.load_record(&address).await.expect("test: merged record");
-        assert_eq!(
-            record.turns.len(),
-            2,
-            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
-        );
-        assert_eq!(
-            record.turns.first().expect("test: original turn").tool_calls.len(),
-            1,
-            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
-        );
-        assert_eq!(
-            record.token_usage_records.len(),
-            1,
-            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
-        );
-        assert_eq!(
-            record.background_sessions.len(),
-            1,
-            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
-        );
-        assert_eq!(
-            record
-                .child_session
-                .as_ref()
-                .and_then(|metadata| metadata.recipe.as_ref())
-                .and_then(|recipe| recipe.last_run.clone()),
-            run,
-            "concurrent history insert and relaunch keep both updates: expected messaging contract changed"
         );
     }
 }

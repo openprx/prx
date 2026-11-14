@@ -1535,60 +1535,35 @@ requirements above or bypass the normal launch and execution gates.
 
 ### Recursive child grants
 
-An enabled, admitted parent can explicitly request that a `sessions_spawn` child
-may spawn another child by setting `allow_delegation: true` on the spawn request
-or a batch entry. This requires `allow_recursive_delegation = true` in
-`[sessions_spawn]`; the operator setting defaults to false. `max_recursive_depth` defaults to
-1 additional level and must equal 1 when permission is enabled. Depth 2 is
-refused at configuration validation because the strict tool-subset contract
-cannot pass the same singleton delegator set onward. Without the
-request, an exact model-only spawn retains its existing empty capability set.
-An invalid batch opt-in is refused before any member is journaled or started,
-and the caller receives the policy refusal reason.
+A parent can let a `sessions_spawn` child spawn its own children by setting
+`allow_delegation: true` on the spawn request or a batch entry. There is no
+operator setting: a child's `sessions_spawn` passes exactly the same gates as a
+root session's `sessions_spawn` at the same autonomy level, and nothing
+recursion-specific is added. In Full autonomy there is no approval and no
+gate; in Supervised the ordinary side-effect approval applies, as for a root
+spawn; in ReadOnly the spawn is refused, as for a root spawn. Without the
+request, a spawn keeps its existing capability set. A non-boolean opt-in is
+refused before any batch member is journaled or started.
 
-The requested grant must remain a proper subset of the parent's authenticated
-capabilities. A parent with no capability to drop cannot grant recursive work.
-Every generation consumes depth, retains the owner, channel exclusions and cost
-ceiling, and pins descendants to the child's selected provider/model. Model and
-provider fallback cannot escape these pins. A descendant must opt in again to
-pass delegation onward; it cannot replenish depth or recover discarded tools.
-A recursive grant permits at most one child, including a model-only leaf.
-A recursive batch with more than one member is refused before launch; repeating
-a single spawn or issuing another outgoing grant cannot reset the consumed slot.
-The first opted-in child receives half the parent's currently unallocated
-monetary balance, rounded down to whole cents and bounded by its sealed ceiling.
-That share is subtracted from the parent's balance before publication. A
-recursive child's model-only leaf receives half of that child's remaining
-balance in the same way. A balance too small to fund a positive whole-cent
-share is refused. Parent, child and leaf reservations therefore divide the
-original allowance; each generation cannot reserve the original amount again.
-The one-child slot and remaining balance follow an authenticated approval
-resume of the original run, even though the resumed turn has a new run ID.
-If the original allowance is unavailable (including after process restart),
-approval resume refuses further recursive child authorization. It does not
-infer an unused slot from missing process state. Ordinary approval execution
-continues under its current admitted limits.
-A failed publication consumes its slot and allocated share conservatively.
+The only bounds are depth, funding and integrity:
+
+- **Depth.** The child's sealed manifest keeps `sessions_spawn` and is a strict
+  subset of its authenticated parent. Every generation consumes one level of
+  the sealed remaining depth, and a child whose depth would reach zero cannot
+  derive another recursive child.
+- **Funding.** Each child receives half of its parent's currently unallocated
+  monetary balance, rounded down to whole cents and bounded by its sealed
+  ceiling; that share is subtracted from the parent before the child starts.
+  An exhausted balance spawns a zero-funded child: its paid requests are
+  refused by its accounting owner, and zero-price work still runs.
+- **Integrity.** Seals, the owner, the catalog generation and the parent run are
+  verified for every child. A re-scoped child scope must share the caller's
+  authenticated parent.
+
 These are reservation bounds, not vendor-enforced billing caps; reported usage
-above an estimate is still charged in full.
-
-Enabling the operator permission also retains the root
-`capability_search` reference before a future spawn request is known. This
-changes the root parent-set/depth bookkeeping even for requests without opt-in.
-Such children still receive exactly the empty model-only tool set and no
-recursive delegation permission; they cannot use that retained root reference.
-
-Worker manifests seal the request, pins and depth, and admission verifies them
-again. `task.spawned` and child-input records carry the grant projection.
-Nested workers bind their logical parent task separately from the admitted
-segment, and verify both against the signed source and durable decision.
-`sessions_spawn` list and `session_status` show the requested grant and remaining
-depth. Their status data grants no execution authority.
-
-Existing configurations deserialize with recursive permission disabled. To roll
-back, stop requesting delegation and set the operator permission to false;
-already admitted work keeps its pinned generation and must finish or be ended
-through the existing run controls before reverting the binary.
+above an estimate is still charged in full. `sessions_spawn` list and
+`session_status` show the requested grant and remaining depth. Their status data
+grants no execution authority.
 
 Scheduler execution uses renewable database claim leases (`scheduler.claim_lease_secs`, default 90 seconds) and attempt fencing. A crashed worker's claim becomes recoverable at the lease expiry boundary, while an older attempt cannot record a run or overwrite the newer attempt's state. This protects cron state and run history from stale commits; it does **not** make external side effects exactly-once. Operators upgrading a shared database must coordinate shutdown of all older scheduler processes before starting lease-aware schedulers, because older binaries do not renew or honor the claim tuple.
 

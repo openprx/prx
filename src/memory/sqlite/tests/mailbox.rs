@@ -1096,7 +1096,7 @@ async fn child_session_reconstructs_mailbox_cursor() {
 }
 
 #[tokio::test]
-async fn child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch() {
+async fn child_sessions_owner_and_agent_erase_remove_records() {
     use crate::chat::sessions::child::{ChildSession, ChildSessionRegistry};
     let f = Fixture::new();
     {
@@ -1107,9 +1107,7 @@ async fn child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch(
                     "INSERT INTO agent_incarnations VALUES (?1,?2,?3,?4,'active',?5)",
                     params![W, O, key, Uuid::from_u128(inc).to_string(), "2".repeat(64)],
                 )
-                .expect(
-                    "test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: execute succeeds",
-                );
+                .expect("test: child_sessions_owner_and_agent_erase_remove_records: execute succeeds");
         }
     }
     let registry = ChildSessionRegistry::new(Arc::new(f.memory.clone())).with_workspace(W.into());
@@ -1118,39 +1116,35 @@ async fn child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch(
     registry
         .insert(&ChildSession::new(a.clone(), None, None))
         .await
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: insert succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: insert succeeds");
     registry
         .insert(&ChildSession::new(b.clone(), None, None))
         .await
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: insert succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: insert succeeds");
     let active = registry
         .reconstruct(&a)
         .await
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: reconstruct succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: reconstruct succeeds");
     let scope = active
         .mailbox_scope()
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: mailbox_scope succeeds")
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: mailbox_scope succeeds")
         .clone();
     drop(active);
     f.store
         .erase_scope(&scope, Duration::from_secs(5), &|| Ok(()))
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: erase_scope succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: erase_scope succeeds");
     assert!(
         registry.reconstruct(&a).await.is_err(),
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
-    );
-    assert!(
-        registry.relaunch(&a).await.is_err(),
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
+        "child sessions owner and agent erase remove records: payload retention and erasure boundary changed"
     );
     let other = registry
         .reconstruct(&b)
         .await
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: reconstruct succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: reconstruct succeeds");
     assert_eq!(
         other.addr(),
         &b,
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
+        "child sessions owner and agent erase remove records: payload retention and erasure boundary changed"
     );
     drop(other);
     // The global MA owner eraser enumerates all owner snapshots. Exercise its
@@ -1159,14 +1153,14 @@ async fn child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch(
         let writer = f.memory.pool.write();
         let mut query = writer
             .prepare("SELECT scope_id,incarnation,generation FROM agent_scopes WHERE workspace_id=?1 AND owner_id=?2")
-            .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: prepare succeeds");
+            .expect("test: child_sessions_owner_and_agent_erase_remove_records: prepare succeeds");
         query
             .query_map(params![W, O], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
             })
-            .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: query_map succeeds")
+            .expect("test: child_sessions_owner_and_agent_erase_remove_records: query_map succeeds")
             .collect::<rusqlite::Result<Vec<_>>>()
-            .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: collect succeeds")
+            .expect("test: child_sessions_owner_and_agent_erase_remove_records: collect succeeds")
     };
     for (id, incarnation, generation) in scopes {
         f.store
@@ -1174,36 +1168,38 @@ async fn child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch(
                 &MailboxScope {
                     workspace_id: W.into(),
                     owner_id: O.into(),
-                    scope_id: Uuid::parse_str(&id).expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: Uuid::parse_str succeeds"),
-                    incarnation: Uuid::parse_str(&incarnation).expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: Uuid::parse_str succeeds"),
+                    scope_id: Uuid::parse_str(&id)
+                        .expect("test: child_sessions_owner_and_agent_erase_remove_records: Uuid::parse_str succeeds"),
+                    incarnation: Uuid::parse_str(&incarnation)
+                        .expect("test: child_sessions_owner_and_agent_erase_remove_records: Uuid::parse_str succeeds"),
                     generation,
                 },
                 Duration::from_secs(5),
                 &|| Ok(()),
             )
-            .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: erase_scope succeeds");
+            .expect("test: child_sessions_owner_and_agent_erase_remove_records: erase_scope succeeds");
     }
     assert_eq!(
         f.scalar("SELECT count(*) FROM child_sessions"),
         0,
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
+        "child sessions owner and agent erase remove records: payload retention and erasure boundary changed"
     );
     assert!(
         registry.reconstruct(&b).await.is_err(),
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
+        "child sessions owner and agent erase remove records: payload retention and erasure boundary changed"
     );
     // A quarantined legacy/orphan cannot be silently omitted by scope SQL.
     f.memory
         .pool
         .write()
         .execute("INSERT INTO child_sessions(key,record) VALUES ('legacy','{}')", [])
-        .expect("test: child_sessions_owner_and_agent_erase_remove_records_and_block_relaunch: execute succeeds");
+        .expect("test: child_sessions_owner_and_agent_erase_remove_records: execute succeeds");
     assert_eq!(
         f.store
             .erase_scope(&f.sender, Duration::from_secs(5), &|| Ok(()))
             .unwrap_err(),
         MailboxError::Fenced,
-        "child sessions owner and agent erase remove records and block relaunch: payload retention and erasure boundary changed"
+        "child sessions owner and agent erase remove records: payload retention and erasure boundary changed"
     );
 }
 
@@ -2780,244 +2776,6 @@ fn worker_data_keeps_sealed_provenance_and_cannot_reset_parent() {
         f.scalar("SELECT sends FROM prx_remote_trees"),
         1,
         "worker data keeps sealed provenance and cannot reset parent: IPC identity or delivery state changed"
-    );
-}
-
-#[tokio::test]
-async fn send_before_and_after_task_reopen_uses_same_session_addr() {
-    use crate::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchRecipe};
-    let f = Fixture::new();
-    let registry = ChildSessionRegistry::new(Arc::new(f.memory.clone())).with_workspace(W.into());
-    registry
-        .insert(&ChildSession::new(
-            f.target.clone(),
-            None,
-            Some(RelaunchRecipe {
-                addr: f.target.clone(),
-                last_run: None,
-                inherited_provenance: None,
-            }),
-        ))
-        .await
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: insert succeeds");
-    let restored = registry
-        .reconstruct(&f.target)
-        .await
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: reconstruct succeeds");
-    let scope = restored
-        .mailbox_scope()
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: mailbox_scope succeeds")
-        .clone();
-    drop(restored);
-    let canonical = ChildSessionRegistry::canonical_session_key(&f.target)
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: ChildSessionRegistry::canonical_session_key succeeds");
-    f.store
-        .close_execution(&f.recipient, &f.target, "run-target")
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: close_execution succeeds");
-    let mut previous = None;
-    for n in 1..=2 {
-        let run = registry
-            .relaunch(&f.target)
-            .await
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: relaunch succeeds")
-            .run
-            .expect(
-                "test: send_before_and_after_task_reopen_uses_same_session_addr: required fixture value is present",
-            );
-        assert_ne!(
-            previous.as_ref(),
-            Some(&run),
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-        previous = Some(run.clone());
-        let mut message = f.message(n, 0);
-        message.to_pin = f
-            .store
-            .recipient_pin(&f.authority, &scope, &canonical)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: recipient_pin succeeds");
-        let sent = f
-            .store
-            .publish(&f.authority, message, &f.sender, f.clock.now() + 300, None)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: publish succeeds");
-        assert_eq!(
-            sent.seq, n,
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-        assert_eq!(
-            sent.stream_id,
-            Uuid::from_u128(STREAM),
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-        let outgoing = f
-            .store
-            .pending_outbox(&f.sender, &f.source)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: pending_outbox succeeds");
-        let message = outgoing
-            .iter()
-            .find(|pending| pending.message().id == sent.message_id)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: find succeeds")
-            .message()
-            .clone();
-        f.store
-            .accept(&f.authority, message)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: accept succeeds");
-        drop(outgoing);
-        let store = f.store.clone();
-        let scope = scope.clone();
-        let address = f.target.clone();
-        let adopted = tokio::spawn(async move {
-            let _owner = store
-                .execution_guard(&scope, &address, run)
-                .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: execution_guard succeeds");
-            let delivered = store
-                .deliver(&scope, &address)
-                .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: deliver succeeds")
-                .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: deliver returns a value");
-            assert_eq!(
-                delivered.message().to,
-                address,
-                "send before and after task reopen uses same session addr: expected messaging contract changed"
-            );
-            store
-                .adopt(&delivered)
-                .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: adopt succeeds")
-        })
-        .await
-        .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: tokio::spawn succeeds");
-        assert_eq!(
-            adopted.state,
-            DeliveryState::Consumed,
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-        f.store
-            .acknowledge(&f.sender, &f.target, sent.message_id, adopted.state)
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: acknowledge succeeds");
-        let restored = registry
-            .reconstruct(&f.target)
-            .await
-            .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: reconstruct succeeds");
-        assert_eq!(
-            restored.addr(),
-            &f.target,
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-        assert_eq!(
-            restored.history().len(),
-            usize::try_from(n)
-                .expect("test: send_before_and_after_task_reopen_uses_same_session_addr: usize::try_from succeeds"),
-            "send before and after task reopen uses same session addr: expected messaging contract changed"
-        );
-    }
-    assert_eq!(
-        f.scalar("SELECT count(*) FROM prx_mailbox_seq"),
-        1,
-        "send before and after task reopen uses same session addr: expected messaging contract changed"
-    );
-}
-
-#[tokio::test]
-async fn run_pinned_message_nacks_after_relaunch() {
-    use crate::chat::sessions::child::{ChildSession, ChildSessionRegistry, RelaunchRecipe};
-    let f = Fixture::new();
-    let registry = ChildSessionRegistry::new(Arc::new(f.memory.clone())).with_workspace(W.into());
-    registry
-        .insert(&ChildSession::new(
-            f.target.clone(),
-            None,
-            Some(RelaunchRecipe {
-                addr: f.target.clone(),
-                last_run: None,
-                inherited_provenance: None,
-            }),
-        ))
-        .await
-        .expect("test: run_pinned_message_nacks_after_relaunch: insert succeeds");
-    let restored = registry
-        .reconstruct(&f.target)
-        .await
-        .expect("test: run_pinned_message_nacks_after_relaunch: reconstruct succeeds");
-    let scope = restored
-        .mailbox_scope()
-        .expect("test: run_pinned_message_nacks_after_relaunch: mailbox_scope succeeds")
-        .clone();
-    drop(restored);
-    let canonical = ChildSessionRegistry::canonical_session_key(&f.target)
-        .expect("test: run_pinned_message_nacks_after_relaunch: ChildSessionRegistry::canonical_session_key succeeds");
-    let first = registry
-        .relaunch(&f.target)
-        .await
-        .expect("test: run_pinned_message_nacks_after_relaunch: relaunch succeeds")
-        .run
-        .expect("test: run_pinned_message_nacks_after_relaunch: required fixture value is present");
-    f.store
-        .set_execution(&scope, &f.target, Some(first.clone()))
-        .expect("test: run_pinned_message_nacks_after_relaunch: set_execution succeeds");
-    let mut message = f.message(1, 0);
-    message.to_pin = f
-        .store
-        .recipient_pin(&f.authority, &scope, &canonical)
-        .expect("test: run_pinned_message_nacks_after_relaunch: recipient_pin succeeds");
-    message.exec = Some(ExecRef {
-        run: Some(first.clone()),
-    });
-    let sent = f
-        .store
-        .publish(&f.authority, message.clone(), &f.sender, f.clock.now() + 300, None)
-        .expect("test: run_pinned_message_nacks_after_relaunch: publish succeeds");
-    let second = registry
-        .relaunch(&f.target)
-        .await
-        .expect("test: run_pinned_message_nacks_after_relaunch: relaunch succeeds")
-        .run
-        .expect("test: run_pinned_message_nacks_after_relaunch: required fixture value is present");
-    assert_ne!(
-        first, second,
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
-    );
-    f.store
-        .set_execution(&scope, &f.target, Some(second))
-        .expect("test: run_pinned_message_nacks_after_relaunch: set_execution succeeds");
-    let outgoing = f
-        .store
-        .pending_outbox(&f.sender, &f.source)
-        .expect("test: run_pinned_message_nacks_after_relaunch: pending_outbox succeeds");
-    let frame = outgoing
-        .first()
-        .expect("test: run_pinned_message_nacks_after_relaunch: first succeeds")
-        .message()
-        .clone();
-    let nack = f.store.accept(&f.authority, frame).unwrap_err();
-    assert_eq!(
-        nack,
-        MailboxError::StaleRun,
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
-    );
-    f.store
-        .reject_outbox(&f.sender, &f.target, sent.message_id, nack)
-        .expect("test: run_pinned_message_nacks_after_relaunch: reject_outbox succeeds");
-    let failed = f
-        .store
-        .publish(&f.authority, message, &f.sender, f.clock.now() + 300, None)
-        .expect("test: run_pinned_message_nacks_after_relaunch: publish succeeds");
-    assert_eq!(
-        failed.state,
-        crate::messaging::mailbox::MailboxSendState::Failed,
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
-    );
-    assert_eq!(
-        failed.error.as_deref(),
-        Some("stale_run"),
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
-    );
-    assert_eq!(
-        f.scalar("SELECT count(*) FROM prx_mailbox_messages"),
-        0,
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
-    );
-    assert_eq!(
-        f.scalar("SELECT count(*) FROM conversation_turns"),
-        0,
-        "run pinned message nacks after relaunch: recipient authority or scope isolation changed"
     );
 }
 

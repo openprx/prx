@@ -23,7 +23,7 @@
     },
     "allow_delegation": {
       "default": false,
-      "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins.",
+      "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks.",
       "type": "boolean"
     },
     "announce": {
@@ -99,7 +99,7 @@
       "type": "string"
     },
     "tasks": {
-      "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap; recursive grants permit one child. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
+      "description": "For 'spawn_batch': tasks to launch together. Ordinary batches have no fixed member cap. Each entry is a task string or an object {task, agent?, model?, provider?, allow_delegation?, mode?, recipient?}; any other key is rejected. Top-level parameters are per-entry defaults that an entry key overrides. Members never announce their own results: call 'join' with the returned batch_id and report them yourself.",
       "items": {
         "anyOf": [
           {
@@ -114,7 +114,7 @@
               },
               "allow_delegation": {
                 "default": false,
-                "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins.",
+                "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks.",
                 "type": "boolean"
               },
               "mode": {

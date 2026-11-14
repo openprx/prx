@@ -182,29 +182,10 @@ impl TurnRuntimeService {
                 allowed.insert(reference.clone());
             }
         } else {
-            for name in ["delegate", "sessions_spawn"] {
-                if let Some(entry) = self
-                    .catalog
-                    .entry_for_public_name(name)
-                    .filter(|entry| permitted(entry))
-                {
-                    allowed.insert(CapabilityRef {
-                        id: entry.id.clone(),
-                        fingerprint: entry.fingerprint,
-                        generation: entry.generation,
-                    });
-                }
-            }
-            // A root also owns its actual discovery control. Capture that
-            // reference when recursive spawning is permitted, so the child
-            // can drop it while retaining an explicitly requested delegator.
-            // An inherited child can never recover this root-only reference.
-            if self.generation.effective.sessions_spawn.allow_recursive_delegation
-                && let Some(entry) = self
-                    .catalog
-                    .entry_for_public_name("capability_search")
-                    .filter(|entry| permitted(entry))
-            {
+            // The root's sealed parent set is every permitted entry, the same
+            // rule the operator root uses. It is sealed parent authority and
+            // never published, so the parent turn's surface is unchanged.
+            for entry in catalog.iter_entries().filter(|entry| permitted(entry)) {
                 allowed.insert(CapabilityRef {
                     id: entry.id.clone(),
                     fingerprint: entry.fingerprint,

@@ -645,10 +645,8 @@
       "description": "Session spawning configuration (`[sessions_spawn]`).",
       "$ref": "#/$defs/SessionsSpawnConfig",
       "default": {
-        "allow_recursive_delegation": false,
         "cleanup_on_complete": true,
         "default_mode": "task",
-        "max_recursive_depth": 1,
         "process_memory_strategy": "shared_fabric",
         "worker_workspace_root": null
       }
@@ -5336,11 +5334,6 @@
       "description": "Sessions spawn configuration (`[sessions_spawn]` section).",
       "type": "object",
       "properties": {
-        "allow_recursive_delegation": {
-          "description": "Permit an explicitly requested, sealed recursive child grant.",
-          "type": "boolean",
-          "default": false
-        },
         "cleanup_on_complete": {
           "description": "Remove worker workspace directory after process-mode completion.",
           "type": "boolean",
@@ -5350,14 +5343,6 @@
           "description": "Default execution mode for sessions_spawn (`task` or `process`).",
           "type": "string",
           "default": "task"
-        },
-        "max_recursive_depth": {
-          "description": "Maximum additional delegation levels granted to an opted-in child.",
-          "type": "integer",
-          "format": "uint8",
-          "default": 1,
-          "maximum": 255,
-          "minimum": 0
         },
         "process_memory_strategy": {
           "description": "Memory strategy for process-mode workers.\n\nSupported values:\n- `shared_fabric`: worker uses the parent workspace memory DB.\n- `isolated_private`: worker uses its private DB.",

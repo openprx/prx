@@ -163,7 +163,7 @@ impl OrdinaryProcessLaunch {
             lease_epoch: envelope.lease_epoch,
             input,
             provider_selection: selection.clone(),
-            parent_source: crate::runtime::child_source::parent::ParentSource::capture(&publication.0.source)
+            parent_source: crate::runtime::child_source::parent::ParentSource::capture(&publication.inner.source)
                 .bind_process(child.parent_authority_id, &parent.key)?,
             provider_catalog: publication
                 .provider_catalog()
@@ -171,7 +171,7 @@ impl OrdinaryProcessLaunch {
             parent_constraints: parent.to_worker_constraints()?,
             capability_manifest: child.to_worker_manifest(),
             config_generation: publication.generation().bind_process(&parent.key)?,
-            catalog: publication.0.service.catalog.bind_process(&parent.key)?,
+            catalog: publication.inner.service.catalog.bind_process(&parent.key)?,
         };
         // Do not partially mutate the manifest if snapshot or backend revalidation fails.
         publication.verify_task_scope()?;

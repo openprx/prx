@@ -34,21 +34,17 @@ pub(super) fn request_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "boolean",
         "default": false,
-        "description": "For 'spawn' and 'spawn_batch': explicitly request a strictly narrower, sealed sessions_spawn grant for this child. Requires operator permission; supports one further level with one child per recursive grant, retaining the selected provider/model pins."
+        "description": "For 'spawn' and 'spawn_batch': let this child spawn its own children. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks."
     })
 }
 
-/// Refuse a recursive delegation opt-in. A recursive grant was issued only
-/// by the removed decision plane (P2-G4), so no parent can issue one; a
-/// missing or `false` opt-in is unchanged.
-pub(super) fn refuse_recursive_request(args: &serde_json::Value) -> anyhow::Result<()> {
+/// Read the recursive delegation opt-in. A missing or `false` opt-in keeps
+/// the captured child scope; `true` derives a scope that keeps
+/// `sessions_spawn`, under the same gates as a root spawn.
+pub(super) fn requested(args: &serde_json::Value) -> anyhow::Result<bool> {
     match args.get("allow_delegation") {
-        None | Some(serde_json::Value::Bool(false)) => Ok(()),
-        Some(serde_json::Value::Bool(true)) => {
-            anyhow::bail!(
-                "recursive child delegation requires a decision-issued parent grant, which is no longer issued"
-            )
-        }
+        None | Some(serde_json::Value::Bool(false)) => Ok(false),
+        Some(serde_json::Value::Bool(true)) => Ok(true),
         Some(_) => anyhow::bail!("allow_delegation must be a boolean"),
     }
 }
@@ -57,7 +53,7 @@ pub(super) fn refuse_recursive_request(args: &serde_json::Value) -> anyhow::Resu
 /// failed batch's generic result would otherwise hide its per-member reason.
 pub(super) fn validate_batch(members: &[(String, serde_json::Value)]) -> anyhow::Result<()> {
     for (_, args) in members {
-        refuse_recursive_request(args)?;
+        requested(args)?;
     }
     Ok(())
 }
@@ -76,11 +72,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recursive_request_is_refused_without_a_decision_issued_grant() {
-        assert!(refuse_recursive_request(&serde_json::json!({})).is_ok());
-        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": false})).is_ok());
-        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": "true"})).is_err());
-        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": true})).is_err());
+    fn recursive_request_parses_only_booleans() {
+        assert!(!requested(&serde_json::json!({})).unwrap());
+        assert!(!requested(&serde_json::json!({"allow_delegation": false})).unwrap());
+        assert!(requested(&serde_json::json!({"allow_delegation": true})).unwrap());
+        for invalid in [
+            serde_json::json!({"allow_delegation": "true"}),
+            serde_json::json!({"allow_delegation": 1}),
+            serde_json::json!({"allow_delegation": null}),
+        ] {
+            let error = requested(&invalid).unwrap_err();
+            assert_eq!(error.to_string(), "allow_delegation must be a boolean");
+        }
     }
 
     #[test]

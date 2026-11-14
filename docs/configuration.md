@@ -95,7 +95,7 @@ and the module-gate family are absorbed on load; they are not live switches.
 | `[agent]` | `compact_context = false`; `read_only_tool_concurrency_window = 2`; `priority_scheduling_enabled = false`; `low_priority_tools = ["sessions_spawn", "delegate"]` |
 | `[agent.compaction]` | `mode = "switch"`; `reserve_tokens = 4096`; `keep_recent_messages = 12`; `memory_flush = true`; `max_context_tokens = 128000` |
 | `[agent.compaction.os_paging]` | `eviction_threshold = 0.70`; `proactive_retrieval = true`; `max_recalled_pages = 10`; `retrieval_injection_role = "system"`; `keep_recent_messages = 12`. Exact `switch` handoffs skip paging |
-| `[sessions_spawn]` | `allow_recursive_delegation = false`; `max_recursive_depth = 1`; `default_mode = "task"`; `process_memory_strategy = "shared_fabric"`; `worker_workspace_root` unset; `cleanup_on_complete = true` |
+| `[sessions_spawn]` | `default_mode = "task"`; `process_memory_strategy = "shared_fabric"`; `worker_workspace_root` unset; `cleanup_on_complete = true` |
 | `[chat]` | `max_concurrent_visible_turns = 2` |
 | `[chat.daemon]` | `url = ""` (derived from `[gateway]`); `token = ""` |
 | `[self_system]` | `fitness_interval_hours = 24` (accepted, unused for scheduling); `evolution_interval_hours = 24`; `evolution_config_path` unset; `evolution_debug_raw = false`; `evolution_judge_timeout_secs = 180`; `evolution_model_max_tokens = 16384`; `evolution_model_max_micro_usd = 0` |
@@ -1251,27 +1251,12 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
 
-Recursive child delegation requires both an operator setting and an explicit
-`allow_delegation: true` spawn request:
-
-```toml
-[sessions_spawn]
-allow_recursive_delegation = false
-max_recursive_depth = 1
-```
-
-The permission defaults to false, including when loading an older config.
-When permission is enabled, `max_recursive_depth` must equal 1. Values above 1 are refused while
-permission is enabled; the current strict tool-subset contract supports one
-additional level. Each child remains a proper
-subset of its authenticated parent, cannot replenish depth or budget, and keeps
-the selected provider/model pins through descendants. Recursive publication
-subtracts a strict half-share of the remaining monetary balance, rounded down
-to whole cents; the parent retains the rest. Approval resume keeps the original
-run's consumed child slot and balance; if that state is unavailable after a
-restart, further recursive grants are refused. A request without the
-opt-in keeps the existing exact model-only scope. See [recursive child grants](tools.md)
-for admission, audit/status and rollback behavior.
+Recursive child delegation needs only an explicit `allow_delegation: true`
+spawn request; there is no operator setting. A child's `sessions_spawn` passes
+the same gates as a root session's at the same autonomy level (Full: no
+approval; Supervised: the ordinary side-effect approval; ReadOnly: refused).
+Only spawn depth, the funded budget and integrity checks bound nesting. See
+[recursive child grants](tools.md).
 
 The two modes also differ in the credential a named agent's child uses when the agent's `provider` is the gateway's own provider (any spelling of the same identity). Task mode reuses the gateway's provider chain, with the root `api_key` at the root `api_url`, and ignores the agent's own `api_key`. Process mode passes the agent's `api_key` to the worker, which presents it to that provider's default catalog host, because an `[agents.<name>]` entry has no URL field. In both modes a key only goes to its own provider identity.
 
@@ -1319,7 +1304,7 @@ effect) and its response carries the same `warning`.
 | `agent.concurrency_rollback_cancel_rate_threshold` | staged rollout retired |
 | `agent.concurrency_rollback_error_rate_threshold` | staged rollout retired |
 | `sessions_spawn.max_concurrent` | sub-agent fan-out is uncapped; use `prx tasks` to see and end runs |
-| `sessions_spawn.max_spawn_depth` | legacy global limit is ignored; explicit recursive grants use `max_recursive_depth` |
+| `sessions_spawn.max_spawn_depth` | legacy global limit is ignored; nesting is bounded by the sealed spawn depth |
 | `sessions_spawn.max_children_per_agent` | per-session fan-out is uncapped |
 | `scheduler.max_concurrent` | due cron jobs all start at once; use `prx tasks` to see and end them |
 | `xin.max_concurrent` | due Xin work is no longer capped by an arbitrary configuration ceiling |

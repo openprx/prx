@@ -1,4 +1,4 @@
-use super::{Deserialize, JsonSchema, Serialize, default_true, recursive_spawn};
+use super::{Deserialize, JsonSchema, Serialize, default_true};
 
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -158,12 +158,6 @@ pub(super) const fn default_os_paging_keep_recent_messages() -> usize {
 /// Sessions spawn configuration (`[sessions_spawn]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionsSpawnConfig {
-    /// Permit an explicitly requested, sealed recursive child grant.
-    #[serde(default)]
-    pub allow_recursive_delegation: bool,
-    /// Maximum additional delegation levels granted to an opted-in child.
-    #[serde(default = "recursive_spawn::default_depth")]
-    pub max_recursive_depth: u8,
     /// Default execution mode for sessions_spawn (`task` or `process`).
     #[serde(default = "default_sessions_spawn_mode")]
     pub default_mode: String,
@@ -186,9 +180,19 @@ pub struct SessionsSpawnConfig {
 
 pub const HYBRID_PROCESS_MEMORY_UNAVAILABLE: &str = "sessions_spawn.process_memory_strategy='hybrid' is unavailable: the production merge consumer and merge/reject/ack/cleanup protocol do not exist; use 'shared_fabric' or 'isolated_private'";
 
+impl Default for SessionsSpawnConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: default_sessions_spawn_mode(),
+            process_memory_strategy: default_sessions_spawn_process_memory_strategy(),
+            worker_workspace_root: None,
+            cleanup_on_complete: default_sessions_spawn_cleanup_on_complete(),
+        }
+    }
+}
+
 impl SessionsSpawnConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        recursive_spawn::validate(self)?;
         match self.process_memory_strategy.trim() {
             "" | "shared_fabric" | "isolated_private" => Ok(()),
             "hybrid" => anyhow::bail!(HYBRID_PROCESS_MEMORY_UNAVAILABLE),

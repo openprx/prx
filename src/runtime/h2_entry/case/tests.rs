@@ -16,7 +16,6 @@ fn nested_case_registry_is_fixed_and_data_storage_never_overlaps_runtime_state()
     config.tunnel.provider = "none".into();
     config.plugins.enabled = false;
     config.memory.backend = "sqlite".into();
-    config.sessions_spawn.allow_recursive_delegation = false;
     config.tool_tiering.always_include = vec!["file_read".into(), "file_write".into(), "file_edit".into()];
     let security = Arc::new(crate::security::SecurityPolicy {
         workspace_dir: state,

@@ -2987,10 +2987,6 @@ bot_token = "***"
             "config/schema/ramflux_channel.rs",
             include_str!("schema/ramflux_channel.rs"),
         ),
-        (
-            "config/schema/recursive_spawn.rs",
-            include_str!("schema/recursive_spawn.rs"),
-        ),
         ("config/schema/routing.rs", include_str!("schema/routing.rs")),
         ("config/schema/runtime.rs", include_str!("schema/runtime.rs")),
         ("config/schema/secrets.rs", include_str!("schema/secrets.rs")),

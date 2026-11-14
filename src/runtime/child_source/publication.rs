@@ -26,14 +26,34 @@ use std::sync::atomic::Ordering;
 /// Read-only provenance for ordinary disabled children. Retaining the actual
 /// service preserves its catalog, PMM and runtime extension generation.
 #[derive(Clone)]
-pub(crate) struct OrdinaryChildPublication(Arc<OrdinaryChildPublicationInner>);
+pub(crate) struct OrdinaryChildPublication {
+    inner: Arc<OrdinaryChildPublicationInner>,
+    /// The selected child scope. A recursive derivation replaces only this
+    /// half and keeps the authenticated parent half (`inner`) shared.
+    scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
+}
 
 struct OrdinaryChildPublicationInner {
     context: Arc<OpenedTurn>,
     authority: crate::runtime::child_source::ParentAuthority,
-    scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
     service: Arc<TurnRuntimeService>,
     source: crate::runtime::turn_source::OwnedTurnSourceProof,
+}
+
+/// Why a recursive child scope could not be derived from the caller's
+/// ordinary publication.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecursiveDelegationRefused {
+    #[error("recursive delegation requires the caller's own ordinary child publication")]
+    ForeignParent,
+    #[error("recursive delegation requires sessions_spawn in the sealed parent authority")]
+    NoDelegator,
+    #[error("recursive delegation refused: spawn depth is exhausted")]
+    DepthExhausted,
+    #[error("recursive child manifest refused: {0}")]
+    Manifest(#[from] crate::tools::capability::child::ChildManifestError),
+    #[error("recursive delegation caller verification failed: {0:#}")]
+    Caller(#[source] anyhow::Error),
 }
 
 impl std::fmt::Debug for OrdinaryChildPublication {
@@ -44,18 +64,18 @@ impl std::fmt::Debug for OrdinaryChildPublication {
 
 impl PartialEq for OrdinaryChildPublication {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.inner, &other.inner) && Arc::ptr_eq(&self.scope, &other.scope)
     }
 }
 impl Eq for OrdinaryChildPublication {}
 
 impl OrdinaryChildPublication {
     pub(crate) fn parent_authority(&self) -> &crate::runtime::child_source::ParentAuthority {
-        &self.0.authority
+        &self.inner.authority
     }
 
     pub(crate) fn intercepts_writes(&self) -> bool {
-        self.0.source.intercepts_writes()
+        self.inner.source.intercepts_writes()
     }
 
     pub(crate) fn dispatch_pin(
@@ -64,8 +84,8 @@ impl OrdinaryChildPublication {
         workspace: &str,
     ) -> Arc<crate::tools::capability::child::ChildDispatchPin> {
         crate::tools::capability::child::ChildDispatchPin::for_scope(
-            &self.0.scope,
-            Arc::clone(&self.0.service.catalog),
+            &self.scope,
+            Arc::clone(&self.inner.service.catalog),
             owner,
             workspace,
         )
@@ -86,22 +106,82 @@ impl OrdinaryChildPublication {
             manifest,
             &authority.constraints,
         )?);
-        Ok(Self(Arc::new(OrdinaryChildPublicationInner {
-            context: Arc::clone(context),
-            authority,
+        Ok(Self {
+            inner: Arc::new(OrdinaryChildPublicationInner {
+                context: Arc::clone(context),
+                authority,
+                service: Arc::clone(service),
+                source: crate::runtime::turn_source::OwnedTurnSourceProof::capture(source),
+            }),
             scope,
-            service: Arc::clone(service),
-            source: crate::runtime::turn_source::OwnedTurnSourceProof::capture(source),
-        })))
+        })
+    }
+
+    /// Both publications were captured from the same authenticated parent.
+    pub(crate) fn same_parent(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Derive a child scope that keeps `sessions_spawn`, so the child can
+    /// spawn its own children. The parent half stays shared; only the
+    /// selected scope changes, and it is a strict subset of the parent.
+    pub(crate) fn with_recursive_delegation(
+        &self,
+        caller: &crate::tools::ToolExecutionContext,
+    ) -> Result<Self, RecursiveDelegationRefused> {
+        if caller.ordinary_child_publication.as_ref() != Some(self) {
+            return Err(RecursiveDelegationRefused::ForeignParent);
+        }
+        self.verify_caller(caller).map_err(RecursiveDelegationRefused::Caller)?;
+        let constraints = &self.inner.authority.constraints;
+        let delegator = self
+            .inner
+            .service
+            .catalog
+            .entry_for_public_name("sessions_spawn")
+            .map(|entry| CapabilityRef {
+                id: entry.id.clone(),
+                fingerprint: entry.fingerprint,
+                generation: entry.generation,
+            })
+            .filter(|reference| constraints.allowed.contains(reference))
+            .ok_or(RecursiveDelegationRefused::NoDelegator)?;
+        let mut requested: Vec<CapabilityRef> = self.scope.gate_inputs().0.allowed.iter().cloned().collect();
+        if !requested.contains(&delegator) {
+            requested.push(delegator);
+        }
+        let manifest =
+            crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(constraints, &requested)?;
+        if manifest.authority.remaining_depth == 0 {
+            return Err(RecursiveDelegationRefused::DepthExhausted);
+        }
+        let scope = crate::tools::capability::child::VerifiedChildScope::new(manifest, constraints)?;
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            scope: Arc::new(scope),
+        })
+    }
+
+    /// A re-scoped publication must share the caller's authenticated parent
+    /// and pass the ordinary caller verification for its selected scope.
+    pub(crate) fn verify_derived_from(&self, caller: &crate::tools::ToolExecutionContext) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            caller
+                .ordinary_child_publication
+                .as_ref()
+                .is_some_and(|publication| publication.same_parent(self)),
+            "re-scoped ordinary child publication belongs to another parent"
+        );
+        self.verify_caller(caller)
     }
 
     pub(crate) fn verify_caller(&self, caller: &crate::tools::ToolExecutionContext) -> anyhow::Result<()> {
-        let source = &self.0.source;
+        let source = &self.inner.source;
         let envelope = &caller.envelope;
-        validate_agent_turn_origin(&self.0.service.generation, self.0.service.surface, source)?;
+        validate_agent_turn_origin(&self.inner.service.generation, self.inner.service.surface, source)?;
         anyhow::ensure!(
-            !self.0.context.runtime().execution_closed.load(Ordering::Acquire)
-                && caller.execution_trace.as_ref() == self.0.context.runtime().execution_trace.get()
+            !self.inner.context.runtime().execution_closed.load(Ordering::Acquire)
+                && caller.execution_trace.as_ref() == self.inner.context.runtime().execution_trace.get()
                 && envelope.workspace_id == source.workspace_id()
                 && envelope.resolved_owner_id() == source.owner_id()
                 && envelope.session_key == source.session_key()
@@ -116,13 +196,13 @@ impl OrdinaryChildPublication {
                 && caller.execution_trace.as_ref().is_some_and(|trace| !trace.is_sealed()),
             "ordinary child publication differs from its live caller"
         );
-        self.0.scope.validate_runtime(
-            &self.0.service.state_key,
+        self.scope.validate_runtime(
+            &self.inner.service.state_key,
             source.owner_id(),
             source.workspace_id(),
-            *self.0.service.catalog.generation(),
+            *self.inner.service.catalog.generation(),
         )?;
-        self.0.service.check_live_parity()?;
+        self.inner.service.check_live_parity()?;
         Ok(())
     }
 
@@ -130,9 +210,9 @@ impl OrdinaryChildPublication {
     /// A child cannot outlive the parent execution that selected its manifest.
     pub(in crate::runtime) fn verify_live(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.0.context.runtime().execution_closed.load(Ordering::Acquire)
+            !self.inner.context.runtime().execution_closed.load(Ordering::Acquire)
                 && self
-                    .0
+                    .inner
                     .context
                     .runtime()
                     .execution_trace
@@ -140,18 +220,18 @@ impl OrdinaryChildPublication {
                     .is_some_and(|trace| !trace.is_sealed()),
             "ordinary child parent execution is closed"
         );
-        self.0.scope.validate_runtime(
-            &self.0.service.state_key,
-            self.0.source.owner_id(),
-            self.0.source.workspace_id(),
-            *self.0.service.catalog.generation(),
+        self.scope.validate_runtime(
+            &self.inner.service.state_key,
+            self.inner.source.owner_id(),
+            self.inner.source.workspace_id(),
+            *self.inner.service.catalog.generation(),
         )?;
-        self.0.service.check_live_parity()?;
+        self.inner.service.check_live_parity()?;
         Ok(())
     }
 
     fn allocate_child_budget(&self) -> anyhow::Result<(u32, Arc<super::recursive_allowance::RecursiveAllowance>)> {
-        self.0
+        self.inner
             .authority
             .allowance
             .carve_ordinary_child(self.scope().gate_inputs().0.authority.max_cost_cents)
@@ -189,7 +269,7 @@ impl OrdinaryChildPublication {
         excluded_tools: &[String],
     ) -> anyhow::Result<Arc<TurnRuntimeService>> {
         let runtime = self.loop_runtime()?.clone();
-        let parent = &self.0.service;
+        let parent = &self.inner.service;
         let (registry, execution) = task_registry.map_or_else(
             || (Arc::clone(&parent.registry), Arc::clone(&parent.execution)),
             |registry| {
@@ -288,55 +368,59 @@ impl OrdinaryChildPublication {
     /// Validate frozen scope and live backend bindings for an already issued
     /// task. The task authority separately checks its own cancellation lease.
     pub(crate) fn verify_task_scope(&self) -> anyhow::Result<()> {
-        self.0.scope.validate_runtime(
-            &self.0.service.state_key,
-            self.0.source.owner_id(),
-            self.0.source.workspace_id(),
-            *self.0.service.catalog.generation(),
+        self.scope.validate_runtime(
+            &self.inner.service.state_key,
+            self.inner.source.owner_id(),
+            self.inner.source.workspace_id(),
+            *self.inner.service.catalog.generation(),
         )?;
-        self.0
+        self.inner
             .service
             .catalog
-            .check_child_parity(&self.0.service.execution, self.scope())?;
+            .check_child_parity(&self.inner.service.execution, self.scope())?;
         Ok(())
     }
 
     pub(crate) fn allows_tool(&self, name: &str) -> bool {
-        self.0.service.catalog.entry_for_public_name(name).is_some_and(|entry| {
-            self.scope()
-                .gate_inputs()
-                .0
-                .allowed
-                .contains(&crate::tools::capability::contract::CapabilityRef {
-                    id: entry.id.clone(),
-                    fingerprint: entry.fingerprint,
-                    generation: entry.generation,
-                })
-        })
+        self.inner
+            .service
+            .catalog
+            .entry_for_public_name(name)
+            .is_some_and(|entry| {
+                self.scope()
+                    .gate_inputs()
+                    .0
+                    .allowed
+                    .contains(&crate::tools::capability::contract::CapabilityRef {
+                        id: entry.id.clone(),
+                        fingerprint: entry.fingerprint,
+                        generation: entry.generation,
+                    })
+            })
     }
 
     pub(crate) fn scope(&self) -> &Arc<crate::tools::capability::child::VerifiedChildScope> {
-        &self.0.scope
+        &self.scope
     }
 
     pub(crate) fn generation(&self) -> &Arc<crate::config::ConfigGeneration> {
-        &self.0.service.generation
+        &self.inner.service.generation
     }
 
     pub(crate) fn model_source(&self) -> (&str, &str, &crate::providers::credentials::CredentialRef) {
         (
-            self.0.source.provider_name(),
-            self.0.source.model_name(),
-            self.0.source.model_binding().credential_reference(),
+            self.inner.source.provider_name(),
+            self.inner.source.model_name(),
+            self.inner.source.model_binding().credential_reference(),
         )
     }
 
     pub(crate) fn provider_catalog(&self) -> &crate::providers::catalog::CatalogView {
-        &self.0.service.provider_catalog
+        &self.inner.service.provider_catalog
     }
 
     pub(crate) fn loop_runtime(&self) -> anyhow::Result<&PublicationLoopRuntime> {
-        self.0
+        self.inner
             .service
             .loop_runtime
             .as_ref()
@@ -344,19 +428,19 @@ impl OrdinaryChildPublication {
     }
 
     pub(crate) fn security(&self) -> &Arc<crate::security::SecurityPolicy> {
-        &self.0.service.security
+        &self.inner.service.security
     }
 
     pub(crate) fn memory(&self) -> &Arc<dyn crate::memory::Memory> {
-        &self.0.service.memory
+        &self.inner.service.memory
     }
 
     pub(crate) fn source_fabric(&self) -> crate::memory::MemoryFabric {
-        crate::memory::MemoryFabric::new(Arc::clone(self.memory()), self.0.source.workspace_id())
+        crate::memory::MemoryFabric::new(Arc::clone(self.memory()), self.inner.source.workspace_id())
             .with_event_recording(self.generation().effective.memory.event_recording_config())
     }
 
     pub(crate) fn memory_scope(&self) -> &crate::memory::principal::MemoryWriteContext {
-        self.0.source.memory_scope()
+        self.inner.source.memory_scope()
     }
 }

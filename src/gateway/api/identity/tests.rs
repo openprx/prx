@@ -11,7 +11,6 @@ async fn fixture() -> super::super::test_support::Served {
         config.plugins.enabled = false;
         config.gateway.require_pairing = true;
         config.gateway.paired_tokens = vec![TOKEN.into()];
-        config.sessions_spawn.allow_recursive_delegation = false;
     })
     .await;
     let config = served.state.config.load_full();

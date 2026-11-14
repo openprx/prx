@@ -1091,6 +1091,22 @@ impl ChildCallContext {
     pub(crate) const fn context(&self) -> &ToolExecutionContext {
         &self.context
     }
+
+    /// Re-scope this receipt onto a publication derived from the caller's own
+    /// authenticated parent. Besides the dispatch boundary, this is the only
+    /// constructor, and it refuses any object with a different parent.
+    pub(crate) fn with_ordinary_publication(
+        &self,
+        derived: crate::runtime::child_source::publication::OrdinaryChildPublication,
+    ) -> anyhow::Result<Self> {
+        derived.verify_derived_from(&self.context)?;
+        let mut context = self.context.clone();
+        context.ordinary_child_publication = Some(derived);
+        Ok(Self {
+            tool_name: self.tool_name,
+            context,
+        })
+    }
 }
 
 tokio::task_local! {

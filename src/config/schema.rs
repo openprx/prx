@@ -1,6 +1,5 @@
 mod codex_effort;
 pub use codex_effort::InvalidCodexReasoningEffort;
-mod recursive_spawn;
 
 use crate::auth::codex_auth::default_codex_auth_json_path;
 use crate::config::files::{build_split_tables, read_merged_toml_with_gate};

@@ -197,10 +197,6 @@ impl ControlledH2Profile {
             config.memory.backend == "sqlite",
             "controlled experiments require native SQLite memory"
         );
-        ensure!(
-            !config.sessions_spawn.allow_recursive_delegation,
-            "controlled experiments refuse recursive process delegation"
-        );
         let channels = serde_json::to_value(&config.channels_config)?;
         ensure!(
             channels

@@ -21,7 +21,6 @@ impl Fixture {
         config.runtime.kind = "native".into();
         config.tunnel.provider = "none".into();
         config.plugins.enabled = false;
-        config.sessions_spawn.allow_recursive_delegation = false;
         ControlledH2Profile::validate_config(&config).unwrap();
         let owner = config.skills_lifecycle.owner().unwrap().unwrap();
         let store = SkillLifecycleStore::open(&workspace, owner.clone()).unwrap();
@@ -195,9 +194,8 @@ fn changed_config_revokes_before_any_second_dispatch() {
 #[test]
 fn strict_profile_refuses_executable_and_remote_factories_before_writes() {
     let fixture = Fixture::new(EntryKind::Terminal);
-    let edits: [fn(&mut Config); 5] = [
+    let edits: [fn(&mut Config); 4] = [
         |c: &mut Config| c.plugins.enabled = true,
-        |c: &mut Config| c.sessions_spawn.allow_recursive_delegation = true,
         |c: &mut Config| c.runtime.kind = "docker".into(),
         |c: &mut Config| c.storage.provider.config.db_url = Some("postgres://invalid".into()),
         |c: &mut Config| c.default_provider = Some("exec:untrusted".into()),
