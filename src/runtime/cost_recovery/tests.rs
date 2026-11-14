@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{Cadence, CostOutboxProjector, PassReport, run_pass, warn_legacy_files};
+use super::{Cadence, CostOutboxProjector, PassObserver, PassReport, run_pass, warn_legacy_files};
 use crate::agent::terminal::{bind_terminal_fixture, completed_commit, finalize_turn, priced_cost_config};
 use crate::memory::fabric::MemoryFabric;
 use crate::memory::recovery_authority::RecoveryCostState;
@@ -299,26 +299,61 @@ const TEST_CADENCE: Cadence = Cadence {
     max: std::time::Duration::from_millis(200),
 };
 
+/// Scheduler passes a test observes at most; a full channel drops reports.
+const OBSERVED_PASSES: usize = 64;
+/// The longest a test waits for one observed scheduler pass.
+const PASS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The next observed pass report that satisfies `wanted`, skipping others
+/// (another test's re-arm can wake the scheduler for an extra pass), within
+/// [`PASS_WAIT`].
+async fn observed_pass(
+    passes: &mut tokio::sync::mpsc::Receiver<PassReport>,
+    wanted: impl Fn(&PassReport) -> bool,
+) -> Option<PassReport> {
+    tokio::time::timeout(PASS_WAIT, async {
+        while let Some(report) = passes.recv().await {
+            if wanted(&report) {
+                return Some(report);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// P2-R5/OV-11: the real background scheduler, idle after an empty startup
 /// pass, is re-armed when an inline projection leaves its row in `error`
 /// (here the ledger cannot be opened). While the failure lasts, the row stays
-/// retryable and the scheduler keeps retrying on its back-off; once the
-/// failure clears, the next scheduled pass acknowledges the row exactly once.
+/// retryable and the scheduler retries it on its back-off; once the failure
+/// clears, the next scheduled pass acknowledges the row exactly once. Each
+/// transition is observed from the scheduler's own pass reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_scheduler_rearms_after_empty_pass_and_retries_transient_failures() {
     let cost = priced_cost_config();
     let (_dir, ws) = workspace();
     let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(&ws).expect("test: memory"));
     let shutdown = tokio_util::sync::CancellationToken::new();
+    let (sender, mut passes) = tokio::sync::mpsc::channel(OBSERVED_PASSES);
     let projector = CostOutboxProjector::spawn(
         Arc::clone(&memory),
         ws.clone(),
         cost.clone(),
         shutdown.child_token(),
         TEST_CADENCE,
+        PassObserver { sender: Some(sender) },
     );
-    // The startup pass sees an empty outbox and the scheduler goes idle.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The startup pass completes an exhausted scan of the empty outbox: the
+    // scheduler goes idle and waits for a re-arm.
+    let startup = observed_pass(&mut passes, |_| true)
+        .await
+        .expect("test: the startup pass is observed");
+    assert!(
+        startup.exhausted && startup.retryable_left == 0,
+        "the startup pass is an exhausted scan: {startup:?}"
+    );
     assert!(fixture_readback::outbox_rows(&ws).is_empty());
 
     // The turn is admitted against a healthy ledger; then a transient ledger
@@ -339,19 +374,28 @@ async fn background_scheduler_rearms_after_empty_pass_and_retries_transient_fail
         Some("error"),
         "the inline projection left the row retryable"
     );
-    // Several back-off passes run while the failure lasts; the row stays
-    // retryable and nothing reaches the ledger.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The re-armed scheduler runs a pass that sees the row and fails to
+    // project it while the failure lasts: the row stays retryable and
+    // nothing reaches the ledger.
+    let failed = observed_pass(&mut passes, |report| {
+        report.retryable_seen > 0 && report.retryable_left > 0
+    })
+    .await
+    .expect("test: a failed scheduled projection is observed");
+    assert_eq!(failed.progressed, 0, "the failed pass changed nothing: {failed:?}");
     assert_eq!(outbox_state(&ws, "prx-rearm").as_deref(), Some("error"));
+    assert!(ledger.is_dir(), "nothing replaced the blocked ledger");
 
+    // Only now the failure clears; a later scheduled pass on the back-off
+    // acknowledges the row.
     std::fs::remove_dir(&ledger).expect("test: clear the ledger failure");
-    assert!(
-        eventually(std::time::Duration::from_secs(10), || {
-            outbox_state(&ws, "prx-rearm").as_deref() == Some("acknowledged")
-        })
-        .await,
-        "the scheduler retried the row after the failure cleared"
-    );
+    let acknowledged = observed_pass(&mut passes, |report| {
+        report.progressed > 0 && report.retryable_left == 0
+    })
+    .await
+    .expect("test: the scheduler retried the row after the failure cleared");
+    assert!(acknowledged.retryable_seen > 0, "{acknowledged:?}");
+    assert_eq!(outbox_state(&ws, "prx-rearm").as_deref(), Some("acknowledged"));
     assert_eq!(ledger_lines(&ws, "prx-rearm"), 1);
     assert!(projector.stop().await);
 }

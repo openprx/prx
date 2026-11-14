@@ -64,6 +64,29 @@ static REARM_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// One legacy-file warning per process.
 static LEGACY_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Where the scheduler reports each pass: nowhere in production; in tests,
+/// a bounded channel, so a test observes the scheduler's passes instead of
+/// sleeping.
+#[derive(Default)]
+struct PassObserver {
+    #[cfg(test)]
+    sender: Option<tokio::sync::mpsc::Sender<PassReport>>,
+}
+
+impl PassObserver {
+    #[cfg(not(test))]
+    const fn observe(_observer: &Self, _report: PassReport) {}
+
+    #[cfg(test)]
+    fn observe(observer: &Self, report: PassReport) {
+        if let Some(sender) = &observer.sender {
+            // A full channel or a test that stopped observing only loses
+            // this observation; the scheduler never waits on a test.
+            let _ = sender.try_send(report);
+        }
+    }
+}
+
 /// What one pass saw and changed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PassReport {
@@ -108,6 +131,7 @@ impl CostOutboxProjector {
             cost_config,
             shutdown.child_token(),
             Cadence::PROCESS,
+            PassObserver::default(),
         )
     }
 
@@ -117,6 +141,7 @@ impl CostOutboxProjector {
         cost_config: CostConfig,
         cancel: CancellationToken,
         cadence: Cadence,
+        observer: PassObserver,
     ) -> Self {
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
@@ -133,6 +158,7 @@ impl CostOutboxProjector {
                 if task_cancel.is_cancelled() {
                     return;
                 }
+                PassObserver::observe(&observer, report);
                 let wait = cadence.next_wait(&report, &mut interval);
                 let notified = REARM.notified();
                 tokio::pin!(notified);
