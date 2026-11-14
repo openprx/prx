@@ -20,7 +20,7 @@ fn invocation(fixture: &Fixture, action: EntryAction) -> Arc<EntryInvocation> {
         run: source.run.clone(),
         event: source.event.clone(),
     };
-    EntryInvocation::admit(origin, call).unwrap()
+    EntryInvocation::admit(origin, call, None).unwrap()
 }
 #[test]
 fn exact_call_cannot_change_action_or_arguments_and_consumes_once() {
@@ -136,7 +136,7 @@ fn gateway_mutation_without_private_local_owner_stamp_cannot_admit() {
     let read = invocation(&fixture, EntryAction::Catalog);
     let mut mutation = read.call.clone();
     mutation.action = EntryAction::Publish;
-    assert!(EntryInvocation::admit(fixture.origin(), mutation).is_err());
+    assert!(EntryInvocation::admit(fixture.origin(), mutation, None).is_err());
 }
 
 /// Uses the real recorded Chat issuer and producer binding; never compiled in production.
@@ -179,7 +179,7 @@ where
         run: source.run.clone(),
         event: source.event.clone(),
     };
-    let invocation = EntryInvocation::admit(origin, call).unwrap();
+    let invocation = EntryInvocation::admit(origin, call, None).unwrap();
     let command = invocation.consume(EntryAction::Plan, &"a".repeat(64)).unwrap();
     command.continuation_scope(work(fixture.config.clone())).await
 }
@@ -261,7 +261,7 @@ pub(crate) async fn test_exact_call_scope<F: std::future::Future>(args: &serde_j
         run: source.run.clone(),
         event: source.event.clone(),
     };
-    let invocation = EntryInvocation::admit(origin, call).unwrap();
+    let invocation = EntryInvocation::admit(origin, call, None).unwrap();
     scope_invocation(Some((invocation, tokio_util::sync::CancellationToken::new())), work).await
 }
 

@@ -37,7 +37,7 @@ pub async fn run_gateway_controlled(
 pub(super) async fn start_local_control(producer: TerminalInputProducer, shutdown: CancellationToken) -> Result<()> {
     let authority = producer.into_local_control()?;
     let profile = Arc::clone(authority.profile());
-    println!("Controlled local control: exit");
+    println!("Controlled local control: approve REVIEW CALL_DIGEST; deny REVIEW; exit");
     let thread = std::thread::Builder::new()
         .name("prx-h2-local-review".into())
         .spawn(move || {
@@ -68,7 +68,7 @@ pub(super) async fn start_local_control(producer: TerminalInputProducer, shutdow
                                     shutdown.cancel();
                                     Ok::<_, anyhow::Error>("local authority revoked".to_owned())
                                 }
-                                _ => Err(anyhow::anyhow!("invalid bounded local-control command")),
+                                fields => authority.review_command(fields),
                             };
                             match outcome {
                                 Ok(output) => println!("{output}"),
@@ -83,6 +83,7 @@ pub(super) async fn start_local_control(producer: TerminalInputProducer, shutdow
                 }
                 Ok(())
             })();
+            authority.cancel_reviews();
             authority.profile().revoke();
             shutdown.cancel();
             if let Err(error) = result {

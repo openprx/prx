@@ -1,4 +1,5 @@
 use super::profile::digest;
+use super::review::LocalOwnerReview;
 use super::{ControlledH2Profile, VerifiedEntryOrigin};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,7 @@ pub(crate) struct EntryInvocation {
     origin: Arc<VerifiedEntryOrigin>,
     call: EntryCall,
     consumed: AtomicBool,
+    local_review: Option<LocalOwnerReview>,
 }
 impl std::fmt::Debug for EntryInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,7 +77,24 @@ impl std::fmt::Debug for EntryInvocation {
     }
 }
 impl EntryInvocation {
-    fn admit(origin: Arc<VerifiedEntryOrigin>, call: EntryCall) -> Result<Arc<Self>> {
+    /// Admits `call`, first asking the original local owner when it is a
+    /// Gateway lifecycle mutation (publish, annotate, rollback, retire).
+    pub(super) async fn admit_reviewed(origin: Arc<VerifiedEntryOrigin>, call: EntryCall) -> Result<Arc<Self>> {
+        let review = if Self::needs_local_review(&origin, &call) {
+            Some(LocalOwnerReview::request(&origin, &call).await?)
+        } else {
+            None
+        };
+        Self::admit(origin, call, review)
+    }
+    fn needs_local_review(origin: &VerifiedEntryOrigin, call: &EntryCall) -> bool {
+        call.action.requires_local_review() && origin.record().kind == "gateway"
+    }
+    pub(super) fn admit(
+        origin: Arc<VerifiedEntryOrigin>,
+        call: EntryCall,
+        local_review: Option<LocalOwnerReview>,
+    ) -> Result<Arc<Self>> {
         origin.ensure_live()?;
         let source = origin.record();
         ensure!(
@@ -89,22 +108,31 @@ impl EntryInvocation {
                 && call.tool == "skills_manage",
             "controlled call source changed"
         );
-        // The local owner review was a decision-approval attestation and is
-        // retired; Gateway lifecycle actions that required it are refused.
-        ensure!(
-            !(call.action.requires_local_review() && source.kind == "gateway"),
-            "local lifecycle owner review required"
-        );
+        if Self::needs_local_review(&origin, &call) {
+            local_review
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("local lifecycle owner review required"))?
+                .verify(&origin, &call)?;
+        }
         Ok(Arc::new(Self {
             origin,
             call,
             consumed: AtomicBool::new(false),
+            local_review,
         }))
     }
-    pub(crate) fn from_verified(
+    /// Admits an actual verified backend call; a Gateway lifecycle mutation
+    /// waits for the original local owner's review of this exact call.
+    pub(crate) async fn from_verified(
         origin: Arc<VerifiedEntryOrigin>,
         verified: &crate::tools::capability::execution_binding::VerifiedExecutionCall,
     ) -> Result<Arc<Self>> {
+        let call = Self::verified_call(verified)?;
+        Self::admit_reviewed(origin, call).await
+    }
+    fn verified_call(
+        verified: &crate::tools::capability::execution_binding::VerifiedExecutionCall,
+    ) -> Result<EntryCall> {
         let command = verified.command();
         ensure!(command.name == "skills_manage", "controlled call has another backend");
         let action = EntryAction::parse(
@@ -135,7 +163,7 @@ impl EntryInvocation {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("controlled event missing"))?,
         };
-        Self::admit(origin, call)
+        Ok(call)
     }
     pub(crate) fn ensure_live(&self) -> Result<()> {
         self.origin.ensure_live()
@@ -146,6 +174,9 @@ impl EntryInvocation {
             self.call.action == action && self.call.args_sha256 == args_sha256,
             "controlled call arguments changed"
         );
+        if let Some(review) = &self.local_review {
+            review.verify(&self.origin, &self.call)?;
+        }
         ensure!(
             !self.consumed.swap(true, Ordering::AcqRel),
             "controlled invocation already consumed"

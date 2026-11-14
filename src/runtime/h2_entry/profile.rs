@@ -46,6 +46,7 @@ pub(crate) struct ControlledH2Profile {
     roots: parking_lot::Mutex<
         std::collections::BTreeMap<String, crate::skills::lifecycle::experiment::ExperimentResources>,
     >,
+    pub(super) reviews: parking_lot::Mutex<std::collections::BTreeMap<String, super::review::PendingLocalReview>>,
 }
 /// The original reader owner retains observation through timeout and task drop.
 #[derive(Default)]
@@ -154,6 +155,7 @@ impl ControlledH2Profile {
             limits,
             reader: parking_lot::Mutex::new(ReaderState::default()),
             roots: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            reviews: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }))
     }
     pub(crate) fn validate_config(config: &Config) -> Result<()> {
@@ -271,6 +273,10 @@ impl ControlledH2Profile {
     }
     pub(crate) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
+    }
+    /// Whether the original terminal reader (the local owner) is running.
+    pub(super) fn has_reader(&self) -> bool {
+        self.reader.lock().handle.is_some()
     }
     pub(crate) fn own_reader(&self, reader: std::thread::JoinHandle<()>) -> Result<()> {
         let mut slot = self.reader.lock();

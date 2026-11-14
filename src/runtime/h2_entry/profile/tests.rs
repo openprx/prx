@@ -54,6 +54,7 @@ impl Fixture {
             },
             reader: parking_lot::Mutex::new(ReaderState::default()),
             roots: parking_lot::Mutex::new(Default::default()),
+            reviews: parking_lot::Mutex::new(Default::default()),
         });
         Self {
             directory,

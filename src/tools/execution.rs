@@ -2755,7 +2755,7 @@ impl ToolExecutionService {
             {
                 return Ok(None);
             }
-            Ok(Some(EntryInvocation::from_verified(origin, &verified)?))
+            Ok(Some(EntryInvocation::from_verified(origin, &verified).await?))
         }
         .await
         {
