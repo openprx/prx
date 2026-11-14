@@ -523,6 +523,7 @@ async fn t3_3_fix_b_effect_save_then_redraw_strict_order() {
             approval_router: Arc::new(ApprovalRouter::new()),
             tool_security_policy: full_tool_security_policy(),
             tool_tiering: crate::config::ToolTieringConfig::default(),
+            tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -593,6 +594,7 @@ async fn real_mode_request_redraw_pings_renderer() {
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
     let executor = EffectExecutor::new_with_deps(deps);
     executor.execute(Effect::RequestRedraw).await;
@@ -875,6 +877,7 @@ async fn real_mode_notify_hook_triggers_emit() {
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
     let executor = EffectExecutor::new_with_deps(deps);
 
@@ -1032,6 +1035,7 @@ async fn redraw_handle_injection_enables_request_redraw() {
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
 
     let executor = EffectExecutor::new_with_deps(deps);

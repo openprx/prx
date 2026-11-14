@@ -3243,7 +3243,10 @@ async fn active_turn_sessions_command_is_handled_without_enqueue() {
     .await
     .expect("sessions command output");
 
-    assert_eq!(output, "No child TUI sessions.");
+    assert_eq!(
+        output,
+        format!("current chat session: {}\nNo child TUI sessions.", chat_session.id)
+    );
     assert_eq!(backlog.len(), 1, "read-only sessions command must not mutate backlog");
 }
 

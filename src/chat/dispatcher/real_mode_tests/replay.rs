@@ -86,6 +86,7 @@ async fn s2_5_t2_5_3_notify_hook_repeat_no_double_fire() {
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
     let executor = EffectExecutor::new_with_deps(deps);
 

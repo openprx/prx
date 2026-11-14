@@ -123,22 +123,41 @@ fn compact_command_reports_window_and_reclaim_delta() {
 }
 
 #[test]
-fn compact_command_below_trigger_threshold_reports_noop() {
+fn compact_command_with_nothing_beyond_the_kept_window_reports_noop() {
     let config = crate::config::AgentCompactionConfig {
         reserve_tokens: 10,
         max_context_tokens: 10_000,
         max_context_tokens_explicit: true,
+        keep_recent_messages: 2,
         ..crate::config::AgentCompactionConfig::default()
     };
     let history = vec![ChatMessage::system("sys"), ChatMessage::user("short prompt")];
 
     assert!(
-        manual_compact_below_trigger_threshold(&history, &config),
-        "short history should not fall through to deterministic /compact trimming"
+        !manual_compact_has_compactable(&history, &config),
+        "a history inside the kept window has nothing to compact"
     );
     let feedback = format_nothing_to_compact_feedback(&history, &config);
     assert!(feedback.contains("Nothing to compact"), "{feedback}");
     assert!(feedback.contains("1 turns"), "{feedback}");
+}
+
+#[test]
+fn compact_command_below_the_budget_still_compacts_beyond_the_kept_window() {
+    let config = crate::config::AgentCompactionConfig {
+        max_context_tokens: 1_000_000,
+        max_context_tokens_explicit: true,
+        keep_recent_messages: 2,
+        ..crate::config::AgentCompactionConfig::default()
+    };
+    let history = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("one"),
+        ChatMessage::assistant("two"),
+        ChatMessage::user("three"),
+    ];
+
+    assert!(manual_compact_has_compactable(&history, &config));
 }
 
 #[test]

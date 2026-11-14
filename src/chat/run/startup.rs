@@ -17,6 +17,8 @@ use tracing::info;
 #[cfg(feature = "terminal-tui")]
 pub(super) struct ChatStartupUi<'a> {
     pub(super) banner: &'a String,
+    /// The chat session id the banner names (TUI) or stderr names (plain).
+    pub(super) session_id: &'a str,
     pub(super) initial_saved_session_entries: &'a Vec<crate::chat::session::SavedSessionPickerEntry>,
 }
 pub(super) fn chat_tracing_guard() -> Option<TracingChatGuard> {
@@ -445,6 +447,7 @@ pub(super) async fn terminal_input(
     security: &Arc<crate::security::SecurityPolicy>,
 ) -> (Option<TerminalGuard>, Option<mpsc::Sender<()>>) {
     let banner = ui_startup.banner;
+    let session_line = crate::chat::session_glue::current_chat_session_line(ui_startup.session_id);
 
     // Spawn the appropriate input loop:
     //   - feature `terminal-tui` + TTY stdin + (PRX_TUI != "0") → ratatui/crossterm
@@ -485,7 +488,9 @@ pub(super) async fn terminal_input(
                 // consistent UI ledger for the Redux path plus test assertions); in Pure mode
                 // this is the single reducer-owned entry point.
                 let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::SystemMessageAdded { text: banner.clone() },
+                    crate::chat::action::Action::SystemMessageAdded {
+                        text: format!("{banner} \u{00B7} session {}", ui_startup.session_id),
+                    },
                     "chat.banner",
                 );
 
@@ -549,6 +554,7 @@ pub(super) async fn terminal_input(
                 // and we are about to use the legacy non-TUI path, so
                 // print it the old way.
                 println!("{banner}");
+                eprintln!("{session_line}");
                 let terminal_for_listen = TerminalChannel::new(plain_mode);
                 tokio::spawn(async move {
                     if let Err(e) = terminal_for_listen
@@ -572,6 +578,7 @@ pub(super) async fn terminal_input(
         // print the banner the old way for parity with the previous
         // behaviour.
         println!("{banner}");
+        eprintln!("{session_line}");
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
             if let Err(e) = terminal_for_listen

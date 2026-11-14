@@ -47,7 +47,7 @@ fn workspace(guard: &HarnessGuard) -> std::path::PathBuf {
 /// The capture as screen text: a cursor-position sequence (`ESC [ r ; c H`),
 /// which the fullscreen renderer uses to skip unchanged blank cells, becomes
 /// one space; every other control sequence is dropped.
-fn screen_text(captured: &str) -> String {
+pub(super) fn screen_text(captured: &str) -> String {
     let mut out = String::with_capacity(captured.len());
     let mut chars = captured.chars().peekable();
     while let Some(c) = chars.next() {

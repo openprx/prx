@@ -144,6 +144,9 @@ pub(crate) struct ToolLoopMemory {
     /// Exact message-fabric lineage for entrypoints whose tool execution scope
     /// is synthetic (notably the local CLI compatibility paths).
     pub(super) request_event_scope: Option<MessageEventScope>,
+    /// Where the turn records the tool-surface reserve its preflight applied,
+    /// for a chat front end that budgets outside the turn.
+    pub(super) tool_surface_reserve: Option<crate::agent::context_budget::ToolSurfaceReserve>,
 }
 
 impl ToolLoopMemory {
@@ -154,7 +157,26 @@ impl ToolLoopMemory {
             ingest,
             event_fabric: None,
             request_event_scope: None,
+            tool_surface_reserve: None,
         }
+    }
+
+    /// Give the turn a durable document-ingest scope without resolving a
+    /// ledger, for callers whose adapter's `ToolExecutionService` already
+    /// carries one. The in-turn compaction preflight needs this scope to
+    /// persist a context-switch handoff.
+    pub(crate) fn with_ingest(mut self, ingest: DocumentIngestRuntime) -> Self {
+        self.ingest = Some(ingest);
+        self
+    }
+
+    /// Record each request's tool-surface reserve into `reserve`.
+    pub(crate) fn with_tool_surface_reserve(
+        mut self,
+        reserve: crate::agent::context_budget::ToolSurfaceReserve,
+    ) -> Self {
+        self.tool_surface_reserve = Some(reserve);
+        self
     }
 
     /// Attach the entrypoint's configured event fabric. This deliberately

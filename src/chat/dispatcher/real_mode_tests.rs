@@ -246,6 +246,7 @@ fn build_deps(
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
     (deps, action_rx, hooks, temp)
 }
@@ -320,6 +321,7 @@ fn build_counting_channel_deps(
         approval_router: Arc::new(ApprovalRouter::new()),
         tool_security_policy: full_tool_security_policy(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
+        tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve::default(),
     };
     (deps, action_rx, temp)
 }

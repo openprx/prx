@@ -104,7 +104,7 @@ pub(super) async fn active_turn_local_command_output(
             };
             return start_daemon_session_command(&action, local_fallback, &chat_sessions.daemon_requests(), daemon);
         }
-        return handle_local_session_command(
+        let output = handle_local_session_command(
             &action,
             chat_sessions,
             session_rings,
@@ -113,6 +113,11 @@ pub(super) async fn active_turn_local_command_output(
             tools_registry,
         )
         .await;
+        if matches!(action, crate::chat::sessions::SessionCommand::Sessions) {
+            return output
+                .map(|listing| super::session_glue::sessions_listing_with_current(&chat_session.id, &listing));
+        }
+        return output;
     }
     None
 }

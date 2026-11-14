@@ -1000,6 +1000,9 @@ pub struct EffectDeps {
     /// republished the whole registry to the provider on every single turn.
     /// Carrying it here puts terminal chat back on the same boundary.
     pub tool_tiering: crate::config::ToolTieringConfig,
+    /// The session's last request tool-surface reserve. The turn engine
+    /// records it; the driver's preflight and footer budget with it.
+    pub tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
@@ -1299,6 +1302,7 @@ impl EffectExecutor {
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let observer = Arc::clone(&deps.observer);
                 let hooks = Arc::clone(&deps.hooks);
+                let tool_surface_reserve = deps.tool_surface_reserve.clone();
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 // Task locals do not cross spawn; carry the chat owner's tracker.
@@ -1359,6 +1363,7 @@ impl EffectExecutor {
                             tool_execution_context,
                             request_event_fabric,
                             compaction_audit,
+                            tool_surface_reserve,
                             chat_mode,
                             observer,
                             hooks,
@@ -2065,10 +2070,23 @@ async fn send_redux_injection_overbudget_diagnostic(
     Ok(true)
 }
 
+/// Hand the turn its source-bound ingest scope, so the in-turn `switch`
+/// preflight can persist a context-switch handoff instead of degrading.
+fn with_compaction_scope(
+    memory: crate::agent::turn_request::ToolLoopMemory,
+    compaction_audit: Option<crate::agent::document_ingest::DocumentIngestRuntime>,
+) -> crate::agent::turn_request::ToolLoopMemory {
+    match compaction_audit {
+        Some(ingest) => memory.with_ingest(ingest),
+        None => memory,
+    }
+}
+
 async fn send_redux_context_window_update(
     action_tx: &mpsc::Sender<Action>,
     history: &[crate::providers::traits::ChatMessage],
     config: &crate::config::AgentCompactionConfig,
+    tool_surface_reserve: &crate::agent::context_budget::ToolSurfaceReserve,
     context: &'static str,
 ) -> Result<(), ()> {
     let budget = crate::agent::context_budget::plan_context_budget(
@@ -2078,7 +2096,7 @@ async fn send_redux_context_window_update(
     );
     if let Err(error) = action_tx
         .send(Action::ContextWindowUpdated {
-            used_context_tokens: Some(budget.used_tokens),
+            used_context_tokens: Some(tool_surface_reserve.request_used_tokens(budget.used_tokens)),
             max_context_tokens: Some(budget.max_context_tokens),
         })
         .await
@@ -2470,6 +2488,7 @@ async fn drive_start_turn_stream(
     tool_execution_context: ToolExecutionContext,
     request_event_fabric: MemoryFabric,
     compaction_audit: Option<crate::agent::document_ingest::DocumentIngestRuntime>,
+    tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve,
     chat_mode: crate::agent::turn_contracts::ChatMode,
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
@@ -2512,7 +2531,13 @@ async fn drive_start_turn_stream(
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
     // provider/tool iteration itself remains exclusively in agent::turn_engine.
-    if let Some(config) = compaction_config.as_ref() {
+    // One budget with the turn preflight: the last measured tool surface is
+    // reserved here too, while the turn itself still receives the configured
+    // budget and reserves its freshly measured surface.
+    let reserved_compaction_config = compaction_config
+        .as_ref()
+        .map(|config| tool_surface_reserve.reserved_config(config));
+    if let Some(config) = reserved_compaction_config.as_ref() {
         let budget = crate::agent::context_budget::plan_context_budget(
             &history,
             config,
@@ -2605,9 +2630,15 @@ async fn drive_start_turn_stream(
             {
                 return;
             }
-            if send_redux_context_window_update(&action_tx, &history, config, "redux_preflight_context_window_updated")
-                .await
-                .is_err()
+            if send_redux_context_window_update(
+                &action_tx,
+                &history,
+                config,
+                &tool_surface_reserve,
+                "redux_preflight_context_window_updated",
+            )
+            .await
+            .is_err()
             {
                 return;
             }
@@ -2691,7 +2722,8 @@ async fn drive_start_turn_stream(
             // The adapter's ToolExecutionService already carries the resolved ledger.
             // The scope lets an approval collection record its request event; the
             // legacy chat loop (chat/run.rs) sets the same scope.
-            memory: crate::agent::turn_request::ToolLoopMemory::none()
+            memory: with_compaction_scope(crate::agent::turn_request::ToolLoopMemory::none(), compaction_audit)
+                .with_tool_surface_reserve(tool_surface_reserve)
                 .with_event_fabric(request_event_fabric)
                 .with_request_event_scope(
                     binding

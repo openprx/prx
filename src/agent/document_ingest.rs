@@ -149,6 +149,29 @@ impl DocumentIngestRuntime {
         self
     }
 
+    /// Bind this runtime to the newest persisted user-input message event of
+    /// its session, the source of an explicit `/compact` (no event is minted).
+    ///
+    /// `Ok(None)` when the session has no durable user input yet.
+    pub(crate) async fn bound_to_newest_user_input(self) -> anyhow::Result<Option<Self>> {
+        /// User events read to find the newest `message.created` one.
+        const NEWEST_USER_INPUT_WINDOW: usize = 16;
+        let mut events = self
+            .memory
+            .load_recent_session_context(crate::memory::SessionContextQuery {
+                principal: self.memory_principal(),
+                since_event_id: None,
+                limit: NEWEST_USER_INPUT_WINDOW,
+                include_roles: vec!["user".to_owned()],
+            })
+            .await?;
+        events.retain(|event| event.role == "user" && event.event_type == "message.created");
+        let Some(newest) = events.into_iter().max_by_key(|event| event.id) else {
+            return Ok(None);
+        };
+        Ok(Some(self.with_source_message_event_id(Some(newest.event_id))))
+    }
+
     pub(super) fn memory_principal(&self) -> MemoryPrincipal {
         MemoryPrincipal {
             workspace_id: self.workspace_id.clone(),

@@ -919,6 +919,40 @@ fn compaction_trigger_limit(config: &crate::config::AgentCompactionConfig) -> Op
     Some(max_tokens - reserve)
 }
 
+/// Trigger name of an explicit `/compact` request from a chat front end.
+pub(crate) const MANUAL_COMPACT_TRIGGER: &str = "chat_manual_compact";
+
+/// Why a compaction runs, which decides whether the configured hard input
+/// limit gates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionDemand {
+    /// The history crossed the configured hard input limit (preflight).
+    Threshold,
+    /// The provider reported a context overflow. Authoritative even when the
+    /// cl100k proxy says the request fits, so tokenizer differences can be
+    /// repaired.
+    ProviderOverflow,
+    /// The user asked for `/compact`: every compactable message beyond
+    /// `keep_recent_messages` is compacted, whatever the budget says.
+    Manual,
+}
+
+impl CompactionDemand {
+    fn from_trigger(trigger: &str) -> Self {
+        if trigger == MANUAL_COMPACT_TRIGGER {
+            Self::Manual
+        } else if trigger.contains("overflow") {
+            Self::ProviderOverflow
+        } else {
+            Self::Threshold
+        }
+    }
+
+    const fn is_forced(self) -> bool {
+        matches!(self, Self::ProviderOverflow | Self::Manual)
+    }
+}
+
 pub(crate) async fn build_configurable_compaction_patch(
     history: &[ChatMessage],
     provider: &dyn Provider,
@@ -943,12 +977,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
     };
-    // A provider overflow is authoritative even when the cl100k proxy says the
-    // request fits. Force a compaction attempt so tokenizer differences can be
-    // repaired; ordinary preflight compaction still follows the configured
-    // hard input limit.
-    let provider_reported_overflow = trigger.contains("overflow");
-    if !provider_reported_overflow && estimate_history_tokens(budget_history) <= limit {
+    if !CompactionDemand::from_trigger(trigger).is_forced() && estimate_history_tokens(budget_history) <= limit {
         return Ok(None);
     }
 

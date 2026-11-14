@@ -88,6 +88,17 @@ fn append_in_flight_daemon_requests(
     }
 }
 
+/// The line that names the current chat session (CF-R12), shown first by
+/// `/sessions` and once at start.
+pub(super) fn current_chat_session_line(chat_session_id: &str) -> String {
+    format!("current chat session: {chat_session_id}")
+}
+
+/// `/sessions` output: the current chat session first, then the listing.
+pub(super) fn sessions_listing_with_current(chat_session_id: &str, listing: &str) -> String {
+    format!("{}\n{listing}", current_chat_session_line(chat_session_id))
+}
+
 pub(super) async fn handle_local_session_command(
     action: &crate::chat::sessions::SessionCommand,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,

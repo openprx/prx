@@ -383,6 +383,7 @@ async fn run_turn_unguarded(
         ingest: document_ingest,
         event_fabric,
         request_event_scope,
+        tool_surface_reserve,
     } = memory_runtime;
     anyhow::ensure!(
         Arc::ptr_eq(turn_runtime, context.runtime()),
@@ -695,6 +696,9 @@ async fn run_turn_unguarded(
         };
         crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
         let mut tool_surface = request_tool_surface_cache.measure(mode_capabilities.native_tool_calling, &tool_specs);
+        if let Some(reserve) = tool_surface_reserve.as_ref() {
+            reserve.record(tool_surface);
+        }
         let mut tool_surface_counts =
             RequestToolSurfaceCounts::measure(tools_registry.len(), selected_tools.len(), &tool_catalog, &tool_specs);
 

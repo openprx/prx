@@ -16,7 +16,6 @@ use crate::providers::ChatMessage;
 use crate::providers::Provider;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::util::truncate_with_ellipsis;
-#[cfg(feature = "terminal-tui")]
 use std::sync::Arc;
 
 /// Keep last N non-system messages during history compaction.
@@ -152,16 +151,119 @@ pub(crate) fn format_context_degraded_notice(dropped_messages: usize) -> String 
     format!("Context trimmed (lossy): {dropped_messages} older {plural} dropped without a recoverable handoff.")
 }
 
-pub(super) fn manual_compact_below_trigger_threshold(
-    history: &[ChatMessage],
+/// Whether an explicit `/compact` has anything to compact: more non-system
+/// messages in `source_history` than `keep_recent_messages` keeps.
+pub(super) fn manual_compact_has_compactable(
+    source_history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
 ) -> bool {
-    !crate::agent::context_budget::plan_context_budget(
+    let system_count = usize::from(source_history.first().is_some_and(|m| m.role == "system"));
+    source_history.len().saturating_sub(system_count) > compaction_config.keep_recent_messages.max(1)
+}
+
+/// Feedback when `/compact` finds no durable transcript to bind to (D7).
+pub(super) const NOTHING_TO_COMPACT_NO_TRANSCRIPT: &str = "Nothing to compact (no durable transcript yet).";
+
+/// Everything an explicit `/compact` works on.
+pub(super) struct ManualCompact<'a> {
+    pub(super) history: &'a mut Vec<ChatMessage>,
+    pub(super) chat_session: &'a super::session::ChatSession,
+    pub(super) provider: &'a dyn Provider,
+    pub(super) model: &'a str,
+    /// The tool-surface-reserved budget (one budget with the preflight).
+    pub(super) config: &'a crate::config::AgentCompactionConfig,
+    pub(super) memory: Arc<dyn Memory>,
+    /// The current chat session's envelope; the audit runtime binds to it.
+    pub(super) envelope: &'a RuntimeEnvelope,
+    pub(super) chat_dispatcher: &'a dispatcher::ChatDispatcher,
+}
+
+/// Run an explicit `/compact`.
+///
+/// Forced: every message beyond `keep_recent_messages` is compacted whatever
+/// the budget says. The audit runtime binds to the session's newest persisted
+/// user-input event, so `switch` mode writes a durable context-switch handoff.
+/// The deterministic trim runs only when no handoff or summary can be built,
+/// and then reports the loss instead of "compacted".
+pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut impl FnMut(&str)) {
+    let ManualCompact {
         history,
-        compaction_config,
-        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+        chat_session,
+        provider,
+        model,
+        config,
+        memory,
+        envelope,
+        chat_dispatcher,
+    } = request;
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    let mut source_history = Vec::with_capacity(chat_session.turns.len().saturating_add(system_count));
+    if let Some(system) = history.first().filter(|message| message.role == "system") {
+        source_history.push(system.clone());
+    }
+    source_history.extend(super::session_store::session_turns_to_history(chat_session));
+    if !manual_compact_has_compactable(&source_history, config) {
+        emit(&format_nothing_to_compact_feedback(history, config));
+        return;
+    }
+    let audit = match DocumentIngestRuntime::from_envelope(memory, envelope)
+        .bound_to_newest_user_input()
+        .await
+    {
+        Ok(Some(audit)) => audit,
+        Ok(None) => {
+            emit(NOTHING_TO_COMPACT_NO_TRANSCRIPT);
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "manual compaction could not read the durable transcript");
+            emit(&format!(
+                "Compaction unavailable: the durable transcript could not be read ({error})."
+            ));
+            return;
+        }
+    };
+    emit("Compacting conversation...");
+    let turns_before = history.len().saturating_sub(system_count);
+    let tokens_before = estimate_chat_history_tokens(history);
+    let patch = build_chat_compaction_patch(
+        history,
+        &source_history,
+        provider,
+        model,
+        config,
+        Some(&audit),
+        crate::agent::compaction::MANUAL_COMPACT_TRIGGER,
     )
-    .over_hard_limit
+    .await;
+    if let Some(patch) = patch {
+        apply_chat_compaction_patch_and_sync(
+            history,
+            Some(&source_history),
+            patch,
+            config,
+            crate::chat::action::CompactReason::Manual,
+            chat_dispatcher,
+        );
+        emit(&format_compact_feedback_after_history(
+            turns_before,
+            tokens_before,
+            history,
+            config,
+        ));
+        return;
+    }
+    let messages_before = history.len();
+    compact_chat_history(history);
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::HistoryCompacted {
+            reason: crate::chat::action::CompactReason::Manual,
+        },
+        "chat.history_compacted_manual",
+    );
+    emit(&format_context_degraded_notice(
+        messages_before.saturating_sub(history.len()),
+    ));
 }
 
 pub(super) fn format_nothing_to_compact_feedback(
@@ -202,6 +304,7 @@ pub(super) struct TuiContextBudgetStatus {
 pub(super) fn context_budget_status_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
+    tool_surface_reserve: &crate::agent::context_budget::ToolSurfaceReserve,
     terminal_tui_enabled: bool,
 ) -> Option<TuiContextBudgetStatus> {
     if !terminal_tui_enabled {
@@ -209,11 +312,11 @@ pub(super) fn context_budget_status_for_tui(
     }
     let budget = crate::agent::context_budget::plan_context_budget(
         history,
-        compaction_config,
+        &tool_surface_reserve.reserved_config(compaction_config),
         crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
     );
     Some(TuiContextBudgetStatus {
-        used_context_tokens: budget.used_tokens,
+        used_context_tokens: tool_surface_reserve.request_used_tokens(budget.used_tokens),
         max_context_tokens: budget.max_context_tokens,
     })
 }
@@ -222,11 +325,14 @@ pub(super) fn context_budget_status_for_tui(
 pub(super) fn refresh_context_budget_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
+    tool_surface_reserve: &crate::agent::context_budget::ToolSurfaceReserve,
     terminal_tui_enabled: bool,
     chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
 ) {
-    let Some(context_budget) = context_budget_status_for_tui(history, compaction_config, terminal_tui_enabled) else {
+    let Some(context_budget) =
+        context_budget_status_for_tui(history, compaction_config, tool_surface_reserve, terminal_tui_enabled)
+    else {
         return;
     };
     let context_used_tokens = Some(context_budget.used_context_tokens);

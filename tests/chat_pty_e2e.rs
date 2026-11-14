@@ -66,6 +66,10 @@ use expectrl::session::Session;
 use serial_test::serial;
 use tempfile::TempDir;
 
+#[path = "chat_pty_e2e/compaction.rs"]
+mod compaction;
+#[path = "support/compaction_script.rs"]
+mod compaction_script;
 #[path = "chat_pty_e2e/guarded_delivery.rs"]
 mod guarded_delivery;
 #[path = "support/loopback_openai.rs"]

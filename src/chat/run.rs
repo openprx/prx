@@ -19,9 +19,8 @@ use super::compaction::refresh_context_budget_for_tui;
 use super::compaction::{
     apply_chat_compaction_patch_and_sync, bounded_legacy_chat_compaction_audit_source, build_chat_compaction_patch,
     chat_embedding_upgrade_notice, compact_chat_history, estimate_chat_history_tokens,
-    format_compact_feedback_after_history, format_nothing_to_compact_feedback, legacy_compaction_token_metadata,
-    manual_compact_below_trigger_threshold, original_legacy_chat_compaction_audit_source,
-    persist_legacy_chat_compaction_audit,
+    format_compact_feedback_after_history, legacy_compaction_token_metadata,
+    original_legacy_chat_compaction_audit_source, persist_legacy_chat_compaction_audit,
 };
 use super::copy_select::{copy_success_message, is_copy_command, select_copy_content};
 use super::file_mention::enrich_file_mentions_for_prompt;
@@ -69,8 +68,7 @@ use super::session_store::{
     bind_session_to_runtime_provider_model, branched_chat_session_from, format_saved_chat_sessions,
     format_turn_boundaries, history_for_session_with_system, list_saved_sessions,
     load_latest_session_with_message_events, load_session_by_id_with_message_events, parse_turn_boundary,
-    persisted_history_for_current_turn, save_session, saved_chat_sessions, session_turns_to_history,
-    upsert_leading_system_prompt,
+    persisted_history_for_current_turn, save_session, saved_chat_sessions, upsert_leading_system_prompt,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_switch::request_diff_apply_approval;
@@ -332,6 +330,7 @@ async fn run_internal(
     #[cfg(feature = "terminal-tui")]
     let ui_startup = startup::ChatStartupUi {
         banner: &banner,
+        session_id: &chat_session.id,
         initial_saved_session_entries: &initial_saved_session_entries,
     };
 
@@ -391,6 +390,10 @@ async fn run_internal(
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &provider_turn_lifecycle_tx;
 
+    // The last request's tool-surface reserve: `/compact`, compaction
+    // feedback and the context footer budget with it, as the preflight does.
+    let tool_surface_reserve = crate::agent::context_budget::ToolSurfaceReserve::default();
+
     // Pick the EffectExecutor mode from the redux mode (TUI feature only)
     #[cfg(feature = "terminal-tui")]
     let effect_executor = {
@@ -414,6 +417,7 @@ async fn run_internal(
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             tool_security_policy: Arc::clone(&security),
             tool_tiering: config.tool_tiering.clone(),
+            tool_surface_reserve: tool_surface_reserve.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
         dispatcher::EffectExecutor::new_with_deps(deps).with_cleanup_owner(Arc::clone(&child_cleanup))
@@ -496,6 +500,7 @@ async fn run_internal(
     #[cfg(not(feature = "terminal-tui"))]
     {
         println!("{banner}");
+        eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.id));
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
             if let Err(e) = terminal_for_listen.listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx)).await {
@@ -1781,72 +1786,39 @@ Retry with a compatible model: /provider {shown} <model>",
             continue;
         }
 
-        // `/compact` mutates the real LLM context history before the next turn.
-        // Prefer the provider-backed summary patch used by the Redux driver; if
-        // the summary call fails or times out, fall back to deterministic trim.
+        // `/compact` is an explicit request: it compacts whatever lies beyond
+        // the kept window, through the same budget the preflight uses.
         if matches!(user_input.as_str(), "/compact") {
             let compact_context = provider_binding
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("chat provider binding is missing"))?
                 .effective_compaction();
-            if manual_compact_below_trigger_threshold(&history, &compact_context.config) {
-                emit_chat_output(&format_nothing_to_compact_feedback(&history, &compact_context.config));
-                continue;
-            }
-            emit_chat_output("Compacting conversation...");
-            let mut compact_source_history = Vec::with_capacity(
-                chat_session
-                    .turns
-                    .len()
-                    .saturating_add(usize::from(!history.is_empty())),
-            );
-            if let Some(system) = history.first().filter(|message| message.role == "system") {
-                compact_source_history.push(system.clone());
-            }
-            compact_source_history.extend(session_turns_to_history(&chat_session));
-            let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
-            let turns_before = history.len().saturating_sub(system_count);
-            let tokens_before = estimate_chat_history_tokens(&history);
-            if let Some(patch) = build_chat_compaction_patch(
-                &history,
-                &compact_source_history,
-                provider.as_ref(),
-                model_name,
-                &compact_context.config,
-                None,
-                "chat_manual_compact",
+            let compact_config = tool_surface_reserve.reserved_config(&compact_context.config);
+            let compact_envelope =
+                super::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &chat_session_key);
+            super::compaction::run_manual_compact(
+                super::compaction::ManualCompact {
+                    history: &mut history,
+                    chat_session: &chat_session,
+                    provider: provider.as_ref(),
+                    model: model_name,
+                    config: &compact_config,
+                    memory: Arc::clone(&mem),
+                    envelope: &compact_envelope,
+                    chat_dispatcher: &chat_dispatcher,
+                },
+                &mut |text: &str| emit_chat_output(text),
             )
-            .await
-            {
-                apply_chat_compaction_patch_and_sync(
-                    &mut history,
-                    Some(&compact_source_history),
-                    patch,
-                    &compact_context.config,
-                    crate::chat::action::CompactReason::Manual,
-                    &chat_dispatcher,
-                );
-            } else {
-                compact_chat_history(&mut history);
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::Manual,
-                    },
-                    "chat.history_compacted_manual",
-                );
-            }
+            .await;
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
                 &compact_context.config,
+                &tool_surface_reserve,
                 redraw_tx_for_main.is_some(),
                 &chat_mirror,
                 &chat_dispatcher,
             );
-
-            let msg =
-                format_compact_feedback_after_history(turns_before, tokens_before, &history, &compact_context.config);
-            emit_chat_output(&msg);
             continue;
         }
 
@@ -2371,7 +2343,10 @@ Retry with a compatible model: /provider {shown} <model>",
                             )
                             .await
                             {
-                                emit_chat_output(&output);
+                                emit_chat_output(&super::session_glue::sessions_listing_with_current(
+                                    &chat_session.id,
+                                    &output,
+                                ));
                             }
                             continue;
                         }
@@ -3068,7 +3043,8 @@ Retry with a compatible model: /provider {shown} <model>",
         .with_event_fabric(memory_fabric.clone())
         .with_request_event_scope(
             runtime_envelope.message_scope().with_recipient(format!("{provider_name}/{model_name}")),
-        );
+        )
+        .with_tool_surface_reserve(tool_surface_reserve.clone());
         // The TUI handoff retains the original source input, before enrichment.
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
@@ -3321,6 +3297,7 @@ Retry with a compatible model: /provider {shown} <model>",
         refresh_context_budget_for_tui(
             &history_for_provider,
             &effective_compaction.config,
+            &tool_surface_reserve,
             redraw_tx_for_main.is_some(),
             &chat_mirror,
             &chat_dispatcher,
@@ -3996,9 +3973,10 @@ Retry with a compatible model: /provider {shown} <model>",
             continue;
         }
 
+        let legacy_budget_config = tool_surface_reserve.reserved_config(&effective_compaction.config);
         let preflight_budget = crate::agent::context_budget::plan_context_budget(
             &history,
-            &effective_compaction.config,
+            &legacy_budget_config,
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         if preflight_budget.over_hard_limit {
@@ -4013,7 +3991,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 &persisted_history_for_turn,
                 provider.as_ref(),
                 model_name,
-                &effective_compaction.config,
+                &legacy_budget_config,
                 memory_runtime.ingest(),
                 "chat_preflight",
             )
@@ -4023,7 +4001,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     &mut history,
                     Some(&persisted_history_for_turn),
                     patch,
-                    &effective_compaction.config,
+                    &legacy_budget_config,
                     crate::chat::action::CompactReason::ContextOverflow,
                     &chat_dispatcher,
                 );
@@ -4049,6 +4027,7 @@ Retry with a compatible model: /provider {shown} <model>",
             refresh_context_budget_for_tui(
                 &history,
                 &effective_compaction.config,
+                &tool_surface_reserve,
                 redraw_tx_for_main.is_some(),
                 &chat_mirror,
                 &chat_dispatcher,
@@ -4057,7 +4036,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 turns_before,
                 tokens_before,
                 &history,
-                &effective_compaction.config,
+                &legacy_budget_config,
             );
             surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
             tracing::warn!(

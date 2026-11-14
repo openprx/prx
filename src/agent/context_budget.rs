@@ -191,6 +191,50 @@ pub(crate) fn reserve_request_tool_surface(
     }
 }
 
+/// The tool-surface reserve of a chat session's most recent request, shared
+/// between the turn engine and the chat front ends.
+///
+/// The preflight reserves the published tool surface before it plans a
+/// request. A chat front end decides `/compact`, prints compaction feedback
+/// and draws the context footer outside any turn, where that surface is not
+/// measured; it reads the last measured reserve from here so all of them use
+/// the window the preflight uses. Zero until the first request is measured.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolSurfaceReserve(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ToolSurfaceReserve {
+    /// Store the reserve the preflight applies for `tool_surface`.
+    pub(crate) fn record(&self, tool_surface: crate::agent::turn_context::RequestToolMeasurement) {
+        self.0.store(
+            budgeted_request_tool_tokens(tool_surface),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The tokens the last measured tool surface occupies in the window.
+    pub(crate) fn tokens(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `config` with the last measured tool surface reserved, the budget the
+    /// preflight plans against.
+    pub(crate) fn reserved_config(
+        &self,
+        config: &crate::config::AgentCompactionConfig,
+    ) -> crate::config::AgentCompactionConfig {
+        crate::config::AgentCompactionConfig {
+            reserve_tokens: config.reserve_tokens.saturating_add(self.tokens()),
+            ..config.clone()
+        }
+    }
+
+    /// Context tokens one request occupies: the history estimate plus the
+    /// reserved tool surface, the figure the context footer shows.
+    pub(crate) fn request_used_tokens(&self, history_used_tokens: usize) -> usize {
+        history_used_tokens.saturating_add(self.tokens())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContextBudgetSnapshot {
     pub used_tokens: usize,

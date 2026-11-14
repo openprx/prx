@@ -561,6 +561,7 @@ mod tests {
             admitted.context,
             admitted.fabric,
             None,
+            crate::agent::context_budget::ToolSurfaceReserve::default(),
             crate::agent::turn_contracts::ChatMode::Edit,
             Arc::new(crate::observability::noop::NoopObserver),
             Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),

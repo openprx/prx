@@ -422,11 +422,12 @@ fn plain_mode_does_not_emit_context_budget_chrome() {
     );
     assert!(budget.used_tokens > 0, "fixture must produce context usage");
     let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
+    let reserve = crate::agent::context_budget::ToolSurfaceReserve::default();
     assert!(
-        context_budget_status_for_tui(&history, &config, terminal_tui_enabled).is_none(),
+        context_budget_status_for_tui(&history, &config, &reserve, terminal_tui_enabled).is_none(),
         "--plain must not emit context budget chrome"
     );
-    let status = context_budget_status_for_tui(&history, &config, true).expect("TUI context budget status");
+    let status = context_budget_status_for_tui(&history, &config, &reserve, true).expect("TUI context budget status");
     assert_eq!(status.used_context_tokens, budget.used_tokens);
     assert_eq!(status.max_context_tokens, budget.max_context_tokens);
 }
