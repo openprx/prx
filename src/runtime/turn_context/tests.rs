@@ -197,7 +197,7 @@ async fn child_turn_context_funds_recursive_money_only_through_the_parent_grant(
             .context("a bound child publication holds its parent grant")?;
         let granted = grant
             .recursive_child_allowance()
-            .and_then(|owner| owner.funded_money())
+            .map(|owner| owner.money())
             .context("the parent grant funds a recursive child allowance")?;
         let funded = holder
             .recursive_money(routing.proof)

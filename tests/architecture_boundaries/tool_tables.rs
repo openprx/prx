@@ -575,14 +575,6 @@ pub(super) const NON_TOOL_EXECUTE_CALL_SITES: &[NonToolCallSite] = &[
         reason: "bind_agent_execution returns the actual shared execution service and its source-bound context; this is the single admitted configured-delegation dispatch",
     },
     NonToolCallSite {
-        entry: "src/runtime/turn_decision/execution.rs::execute_agent_resume",
-        receiver: "dispatch.service",
-        occurrences: 1,
-        evidence_file: "src/runtime/turn_decision/execution.rs",
-        evidence: "service: Arc<ToolExecutionService>,",
-        reason: "sealed ResumeDispatch carries the actual ToolExecutionService; resume invokes exactly the approved command with the issued context",
-    },
-    NonToolCallSite {
         entry: "src/memory/postgres/ingress_recovery.rs::prepare_ingress_schema",
         receiver: "session.client",
         occurrences: 1,

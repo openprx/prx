@@ -9,7 +9,6 @@ impl ChatTurnBinding {
         &self,
         service: &Arc<crate::runtime::turn_decision::TurnDecisionService>,
         cancellation: &tokio_util::sync::CancellationToken,
-        resume: bool,
     ) -> anyhow::Result<&Arc<crate::runtime::turn_decision::TurnDecisionContext>> {
         anyhow::ensure!(
             matches!(self.admission_mode, ChatAdmissionMode::Model(_)),
@@ -21,23 +20,17 @@ impl ChatTurnBinding {
             .decision
             .get_or_try_init(|| async {
                 let kind = crate::runtime::turn_context::AgentTurnKind::Repl;
-                let context = if resume {
-                    crate::runtime::turn_publication::open_resume_turn(service, self, kind, cancellation).await?
-                } else {
-                    let opened = service.open_turn_context(self, kind, cancellation).await?;
-                    service.record_opened_context(self, opened, cancellation).await?
-                };
+                let opened = service.open_turn_context(self, kind, cancellation).await?;
+                let context = service.record_opened_context(self, opened, cancellation).await?;
                 let advice = service.advisory().analyze_turn(context.runtime(), cancellation).await;
                 Ok::<_, anyhow::Error>(ChatDecision {
                     advice,
-                    resume,
                     service: Arc::clone(service),
                     context,
                 })
             })
             .await?;
         anyhow::ensure!(Arc::ptr_eq(&decided.service, service), "chat decision service changed");
-        anyhow::ensure!(decided.resume == resume, "chat decision mode changed");
         Ok(&decided.context)
     }
 
@@ -86,7 +79,7 @@ mod tests {
             // turn's accounting scope.
             let cleanup = std::sync::Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
             let context = cleanup
-                .scope(binding.issue_decision(&service, &cancellation, false))
+                .scope(binding.issue_decision(&service, &cancellation))
                 .await
                 .unwrap();
             let advice = binding.decision_advice();

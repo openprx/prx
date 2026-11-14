@@ -1,6 +1,6 @@
 //! Decision-free, authenticated exact-call approval over MemoryFabric.
 use super::keys::{ApprovalAuthority, RunCallAuthority};
-use super::pending::scope_from_source;
+use super::view::scope_from_source;
 use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, RiskLevel, Subject, WitnessKeyring};
 use crate::memory::{Memory, MemoryFabric, MessageEvent};
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
@@ -66,8 +66,8 @@ impl PendingCall {
     pub(crate) fn source_event_id(&self) -> &str {
         &self.source_event_id
     }
-    pub(crate) fn view(&self) -> super::pending::DecisionApprovalView {
-        super::pending::DecisionApprovalView {
+    pub(crate) fn view(&self) -> super::view::DecisionApprovalView {
+        super::view::DecisionApprovalView {
             decision_id: String::new(),
             call_id: Some(self.authority.call_id()),
             tool: None,
@@ -480,7 +480,7 @@ impl ApprovalLedgerPort<'_> {
         if let Some(grant) = &stored.record.grant {
             self.verify_grant(&pending.record, grant)?;
             let issued = self
-                .write(&source, &authority.issued_key(""), "approval.call.issued", &stored)
+                .write(&source, &authority.issued_key(), "approval.call.issued", &stored)
                 .await?;
             anyhow::ensure!(
                 issued.raw_payload_json == event.raw_payload_json,
@@ -537,7 +537,7 @@ impl ApprovalLedgerPort<'_> {
         }
         let Some(issued) = self
             .memory
-            .find_message_event_by_idempotency_key(self.workspace, &authority.issued_key(""))
+            .find_message_event_by_idempotency_key(self.workspace, &authority.issued_key())
             .await?
         else {
             return Ok(None);
@@ -564,7 +564,7 @@ impl ApprovalLedgerPort<'_> {
         revoked: bool,
     ) -> anyhow::Result<MessageEvent> {
         let (pending, source) = self.load(owner, session, authority).await?;
-        let issued_key = authority.issued_key("");
+        let issued_key = authority.issued_key();
         let issued = self
             .memory
             .find_message_event_by_idempotency_key(self.workspace, &issued_key)
@@ -583,7 +583,7 @@ impl ApprovalLedgerPort<'_> {
             (authority, &grant.grant_id, revoked, uuid::Uuid::new_v4().to_string()),
         )?;
         let event = self
-            .write(&source, &authority.resolution_key(""), "approval.call.resolved", &claim)
+            .write(&source, &authority.resolution_key(), "approval.call.resolved", &claim)
             .await?;
         anyhow::ensure!(
             serde_json::from_str::<serde_json::Value>(
@@ -645,7 +645,7 @@ impl ApprovalLedgerPort<'_> {
             }
             if self
                 .memory
-                .find_message_event_by_idempotency_key(self.workspace, &record.authority.resolution_key(""))
+                .find_message_event_by_idempotency_key(self.workspace, &record.authority.resolution_key())
                 .await?
                 .is_some()
             {

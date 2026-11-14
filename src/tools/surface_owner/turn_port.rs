@@ -13,7 +13,6 @@ use crate::runtime::turn_source::TurnSourceProof;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogView, SurfacePolicy};
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
-use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
 use crate::tools::capability::search_tool::DiscoveryState;
 use crate::tools::capability::turn_state::TrustedParts;
 use crate::tools::execution::ToolExecutionService;
@@ -28,8 +27,6 @@ pub(crate) trait TurnSurfacePort {
     /// The serving model resolved for `proof`, without the turn recheck.
     fn resolve_model(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<ResolvedModel>;
     fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool;
-    /// Re-authenticate the historical resume evidence of this turn, if any.
-    fn fresh_resume_evidence(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<Option<VerifiedResumeEvidenceV1>>;
     fn catalog(&self) -> &Arc<CapabilityCatalog>;
     fn publication_policy(&self) -> &SurfacePolicy;
     fn execution(&self) -> &Arc<ToolExecutionService>;

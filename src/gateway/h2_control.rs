@@ -1,5 +1,5 @@
 //! Direct OS launch only. No reload file or network endpoint mints authority.
-use super::{AppState, Arc, CancellationToken, Config, Context, Result};
+use super::{Arc, CancellationToken, Config, Context, Result};
 use crate::runtime::h2_entry::{EntryKind, EntryLimits, TerminalInputProducer};
 
 #[allow(clippy::too_many_arguments)]
@@ -34,19 +34,10 @@ pub async fn run_gateway_controlled(
     result
 }
 
-pub(super) async fn start_local_control(
-    producer: TerminalInputProducer,
-    state: AppState,
-    shutdown: CancellationToken,
-) -> Result<()> {
+pub(super) async fn start_local_control(producer: TerminalInputProducer, shutdown: CancellationToken) -> Result<()> {
     let authority = producer.into_local_control()?;
     let profile = Arc::clone(authority.profile());
-    let runtime = state.pin_turn_runtime();
-    let service = Arc::clone(runtime.decision_slot.publish(&runtime, &state).await?);
-    let handle = tokio::runtime::Handle::current();
-    println!(
-        "Controlled local review: show SESSION PENDING; approve SESSION PENDING DIGEST; deny SESSION PENDING DIGEST; revoke SESSION PENDING; exit"
-    );
+    println!("Controlled local control: exit");
     let thread = std::thread::Builder::new()
         .name("prx-h2-local-review".into())
         .spawn(move || {
@@ -71,50 +62,14 @@ pub(super) async fn start_local_control(
                         if byte == b'\n' {
                             let text = std::str::from_utf8(&line).context("local review input is not UTF-8")?;
                             let fields: Vec<_> = text.split_whitespace().collect();
-                            let outcome = handle.block_on(async {
-                                use crate::security::decision_id::DecisionId;
-                                match fields.as_slice() {
-                                    ["show", session, id] => {
-                                        let view = service
-                                            .inspect_pending_decision_approval(
-                                                authority.principal(),
-                                                session,
-                                                DecisionId::parse(id)?,
-                                            )
-                                            .await?;
-                                        Ok(serde_json::to_string(&view)?)
-                                    }
-                                    [verb @ ("approve" | "deny"), session, id, digest] => {
-                                        let receipt = service
-                                            .review_h2_local(
-                                                &authority,
-                                                session,
-                                                DecisionId::parse(id)?,
-                                                digest,
-                                                *verb == "approve",
-                                            )
-                                            .await?;
-                                        Ok(serde_json::to_string(&receipt)?)
-                                    }
-                                    ["revoke", session, id] => {
-                                        authority.profile().ensure_live()?;
-                                        let receipt = service
-                                            .revoke_pending_decision_approval(
-                                                authority.principal(),
-                                                session,
-                                                DecisionId::parse(id)?,
-                                            )
-                                            .await?;
-                                        Ok(serde_json::to_string(&receipt)?)
-                                    }
-                                    ["exit"] => {
-                                        authority.profile().revoke();
-                                        shutdown.cancel();
-                                        Ok("local authority revoked".into())
-                                    }
-                                    _ => anyhow::bail!("invalid bounded local-review command"),
+                            let outcome = match fields.as_slice() {
+                                ["exit"] => {
+                                    authority.profile().revoke();
+                                    shutdown.cancel();
+                                    Ok::<_, anyhow::Error>("local authority revoked".to_owned())
                                 }
-                            });
+                                _ => Err(anyhow::anyhow!("invalid bounded local-control command")),
+                            };
                             match outcome {
                                 Ok(output) => println!("{output}"),
                                 Err(error) => eprintln!("local review refused: {error}"),

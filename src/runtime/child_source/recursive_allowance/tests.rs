@@ -1,10 +1,10 @@
-//! Run-owned budgets retire with their contexts or explicit denial.
+//! Run-owned budgets retire with their contexts.
 #![cfg(test)]
 use super::*;
 use crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input;
 
 #[tokio::test]
-async fn context_drop_and_denied_pending_remove_every_run_alias() {
+async fn context_drop_removes_every_run_alias() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
@@ -25,19 +25,6 @@ async fn context_drop_and_denied_pending_remove_every_run_alias() {
         .insert(RunAllowances::key_for_run(&proof, "prx_drop_alias"), Arc::clone(&owner));
     assert_eq!(registry.lock().len(), 2);
     drop(second);
-    assert!(registry.lock().is_empty());
-    let owner = runs.issue(&proof, Arc::new(AtomicU64::new(100_000)));
-    registry.lock().insert(
-        RunAllowances::key_for_run(&proof, "prx_denied_alias"),
-        Arc::clone(&owner),
-    );
-    assert_eq!(registry.lock().len(), 2);
-    runs.retire_pending(
-        proof.workspace_id(),
-        proof.owner_id(),
-        proof.session_key(),
-        proof.run_id(),
-    );
     assert!(registry.lock().is_empty());
 }
 

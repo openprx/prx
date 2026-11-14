@@ -6,12 +6,12 @@ mod input;
 mod origin;
 mod profile;
 mod review;
-pub(crate) use review::{LocalControlAuthority, LocalOwnerReview, LocalOwnerReviewStamp};
+pub(crate) use review::LocalControlAuthority;
 
 pub use authority::ControlledAdmissionPin;
 pub(crate) use authority::{
-    EntryAction, EntryCall, EntryInvocation, RunContinuation, ValidatedLifecycleCommand, arguments_digest,
-    current_admission_pin, current_invocation, current_run_continuation, retain_run_continuation, scope_invocation,
+    EntryAction, EntryInvocation, RunContinuation, ValidatedLifecycleCommand, arguments_digest, current_admission_pin,
+    current_invocation, current_run_continuation, retain_run_continuation, scope_invocation,
 };
 pub(crate) use case::ControlledCaseScope;
 pub(crate) use input::{

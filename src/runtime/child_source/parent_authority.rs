@@ -16,10 +16,6 @@ impl ParentAuthority {
             self.constraints.authority.remaining_depth > 0,
             "parent child depth is exhausted"
         );
-        anyhow::ensure!(
-            self.allowance.funded_money().is_some(),
-            "parent child allowance is unavailable"
-        );
         Ok(())
     }
 

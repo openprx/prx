@@ -458,31 +458,10 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg: NO_ARG,
     },
     CommandSpec {
-        name: "/resume-decision",
-        aliases: &[],
-        args_hint: "<uuid>",
-        description: "Explicitly resume an approved stored call in this chat",
-        arg: NO_ARG,
-    },
-    CommandSpec {
-        name: "/approval",
-        aliases: &[],
-        args_hint: "--decision <uuid>",
-        description: "Inspect a pending causal decision in this chat",
-        arg: NO_ARG,
-    },
-    CommandSpec {
-        name: "/revoke",
-        aliases: &[],
-        args_hint: "--decision <uuid>",
-        description: "Revoke a causal decision approval in this chat",
-        arg: NO_ARG,
-    },
-    CommandSpec {
         name: "/approve",
         aliases: &[],
         args_hint: "<id>",
-        description: "Approve a child session or displayed decision number; --decision <uuid> selects an explicit decision",
+        description: "Approve a child session",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },
@@ -491,7 +470,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         name: "/deny",
         aliases: &[],
         args_hint: "<id>",
-        description: "Deny a child session or displayed decision number; --decision <uuid> selects an explicit decision",
+        description: "Deny a child session",
         arg: CommandArgSpec {
             source: CommandArgSource::LiveSessions,
         },

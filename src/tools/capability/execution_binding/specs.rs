@@ -34,10 +34,8 @@ pub(crate) fn execution_specs(
         rules.turn_scope_admits(),
         "turn scope no longer passes its execution rules"
     );
-    // A historical resume re-authenticates its evidence at every recheck.
-    let resume = port.fresh_resume_evidence(proof)?;
     let cost = &port.config().cost;
-    let references = rules.surface(resume.as_ref(), port.outgoing_child(), &|bytes| {
+    let references = rules.surface(port.outgoing_child(), &|bytes| {
         crate::cost::estimate::estimate_cost(&model, cost, bytes)
     });
     anyhow::ensure!(

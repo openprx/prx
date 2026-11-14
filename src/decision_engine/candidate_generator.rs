@@ -573,15 +573,7 @@ pub(crate) fn select_family_candidate<'a>(
             })
         });
     let mut passed_fallback = None;
-    let native_files = action == CausalActionKind::UseTool
-        && family == CapabilityTarget::Filesystem
-        && !bind_namespace
-        && !state
-            .trusted
-            .parts()
-            .constraints
-            .iter()
-            .any(|code| code.as_str() == "resume_exact_call");
+    let native_files = action == CausalActionKind::UseTool && family == CapabilityTarget::Filesystem && !bind_namespace;
     let mut file_members = Vec::new();
     let mut approval_only = None;
     for entry in entries {

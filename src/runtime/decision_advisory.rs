@@ -1,10 +1,7 @@
 //! Free-standing advisory decision driver and its execution-owned gate inputs.
 //!
 //! The helpers here rebuild the hard-gate inputs from execution-owned facts
-//! (`AdmissionFactsV1`) and, on an authenticated resume turn, from the
-//! verified resume evidence. The execution path (`open_turn_context_observed`)
-//! and the advisory driver use the same helpers, so resume annotations and
-//! execution gating stay identical.
+//! (`AdmissionFactsV1`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,7 +15,7 @@ use crate::config::Config;
 use crate::config::schema::decision_engine::{DecisionEngineConfig, DecisionMode, effective_engine_backend};
 use crate::cost::decision_attempt::DecisionAttemptAccounting;
 use crate::decision_engine::admission_probe::{AdmissionProbe, AdvisoryProbe};
-use crate::decision_engine::candidate::{CandidateId, Ns8};
+use crate::decision_engine::candidate::CandidateId;
 use crate::decision_engine::candidate_generator::{
     CandidatePolicy, CandidateSet, CausalCandidateGenerator, DiscoveredRefs,
 };
@@ -40,41 +37,14 @@ use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogView, SurfacePolicy};
-use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration, CausalActionKind};
+use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 use crate::tools::capability::execution_trace::ExecutionTraceSnapshot;
-use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
 use crate::tools::capability::turn_state::TrustedState;
 
 /// Exact call fingerprints by candidate id.
 pub(crate) type CallFingerprints = BTreeMap<CandidateId, [u8; 32]>;
 /// Verified exact capability scope by call digest.
 pub(crate) type VerifiedApprovalCalls = BTreeMap<[u8; 32], BTreeSet<CapabilityRef>>;
-
-/// The baseline candidate maps of one verified resume: both candidate ids of
-/// the resumed entry (unbound and namespace-bound with `state_key`) map to the
-/// pending call digest, and the digest maps to the single resumed capability.
-pub(crate) fn resume_gate_maps(
-    evidence: &VerifiedResumeEvidenceV1,
-    state_key: &DecisionKey,
-) -> (CallFingerprints, VerifiedApprovalCalls) {
-    let digest = *evidence.call_digest();
-    let calls = BTreeMap::from([
-        (
-            CandidateId::new(CausalActionKind::UseTool, evidence.family(), None),
-            digest,
-        ),
-        (
-            CandidateId::new(
-                CausalActionKind::UseTool,
-                evidence.family(),
-                Some(Ns8::of(state_key, evidence.namespace())),
-            ),
-            digest,
-        ),
-    ]);
-    let approvals = BTreeMap::from([(digest, BTreeSet::from([evidence.capability().clone()]))]);
-    (calls, approvals)
-}
 
 /// The only `GateInputs` constructor of the advisory driver: execution-owned
 /// facts plus the resume maps (empty on a non-resume turn). Failed-call
@@ -111,7 +81,6 @@ pub(crate) struct AdvisoryInput {
     pub(crate) decision_id: DecisionId,
     pub(crate) state: CausalState,
     pub(crate) facts: AdmissionFactsV1,
-    pub(crate) resume_evidence: Option<Arc<VerifiedResumeEvidenceV1>>,
     pub(crate) state_key: Arc<DecisionKey>,
     pub(crate) catalog: Arc<CapabilityCatalog>,
     pub(crate) publication_policy: SurfacePolicy,
@@ -147,7 +116,6 @@ impl AdvisoryInput {
             decision_id: runtime.decision_id,
             state: build_state(runtime),
             facts: runtime.admission.clone(),
-            resume_evidence: runtime.resume_evidence.clone(),
             state_key: Arc::clone(&runtime.state_key),
             catalog: Arc::clone(&runtime.catalog),
             publication_policy: runtime.publication_policy.clone(),
@@ -460,12 +428,9 @@ impl DecisionAdvisory {
         if view.generation() != input.catalog_generation {
             return Err(());
         }
-        let (calls, approvals) = input.resume_evidence.as_deref().map_or_else(
-            || (BTreeMap::new(), BTreeMap::new()),
-            |evidence| resume_gate_maps(evidence, &input.state_key),
-        );
+        let calls = BTreeMap::new();
         let replayed = BTreeSet::new();
-        let gates = gate_inputs(&input.facts, &calls, approvals, &replayed);
+        let gates = gate_inputs(&input.facts, &calls, BTreeMap::new(), &replayed);
         let observed_latency = BTreeMap::new();
         let cost_model =
             crate::decision_engine::cost_model::RuntimeCostModel::new(&input.model, &self.config, &observed_latency);

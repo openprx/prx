@@ -535,7 +535,6 @@ pub enum DispatchOrigin {
 struct H2ExecutionMetadata {
     controlled_case: Option<Arc<crate::runtime::h2_entry::ControlledCaseScope>>,
     origin: Option<Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>>,
-    review: Option<crate::runtime::h2_entry::LocalOwnerReview>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionContext {
@@ -553,7 +552,6 @@ pub struct ToolExecutionContext {
     pub(crate) child_pin: Option<Arc<super::capability::child::ChildDispatchPin>>,
     /// Live G6 tokens for the model turn's called tools; absent outside model turns.
     pub(crate) call_budget: Option<admission::CallTokenBudget>,
-    pub(crate) decision_resume: Option<super::capability::execution_binding::DecisionResumePort>,
     /// A call that needs approval ends denied before any ledger route or
     /// durable pending decision exists. Set for targeted agent turns, which
     /// have no resumable approval until MA-04.
@@ -588,13 +586,12 @@ impl ToolExecutionContext {
     pub(crate) fn h2_origin(&self) -> Option<&Arc<crate::runtime::h2_entry::VerifiedEntryOrigin>> {
         self.h2_metadata.as_ref().and_then(|metadata| metadata.origin.as_ref())
     }
-    pub(crate) fn h2_review(&self) -> Option<&crate::runtime::h2_entry::LocalOwnerReview> {
-        self.h2_metadata.as_ref().and_then(|metadata| metadata.review.as_ref())
-    }
     fn normalize_h2_metadata(&mut self) {
-        if self.h2_metadata.as_ref().is_some_and(|metadata| {
-            metadata.controlled_case.is_none() && metadata.origin.is_none() && metadata.review.is_none()
-        }) {
+        if self
+            .h2_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.controlled_case.is_none() && metadata.origin.is_none())
+        {
             self.h2_metadata = None;
         }
     }
@@ -606,13 +603,6 @@ impl ToolExecutionContext {
             return;
         }
         self.h2_metadata.get_or_insert_with(Box::default).origin = origin;
-        self.normalize_h2_metadata();
-    }
-    pub(crate) fn set_h2_review(&mut self, review: Option<crate::runtime::h2_entry::LocalOwnerReview>) {
-        if self.h2_metadata.is_none() && review.is_none() {
-            return;
-        }
-        self.h2_metadata.get_or_insert_with(Box::default).review = review;
         self.normalize_h2_metadata();
     }
     #[must_use]
@@ -636,7 +626,6 @@ impl ToolExecutionContext {
             child_scope: None,
             child_pin: None,
             call_budget: None,
-            decision_resume: None,
             pending_approval_denied: false,
             admitted_binding: None,
             execution_admission: None,
@@ -668,13 +657,6 @@ impl ToolExecutionContext {
     #[must_use]
     pub(crate) const fn with_dispatch_origin(mut self, dispatch_origin: DispatchOrigin) -> Self {
         self.dispatch_origin = dispatch_origin;
-        self
-    }
-
-    /// Attach the called-tool budget for a model turn.
-    #[must_use]
-    pub(crate) fn with_call_budget(mut self, budget: admission::CallTokenBudget) -> Self {
-        self.call_budget = Some(budget);
         self
     }
 
@@ -1879,19 +1861,6 @@ impl ToolExecutionService {
         })
     }
 
-    pub(crate) async fn resolve_approval_operation(
-        &self,
-        public_name: &str,
-        arguments: &serde_json::Value,
-    ) -> anyhow::Result<(String, crate::acl::approval_grant::RiskLevel)> {
-        self.resolve(public_name)
-            .ok_or_else(|| anyhow::anyhow!("approval backend unavailable"))?
-            .backend
-            .resolve_approval_operation(public_name, arguments)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("approval operation cannot be resolved exactly"))
-    }
-
     /// Full live inventory. A collision with a pinned startup name is
     /// reported by parity even if the service still routes to its first owner.
     #[must_use]
@@ -2778,21 +2747,15 @@ impl ToolExecutionService {
             let verified = self
                 .verify_admitted_call(&context.envelope, admission, &descriptor, &command)
                 .map_err(|_| anyhow::anyhow!("experiment action has no admitted descriptor"))?;
-            // Only execution after the original approval can consume this port.
             // The initial pending call still needs to be recorded first. Full
             // autonomy requests no approval (R51); the admitted-descriptor
             // verification above still applies.
-            if context.decision_resume.is_none()
-                && self.policy.autonomy_level() != crate::security::AutonomyLevel::Full
+            if self.policy.autonomy_level() != crate::security::AutonomyLevel::Full
                 && crate::security::approval_operation::requires_explicit_grant(&command.name, &command.arguments)
             {
                 return Ok(None);
             }
-            Ok(Some(EntryInvocation::from_verified(
-                origin,
-                &verified,
-                context.h2_review().cloned(),
-            )?))
+            Ok(Some(EntryInvocation::from_verified(origin, &verified)?))
         }
         .await
         {
@@ -2864,33 +2827,6 @@ impl ToolExecutionService {
 
         let mut runtime_approval_granted = false;
         let mut runtime_grant = None;
-        if let Some(resume) = &context.decision_resume {
-            match resume
-                .verify(&command, &context)
-                .and_then(|grant| serde_json::to_value(grant).map_err(anyhow::Error::from))
-            {
-                Ok(grant) => {
-                    runtime_approval_granted = true;
-                    runtime_grant = Some(grant);
-                }
-                Err(error) => {
-                    let error = error.to_string();
-                    return self.finish(
-                        &command,
-                        &context,
-                        input_sha256,
-                        Some(descriptor),
-                        Some(decision),
-                        ToolExecutionStatus::ApprovalDenied,
-                        format!("Error: {error}"),
-                        None,
-                        Some(error),
-                        None,
-                        started,
-                    );
-                }
-            }
-        }
         let approval_run = context.envelope.run_id.clone().unwrap_or_default();
         let approval_channel = context.envelope.channel.clone().unwrap_or_default();
         let channel_gate =
@@ -2906,10 +2842,7 @@ impl ToolExecutionService {
         if channel_policy_ask && channel_gate.as_ref().is_some_and(|gate| gate.effective_full) {
             runtime_approval_granted = true;
         }
-        if decision == ToolExecutionDecision::Ask
-            && context.pending_approval_denied
-            && context.decision_resume.is_none()
-        {
+        if decision == ToolExecutionDecision::Ask && context.pending_approval_denied {
             let reason = "approval is not available for this agent".to_string();
             return self.finish(
                 &command,
@@ -2925,11 +2858,7 @@ impl ToolExecutionService {
                 started,
             );
         }
-        if decision == ToolExecutionDecision::Ask
-            && !prx_operator_ask
-            && context.decision_resume.is_none()
-            && channel_gate.is_some()
-        {
+        if decision == ToolExecutionDecision::Ask && !prx_operator_ask && channel_gate.is_some() {
             let approval_resolution: std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Option<crate::agent::turn_contracts::ApprovalDecision>>
@@ -2960,7 +2889,7 @@ impl ToolExecutionService {
                 );
             }
             runtime_approval_granted = true;
-        } else if decision == ToolExecutionDecision::Ask && context.decision_resume.is_none() {
+        } else if decision == ToolExecutionDecision::Ask {
             let (approval, ledger_route) = self
                 .resolve_ordinary_approval(ToolApprovalRequest {
                     command: command.clone(),
@@ -3105,52 +3034,6 @@ impl ToolExecutionService {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-
-        // A resume consumes approval only after preparation and the execution
-        // reservation. Cancellation or an uncertain claim never restores it.
-        let claimed_decision = if let Some(resume) = &context.decision_resume {
-            let claim = async {
-                if let Some(token) = cancellation.as_ref() {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => anyhow::bail!("resume cancelled during final claim"),
-                        result = resume.claim(&command, &context) => result,
-                    }
-                } else {
-                    resume.claim(&command, &context).await
-                }
-            }
-            .await;
-            match claim {
-                Ok(authority) => Some(authority),
-                Err(error) => {
-                    // The backend has not started, but the durable claim may
-                    // have committed before a readback failure/cancellation.
-                    let abandonment = self
-                        .abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
-                        .await;
-                    let error = abandonment.err().unwrap_or_else(|| error.to_string());
-                    if let Some(observation) = exact_call {
-                        observation.refused(ToolExecutionStatus::Indeterminate, false);
-                    }
-                    return self.finish(
-                        &command,
-                        &context,
-                        input_sha256,
-                        Some(descriptor),
-                        Some(decision),
-                        ToolExecutionStatus::Indeterminate,
-                        format!("Error: {error}"),
-                        None,
-                        Some(error),
-                        Some(preparation),
-                        started,
-                    );
-                }
-            }
-        } else {
-            None
-        };
 
         // A scheduled claim can expire while approval, preparation or the
         // idempotency reservation awaits. Validate its live authority before
@@ -3339,19 +3222,7 @@ impl ToolExecutionService {
             if let Some(invocation) = &h2_invocation {
                 invocation.ensure_live()?;
             }
-            match claimed_decision {
-                Some(authority) => {
-                    // Check again on the backend future's first poll, after
-                    // scheduling/cancellation may have closed the owning turn.
-                    context
-                        .decision_resume
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("resume adapter missing at dispatch"))?
-                        .verify(&command, &context)?;
-                    crate::security::decision_approval::with_claimed_decision(authority, tool_future).await
-                }
-                None => tool_future.await,
-            }
+            tool_future.await
         };
         let mut cancelled_before_invoke = false;
         let raw_result = if let (Some(token), Some(_)) = (cancellation.clone(), idempotency_lease.as_ref()) {

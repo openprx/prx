@@ -171,23 +171,6 @@ impl TurnSurface {
         self
     }
 
-    /// Restrict the published set to `name` alone (a historical resume turn
-    /// publishes only its prepared tool). Never widens the ceiling.
-    pub(crate) fn restricted_to(&self, name: &str) -> Self {
-        let mut surface = self.clone();
-        surface.published.retain(|published| published == name);
-        surface
-    }
-
-    /// The published tool when exactly one is published.
-    pub(crate) fn single_published(&self) -> Option<&str> {
-        let mut names = self.published.iter().filter(|name| self.contains(name));
-        match (names.next(), names.next()) {
-            (Some(name), None) => Some(name.as_str()),
-            _ => None,
-        }
-    }
-
     pub(crate) fn observed_capability_id(&self, name: &str) -> Option<&str> {
         self.capability_ids.get(name).map(String::as_str)
     }

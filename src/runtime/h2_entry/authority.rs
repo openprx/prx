@@ -1,5 +1,5 @@
 use super::profile::digest;
-use super::{ControlledH2Profile, LocalOwnerReview, VerifiedEntryOrigin};
+use super::{ControlledH2Profile, VerifiedEntryOrigin};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -68,7 +68,6 @@ pub(crate) struct EntryInvocation {
     origin: Arc<VerifiedEntryOrigin>,
     call: EntryCall,
     consumed: AtomicBool,
-    local_review: Option<LocalOwnerReview>,
 }
 impl std::fmt::Debug for EntryInvocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,11 +75,7 @@ impl std::fmt::Debug for EntryInvocation {
     }
 }
 impl EntryInvocation {
-    fn admit(
-        origin: Arc<VerifiedEntryOrigin>,
-        call: EntryCall,
-        local_review: Option<LocalOwnerReview>,
-    ) -> Result<Arc<Self>> {
+    fn admit(origin: Arc<VerifiedEntryOrigin>, call: EntryCall) -> Result<Arc<Self>> {
         origin.ensure_live()?;
         let source = origin.record();
         ensure!(
@@ -94,23 +89,21 @@ impl EntryInvocation {
                 && call.tool == "skills_manage",
             "controlled call source changed"
         );
-        if call.action.requires_local_review() && source.kind == "gateway" {
-            let review = local_review
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("local lifecycle owner review required"))?;
-            review.verify(&origin, &call)?;
-        }
+        // The local owner review was a decision-approval attestation and is
+        // retired; Gateway lifecycle actions that required it are refused.
+        ensure!(
+            !(call.action.requires_local_review() && source.kind == "gateway"),
+            "local lifecycle owner review required"
+        );
         Ok(Arc::new(Self {
             origin,
             call,
             consumed: AtomicBool::new(false),
-            local_review,
         }))
     }
     pub(crate) fn from_verified(
         origin: Arc<VerifiedEntryOrigin>,
         verified: &crate::tools::capability::execution_binding::VerifiedExecutionCall,
-        local_review: Option<LocalOwnerReview>,
     ) -> Result<Arc<Self>> {
         let command = verified.command();
         ensure!(command.name == "skills_manage", "controlled call has another backend");
@@ -142,7 +135,7 @@ impl EntryInvocation {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("controlled event missing"))?,
         };
-        Self::admit(origin, call, local_review)
+        Self::admit(origin, call)
     }
     pub(crate) fn ensure_live(&self) -> Result<()> {
         self.origin.ensure_live()
@@ -153,9 +146,6 @@ impl EntryInvocation {
             self.call.action == action && self.call.args_sha256 == args_sha256,
             "controlled call arguments changed"
         );
-        if let Some(review) = &self.local_review {
-            review.verify(&self.origin, &self.call)?;
-        }
         ensure!(
             !self.consumed.swap(true, Ordering::AcqRel),
             "controlled invocation already consumed"

@@ -11,8 +11,8 @@ use super::bootstrap::{chat_model_switch, chat_provider_chain, initial_chat_disp
 #[cfg(feature = "terminal-tui")]
 use super::chat_events::{ReduxMode, collect_reasoning_from_history_slice};
 use super::chat_events::{
-    chat_message_event_scope, chat_runtime_envelope, finalize_chat_non_success_turn, finalize_chat_success_turn,
-    record_route_decision_event, sanitize_chat_semantic_memory_content,
+    chat_message_event_scope, finalize_chat_non_success_turn, finalize_chat_success_turn, record_route_decision_event,
+    sanitize_chat_semantic_memory_content,
 };
 #[cfg(feature = "terminal-tui")]
 use super::compaction::refresh_context_budget_for_tui;
@@ -24,7 +24,7 @@ use super::compaction::{
     persist_legacy_chat_compaction_audit,
 };
 use super::copy_select::{copy_success_message, is_copy_command, select_copy_content};
-use super::file_mention::{FileMentionEnrichment, enrich_file_mentions_for_prompt};
+use super::file_mention::enrich_file_mentions_for_prompt;
 use super::input_queue::{
     DequeuedInputMessage, QueuedInputMessage, drain_available_input_messages, enqueue_input_message_with_scheduler,
     format_input_backlog_report, is_local_operator_input, is_synthetic_ui_command,
@@ -33,8 +33,7 @@ use super::input_queue::{
 use super::output::{print_fallback_chat_output, render_response, should_resend_on_finalize_failure};
 use super::provider_turns::{
     PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext, ProviderTurnCompletionEvent,
-    dispatch_ordered_provider_turn_commit_and_wait, gate_cancelled_provider_turn_finalization,
-    gate_completed_provider_turn_finalization, gate_failed_provider_turn_finalization, mark_provider_turn_completed,
+    gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization, mark_provider_turn_completed,
     provider_turn_visible_admission, provider_worker_status, publish_provider_worker_status,
     record_provider_turn_completion_context, record_provider_turn_lifecycle_event, record_provider_turn_usage,
     register_provider_history_commit_task, register_provider_turn_worker, route_provider_completion_event_and_publish,
@@ -97,7 +96,7 @@ use super::views::{
 };
 use super::{
     CHAT_CONTROL_CHANNEL_CAPACITY, DOUBLE_CTRLC_WINDOW_MS, INPUT_CHANNEL_CAPACITY, TOOL_EVENT_CHANNEL_CAPACITY,
-    binding, commands, diff_apply, dispatcher, sanitize, session, terminal_proto,
+    binding, commands, diff_apply, dispatcher, session, terminal_proto,
 };
 use crate::agent::context_recall::increment_recalled_useful_counts;
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -1347,8 +1346,7 @@ async fn run_internal(
         if let Err(error) = entry::validate_input(ctx.controlled_entry.is_some(),terminal_origin.is_some(),&msg.content) {
             surface_session_message(&chat_dispatcher,sessions_redraw_handle.as_ref(),&error.to_string()); continue;
         }
-        let mut user_input = msg.content.clone();
-        let mut resume_decision = false;
+        let user_input = msg.content.clone();
         let synthetic_ui_command = is_synthetic_ui_command(&msg);
         // Armed here, at the top, because the turn body has many exits — a
         // slash command short-circuits it, a cancellation unwinds it, `/quit`
@@ -2784,78 +2782,6 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                             continue;
                         }
-                        SessionCommand::ResumeDecision { decision_id } => {
-                            if !config.causal_tree.enabled {
-                                emit_chat_output("Decision resume is unavailable while the decision plane is disabled.");
-                                continue;
-                            }
-                            // Only this explicit command selects resume mode. The
-                            // fresh source event records the exact canonical request.
-                            user_input = serde_json::json!({ "decision_id": decision_id.hyphenated().to_string() }).to_string();
-                            resume_decision = true;
-                        }
-                        SessionCommand::InspectDecision { decision_id } => {
-                            if !config.causal_tree.enabled {
-                                emit_chat_output("Decision inspection is unavailable while the decision plane is disabled.");
-                                continue;
-                            }
-                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
-                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
-                            let inspected = turn_decisions.inspect_pending_decision_approval(
-                                &envelope.resolved_owner_id(), &envelope.session_key, id,
-                            ).await.and_then(|view| serde_json::to_string_pretty(&view).map_err(Into::into));
-                            match inspected {
-                                Ok(view) => {
-                                    match chat_sessions.register_decision_seq(&chat_session_key, id) {
-                                        Ok(seq) => emit_chat_output(&format!("Pending decision #{seq}: {id}. Review with /approve {seq} or /deny {seq}.")),
-                                        Err(_) => emit_chat_output("A display number is unavailable; use the explicit decision UUID."),
-                                    }
-                                    emit_chat_output("Recorded approval details (arguments may be redacted; output may be truncated):");
-                                    emit_chat_output(&sanitize::truncate_large_output(&view));
-                                }
-                                Err(_) => emit_chat_output("No inspectable pending decision is available for this chat."),
-                            }
-                            continue;
-                        }
-                        SessionCommand::RevokeDecision { decision_id } => {
-                            if !config.causal_tree.enabled {
-                                emit_chat_output("Decision revocation is unavailable while the decision plane is disabled.");
-                                continue;
-                            }
-                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
-                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
-                            match turn_decisions.revoke_pending_decision_approval(
-                                &envelope.resolved_owner_id(), &envelope.session_key, id,
-                            ).await {
-                                Ok(_) => emit_chat_output("Decision grant revocation recorded. This does not undo an operation that already ran."),
-                                Err(_) => emit_chat_output("Decision revocation could not be confirmed for this chat. No automatic retry was made."),
-                            }
-                            continue;
-                        }
-                        SessionCommand::ReviewDecision { decision_id, approved } => {
-                            if !config.causal_tree.enabled {
-                                emit_chat_output("Decision review is unavailable while the decision plane is disabled.");
-                                continue;
-                            }
-                            let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
-                            let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                            let id = crate::security::decision_id::DecisionId::parse(&decision_id.hyphenated().to_string())?;
-                            match turn_decisions.review_pending_decision_approval(
-                                &envelope.resolved_owner_id(), &envelope.session_key, id, approved,
-                            ).await {
-                                Ok(_) => emit_chat_output(if approved {
-                                    "Decision approval recorded. The operation has not run; explicit resume is required."
-                                } else {
-                                    "Decision rejected. The operation has not run."
-                                }),
-                                Err(_) => emit_chat_output(
-                                    "Decision review could not be confirmed for this chat. No automatic retry was made."
-                                ),
-                            }
-                            continue;
-                        }
                         SessionCommand::Approve { seq } | SessionCommand::Deny { seq } => {
                             // NeedsInput: deliver an approval decision to a
                             // background sub-agent suspended on the supervised
@@ -2863,30 +2789,6 @@ Retry with a compatible model: /provider {shown} <model>",
                             // (Grant) so the gated tool can pass the gate; `/deny`
                             // reports the tool as denied to the sub-agent.
                             let approve = matches!(action, SessionCommand::Approve { .. });
-                            match chat_sessions.decision_for_seq(&chat_session_key, seq) {
-                                Ok(Some(id)) => {
-                                    if !config.causal_tree.enabled {
-                                        emit_chat_output("Decision review is unavailable while the decision plane is disabled.");
-                                        continue;
-                                    }
-                                    let workspace = ctx.config_generation.effective.workspace_dir.to_string_lossy();
-                                    let envelope = chat_runtime_envelope(&workspace, &chat_session_key);
-                                    match turn_decisions.review_pending_decision_approval(
-                                        &envelope.resolved_owner_id(), &envelope.session_key, id, approve,
-                                    ).await {
-                                        Ok(_) => emit_chat_output(if approve {
-                                            "Decision approval recorded. The operation has not run; explicit resume is required."
-                                        } else { "Decision rejected. The operation has not run." }),
-                                        Err(_) => emit_chat_output("Decision review could not be confirmed for this chat. No automatic retry was made."),
-                                    }
-                                    continue;
-                                }
-                                Err(_) => {
-                                    emit_chat_output("No decision alias is available in this chat.");
-                                    continue;
-                                }
-                                Ok(None) => {}
-                            }
                             let run_id = match chat_sessions.resolve_run_id(seq).await {
                                 Ok(id) => id,
                                 Err(e) => {
@@ -3031,15 +2933,11 @@ Retry with a compatible model: /provider {shown} <model>",
         // Some(id), including when its UI receiver has closed. Capacity can
         // therefore be selected before creating the durable source. The local
         // worker registry is inserted into only by this main loop; awaits below
-        // cannot consume another slot. Explicit approval resume stays foreground.
+        // cannot consume another slot.
         #[cfg(feature = "terminal-tui")]
-        let reducer_driver_turn_active = !resume_decision;
+        let reducer_driver_turn_active = true;
         #[cfg(feature = "terminal-tui")]
-        let provider_worker_kind = if reducer_driver_turn_active {
-            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached
-        } else {
-            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
-        };
+        let provider_worker_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::Detached;
         #[cfg(not(feature = "terminal-tui"))]
         let provider_worker_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
         let provider_admission_max = match provider_worker_kind {
@@ -3118,10 +3016,10 @@ Retry with a compatible model: /provider {shown} <model>",
         let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded_with_origin(
             memory_fabric.clone(), (input_scope, &chat_session_key, binding::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
             format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
-            child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input,resume_decision)?,
+            child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input)?,
         ).await?;
         let admission = admitted_binding
-            .issue_decision(&turn_decisions, &cancellation, resume_decision)
+            .issue_decision(&turn_decisions, &cancellation)
             .await;
         if let Err(error) = admission {
             if let Err(record_error) = admission_guard.finish_failure(
@@ -3129,41 +3027,19 @@ Retry with a compatible model: /provider {shown} <model>",
             ).await {
                 return Err(error.context(format!("Chat admission failure persistence is unconfirmed: {record_error}")));
             }
-            if resume_decision {
-                if let Some(id) = provider_queue_task_id {
-                    super::input_queue::cancel_dequeued_input_task(&mut turn_scheduler, id)?;
-                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
-                }
-                let reply = binding::resume_admission_failure_reply(&error);
-                emit_chat_output(reply);
-                if let Some(guard) = assignment_guard.as_mut() { guard.failed(reply); }
-                continue;
-            }
             return Err(error);
         }
         admission_guard.handoff_terminal()?;
         let chat_turn_binding = Some(Arc::clone(&admitted_binding));
-        if let Some(id) = chat_turn_binding.as_ref().and_then(|binding| binding.pending_decision_id()) {
-            match chat_sessions.register_decision_seq(&chat_session_key, id) {
-                Ok(seq) => emit_chat_output(&format!("Pending decision #{seq}: {id}. Inspect with /approval --decision {id}; review with /approve {seq} or /deny {seq}.")),
-                Err(_) => emit_chat_output("A display number is unavailable; use the explicit decision UUID."),
-            }
-        }
 
-
-        let direct_decision_turn = resume_decision;
-        let file_mention_enrichment = if direct_decision_turn {
-            FileMentionEnrichment { prompt: user_input.clone(), visible_note: None }
-        } else {
-            enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await
-        };
+        let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await;
         if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
             emit_chat_output(note);
         }
         let user_input_for_prompt = file_mention_enrichment.prompt;
 
         // Auto-save user message to memory
-        if !direct_decision_turn && config.memory.should_auto_promote_user_message(&user_input) {
+        if config.memory.should_auto_promote_user_message(&user_input) {
             let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
             let _ = crate::agent::entry::save_current_input(&memory_fabric,
                 admitted_binding.envelope().run_id.as_deref().context("chat turn run id missing")?,
@@ -3188,11 +3064,7 @@ Retry with a compatible model: /provider {shown} <model>",
         // The TUI handoff retains the original source input, before enrichment.
         #[cfg(feature = "terminal-tui")]
         let routing_input = admitted_binding.routing_input().to_owned();
-        let mem_context = if direct_decision_turn {
-            crate::agent::context_recall::RecalledMemoryContext { preamble: String::new(), ids: Vec::new(), semantic_range: 0..0, summaries: Vec::new() }
-        } else {
-            admitted_binding.recalled_context(mem.as_ref()).await
-        };
+        let mem_context = admitted_binding.recalled_context(mem.as_ref()).await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
             user_input_for_prompt.clone()
@@ -3201,11 +3073,7 @@ Retry with a compatible model: /provider {shown} <model>",
         };
 
         // Build system prompt with skill selection
-        let selected_skills = if direct_decision_turn {
-            Vec::new()
-        } else {
-            admitted_binding.prompt_skills()?
-        };
+        let selected_skills = admitted_binding.prompt_skills()?;
         // Publish only this turn's selected metadata. Previous turns do not
         // grant continued Skill exposure; the prompt builder orders entries.
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
@@ -3569,71 +3437,6 @@ Retry with a compatible model: /provider {shown} <model>",
         );
         publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
         publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
-
-        // Foreground fixed closes have no older visible worker to wait for.
-        // Keep the same task-scoped persistence acknowledgement as detached
-        // replies, including builds without the terminal TUI.
-        if provider_worker_kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
-            && let Some(binding) = chat_turn_binding.as_ref()
-            && resume_decision
-        {
-            anyhow::ensure!(history_commit_coordinator.pending_tasks() == 1,
-                "foreground Chat close has an earlier uncommitted turn");
-            let task_id = provider_turn_task_id.context("Chat close has no scheduler task")?;
-            drop(delta_tx);
-            drop(tool_event_tx);
-            if let Some(handle) = draft_updater { let _ = handle.await; }
-            let _ = tool_event_forwarder.await;
-            let close_draft_id = draft_id.clone().unwrap_or_else(|| format!("decision-close:{turn_run_id}"));
-            if draft_id.is_none() {
-                anyhow::ensure!(matches!(chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::TurnStarted {
-                        draft_id: close_draft_id.clone(), cancel: cancellation.clone(),
-                    }, "chat.fixed_close_started"), dispatcher::DispatchResult::Sent),
-                    "Chat close draft could not be registered");
-            }
-            let commit_len = history.len().saturating_add(1);
-            // This awaited execution has no detached driver's lifecycle events.
-            // Its task owns the lease until execution returns; finalization must
-            // observe completion-ready before it can release visible admission.
-            // Lease comparisons are scoped to this task's worker, not global.
-            // This foreground worker never receives detached-driver lease events.
-            let lease_id = task_id.get();
-            provider_turn_workers.record_execution_started(task_id, lease_id)
-                .map_err(|error| anyhow::anyhow!("Chat close execution start failed: {error:?}"))?;
-            let (reply, succeeded) = binding.execute_resume_and_finalize(&memory_fabric, commit_len, provider_started_at, &cancellation).await?;
-            provider_turn_workers.record_execution_exited(task_id, lease_id)
-                .map_err(|error| anyhow::anyhow!("Chat close execution exit failed: {error:?}"))?;
-            provider_turn_workers.record_completion_ready(task_id)
-                .map_err(|error| anyhow::anyhow!("Chat close completion failed: {error:?}"))?;
-            dispatch_ordered_provider_turn_commit_and_wait(
-                &chat_dispatcher, &turn_signal, task_id, &close_draft_id,
-                &user_input, &reply, "", false, false,
-            ).await.map_err(anyhow::Error::msg)?;
-            history.push(ChatMessage::assistant(reply.to_owned()));
-            chat_session.add_user_turn(&user_input);
-            chat_session.add_assistant_turn(&reply, Vec::new());
-            gate_completed_provider_turn_finalization(
-                &mut turn_scheduler, &mut history_commit_coordinator, &mut provider_turn_workers,
-                Some(task_id), commit_len, reply.chars().count(), reply.chars().count(),
-                &crate::llm::route_decision::TokenUsage::default(), "chat decision closed",
-            );
-            take_provider_turn_completion_history_len(&mut provider_turn_completion_contexts,
-                Some(task_id), commit_len);
-            if let Some(id) = draft_id.as_ref() {
-                terminal.finalize_draft("user", id, &reply).await?;
-            } else {
-                terminal.send(&SendMessage::new(&reply, "user")).await?;
-            }
-            if let Some(guard) = assignment_guard.as_mut() {
-                if succeeded { guard.completed(&reply); } else { guard.failed(&reply); }
-            }
-            #[cfg(not(feature = "terminal-tui"))]
-            { *active_cancel.lock() = None; }
-            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
-            publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
-            continue;
-        }
 
         // ── Redux driver switched-over path (Step 5a-4) ────────────
         //

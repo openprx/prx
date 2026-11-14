@@ -150,10 +150,6 @@ pub fn router(state: AppState) -> Router<AppState> {
                 .post(sessions::post_decision_approval)
                 .delete(sessions::delete_decision_approval),
         )
-        .route(
-            "/sessions/{id}/approvals/{decision_id}/resume",
-            post(sessions::post_decision_resume),
-        )
         .route("/channels", get(channels::get_channels_status))
         // Phase 1: alias for frontend compatibility
         .route("/channels/status", get(channels::get_channels_status))

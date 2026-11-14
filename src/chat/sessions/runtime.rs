@@ -176,8 +176,6 @@ pub struct ChatSessionsHandle {
     seq_map: Vec<(u64, SessionId)>,
     /// Next sequence number to hand out.
     next_seq: u64,
-    /// Decision aliases share the allocator but never enter the child registry.
-    decision_seqs: Vec<(u64, String, crate::security::decision_id::DecisionId)>,
     /// First time this handle observed a PTY as exited. PTY sessions do not
     /// carry `finished_at`, so cleanup ages them from this observation point.
     pty_terminal_seen_at: HashMap<SessionId, DateTime<Utc>>,
@@ -204,7 +202,6 @@ impl ChatSessionsHandle {
             ptys: Arc::new(Mutex::new(Vec::new())),
             seq_map: Vec::new(),
             next_seq: 1,
-            decision_seqs: Vec::new(),
             pty_terminal_seen_at: HashMap::new(),
             reaped_sessions: Vec::new(),
             daemon_requests: super::daemon::new_in_flight_registry(),
@@ -315,46 +312,6 @@ impl ChatSessionsHandle {
         self.next_seq += 1;
         self.seq_map.push((seq, id.clone()));
         seq
-    }
-
-    /// Register an already authenticated pending decision for the current
-    /// chat. Aliases are never reused, including after a session switch.
-    pub(crate) fn register_decision_seq(
-        &mut self,
-        session: &str,
-        decision: crate::security::decision_id::DecisionId,
-    ) -> Result<u64> {
-        if let Some((seq, _, _)) = self
-            .decision_seqs
-            .iter()
-            .find(|(_, existing_session, existing)| existing_session == session && *existing == decision)
-        {
-            return Ok(*seq);
-        }
-        anyhow::ensure!(
-            !session.is_empty() && self.decision_seqs.len() < 1024,
-            "decision display sequence unavailable; use the explicit decision UUID"
-        );
-        let seq = self.next_seq;
-        self.next_seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("display sequence exhausted"))?;
-        self.decision_seqs.push((seq, session.to_owned(), decision));
-        Ok(seq)
-    }
-
-    /// A foreign-chat alias is an error, never a fallback to a child session.
-    pub(crate) fn decision_for_seq(
-        &self,
-        session: &str,
-        seq: u64,
-    ) -> Result<Option<crate::security::decision_id::DecisionId>> {
-        let Some((_, owner_session, decision)) = self.decision_seqs.iter().find(|(id, _, _)| *id == seq) else {
-            return Ok(None);
-        };
-        anyhow::ensure!(owner_session == session, "no decision alias in the current chat");
-        Ok(Some(*decision))
     }
 
     /// Resolve a display sequence `#N` to the underlying run UUID.

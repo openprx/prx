@@ -131,7 +131,7 @@ async fn child_call_ask_binds_to_child_context() {
     let ledger = child.approval_ledger.as_ref().unwrap();
     let resolution = ledger
         .memory
-        .find_message_event_by_idempotency_key(&ledger.workspace, &pending.authority().resolution_key(""))
+        .find_message_event_by_idempotency_key(&ledger.workspace, &pending.authority().resolution_key())
         .await
         .unwrap()
         .unwrap();

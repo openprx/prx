@@ -9,23 +9,6 @@ use crate::agent::terminal::TurnTerminalStatus;
 use crate::memory::{MemoryFabric, SqliteMemory};
 
 #[test]
-fn resume_admission_infrastructure_failure_offers_retry_without_error_details() {
-    use crate::runtime::turn_context::AgentDecisionError;
-    for error in [
-        AgentDecisionError::PendingApproval(std::io::Error::other("prx_private_path").into()),
-        AgentDecisionError::PendingApproval(rusqlite::Error::InvalidQuery.into()),
-        AgentDecisionError::RecordWriterUnavailable,
-        AgentDecisionError::IngressRecovery(anyhow::anyhow!("prx_private_owner")),
-    ] {
-        let error = anyhow::Error::new(error).context("prx_private_decision");
-        assert_eq!(
-            resume_admission_failure_reply(&error),
-            "Decision resume failed before execution. You can retry this request."
-        );
-    }
-}
-
-#[test]
 fn failed_inbound_persistence_names_the_cause_and_hides_private_text() {
     let error =
         anyhow::anyhow!("invalid ingress capsule authentication").context("owner=/Users/hidden/prx_owner token=abcd");
@@ -39,19 +22,6 @@ fn failed_inbound_persistence_names_the_cause_and_hides_private_text() {
     assert!(!text.contains("hidden"), "{text}");
     assert!(!text.contains("abcd"), "{text}");
     assert!(!text.contains("token"), "{text}");
-}
-
-#[test]
-fn resume_admission_authority_failures_share_an_opaque_refusal() {
-    use crate::runtime::turn_context::AgentDecisionError;
-    for reason in ["owner mismatch", "scope mismatch", "already consumed"] {
-        let error = anyhow::Error::new(AgentDecisionError::PendingApproval(anyhow::anyhow!(reason)))
-            .context("prx_private_decision");
-        assert_eq!(
-            resume_admission_failure_reply(&error),
-            "Decision resume could not be admitted for this chat. No operation was run by this request."
-        );
-    }
 }
 
 /// Admit only an actual local `/bg` fixture through Chat's private source path.
@@ -142,7 +112,7 @@ pub(crate) async fn dispatch_recorded_model_spawn(
         ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let context = binding.issue_decision(&service, &cancellation, false).await?;
+    let context = binding.issue_decision(&service, &cancellation).await?;
     use crate::tools::Tool as _;
     let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
     if !specs.specs.iter().any(|spec| spec.name == "sessions_spawn") {
@@ -258,7 +228,7 @@ pub(crate) async fn dispatch_unknown_agent_fixture(
         ChatAdmissionMode::Model(crate::agent::turn_contracts::ChatMode::Edit),
     )?;
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let context = binding.issue_decision(&service, &cancellation, false).await?;
+    let context = binding.issue_decision(&service, &cancellation).await?;
     use crate::tools::Tool as _;
     let mut specs = service.agent_execution_specs(binding.as_ref(), context)?;
     if !specs.specs.iter().any(|spec| spec.name == "sessions_spawn") {
@@ -556,7 +526,7 @@ async fn decided_binding_for_provider_retained(
         });
     }
     binding
-        .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
+        .issue_decision(&service, &tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
     (binding, service, event)
@@ -592,7 +562,7 @@ async fn h2_approval_ledger_requires_h2_origin() {
     let service = service(&fabric, &binding).await;
     assert!(service.execution_approval_ledger().is_some(), "durable fixture ledger");
     binding
-        .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
+        .issue_decision(&service, &tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
     assert!(
@@ -656,7 +626,7 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
         let copied = OwnedTurnSourceProof::capture(&owned);
         assert!(owned.intercepts_writes() && copied.intercepts_writes());
         let service = service(&fabric, &binding).await;
-        let context = binding.issue_decision(&service, &cancellation, false).await.unwrap();
+        let context = binding.issue_decision(&service, &cancellation).await.unwrap();
         assert!(
             context
                 .inherited_constraint_codes()
@@ -707,8 +677,6 @@ async fn guarded_plan_admission_preserves_mode_and_owned_capture_with_plane_on_a
             )
             .is_err()
         );
-        // Resume cannot reinterpret a cached initial decision or clear its mode.
-        assert!(binding.issue_decision(&service, &cancellation, true).await.is_err());
         assert!(queued.verify_execution_mode(ChatMode::Edit).is_err());
         assert!(binding.intercepts_writes());
         service
@@ -738,13 +706,7 @@ async fn operator_command_binding_cannot_be_reused_as_model_admission() {
     let service = service(&fabric, &operator).await;
     assert!(
         operator
-            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
-            .await
-            .is_err()
-    );
-    assert!(
-        operator
-            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), true)
+            .issue_decision(&service, &tokio_util::sync::CancellationToken::new())
             .await
             .is_err()
     );
@@ -816,36 +778,6 @@ pub(in crate::chat) fn install_fixture_terminal(
 }
 
 #[tokio::test]
-async fn enabled_fresh_plan_resume_without_approved_grant_is_rejected() {
-    use crate::agent::turn_contracts::ChatMode;
-    use crate::runtime::turn_source::TurnSourceProof;
-    let (_dir, fabric, original) = fixture_with_plane(true, true).await;
-    let provider = ChatProviderBinding::capture(&original.generation, &original.provider, "ollama", "prx-local-model")
-        .unwrap()
-        .unwrap();
-    let source = ChatSourceReceipt {
-        envelope: original.envelope.clone(),
-        routing_input: Arc::clone(&original.routing_input),
-    };
-    let binding = source
-        .bind_provider(&provider, ChatAdmissionMode::Model(ChatMode::Plan))
-        .unwrap();
-    let service = service(&fabric, &binding).await;
-    assert!(
-        binding
-            .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), true)
-            .await
-            .is_err()
-    );
-    assert!(!binding.is_decided());
-    assert!(binding.intercepts_writes());
-    assert!(binding.verify_execution_mode(ChatMode::Edit).is_err());
-    service
-        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
-        .await;
-}
-
-#[tokio::test]
 async fn closed_input_cannot_issue_a_decision() {
     let (_dir, fabric, binding) = fixture(true).await;
     let service = service(&fabric, &binding).await;
@@ -854,7 +786,7 @@ async fn closed_input_cannot_issue_a_decision() {
         .await
         .unwrap();
     let result = binding
-        .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
+        .issue_decision(&service, &tokio_util::sync::CancellationToken::new())
         .await;
     assert!(
         result
@@ -874,7 +806,7 @@ async fn decided_input_rejects_admission_failure_and_commits_redacted_reply() {
     let (dir, fabric, binding) = fixture(true).await;
     let service = service(&fabric, &binding).await;
     binding
-        .issue_decision(&service, &tokio_util::sync::CancellationToken::new(), false)
+        .issue_decision(&service, &tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
     assert!(

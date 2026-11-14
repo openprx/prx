@@ -27,7 +27,6 @@ use crate::runtime::turn_decision::{
     AgentDecisionBudgetError, AgentDiscoveryError, AgentRetrievalError, SendLimits, TurnModelError,
 };
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::security::approval_ledger::historical::AdmittedDecisionResume;
 use crate::security::decision_id::DecisionId;
 use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
@@ -35,7 +34,6 @@ use crate::tools::capability::catalog::ParityError;
 use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
 use crate::tools::capability::child::ChildCapabilityManifest;
 use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
-use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
 use crate::tools::capability::search_tool::DiscoveryState;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::capability::turn_state::{TrustedParts, TurnBudgets};
@@ -152,16 +150,12 @@ impl TurnRuntimeHolder {
     /// issued allowance.
     pub(crate) fn recursive_money(&self, proof: &dyn TurnSourceProof) -> Option<Arc<AtomicU64>> {
         if let Some(incoming) = &self.parent_grant {
-            return incoming
-                .recursive_child_allowance()
-                .and_then(|owner| owner.funded_money());
+            return incoming.recursive_child_allowance().map(|owner| owner.money());
         }
         if let Some(money) = &self.ordinary_money {
             return Some(Arc::clone(money));
         }
-        self.recursive_allowances
-            .lookup(proof)
-            .and_then(|owner| owner.funded_money())
+        self.recursive_allowances.lookup(proof).map(|owner| owner.money())
     }
 
     /// Remaining workspace money under the publication's pinned spend inputs
@@ -227,9 +221,6 @@ pub(crate) struct TurnRuntimeContext {
     pub(crate) discovery: DiscoveryState,
     /// The outgoing child manifest sealed at opening, if any.
     pub(crate) outgoing_delegation: Option<OutgoingDelegation>,
-    /// Shared handle to the same value the decision context holds.
-    pub(crate) resume: Option<Arc<AdmittedDecisionResume>>,
-    pub(crate) resume_evidence: Option<Arc<VerifiedResumeEvidenceV1>>,
     /// The same key the service uses for `Ns8::of`.
     pub(crate) state_key: Arc<DecisionKey>,
     /// Publication-scoped holder shared with every turn of the publication.
@@ -259,11 +250,6 @@ impl TurnRuntimeContext {
                     .remaining_micro_usd
                     .min(scope.remaining_budgets().micro_usd)
             })
-    }
-
-    /// The single tool a historical resume turn may publish and dispatch.
-    pub(crate) fn resume_tool_name(&self) -> Option<&str> {
-        self.resume.as_deref().map(AdmittedDecisionResume::prepared_tool_name)
     }
 
     pub(crate) fn model_catalog(&self) -> Option<&ReleaseCatalog> {

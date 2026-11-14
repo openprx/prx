@@ -1,7 +1,7 @@
 //! Source-bound selection of exact tool schemas for the shared turn loop.
 use super::{
-    Arc, CancellationToken, CapabilityAvailabilityLevel, ConfigGeneration, Context, Memory, SecurityPolicy,
-    ToolExecutionService, TurnDecisionContext, TurnDecisionService, TurnSourceProof, TurnSurfaceKind,
+    Arc, CapabilityAvailabilityLevel, ConfigGeneration, Context, Memory, SecurityPolicy, ToolExecutionService,
+    TurnDecisionContext, TurnDecisionService, TurnSourceProof, TurnSurfaceKind,
 };
 use crate::runtime::child_source::publication::OrdinaryChildPublication;
 use crate::tools::ToolSpec;
@@ -50,19 +50,6 @@ impl TurnDecisionService {
     }
 }
 
-struct DecisionResumeDispatch {
-    service: Arc<ToolExecutionService>,
-    context: crate::tools::ToolExecutionContext,
-    command: crate::tools::ToolExecutionCommand,
-}
-
-struct ResumeExecutionGuard<'a>(&'a TurnDecisionContext);
-impl Drop for ResumeExecutionGuard<'_> {
-    fn drop(&mut self) {
-        self.0.terminal_execution_trace();
-    }
-}
-
 impl TurnDecisionService {
     pub(crate) fn bind_agent_execution(
         self: &Arc<Self>,
@@ -71,10 +58,6 @@ impl TurnDecisionService {
         execution_context: &crate::tools::ToolExecutionContext,
         specs: &[ToolSpec],
     ) -> anyhow::Result<(Arc<ToolExecutionService>, crate::tools::ToolExecutionContext)> {
-        anyhow::ensure!(
-            context.resume.is_none(),
-            "resumed execution requires the dedicated durable claim adapter"
-        );
         self.bind_execution(proof, context, execution_context, specs)
     }
 
@@ -94,74 +77,6 @@ impl TurnDecisionService {
         let (published_execution, execution_context) =
             self.bind_agent_execution(proof, context, execution_context, specs)?;
         Ok((runtime_execution.unwrap_or(published_execution), execution_context))
-    }
-
-    /// Returns only the original prepared command and exact selected schema;
-    /// a resume never asks a model to recreate approved arguments.
-    fn bind_resume_execution(
-        self: &Arc<Self>,
-        proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
-        execution_context: &crate::tools::ToolExecutionContext,
-    ) -> anyhow::Result<DecisionResumeDispatch> {
-        let resume = context.resume.as_ref().context("resume admission missing")?;
-        let (command, dialect) = resume.command()?;
-        // V-17: the resume turn's published surface (execution rules, R28)
-        // is exactly the prepared tool, and the dispatch surface is
-        // restricted to it.
-        let selected = self.agent_execution_specs(proof, context)?;
-        anyhow::ensure!(
-            context.runtime().resume_tool_name() == Some(command.name.as_str())
-                && selected.specs.len() == 1
-                && selected.specs.first().is_some_and(|spec| spec.name == command.name),
-            "resume surface differs from approved call"
-        );
-        let (service, mut execution_context) =
-            self.bind_execution(proof, context, execution_context, &selected.specs)?;
-        execution_context.turn_surface = execution_context
-            .turn_surface
-            .as_ref()
-            .map(|surface| Arc::new(surface.restricted_to(&command.name)));
-        execution_context.schema_dialect = dialect;
-        execution_context.set_h2_origin(proof.h2_entry_origin().cloned());
-        execution_context.set_h2_review(self.resume_local_owner_review(context, proof)?);
-        execution_context.decision_resume = Some(crate::tools::capability::execution_binding::DecisionResumePort::new(
-            Arc::new(
-                crate::security::approval_ledger::historical::ExecutionResumeAdapter::new(
-                    Arc::clone(self)
-                        as Arc<dyn crate::security::approval_ledger::historical::HistoricalApprovalRuntime>,
-                    Arc::new(super::pending_approval::DecisionResumeTurn::new(
-                        Arc::clone(self),
-                        Arc::clone(context),
-                    )),
-                    proof,
-                    execution_context.envelope.clone(),
-                ),
-            ),
-        ));
-        Ok(DecisionResumeDispatch {
-            service,
-            context: execution_context,
-            command: command.clone(),
-        })
-    }
-
-    /// Execute exactly the approved call, without a model round trip. The
-    /// owning ingress must durably finalize the returned outcome. Cancellation
-    /// or dropping this future seals its trace and prevents further dispatch.
-    pub(crate) async fn execute_agent_resume(
-        self: &Arc<Self>,
-        proof: &dyn TurnSourceProof,
-        context: &Arc<TurnDecisionContext>,
-        execution_context: &crate::tools::ToolExecutionContext,
-        cancellation: &CancellationToken,
-    ) -> anyhow::Result<crate::tools::ToolExecutionOutcome> {
-        let dispatch = self.bind_resume_execution(proof, context, execution_context)?;
-        let _guard = ResumeExecutionGuard(context);
-        Ok(dispatch
-            .service
-            .execute(dispatch.command, dispatch.context, Some(cancellation.clone()))
-            .await)
     }
 
     fn bind_execution(
@@ -247,7 +162,6 @@ impl TurnDecisionService {
         } else {
             None
         };
-        execution_context.decision_resume = None;
         if execution_context.call_budget.is_none() {
             execution_context.call_budget = Some(
                 crate::agent::send_admission::call_token_budget(self, context, proof).context("called-tool budget")?,

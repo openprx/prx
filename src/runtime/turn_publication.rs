@@ -4,7 +4,6 @@
 //! the publication-scoped `TurnRuntimeHolder` and the `DecisionAdvisory`;
 //! every turn then opens its own `TurnRuntimeContext` from that holder. The
 //! assembled service remains until Part 2 deletes it.
-mod approval;
 mod build_error;
 mod builder;
 mod operator_process;
@@ -16,38 +15,6 @@ pub(crate) use builder::{PublicationInputs, PublicationLoopRuntime, build_public
 use crate::tools;
 use anyhow::Result;
 use std::sync::Arc;
-
-/// Open the resume variant of a turn: admit the historical approval resume
-/// against this publication, then open the prediction-free turn carrying it
-/// in its `TurnRuntimeContext` (R26, R54).
-pub(crate) async fn open_resume_turn(
-    service: &super::turn_decision::TurnDecisionService,
-    proof: &dyn super::turn_source::TurnSourceProof,
-    kind: super::turn_context::AgentTurnKind,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> Result<Arc<super::turn_decision::TurnDecisionContext>, super::turn_context::AgentDecisionError> {
-    use super::turn_context::AgentDecisionError;
-    let admitted = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
-        admitted = crate::security::approval_ledger::historical::admit_decision_resume(service, proof) => admitted.map_err(AgentDecisionError::PendingApproval)?,
-    };
-    let _resume_allowance = service
-        .generation
-        .effective
-        .sessions_spawn
-        .allow_recursive_delegation
-        .then(|| {
-            service
-                .runtime
-                .recursive_allowances()
-                .inherit_resume(proof, admitted.original_run())
-        });
-    let opened = service
-        .open_turn_context_observed(proof, kind, cancellation, None, Some(admitted))
-        .await?;
-    service.record_opened_context(proof, opened, cancellation).await
-}
 
 /// The bounded native schemas kept on ordinary model turns. These are the
 /// common file and shell operations from the standard progressive-disclosure

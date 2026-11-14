@@ -8,8 +8,8 @@ use std::sync::{
 
 type Registry = parking_lot::Mutex<BTreeMap<[u8; 32], Arc<RecursiveAllowance>>>;
 
-// A config reload can publish a new service while an approval is pending.
-// The original run's allowance therefore belongs to the process, not a service.
+// A config reload can publish a new service while a run is live. The run's
+// allowance therefore belongs to the process, not a service.
 static RUN_ALLOWANCES: OnceLock<Arc<Registry>> = OnceLock::new();
 
 #[derive(Default)]
@@ -18,7 +18,6 @@ pub(in crate::runtime) struct RunAllowances(OnceLock<Arc<Registry>>);
 pub(crate) struct RecursiveAllowance {
     money: Arc<AtomicU64>,
     claimed: AtomicBool,
-    funded: bool,
     retention: Option<Weak<Registry>>,
     contexts: AtomicUsize,
 }
@@ -28,7 +27,6 @@ impl RecursiveAllowance {
         Self {
             money: Arc::new(AtomicU64::new(micro_usd)),
             claimed: AtomicBool::new(false),
-            funded: true,
             retention: None,
             contexts: AtomicUsize::new(0),
         }
@@ -38,12 +36,7 @@ impl RecursiveAllowance {
         Arc::clone(&self.money)
     }
 
-    pub(crate) fn funded_money(&self) -> Option<Arc<AtomicU64>> {
-        self.funded.then(|| self.money())
-    }
-
     pub(crate) fn ensure_available(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.funded, "original recursive allowance is unavailable after resume");
         anyhow::ensure!(
             !self.claimed.load(Ordering::Acquire),
             "recursive grant already allocated its one child allowance"
@@ -54,7 +47,6 @@ impl RecursiveAllowance {
     /// Claim once and subtract a whole-cent strict share before publication.
     /// A failed publication keeps its allocation consumed, never reissues it.
     pub(crate) fn carve_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
-        anyhow::ensure!(self.funded, "original recursive allowance is unavailable after resume");
         anyhow::ensure!(
             self.claimed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -72,7 +64,6 @@ impl RecursiveAllowance {
     /// Each ordinary launch atomically reserves a strict share of the balance.
     /// Failed launches retain their reservation; siblings cannot reuse it.
     pub(crate) fn carve_ordinary_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
-        anyhow::ensure!(self.funded, "parent child allowance is unavailable");
         let mut available = self.money.load(Ordering::Acquire);
         loop {
             let cents = u32::try_from(available.min(u64::from(ceiling_cents) * 10_000) / 20_000)?;
@@ -140,33 +131,6 @@ impl RunAllowances {
             .map_or_else(OnceLock::new, OnceLock::from)
     }
 
-    pub(in crate::runtime) fn inherit_resume(
-        &self,
-        proof: &dyn TurnSourceProof,
-        original_run: &str,
-    ) -> ContextAllowance {
-        let registry = self
-            .0
-            .get_or_init(|| Arc::clone(RUN_ALLOWANCES.get_or_init(|| Arc::new(Registry::default()))));
-        let mut entries = registry.lock();
-        let original = entries
-            .get(&Self::key_for_run(proof, original_run))
-            .cloned()
-            .unwrap_or_else(|| {
-                // A process restart has lost the admitted allowance. Fail
-                // closed rather than reconstructing an unused child slot.
-                Arc::new(RecursiveAllowance {
-                    money: Arc::new(AtomicU64::new(0)),
-                    claimed: AtomicBool::new(true),
-                    funded: false,
-                    retention: Some(Arc::downgrade(registry)),
-                    contexts: AtomicUsize::new(0),
-                })
-            });
-        entries.insert(Self::key(proof), Arc::clone(&original));
-        ContextAllowance::new(original)
-    }
-
     pub(in crate::runtime) fn lookup(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
         self.existing()?.lock().get(&Self::key(proof)).cloned()
     }
@@ -181,7 +145,6 @@ impl RunAllowances {
             Arc::new(RecursiveAllowance {
                 money,
                 claimed: AtomicBool::new(false),
-                funded: true,
                 retention: Some(Arc::downgrade(registry)),
                 contexts: AtomicUsize::new(0),
             })
@@ -189,8 +152,7 @@ impl RunAllowances {
     }
 }
 
-/// A registry entry is active only while a context or a durable pending
-/// approval owns it. Dropping admission on any error releases its lease.
+/// A registry entry is active only while a context owns it. Dropping admission on any error releases its lease.
 pub(in crate::runtime) struct ContextAllowance(Arc<RecursiveAllowance>);
 impl ContextAllowance {
     fn new(owner: Arc<RecursiveAllowance>) -> Self {
@@ -209,24 +171,8 @@ impl Drop for ContextAllowance {
         let last = self.0.contexts.fetch_sub(1, Ordering::AcqRel) == 1;
         if last {
             // Lease acquisition holds the same registry lock. Recheck after
-            // taking it so a concurrent resume cannot lose its registry entry.
+            // taking it so a concurrent lease cannot lose its registry entry.
             self.0.retire_if(|| self.0.contexts.load(Ordering::Acquire) == 0);
-        }
-    }
-}
-
-impl RunAllowances {
-    pub(in crate::runtime) fn retire_pending(&self, workspace: &str, owner: &str, session: &str, run: &str) {
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        for part in [workspace, owner, session, run] {
-            hash.update((part.len() as u64).to_be_bytes());
-            hash.update(part.as_bytes());
-        }
-        let key: [u8; 32] = hash.finalize().into();
-        let entry = self.existing().and_then(|registry| registry.lock().get(&key).cloned());
-        if let Some(entry) = entry {
-            entry.retire();
         }
     }
 }

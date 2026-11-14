@@ -40,36 +40,6 @@ use crate::tools::traits::{ToolResult, ToolSpec};
 use async_trait::async_trait;
 use catalog_drift::DriftingCatalogTool;
 
-/// Fixtures and field access for the historical approval tests that live in
-/// `security::approval_ledger::tests` (R54).
-pub(crate) mod historical_support {
-    use std::sync::Arc;
-
-    use super::super::TurnDecisionService;
-    use crate::decision_engine::prediction::factory::DecisionBackendFactory;
-    use crate::security::runtime_key::DecisionKey;
-
-    pub(crate) use super::{CountingTransports, SilentEvents, sources};
-
-    pub(crate) fn install_factory(service: &mut TurnDecisionService, factory: DecisionBackendFactory) {
-        service.factory = factory;
-    }
-
-    pub(crate) fn state_key(service: &TurnDecisionService) -> Arc<DecisionKey> {
-        Arc::clone(&service.state_key)
-    }
-
-    pub(crate) fn recordable_and_durable(service: &TurnDecisionService) -> bool {
-        service.recordable && service.durable_key
-    }
-
-    pub(crate) fn force_recordable_durable(service: &mut TurnDecisionService, key: Arc<DecisionKey>) {
-        service.recordable = true;
-        service.durable_key = true;
-        service.state_key = key;
-    }
-}
-
 pub(crate) struct SilentEvents;
 
 impl CausalEventSink for SilentEvents {

@@ -130,32 +130,6 @@ impl TerminalInputProof {
     pub(crate) fn invalidate_source(&self) {
         self.0.profile.revoke();
     }
-    pub(crate) fn resume_request(&self, message_id: &str, current: &str, routed: &str) -> Result<Self> {
-        ensure!(
-            self.matches_message(message_id, current) && self.0.binding.get().is_none(),
-            "resume changed the actual submitted terminal command"
-        );
-        let id = current
-            .trim()
-            .strip_prefix("/resume-decision")
-            .and_then(|rest| rest.strip_prefix(char::is_whitespace))
-            .ok_or_else(|| anyhow::anyhow!("resume did not originate from the explicit local command"))?
-            .trim();
-        let parsed = uuid::Uuid::parse_str(id)?;
-        let expected = serde_json::to_string(&serde_json::json!({"decision_id":id}))?;
-        ensure!(
-            parsed.hyphenated().to_string() == id && routed == expected,
-            "resume normalization differs from the exact local decision command"
-        );
-        Ok(Self(Arc::new(InputProof {
-            profile: Arc::clone(&self.0.profile),
-            sequence: self.0.sequence,
-            message_id: self.0.message_id.clone(),
-            original: self.0.original.clone(),
-            routed: digest(routed.as_bytes()),
-            binding: Arc::clone(&self.0.binding),
-        })))
-    }
     pub(crate) fn matches_message(&self, id: &str, text: &str) -> bool {
         self.0.message_id == id && self.0.routed == digest(text.as_bytes())
     }

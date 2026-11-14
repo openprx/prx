@@ -64,8 +64,7 @@ fn pre_strip_direct_surface(
                 return None;
             }
             if trusted.constraints.iter().any(|code| {
-                matches!(code.as_str(), "resume_exact_call" | "tools_off")
-                    || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
+                code.as_str() == "tools_off" || code.as_str() == "intercepts_writes" && entry.plan_intercepted()
             }) || trusted.side_effect_mode == SideEffectMode::ReadOnly && entry.effect > SideEffectClass::ReadOnly
             {
                 return None;
@@ -201,7 +200,7 @@ fn publication_rules_match_pre_strip_direct_surface() {
         );
         assert!(rules.turn_scope_admits(), "turn scope refused for {level:?}");
         // No resume and no outgoing child: the turn surface is the direct core.
-        assert_eq!(rules.surface(None, false, &|_| None), expected);
+        assert_eq!(rules.surface(false, &|_| None), expected);
     }
 }
 
@@ -301,8 +300,8 @@ fn full_turn_discovery_ignores_an_attenuated_child_manifest() {
             facts: &facts,
             catalog: &view,
         };
-        let member = rules.capability(entry("file_write"), &entry_ref(entry("file_write")), false, cost, false);
-        let outside = rules.capability(entry("shell"), &entry_ref(entry("shell")), false, cost, false);
+        let member = rules.capability(entry("file_write"), &entry_ref(entry("file_write")), false, cost);
+        let outside = rules.capability(entry("shell"), &entry_ref(entry("shell")), false, cost);
         if level == AutonomyLevel::Full {
             assert_eq!(
                 member,

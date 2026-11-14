@@ -579,7 +579,6 @@ struct Driven {
     executions: std::collections::BTreeMap<&'static str, usize>,
     /// Durable approval rows by event type, read from the memory store.
     rows: std::collections::BTreeMap<&'static str, usize>,
-    pending_decisions: usize,
     pending_calls: Option<usize>,
     /// How often the channel approval resolver was consulted.
     approval_asked: usize,
@@ -814,12 +813,6 @@ async fn drive(
                             .expect("test: read approval rows");
                         rows.insert(event_type, found.len());
                     }
-                    let pending_decisions = service
-                        .list_pending_decision_approvals(&owner, 0, 10)
-                        .await
-                        .expect("test: pending decision approvals")
-                        .items
-                        .len();
                     let pending_calls = match service.call_approval_strategy(proof.envelope().clone()) {
                         Ok(adapter) => Some(
                             adapter
@@ -862,7 +855,6 @@ async fn drive(
                             .map(|(name, count)| (*name, count.load(std::sync::atomic::Ordering::SeqCst)))
                             .collect(),
                         rows,
-                        pending_decisions,
                         pending_calls,
                         approval_asked: resolver.asked.load(std::sync::atomic::Ordering::SeqCst),
                     })
@@ -947,7 +939,6 @@ async fn targeted_turn_approval_call_ends_denied_without_pending_state() {
     assert_eq!(targeted.awaiting_approval_attempts, 0);
     assert_eq!(targeted.successful_attempts, 0);
     assert!(!targeted.awaiting_approval, "the turn is not waiting for anyone");
-    assert_eq!(targeted.pending_decisions, 0, "no pending decision");
     assert_eq!(targeted.pending_calls.unwrap_or(0), 0, "no pending call");
     for (event_type, count) in &targeted.rows {
         assert_eq!(*count, 0, "no {event_type} row was written");

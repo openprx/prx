@@ -5,15 +5,11 @@
 //! when the decision engine is off. Callers pass the binding, registry, ACL,
 //! config and catalog; this module does not read `TurnDecisionService`.
 use crate::config::ToolTieringConfig;
-use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, SurfacePolicy};
-use crate::tools::execution::admission::{CallTokenBudget, TurnSurface};
-use crate::tools::execution::{
-    DispatchOrigin, ToolExecutionContext, ToolExecutionDecision, ToolExecutionService, decide_tool_execution,
-};
+use crate::tools::execution::admission::TurnSurface;
+use crate::tools::execution::{ToolExecutionDecision, ToolExecutionService, decide_tool_execution};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 pub(crate) struct SurfaceParts<'a> {
     pub execution: &'a ToolExecutionService,
@@ -28,24 +24,6 @@ pub(crate) struct SurfaceParts<'a> {
     pub channel_name: &'a str,
     pub chat_type: &'a str,
     pub tool_calls_allowed: bool,
-}
-
-/// Model-turn resume and self-dispatch context: origin plus the ceiling built
-/// from [`SurfaceParts`]. Console and chat resume share this so a replayed
-/// model call cannot skip the surface.
-pub(crate) fn model_turn_context(
-    envelope: RuntimeEnvelope,
-    chat_type: impl Into<String>,
-    parts: SurfaceParts<'_>,
-    budget: CallTokenBudget,
-) -> ToolExecutionContext {
-    let chat_id = envelope.session_key.clone();
-    let mut context = ToolExecutionContext::new(envelope, chat_type)
-        .with_chat_id(&chat_id)
-        .with_dispatch_origin(DispatchOrigin::ModelTurn)
-        .with_call_budget(budget);
-    context.turn_surface = Some(Arc::new(build(parts)));
-    context
 }
 
 pub(crate) fn build(parts: SurfaceParts<'_>) -> TurnSurface {

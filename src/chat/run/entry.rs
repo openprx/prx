@@ -132,9 +132,6 @@ pub(super) fn validate_input(controlled: bool, proof: bool, text: &str) -> anyho
                         | "new"
                         | "save"
                         | "resume"
-                        | "resume-decision"
-                        | "approval"
-                        | "revoke"
                         | "approve"
                         | "deny"
                         | "cancel"
@@ -159,19 +156,14 @@ pub(super) fn prepare_origin(
     origin: Option<crate::runtime::h2_entry::TerminalInputProof>,
     message: &crate::channels::traits::ChannelMessage,
     routed: &str,
-    resume: bool,
 ) -> anyhow::Result<Option<crate::runtime::h2_entry::TerminalInputProof>> {
     origin
         .map(|proof| {
-            if resume {
-                proof.resume_request(&message.id, &message.content, routed)
-            } else {
-                anyhow::ensure!(
-                    proof.matches_message(&message.id, routed),
-                    "terminal input changed before source admission"
-                );
-                Ok(proof)
-            }
+            anyhow::ensure!(
+                proof.matches_message(&message.id, routed),
+                "terminal input changed before source admission"
+            );
+            Ok(proof)
         })
         .transpose()
 }

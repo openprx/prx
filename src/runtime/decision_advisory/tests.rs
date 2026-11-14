@@ -346,7 +346,6 @@ pub(crate) fn analysis_input(
             child_discovery: false,
             child_served: None,
         },
-        resume_evidence: None,
         state_key: Arc::clone(key),
         catalog_generation: *catalog.generation(),
         catalog,

@@ -550,11 +550,6 @@ async fn run_turn_unguarded(
             tool_calls_allowed: service.model_can_call_tools(proof),
         },
     ));
-    // V-17: a historical resume turn publishes exactly its prepared tool.
-    let safety_surface = match turn_runtime.resume_tool_name() {
-        Some(name) => Arc::new(safety_surface.restricted_to(name)),
-        None => safety_surface,
-    };
     let mut iteration = 0usize;
     loop {
         iteration = iteration.saturating_add(1);

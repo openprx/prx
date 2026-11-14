@@ -37,8 +37,6 @@ mod execution;
 use super::child_source::publication::OrdinaryChildPublication;
 use super::child_turn::segment_observation;
 mod owner_filesystem;
-mod pending_approval;
-use crate::security::approval_ledger::historical::AdmittedDecisionResume;
 
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -422,7 +420,6 @@ pub(crate) enum AgentDecisionBudgetError {
 pub(crate) struct TurnDecisionContext {
     _event_memory: Arc<super::causal_events::routes::EventMemory>,
     owner_filesystem: Option<Arc<crate::tools::owner_filesystem::OwnerFilesystem>>,
-    resume: Option<Arc<AdmittedDecisionResume>>,
     /// The execution-owned runtime context of this turn (R60).
     runtime: Arc<crate::runtime::turn_context::TurnRuntimeContext>,
     source_actor: (Arc<str>, Arc<str>),
@@ -432,8 +429,6 @@ pub(crate) struct TurnDecisionContext {
         std::sync::OnceLock<crate::tools::capability::execution_trace::ExecutionTrace>,
     pub(in crate::runtime) execution_closed: Arc<AtomicBool>,
 
-    collected_approval_result:
-        std::sync::OnceLock<Box<crate::security::approval_ledger::historical::CollectedApprovalResult>>,
     pub(in crate::runtime) engine: EngineDecision,
     /// Completed dependent hops retained for the recorder. Nothing is
     /// written until the whole chain returns successfully.
@@ -443,9 +438,6 @@ pub(crate) struct TurnDecisionContext {
 }
 
 impl TurnDecisionContext {
-    pub(crate) fn claimed_resume_event(&self) -> Option<&crate::memory::MessageEvent> {
-        self.resume.as_ref().and_then(|resume| resume.claimed_event())
-    }
     pub(crate) fn source_channel(&self) -> &str {
         &self.source_actor.0
     }
@@ -516,23 +508,6 @@ impl TurnDecisionContext {
         &self.engine.state.trusted.parts().constraints
     }
 
-    /// Exact final-gated parent execution metadata. Reading these references
-    /// grants no dispatch lease; the constrained reader must recheck scope,
-    /// generation, security and approval at its execution boundary.
-    pub(crate) fn collected_pending_event(&self) -> Option<&crate::memory::MessageEvent> {
-        self.collected_approval_result
-            .get()
-            .map(|result| result.event())
-            .filter(|event| event.event_type == "approval.decision.pending")
-    }
-
-    pub(crate) fn collected_declined_event(&self) -> Option<&crate::memory::MessageEvent> {
-        self.collected_approval_result
-            .get()
-            .map(|result| result.event())
-            .filter(|event| event.event_type == "approval.collection.declined")
-    }
-
     pub(crate) fn execution_refs(&self) -> &BTreeSet<CapabilityRef> {
         &self.runtime.published
     }
@@ -554,10 +529,6 @@ impl TurnDecisionContext {
 
     pub(crate) fn is_run(&self) -> bool {
         crate::runtime::decision_accounting::is_run(self)
-    }
-
-    pub(crate) const fn pending_approval_id(&self) -> Option<DecisionId> {
-        None
     }
 }
 
@@ -719,8 +690,7 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        self.open_turn_context_observed(proof, kind, cancellation, None, None)
-            .await
+        self.open_turn_context_observed(proof, kind, cancellation, None).await
     }
 
     /// Segment admission uses the same builder as a first turn, with the
@@ -731,7 +701,7 @@ impl TurnDecisionService {
         observation: Option<&segment_observation::SegmentObservation>,
         cancellation: &CancellationToken,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
-        self.open_turn_context_observed(proof, AgentTurnKind::SingleShot, cancellation, observation, None)
+        self.open_turn_context_observed(proof, AgentTurnKind::SingleShot, cancellation, observation)
             .await
     }
 
@@ -741,7 +711,6 @@ impl TurnDecisionService {
         kind: AgentTurnKind,
         cancellation: &CancellationToken,
         observation: Option<&segment_observation::SegmentObservation>,
-        resume: Option<AdmittedDecisionResume>,
     ) -> Result<Arc<TurnDecisionContext>, AgentDecisionError> {
         if cancellation.is_cancelled() {
             return Err(AgentDecisionError::Cancelled);
@@ -783,11 +752,6 @@ impl TurnDecisionService {
             &self.state_key,
         );
         let g6_slice = budget.budgets.tokens;
-        let resume_evidence = resume
-            .as_ref()
-            .map(|resume| resume.gate_evidence(self, proof))
-            .transpose()
-            .map_err(AgentDecisionError::PendingApproval)?;
         let trusted = TrustedState::from_runtime(TrustedParts {
             workspace_id: Arc::from(proof.workspace_id()),
             owner_id: Some(Arc::from(proof.owner_id())),
@@ -796,9 +760,7 @@ impl TurnDecisionService {
             task_id: proof.task_id().map(Arc::from),
             channel: None,
             source_event_id: proof.source_event_id().map(Arc::from),
-            causation_event_id: resume_evidence
-                .as_ref()
-                .map(|evidence| Arc::clone(evidence.causation())),
+            causation_event_id: None,
             surface: proof.surface(),
             side_effect_mode: match self.security.autonomy {
                 crate::security::AutonomyLevel::ReadOnly => {
@@ -820,11 +782,6 @@ impl TurnDecisionService {
                         "owner_isolated",
                     ));
                 }
-                if resume_evidence.is_some() {
-                    constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
-                        "resume_exact_call",
-                    ));
-                }
                 if proof.intercepts_writes() {
                     constraints.push(crate::tools::capability::turn_state::ConstraintCode::new(
                         "intercepts_writes",
@@ -838,9 +795,7 @@ impl TurnDecisionService {
                 constraints
             },
             approval_pending: false,
-            approval_grants: resume_evidence
-                .as_ref()
-                .map_or_else(Vec::new, |evidence| evidence.grants().to_vec()),
+            approval_grants: Vec::new(),
             budgets: TurnBudgets {
                 tokens: g6_slice,
                 latency_ms: budget.budgets.latency_ms,
@@ -858,15 +813,7 @@ impl TurnDecisionService {
             resolved_model_id: Arc::from(model.model()),
         });
         let projected_input = crate::multimodal::project_image_markers_for_routing(proof.routing_input()).into_owned();
-        let goal = resume_evidence.as_ref().map_or_else(
-            || projected_input.clone(),
-            |evidence| {
-                let original = crate::multimodal::project_image_markers_for_routing(evidence.original_request());
-                format!(
-                    "Resume the exact approved tool call for the original request below. Current hard gates and the single-use execution claim still apply. Original user request (data): {original}"
-                )
-            },
-        );
+        let goal = projected_input.clone();
         let decision_id = DecisionId::new_runtime();
         let trusted_parts = trusted.parts().clone();
         let budgets = trusted_parts.budgets;
@@ -922,7 +869,7 @@ impl TurnDecisionService {
             facts: &admission_facts,
             catalog: &catalog,
         }
-        .surface(resume_evidence.as_ref(), engine.outgoing_child.is_some(), &|bytes| {
+        .surface(engine.outgoing_child.is_some(), &|bytes| {
             crate::cost::estimate::estimate_cost(&model, &self.generation.effective.cost, bytes)
         });
         let outgoing_delegation = engine
@@ -938,7 +885,6 @@ impl TurnDecisionService {
         // The turn's one accounting scope, created at opening. Without the
         // prediction hop nothing has been charged to it yet.
         let accounting = opening::accounting_scope(self, proof, budgets, deadline);
-        let resume = resume.map(Arc::new);
         let runtime = Arc::new(crate::runtime::turn_context::TurnRuntimeContext {
             decision_id,
             trusted: trusted_parts,
@@ -956,8 +902,6 @@ impl TurnDecisionService {
             published,
             discovery: crate::tools::capability::search_tool::DiscoveryState::default(),
             outgoing_delegation,
-            resume: resume.clone(),
-            resume_evidence: resume_evidence.map(Arc::new),
             state_key: Arc::clone(&self.state_key),
             holder: Arc::clone(&self.runtime),
             model_catalog: self.provider_catalog.release_pin(),
@@ -967,14 +911,12 @@ impl TurnDecisionService {
         Ok(Arc::new(TurnDecisionContext {
             _event_memory: event_memory,
             runtime,
-            resume,
             owner_filesystem,
             source_actor: (Arc::from(proof.policy_channel()), Arc::from(proof.policy_sender())),
             service_id: self.service_id,
             record_admitted: AtomicBool::new(false),
             execution_trace: std::sync::OnceLock::new(),
             execution_closed: Arc::new(AtomicBool::new(false)),
-            collected_approval_result: std::sync::OnceLock::new(),
             engine,
             hop_ids: vec![decision_id],
             prior_hops: Vec::new(),

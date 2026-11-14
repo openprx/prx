@@ -623,16 +623,6 @@ impl SqliteMemory {
         Ok(())
     }
 
-    /// Corrupt the owner anchor to exercise authenticated ledger reads.
-    pub(crate) fn replace_event_owner_for_test(&self, key: &str, owner: &str) -> anyhow::Result<()> {
-        let updated = self.pool.write().execute(
-            "UPDATE message_events SET owner_id = ?1 WHERE idempotency_key = ?2",
-            params![owner, key],
-        )?;
-        anyhow::ensure!(updated == 1, "historical event not found");
-        Ok(())
-    }
-
     /// Corrupt the ingress source while retaining the durable event identity.
     pub(crate) fn replace_event_source_for_test(&self, run_id: &str, source: &str) -> anyhow::Result<()> {
         let updated = self.pool.write().execute(

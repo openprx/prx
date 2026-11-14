@@ -2,8 +2,7 @@
 //!
 //! The hard-gate inputs other than state and catalog, captured once when the
 //! turn opens: actor-scoped policy facts (G4), model facts and the inherited
-//! child scope. Approval evidence is not a fact; an authenticated resume turn
-//! carries it separately in `resume_evidence::VerifiedResumeEvidenceV1`.
+//! child scope. Approval evidence is not a fact.
 //! Owned, read-only and cheap to clone; no interior mutability.
 
 use std::collections::BTreeSet;

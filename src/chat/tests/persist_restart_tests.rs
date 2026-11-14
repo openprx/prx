@@ -330,7 +330,7 @@ async fn completed_chat_under_cleanup(workspace: &Path, fault: Fault, cleanup: &
                 .unwrap();
             let service = publish(memory.clone(), generation).await.unwrap();
             let cancel = CancellationToken::new();
-            binding.issue_decision(&service, &cancel, false).await.unwrap();
+            binding.issue_decision(&service, &cancel).await.unwrap();
             let fabric = MemoryFabric::new(memory.clone(), workspace.to_string_lossy());
             let receipt = persist_completed_chat(&binding, &fabric, workspace, 2).await;
             if !matches!(fault, Fault::None) {
@@ -480,7 +480,7 @@ async fn chat_drained_service_releases_ingress_lease_before_restart() {
             )?;
             let service = publish(memory.clone(), generation).await?;
             let cancel = CancellationToken::new();
-            binding.issue_decision(&service, &cancel, false).await?;
+            binding.issue_decision(&service, &cancel).await?;
             let fabric = MemoryFabric::new(memory, dir.path().to_string_lossy());
             let _ = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             guard.handoff();
@@ -971,7 +971,7 @@ async fn legacy_fixture_waits_for_queued_decision_writes() {
                 .expect("writer hold ready");
 
             let cancel = CancellationToken::new();
-            binding.issue_decision(&service, &cancel, false).await?;
+            binding.issue_decision(&service, &cancel).await?;
             let fabric = MemoryFabric::new(memory.clone(), dir.path().to_string_lossy());
             let receipt = persist_completed_chat(&binding, &fabric, dir.path(), 2).await;
             let mut payload: serde_json::Value = serde_json::from_str(

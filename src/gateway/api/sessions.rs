@@ -1220,38 +1220,7 @@ pub(super) async fn get_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
-    if decision_id.starts_with("call.") {
-        return call_approval_action(state, session_id, decision_id, principal, None).await;
-    }
-    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
-        Ok(id) => id,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
-    };
-    let runtime = state.pin_turn_runtime();
-    if !runtime.config_generation.effective.causal_tree.enabled {
-        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
-    }
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let cleanup =
-        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
-            Ok(cleanup) => cleanup,
-            Err(error) => {
-                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console decision approval read", &error);
-                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
-            }
-        };
-    let result = cleanup
-        .run(Box::pin(async {
-            let service = runtime.decision_slot.publish(&runtime, &state).await?;
-            service
-                .inspect_pending_decision_approval(&principal.owner_id, &session_id, decision_id)
-                .await
-        }))
-        .await;
-    result.map_or_else(
-        |_| json_error(StatusCode::CONFLICT, "Decision approval is unavailable or expired"),
-        |view| Json(view).into_response(),
-    )
+    call_approval_action(state, session_id, decision_id, principal, None).await
 }
 
 const INBOX_DEFAULT_LIMIT: usize = 50;
@@ -1280,7 +1249,7 @@ fn parse_inbox_cursor(cursor: Option<&str>) -> Result<i64, Response> {
 struct ApprovalInboxItem {
     session_id: String,
     #[serde(flatten)]
-    view: crate::security::approval_ledger::pending::DecisionApprovalView,
+    view: crate::security::approval_ledger::view::DecisionApprovalView,
 }
 
 #[derive(Serialize)]
@@ -1316,9 +1285,6 @@ pub(super) async fn get_session_approvals(
     let result = cleanup
         .run(Box::pin(async {
             let service = runtime.decision_slot.publish(&runtime, &state).await?;
-            let page = service
-                .list_pending_decision_approvals(&principal.owner_id, after_id, limit)
-                .await?;
             let mut envelope = RuntimeEnvelope::console(
                 runtime
                     .config_generation
@@ -1335,23 +1301,7 @@ pub(super) async fn get_session_approvals(
                 .list_pending_calls(&principal.owner_id, after_id, limit)
                 .await?;
             let mut rows = Vec::new();
-            use crate::security::approval_ledger::keys::{ApprovalAuthority, DecisionAuthority};
-            for item in page.items {
-                let key = DecisionAuthority(crate::security::decision_id::DecisionId::parse(&item.view.decision_id)?)
-                    .pending_key();
-                let event = service
-                    .memory()
-                    .find_message_event_by_idempotency_key(adapter.port.workspace, &key)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("pending approval disappeared"))?;
-                rows.push((
-                    event.id,
-                    ApprovalInboxItem {
-                        session_id: item.session_id,
-                        view: item.view,
-                    },
-                ));
-            }
+            use crate::security::approval_ledger::keys::ApprovalAuthority;
             for item in calls.items {
                 let event = service
                     .memory()
@@ -1366,8 +1316,8 @@ pub(super) async fn get_session_approvals(
                     },
                 ));
             }
-            // Do not advance past either reader's bounded scan frontier.
-            let frontier = page.next_cursor.into_iter().chain(calls.next_cursor).min();
+            // Do not advance past the reader's bounded scan frontier.
+            let frontier = calls.next_cursor;
             if let Some(frontier) = frontier {
                 rows.retain(|(id, _)| *id <= frontier);
             }
@@ -1400,12 +1350,12 @@ pub(super) async fn post_decision_approval(
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
     Json(request): Json<DecisionApprovalRequest>,
 ) -> Response {
-    change_decision_approval(
+    call_approval_action(
         state,
         session_id,
         decision_id,
         principal,
-        DecisionApprovalChange::Review(request.approved),
+        Some(DecisionApprovalChange::Review(request.approved)),
     )
     .await
 }
@@ -1415,12 +1365,12 @@ pub(super) async fn delete_decision_approval(
     Path((session_id, decision_id)): Path<(String, String)>,
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
-    change_decision_approval(
+    call_approval_action(
         state,
         session_id,
         decision_id,
         principal,
-        DecisionApprovalChange::Revoke,
+        Some(DecisionApprovalChange::Revoke),
     )
     .await
 }
@@ -1430,125 +1380,10 @@ enum DecisionApprovalChange {
     Revoke,
 }
 
-// This control-plane check does not grant permission to execute a file effect.
-// Only the existing signed review issuer and exact-call resume consumer do that.
-#[derive(Clone, Copy, Debug)]
-enum ConsoleDecisionControl {
-    Review,
-    Reject,
-    Revoke,
-    Resume,
-}
-
 fn console_decision_control_policy(config: &crate::config::Config) -> Result<(), &'static str> {
     crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
         .enforce_tool_operation(crate::security::policy::ToolOperation::Act, "console decision control")
         .map_err(|_| "Decision control is not permitted by policy")
-}
-
-async fn authorize_console_decision_control(
-    service: &crate::runtime::turn_decision::TurnDecisionService,
-    principal: &super::ApiPrincipal,
-    session: &str,
-    decision_id: crate::security::decision_id::DecisionId,
-    action: ConsoleDecisionControl,
-) -> anyhow::Result<()> {
-    // Authenticate the durable pending record, its original source and decision
-    // chain under the same pinned publication; an API identity alone is insufficient.
-    if matches!(action, ConsoleDecisionControl::Reject | ConsoleDecisionControl::Revoke) {
-        service
-            .load_pending_decision_approval(&principal.owner_id, session, decision_id)
-            .await?;
-    } else {
-        service
-            .inspect_pending_decision_approval(&principal.owner_id, session, decision_id)
-            .await?;
-    }
-    if matches!(action, ConsoleDecisionControl::Resume) {
-        // Pending metadata remains inspectable after a grant is consumed.
-        // Refuse a closed or unreviewed operation before recording new ingress;
-        // the final execution path still owns the atomic one-use claim.
-        service
-            .validate_pending_decision_resume(&principal.owner_id, session, decision_id)
-            .await?;
-    }
-    tracing::info!(
-        owner = %principal.owner_id,
-        decision_id = %decision_id,
-        action = ?action,
-        "Authenticated owner decision control request authorized; execution not granted"
-    );
-    Ok(())
-}
-
-async fn change_decision_approval(
-    state: AppState,
-    session_id: String,
-    decision_id: String,
-    principal: super::ApiPrincipal,
-    change: DecisionApprovalChange,
-) -> Response {
-    if decision_id.starts_with("call.") {
-        return call_approval_action(state, session_id, decision_id, principal, Some(change)).await;
-    }
-    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
-        Ok(id) => id,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
-    };
-    let runtime = state.pin_turn_runtime();
-    if !runtime.config_generation.effective.causal_tree.enabled {
-        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
-    }
-    if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
-        return json_error(StatusCode::FORBIDDEN, message);
-    }
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let cleanup =
-        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
-            Ok(cleanup) => cleanup,
-            Err(error) => {
-                warn_cleanup_refused(
-                    &runtime.decision_slot.cleanup,
-                    "Console decision approval change",
-                    &error,
-                );
-                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
-            }
-        };
-    let result = cleanup
-        .run(Box::pin(async {
-            let service = runtime.decision_slot.publish(&runtime, &state).await?;
-            let action = match change {
-                DecisionApprovalChange::Review(true) => ConsoleDecisionControl::Review,
-                DecisionApprovalChange::Review(false) => ConsoleDecisionControl::Reject,
-                DecisionApprovalChange::Revoke => ConsoleDecisionControl::Revoke,
-            };
-            authorize_console_decision_control(&service, &principal, &session_id, decision_id, action).await?;
-            let receipt = match change {
-                DecisionApprovalChange::Review(approved) => serde_json::to_value(
-                    service
-                        .review_pending_decision_approval(&principal.owner_id, &session_id, decision_id, approved)
-                        .await?,
-                )?,
-                DecisionApprovalChange::Revoke => serde_json::to_value(
-                    service
-                        .revoke_pending_decision_approval(&principal.owner_id, &session_id, decision_id)
-                        .await?,
-                )?,
-            };
-            Ok::<_, anyhow::Error>(receipt)
-        }))
-        .await;
-    match result {
-        Ok(receipt) => Json(receipt).into_response(),
-        Err(error) => {
-            tracing::warn!(error = %error, "Decision approval change failed");
-            json_error(
-                StatusCode::CONFLICT,
-                "Decision approval is unavailable, expired, or already resolved",
-            )
-        }
-    }
 }
 
 pub async fn post_session_message(
@@ -1588,7 +1423,6 @@ pub async fn post_session_message(
             selected,
             message,
             async_mode,
-            mode: ConsoleTurnMode::Message,
             uploads,
         },
     )
@@ -1673,12 +1507,6 @@ fn select_turn_target(
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConsoleTurnMode {
-    Message,
-    Resume,
-}
-
 #[cfg_attr(
     test,
     expect(
@@ -1690,7 +1518,6 @@ enum ConsoleTurnSource {
     #[cfg(test)]
     Message(crate::gateway::turn_source::GatewayTurnProof),
     Admitted {
-        mode: ConsoleTurnMode,
         proof: crate::gateway::turn_source::GatewayTurnProof,
         guard: crate::gateway::turn_source::GatewayAdmissionGuard,
     },
@@ -1869,110 +1696,12 @@ impl ConsolePendingInput {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum DecisionResumeRequest {
-    Stored(StoredDecisionResumeRequest),
-    Explicit(ExplicitDecisionResumeRequest),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredDecisionResumeRequest {}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExplicitDecisionResumeRequest {
-    tool: String,
-    arguments: serde_json::Value,
-}
-
-pub(super) async fn post_decision_resume(
-    State(state): State<AppState>,
-    Path((session_id, decision_id)): Path<(String, String)>,
-    request: Request,
-) -> Response {
-    let Some(principal) = request.extensions().get::<super::ApiPrincipal>().cloned() else {
-        return json_error(StatusCode::UNAUTHORIZED, "Authenticated API principal missing");
-    };
-    let decision_id = match crate::security::decision_id::DecisionId::parse(&decision_id) {
-        Ok(id) => id,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid decision id"),
-    };
-    let runtime = state.pin_turn_runtime();
-    if !runtime.config_generation.effective.causal_tree.enabled {
-        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
-    }
-    if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {
-        return json_error(StatusCode::FORBIDDEN, message);
-    }
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    let cleanup =
-        match crate::runtime::turn_cleanup::CleanupScope::new(Some(&runtime.decision_slot.cleanup), cancellation) {
-            Ok(cleanup) => cleanup,
-            Err(error) => {
-                warn_cleanup_refused(&runtime.decision_slot.cleanup, "Console decision resume", &error);
-                return json_error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is draining");
-            }
-        };
-    let authorization = cleanup
-        .run(Box::pin(async {
-            let service = runtime.decision_slot.publish(&runtime, &state).await?;
-            authorize_console_decision_control(
-                &service,
-                &principal,
-                &session_id,
-                decision_id,
-                ConsoleDecisionControl::Resume,
-            )
-            .await
-        }))
-        .await;
-    if authorization.is_err() {
-        return json_error(StatusCode::CONFLICT, "Decision resume is unavailable or not permitted");
-    }
-    let async_mode = jobs::wants_async(request.uri().query(), request.headers());
-    let Json(body) = match Json::<DecisionResumeRequest>::from_request(request, &state).await {
-        Ok(body) => body,
-        Err(error) => return error.into_response(),
-    };
-    let message = match body {
-        DecisionResumeRequest::Stored(_) => serde_json::json!({
-            "decision_id": decision_id.to_string(),
-        }),
-        DecisionResumeRequest::Explicit(body) => serde_json::json!({
-            "decision_id": decision_id.to_string(),
-            "tool": body.tool,
-            "arguments": body.arguments,
-        }),
-    }
-    .to_string();
-    submit_console_message(
-        state,
-        session_id,
-        principal,
-        ConsoleSubmission {
-            selected: SelectedTurn {
-                runtime,
-                targeted: None,
-                incarnation: None,
-            },
-            message,
-            async_mode,
-            mode: ConsoleTurnMode::Resume,
-            uploads: UploadGuard::default(),
-        },
-    )
-    .await
-}
-
 /// What one console submission carries into admission. `uploads` rides along
 /// so the files are removed unless the input or job is accepted.
 struct ConsoleSubmission {
     selected: SelectedTurn,
     message: String,
     async_mode: bool,
-    mode: ConsoleTurnMode,
     uploads: UploadGuard,
 }
 
@@ -1986,7 +1715,6 @@ async fn submit_console_message(
         selected,
         message,
         async_mode,
-        mode,
         uploads,
     } = submission;
     let SelectedTurn {
@@ -2131,7 +1859,7 @@ async fn submit_console_message(
             "Console input cleanup ownership is unconfirmed",
         );
     }
-    let source = ConsoleTurnSource::Admitted { mode, proof, guard };
+    let source = ConsoleTurnSource::Admitted { proof, guard };
 
     // Everything up to here is bounded bookkeeping. What follows is the agent
     // turn itself, which has no upper bound — tool chains, sub-agents, and
@@ -2189,10 +1917,10 @@ async fn run_console_message_job_work(
     source: ConsoleTurnSource,
     target: Option<TargetedTurn>,
 ) -> Result<jobs::JobOutput, String> {
-    let (mode, source_proof, input_guard) = match source {
+    let (source_proof, input_guard) = match source {
         #[cfg(test)]
-        ConsoleTurnSource::Message(proof) => (ConsoleTurnMode::Message, proof, None),
-        ConsoleTurnSource::Admitted { mode, proof, guard } => (mode, proof, Some(guard)),
+        ConsoleTurnSource::Message(proof) => (proof, None),
+        ConsoleTurnSource::Admitted { proof, guard } => (proof, Some(guard)),
     };
     let runtime_envelope = source_proof.envelope().clone();
     let cancellation =
@@ -2256,14 +1984,10 @@ async fn run_console_message_job_work(
                         .await
                         .map_err(|_| "Console decision publication failed".to_owned())?;
                     let kind = crate::runtime::turn_context::AgentTurnKind::SingleShot;
-                    let context = match mode {
-                        ConsoleTurnMode::Message => service.open_issued_turn_context(proof, kind, &cancellation).await,
-                        ConsoleTurnMode::Resume => {
-                            crate::runtime::turn_publication::open_resume_turn(&service, proof, kind, &cancellation)
-                                .await
-                        }
-                    }
-                    .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
+                    let context = service
+                        .open_issued_turn_context(proof, kind, &cancellation)
+                        .await
+                        .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()))?;
                     let advice = service.advisory().analyze_turn(context.runtime(), &cancellation).await;
                     Ok::<_, String>((service, context, advice))
                 }
@@ -2324,17 +2048,6 @@ async fn run_console_message_job_work(
         terminal_guard
     };
     let work = async {
-        if mode == ConsoleTurnMode::Resume {
-            crate::gateway::authorize_gateway_config_resource_mutation(
-                config,
-                "gateway_api:sessions:assistant_message",
-                ResourceRiskLevel::Low,
-            )
-            .map_err(|_| "Console resume history authorization denied".to_owned())?;
-            return run_console_resume(&decision, &terminal_guard, turns.len() + 2, &cancellation)
-                .await
-                .map_err(|error| crate::providers::sanitize_api_error(&error.to_string()));
-        }
         let turn = match run_console_runtime_turn(
             std::sync::Arc::clone(&turn_runtime),
             &state,
@@ -2493,94 +2206,6 @@ async fn run_console_message_job_work(
             .map_err(|_| "Console terminal cleanup persistence is unconfirmed".to_owned())?;
     }
     result
-}
-
-async fn run_console_resume(
-    decision: &ConsoleDecisionTurn<'_>,
-    guard: &crate::gateway::decision_runtime::GatewayTerminalGuard,
-    history_commit_len: usize,
-    cancellation: &tokio_util::sync::CancellationToken,
-) -> anyhow::Result<jobs::JobOutput> {
-    use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
-    use crate::runtime::turn_source::TurnSourceProof;
-    use crate::tools::ToolExecutionStatus;
-    let envelope = decision.proof.envelope();
-    let started_at = Utc::now();
-    let execution = crate::tools::surface_owner::model_turn_context(
-        envelope.clone(),
-        "private",
-        crate::tools::surface_owner::SurfaceParts {
-            execution: decision.service.execution(),
-            catalog: decision.service.catalog(),
-            publication_policy: decision.service.publication_policy(),
-            tiering: decision.service.tool_tiering(),
-            security: decision.service.security(),
-            pinned_model: decision.proof.model_binding().pinned_model(),
-            channel: decision.service.channel_surface(),
-            inherited_exclusions: &[],
-            sender: decision.proof.policy_sender(),
-            channel_name: decision.proof.policy_channel(),
-            chat_type: decision.proof.policy_chat_type(),
-            tool_calls_allowed: decision.service.model_can_call_tools(decision.proof),
-        },
-        crate::agent::send_admission::call_token_budget(decision.service.as_ref(), &decision.context, decision.proof)?,
-    );
-    let outcome = decision
-        .service
-        .execute_agent_resume(decision.proof, &decision.context, &execution, cancellation)
-        .await?;
-    let (status, reply) = match outcome.status {
-        ToolExecutionStatus::Succeeded => (
-            TurnTerminalStatus::Completed,
-            crate::security::redaction::redact_secrets(&outcome.model_content),
-        ),
-        ToolExecutionStatus::Cancelled => (
-            TurnTerminalStatus::Cancelled,
-            "Approved operation was cancelled.".to_owned(),
-        ),
-        _ => (
-            TurnTerminalStatus::Failed,
-            "Approved operation could not be completed.".to_owned(),
-        ),
-    };
-    guard
-        .commit(TurnTerminalDraft {
-            decision: Some(
-                decision
-                    .service
-                    .settlement_ref(std::sync::Arc::clone(&decision.context))?,
-            ),
-            binding: Some(decision.service.terminal_binding(&decision.context)?),
-            terminal_id: envelope
-                .run_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Resume run missing"))?,
-            scope: envelope.message_scope(),
-            status,
-            history: Some(crate::agent::terminal::TurnHistoryProjection {
-                assistant_content: reply.clone(),
-                history_commit_len,
-            }),
-            history_scope: None,
-            // The approved call runs directly. Decision-stage model usage is
-            // already recorded by that stage; no provider turn is fabricated.
-            provider_outcome: None,
-            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                summary: "console approved operation finished".to_owned(),
-                started_at,
-                finished_at: Utc::now(),
-            },
-            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
-        })
-        .await?;
-    Ok(jobs::JobOutput::new(
-        StatusCode::OK,
-        serde_json::json!({
-            "status": if status == TurnTerminalStatus::Completed { "ok" } else { "failed" },
-            "execution_status": outcome.status,
-            "reply": reply,
-        }),
-    ))
 }
 
 pub async fn get_session_media(

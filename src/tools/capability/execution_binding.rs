@@ -9,7 +9,7 @@ pub(crate) use dispatch::{scope_dispatch_binding, verify_current_dispatch};
 use super::catalog::{CapabilityCatalog, CapabilityEntry};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::capability::contract::CapabilityRef;
-use crate::tools::execution::{ToolDescriptor, ToolExecutionCommand, ToolExecutionService};
+use crate::tools::execution::{ToolDescriptor, ToolExecutionService};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -111,55 +111,6 @@ impl ExecutionBinding {
         Ok(())
     }
 }
-
-/// The decision owner supplies preflight metadata separately from the final
-/// durable claim. Only the latter can authorize a backend's side-effect gate.
-#[async_trait::async_trait]
-pub(crate) trait DecisionResumeAdapter: Send + Sync {
-    fn verify(
-        &self,
-        command: &ToolExecutionCommand,
-        context: &crate::tools::ToolExecutionContext,
-    ) -> anyhow::Result<crate::security::policy::ApprovalGrant>;
-    async fn claim(
-        &self,
-        command: &ToolExecutionCommand,
-        context: &crate::tools::ToolExecutionContext,
-    ) -> anyhow::Result<Box<dyn crate::security::decision_approval::DecisionGrantAuthority>>;
-}
-
-#[derive(Clone)]
-pub(crate) struct DecisionResumePort(Arc<dyn DecisionResumeAdapter>);
-impl DecisionResumePort {
-    pub(crate) fn new(adapter: Arc<dyn DecisionResumeAdapter>) -> Self {
-        Self(adapter)
-    }
-    pub(crate) fn verify(
-        &self,
-        command: &ToolExecutionCommand,
-        context: &crate::tools::ToolExecutionContext,
-    ) -> anyhow::Result<crate::security::policy::ApprovalGrant> {
-        self.0.verify(command, context)
-    }
-    pub(crate) async fn claim(
-        &self,
-        command: &ToolExecutionCommand,
-        context: &crate::tools::ToolExecutionContext,
-    ) -> anyhow::Result<Box<dyn crate::security::decision_approval::DecisionGrantAuthority>> {
-        self.0.claim(command, context).await
-    }
-}
-impl std::fmt::Debug for DecisionResumePort {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DecisionResumePort")
-    }
-}
-impl PartialEq for DecisionResumePort {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for DecisionResumePort {}
 
 /// Digest inputs shared with authenticated resume preparation. This computes
 /// identity only and cannot manufacture an execution binding or approval.

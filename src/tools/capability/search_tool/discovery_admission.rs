@@ -293,7 +293,7 @@ pub(crate) fn prepare_discovered_tool(
     // Publication rules stop before dispatch budgets, but a discovery cannot
     // undo the turn's structural restrictions or exact resume scope.
     anyhow::ensure!(
-        !rules.restricts(entry, true),
+        !rules.restricts(entry),
         "discovered capability conflicts with turn restrictions"
     );
     let model = port.resolve_model(proof)?;
@@ -303,7 +303,7 @@ pub(crate) fn prepare_discovered_tool(
         "offered delegation has no source-issued child manifest"
     );
     let estimate = crate::cost::estimate::estimate_cost(&model, &port.config().cost, entry.schema_bytes);
-    let admission = rules.capability(entry, &reference, delegation, estimate, false);
+    let admission = rules.capability(entry, &reference, delegation, estimate);
     let descriptor = port
         .execution()
         .current_descriptor(&entry.public_name)

@@ -325,9 +325,6 @@ impl ControlledH2Profile {
     pub(crate) const fn target_owner(&self) -> &OwnerScope {
         &self.owner
     }
-    pub(crate) fn workspace(&self) -> &Path {
-        &self.workspace
-    }
     pub(crate) fn claim_experiment(&self, plan: &crate::skills::lifecycle::experiment::FrozenExperiment) -> Result<()> {
         self.ensure_live()?;
         let spec = plan.spec();

@@ -29,55 +29,6 @@ async fn segment_context_carries_budget() {
 }
 
 #[tokio::test]
-async fn resume_context_carries_budget() {
-    let fixture = fixture();
-    let tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(RecordingTool {
-        root_name: "project_tool",
-        aliases: vec![],
-        calls: Arc::clone(&fixture.calls),
-        arguments: Arc::clone(&fixture.arguments),
-        stages: Arc::clone(&fixture.stages),
-    })];
-    let publication_policy = crate::tools::capability::catalog::SurfacePolicy::default();
-    let catalog = crate::tools::capability::catalog::CapabilityCatalog::build(
-        &tools,
-        &crate::tools::capability::catalog::CatalogSources::default(),
-        &publication_policy,
-    )
-    .expect("test: catalog");
-    let tiering = crate::config::ToolTieringConfig::default();
-    let security = crate::security::SecurityPolicy::default();
-    let service = crate::tools::ToolExecutionService::from_boxed(
-        tools,
-        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::new(security.clone()))),
-        Arc::new(crate::tools::DenyApprovalStrategy),
-        Arc::new(crate::tools::AdapterOwnedPreparation),
-        Arc::new(crate::tools::TracingToolExecutionAudit),
-    );
-    let envelope = crate::runtime::envelope::RuntimeEnvelope::console("prx_workspace", "prx_session");
-    let context = crate::tools::surface_owner::model_turn_context(
-        envelope,
-        "private",
-        crate::tools::surface_owner::SurfaceParts {
-            execution: &service,
-            catalog: &catalog,
-            publication_policy: &publication_policy,
-            tiering: &tiering,
-            security: &security,
-            pinned_model: "prx_model",
-            channel: true,
-            inherited_exclusions: &[],
-            sender: "prx_user",
-            channel_name: "wacli",
-            chat_type: "dm",
-            tool_calls_allowed: true,
-        },
-        CallTokenBudget::new(|| 4096, |_| Some(1)).with_spend(|| Some(1_000), |_| Some(1)),
-    );
-    assert!(context.call_budget.is_some());
-}
-
-#[tokio::test]
 async fn model_turn_without_call_budget_is_denied() {
     let fixture = fixture();
     let service = fixture.service(CONFIG_RELOAD, vec![], ToolExecutionDecision::Allow, approved(), true);

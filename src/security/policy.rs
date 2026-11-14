@@ -778,15 +778,7 @@ impl ApprovalGrant {
         let Some(grant) = self.v2.as_ref() else {
             return Err("missing v2 grant".to_string());
         };
-        if grant.decision_binding.is_some() {
-            return super::decision_approval::verify_claimed_decision(
-                grant,
-                &self.tool,
-                op_id,
-                risk,
-                self.caller_principal_id.as_deref(),
-            );
-        }
+        grant.refuse_decision_binding().map_err(|error| error.to_string())?;
         let keyring = match crate::acl::approval_grant::WitnessKeyring::global() {
             Ok(keyring) => keyring,
             Err(error) => {

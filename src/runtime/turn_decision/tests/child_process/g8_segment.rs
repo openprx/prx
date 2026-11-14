@@ -560,7 +560,7 @@ async fn child_source_gate_and_ledger_case(budget: Option<BudgetCell>) -> anyhow
             .await?;
         let funding = budgeted
             .recursive_child_allowance()
-            .and_then(|owner| owner.funded_money())
+            .map(|owner| owner.money())
             .ok_or_else(|| anyhow::anyhow!("budgeted child has no funding"))?;
         match cell {
             BudgetCell::Exhausted => funding.store(0, Ordering::Release),

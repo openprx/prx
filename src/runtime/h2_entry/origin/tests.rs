@@ -48,25 +48,10 @@ async fn real_recorded_chat_binds_only_matching_input_and_one_original_turn() {
     assert!(super::super::current_invocation().is_err());
 }
 #[test]
-fn explicit_resume_normalization_preserves_original_input_and_cannot_change_decision() {
+fn revoked_profile_refuses_new_terminal_input() {
     let fixture = Fixture::new(EntryKind::Terminal);
     let mut producer = producer(fixture.profile.clone());
-    let id = uuid::Uuid::new_v4().to_string();
-    let command = format!("/resume-decision {id}");
-    let proof = producer.submitted("resume-message", &command).unwrap();
-    let routed = serde_json::json!({"decision_id":id}).to_string();
-    let resumed = proof.resume_request("resume-message", &command, &routed).unwrap();
-    assert!(resumed.matches_message("resume-message", &routed));
-    assert!(!resumed.matches_message("other-message", &routed));
-    let other = serde_json::json!({"decision_id":uuid::Uuid::new_v4().to_string()}).to_string();
-    assert!(proof.resume_request("resume-message", &command, &other).is_err());
-    assert!(
-        producer
-            .submitted("plain", "resume this please")
-            .unwrap()
-            .resume_request("plain", "resume this please", &routed)
-            .is_err()
-    );
+    assert!(producer.submitted("before", "prx input").is_ok());
     fixture.profile.revoke();
     assert!(producer.submitted("after", "prx input").is_err());
 }

@@ -2,7 +2,6 @@
 use crate::providers::catalog::ResolvedModel;
 use crate::providers::catalog::{Requirement, UnknownPolicy};
 use crate::runtime::auxiliary_call::{AuxiliaryAccounting, AuxiliaryPurpose};
-use crate::runtime::child_source::recursive_allowance::RecursiveAllowance;
 use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService};
 use crate::runtime::turn_source::TurnSourceProof;
 use std::sync::Arc;
@@ -202,7 +201,7 @@ fn bind_auxiliary_accounting(
                     context
                         .runtime()
                         .recursive_allowance()
-                        .and_then(RecursiveAllowance::funded_money)
+                        .map(|owner| owner.money())
                         .or_else(|| service.runtime.recursive_money(proof)),
                 ),
             )

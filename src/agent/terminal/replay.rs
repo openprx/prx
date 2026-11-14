@@ -428,21 +428,6 @@ impl PreparedReplay {
         anyhow::ensure!(!hops.is_empty() && hops.len() <= 5, "invalid decision replay chain");
         let (recorded_directive, fixed_close) =
             last_recorded.context("decision replay chain has no recorded directive")?;
-        let resume_claim = if let Some(expected) = link.context.claimed_resume_event() {
-            let stored = commit
-                .binding
-                .memory
-                .find_owned_message_event(&trusted.workspace_id, owner, &expected.event_id)
-                .await?
-                .context("resume consumption receipt is no longer durable")?;
-            anyhow::ensure!(
-                serde_json::to_value(&stored)? == serde_json::to_value(expected)?,
-                "resume consumption receipt changed before terminal commit"
-            );
-            Some(event_binding(&recorded.key, RESUME_DOMAIN, &stored)?)
-        } else {
-            None
-        };
         let parent = if let Some(grant) = &commit.binding.parent_grant {
             let parent_id = grant.scope().gate_inputs().0.parent_authority_id.decision_grant_id();
             let (store_workspace, expected_digest) = grant.parent_record_binding();
@@ -520,45 +505,15 @@ impl PreparedReplay {
             None
         };
         let operator = operator::prepare(link, &commit.binding, &source, trusted.task_id.as_deref()).await?;
-        let collected_pending = link
-            .context
-            .collected_pending_event()
-            .map(|event| event_binding(&recorded.key, COLLECTION_DOMAIN, event))
-            .transpose()?;
-        let collection = matches!(recorded_directive, RecordedDirective::CollectApprovalArguments);
-        let collected_declined = link
-            .context
-            .collected_declined_event()
-            .map(|event| {
-                let reply = commit.history.as_ref().context("declined collection reply missing")?;
-                validate_collection_decline(
-                    event,
-                    source_id,
-                    &link.context.decision_id().to_string(),
-                    &reply.assistant_content,
-                )?;
-                anyhow::ensure!(
-                    link.context.execution_refs().is_empty(),
-                    "declined collection has execution references"
-                );
-                event_binding(&recorded.key, COLLECTION_DECLINED_DOMAIN, event)
-            })
-            .transpose()?;
+        // Historical approval collection and resume claims are retired: a
+        // new terminal never binds either receipt.
         anyhow::ensure!(
-            (collected_pending.is_none() && collected_declined.is_none() || collection)
-                && !(collected_pending.is_some() && collected_declined.is_some()),
-            "pending collection on ordinary terminal"
-        );
-        anyhow::ensure!(
-            !collection
-                || commit.status != TurnTerminalStatus::Completed
-                || collected_pending.is_some()
-                || collected_declined.is_some(),
-            "completed collection lacks durable pending receipt"
+            !matches!(recorded_directive, RecordedDirective::CollectApprovalArguments),
+            "historical approval collection terminals are not recorded"
         );
         Ok(Self(ReplayBinding {
-            collected_pending,
-            collected_declined,
+            collected_pending: None,
+            collected_declined: None,
             version: 1,
             router_read: None,
             served_auxiliary: None,
@@ -577,7 +532,7 @@ impl PreparedReplay {
             claim: None,
             assistant: None,
             fixed_close,
-            resume_claim,
+            resume_claim: None,
             run_capabilities: recorded_run_capabilities(&recorded_directive, link),
         }))
     }

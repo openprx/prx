@@ -38,15 +38,6 @@ pub enum SessionCommand {
     /// `/approve <seq>` — approve a child session suspended on the approval
     /// gate (NeedsInput), injecting a runtime grant so the gated tool can proceed.
     Approve { seq: u64 },
-    /// Explicit review of a durable causal decision in the current chat.
-    /// Approval records consent only; execution requires a separate resume.
-    ReviewDecision { decision_id: uuid::Uuid, approved: bool },
-    /// `/approval --decision <uuid>` — inspect the current chat's pending call.
-    InspectDecision { decision_id: uuid::Uuid },
-    /// Explicitly resume the original stored call after durable approval.
-    ResumeDecision { decision_id: uuid::Uuid },
-    /// `/revoke --decision <uuid>` — revoke a reviewed decision's grants.
-    RevokeDecision { decision_id: uuid::Uuid },
     /// `/deny <seq>` — deny a child session suspended on the approval gate
     /// (NeedsInput); the gated tool is reported as denied to the sub-agent.
     Deny { seq: u64 },
@@ -78,10 +69,6 @@ impl SessionCommand {
                 | Self::Pty { .. }
                 | Self::Approve { .. }
                 | Self::Deny { .. }
-                | Self::ReviewDecision { .. }
-                | Self::InspectDecision { .. }
-                | Self::ResumeDecision { .. }
-                | Self::RevokeDecision { .. }
                 | Self::DaemonKill { .. }
                 | Self::DaemonSteer { .. }
         )
@@ -230,59 +217,6 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         let arg = rest.strip_prefix(char::is_whitespace)?;
         let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Logs { seq });
-    }
-
-    for (verb, inspect) in [("/approval", true), ("/revoke", false)] {
-        if let Some(rest) = trimmed
-            .strip_prefix(verb)
-            .and_then(|rest| rest.strip_prefix(char::is_whitespace))
-        {
-            let mut parts = rest.split_whitespace();
-            if parts.next() != Some("--decision") {
-                return None;
-            }
-            let text = parts.next()?;
-            let decision_id = uuid::Uuid::parse_str(text).ok()?;
-            if parts.next().is_some() || decision_id.hyphenated().to_string() != text {
-                return None;
-            }
-            return Some(if inspect {
-                SessionCommand::InspectDecision { decision_id }
-            } else {
-                SessionCommand::RevokeDecision { decision_id }
-            });
-        }
-    }
-
-    if let Some(rest) = trimmed
-        .strip_prefix("/resume-decision")
-        .and_then(|rest| rest.strip_prefix(char::is_whitespace))
-    {
-        let text = rest.trim();
-        let decision_id = uuid::Uuid::parse_str(text).ok()?;
-        if decision_id.hyphenated().to_string() != text {
-            return None;
-        }
-        return Some(SessionCommand::ResumeDecision { decision_id });
-    }
-
-    // Keep durable decision IDs in an explicit address space. Malformed
-    // decision syntax cannot fall back to a child-session sequence.
-    for (verb, approved) in [("/approve", true), ("/deny", false)] {
-        if let Some(rest) = trimmed
-            .strip_prefix(verb)
-            .and_then(|rest| rest.strip_prefix(char::is_whitespace))
-        {
-            let mut parts = rest.split_whitespace();
-            if parts.next() == Some("--decision") {
-                let text = parts.next()?;
-                let decision_id = uuid::Uuid::parse_str(text).ok()?;
-                if parts.next().is_some() || decision_id.hyphenated().to_string() != text {
-                    return None;
-                }
-                return Some(SessionCommand::ReviewDecision { decision_id, approved });
-            }
-        }
     }
 
     // `/approve <seq>` (NeedsInput)

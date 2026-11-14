@@ -33,6 +33,13 @@ pub struct ApprovalGrantV2 {
     pub decision_binding: Option<DecisionApprovalBinding>,
 }
 
+/// A grant that no consumer may accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GrantRefused {
+    #[error("approval grant with a decision binding is refused")]
+    DecisionBound,
+}
+
 /// Signed identity of the one decision call a human approved. This contains
 /// fingerprints only; tool arguments and credentials are not serialized here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,67 +375,6 @@ impl ApprovalGrantV2 {
         Ok(grant)
     }
 
-    /// Issue a human-reviewed, exact-operation grant for a pending decision.
-    /// The producer must obtain `subject` and `binding` from authenticated
-    /// pending state, never from fields supplied by an approval HTTP request.
-    pub fn issue_decision_one_shot(
-        keyring: &WitnessKeyring,
-        subject: Subject,
-        op_id: impl Into<String>,
-        risk_level: RiskLevel,
-        binding: DecisionApprovalBinding,
-        expires_at: DateTime<Utc>,
-    ) -> Result<Self> {
-        let op_id = op_id.into();
-        let now = Utc::now();
-        anyhow::ensure!(
-            !Uuid::parse_str(&binding.decision_id)?.is_nil()
-                && !op_id.trim().is_empty()
-                && !subject.agent_id.is_empty()
-                && !subject.principal_id.is_empty()
-                && !subject.owner_id.is_empty()
-                && !subject.workspace_id.is_empty()
-                && subject
-                    .session_key
-                    .as_deref()
-                    .is_some_and(|session| !session.is_empty())
-                && now < expires_at
-                && expires_at <= now + Duration::minutes(5),
-            "decision approval scope is incomplete or expired"
-        );
-        let mut grant = Self::issue_one_shot(keyring, subject, IssuerAuthority::HumanReview, op_id, risk_level)?;
-        grant.expires_at = grant.expires_at.min(expires_at);
-        grant.decision_binding = Some(binding);
-        sign_grant(keyring, &mut grant)?;
-        Ok(grant)
-    }
-
-    /// Verify the signed scope against independently obtained pending state.
-    /// This does not reserve or consume a grant: the durable single-use claim
-    /// remains required before execution can receive approval evidence.
-    pub fn verify_for_decision(
-        &self,
-        keyring: &WitnessKeyring,
-        subject: &Subject,
-        binding: &DecisionApprovalBinding,
-        op_id: &str,
-        risk_level: RiskLevel,
-        now: DateTime<Utc>,
-    ) -> Result<()> {
-        self.verify_operation_signature(keyring, op_id, risk_level, now)?;
-        anyhow::ensure!(
-            self.subject == *subject
-                && self.decision_binding.as_ref() == Some(binding)
-                && self.issuer.authority == IssuerAuthority::HumanReview
-                && self.max_uses == 1
-                && self.uses_consumed == 0
-                && self.capability.op_id_match == OpIdMatch::Exact
-                && self.capability.op_id == op_id,
-            "approval grant does not match the pending decision call"
-        );
-        Ok(())
-    }
-
     #[must_use]
     pub fn is_time_valid(&self, now: DateTime<Utc>) -> bool {
         self.not_before <= now && now < self.expires_at
@@ -450,6 +396,15 @@ impl ApprovalGrantV2 {
             && op_id_matches(&self.capability.op_id, &self.capability.op_id_match, op_id)
     }
 
+    /// Decision-bound grants are kept on the wire for format stability
+    /// (OV-10) but no consumer accepts one.
+    pub fn refuse_decision_binding(&self) -> std::result::Result<(), GrantRefused> {
+        if self.decision_binding.is_some() {
+            return Err(GrantRefused::DecisionBound);
+        }
+        Ok(())
+    }
+
     pub fn verify_for_operation(
         &self,
         keyring: &WitnessKeyring,
@@ -457,10 +412,7 @@ impl ApprovalGrantV2 {
         risk_level: RiskLevel,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        anyhow::ensure!(
-            self.decision_binding.is_none(),
-            "decision-bound approval requires decision-scope verification"
-        );
+        self.refuse_decision_binding()?;
         self.verify_operation_signature(keyring, op_id, risk_level, now)
     }
 
@@ -869,6 +821,44 @@ mod tests {
             let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "witness key must be 0600");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn grant_with_decision_binding_is_refused() -> Result<()> {
+        let keyring = WitnessKeyring::generate_for_tests()?;
+        let mut grant = ApprovalGrantV2::issue_one_shot(
+            &keyring,
+            test_subject(),
+            IssuerAuthority::HumanReview,
+            "file_write:write:abc",
+            RiskLevel::Medium,
+        )?;
+        grant.decision_binding = Some(DecisionApprovalBinding {
+            decision_id: "00000000-0000-4000-8000-000000000001".into(),
+            catalog_generation: [1; 32],
+            call_digest: [2; 32],
+        });
+        sign_grant(&keyring, &mut grant)?;
+        let now = Utc::now();
+        assert_eq!(grant.refuse_decision_binding(), Err(GrantRefused::DecisionBound));
+        let error = grant
+            .verify_for_operation(&keyring, "file_write:write:abc", RiskLevel::Medium, now)
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<GrantRefused>(), Some(&GrantRefused::DecisionBound));
+        let error = grant
+            .verify_for_operation_bound(
+                &keyring,
+                "file_write:write:abc",
+                RiskLevel::Medium,
+                Some("telegram:alice"),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<GrantRefused>(), Some(&GrantRefused::DecisionBound));
+        // The wire field still round-trips unchanged (OV-10).
+        let decoded: ApprovalGrantV2 = serde_json::from_value(serde_json::to_value(&grant)?)?;
+        assert_eq!(decoded.decision_binding, grant.decision_binding);
         Ok(())
     }
 

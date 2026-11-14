@@ -70,31 +70,6 @@ fn persistence_cause_is_public(text: &str) -> bool {
             .all(|character| character.is_ascii() && !character.is_control())
 }
 
-/// Only typed infrastructure failures receive retry guidance. Opaque approval
-/// failures include owner/scope/consumption checks and retain the same refusal.
-/// Never render an error's text: its sources may contain private identifiers.
-pub(super) fn resume_admission_failure_reply(error: &anyhow::Error) -> &'static str {
-    use crate::runtime::turn_context::AgentDecisionError;
-    let infrastructure = error.chain().any(|cause| {
-        cause.is::<std::io::Error>()
-            || cause.is::<rusqlite::Error>()
-            || cause.is::<reqwest::Error>()
-            || matches!(
-                cause.downcast_ref::<AgentDecisionError>(),
-                Some(
-                    AgentDecisionError::RecordWriterUnavailable
-                        | AgentDecisionError::DelegationStorage(_)
-                        | AgentDecisionError::IngressRecovery(_)
-                )
-            )
-    });
-    if infrastructure {
-        "Decision resume failed before execution. You can retry this request."
-    } else {
-        "Decision resume could not be admitted for this chat. No operation was run by this request."
-    }
-}
-
 /// Selection identity paired with the concrete provider instance. Only Chat's
 /// construction/switch path publishes it, before updating either UI slot.
 ///
@@ -560,7 +535,6 @@ struct CapturedChatTrace {
 
 pub(super) struct ChatDecision {
     pub(super) advice: Option<crate::decision_engine::IntentAnalysis>,
-    pub(super) resume: bool,
     pub(super) service: Arc<crate::runtime::turn_decision::TurnDecisionService>,
     pub(super) context: Arc<crate::runtime::turn_decision::TurnDecisionContext>,
 }
@@ -676,10 +650,6 @@ impl ChatTurnBinding {
         outcome.finished_at = captured.finished_at;
         Ok(outcome)
     }
-    pub(super) fn pending_decision_id(&self) -> Option<crate::security::decision_id::DecisionId> {
-        self.decision.get()?.context.pending_approval_id()
-    }
-
     pub(super) fn is_decided(&self) -> bool {
         self.decision.initialized()
     }
@@ -893,88 +863,6 @@ impl ChatTurnBinding {
         Ok(decided
             .service
             .effective_compaction(self.choice.provider_name(), self.choice.model_name()))
-    }
-
-    /// Direct approved-call execution has its own sealed tool trace. It must
-    /// never manufacture a provider outcome or weaken capture_trace checks.
-    pub(super) async fn execute_resume_and_finalize(
-        &self,
-        fabric: &crate::memory::MemoryFabric,
-        history_commit_len: usize,
-        started_at: chrono::DateTime<chrono::Utc>,
-        cancellation: &tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<(String, bool)> {
-        use crate::agent::terminal::{TurnTerminalDraft, TurnTerminalStatus};
-        use crate::runtime::turn_source::TurnSourceProof;
-        let decided = self.decision.get().context("chat resume has no decision")?;
-        anyhow::ensure!(decided.resume, "chat turn is not an explicit resume");
-        let execution = crate::tools::surface_owner::model_turn_context(
-            self.envelope.clone(),
-            "private",
-            crate::tools::surface_owner::SurfaceParts {
-                execution: decided.service.execution(),
-                catalog: decided.service.catalog(),
-                publication_policy: decided.service.publication_policy(),
-                tiering: decided.service.tool_tiering(),
-                security: decided.service.security(),
-                pinned_model: self.model_binding().pinned_model(),
-                channel: decided.service.channel_surface(),
-                inherited_exclusions: &[],
-                sender: self.policy_sender(),
-                channel_name: self.policy_channel(),
-                chat_type: self.policy_chat_type(),
-                tool_calls_allowed: decided.service.model_can_call_tools(self),
-            },
-            crate::agent::send_admission::call_token_budget(&decided.service, &decided.context, self)?,
-        );
-        let outcome = decided
-            .service
-            .execute_agent_resume(self, &decided.context, &execution, cancellation)
-            .await?;
-        let (status, reply) = match outcome.status {
-            crate::tools::ToolExecutionStatus::Succeeded => (
-                TurnTerminalStatus::Completed,
-                crate::security::redaction::redact_secrets(&outcome.model_content),
-            ),
-            crate::tools::ToolExecutionStatus::Cancelled => (
-                TurnTerminalStatus::Cancelled,
-                "Approved operation was cancelled.".to_owned(),
-            ),
-            _ => (
-                TurnTerminalStatus::Failed,
-                "Approved operation could not be completed.".to_owned(),
-            ),
-        };
-        let terminal_id = self.envelope.run_id.as_deref().context("chat resume has no run")?;
-        let scope = self.envelope.message_scope();
-        self.commit_terminal(
-            fabric,
-            TurnTerminalDraft {
-                decision: self.settlement_ref(terminal_id)?,
-                binding: self.terminal_binding(terminal_id)?,
-                terminal_id: terminal_id.to_owned(),
-                history_scope: Some(scope.clone().with_sender("prx_runtime").with_recipient("local-user")),
-                scope,
-                status,
-                history: Some(crate::agent::terminal::TurnHistoryProjection {
-                    assistant_content: reply.clone(),
-                    history_commit_len,
-                }),
-                provider_outcome: None,
-                telemetry: crate::agent::terminal::TurnTerminalTelemetry {
-                    summary: "chat approved operation finished".to_owned(),
-                    started_at,
-                    finished_at: chrono::Utc::now(),
-                },
-                delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
-                    target: "terminal:local-user".to_owned(),
-                },
-            },
-            &self.generation.effective.cost,
-            &self.generation.effective.workspace_dir,
-        )
-        .await?;
-        Ok((reply, status == TurnTerminalStatus::Completed))
     }
 
     pub(super) fn prompt_skills(&self) -> anyhow::Result<Vec<crate::skills::Skill>> {

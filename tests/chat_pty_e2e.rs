@@ -66,8 +66,6 @@ use expectrl::session::Session;
 use serial_test::serial;
 use tempfile::TempDir;
 
-#[path = "chat_pty_e2e/decision_resume.rs"]
-mod decision_resume;
 #[path = "chat_pty_e2e/search_reachability.rs"]
 mod search_reachability;
 

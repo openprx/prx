@@ -240,7 +240,6 @@ const CAUSAL_DOMAIN_CRATE_PATHS: &[&str] = &[
     "providers::model_pin::is_unpinned_model",
     "providers::loopback::",
     "cost::decision_attempt::DecisionError",
-    "security::approval_ledger::valid_projection",
     "observability::causal_event::CausalEvent",
     "observability::causal_event::CausalEventFields",
     "observability::causal_event::CausalEventKind",

@@ -9,7 +9,6 @@ use crate::tools::ToolSpec;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityCatalog, SurfacePolicy};
 use crate::tools::capability::execution_binding::specs::{self, ConstrainedToolSelection};
-use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
 use crate::tools::capability::search_tool::{
     self, CapabilitySearchPort, DiscoveredToolProposal, DiscoveryState, MAX_DISCOVERED_TOOLS_PER_TURN,
 };
@@ -72,14 +71,6 @@ impl TurnSurfacePort for TurnSurfaceBinding<'_> {
 
     fn model_can_call_tools(&self, proof: &dyn TurnSourceProof) -> bool {
         self.service.model_can_call_tools(proof)
-    }
-
-    fn fresh_resume_evidence(&self, proof: &dyn TurnSourceProof) -> anyhow::Result<Option<VerifiedResumeEvidenceV1>> {
-        self.context
-            .resume
-            .as_ref()
-            .map(|resume| resume.gate_evidence(self.service, proof))
-            .transpose()
     }
 
     fn catalog(&self) -> &Arc<CapabilityCatalog> {

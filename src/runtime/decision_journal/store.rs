@@ -1597,19 +1597,12 @@ impl DecisionReplayRecord {
             legacy_v1: evidence_value(columns, "legacy_v1")?,
             backend_endpoint: evidence_value(columns, "backend_endpoint")?,
         };
-        // The same collection gates as the store read: a bounded, valid projection.
-        if raw.directive_kind == "collect_approval_arguments" {
-            let gates_json: String = evidence_value(columns, "gates_json")?;
-            anyhow::ensure!(
-                gates_json.len() <= 1_048_576,
-                "decision evidence gates exceed the collection limit"
-            );
-            let gates: serde_json::Value = serde_json::from_str(&gates_json)?;
-            anyhow::ensure!(
-                crate::security::approval_ledger::valid_projection(&gates, &state_fingerprint, &catalog_generation),
-                "decision evidence collection projection is invalid"
-            );
-        }
+        // Historical approval-collection evidence is not replayed (no
+        // compatibility with pre-strip approvals).
+        anyhow::ensure!(
+            raw.directive_kind != "collect_approval_arguments",
+            "historical approval-collection evidence is not replayable"
+        );
         let source_event_id: Option<String> = evidence_value(columns, "source_event_id")?;
         let decision = raw
             .decode(Vec::new())
@@ -2797,22 +2790,9 @@ fn replay_record_on_connection_with_deadline(
                 let column = format!("replay_{name}");
                 replay_column_hash(&mut digest, name, row.get_ref(column.as_str())?);
             }
-            // Collection evidence remains inside the existing digest-covered gates
-            // column. Old rows take no new JSON decode or canonical encoding path.
+            // Historical approval-collection rows are not replayable.
             if row.get_ref("replay_directive_kind")?.as_str()? == "collect_approval_arguments" {
-                let raw = row.get_ref("replay_gates_json")?.as_str()?;
-                if raw.len() > 1_048_576 {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                let gates: serde_json::Value = match deadline {
-                    Some(deadline) => recovery_json(raw, deadline).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    None => serde_json::from_str(raw).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                };
-                let state: String = row.get("replay_state_fingerprint")?;
-                let generation: String = row.get("replay_catalog_generation")?;
-                if !crate::security::approval_ledger::valid_projection(&gates, &state, &generation) {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
+                return Err(rusqlite::Error::InvalidQuery);
             }
             Ok((
                 RawDecision::read(row)?,

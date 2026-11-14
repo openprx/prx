@@ -772,9 +772,9 @@ impl TerminalFacts {
             .signed_duration_since(marker.telemetry.started_at);
         let latency_ms = u64::try_from(elapsed.num_milliseconds()).map_err(|_| OutcomeCorrelationError::Number)?;
         Ok(Self {
-            collected_pending: context.collected_pending_event().is_some(),
-            collected_declined: context.collected_declined_event().is_some(),
-            resume_claimed: context.claimed_resume_event().is_some(),
+            collected_pending: false,
+            collected_declined: false,
+            resume_claimed: false,
             terminal_id: marker.terminal_id,
             status: marker.status,
             provider_outcome: marker.provider_outcome,

@@ -19,7 +19,6 @@ use crate::security::AutonomyLevel;
 use crate::tools::capability::admission_facts::AdmissionFactsV1;
 use crate::tools::capability::catalog::{CapabilityEntry, CatalogView, Exposure};
 use crate::tools::capability::contract::{CapabilityRef, CostEstimate, SideEffectClass};
-use crate::tools::capability::resume_evidence::VerifiedResumeEvidenceV1;
 use crate::tools::capability::turn_state::{SideEffectMode, TrustedParts, TurnSurfaceKind};
 use crate::tools::execution::{ToolExecutionDecision, decide_tool_execution};
 
@@ -101,11 +100,8 @@ impl PublicationRules<'_, '_> {
 
     /// Structural turn restrictions a publication can never undo: tools off,
     /// plan-mode write interception and (outside Full) read-only mode.
-    /// `resume_exact_call` additionally restricts every capability except the
-    /// historical resume's prepared one.
-    pub(crate) fn restricts(&self, entry: &CapabilityEntry, resume_scope: bool) -> bool {
-        (resume_scope && self.has_constraint("resume_exact_call"))
-            || self.has_constraint("tools_off")
+    pub(crate) fn restricts(&self, entry: &CapabilityEntry) -> bool {
+        self.has_constraint("tools_off")
             || (self.has_constraint("intercepts_writes") && entry.plan_intercepted())
             || (!self.full_autonomy()
                 && self.trusted.side_effect_mode == SideEffectMode::ReadOnly
@@ -150,14 +146,13 @@ impl PublicationRules<'_, '_> {
     /// Publication admission of one capability (scope, owner isolation, turn
     /// controls, exclusions, catalog parity, policy and schema). Approval is
     /// required for an effectful capability under approval-required mode or a
-    /// Supervised child, and for a policy Ask, unless `approval_verified`.
+    /// Supervised child, and for a policy Ask.
     pub(crate) fn capability(
         &self,
         entry: &CapabilityEntry,
         reference: &CapabilityRef,
         delegate: bool,
         estimated_cost: Option<CostEstimate>,
-        approval_verified: bool,
     ) -> PublicationAdmission {
         let trusted = self.trusted;
         let generation = self.catalog.generation();
@@ -245,7 +240,7 @@ impl PublicationRules<'_, '_> {
         if reference.fingerprint != entry.fingerprint {
             return blocked(5, "schema_changed");
         }
-        if (approval_required || policy_asks) && !approval_verified {
+        if approval_required || policy_asks {
             PublicationAdmission::ApprovalRequired
         } else {
             PublicationAdmission::Passed
@@ -304,51 +299,22 @@ impl PublicationRules<'_, '_> {
                 if delegate && !outgoing_child && self.facts.child_scope().is_some() {
                     return None;
                 }
-                if self.restricts(entry, true) {
+                if self.restricts(entry) {
                     return None;
                 }
                 let cost = self.facts.child_scope().and_then(|_| estimate(entry.schema_bytes));
-                (!self.capability(entry, &reference, delegate, cost, false).is_blocked()).then_some(reference)
+                (!self.capability(entry, &reference, delegate, cost).is_blocked()).then_some(reference)
             })
             .collect()
     }
 
-    /// V-17: a historical resume turn publishes exactly its prepared
-    /// capability, whose approval the authenticated evidence verifies.
-    pub(crate) fn resume_surface(
-        &self,
-        evidence: &VerifiedResumeEvidenceV1,
-        estimate: &dyn Fn(usize) -> Option<CostEstimate>,
-    ) -> BTreeSet<CapabilityRef> {
-        if !self.facts.model_can_call_tools {
-            return BTreeSet::new();
-        }
-        let reference = evidence.capability();
-        let Some(entry) = self.catalog.entry_any(&reference.id) else {
-            return BTreeSet::new();
-        };
-        if is_delegator(&entry.public_name) || self.restricts(entry, false) {
-            return BTreeSet::new();
-        }
-        let cost = self.facts.child_scope().and_then(|_| estimate(entry.schema_bytes));
-        if self.capability(entry, reference, false, cost, true).is_blocked() {
-            return BTreeSet::new();
-        }
-        BTreeSet::from([reference.clone()])
-    }
-
-    /// The turn's published surface: the resume surface on a historical
-    /// resume turn, else the direct core.
+    /// The turn's published surface: the direct core.
     pub(crate) fn surface(
         &self,
-        resume: Option<&VerifiedResumeEvidenceV1>,
         outgoing_child: bool,
         estimate: &dyn Fn(usize) -> Option<CostEstimate>,
     ) -> BTreeSet<CapabilityRef> {
-        resume.map_or_else(
-            || self.direct_surface(outgoing_child, estimate),
-            |evidence| self.resume_surface(evidence, estimate),
-        )
+        self.direct_surface(outgoing_child, estimate)
     }
 
     /// A delegator in the published surface may bind the turn's sealed

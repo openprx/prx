@@ -554,18 +554,11 @@ fn the_occurrence_rule_reports_extra_calls_stale_entries_and_duplicates() {
 #[test]
 pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
     // Pin the two issued execution-service bindings, not merely a nearby type name.
-    for (relative, function, binding) in [
-        (
-            "src/agent/embedded_turn.rs",
-            "run_work",
-            "let(execution,context)=service.bind_agent_execution(source,&decision,&context,&selected.specs)?;",
-        ),
-        (
-            "src/runtime/turn_decision/execution.rs",
-            "execute_agent_resume",
-            "letdispatch=self.bind_resume_execution(proof,context,execution_context)?;",
-        ),
-    ] {
+    for (relative, function, binding) in [(
+        "src/agent/embedded_turn.rs",
+        "run_work",
+        "let(execution,context)=service.bind_agent_execution(source,&decision,&context,&selected.specs)?;",
+    )] {
         let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
             &repository_root().join(relative),
         )));
@@ -596,29 +589,6 @@ pub(super) fn every_non_tool_execute_call_site_shows_its_type_evidence() {
             exception.entry,
             exception.receiver,
             exception.evidence
-        );
-    }
-}
-
-/// Console and chat resume must go through `model_turn_context`. Reverting
-/// either site to a bare `ToolExecutionContext::new` (Internal) fails this cell.
-#[test]
-pub(super) fn resume_sites_go_through_model_turn_context() {
-    for (relative, function) in [
-        ("src/gateway/api/sessions.rs", "run_console_resume"),
-        ("src/chat/binding.rs", "execute_resume_and_finalize"),
-    ] {
-        let production = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
-            &repository_root().join(relative),
-        )));
-        let body = compact_rust_tokens(&function_body(&production, function));
-        assert!(
-            body.contains("crate::tools::surface_owner::model_turn_context("),
-            "{function} must stamp ModelTurn+surface via model_turn_context"
-        );
-        assert!(
-            !body.contains("ToolExecutionContext::new("),
-            "{function} must not construct a bare Internal context"
         );
     }
 }
