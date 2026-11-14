@@ -19,8 +19,7 @@ pub(super) async fn operator_process_publication(
     authority.verify()?;
     let snapshots = authority.snapshots();
     anyhow::ensure!(
-        build.parent_grant.is_none()
-            && Arc::ptr_eq(&build.generation, &snapshots.generation)
+        Arc::ptr_eq(&build.generation, &snapshots.generation)
             && Arc::ptr_eq(&build.memory, &authority.source_fabric().memory())
             && build.catalog_sources.config_generation_id == snapshots.generation.id.0.to_string(),
         "operator worker service differs from source"
@@ -106,7 +105,6 @@ pub(super) async fn operator_process_publication(
         &build.generation,
         Arc::clone(&build.memory),
         TurnSurfaceKind::Worker,
-        None,
         &recovery_owner,
         workspace_key.clone(),
         match &opened {
@@ -135,7 +133,6 @@ pub(super) async fn operator_process_publication(
     let service = Arc::new(TurnDecisionService {
         runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
             recovery,
-            None,
             None,
             &snapshots.generation.effective,
             &build.security,

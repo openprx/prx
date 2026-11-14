@@ -545,8 +545,7 @@ pub struct ToolExecutionContext {
     pub(crate) owner_filesystem: Option<Arc<super::owner_filesystem::OwnerFilesystem>>,
     pub(crate) capability_search: Option<super::capability::search_tool::CapabilitySearchPort>,
     pub(crate) ordinary_child_publication: Option<crate::runtime::child_source::publication::OrdinaryChildPublication>,
-    pub(crate) child_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    /// Incoming child authority of this turn, independent of `child_grant`.
+    /// Incoming child authority of this turn.
     pub(crate) child_scope: Option<Arc<super::capability::child::VerifiedChildScope>>,
     /// Pinned child provenance; dispatch refuses either half without the other.
     pub(crate) child_pin: Option<Arc<super::capability::child::ChildDispatchPin>>,
@@ -622,7 +621,6 @@ impl ToolExecutionContext {
             owner_filesystem: None,
             capability_search: None,
             ordinary_child_publication: None,
-            child_grant: None,
             child_scope: None,
             child_pin: None,
             call_budget: None,
@@ -3175,45 +3173,42 @@ impl ToolExecutionService {
         let schema_dialect = context.schema_dialect;
         let tool_future = crate::runtime::registry::scope_current(
             work.id(),
-            crate::runtime::child_source::scope_outgoing_grant(
-                context.child_grant.clone(),
-                CHILD_CALL_CONTEXT.scope(
-                    child_call_context,
-                    super::capability::search_tool::with_search_authority(
-                        if command.name == "capability_search" {
-                            context.capability_search.clone()
+            CHILD_CALL_CONTEXT.scope(
+                child_call_context,
+                super::capability::search_tool::with_search_authority(
+                    if command.name == "capability_search" {
+                        context.capability_search.clone()
+                    } else {
+                        None
+                    },
+                    super::capability::execution_binding::scope_dispatch_binding(
+                        if backend.root_name() == "mcp_call" {
+                            context.admitted_binding.as_ref()
                         } else {
                             None
                         },
-                        super::capability::execution_binding::scope_dispatch_binding(
-                            if backend.root_name() == "mcp_call" {
-                                context.admitted_binding.as_ref()
-                            } else {
-                                None
-                            },
-                            async move {
-                                if let Some(observation) = exact_call_ref {
-                                    observation.backend_started();
-                                }
-                                super::owner_filesystem_dispatch::scope(
-                                    private_filesystem,
-                                    crate::tools::schema::with_execution_contract(
-                                        execution_parameters,
-                                        schema_dialect,
-                                        crate::runtime::h2_entry::scope_invocation(
-                                            backend_h2_invocation.map(|invocation| {
-                                                (invocation, backend_cancellation.clone().unwrap_or_default())
-                                            }),
-                                            super::effective_autonomy::scope(
-                                                effective_level,
-                                                backend.invoke_observed(public_name, arguments, backend_cancellation),
-                                            ),
+                        async move {
+                            if let Some(observation) = exact_call_ref {
+                                observation.backend_started();
+                            }
+                            super::owner_filesystem_dispatch::scope(
+                                private_filesystem,
+                                crate::tools::schema::with_execution_contract(
+                                    execution_parameters,
+                                    schema_dialect,
+                                    crate::runtime::h2_entry::scope_invocation(
+                                        backend_h2_invocation.map(|invocation| {
+                                            (invocation, backend_cancellation.clone().unwrap_or_default())
+                                        }),
+                                        super::effective_autonomy::scope(
+                                            effective_level,
+                                            backend.invoke_observed(public_name, arguments, backend_cancellation),
                                         ),
                                     ),
-                                )
-                                .await
-                            },
-                        ),
+                                ),
+                            )
+                            .await
+                        },
                     ),
                 ),
             ),

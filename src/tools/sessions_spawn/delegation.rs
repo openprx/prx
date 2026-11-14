@@ -28,30 +28,6 @@ impl SpawnDelegationStatus {
         status.provider = crate::providers::redact_endpoint_userinfo(&status.provider).into_owned();
         Some(status)
     }
-
-    pub(super) fn from_grant(grant: &crate::runtime::child_source::IssuedChildGrant) -> Option<Self> {
-        let (manifest, _) = grant.scope().gate_inputs();
-        let pins = manifest.authority.delegation.as_ref()?;
-        let catalog = grant.catalog().view(&Default::default());
-        Some(Self {
-            requested: pins.requested,
-            provider: crate::providers::redact_endpoint_userinfo(&pins.provider).into_owned(),
-            model: pins.model.clone(),
-            remaining_depth: manifest.authority.remaining_depth,
-            max_cost_cents: manifest.authority.max_cost_cents,
-            allowed_tools: manifest
-                .allowed
-                .iter()
-                .map(|reference| {
-                    // A status projection retains every sealed reference even
-                    // if its display entry is unavailable; it grants nothing.
-                    catalog
-                        .entry_any(&reference.id)
-                        .map_or_else(|| reference.id.as_str().to_owned(), |entry| entry.public_name.clone())
-                })
-                .collect(),
-        })
-    }
 }
 
 pub(super) fn request_schema() -> serde_json::Value {
@@ -62,69 +38,26 @@ pub(super) fn request_schema() -> serde_json::Value {
     })
 }
 
-pub(super) fn requested(
-    args: &serde_json::Value,
-    config: &crate::config::SessionsSpawnConfig,
-    has_parent_grant: bool,
-) -> anyhow::Result<bool> {
-    let requested = match args.get("allow_delegation") {
-        None | Some(serde_json::Value::Bool(false)) => false,
-        Some(serde_json::Value::Bool(true)) => true,
+/// Refuse a recursive delegation opt-in. A recursive grant was issued only
+/// by the removed decision plane (P2-G4), so no parent can issue one; a
+/// missing or `false` opt-in is unchanged.
+pub(super) fn refuse_recursive_request(args: &serde_json::Value) -> anyhow::Result<()> {
+    match args.get("allow_delegation") {
+        None | Some(serde_json::Value::Bool(false)) => Ok(()),
+        Some(serde_json::Value::Bool(true)) => {
+            anyhow::bail!(
+                "recursive child delegation requires a decision-issued parent grant, which is no longer issued"
+            )
+        }
         Some(_) => anyhow::bail!("allow_delegation must be a boolean"),
-    };
-    if requested {
-        anyhow::ensure!(
-            config.allow_recursive_delegation,
-            "recursive child delegation is disabled by operator configuration"
-        );
-        anyhow::ensure!(
-            has_parent_grant,
-            "recursive child delegation requires an enabled, admitted parent grant"
-        );
-        config.validate()?;
     }
-    Ok(requested)
 }
 
 /// Refuse invalid opt-ins before a batch journals or starts any member. A
 /// failed batch's generic result would otherwise hide its per-member reason.
-pub(super) fn validate_batch(
-    members: &[(String, serde_json::Value)],
-    grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
-) -> anyhow::Result<()> {
-    let mut recursive = grant.is_some_and(crate::runtime::child_source::IssuedChildGrant::has_recursive_ancestry);
+pub(super) fn validate_batch(members: &[(String, serde_json::Value)]) -> anyhow::Result<()> {
     for (_, args) in members {
-        if let Some(grant) = grant {
-            recursive |= requested(args, &grant.generation().effective.sessions_spawn, true)?;
-        } else {
-            // Without a parent grant recursive work is unavailable, including
-            // on ordinary or operator surfaces. Missing/false is unchanged.
-            requested(args, &crate::config::SessionsSpawnConfig::default(), false)?;
-        }
-    }
-    anyhow::ensure!(
-        !recursive || members.len() <= 1,
-        "recursive grants allow at most one child per issued grant"
-    );
-    if recursive
-        && !members.is_empty()
-        && let Some(grant) = grant
-    {
-        grant.ensure_recursive_child_available()?;
-    }
-    Ok(())
-}
-
-pub(super) fn append_metadata(
-    metadata: &mut serde_json::Value,
-    grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    if let Some(status) = grant.and_then(SpawnDelegationStatus::from_grant) {
-        metadata
-            .as_object_mut()
-            .context("spawn input metadata must be an object")?
-            .insert("delegation".to_owned(), serde_json::to_value(status)?);
+        refuse_recursive_request(args)?;
     }
     Ok(())
 }
@@ -138,33 +71,16 @@ pub(super) fn append_task(metadata: &mut serde_json::Value, task: &str) -> anyho
     Ok(())
 }
 
-pub(super) fn status(
-    process: &Option<std::sync::Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    task: &Option<std::sync::Arc<crate::runtime::child_source::IssuedChildGrant>>,
-) -> Option<SpawnDelegationStatus> {
-    process
-        .as_deref()
-        .or(task.as_deref())
-        .and_then(SpawnDelegationStatus::from_grant)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn recursive_request_requires_operator_permission_and_an_admitted_parent() {
-        let mut config = crate::config::SessionsSpawnConfig::default();
-        assert!(!requested(&serde_json::json!({}), &config, false).unwrap());
-        assert!(!requested(&serde_json::json!({"allow_delegation": false}), &config, false).unwrap());
-        assert!(requested(&serde_json::json!({"allow_delegation": "true"}), &config, true).is_err());
-        let request = serde_json::json!({"allow_delegation": true});
-        assert!(requested(&request, &config, true).is_err());
-        config.allow_recursive_delegation = true;
-        assert!(requested(&request, &config, false).is_err());
-        assert!(requested(&request, &config, true).unwrap());
-        config.max_recursive_depth = 0;
-        assert!(requested(&request, &config, true).is_err());
+    fn recursive_request_is_refused_without_a_decision_issued_grant() {
+        assert!(refuse_recursive_request(&serde_json::json!({})).is_ok());
+        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": false})).is_ok());
+        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": "true"})).is_err());
+        assert!(refuse_recursive_request(&serde_json::json!({"allow_delegation": true})).is_err());
     }
 
     #[test]

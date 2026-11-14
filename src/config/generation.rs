@@ -180,12 +180,8 @@ impl ProcessGenerationBinding {
 }
 
 impl ConfigGeneration {
-    /// Pin an ordinary disabled child without startup globals or disk reloads.
-    pub(crate) fn for_disabled_child(config: &Config) -> anyhow::Result<Arc<Self>> {
-        anyhow::ensure!(
-            !config.causal_tree.enabled,
-            "ordinary child snapshot requires disabled decision plane"
-        );
+    /// Pin an ordinary child without startup globals or disk reloads.
+    pub(crate) fn for_child(config: &Config) -> anyhow::Result<Arc<Self>> {
         let mut value = serde_json::to_value((&config.workspace_dir, &config.config_path, config))?;
         value.sort_all_objects();
         let encoded = serde_json::to_vec(&value)?;
@@ -1213,6 +1209,22 @@ fn preserve_deferred_fields(old: &Config, desired: Config, fields: &[String]) ->
 
 #[cfg(test)]
 mod tests {
+    /// S7: the child snapshot fingerprint keeps its encoding:
+    /// SHA-256 over the sorted JSON of `(workspace_dir, config_path, config)`.
+    #[test]
+    fn for_child_fingerprint_encoding_is_unchanged() {
+        use sha2::Digest as _;
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = std::path::PathBuf::from("/prx/ws-1");
+        config.config_path = std::path::PathBuf::from("/prx/config.toml");
+        let generation = super::ConfigGeneration::for_child(&config).unwrap();
+        let mut value = serde_json::to_value((&config.workspace_dir, &config.config_path, &config)).unwrap();
+        value.sort_all_objects();
+        let expected = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&value).unwrap()));
+        assert_eq!(generation.source_revision.fingerprint_sha256, expected);
+        assert_eq!(generation.id.0, 0);
+        assert!(generation.source_revision.disk_generation.is_none());
+    }
     use super::*;
     use serial_test::serial;
 

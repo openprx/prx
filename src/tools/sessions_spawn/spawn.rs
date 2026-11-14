@@ -120,35 +120,32 @@ impl SessionsSpawnTool {
         if let (Some(publication), Some(caller)) = (ordinary_publication, caller.as_ref()) {
             publication.verify_caller(caller.context())?;
         }
-        let child_grant = crate::runtime::child_source::outgoing_grant();
         anyhow::ensure!(
-            child_grant.is_some() || ordinary_publication.is_some() || operator_source.is_some(),
+            ordinary_publication.is_some() || operator_source.is_some(),
             "session spawning requires an admitted parent or operator source"
         );
         anyhow::ensure!(
-            operator_source.is_none()
-                || (caller.is_none() && child_grant.is_none() && current_spawn_execution_context().is_none()),
+            operator_source.is_none() || (caller.is_none() && current_spawn_execution_context().is_none()),
             "operator spawn cannot inherit model or child authority"
         );
-        let child_model_config = child_grant
-            .as_ref()
-            .map(|grant| grant.generation().effective.as_ref())
-            .or_else(|| ordinary_publication.map(|publication| publication.generation().effective.as_ref()))
+        let child_model_config = ordinary_publication
+            .map(|publication| publication.generation().effective.as_ref())
             .or_else(|| {
                 operator_source
                     .as_ref()
                     .map(|source| source.generation().effective.as_ref())
             })
             .context("spawn admitted configuration missing")?;
-        let launch_security = child_grant
-            .as_ref()
-            .map(|grant| grant.security())
-            .or_else(|| ordinary_publication.map(|publication| publication.security()))
+        let launch_security = ordinary_publication
+            .map(|publication| publication.security())
             .or_else(|| operator_source.as_ref().map(|source| source.security()))
             .ok_or_else(|| anyhow::anyhow!("spawn admitted security policy missing"))?;
         let provider_options = &providers::provider_runtime_options_from_config(child_model_config);
         let spawn_config = &child_model_config.sessions_spawn;
-        let allow_delegation = delegation::requested(args, spawn_config, child_grant.is_some())?;
+        // Recursive delegation required a decision-issued parent grant, which
+        // no longer exists (P2-G4); an opt-in is refused as on ordinary
+        // surfaces before.
+        delegation::refuse_recursive_request(args)?;
         let agents = &child_model_config.agents;
         let task = args
             .get("task")
@@ -284,11 +281,6 @@ impl SessionsSpawnTool {
         }
 
         let run_id = reserved_run_id.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
-        // A native issued child owns a distinct session before its durable input
-        // is issued. Ordinary and operator spawning retain their shared scope.
-        let session_scope_key = child_grant.as_ref().map_or(session_scope_key, |grant| {
-            format!("{}:child:{run_id}", grant.parent().session_key())
-        });
 
         let selected_agent = match agent_name.as_deref() {
             Some(name) => match agents.get(name) {
@@ -400,14 +392,8 @@ impl SessionsSpawnTool {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
 
-        anyhow::ensure!(
-            !child_model_config.causal_tree.enabled || child_grant.is_some() || operator_source.is_some(),
-            "decision-enabled spawning requires a child grant or typed operator source"
-        );
-        let memory_fabric = child_grant
-            .as_ref()
-            .map(|grant| grant.source_fabric().clone())
-            .or_else(|| ordinary_publication.map(|publication| publication.source_fabric()))
+        let memory_fabric = ordinary_publication
+            .map(|publication| publication.source_fabric())
             .or_else(|| operator_source.as_ref().map(|source| source.fabric().clone()))
             .context("spawn admitted memory fabric missing")?;
         if mode == "process" && memory_fabric.memory().requires_scoped_execution() {
@@ -416,10 +402,8 @@ impl SessionsSpawnTool {
             );
         }
         let process_memory_backend = memory_fabric.memory().name().to_owned();
-        let child_model_catalog = child_grant
-            .as_ref()
-            .map(|grant| grant.provider_catalog())
-            .or_else(|| ordinary_publication.map(|publication| publication.provider_catalog()))
+        let child_model_catalog = ordinary_publication
+            .map(|publication| publication.provider_catalog())
             .or_else(|| operator_source.as_ref().map(|source| source.catalog()))
             .context("spawn admitted provider catalog missing")?;
         // A per-call provider is accepted only among the providers the operator
@@ -431,9 +415,7 @@ impl SessionsSpawnTool {
                 return Ok(SpawnOutcome::rejected(error.to_string()));
             }
         }
-        let inherited_model = if let Some(grant) = &child_grant {
-            grant.model_source()?
-        } else if let Some(publication) = ordinary_publication {
+        let inherited_model = if let Some(publication) = ordinary_publication {
             publication.model_source()
         } else {
             use crate::runtime::turn_source::TurnSourceProof;
@@ -462,7 +444,8 @@ impl SessionsSpawnTool {
         });
         // Retain the request spelling: a resolved hint alone cannot prove which
         // route and credential source selected the actual child provider.
-        let mut child_requested_model = (child_grant.is_some() || ordinary_publication.is_some())
+        let mut child_requested_model = ordinary_publication
+            .is_some()
             .then(|| (resolved_provider_name.clone(), resolved_model.clone()));
         let selected_route_hint = resolved_model.trim().strip_prefix("hint:").map(str::to_string);
         let route_source_provider = selected_route_hint.as_ref().map(|_| resolved_provider_name.clone());
@@ -668,21 +651,6 @@ impl SessionsSpawnTool {
                 ))
             })
             .transpose()?;
-        let child_grant = child_grant
-            .as_ref()
-            .map(|grant| grant.for_spawn_request(allow_delegation, &resolved_provider_name, &resolved_model))
-            .transpose()?;
-        let process_child_grant = (mode == "process")
-            .then(|| {
-                child_grant
-                    .as_deref()
-                    .map(crate::runtime::child_source::IssuedChildGrant::for_process_worker)
-                    .transpose()
-                    .map(|grant| grant.map(Arc::new))
-            })
-            .transpose()?
-            .flatten();
-        let delegation_status = delegation::status(&process_child_grant, &child_grant);
         let event_workspace = memory_fabric.workspace_id();
         let mut spawn_scope_for_event = spawn_event_scope(
             event_workspace,
@@ -692,9 +660,6 @@ impl SessionsSpawnTool {
             agent_name.as_deref(),
             spawn_scope.as_ref(),
         );
-        if let Some(grant) = process_child_grant.as_ref().or(child_grant.as_ref()) {
-            grant.bind_event_scope(&mut spawn_scope_for_event)?;
-        }
         if let Some(binding) = &ordinary_binding {
             binding.bind_ordinary_input_scope(
                 &binding.provider(),
@@ -744,14 +709,13 @@ impl SessionsSpawnTool {
             &mode,
             (&resolved_provider_name, &resolved_model),
             &run_lineage,
-            process_child_grant.as_deref().or(child_grant.as_deref()),
         )
         .await?;
 
         if mode == "process" {
             let (process_config_dir, process_config_generation) =
                 process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
-            let process_provider_selection = if child_grant.is_some() || ordinary_publication.is_some() {
+            let process_provider_selection = if ordinary_publication.is_some() {
                 let (provider, model) = child_requested_model
                     .as_ref()
                     .context("process child selection missing")?;
@@ -822,7 +786,8 @@ impl SessionsSpawnTool {
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
-                    delegation: delegation_status.clone(),
+                    // Recursive delegation status is issued by no parent (P2-G4).
+                    delegation: None,
                     progress: Arc::clone(&process_progress),
                     batch_id: batch_id.map(str::to_string),
                 }));
@@ -898,7 +863,6 @@ impl SessionsSpawnTool {
                     .unwrap_or_default(),
                 operator_authority: None,
                 ordinary_authority: None,
-                incoming_grant: process_child_grant.clone(),
                 provider_binding: None,
                 terminal_usage: None,
                 input_receipt: source_receipt.clone(),
@@ -943,14 +907,6 @@ impl SessionsSpawnTool {
             crate::runtime::registry::attach_steer_sender(sub_agent_work.id(), process_steer_tx.clone());
             sub_agent_work.require_cleanup_acknowledgement();
             let process_work_id = sub_agent_work.id();
-            let process_recovery = process_child_grant.as_ref().map(|grant| {
-                Arc::new(process_terminal::ProcessRecovery::new(
-                    process_memory_fabric.clone(),
-                    Arc::clone(grant),
-                    source_receipt.clone(),
-                    batch_id.map(str::to_owned),
-                ))
-            });
             let is_ordinary_process = process_source_launch
                 .as_ref()
                 .is_some_and(|launch| launch.is_ordinary());
@@ -991,9 +947,6 @@ impl SessionsSpawnTool {
             let process_batch_id = batch_id.map(str::to_owned);
             #[cfg(test)]
             let test_worker_executable = self.test_worker_executable.clone();
-            let monitor_recovery = process_recovery.clone();
-            let verified_terminal = Arc::new(parking_lot::Mutex::new(None));
-            let monitor_verified_terminal = Arc::clone(&verified_terminal);
             let ordinary_terminal = Arc::new(parking_lot::Mutex::new(None));
             let monitor_ordinary_terminal = Arc::clone(&ordinary_terminal);
             let operator_terminal = Arc::new(parking_lot::Mutex::new(None));
@@ -1010,7 +963,7 @@ impl SessionsSpawnTool {
                         let monitor_result = std::panic::AssertUnwindSafe(async {
                             tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                            let mut worker_result = run_sub_agent_process(
+                            let worker_result = run_sub_agent_process(
                                 &rid,
                                 &task_owned,
                                 &provider_name,
@@ -1046,9 +999,7 @@ impl SessionsSpawnTool {
                                 process_steer_rx,
                                 history_arc,
                                 Arc::clone(&monitor_progress),
-                                process_provider_selection.as_ref(),
                                 process_memory_fabric.as_ref(),
-                                monitor_recovery.as_deref(),
                                 process_source_launch,
                                 process_batch_id.as_deref(),
                                 process_worker_mailbox.as_ref(),
@@ -1057,53 +1008,7 @@ impl SessionsSpawnTool {
                             )
                             .await;
 
-                            let recovered_usage = if matches!(
-                                &worker_result,
-                                Ok(ProcessWorkerOutcome::Terminated(_) | ProcessWorkerOutcome::ExitedWithoutResult(_))
-                            ) {
-                                let context = current_spawn_execution_context();
-                                if let Some(grant) = context.as_ref().and_then(|value| value.incoming_grant.as_ref()) {
-                                    let recovery = async {
-                                        let fabric = process_memory_fabric.as_ref().context("worker recovery storage missing")?;
-                                        let input = context.as_ref().and_then(|value| value.input_receipt.as_deref())
-                                            .context("worker recovery input missing")?;
-                                        if let Some(completion) = process_terminal::recover_completion(fabric, grant, input).await? {
-                                            Ok::<_, anyhow::Error>((Some(completion), None))
-                                        } else {
-                                            let usage = process_terminal::recover_usage(fabric, grant, input).await?;
-                                            Ok((None, Some(usage)))
-                                        }
-                                    }.await;
-                                    match recovery {
-                                        Ok((completion, usage)) => {
-                                            if let Some(completion) = completion {
-                                                worker_result = Ok(ProcessWorkerOutcome::VerifiedFinished(completion));
-                                            }
-                                            usage
-                                        }
-                                        Err(error) => {
-                                            tracing::error!(run_id = %rid, error = %error,
-                                                "worker interruption settlement remains unconfirmed");
-                                            return;
-                                        }
-                                    }
-                                } else { None }
-                            } else { None };
-                            let (status, mut result_text, mut token_usage_records, finalization) = match worker_result {
-                                Ok(ProcessWorkerOutcome::VerifiedFinished(completion)) => {
-                                    *monitor_verified_terminal.lock() = Some(completion.clone());
-                                    let (result, usage) = completion.into_parts();
-                                    let (status, text) = if result.success {
-                                        (SubAgentStatus::Completed(result.output.clone()), result.output)
-                                    } else {
-                                        let error = super::failure::llm_visible_error(&result.error.unwrap_or_else(|| "worker failed".to_owned()));
-                                        (
-                                            SubAgentStatus::Failed(sub_agent_reported_failure(&error)),
-                                            format!("Sub-agent error: {error}"),
-                                        )
-                                    };
-                                    (status, text, usage, ProcessFinalization::Natural)
-                                }
+                            let (status, result_text, token_usage_records, finalization) = match worker_result {
                                 Ok(ProcessWorkerOutcome::OrdinaryVerifiedFinished(completion)) => {
                                     *monitor_ordinary_terminal.lock() = Some(completion.clone());
                                     let result = completion.result;
@@ -1235,21 +1140,12 @@ impl SessionsSpawnTool {
                                         SubAgentStatus::Failed(detail),
                                         msg,
                                         Vec::new(),
-                                        if is_ordinary_process || is_operator_process || current_spawn_execution_context().as_ref()
-                                            .is_some_and(|context| context.incoming_grant.is_some()) {
+                                        if is_ordinary_process || is_operator_process {
                                             ProcessFinalization::Unconfirmed
                                         } else { ProcessFinalization::Natural },
                                     )
                                 }
                             };
-
-                            if let Some(recovered) = recovered_usage {
-                                token_usage_records.extend(recovered.records);
-                                result_text.push_str(&format!(
-                                    "; provider usage may be incomplete ({} recorded segments lack terminals)",
-                                    recovered.unfinished_segments,
-                                ));
-                            }
 
                             let announce = format_announce_message(&rid, &status, &result_text);
                             if let Err(error) = commit_process_terminal_state(
@@ -1337,8 +1233,6 @@ impl SessionsSpawnTool {
                 run_id.clone(),
                 process_control.clone(),
                 sub_agent_work,
-                verified_terminal,
-                process_recovery,
                 ordinary_terminal,
                 ordinary_recovery,
                 operator_terminal,
@@ -1379,20 +1273,7 @@ impl SessionsSpawnTool {
         };
         let mut provider_name = resolved_provider_name;
         let mut model = resolved_model;
-        let child_provider_binding = if let Some(grant) = child_grant.as_ref() {
-            let credential = child_credential.clone().context("child credential selection missing")?;
-            let (requested_child_provider, requested_child_model) =
-                child_requested_model.as_ref().context("child model request missing")?;
-            let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build(
-                Arc::clone(grant),
-                requested_child_provider,
-                requested_child_model,
-                credential,
-            )?);
-            provider_name = binding.provider_name().to_owned();
-            model = binding.model().to_owned();
-            Some(binding)
-        } else if let Some(source) = &operator_source {
+        let child_provider_binding = if let Some(source) = &operator_source {
             let binding = Arc::new(crate::runtime::child_source::ChildProviderBinding::build_operator(
                 source,
             )?);
@@ -1462,18 +1343,7 @@ impl SessionsSpawnTool {
         // Same handle the run writes its transcript through, so a refused
         // announcement is visible on the run itself and not only in the log.
         let announce_history = history_arc.clone();
-        let mut terminal_usage = child_grant.as_ref().map(|grant| {
-            Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new(
-                grant
-                    .generation()
-                    .effective
-                    .workspace_dir
-                    .to_string_lossy()
-                    .into_owned(),
-                grant.scope().gate_inputs().0.authority.owner.clone(),
-                rid.clone(),
-            ))
-        });
+        let mut terminal_usage = None;
         let mut task_execution_ctx = SpawnExecutionContext {
             task_input: parent_exec_ctx
                 .as_ref()
@@ -1481,7 +1351,6 @@ impl SessionsSpawnTool {
                 .unwrap_or_default(),
             operator_authority: None,
             ordinary_authority: None,
-            incoming_grant: child_grant,
             provider_binding: child_provider_binding,
             terminal_usage: terminal_usage.clone(),
             input_receipt: source_receipt,
@@ -1611,20 +1480,11 @@ impl SessionsSpawnTool {
         let logical_terminal = {
             use crate::agent::terminal::logical::LogicalTaskTerminalRef;
             match (
-                task_execution_ctx.incoming_grant.as_deref(),
                 task_execution_ctx.ordinary_authority.as_deref(),
                 task_execution_ctx.operator_authority.as_deref(),
             ) {
-                (Some(grant), None, None) => LogicalTaskTerminalRef::granted(
-                    grant,
-                    task_execution_ctx
-                        .input_receipt
-                        .as_deref()
-                        .context("logical task input missing")?,
-                    &task_result_scope,
-                )?,
-                (None, Some(authority), None) => LogicalTaskTerminalRef::ordinary(authority)?,
-                (None, None, Some(authority)) => LogicalTaskTerminalRef::operator(authority)?,
+                (Some(authority), None) => LogicalTaskTerminalRef::ordinary(authority)?,
+                (None, Some(authority)) => LogicalTaskTerminalRef::operator(authority)?,
                 _ => anyhow::bail!("logical task completion requires one issued source authority"),
             }
         };
@@ -1664,7 +1524,8 @@ impl SessionsSpawnTool {
                 parent_run_id: parent_run_id.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
-                delegation: delegation_status.clone(),
+                // Recursive delegation status is issued by no parent (P2-G4).
+                delegation: None,
                 token_usage_records: Vec::new(),
                 progress: Arc::clone(&task_progress),
                 batch_id: batch_id.map(str::to_string),

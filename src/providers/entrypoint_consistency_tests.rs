@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use super::{configured_connection_for, provider_runtime_options_from_config, scoped_reliability};
+use super::provider_runtime_options_from_config;
 use crate::config::Config;
 use crate::providers::traits::{ChatMessage, ChatRequest};
 
@@ -82,19 +82,6 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
     let channels = refusal(crate::channels::build_channel_startup_provider(&config, &options));
     let gateway = refusal(crate::gateway::build_gateway_provider_selection(&config, &options));
 
-    let connection =
-        configured_connection_for(provider, provider, config.api_key.as_deref(), config.api_url.as_deref());
-    let reliability = scoped_reliability(&config.reliability, &connection);
-    let worker = refusal(crate::session_worker::runner::build_worker_provider_selection(
-        &config,
-        provider,
-        PRIMARY_MODEL,
-        None,
-        crate::providers::selection::credential_for(&config, provider),
-        &connection,
-        &reliability,
-        &options,
-    ));
     let catalog = crate::providers::selection::catalog_for(&config);
     let gateway_child = refusal(crate::runtime::child_source::ChildProviderBinding::build_ordinary(
         &config,
@@ -110,7 +97,6 @@ fn cross_dialect_fallback_is_refused_by_every_production_entry_builder() {
         ("cli", cli),
         ("channels", channels),
         ("gateway", gateway),
-        ("worker", worker),
         ("gateway child", gateway_child),
     ];
     let expected = &refusals[0].1;

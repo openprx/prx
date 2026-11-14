@@ -141,7 +141,7 @@ pub(super) async fn recover_usage(
                 payload.get("terminal_id").and_then(serde_json::Value::as_str) == Some(run.as_str()),
                 "operator terminal asserts a different decision or segment"
             );
-            verify_segment_replay(fabric, owner, &run, &event, &payload).await?;
+            verify_segment_replay(&payload)?;
             let usage: Option<crate::llm::route_decision::MeteredTokenUsageRecord> = serde_json::from_value(
                 payload
                     .get("usage_settlement")

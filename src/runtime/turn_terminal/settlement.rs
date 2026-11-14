@@ -115,7 +115,6 @@ pub(crate) fn terminal_binding(
         Arc::clone(&service.memory),
         SettlementIssueToken(()),
     )
-    .with_parent_grant(service.runtime.parent_grant().cloned())
     .with_operator_parent(
         service
             .operator_task

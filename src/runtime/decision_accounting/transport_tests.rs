@@ -679,8 +679,8 @@ async fn recursive_parent_child_and_leaf_reservations_share_the_original_money()
     let config = Arc::new(config);
     let initial_money = crate::cost::tracker::remaining_micro_usd_read_only(&config.cost, workspace.path())?;
     let root = RecursiveAllowance::new(40_000);
-    let (_, child) = root.carve_child(4)?;
-    let (_, leaf) = child.carve_child(2)?;
+    let (_, child) = root.carve_ordinary_child(4)?;
+    let (_, leaf) = child.carve_ordinary_child(2)?;
     let cleanup = Arc::new(CleanupTracker::default());
     let result = cleanup
         .scope(Box::pin(async {
@@ -743,8 +743,6 @@ async fn recursive_parent_child_and_leaf_reservations_share_the_original_money()
                     + leaf.money().load(Ordering::Acquire),
                 40_000
             );
-            assert!(root.carve_child(4).is_err());
-            assert!(child.carve_child(2).is_err());
             Ok::<_, anyhow::Error>(total)
         }))
         .await;

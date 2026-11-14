@@ -7,9 +7,6 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     // Architecture review Q73B/Q74: exact test-owned read-only ACL and generation-scoped Retrieve witnesses.
     "src/channels/tests/factory_reload_fixture.rs::run::let connection = rusqlite::Connection::open_with_flags(",
     "src/channels/tests/factory_reload_fixture.rs::run::let decisions = rusqlite::Connection::open_with_flags(tmp.path().join(\"self/causal_tree/decisions.db\"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect(\"durable decision evidence\");",
-    // Isolated child-process AUT: consistent snapshot and one copied completion tamper.
-    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let logical_db = rusqlite::Connection::open(workspace.join(\"memory/brain.db\"))?;",
-    "src/runtime/turn_decision/tests/child_process.rs::actual_parent_process_case::let copy = rusqlite::Connection::open(&copied_db)?;",
     // Fresh-process fixture: bounded, read-only enumeration before owned repository readback.
     "src/runtime/ingress_recovery/tests.rs::report::let conn = rusqlite::Connection::open_with_flags(",
     // Test-only isolated fixtures: actual instance routing, source scope, and durable turn receipts.

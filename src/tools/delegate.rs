@@ -37,16 +37,11 @@ where
     Ok(Box::pin(make()?))
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Inline child context preserves ownership without adding a hot-path allocation"
-)]
-enum DelegateChildAuthority {
-    Granted(Arc<crate::runtime::child_source::IssuedChildGrant>),
-    Ordinary {
-        publication: crate::runtime::child_source::publication::OrdinaryChildPublication,
-        caller: crate::tools::ToolExecutionContext,
-    },
+/// The ordinary parent publication and the caller context a delegate child
+/// executes under (the only child issuance path).
+struct DelegateChildAuthority {
+    publication: crate::runtime::child_source::publication::OrdinaryChildPublication,
+    caller: crate::tools::ToolExecutionContext,
 }
 
 struct DelegateChildSource {
@@ -501,7 +496,6 @@ impl Tool for DelegateTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         #[cfg(all(test, unix))]
         delegate_diagnostic::phase("delegate-body.json");
-        let child_grant = crate::runtime::child_source::outgoing_grant();
         let caller = crate::tools::execution::current_child_call_context();
         if let Some(caller) = caller.as_ref() {
             caller.verify_tool("delegate")?;
@@ -570,28 +564,15 @@ impl Tool for DelegateTool {
             publication.verify_caller(caller.context())?;
             publication.parent_authority().ensure_child_available()?;
         }
-        if child_grant.is_none() && ordinary_publication.is_none() {
+        let Some(ordinary_publication) = ordinary_publication else {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("delegation requires an admitted parent source".into()),
             });
-        }
-        let security = match child_grant.as_ref() {
-            Some(grant) => grant.security(),
-            None => ordinary_publication
-                .ok_or_else(|| anyhow::anyhow!("delegate parent policy missing"))?
-                .security(),
         };
-        let child_config = child_grant
-            .as_ref()
-            .map(|grant| grant.generation().effective.as_ref())
-            .or_else(|| ordinary_publication.map(|publication| publication.generation().effective.as_ref()))
-            .ok_or_else(|| anyhow::anyhow!("delegate admitted configuration missing"))?;
-        anyhow::ensure!(
-            !child_config.causal_tree.enabled || child_grant.is_some(),
-            "decision-enabled delegation requires an issued child grant"
-        );
+        let security = ordinary_publication.security();
+        let child_config = ordinary_publication.generation().effective.as_ref();
         let agents = &child_config.agents;
         let agent_config = match agents.get(agent_name) {
             Some(cfg) => cfg,
@@ -655,11 +636,6 @@ impl Tool for DelegateTool {
             .unwrap_or_else(|| agent_config.provider.clone());
         let mut effective_model = model_override.clone().unwrap_or_else(|| agent_config.model.clone());
 
-        let child_grant = child_grant
-            .as_ref()
-            .map(|grant| grant.for_spawn_request(false, &effective_provider, &effective_model))
-            .transpose()?;
-
         let child_binding_result = {
             let config = child_config;
 
@@ -685,22 +661,14 @@ impl Tool for DelegateTool {
             } else {
                 providers::selection::credential_for(config, &effective_provider)
             };
-            match child_grant.as_ref() {
-                Some(grant) => crate::runtime::child_source::ChildProviderBinding::build(
-                    Arc::clone(grant),
-                    &effective_provider,
-                    &effective_model,
-                    credential,
-                ),
-                None => crate::runtime::child_source::ChildProviderBinding::build_ordinary(
-                    config,
-                    &self.model_catalog,
-                    &effective_provider,
-                    &effective_model,
-                    credential,
-                    ordinary_publication,
-                ),
-            }
+            crate::runtime::child_source::ChildProviderBinding::build_ordinary(
+                config,
+                &self.model_catalog,
+                &effective_provider,
+                &effective_model,
+                credential,
+                Some(ordinary_publication),
+            )
         };
         let child_binding = match child_binding_result {
             Ok(binding) => binding,
@@ -722,27 +690,19 @@ impl Tool for DelegateTool {
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
         let delegate_run_id = uuid::Uuid::new_v4().to_string();
-        let memory_fabric = child_grant
-            .as_ref()
-            .map(|grant| grant.source_fabric().clone())
-            .or_else(|| ordinary_publication.map(|publication| publication.source_fabric()))
-            .ok_or_else(|| anyhow::anyhow!("delegate admitted memory fabric missing"))?;
+        let memory_fabric = ordinary_publication.source_fabric();
         let mut event_scope = delegate_event_scope(
             &security.workspace_dir.to_string_lossy(),
             &delegate_run_id,
             agent_name,
             scope.as_ref(),
         );
-        if let Some(grant) = child_grant.as_ref() {
-            grant.bind_event_scope(&mut event_scope)?;
-        } else {
-            child_binding.bind_ordinary_input_scope(
-                &provider,
-                &security.workspace_dir.to_string_lossy(),
-                &mut event_scope,
-                caller.as_ref(),
-            )?;
-        }
+        child_binding.bind_ordinary_input_scope(
+            &provider,
+            &security.workspace_dir.to_string_lossy(),
+            &mut event_scope,
+            caller.as_ref(),
+        )?;
         // Box the measured owned input-recording future at its construction boundary.
         // The parent retains cancellation ownership and awaits it in the same position.
         let source_receipt = boxed_delegate_field(|| {
@@ -761,7 +721,6 @@ impl Tool for DelegateTool {
                     })
                     .to_string(),
                 ),
-                child_grant.as_deref(),
             )
         })
         .await?;
@@ -782,19 +741,7 @@ impl Tool for DelegateTool {
             }),
         )
         .await;
-        let child_source = if let Some(grant) = child_grant.as_ref() {
-            let receipt = source_receipt
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("delegate child input is not durable"))?;
-            let proof = Arc::new(child_binding.source_proof(grant, receipt, &provider)?);
-            let execution = receipt.execution_context(proof.as_ref())?;
-            Some(DelegateChildSource {
-                authority: DelegateChildAuthority::Granted(Arc::clone(grant)),
-                proof,
-                execution,
-                fabric: memory_fabric.clone(),
-            })
-        } else if let Some(caller) = caller.as_ref()
+        let child_source = if let Some(caller) = caller.as_ref()
             && let Some(publication) = &caller.context().ordinary_child_publication
         {
             let (proof, execution) = child_binding.ordinary_execution_source(
@@ -805,7 +752,7 @@ impl Tool for DelegateTool {
                 source_receipt.as_deref(),
             )?;
             Some(DelegateChildSource {
-                authority: DelegateChildAuthority::Ordinary {
+                authority: DelegateChildAuthority {
                     publication: publication.clone(),
                     caller: caller.context().clone(),
                 },
@@ -1067,10 +1014,7 @@ impl DelegateTool {
             child_source,
         } = request;
         let resources = self.loop_resources();
-        let config = match &child_source.authority {
-            DelegateChildAuthority::Granted(grant) => Arc::clone(&grant.generation().effective),
-            DelegateChildAuthority::Ordinary { publication, .. } => Arc::clone(&publication.generation().effective),
-        };
+        let config = Arc::clone(&child_source.authority.publication.generation().effective);
         // Register before spawn: even cancellation before the first poll keeps
         // the child represented in the parent's cleanup tracker.
         let task_context = DelegateTaskContext::new()?;
@@ -1249,10 +1193,9 @@ impl DelegateLoopResources {
     ) -> anyhow::Result<DelegateAgenticExecution> {
         #[cfg(all(test, unix))]
         delegate_diagnostic::phase("child-body-entered.json");
-        let security = match child_source.as_ref().map(|source| &source.authority) {
-            Some(DelegateChildAuthority::Ordinary { publication, .. }) => Arc::clone(publication.security()),
-            Some(DelegateChildAuthority::Granted(grant)) => Arc::clone(grant.security()),
-            _ => Arc::clone(&self.security),
+        let security = match child_source.as_ref() {
+            Some(source) => Arc::clone(source.authority.publication.security()),
+            None => Arc::clone(&self.security),
         };
         if let Some(source) = child_source.as_ref() {
             use crate::runtime::turn_source::TurnSourceProof;
@@ -1324,7 +1267,7 @@ impl DelegateLoopResources {
         }
 
         let mut sub_tools: Vec<Box<dyn Tool>> = if inherit_all || child_source.is_some() {
-            // Granted execution always uses exact per-call bindings and the
+            // Child execution always uses exact per-call bindings and the
             // verified manifest. Keeping real roots is necessary for MCP
             // aliases and synthetic target binding/parity checks; it does not
             // add any name to that manifest or the model's selected surface.
@@ -1351,22 +1294,11 @@ impl DelegateLoopResources {
         // Answer-only sources keep inherited registry parity, but may not
         // acquire an additional runtime tool dependency.
         let history_dependency_allowed = !answer_only
-            && child_source.as_ref().is_none_or(|source| match &source.authority {
-                DelegateChildAuthority::Granted(grant) => grant
-                    .catalog()
-                    .entry_for_public_name(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
-                    .is_some_and(|entry| {
-                        grant.scope().gate_inputs().0.allowed.contains(
-                            &crate::tools::capability::contract::CapabilityRef {
-                                id: entry.id.clone(),
-                                fingerprint: entry.fingerprint,
-                                generation: entry.generation,
-                            },
-                        )
-                    }),
-                DelegateChildAuthority::Ordinary { publication, .. } => {
-                    publication.allows_tool(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
-                }
+            && child_source.as_ref().is_none_or(|source| {
+                source
+                    .authority
+                    .publication
+                    .allows_tool(crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME)
             });
         if history_dependency_allowed
             && !sub_tools
@@ -1397,17 +1329,16 @@ impl DelegateLoopResources {
             });
         }
 
-        let (hooks, observer): (Arc<HookManager>, Arc<dyn Observer>) =
-            match child_source.as_ref().map(|source| &source.authority) {
-                Some(DelegateChildAuthority::Ordinary { publication, .. }) => {
-                    let runtime = publication.loop_runtime()?;
-                    (Arc::clone(&runtime.hooks), Arc::clone(&runtime.observer))
-                }
-                _ => (
-                    super::child_hooks::child_hooks(self.parent_hooks.clone(), &security.workspace_dir),
-                    Arc::new(NoopObserver),
-                ),
-            };
+        let (hooks, observer): (Arc<HookManager>, Arc<dyn Observer>) = match child_source.as_ref() {
+            Some(source) => {
+                let runtime = source.authority.publication.loop_runtime()?;
+                (Arc::clone(&runtime.hooks), Arc::clone(&runtime.observer))
+            }
+            None => (
+                super::child_hooks::child_hooks(self.parent_hooks.clone(), &security.workspace_dir),
+                Arc::new(NoopObserver),
+            ),
+        };
         let child_source =
             child_source.ok_or_else(|| anyhow::anyhow!("delegate requires its admitted child source"))?;
         let child_execution = child_source.execution.clone();
@@ -1415,10 +1346,7 @@ impl DelegateLoopResources {
         let child_memory = child_event_fabric.memory();
         let envelope = &child_execution.envelope;
         let scope_ctx = ScopeContext::from_execution_context(&security, &child_execution, &envelope.session_key);
-        let child_config = match &child_source.authority {
-            DelegateChildAuthority::Granted(grant) => &grant.generation().effective,
-            DelegateChildAuthority::Ordinary { publication, .. } => &publication.generation().effective,
-        };
+        let child_config = &child_source.authority.publication.generation().effective;
         let resolved_compaction = resolve_pinned_child_compaction(child_config, effective_provider, effective_model);
         tracing::debug!(
             agent = agent_name,
@@ -1453,26 +1381,14 @@ impl DelegateLoopResources {
                     ))
                     .collect()
             });
-            let (service, config) = match &source.authority {
-                DelegateChildAuthority::Granted(grant) => {
-                    let service = crate::runtime::turn_publication::ChildDecisionPublication {
-                        allowed_tools,
-                        grant: Arc::clone(grant),
-                        registry: Arc::clone(&registry),
-                        observer: Arc::new(NoopObserver),
-                    }
-                    .publish()
-                    .await?;
-                    (service, Arc::clone(&grant.generation().effective))
-                }
-                DelegateChildAuthority::Ordinary { publication, caller } => {
-                    let owner = cleanup_owner
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("ordinary delegate cleanup owner missing"))?;
-                    let service = publication.child_service(caller, allowed_tools)?;
-                    owner.retain_child_service(Arc::clone(&service))?;
-                    (service, Arc::clone(&publication.generation().effective))
-                }
+            let (service, config) = {
+                let DelegateChildAuthority { publication, caller } = &source.authority;
+                let owner = cleanup_owner
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ordinary delegate cleanup owner missing"))?;
+                let service = publication.child_service(caller, allowed_tools)?;
+                owner.retain_child_service(Arc::clone(&service))?;
+                (service, Arc::clone(&publication.generation().effective))
             };
             let admitted = try_boxed_delegate_field(|| {
                 Ok(crate::runtime::child_turn::ChildSegmentTurn::admit(
@@ -3112,84 +3028,6 @@ pub(crate) mod tests {
             }),
         )
         .await
-    }
-
-    /// Runs the one native-tool delegation of
-    /// `agentic_mode_accepts_and_executes_one_explicit_dynamic_alias` against a
-    /// caller-owned workspace, so it survives for close, quarantine and reopen.
-    /// Returns the in-process child's segment terminal id.
-    pub(crate) async fn retained_delegation_fixture(workspace: &std::path::Path) -> anyhow::Result<String> {
-        use anyhow::Context as _;
-        let retained = tempfile::tempdir()?;
-        let driver = crate::agent::agent::native_decision_fixture::Driver::start_delegation("native_tool")
-            .await?
-            .retain_evidence_at(retained.path().to_path_buf());
-        let endpoint = driver.endpoint().to_owned();
-        let owned = workspace.to_path_buf();
-        let (result, _) = driver
-            .run_factory(move || async move {
-                let cleanup =
-                    crate::runtime::turn_cleanup::CleanupScope::new(None, tokio_util::sync::CancellationToken::new())?;
-                let mut observed = None;
-                cleanup
-                    .run(boxed_delegate_observation(|| async {
-                        observed = Some(
-                            CONFIGURED_DELEGATE_ENDPOINT
-                                .scope(
-                                    endpoint,
-                                    boxed_delegate_observation(|| {
-                                        run_admitted_delegate_fixture(
-                                            owned,
-                                            vec!["dynamic_alias".to_owned()],
-                                            vec![Arc::new(DynamicAliasTool)],
-                                            "dynamic_alias",
-                                            json!({}),
-                                            None,
-                                            false,
-                                            None,
-                                            false,
-                                        )
-                                    }),
-                                )
-                                .await,
-                        );
-                        Ok(())
-                    }))
-                    .await
-                    .map_err(|error| anyhow::anyhow!("delegate fixture writers did not drain: {error:?}"))?;
-                observed.context("delegate fixture did not run")
-            })
-            .await?;
-        anyhow::ensure!(result.success, "delegate fixture child failed: {:?}", result.error);
-        let workspace_id = workspace.to_string_lossy();
-        let memory = SqliteMemory::new(workspace)?;
-        let mut owners: Vec<String> = crate::memory::sqlite::fixture_readback::terminal_rows(workspace)?
-            .into_iter()
-            .filter_map(|row| row.owner_id)
-            .collect();
-        owners.sort();
-        owners.dedup();
-        let mut terminals = Vec::new();
-        for owner in &owners {
-            for event in memory
-                .list_owned_message_events_by_type(&workspace_id, owner, "turn.finalized", 0, 100)
-                .await?
-            {
-                if event.source == crate::memory::MessageEventSource::Delegate
-                    && let Some(id) = event
-                        .idempotency_key
-                        .as_deref()
-                        .and_then(|key| key.strip_prefix("turn:"))
-                        .and_then(|key| key.strip_suffix(":final"))
-                {
-                    terminals.push(id.to_owned());
-                }
-            }
-        }
-        match terminals.as_slice() {
-            [terminal] => Ok(terminal.clone()),
-            other => anyhow::bail!("expected one delegate terminal, found {}", other.len()),
-        }
     }
 
     async fn observe_owned_delegate_workspace<T, F, Fut>(work: F) -> T

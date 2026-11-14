@@ -117,51 +117,34 @@ impl TurnDecisionService {
             .any(|spec| spec.name == "capability_search")
             .then(|| self.capability_search_port(proof, context))
             .transpose()?;
-        execution_context.ordinary_child_publication = (!self.generation.effective.causal_tree.enabled
-            && specs
-                .iter()
-                .any(|spec| matches!(spec.name.as_str(), "delegate" | "sessions_spawn")))
-        .then(|| {
-            let scope = self.verified_delegation_scope(context)?;
-            let (issued, parent) = scope.gate_inputs();
-            // Retain the accounting owner before the parent model can spend.
-            let allowance = context
-                .runtime()
-                .issue_recursive_allowance(proof)
-                .context("ordinary parent budget owner missing")?;
-            let authority = crate::runtime::child_source::ParentAuthority::for_run(
-                proof.run_id(),
-                parent.allowed.clone(),
-                parent.authority.clone(),
-                parent.catalog_generation,
-                Arc::clone(&parent.key),
-                allowance,
-            );
-            OrdinaryChildPublication::capture(
-                self,
-                context,
-                proof,
-                authority,
-                &issued.allowed.iter().cloned().collect::<Vec<_>>(),
-            )
-        })
-        .transpose()?;
-        let delegation_bound = specs
+        execution_context.ordinary_child_publication = specs
             .iter()
-            .any(|spec| matches!(spec.name.as_str(), "delegate" | "sessions_spawn"));
-        execution_context.child_grant = if delegation_bound && self.generation.effective.causal_tree.enabled {
-            Some(self.issue_child_grant(proof, context)?)
-        } else if delegation_bound {
-            {
-                anyhow::ensure!(
-                    execution_context.ordinary_child_publication.is_some(),
-                    "ordinary delegation execution lacks its parent publication"
+            .any(|spec| matches!(spec.name.as_str(), "delegate" | "sessions_spawn"))
+            .then(|| {
+                let scope = self.verified_delegation_scope(context)?;
+                let (issued, parent) = scope.gate_inputs();
+                // Retain the accounting owner before the parent model can spend.
+                let allowance = context
+                    .runtime()
+                    .issue_recursive_allowance(proof)
+                    .context("ordinary parent budget owner missing")?;
+                let authority = crate::runtime::child_source::ParentAuthority::for_run(
+                    proof.run_id(),
+                    parent.allowed.clone(),
+                    parent.authority.clone(),
+                    parent.catalog_generation,
+                    Arc::clone(&parent.key),
+                    allowance,
                 );
-            }
-            None
-        } else {
-            None
-        };
+                OrdinaryChildPublication::capture(
+                    self,
+                    context,
+                    proof,
+                    authority,
+                    &issued.allowed.iter().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .transpose()?;
         if execution_context.call_budget.is_none() {
             execution_context.call_budget = Some(
                 crate::agent::send_admission::call_token_budget(self, context, proof).context("called-tool budget")?,

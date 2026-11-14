@@ -506,7 +506,6 @@ async fn admit_chat_fixture_with_mode(
     let decisions = crate::runtime::turn_publication::build_publication(
         crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
         crate::runtime::turn_publication::PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
             execution: Arc::clone(&service),

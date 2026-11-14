@@ -99,7 +99,6 @@ async fn prepare_scope(
         &generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        None,
         &tracker,
         None,
         crate::runtime::ingress_recovery::PreparedAdvisory::default(),

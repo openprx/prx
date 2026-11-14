@@ -73,8 +73,7 @@ impl OperatorProcessSegments {
                 })
                 .to_string(),
             ),
-            None,
-        )
+)
         .await?;
         self.authority.verify()?;
         super::journal::OperatorSegmentJournal::new(&self.authority)?

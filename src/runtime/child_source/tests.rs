@@ -197,8 +197,7 @@ async fn dispatch(
         .status
 }
 
-async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
-    let workspace = tempfile::tempdir()?;
+async fn ordinary_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> anyhow::Result<()> {
     let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
     let result = cleanup
@@ -288,7 +287,7 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
             // strict child share, in Full as in Supervised; nothing dispatches.
             let allowance = &publication.parent_authority().allowance;
             allowance.money().store(0, Ordering::Release);
-            assert!(allowance.carve_child(1).is_err());
+            assert_eq!(allowance.carve_ordinary_child(1)?.0, 0);
             assert_eq!(calls.load(Ordering::SeqCst), executed);
 
             // Parity: a live executor that drifted from the pinned catalog is
@@ -315,8 +314,7 @@ async fn ordinary_case(level: AutonomyLevel) -> anyhow::Result<()> {
 
 const OPERATOR_TASK: &str = "Add two integers.";
 
-async fn operator_case(level: AutonomyLevel) -> anyhow::Result<()> {
-    let workspace = tempfile::tempdir()?;
+async fn operator_case(level: AutonomyLevel, workspace: &tempfile::TempDir) -> anyhow::Result<()> {
     let mut config = crate::config::Config::default();
     config.workspace_dir = workspace.path().to_owned();
     config.config_path = workspace.path().join("config.toml");
@@ -415,7 +413,6 @@ async fn operator_task_cells(
         scope.clone(),
         OPERATOR_TASK,
         Some("prx-child-operator-task-input".to_owned()),
-        None,
         None,
     )
     .await?;
@@ -524,10 +521,10 @@ async fn operator_task_cells(
     // task or parent allowance funds no child share in Full as in
     // Supervised; nothing dispatches.
     authority.allowance().money().store(0, Ordering::Release);
-    assert!(authority.allowance().carve_child(1).is_err());
+    assert_eq!(authority.allowance().carve_ordinary_child(1)?.0, 0);
     let parent = &authority.publication().parent_authority().allowance;
     parent.money().store(0, Ordering::Release);
-    assert!(parent.carve_child(1).is_err());
+    assert_eq!(parent.carve_ordinary_child(1)?.0, 0);
     assert_eq!(calls.load(Ordering::SeqCst), executed);
 
     // Parity: drift of the live executor refuses the operator source, the
@@ -548,13 +545,70 @@ async fn operator_task_cells(
 #[tokio::test]
 async fn child_publication_survives_without_turn_decision_service() -> anyhow::Result<()> {
     for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
-        ordinary_case(level)
+        ordinary_case(level, &tempfile::tempdir()?)
             .await
             .with_context(|| format!("ordinary child, {level:?}"))?;
-        operator_case(level)
+        operator_case(level, &tempfile::tempdir()?)
             .await
             .with_context(|| format!("operator child, {level:?}"))?;
     }
+    Ok(())
+}
+
+/// P2-R18: every child kind issues through the ordinary or operator
+/// publication with no decision record. Each cell checks that no legacy
+/// decision artifact (`.decision_key`, `decisions.db`, `journal.db`) exists
+/// afterwards, whatever the decision-plane setting, and a pre-strip delegated
+/// manifest no longer decodes.
+#[tokio::test]
+async fn every_child_kind_issues_without_decision_records() -> anyhow::Result<()> {
+    fn assert_no_decision_records(workspace: &std::path::Path, cell: &str) {
+        for relative in [
+            "self/causal_tree/.decision_key",
+            "self/causal_tree/decisions.db",
+            "self/child_authority/journal.db",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(workspace.join(relative)).is_err(),
+                "{cell}: {relative} must not exist"
+            );
+        }
+    }
+    for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+        // sessions_spawn and delegate children of an ordinary parent share
+        // the ordinary child publication (task, process and batch launches
+        // derive from it); operator children use the operator publication.
+        let ordinary = tempfile::tempdir()?;
+        ordinary_case(level, &ordinary)
+            .await
+            .with_context(|| format!("ordinary child, {level:?}"))?;
+        assert_no_decision_records(ordinary.path(), "ordinary child");
+        let operator = tempfile::tempdir()?;
+        operator_case(level, &operator)
+            .await
+            .with_context(|| format!("operator child, {level:?}"))?;
+        assert_no_decision_records(operator.path(), "operator child");
+    }
+    // A pre-strip delegated worker manifest carries retired fields and is
+    // refused at decode (WorkerManifestUnsupported at the snapshot reader).
+    let scratch = tempfile::tempdir()?;
+    let manifest = crate::session_worker::runner::tests::base_manifest(scratch.path(), "capability");
+    for retired in ["child_source", "capability_manifest"] {
+        let mut value = serde_json::to_value(&manifest)?;
+        value
+            .as_object_mut()
+            .context("worker manifest serializes as an object")?
+            .insert(retired.to_owned(), serde_json::json!({}));
+        assert!(
+            serde_json::from_value::<crate::session_worker::protocol::WorkerManifest>(value).is_err(),
+            "a manifest with `{retired}` must not decode"
+        );
+    }
+    assert!(
+        serde_json::from_value::<crate::session_worker::protocol::WorkerManifest>(serde_json::to_value(&manifest)?)
+            .is_ok()
+    );
+    assert_no_decision_records(scratch.path(), "manifest decode");
     Ok(())
 }
 

@@ -152,33 +152,8 @@ pub(super) async fn run_sub_agent_task(
             authority.segments()
         })
         .transpose()?;
-    let mut child_segments = SPAWN_EXECUTION_CONTEXT
-        .try_with(|context| -> anyhow::Result<_> {
-            let Some(grant) = context.incoming_grant.as_ref() else {
-                return Ok(None);
-            };
-            let binding = context
-                .provider_binding
-                .as_ref()
-                .context("child provider binding missing")?;
-            let receipt = context.input_receipt.as_ref().context("child input receipt missing")?;
-            anyhow::ensure!(
-                binding.provider_name() == provider_name && binding.model() == model && receipt.input() == task,
-                "child execution inputs differ from their admitted source"
-            );
-            binding.source_proof(grant, receipt, &provider)?;
-            Ok(Some((
-                Arc::clone(grant),
-                Arc::clone(binding),
-                crate::runtime::child_source::ChildSegmentSequence::new(Arc::clone(grant), Arc::clone(receipt))?,
-            )))
-        })
-        .unwrap_or(Ok(None))?;
     anyhow::ensure!(
-        usize::from(child_segments.is_some())
-            + usize::from(ordinary_segments.is_some())
-            + usize::from(operator_segments.is_some())
-            == 1,
+        usize::from(ordinary_segments.is_some()) + usize::from(operator_segments.is_some()) == 1,
         "task execution requires exactly one admitted source authority"
     );
     let child_usage = SPAWN_EXECUTION_CONTEXT
@@ -186,27 +161,14 @@ pub(super) async fn run_sub_agent_task(
         .ok()
         .flatten();
     anyhow::ensure!(
-        (child_segments.is_none() && ordinary_segments.is_none() && operator_segments.is_none())
-            || child_usage.is_some(),
+        (ordinary_segments.is_none() && operator_segments.is_none()) || child_usage.is_some(),
         "child segment usage owner missing"
     );
-    let child_fabric = child_segments
+    let child_fabric = ordinary_authority
         .as_ref()
-        .map(|(grant, _, _)| grant.source_fabric().clone())
-        .or_else(|| {
-            ordinary_authority
-                .as_ref()
-                .map(|authority| authority.publication().source_fabric())
-        })
+        .map(|authority| authority.publication().source_fabric())
         .or_else(|| operator_authority.as_ref().map(|authority| authority.fabric().clone()));
-    let mut child_source = if let Some((grant, binding, segments)) = child_segments.as_mut() {
-        let receipt = segments
-            .record(child_fabric.as_ref().context("child segment fabric missing")?, task)
-            .await?;
-        let proof = Arc::new(binding.source_proof(grant, &receipt, &provider)?);
-        let execution_context = receipt.execution_context(&proof)?;
-        Some((proof, execution_context))
-    } else if let Some(segments) = ordinary_segments.as_mut() {
+    let mut child_source = if let Some(segments) = ordinary_segments.as_mut() {
         Some(segments.record(task).await?)
     } else if let Some(segments) = operator_segments.as_mut() {
         Some(segments.record(task).await?)
@@ -217,32 +179,16 @@ pub(super) async fn run_sub_agent_task(
     // terminal lifecycle. No direct provider path can bypass admission.
     let tools_registry = tools.unwrap_or_else(|| Arc::new(Vec::new()));
 
-    let child_config = child_segments
+    let child_config = ordinary_authority
         .as_ref()
-        .map(|(grant, _, _)| Arc::clone(&grant.generation().effective))
-        .or_else(|| {
-            ordinary_authority
-                .as_ref()
-                .map(|authority| Arc::clone(&authority.publication().generation().effective))
-        })
+        .map(|authority| Arc::clone(&authority.publication().generation().effective))
         .or_else(|| {
             operator_authority
                 .as_ref()
                 .map(|authority| Arc::clone(&authority.generation().effective))
         });
     let mut settled_segment_usage = Vec::new();
-    let child_service = if let Some((grant, _, _)) = child_segments.as_ref() {
-        Some(
-            crate::runtime::turn_publication::ChildDecisionPublication {
-                allowed_tools: None,
-                grant: Arc::clone(grant),
-                registry: Arc::clone(&tools_registry),
-                observer: Arc::new(NoopObserver),
-            }
-            .publish()
-            .await?,
-        )
-    } else if let Some(authority) = &ordinary_authority {
+    let child_service = if let Some(authority) = &ordinary_authority {
         let owner = crate::runtime::turn_cleanup::current_tracker().context("ordinary task cleanup owner missing")?;
         let excluded = SPAWN_EXECUTION_CONTEXT
             .try_with(|context| context.channel_excluded_tools.clone())
@@ -566,15 +512,7 @@ pub(super) async fn run_sub_agent_task(
                         // state set by a concurrent kill / timeout.
                         restore_running().await;
                         let segment_input = steering_instruction(&steer_msg);
-                        if let Some((grant, binding, segments)) = child_segments.as_mut() {
-                            let receipt = segments.record(
-                                child_fabric.as_ref().context("child segment fabric missing")?,
-                                &segment_input,
-                            ).await?;
-                            let proof = Arc::new(binding.source_proof(grant, &receipt, &provider)?);
-                            let execution_context = receipt.execution_context(&proof)?;
-                            child_source = Some((proof, execution_context));
-                        } else if let Some(segments) = ordinary_segments.as_mut() {
+                        if let Some(segments) = ordinary_segments.as_mut() {
                             child_source = Some(segments.record(&segment_input).await?);
                         } else if let Some(segments) = operator_segments.as_mut() {
                             child_source = Some(segments.record(&segment_input).await?);

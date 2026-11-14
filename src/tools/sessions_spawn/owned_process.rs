@@ -174,7 +174,6 @@ pub(super) enum ProcessWorkerOutcome {
         usage: process_terminal::RecoveredWorkerUsage,
     },
     Finished(WorkerResult),
-    VerifiedFinished(process_terminal::VerifiedWorkerCompletion),
     OrdinaryVerifiedFinished(process_terminal::ordinary::VerifiedOrdinaryWorkerCompletion),
     OrdinaryInterrupted {
         detail: String,

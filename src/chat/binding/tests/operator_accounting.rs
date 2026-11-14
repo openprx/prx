@@ -215,7 +215,6 @@ async fn run_operator_case(process: bool) -> anyhow::Result<()> {
                     task,
                     Some("prx-operator-task-input".to_owned()),
                     None,
-                    None,
                 )
                 .await?;
                 assert!(
@@ -354,8 +353,6 @@ async fn restore_operator_process(
     let workspace = &config.workspace_dir;
     let mut manifest = crate::session_worker::protocol::WorkerManifest {
         parent_capability: None,
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: scope

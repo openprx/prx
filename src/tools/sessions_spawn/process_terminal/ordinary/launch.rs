@@ -1,5 +1,5 @@
 //! Minimal ordinary launch provenance; contains no executable worker manifest.
-use super::super::launch::process_identity;
+use super::super::process_identity;
 use super::{
     CompletionLineage, Context, MemoryFabric, MessageEvent, MessageEventSource, RecoveredWorkerUsage,
     VerifiedOrdinaryWorkerCompletion, WorkerManifest, authenticate_launch, recover_journal, verify_lineage,

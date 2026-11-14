@@ -79,7 +79,6 @@ async fn service_builtin_allocation_diagnostic_holds_candidate_count_fixed() {
         let service = build_publication(
             TurnSurfaceKind::AgentLoop,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution,
@@ -204,7 +203,6 @@ async fn enabled_service_allocation_diagnostic_holds_candidate_count_fixed() {
         let service = build_publication(
             TurnSurfaceKind::AgentLoop,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution,

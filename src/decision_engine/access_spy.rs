@@ -15,7 +15,6 @@ pub(crate) struct AccessCounts {
     pub factory: AtomicUsize,
     pub constructor: AtomicUsize,
     pub backend_slots: AtomicUsize,
-    pub delegation_storage: AtomicUsize,
 }
 static SPIES: LazyLock<Mutex<HashMap<PathBuf, Weak<AccessCounts>>>> = LazyLock::new(Default::default);
 pub(crate) struct AccessSpy {
@@ -92,8 +91,4 @@ fn bump(workspace: &Path, counter: impl FnOnce(&AccessCounts) -> &AtomicUsize) {
 
 pub(crate) fn record_backend_slot(workspace: &Path) {
     bump(workspace, |counts| &counts.backend_slots);
-}
-
-pub(crate) fn record_delegation_storage(workspace: &Path) {
-    bump(workspace, |counts| &counts.delegation_storage);
 }

@@ -2,7 +2,7 @@ use super::capability::{AuthenticatedWorkerTransport, authenticate_worker_capabi
 use super::paths::{
     ensure_child_path, ensure_clean_path, ensure_relative_clean_path, normalized_worker_memory_strategy,
 };
-use crate::session_worker::protocol::WorkerManifest;
+use crate::session_worker::protocol::{WorkerManifest, WorkerManifestUnsupported};
 use anyhow::{Context, Result};
 use std::path::{Component, Path};
 
@@ -11,13 +11,12 @@ pub(super) fn validate_worker_manifest_with_capability_env(
     env_capability: Option<&str>,
 ) -> Result<AuthenticatedWorkerTransport> {
     let transport = authenticate_worker_capability_with_env(manifest, env_capability)?;
-    anyhow::ensure!(
-        manifest.operator_source.is_none()
-            || (manifest.ordinary_source.is_none()
-                && manifest.child_source.is_none()
-                && manifest.capability_manifest.is_none()),
-        "session-worker cannot mix operator and delegated source authority"
-    );
+    // Exactly one source: the ordinary/operator publication is the only
+    // child issuance path (P2-R17). Pre-strip delegated manifests carry
+    // unknown fields and fail to decode before reaching this check.
+    if manifest.ordinary_source.is_some() == manifest.operator_source.is_some() {
+        return Err(WorkerManifestUnsupported.into());
+    }
     if let Some(source) = &manifest.operator_source {
         let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
             &transport.key,
@@ -42,49 +41,6 @@ pub(super) fn validate_worker_manifest_with_capability_env(
         )?;
         crate::runtime::child_source::parent::ParentSource::restore_operator_process(manifest, &publication, &key)?;
     }
-    anyhow::ensure!(
-        manifest.ordinary_source.is_none()
-            || (manifest.capability_manifest.is_none() && manifest.child_source.is_none()),
-        "session-worker cannot mix ordinary and durable source authority"
-    );
-
-    // The outer HMAC authenticates transport only. Inner capability seal,
-    // durable parent/source lookup and executor parity are admission's job.
-    match (&manifest.capability_manifest, &manifest.child_source) {
-        (None, None) => {}
-        (Some(capabilities), Some(source)) => {
-            let parent = crate::security::decision_id::DecisionId::parse(&capabilities.parent_decision_id)
-                .context("session-worker parent decision id is malformed")?;
-            anyhow::ensure!(
-                parent.to_string() == capabilities.parent_decision_id
-                    && manifest.owner_id.as_deref() == Some(capabilities.owner.as_str())
-                    && !capabilities.owner.is_empty()
-                    && capabilities.workspace == source.parent_constraints.workspace
-                    && !source.parent_store_workspace.is_empty()
-                    && source.parent_decision_digest.len() == 64
-                    && source
-                        .parent_decision_digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit())
-                    && !source.input_event_id.is_empty()
-                    && source.input_event_id.len() <= 256
-                    && !source.input_event_id.chars().any(char::is_control)
-                    && manifest
-                        .parent_run_id
-                        .as_deref()
-                        .is_some_and(|id| !id.is_empty() && id != manifest.run_id)
-                    && !manifest.session_scope_key.is_empty()
-                    && manifest.runtime_config_generation_id.is_some()
-                    && manifest
-                        .runtime_config_source_revision
-                        .as_deref()
-                        .is_some_and(|revision| !revision.is_empty()),
-                "session-worker child source transport is inconsistent"
-            );
-        }
-        _ => anyhow::bail!("session-worker child authority and source must be supplied together"),
-    }
-
     let run_id = manifest.run_id.trim();
     if run_id.is_empty()
         || run_id.contains('/')

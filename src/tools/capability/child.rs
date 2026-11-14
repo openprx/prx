@@ -30,19 +30,6 @@ impl ParentAuthorityId {
     fn parse(text: &str) -> Result<Self, uuid::Error> {
         uuid::Uuid::parse_str(text).map(Self)
     }
-
-    /// The authority UUID. Process binders and journals use this identity
-    /// directly; it is never printed and parsed back as a decision id.
-    pub(crate) const fn as_uuid(self) -> uuid::Uuid {
-        self.0
-    }
-
-    /// The only conversion from parent authority to a decision id. It is for
-    /// decision-store grant lookups; the authority identity itself stays a
-    /// `ParentAuthorityId` everywhere else.
-    pub(crate) const fn decision_grant_id(self) -> DecisionId {
-        DecisionId::from_uuid(self.as_uuid())
-    }
 }
 
 impl From<DecisionId> for ParentAuthorityId {
@@ -224,54 +211,6 @@ pub(crate) enum ChildManifestError {
 }
 
 impl ChildCapabilityManifest {
-    /// The caller has an explicit operator-permitted spawn request. This is a
-    /// new child of the retained parent, never an expansion of an incoming child.
-    pub(crate) fn for_recursive_spawn(
-        parent: &CapabilityConstraints,
-        requested: &[CapabilityRef],
-        provider: &str,
-        model: &str,
-        max_depth: u8,
-    ) -> Result<Self, ChildManifestError> {
-        if max_depth == 0 {
-            return Err(ChildManifestError::DepthExhausted);
-        }
-        if provider.trim().is_empty() || model.trim().is_empty() {
-            return Err(ChildManifestError::InvalidTransport);
-        }
-        let mut manifest = Self::derive_strict_subset(parent, requested)?;
-        manifest.authority.remaining_depth = manifest.authority.remaining_depth.min(max_depth);
-        if manifest.authority.remaining_depth == 0 {
-            return Err(ChildManifestError::DepthExhausted);
-        }
-        manifest.authority.delegation = Some(Arc::new(wire::WorkerDelegationAuthority {
-            requested: true,
-            provider: provider.to_owned(),
-            model: model.to_owned(),
-        }));
-        manifest.seal = manifest.compute_seal(&parent.key);
-        manifest.verify(parent)?;
-        Ok(manifest)
-    }
-
-    /// Process transport may remove unavailable backends from this same child.
-    /// Preserve the issued model pins and depth ceiling while narrowing its set.
-    pub(crate) fn narrow_allowed(
-        &self,
-        parent: &CapabilityConstraints,
-        requested: &[CapabilityRef],
-    ) -> Result<Self, ChildManifestError> {
-        self.verify(parent)?;
-        if requested.iter().any(|reference| !self.allowed.contains(reference)) {
-            return Err(ChildManifestError::NotStrictSubset);
-        }
-        let mut manifest = self.clone();
-        manifest.allowed = requested.iter().cloned().collect();
-        manifest.seal = manifest.compute_seal(&parent.key);
-        manifest.verify(parent)?;
-        Ok(manifest)
-    }
-
     pub(crate) fn derive_strict_subset(
         parent: &CapabilityConstraints,
         requested: &[CapabilityRef],

@@ -498,11 +498,8 @@ impl SessionsSpawnTool {
             }
         }
 
-        delegation::validate_batch(&member_args, crate::runtime::child_source::outgoing_grant().as_deref())?;
-        let prepared = if let Some(grant) = crate::runtime::child_source::outgoing_grant() {
-            let fabric = grant.source_fabric().clone();
-            Some(batch_journal::PreparedBatch::prepare(fabric, &grant, &batch_id, &member_args).await?)
-        } else if let Some(caller) = crate::tools::execution::current_child_call_context() {
+        delegation::validate_batch(&member_args)?;
+        let prepared = if let Some(caller) = crate::tools::execution::current_child_call_context() {
             caller.verify_tool("sessions_spawn")?;
             if let Some(publication) = caller.context().ordinary_child_publication.as_ref() {
                 batch_journal::PreparedBatch::prepare_ordinary(publication, caller.context(), &batch_id, &member_args)
@@ -651,7 +648,6 @@ impl SessionsSpawnTool {
                     std::path::Path::new(fabric.workspace_id()),
                     batch_id,
                     owner_scope,
-                    None,
                 )
                 .await?
             } else {

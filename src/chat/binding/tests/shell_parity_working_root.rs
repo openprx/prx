@@ -318,8 +318,8 @@ async fn root_pwd(override_root: bool) -> anyhow::Result<()> {
             let (execution, bound) =
                 publication.bind_agent_execution(proof.as_ref(), &context, &original, &spawn_spec)?;
             anyhow::ensure!(
-                bound.child_grant.is_some(),
-                "test: real parent-issued child grant required"
+                bound.ordinary_child_publication.is_some(),
+                "test: real parent-issued ordinary child publication required"
             );
             let spawn_context = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
                 proof.run_id().to_owned(),

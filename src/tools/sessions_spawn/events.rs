@@ -42,7 +42,6 @@ pub(super) async fn record_spawn_request_event(
     mode: &str,
     selection: (&str, &str),
     lineage: &SpawnLineage,
-    grant: Option<&crate::runtime::child_source::IssuedChildGrant>,
 ) -> anyhow::Result<Option<Arc<crate::runtime::child_source::ChildInputReceipt>>> {
     let Some(fabric) = fabric else {
         return Ok(None);
@@ -62,10 +61,8 @@ pub(super) async fn record_spawn_request_event(
         "parent_task_id": lineage.parent_task_id,
         "source_message_event_id": lineage.source_message_event_id
     });
-    delegation::append_metadata(&mut metadata, grant)?;
     let receipt =
-        crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string()), grant)
-            .await?;
+        crate::runtime::child_source::record_child_input(fabric, scope, task, None, Some(metadata.to_string())).await?;
     delegation::append_task(&mut metadata, task)?;
     if let Err(error) = fabric
         .record_task_event(task_event_scope, task_id, "task.spawned", Some(metadata.to_string()))

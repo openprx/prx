@@ -171,7 +171,6 @@ impl TurnDecisionPublication {
         let service = build_publication(
             surface,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&config_generation),
                 registry: Arc::clone(registry),
                 execution,
@@ -212,75 +211,6 @@ impl TurnDecisionPublication {
     }
 }
 
-/// A child publishes its own executable registry against the parent's sealed
-/// catalog. No MCP refresh or auxiliary catalog enumeration occurs here.
-pub(crate) struct ChildDecisionPublication {
-    pub(crate) allowed_tools: Option<std::collections::BTreeSet<String>>,
-    pub(crate) grant: Arc<super::child_source::IssuedChildGrant>,
-    pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
-    pub(crate) observer: Arc<dyn crate::observability::Observer>,
-}
-
-impl ChildDecisionPublication {
-    pub(crate) async fn publish(self) -> Result<Arc<super::turn_decision::TurnDecisionService>> {
-        let owner = super::turn_cleanup::current_tracker()
-            .ok_or_else(|| anyhow::anyhow!("child decision publication requires a cleanup owner"))?;
-        let generation = Arc::clone(self.grant.generation());
-        let config = &generation.effective;
-        let security = Arc::clone(self.grant.security());
-        let memory = self.grant.source_fabric().memory();
-        let execution = Arc::new(
-            tools::ToolExecutionService::from_shared_boxed_registry(
-                Arc::clone(&self.registry),
-                Arc::new(tools::SecurityEffectPolicy::new(Arc::clone(&security))),
-                Arc::new(tools::DenyApprovalStrategy),
-                Arc::new(tools::AdapterOwnedPreparation),
-                Arc::new(tools::TracingToolExecutionAudit),
-            )
-            .with_idempotency_memory(Arc::clone(&memory)),
-        );
-        let surface_policy = crate::tools::capability::catalog::SurfacePolicy {
-            allowed_tools: self.allowed_tools,
-            excluded_names: config.tool_tiering.always_exclude.iter().cloned().collect(),
-            direct_names: direct_tool_names(&config.tool_tiering),
-            channel_allowed: false,
-        };
-        let events = Arc::new(crate::observability::causal_event::ObserverCausalSink::new(
-            self.observer,
-        ));
-        let service = build_publication(
-            crate::tools::capability::turn_state::TurnSurfaceKind::Worker,
-            PublicationInputs {
-                parent_grant: Some(Arc::clone(&self.grant)),
-                generation: Arc::clone(&generation),
-                registry: self.registry,
-                execution,
-                // Inheritance uses the exact parent catalog; these sources
-                // carry only the generation check and are never rebuilt.
-                catalog_sources: crate::tools::capability::catalog::CatalogSources {
-                    config_generation_id: generation.id.0.to_string(),
-                    ..Default::default()
-                },
-                surface_policy,
-                provider_catalog: self.grant.provider_catalog(),
-                transports: &crate::decision_engine::prediction::compatible_http::HttpDecisionTransports,
-                events,
-                memory,
-                security,
-            },
-        )
-        .await?;
-        if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
-            service
-                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
-                .await;
-            return Err(error);
-        }
-        super::control_ladder::report_decision_service_status(&service);
-        Ok(service)
-    }
-}
-
 /// Publish an ordinary process against its restored catalog and the actual
 /// local executor. The driver separately owns its authority lifetime guard.
 pub(crate) struct OrdinaryProcessDecisionPublication {
@@ -314,7 +244,6 @@ impl OrdinaryProcessDecisionPublication {
         let service = ordinary_process::ordinary_process_publication(
             Arc::clone(&self.authority),
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry: self.registry,
                 execution,
@@ -374,7 +303,6 @@ impl OperatorProcessDecisionPublication {
         let service = operator_process::operator_process_publication(
             Arc::clone(&self.authority),
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry: self.registry,
                 execution,

@@ -148,28 +148,6 @@ async fn a_route_with_its_own_key_still_presents_it() {
     assert!(!probe.saw(ROOT_SENTINEL) && !probe.saw(ROTATION_SENTINEL));
 }
 
-#[test]
-fn rotation_keys_follow_the_root_connection() {
-    let reliability = rotating_reliability();
-
-    let released = configured_connection_for("OpenAI", "openai", Some(ROOT_SENTINEL), None);
-    let scoped = scoped_reliability(&reliability, &released);
-    assert!(released.released);
-    assert!(matches!(scoped, std::borrow::Cow::Borrowed(_)));
-    assert_eq!(scoped.api_keys, vec![ROTATION_SENTINEL.to_string()]);
-
-    let withheld = configured_connection_for("custom:http://127.0.0.1:9/v1", "openai", Some(ROOT_SENTINEL), None);
-    let scoped = scoped_reliability(&reliability, &withheld);
-    assert!(!withheld.released);
-    assert!(
-        scoped.api_keys.is_empty(),
-        "a withheld connection carries no rotation keys"
-    );
-    assert_eq!(scoped.provider_retries, reliability.provider_retries);
-    assert_eq!(scoped.provider_backoff_ms, reliability.provider_backoff_ms);
-    assert_eq!(scoped.fallback_providers, reliability.fallback_providers);
-}
-
 /// The factory-level shape of P0-B: a withheld connection plus the scoped
 /// reliability sends neither the root key nor a rotation key.
 #[tokio::test]

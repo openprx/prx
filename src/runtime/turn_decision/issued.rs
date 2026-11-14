@@ -95,22 +95,12 @@ impl TurnDecisionService {
             })
         });
         if admits_delegation {
-            if self.generation.effective.causal_tree.enabled {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return Err(AgentDecisionError::Cancelled),
-                    verified = self.validate_delegation_storage(Arc::clone(&context)) => {
-                        verified.map_err(AgentDecisionError::DelegationStorage)?;
-                    }
-                }
-            } else {
-                self.loop_runtime
-                    .as_ref()
-                    .context("ordinary delegation runtime missing")
-                    .map_err(AgentDecisionError::DelegationScope)?;
-                self.verified_delegation_scope(&context)
-                    .map_err(AgentDecisionError::DelegationScope)?;
-            }
+            self.loop_runtime
+                .as_ref()
+                .context("ordinary delegation runtime missing")
+                .map_err(AgentDecisionError::DelegationScope)?;
+            self.verified_delegation_scope(&context)
+                .map_err(AgentDecisionError::DelegationScope)?;
             if cancellation.is_cancelled() {
                 return Err(AgentDecisionError::Cancelled);
             }

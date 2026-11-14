@@ -20,8 +20,7 @@ pub(super) fn ordinary_process_publication(
     authority.verify()?;
     let snapshots = authority.snapshots();
     anyhow::ensure!(
-        build.parent_grant.is_none()
-            && Arc::ptr_eq(&build.generation, &snapshots.generation)
+        Arc::ptr_eq(&build.generation, &snapshots.generation)
             && Arc::ptr_eq(&build.memory, &authority.source_fabric().memory())
             && build.catalog_sources.config_generation_id == snapshots.generation.id.0.to_string(),
         "ordinary worker service differs from restored source"
@@ -67,7 +66,6 @@ pub(super) fn ordinary_process_publication(
             Some(Arc::new(std::sync::atomic::AtomicU64::new(
                 u64::from(child.authority.max_cost_cents) * 10_000,
             ))),
-            None,
             &snapshots.generation.effective,
             &build.security,
         )),

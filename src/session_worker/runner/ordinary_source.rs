@@ -18,10 +18,7 @@ pub(super) fn restore(
         .as_ref()
         .context("ordinary worker source missing")?;
     anyhow::ensure!(
-        !config.causal_tree.enabled
-            && manifest.child_source.is_none()
-            && manifest.capability_manifest.is_none()
-            && !manifest.run_id.is_empty()
+        !manifest.run_id.is_empty()
             && !manifest.session_scope_key.is_empty()
             && manifest.runtime_config_generation_id == Some(source.config_generation.id.0)
             && manifest.runtime_config_source_revision.as_deref()

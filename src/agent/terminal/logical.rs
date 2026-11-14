@@ -13,17 +13,6 @@ pub(crate) struct LogicalTaskTerminalRef {
 }
 
 impl LogicalTaskTerminalRef {
-    pub(crate) fn granted(
-        grant: &crate::runtime::child_source::IssuedChildGrant,
-        input: &crate::runtime::child_source::ChildInputReceipt,
-        scope: &MessageEventScope,
-    ) -> anyhow::Result<Self> {
-        grant.verify_receipt(input)?;
-        input.verify_backend(&grant.source_fabric().memory())?;
-        verify_event_scope(input.event(), scope)?;
-        Self::issued(grant.source_fabric().clone(), scope.clone())
-    }
-
     pub(crate) fn ordinary(
         authority: &crate::runtime::child_source::ordinary_task::OrdinaryTaskAuthority,
     ) -> anyhow::Result<Self> {

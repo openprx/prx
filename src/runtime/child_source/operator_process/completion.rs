@@ -13,9 +13,7 @@ impl OperatorProcessAuthority {
     ) -> anyhow::Result<()> {
         self.verify()?;
         anyhow::ensure!(
-            result.completion_evidence.is_none()
-                && result.ordinary_completion.is_none()
-                && result.operator_completion.is_none(),
+            result.ordinary_completion.is_none() && result.operator_completion.is_none(),
             "operator result already has completion evidence"
         );
         let scope = self.logical_scope();

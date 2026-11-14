@@ -428,82 +428,9 @@ impl PreparedReplay {
         anyhow::ensure!(!hops.is_empty() && hops.len() <= 5, "invalid decision replay chain");
         let (recorded_directive, fixed_close) =
             last_recorded.context("decision replay chain has no recorded directive")?;
-        let parent = if let Some(grant) = &commit.binding.parent_grant {
-            let parent_id = grant.scope().gate_inputs().0.parent_authority_id.decision_grant_id();
-            let (store_workspace, expected_digest) = grant.parent_record_binding();
-            let row = if REPLAY_EVIDENCE_AUTHORITY {
-                read_journal_replay_record(
-                    &recorded.workspace_dir,
-                    &recorded.key,
-                    &recorded.store_workspace_id,
-                    owner,
-                    &parent_id,
-                )
-                .await?
-                .context("parent decision replay row is missing")?
-            } else {
-                recorded
-                    .reader
-                    .replay_record(&scope, &parent_id)?
-                    .context("parent decision replay row is missing")?
-            };
-            let proof = grant.parent();
-            anyhow::ensure!(
-                store_workspace == recorded.store_workspace_id.as_ref()
-                    && row.digest == expected_digest
-                    && row.decision.admits_issued_child()
-                    && row.decision.run_id.as_deref() == Some(proof.run_id())
-                    && row.decision.session_key.as_deref() == Some(proof.session_key())
-                    && row.source_event_id.as_deref() == proof.source_event_id()
-                    && proof.owner_id() == owner
-                    && proof.workspace_id() == trusted.workspace_id.as_ref(),
-                "parent decision differs from issued child authority"
-            );
-            let parent_source = commit
-                .binding
-                .memory
-                .find_owned_message_event(
-                    &trusted.workspace_id,
-                    owner,
-                    proof.source_event_id().context("parent source identity missing")?,
-                )
-                .await?
-                .context("parent source event missing")?;
-            anyhow::ensure!(
-                parent_source.id > 0
-                    && Some(parent_source.event_id.as_str()) == proof.source_event_id()
-                    && parent_source.workspace_id == trusted.workspace_id.as_ref()
-                    && parent_source.owner_id.as_deref() == Some(owner)
-                    && parent_source.role == "user"
-                    && parent_source.event_type == "message.created"
-                    && source.parent_run_id.as_deref() == Some(proof.spawn_run_id())
-                    && (proof.spawn_run_id() == proof.run_id()
-                        || crate::runtime::child_source::parent::matches_parent_task_segment(
-                            proof.spawn_run_id(),
-                            &row,
-                            &parent_source,
-                        ))
-                    && source.parent_session_key == parent_source.session_key
-                    && source.causation_event_id.as_deref() == Some(parent_source.event_id.as_str())
-                    && source.run_id != parent_source.run_id
-                    && parent_source.run_id.as_deref() == Some(proof.run_id())
-                    && parent_source.session_key.as_deref() == Some(proof.session_key())
-                    && crate::runtime::turn_source::recorded_input_matches(
-                        proof.surface(),
-                        &parent_source,
-                        proof.routing_input()
-                    ),
-                "parent source differs from issued child authority"
-            );
-            Some(ReplayParent {
-                decision_id: parent_id.to_string(),
-                digest: row.digest,
-                source: event_binding(&recorded.key, SOURCE_DOMAIN, &parent_source)?,
-                task_run_id: (proof.spawn_run_id() != proof.run_id()).then(|| proof.spawn_run_id().to_owned()),
-            })
-        } else {
-            None
-        };
+        // Delegated child issuance is removed (P2-G4): no replay names a
+        // parent decision.
+        let parent: Option<ReplayParent> = None;
         let operator = operator::prepare(link, &commit.binding, &source, trusted.task_id.as_deref()).await?;
         // Historical approval collection and resume claims are retired: a
         // new terminal never binds either receipt.

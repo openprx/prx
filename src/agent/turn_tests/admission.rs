@@ -684,7 +684,6 @@ impl AdmittedTurn {
         let mut service = build_publication(
             surface,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution: Arc::clone(&execution),

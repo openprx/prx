@@ -1045,12 +1045,10 @@ enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
     DecisionBatch(Box<[DecisionRecord]>),
 
-    ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
     Drain(std::sync::mpsc::Sender<()>),
 }
 
-mod acknowledged;
 mod batching;
 mod shared;
 
@@ -1966,13 +1964,6 @@ impl CausalDecisionStore {
         Arc::new(store)
     }
 
-    /// Borrow an existing writable store without creating or upgrading it.
-    pub(crate) fn existing_shared_writer(workspace_dir: &Path) -> Option<Arc<Self>> {
-        // Recovery may borrow an already owned writer, but must not create,
-        // migrate, repair or upgrade storage merely to replay a terminal.
-        shared::existing_writer(workspace_dir)
-    }
-
     /// The store of `workspace_dir`, shared by the process: a second open of
     /// the same database returns the first store while it lives. A
     /// read-write request replaces a read-only store.
@@ -2613,7 +2604,6 @@ fn run_writer(mut thread: WriterThread) {
         match command {
             WriterMessage::DecisionBatch(records) => thread.write_ready_decisions(records, &mut pending),
 
-            WriterMessage::ReplayChain(read) => read.finish(&mut thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
             WriterMessage::Drain(done) => {

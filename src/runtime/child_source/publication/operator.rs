@@ -220,11 +220,9 @@ impl OperatorChildPublication {
             runtime: Arc::new(crate::runtime::turn_context::TurnRuntimeHolder::new(
                 Arc::new(crate::runtime::ingress_recovery::RecoveryScope {
                     surface: TurnSurfaceKind::Worker,
-                    parent_authority_id: None,
                     ..parent.runtime.recovery_scope().as_ref().clone()
                 }),
                 Some(task.allowance().money()),
-                None,
                 &parent.generation.effective,
                 &parent.security,
             )),

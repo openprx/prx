@@ -175,7 +175,6 @@ async fn prepare_recovery(
         generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        None,
         tracker,
         workspace_key,
         advisory,

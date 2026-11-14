@@ -138,11 +138,10 @@ async fn rejoin_restart_cell(cell: &RestartCell) -> anyhow::Result<()> {
         &generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        None,
         &tracker,
         None,
         crate::runtime::ingress_recovery::PreparedAdvisory::default(),
-    )
+)
     .await?;
     recovery.rejoin_terminal(&cell.terminal_id, &cell.owner).await.map(|_| ())
 }

@@ -5,11 +5,11 @@ use super::capability::{
 };
 use super::context::{
     boxed_worker_segments, load_worker_shared_context, record_hybrid_worker_draft_if_needed,
-    with_manifest_spawn_context, worker_lineage_payload, worker_message_event_scope,
+    with_manifest_spawn_context, worker_message_event_scope,
 };
 use super::paths::normalized_worker_memory_strategy;
 use super::prompt::{build_worker_system_prompt, build_worker_system_prompt_with_skills};
-use super::provider::{validate_worker_route, worker_credentials, worker_provider, worker_spawn_tool};
+use super::provider::{worker_credentials, worker_spawn_tool};
 use super::steering::run_segments_with_controls;
 use super::tools::{select_tools_for_manifest, verify_worker_orchestration_tool_names};
 use super::validate::validate_parent_memory_backend;
@@ -18,7 +18,7 @@ use crate::agent::turn_contracts::ScopeContext;
 use crate::agent::turn_engine::run_turn;
 use crate::config::Config;
 use crate::hooks::HookManager;
-use crate::memory::{Memory, MemoryFabric, MessageEventScope};
+use crate::memory::{Memory, MemoryFabric};
 use crate::observability::NoopObserver;
 use crate::providers::{ChatMessage, Provider};
 use crate::runtime;
@@ -82,21 +82,6 @@ pub(super) async fn run_authenticated_manifest(
                 memory_db.display()
             )
         })?;
-    if let Some(completion) = prepared.completion {
-        crate::session_worker::completion::persist(
-            &completion.fabric,
-            completion.scope,
-            &completion.grant,
-            &prepared.result,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "persist worker completion journal in {}",
-                completion.fabric.workspace_id()
-            )
-        })?;
-    }
     if let Some(authority) = prepared.ordinary_completion {
         crate::session_worker::completion::persist_ordinary(&authority, &prepared.result)
             .await
@@ -120,31 +105,19 @@ pub(super) async fn run_authenticated_manifest(
     Ok(prepared.result)
 }
 
-struct PendingWorkerCompletion {
-    fabric: MemoryFabric,
-    scope: MessageEventScope,
-    grant: Arc<crate::runtime::child_source::IssuedChildGrant>,
-}
-
 struct PreparedWorkerResult {
     _operator_lifetime: Option<crate::runtime::child_source::operator_process::OperatorProcessLifetime>,
     operator_completion: Option<Arc<crate::runtime::child_source::operator_process::OperatorProcessAuthority>>,
     _ordinary_lifetime: Option<crate::runtime::child_source::ordinary_process::OrdinaryProcessLifetime>,
     result: WorkerResult,
-    completion: Option<PendingWorkerCompletion>,
     ordinary_completion: Option<Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>>,
 }
 
 fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
-    match (
-        &manifest.child_source,
-        &manifest.ordinary_source,
-        &manifest.operator_source,
-    ) {
-        (Some(source), None, None) => Ok(source.parent_constraints.workspace.as_str()),
-        (None, Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
-        (None, None, Some(source)) => Ok(source.publication.workspace.as_str()),
-        _ => anyhow::bail!("worker source storage requires one authenticated source"),
+    match (&manifest.ordinary_source, &manifest.operator_source) {
+        (Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
+        (None, Some(source)) => Ok(source.publication.workspace.as_str()),
+        _ => Err(crate::session_worker::protocol::WorkerManifestUnsupported.into()),
     }
 }
 
@@ -190,12 +163,6 @@ enum WorkerSegmentSource {
         sequence: tokio::sync::Mutex<crate::runtime::child_source::operator_process::OperatorProcessSegments>,
         authority: Arc<crate::runtime::child_source::operator_process::OperatorProcessAuthority>,
     },
-    Granted {
-        sequence: tokio::sync::Mutex<crate::runtime::child_source::ChildSegmentSequence>,
-        grant: Arc<crate::runtime::child_source::IssuedChildGrant>,
-        binding: Arc<crate::runtime::child_source::ChildProviderBinding>,
-        provider: Arc<dyn Provider>,
-    },
     Ordinary {
         sequence: tokio::sync::Mutex<crate::runtime::child_source::ordinary_process::OrdinaryProcessSegments>,
         authority: Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>,
@@ -217,7 +184,6 @@ struct WorkerChildSegments {
 impl WorkerChildSegments {
     async fn recorded_count(&self) -> u64 {
         match &self.source {
-            WorkerSegmentSource::Granted { sequence, .. } => sequence.lock().await.recorded_count(),
             WorkerSegmentSource::Ordinary { sequence, .. } => sequence.lock().await.recorded_count(),
             WorkerSegmentSource::Operator { sequence, .. } => sequence.lock().await.recorded_count(),
         }
@@ -230,17 +196,6 @@ impl WorkerChildSegments {
         acknowledgement: tokio::sync::oneshot::Receiver<Result<(), String>>,
     ) -> Result<crate::runtime::child_turn::ChildSegmentTurn> {
         let (source, config) = match &self.source {
-            WorkerSegmentSource::Granted {
-                sequence,
-                grant,
-                binding,
-                provider,
-            } => {
-                let receipt = sequence.lock().await.record(&self.fabric, input).await?;
-                let proof = Arc::new(binding.source_proof(grant, &receipt, provider)?);
-                let execution = receipt.execution_context(proof.as_ref())?;
-                ((proof, execution), Arc::clone(&grant.generation().effective))
-            }
             WorkerSegmentSource::Ordinary { sequence, authority } => {
                 authority.verify()?;
                 let source = sequence.lock().await.record(input).await?;
@@ -274,92 +229,6 @@ impl WorkerChildSegments {
         );
         Ok(turn.with_child_cleanup(acknowledgement))
     }
-}
-
-pub(super) struct VerifiedWorkerParent {
-    store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-    scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-    catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
-}
-
-/// Reconstruct the signed scope and inherited catalog. Actual executor parity,
-/// source proof and child terminal ownership remain required before execution.
-pub(super) fn verify_worker_parent_authority(
-    manifest: &WorkerManifest,
-    logical_workspace: &Path,
-) -> Result<Option<VerifiedWorkerParent>> {
-    use crate::runtime::decision_journal::store::{CausalDecisionStore, DecisionScope};
-    use crate::tools::capability::child::{CapabilityConstraints, ChildCapabilityManifest, VerifiedChildScope};
-    anyhow::ensure!(
-        manifest.ordinary_source.is_none() && manifest.operator_source.is_none(),
-        "durable parent verifier rejects non-delegated worker source"
-    );
-    let (wire, source) = match (&manifest.capability_manifest, &manifest.child_source) {
-        (None, None) => return Ok(None),
-        (Some(wire), Some(source)) => (wire, source),
-        _ => anyhow::bail!("session-worker child authority and source must be supplied together"),
-    };
-    anyhow::ensure!(
-        wire.workspace == source.parent_constraints.workspace,
-        "session-worker parent workspace differs from configuration"
-    );
-    anyhow::ensure!(
-        wire.workspace == logical_workspace.to_string_lossy(),
-        "session-worker parent workspace differs from configuration"
-    );
-    let key = crate::security::runtime_key::DecisionKey::load_existing(logical_workspace)?;
-    let parent = CapabilityConstraints::from_worker_constraints(&source.parent_constraints, key)?;
-    let child = ChildCapabilityManifest::from_worker_manifest(wire, &parent)?;
-    let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
-        &source.catalog,
-        &parent.key,
-        parent.catalog_generation,
-    )?;
-    for reference in &parent.allowed {
-        catalog.resolve(std::slice::from_ref(reference))?;
-    }
-    if crate::runtime::child_source::authority_journal::verify(manifest, logical_workspace, &parent.key)? {
-        anyhow::ensure!(
-            manifest.owner_id.as_deref() == Some(parent.authority.owner.as_str()),
-            "worker owner differs from parent authority"
-        );
-        return Ok(Some(VerifiedWorkerParent {
-            store: None,
-            scope: Arc::new(VerifiedChildScope::new(child, &parent)?),
-            catalog,
-        }));
-    }
-    let store = CausalDecisionStore::open_unshared_read_only(logical_workspace);
-    let store_workspace = store.workspace_id().context("worker parent store namespace missing")?;
-    anyhow::ensure!(
-        store_workspace.as_ref() == source.parent_store_workspace,
-        "worker original store namespace differs from configured decision store"
-    );
-    let scope = DecisionScope::Owner {
-        workspace_id: store_workspace,
-        owner_id: Arc::from(parent.authority.owner.as_str()),
-    };
-    let record = store
-        .reader()
-        .replay_record(&scope, &parent.parent_authority_id.decision_grant_id())?
-        .context("session-worker parent decision is unavailable")?;
-    anyhow::ensure!(
-        record.digest == source.parent_decision_digest
-            && record.catalog_generation == parent.catalog_generation.to_hex()
-            && record.decision.enabled_snapshot
-            && !record.decision.legacy_v1
-            && record.decision.admits_issued_child()
-            && source
-                .parent_source
-                .matches_worker_parent_run(manifest, &record.decision)
-            && manifest.owner_id.as_deref() == Some(parent.authority.owner.as_str()),
-        "session-worker parent decision differs from issued authority"
-    );
-    Ok(Some(VerifiedWorkerParent {
-        store: Some(store),
-        scope: Arc::new(VerifiedChildScope::new(child, &parent)?),
-        catalog,
-    }))
 }
 
 fn owned_worker_future(
@@ -409,10 +278,9 @@ async fn run_owned_manifest(
             .is_none_or(|value| value.is_finite() && value.to_bits() == manifest.temperature.to_bits()),
         "worker caller temperature differs from its sealed temperature"
     );
-    anyhow::ensure!(
-        manifest.child_source.is_some() || manifest.ordinary_source.is_some() || manifest.operator_source.is_some(),
-        "worker requires an authenticated decision source"
-    );
+    if manifest.ordinary_source.is_some() == manifest.operator_source.is_some() {
+        return Err(crate::session_worker::protocol::WorkerManifestUnsupported.into());
+    }
     let explicit_config_dir = explicit_config_dir
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -469,15 +337,9 @@ async fn run_owned_manifest(
     // All three sources are covered by the worker transport signature. The
     // effective-config seal below additionally authenticates this override.
     let binding = manifest
-        .child_source
+        .ordinary_source
         .as_ref()
         .map(|source| &source.config_generation)
-        .or_else(|| {
-            manifest
-                .ordinary_source
-                .as_ref()
-                .map(|source| &source.config_generation)
-        })
         .or_else(|| {
             manifest
                 .operator_source
@@ -505,51 +367,15 @@ async fn run_owned_manifest(
     } else {
         None
     };
-    let child_parent = if ordinary_snapshots.is_some() || operator_snapshots.is_some() {
-        None
-    } else {
-        verify_worker_parent_authority(&manifest, &config.workspace_dir)?
-    };
-    let child_generation = match (child_parent.as_ref(), manifest.child_source.as_ref()) {
-        (Some(parent_authority), Some(source)) => {
-            anyhow::ensure!(
-                manifest.runtime_config_generation_id == Some(source.config_generation.id.0)
-                    && manifest.runtime_config_source_revision.as_deref()
-                        == Some(source.config_generation.source_revision.fingerprint_sha256.as_str()),
-                "session-worker configuration binding differs from source lineage"
-            );
-            let (_, parent) = parent_authority.scope.gate_inputs();
-            Some(crate::config::ConfigGeneration::restore_process(
-                config.clone(),
-                &source.config_generation,
-                &parent.key,
-            )?)
-        }
-        (None, None) => None,
-        _ => anyhow::bail!("session-worker verified scope and source binding differ"),
-    };
-    anyhow::ensure!(
-        !config.causal_tree.enabled || child_parent.is_some() || operator_snapshots.is_some(),
-        "decision-enabled session-worker requires authenticated child authority"
-    );
-
-    if child_parent.is_none() && ordinary_snapshots.is_none() && operator_snapshots.is_none() {
-        validate_worker_route(&manifest, &config)?;
-    }
     let configured_memory_backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     validate_parent_memory_backend(&manifest, &configured_memory_backend)?;
     // Read-only skills retain the authenticated parent's catalog location.
     // The worker's private workspace scopes mutable tools, but rebuilding the
     // reader there would lose the signed skill bindings inherited by the child.
-    let source_skill_binding = child_parent
+    let source_skill_binding = ordinary_snapshots
         .as_ref()
         .map(|parent| (&parent.catalog, &parent.scope.gate_inputs().0.allowed))
-        .or_else(|| {
-            ordinary_snapshots
-                .as_ref()
-                .map(|parent| (&parent.catalog, &parent.scope.gate_inputs().0.allowed))
-        })
         .or_else(|| {
             operator_snapshots
                 .as_ref()
@@ -578,18 +404,6 @@ async fn run_owned_manifest(
         };
 
     let credentials = worker_credentials(&manifest, &config);
-    let legacy_provider: Option<Arc<dyn Provider>> =
-        if child_parent.is_none() && ordinary_snapshots.is_none() && operator_snapshots.is_none() {
-            Some(Arc::from(worker_provider(
-                &manifest,
-                &config,
-                &credentials,
-                &provider_runtime_options,
-            )?))
-        } else {
-            None
-        };
-
     let memory: Arc<dyn Memory> = if normalized_worker_memory_strategy(&manifest)? == "shared_fabric" {
         let parent_workspace = manifest
             .memory_workspace_id
@@ -632,9 +446,9 @@ async fn run_owned_manifest(
         .unwrap_or_else(|| manifest.workspace_dir.to_string_lossy().to_string());
     let memory_fabric =
         MemoryFabric::new(memory.clone(), memory_workspace_id).with_event_recording(manifest.memory_event_recording);
-    let decision_fabric = child_generation
+    let decision_fabric = ordinary_snapshots
         .as_ref()
-        .or_else(|| ordinary_snapshots.as_ref().map(|source| &source.generation))
+        .map(|source| &source.generation)
         .or_else(|| operator_snapshots.as_ref().map(|source| &source.generation))
         .map(|generation| worker_decision_fabric(&manifest, generation, &memory_fabric))
         .transpose()?;
@@ -675,151 +489,28 @@ async fn run_owned_manifest(
     let worker_event_scope = operator_authority
         .as_ref()
         .map_or(worker_event_scope, |authority| authority.logical_scope());
-    let source_receipt = if let Some(parent) = child_parent.as_ref() {
-        let source_fabric = decision_fabric.as_ref().context("worker decision storage is missing")?;
-        Some(crate::runtime::child_source::restore_worker_input(source_fabric, &manifest, &parent.scope).await?)
-    } else if ordinary_authority.is_some() || operator_authority.is_some() {
-        // The parent's optional original input was already read back by issuance.
-        None
-    } else {
-        SideEffectGate::new(security.as_ref())
-            .authorize_resource_operation(
-                "session_worker",
-                &format!("session_worker:request_event:{}", manifest.run_id),
-                ResourceRiskLevel::Low,
-                None,
-            )
-            .map_err(anyhow::Error::msg)?;
-        crate::runtime::child_source::record_child_input(
-            &memory_fabric,
-            worker_event_scope.clone(),
-            &manifest.task,
-            Some(format!("session_worker:{}:request", manifest.run_id)),
-            Some(worker_lineage_payload(&manifest).to_string()),
-            None,
-        )
-        .await?
-    };
-
-    let parent_source = if let Some(parent) = child_parent.as_ref() {
-        Some(
-            crate::runtime::child_source::parent::ParentSource::restore_process(
-                &manifest,
-                parent.store.as_deref(),
-                &parent.scope,
-                decision_fabric.as_ref().context("worker decision storage is missing")?,
-                child_generation
-                    .as_deref()
-                    .context("worker child generation is missing")?,
-                source_receipt.as_deref().context("worker child input is missing")?,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    let child_grant = if let Some(provenance) = parent_source {
-        let authority = child_parent.as_ref().context("worker parent authority missing")?;
-        let source = manifest
-            .child_source
-            .as_ref()
-            .context("worker source binding missing")?;
-        let (_, constraints) = authority.scope.gate_inputs();
-        let provider_catalog = crate::providers::catalog::CatalogView::restore_process(
-            &source.provider_catalog,
-            &constraints.key,
-            constraints.parent_authority_id,
-        )?;
-        Some(crate::runtime::child_source::IssuedChildGrant::restore_process(
-            Arc::clone(&authority.scope),
-            provenance,
-            Arc::clone(&authority.catalog),
-            Arc::clone(child_generation.as_ref().context("worker child generation missing")?),
-            provider_catalog,
-            (
-                Arc::from(source.parent_store_workspace.as_str()),
-                source.parent_decision_digest.clone(),
-            ),
-            crate::runtime::child_source::ChildGrantRuntime {
-                recursive_child_claimed: None,
-                decision_store: authority.store.clone(),
-                source_fabric: decision_fabric
-                    .as_ref()
-                    .context("worker logical source fabric missing")?
-                    .clone(),
-                security: Arc::clone(&security),
-                parent_issuer: None,
-            },
-            source_receipt.as_deref().context("worker child input missing")?,
-            &manifest,
-            transport
-                .as_ref()
-                .context("worker execution workspace is not authenticated")?,
-        )?)
-    } else {
-        None
-    };
-
-    // Logical completion belongs to the authenticated original spawn input.
+    // Logical completion belongs to the authenticated source authority.
     // Worker model segments and worker-result events keep their own scope.
-    let logical_task_scope = if child_grant.is_some() {
-        source_receipt
-            .as_deref()
-            .context("worker logical input missing")?
-            .logical_task_scope()
-    } else {
-        worker_event_scope.clone()
-    };
+    let logical_task_scope = worker_event_scope.clone();
 
     // Capture completion-only authority before the driver can be cancelled.
     // Model segment authority remains independently checked per segment.
-    let logical_terminal = match (
-        child_grant.as_deref(),
-        ordinary_authority.as_deref(),
-        operator_authority.as_deref(),
-    ) {
-        (Some(grant), None, None) => crate::agent::terminal::logical::LogicalTaskTerminalRef::granted(
-            grant,
-            source_receipt.as_deref().context("worker logical input missing")?,
-            &logical_task_scope,
-        )?,
-        (None, Some(authority), None) => {
+    let logical_terminal = match (ordinary_authority.as_deref(), operator_authority.as_deref()) {
+        (Some(authority), None) => {
             crate::agent::terminal::logical::LogicalTaskTerminalRef::ordinary_process(authority)?
         }
-        (None, None, Some(authority)) => {
+        (None, Some(authority)) => {
             crate::agent::terminal::logical::LogicalTaskTerminalRef::operator_process(authority)?
         }
         _ => anyhow::bail!("worker logical completion requires one authenticated source authority"),
     };
 
-    let child_provider_binding = child_grant
-        .as_ref()
-        .map(|grant| {
-            crate::runtime::child_source::ChildProviderBinding::build_worker(Arc::clone(grant), &manifest).map(Arc::new)
-        })
-        .transpose()?;
-    let provider: Arc<dyn Provider> = if let Some(binding) = child_provider_binding.as_ref() {
-        binding.provider()
-    } else if let Some(authority) = &operator_authority {
-        authority.binding().provider()
+    let (provider, child_source_proof): (Arc<dyn Provider>, _) = if let Some(authority) = &operator_authority {
+        (authority.binding().provider(), Some(authority.source_proof()?))
     } else if let Some(authority) = &ordinary_authority {
-        authority.binding().provider()
+        (authority.binding().provider(), Some(authority.source_proof()?))
     } else {
-        legacy_provider.context("legacy worker provider missing")?
-    };
-    let child_source_proof = if let Some(binding) = child_provider_binding.as_ref() {
-        Some(binding.source_proof(
-            child_grant.as_deref().context("worker issued grant missing")?,
-            source_receipt.as_deref().context("worker child input missing")?,
-            &provider,
-        )?)
-    } else if let Some(authority) = &operator_authority {
-        Some(authority.source_proof()?)
-    } else if let Some(authority) = &ordinary_authority {
-        Some(authority.source_proof()?)
-    } else {
-        None
+        return Err(crate::session_worker::protocol::WorkerManifestUnsupported.into());
     };
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
@@ -967,18 +658,7 @@ async fn run_owned_manifest(
 
     let tools_registry = select_tools_for_manifest(full_tools, &manifest).await?;
     let _ = spawn_tools_handle.set(&tools_registry);
-    let child_service = if let Some(grant) = child_grant.as_ref() {
-        Some(
-            crate::runtime::turn_publication::ChildDecisionPublication {
-                allowed_tools: None,
-                grant: Arc::clone(grant),
-                registry: Arc::clone(&tools_registry),
-                observer: Arc::new(NoopObserver),
-            }
-            .publish()
-            .await?,
-        )
-    } else if let Some(authority) = &ordinary_authority {
+    let child_service = if let Some(authority) = &ordinary_authority {
         let mut excluded_names: std::collections::BTreeSet<String> =
             config.tool_tiering.always_exclude.iter().cloned().collect();
         excluded_names.extend(manifest.channel_excluded_tools.iter().cloned());
@@ -1053,42 +733,7 @@ async fn run_owned_manifest(
     };
     let provider_started_at = chrono::Utc::now();
 
-    let child_segments = if let Some(grant) = child_grant.as_ref() {
-        Some(Arc::new(WorkerChildSegments {
-            source: WorkerSegmentSource::Granted {
-                sequence: tokio::sync::Mutex::new(crate::runtime::child_source::ChildSegmentSequence::new_worker(
-                    Arc::clone(grant),
-                    Arc::clone(source_receipt.as_ref().context("worker child input missing")?),
-                )?),
-                grant: Arc::clone(grant),
-                binding: Arc::clone(
-                    child_provider_binding
-                        .as_ref()
-                        .context("worker provider binding missing")?,
-                ),
-                provider: Arc::clone(&provider),
-            },
-            service: Arc::clone(child_service.as_ref().context("worker child service missing")?),
-            runtime: Arc::clone(
-                child_service
-                    .as_ref()
-                    .context("worker child service missing")?
-                    .runtime_holder(),
-            ),
-            fabric: decision_fabric
-                .as_ref()
-                .context("worker decision storage missing")?
-                .clone(),
-            owner: crate::runtime::turn_cleanup::current_tracker().context("worker cleanup owner missing")?,
-            completion: ChildCompletionPort {
-                usage: Arc::new(crate::runtime::turn_terminal::TerminalUsageCollector::new(
-                    grant.parent().workspace_id().to_owned(),
-                    grant.parent().owner_id().to_owned(),
-                    manifest.run_id.clone(),
-                )),
-            },
-        }))
-    } else if let Some(authority) = &ordinary_authority {
+    let child_segments = if let Some(authority) = &ordinary_authority {
         Some(Arc::new(WorkerChildSegments {
             source: WorkerSegmentSource::Ordinary {
                 sequence: tokio::sync::Mutex::new(authority.segments()?),
@@ -1414,9 +1059,6 @@ async fn run_owned_manifest(
 
     let run_future = with_manifest_spawn_context(
         &manifest,
-        source_receipt,
-        child_grant.clone(),
-        child_provider_binding.clone(),
         child_segments
             .as_ref()
             .map(|segments| Arc::clone(&segments.completion.usage)),
@@ -1434,7 +1076,6 @@ async fn run_owned_manifest(
             let tokens_used = trace.tokens_used;
             (
                 WorkerResult {
-                    completion_evidence: None,
                     ordinary_completion: None,
                     operator_completion: None,
                     success: true,
@@ -1451,7 +1092,6 @@ async fn run_owned_manifest(
         }
         Err(error) => (
             WorkerResult {
-                completion_evidence: None,
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
@@ -1528,7 +1168,7 @@ async fn run_owned_manifest(
             (if manifest.memory_event_recording.enabled {
                 event.id > 0
             } else {
-                child_grant.is_none() && event.id == 0
+                event.id == 0
             }) && terminal_receipt.terminal_id == manifest.run_id
                 && terminal_receipt.usage_settlement.is_none()
                 && event.workspace_id == terminal_fabric.workspace_id()
@@ -1555,38 +1195,6 @@ async fn run_owned_manifest(
                 "worker logical terminal differs from durable record"
             );
         }
-    }
-
-    if let (Some(segments), Some(grant)) = (child_segments.as_ref(), child_grant.as_ref()) {
-        use sha2::Digest;
-        let (child, constraints) = grant.scope().gate_inputs();
-        let mut evidence = crate::session_worker::protocol::WorkerCompletionEvidence {
-            run_id: manifest.run_id.clone(),
-            input_event_id: manifest
-                .child_source
-                .as_ref()
-                .context("worker child source missing")?
-                .input_event_id
-                .clone(),
-            terminal_event_id: terminal_receipt.terminal_event.event_id.clone(),
-            terminal_event_digest: format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&terminal_receipt.terminal_event)?)
-            ),
-            recorded_segments: segments.recorded_count().await,
-            segments: segments.completion.usage.terminal_references(),
-            seal: [0; 32],
-        };
-        evidence.validate_inventory(worker_result.success)?;
-        evidence.seal = constraints.key.hmac(
-            crate::security::runtime_key::KeyDomain::StateFingerprint,
-            &[
-                b"worker-completion-v1",
-                child.parent_authority_id.to_string().as_bytes(),
-                &evidence.signing_bytes(&worker_result)?,
-            ],
-        );
-        worker_result.completion_evidence = Some(evidence);
     }
 
     if let (Some(segments), Some(authority)) = (child_segments.as_ref(), ordinary_authority.as_ref()) {
@@ -1694,17 +1302,11 @@ async fn run_owned_manifest(
     )
     .await;
 
-    let completion = child_grant.map(|grant| PendingWorkerCompletion {
-        fabric: terminal_fabric.clone(),
-        scope: worker_event_scope,
-        grant,
-    });
     Ok(PreparedWorkerResult {
         _ordinary_lifetime: ordinary_lifetime,
         _operator_lifetime: operator_lifetime,
         operator_completion: operator_authority,
         result: worker_result,
-        completion,
         ordinary_completion: ordinary_authority,
     })
 }

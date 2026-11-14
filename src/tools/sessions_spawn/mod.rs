@@ -108,11 +108,11 @@ use self::terminal_commit::{
 };
 #[cfg(test)]
 use self::test_worker::{
-    TestWorkerExecutable, TestWorkerProtocolDiagnostic, TestWorkerProtocolTerminal, TestWorkerRecoveryResult,
-    TestWorkerRouteObservation, test_worker_cleanup_error_class, test_worker_process_identity,
+    TestWorkerExecutable, TestWorkerProtocolDiagnostic, TestWorkerProtocolTerminal, test_worker_cleanup_error_class,
+    test_worker_process_identity,
 };
 #[cfg(test)]
-pub(crate) use self::test_worker::{TestWorkerProtocolCase, TestWorkerProtocolControl, TestWorkerRouteCapture};
+pub(crate) use self::test_worker::{TestWorkerProtocolCase, TestWorkerProtocolControl};
 use self::tool_proxy::AllowedToolProxy;
 pub(crate) use self::tool_proxy::{refresh_tools_for_explicit_allowlist, resolve_tools_for_agent};
 pub(crate) use self::worker_capability::{SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV};

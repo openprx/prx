@@ -201,16 +201,6 @@ impl Tool for SessionsSpawnTool {
         crate::tools::schema::validate_execution_contract(self.name(), self.execution_schema(), &mut args)?;
         crate::tools::execution::verify_current_child_call("sessions_spawn")?;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
-        if action == "spawn_batch" {
-            anyhow::ensure!(
-                !self
-                    .hint_config
-                    .as_ref()
-                    .is_some_and(|config| config.causal_tree.enabled)
-                    || crate::runtime::child_source::outgoing_grant().is_some(),
-                "decision-enabled spawning requires an issued child grant"
-            );
-        }
         // OWNER-VIS: every run lookup below is confined to the runs this
         // caller's owner started; the local-process operator sees them all. A
         // run outside the scope answers exactly like a missing one.

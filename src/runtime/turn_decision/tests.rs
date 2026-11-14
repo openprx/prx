@@ -1,13 +1,10 @@
 #![cfg(test)]
-mod child_process;
-pub(crate) use child_process::worker_probe::with_manifest as with_worker_probe_manifest;
 mod agent_decision;
 mod catalog_drift;
 mod discovery_surface;
 mod enabled_service;
 mod execution;
 mod recorded_chain;
-mod recursive_budget;
 mod skill_receipts;
 mod terminal_scope;
 
@@ -158,7 +155,6 @@ async fn agent_service_with_memory(
     build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(generation),
             registry,
             execution,

@@ -331,19 +331,6 @@ async fn a_keyless_root_releases_its_rotation_keys_only_to_its_own_identity() {
     let same_child = agent(&root.custom_provider(), None);
     let same = tool.child_connection(&same_child, &root.custom_provider());
     assert!(same.released);
-    assert_eq!(
-        providers::scoped_reliability(&tool.reliability, &same).api_keys,
-        vec![ROTATION_SENTINEL.to_string()]
-    );
-    let other_child = agent(&other.custom_provider(), None);
-    let different = tool.child_connection(&other_child, &other.custom_provider());
-    assert!(!different.released);
-    assert!(
-        providers::scoped_reliability(&tool.reliability, &different)
-            .api_keys
-            .is_empty(),
-        "expected an empty value"
-    );
 
     // On the wire.
     let served = super::tests::dispatch_admitted_delegate(

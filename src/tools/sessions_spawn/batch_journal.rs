@@ -1,12 +1,9 @@
 //! Durable batch membership; no execution authority is reconstructed from it.
 use super::{BatchMember, BatchRoster};
 use crate::memory::{MemoryFabric, MemoryVisibility, MessageEventScope};
-use crate::runtime::child_source::IssuedChildGrant;
-use crate::runtime::child_source::authority_journal::{self, BatchParentRow};
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,15 +35,12 @@ struct OrdinarySource {
 struct Fields {
     version: u8,
     workspace: String,
-    // Omitted for historical envelopes and the ordinary (non-decision) path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    store_workspace: Option<String>,
     owner: String,
     batch: String,
+    // Always empty: kept in the sealed v2 encoding (byte-identical seals).
     parent_decision: String,
     parent_digest: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ordinary_source: Option<OrdinarySource>,
+    ordinary_source: OrdinarySource,
     members: Vec<Member>,
     // None means dispatch did not finish recording. Unknown members remain in
     // the roster; only explicit pre-launch rejections are excluded.
@@ -89,17 +83,16 @@ pub(crate) fn golden_plan_seal(key: &DecisionKey, plan: &GoldenPlan<'_>) -> anyh
     let fields = Fields {
         version: 2,
         workspace: plan.workspace.to_owned(),
-        store_workspace: None,
         owner: plan.owner.to_owned(),
         batch: plan.batch.to_owned(),
         parent_decision: String::new(),
         parent_digest: String::new(),
-        ordinary_source: Some(OrdinarySource {
+        ordinary_source: OrdinarySource {
             parent_run: plan.parent_run.to_owned(),
             parent_session: plan.parent_session.to_owned(),
             config_generation: plan.config_generation,
             config_revision: plan.config_revision.to_owned(),
-        }),
+        },
         members: plan
             .members
             .iter()
@@ -120,62 +113,6 @@ pub(super) struct PreparedBatch {
 }
 
 impl PreparedBatch {
-    pub(super) async fn prepare(
-        fabric: MemoryFabric,
-        grant: &IssuedChildGrant,
-        batch: &str,
-        members: &[(String, serde_json::Value)],
-    ) -> anyhow::Result<Self> {
-        let (scope, constraints) = grant.scope().gate_inputs();
-        anyhow::ensure!(
-            fabric.workspace_id() == scope.authority.workspace,
-            "batch workspace differs from grant"
-        );
-        let issuer = grant.parent_issuer_evidence()?;
-        authority_journal::persist_batch_parent(
-            Path::new(&scope.authority.workspace),
-            &constraints.key,
-            &BatchParentRow {
-                version: authority_journal::BATCH_PARENT_VERSION,
-                batch: batch.to_owned(),
-                owner: scope.authority.owner.clone(),
-                parent_decision: scope.parent_authority_id.to_string(),
-                parent_digest: grant.parent_record_binding().1.to_owned(),
-                store_workspace: grant.parent_record_binding().0.to_owned(),
-                enabled_snapshot: issuer.enabled_snapshot,
-                legacy_v1: issuer.legacy_v1,
-                admits_issued_child: issuer.admits_issued_child,
-            },
-        )?;
-        let fields = Fields {
-            version: authority_journal::BATCH_PARENT_VERSION,
-            workspace: fabric.workspace_id().to_owned(),
-            store_workspace: Some(grant.parent_record_binding().0.to_owned()),
-            owner: scope.authority.owner.clone(),
-            batch: batch.to_owned(),
-            parent_decision: scope.parent_authority_id.to_string(),
-            parent_digest: grant.parent_record_binding().1.to_owned(),
-            ordinary_source: None,
-            members: members
-                .iter()
-                .map(|(run_id, args)| Member {
-                    run_id: run_id.clone(),
-                    task: crate::agent::terminal::redact_persisted_text(
-                        args.get("task").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                    ),
-                })
-                .collect(),
-            dispatched: None,
-        };
-        let prepared = Self {
-            fabric,
-            key: Arc::clone(&constraints.key),
-            fields,
-        };
-        prepared.persist("plan").await?;
-        Ok(prepared)
-    }
-
     pub(super) async fn prepare_ordinary(
         publication: &crate::runtime::child_source::publication::OrdinaryChildPublication,
         caller: &crate::tools::ToolExecutionContext,
@@ -207,12 +144,11 @@ impl PreparedBatch {
         let fields = Fields {
             version: 2,
             workspace: fabric.workspace_id().to_owned(),
-            store_workspace: None,
             owner: caller.envelope.resolved_owner_id(),
             batch: batch.to_owned(),
             parent_decision: String::new(),
             parent_digest: String::new(),
-            ordinary_source: Some(source),
+            ordinary_source: source,
             members: members
                 .iter()
                 .map(|(run_id, args)| Member {
@@ -288,7 +224,6 @@ pub(super) async fn read(
     workspace: &std::path::Path,
     batch: &str,
     owners: &crate::tools::sessions_read_model::RunOwnerScope,
-    expected_parent: Option<(crate::security::decision_id::DecisionId, &str)>,
 ) -> anyhow::Result<Option<BatchRoster>> {
     anyhow::ensure!(
         fabric.workspace_id() == workspace.to_string_lossy(),
@@ -306,44 +241,17 @@ pub(super) async fn read(
         return Ok(None);
     }
     let parsed: Signed = serde_json::from_str(plan.raw_payload_json.as_deref().context("batch payload missing")?)?;
-    let key = if let Some(source) = parsed.fields.ordinary_source.as_ref() {
-        anyhow::ensure!(
-            expected_parent.is_none(),
-            "ordinary batch cannot satisfy a durable parent grant"
-        );
-        DecisionKey::from_worker_channel(
-            &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
-            fabric.workspace_id(),
-            batch,
-            &source.config_revision,
-        )?
-    } else {
-        DecisionKey::load_existing(workspace)?
-    };
+    let key = DecisionKey::from_worker_channel(
+        &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
+        fabric.workspace_id(),
+        batch,
+        &parsed.fields.ordinary_source.config_revision,
+    )?;
     let plan_fields = verify(&plan, fabric.workspace_id(), batch, "plan", &key)?;
     anyhow::ensure!(
         plan_fields.dispatched.is_none(),
         "batch plan contains a dispatch result"
     );
-    if plan_fields.ordinary_source.is_none() {
-        let decision = crate::security::decision_id::DecisionId::parse(&plan_fields.parent_decision)?;
-        if let Some((expected, digest)) = expected_parent {
-            anyhow::ensure!(
-                decision == expected && plan_fields.parent_digest == digest,
-                "batch belongs to another parent decision"
-            );
-        }
-        anyhow::ensure!(
-            decision.to_string() == plan_fields.parent_decision,
-            "batch parent identity is not canonical"
-        );
-        if plan_fields.version == authority_journal::BATCH_PARENT_VERSION {
-            // Version 4 authority comes only from the sealed row; no store read.
-            verify_batch_parent_row(workspace, batch, &plan_fields, &key)?;
-        } else {
-            verify_store_parent(workspace, &plan_fields, decision)?;
-        }
-    }
     let dispatched = if let Some(event) = memory
         .find_owned_message_event_by_idempotency_key(
             fabric.workspace_id(),
@@ -385,69 +293,6 @@ pub(super) async fn read(
     }))
 }
 
-/// Version 4: the parent authority is the sealed row, never the decision store.
-fn verify_batch_parent_row(
-    workspace: &Path,
-    batch: &str,
-    plan_fields: &Fields,
-    key: &DecisionKey,
-) -> anyhow::Result<()> {
-    let row = authority_journal::read_batch_parent(workspace, batch, key)?
-        .context("batch parent authority row is missing")?;
-    let store = plan_fields
-        .store_workspace
-        .as_deref()
-        .context("batch plan lacks its store namespace")?;
-    anyhow::ensure!(
-        row.version == authority_journal::BATCH_PARENT_VERSION
-            && row.batch == batch
-            && row.owner == plan_fields.owner
-            && row.parent_decision == plan_fields.parent_decision
-            && row.parent_digest == plan_fields.parent_digest
-            && row.store_workspace == store
-            && row.enabled_snapshot
-            && !row.legacy_v1
-            && row.admits_issued_child,
-        "batch parent authority differs from signed plan"
-    );
-    Ok(())
-}
-
-/// Version 3 and earlier: the parent must still exist in its original store.
-fn verify_store_parent(
-    workspace: &std::path::Path,
-    plan_fields: &Fields,
-    decision: crate::security::decision_id::DecisionId,
-) -> anyhow::Result<()> {
-    let original_store = plan_fields
-        .store_workspace
-        .as_deref()
-        .filter(|_| plan_fields.version == 3)
-        .context("legacy child batch lacks its original store namespace; membership remains unconfirmed")?;
-    let store = crate::runtime::decision_journal::store::CausalDecisionStore::open_unshared_read_only(workspace);
-    let store_workspace = store.workspace_id().context("batch decision store namespace missing")?;
-    anyhow::ensure!(
-        store_workspace.as_ref() == original_store,
-        "batch original store namespace differs from configured store"
-    );
-    let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
-        workspace_id: store_workspace,
-        owner_id: Arc::from(plan_fields.owner.as_str()),
-    };
-    let parent = store
-        .reader()
-        .replay_record(&scope, &decision)?
-        .context("batch parent decision missing")?;
-    anyhow::ensure!(
-        parent.digest == plan_fields.parent_digest
-            && parent.decision.enabled_snapshot
-            && !parent.decision.legacy_v1
-            && parent.decision.admits_issued_child(),
-        "batch parent differs from signed plan"
-    );
-    Ok(())
-}
-
 fn verify(
     event: &crate::memory::MessageEvent,
     workspace: &str,
@@ -466,17 +311,13 @@ fn verify(
     );
     let fields = signed.fields;
     anyhow::ensure!(
-        (match &fields.ordinary_source {
-            Some(source) =>
-                fields.version == 2
-                    && fields.store_workspace.is_none()
-                    && fields.parent_decision.is_empty()
-                    && fields.parent_digest.is_empty()
-                    && !source.parent_run.is_empty()
-                    && !source.parent_session.is_empty()
-                    && !source.config_revision.is_empty(),
-            None => matches!(fields.version, 1 | 3 | 4),
-        }) && fields.workspace == workspace
+        fields.version == 2
+            && fields.parent_decision.is_empty()
+            && fields.parent_digest.is_empty()
+            && !fields.ordinary_source.parent_run.is_empty()
+            && !fields.ordinary_source.parent_session.is_empty()
+            && !fields.ordinary_source.config_revision.is_empty()
+            && fields.workspace == workspace
             && fields.batch == batch
             && !fields.owner.is_empty()
             && event.id > 0
@@ -522,11 +363,7 @@ pub(super) async fn verify_ordinary_member(
             .as_deref()
             .context("ordinary batch payload missing")?,
     )?;
-    let source = parsed
-        .fields
-        .ordinary_source
-        .as_ref()
-        .context("ordinary launch requires ordinary batch provenance")?;
+    let source = &parsed.fields.ordinary_source;
     let key = DecisionKey::from_worker_channel(
         &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
         fabric.workspace_id(),
@@ -534,10 +371,7 @@ pub(super) async fn verify_ordinary_member(
         &source.config_revision,
     )?;
     let fields = verify(&event, fabric.workspace_id(), batch, "plan", &key)?;
-    let source = fields
-        .ordinary_source
-        .as_ref()
-        .context("ordinary batch source missing")?;
+    let source = &fields.ordinary_source;
     anyhow::ensure!(
         fields.owner == owner
             && source.parent_run == parent_run
@@ -550,7 +384,6 @@ pub(super) async fn verify_ordinary_member(
         std::path::Path::new(fabric.workspace_id()),
         batch,
         &crate::tools::sessions_read_model::RunOwnerScope::Owner(Some(owner.to_owned())),
-        None,
     )
     .await?
     .context("ordinary batch roster missing")?;
@@ -559,44 +392,4 @@ pub(super) async fn verify_ordinary_member(
         "ordinary worker was rejected by batch dispatch"
     );
     Ok(())
-}
-
-/// Test fixture: record a plan as `prepare` would, without a live grant.
-#[cfg(test)]
-pub(super) struct PlanFixture<'a> {
-    pub(super) version: u8,
-    pub(super) owner: &'a str,
-    pub(super) batch: &'a str,
-    pub(super) parent_decision: &'a str,
-    pub(super) parent_digest: &'a str,
-    pub(super) store_workspace: &'a str,
-    pub(super) run_ids: &'a [&'a str],
-}
-
-#[cfg(test)]
-pub(super) async fn record_plan_fixture(
-    fabric: MemoryFabric,
-    key: Arc<DecisionKey>,
-    plan: PlanFixture<'_>,
-) -> anyhow::Result<()> {
-    let fields = Fields {
-        version: plan.version,
-        workspace: fabric.workspace_id().to_owned(),
-        store_workspace: Some(plan.store_workspace.to_owned()),
-        owner: plan.owner.to_owned(),
-        batch: plan.batch.to_owned(),
-        parent_decision: plan.parent_decision.to_owned(),
-        parent_digest: plan.parent_digest.to_owned(),
-        ordinary_source: None,
-        members: plan
-            .run_ids
-            .iter()
-            .map(|run_id| Member {
-                run_id: (*run_id).to_owned(),
-                task: String::new(),
-            })
-            .collect(),
-        dispatched: None,
-    };
-    PreparedBatch { fabric, key, fields }.persist("plan").await
 }

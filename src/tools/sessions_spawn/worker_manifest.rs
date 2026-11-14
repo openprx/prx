@@ -100,11 +100,6 @@ pub(super) fn build_session_worker_manifest(
     parent_run_id: Option<&str>,
     compaction_config: &AgentCompactionConfig,
     channel_excluded_tools: &[String],
-    child_source: Option<(
-        &crate::runtime::child_source::IssuedChildGrant,
-        &crate::runtime::child_source::ChildInputReceipt,
-        &crate::session_worker::protocol::WorkerProviderSelection,
-    )>,
     source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
     transport_key: &ring::hmac::Key,
     mailbox: Option<&std::sync::Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
@@ -116,8 +111,6 @@ pub(super) fn build_session_worker_manifest(
 )> {
     let mut manifest = WorkerManifest {
         parent_capability: None,
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: run_id.to_string(),
@@ -169,10 +162,6 @@ pub(super) fn build_session_worker_manifest(
         session_addr: None,
         compaction_config: Some(compaction_config.clone()),
     };
-
-    if let Some((grant, receipt, selection)) = child_source {
-        grant.bind_worker_manifest(&mut manifest, receipt, selection)?;
-    }
 
     if let Some(launch) = source_launch {
         launch.bind_worker_manifest(transport_key, &mut manifest)?;

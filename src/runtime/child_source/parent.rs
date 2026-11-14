@@ -1,5 +1,5 @@
 //! Parent provenance for child issuance, deliberately not a TurnSourceProof.
-use super::{Arc, ChildInputReceipt, Context, MemoryFabric};
+use super::Context;
 use crate::memory::principal::MemoryWriteContext;
 use crate::security::runtime_key::{DecisionKey, KeyDomain};
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -30,49 +30,7 @@ pub struct ParentSourceSnapshot {
     payload: String,
     seal: [u8; 32],
 }
-impl ParentSourceSnapshot {
-    pub(super) fn matches_binding(&self, other: &Self) -> bool {
-        self.payload == other.payload && self.seal == other.seal
-    }
-
-    /// Joins the sealed `launch_parent` lineage to this manifest-authenticated
-    /// parent source: parent run, session, source event, task and configuration.
-    pub(crate) fn matches_launch_parent(&self, launch: &super::authority_journal::LaunchParentRow) -> bool {
-        let Ok(fields) = serde_json::from_str::<SourceFields>(&self.payload) else {
-            return false;
-        };
-        launch.parent_run_id.as_deref() == Some(fields.run_id.as_str())
-            && launch.session_key.as_deref() == Some(fields.session_key.as_str())
-            && launch.source_event_id == fields.source_event_id
-            && launch.parent_task_run_id == fields.task_run_id
-            && launch.config_generation_id == fields.config_generation_id
-            && launch.config_source_revision == fields.config_source_revision
-    }
-
-    /// A preliminary row/manifest join. restore_process independently checks
-    /// this snapshot's signature and the durable source event before use.
-    pub(crate) fn matches_worker_parent_run(
-        &self,
-        worker: &crate::session_worker::protocol::WorkerManifest,
-        record: &crate::runtime::decision_journal::store::DecisionView,
-    ) -> bool {
-        let Ok(fields) = serde_json::from_str::<SourceFields>(&self.payload) else {
-            return false;
-        };
-        fields.run_id.as_str() == record.run_id.as_deref().unwrap_or_default()
-            && fields.task_run_id.as_deref().is_none_or(|task| {
-                fields.surface == "worker"
-                    && worker
-                        .capability_manifest
-                        .as_ref()
-                        .is_some_and(|scope| scope.delegation.is_some())
-                    && !task.is_empty()
-                    && task != fields.run_id
-                    && record.task_id.as_deref() == Some(task)
-            })
-            && worker.parent_run_id.as_deref() == Some(fields.task_run_id.as_deref().unwrap_or(&fields.run_id))
-    }
-}
+impl ParentSourceSnapshot {}
 impl std::fmt::Debug for ParentSourceSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParentSourceSnapshot").finish_non_exhaustive()
@@ -207,9 +165,6 @@ impl ParentSource {
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
     }
-    pub(crate) fn spawn_run_id(&self) -> &str {
-        self.task_run_id.as_deref().unwrap_or(&self.run_id)
-    }
     pub(crate) fn routing_input(&self) -> &str {
         &self.routing_input
     }
@@ -314,8 +269,6 @@ impl ParentSource {
         let snapshot = &source.operator_source;
         anyhow::ensure!(
             worker.ordinary_source.is_none()
-                && worker.child_source.is_none()
-                && worker.capability_manifest.is_none()
                 && key.verify_hmac(
                     KeyDomain::StateFingerprint,
                     &[
@@ -398,9 +351,7 @@ impl ParentSource {
         let snapshot = &source.parent_source;
         let (child, constraints) = scope.gate_inputs();
         anyhow::ensure!(
-            !generation.effective.causal_tree.enabled
-                && worker.child_source.is_none()
-                && worker.capability_manifest.is_none()
+            worker.operator_source.is_none()
                 && constraints.key.verify_hmac(
                     KeyDomain::StateFingerprint,
                     &[
@@ -471,162 +422,6 @@ impl ParentSource {
             },
         })
     }
-
-    pub(crate) async fn restore_process(
-        worker: &crate::session_worker::protocol::WorkerManifest,
-        store: Option<&crate::runtime::decision_journal::store::CausalDecisionStore>,
-        scope: &crate::tools::capability::child::VerifiedChildScope,
-        fabric: &MemoryFabric,
-        generation: &crate::config::ConfigGeneration,
-        child_input: &ChildInputReceipt,
-    ) -> anyhow::Result<Self> {
-        use crate::runtime::decision_journal::store::DecisionScope;
-        let source = worker.child_source.as_ref().context("worker parent source missing")?;
-        let snapshot = &source.parent_source;
-        let (child, constraints) = scope.gate_inputs();
-        anyhow::ensure!(
-            constraints.key.verify_hmac(
-                KeyDomain::StateFingerprint,
-                &[
-                    b"worker-parent-source-v1",
-                    child.parent_authority_id.to_string().as_bytes(),
-                    snapshot.payload.as_bytes()
-                ],
-                &snapshot.seal
-            ),
-            "worker parent provenance signature is invalid"
-        );
-        let fields: SourceFields = serde_json::from_str(&snapshot.payload)?;
-        let surface = match fields.surface.as_str() {
-            "interactive" => TurnSurfaceKind::Interactive,
-            "agent_loop" => TurnSurfaceKind::AgentLoop,
-            "cron" => TurnSurfaceKind::Cron,
-            "xin" => TurnSurfaceKind::Xin,
-            "server" => TurnSurfaceKind::Server,
-            "channel" => TurnSurfaceKind::Channel,
-            "worker" => TurnSurfaceKind::Worker,
-            _ => anyhow::bail!("worker parent source surface is invalid"),
-        };
-        let source_id = fields
-            .source_event_id
-            .as_deref()
-            .context("worker parent source identity missing")?;
-        anyhow::ensure!(
-            !source_id.is_empty()
-                && !fields.run_id.is_empty()
-                && !fields.session_key.is_empty()
-                && fields.workspace_id == fabric.workspace_id()
-                && fields.workspace_id == constraints.authority.workspace
-                && fields.workspace_id == generation.effective.workspace_dir.to_string_lossy()
-                && fields.owner_id == constraints.authority.owner
-                && fields.config_generation_id == generation.id.0
-                && fields.config_source_revision == generation.source_revision.fingerprint_sha256,
-            "worker parent provenance differs from verified scope"
-        );
-        let journal = super::authority_journal::verify(worker, &generation.effective.workspace_dir, &constraints.key)?;
-        let row = if journal {
-            None
-        } else {
-            let store = store.context("legacy worker parent store missing")?;
-            let store_workspace = store.workspace_id().context("worker parent store namespace missing")?;
-            anyhow::ensure!(
-                store_workspace.as_ref() == source.parent_store_workspace,
-                "worker parent store namespace differs from signed source"
-            );
-            let owner_scope = DecisionScope::Owner {
-                workspace_id: store_workspace,
-                owner_id: Arc::from(fields.owner_id.as_str()),
-            };
-            let row = store
-                .reader()
-                .replay_record(&owner_scope, &child.parent_authority_id.decision_grant_id())?
-                .context("worker parent decision is unavailable")?;
-            anyhow::ensure!(
-                row.digest == source.parent_decision_digest
-                    && snapshot.matches_worker_parent_run(worker, &row.decision)
-                    && row.decision.admits_issued_child()
-                    && row.decision.enabled_snapshot
-                    && !row.decision.legacy_v1
-                    && row.source_event_id.as_deref() == Some(source_id)
-                    && row.decision.run_id.as_deref() == Some(fields.run_id.as_str())
-                    && fields.task_run_id.as_deref().is_none_or(|task| {
-                        surface == TurnSurfaceKind::Worker
-                            && child.authority.delegation.is_some()
-                            && !task.is_empty()
-                            && task != fields.run_id
-                            && row.decision.task_id.as_deref() == Some(task)
-                    })
-                    && row.decision.session_key.as_deref() == Some(fields.session_key.as_str()),
-                "worker parent provenance differs from durable decision"
-            );
-            Some(row)
-        };
-        let event = fabric
-            .memory()
-            .find_owned_message_event(&fields.workspace_id, &fields.owner_id, source_id)
-            .await?
-            .context("worker parent event is unavailable")?;
-        let input = child_input.event();
-        anyhow::ensure!(
-            event.id > 0
-                && event.event_id == source_id
-                && event.workspace_id == fields.workspace_id
-                && event.owner_id.as_deref() == Some(fields.owner_id.as_str())
-                && event.role == "user"
-                && event.event_type == "message.created"
-                && event.run_id.as_deref() == Some(fields.run_id.as_str())
-                && event.session_key.as_deref() == Some(fields.session_key.as_str())
-                && crate::runtime::turn_source::recorded_input_matches(surface, &event, &fields.routing_input)
-                && input.event_id == source.input_event_id
-                && input.run_id.as_deref() == Some(worker.run_id.as_str())
-                && input.session_key.as_deref() == Some(worker.session_scope_key.as_str())
-                && child_input.input() == worker.task
-                && input.workspace_id == fields.workspace_id
-                && input.owner_id == event.owner_id
-                && input.parent_run_id.as_deref() == Some(fields.task_run_id.as_deref().unwrap_or(&fields.run_id))
-                && fields.task_run_id.as_deref().is_none_or(|task| {
-                    row.as_ref()
-                        .is_none_or(|row| matches_parent_task_segment(task, row, &event))
-                })
-                && input.parent_session_key == event.session_key
-                && input.causation_event_id.as_deref() == Some(source_id)
-                && input.run_id != event.run_id
-                && input.channel.as_deref() == Some(fields.policy_channel.as_str())
-                && input.sender.as_deref() == Some(fields.policy_sender.as_str())
-                && input.config_generation_id == Some(fields.config_generation_id)
-                && input.config_source_revision.as_deref() == Some(fields.config_source_revision.as_str()),
-            "worker parent and child durable lineage differ"
-        );
-        Ok(Self {
-            owner_isolated: fields.owner_isolated,
-            workspace_id: fields.workspace_id,
-            owner_id: fields.owner_id,
-            session_key: fields.session_key,
-            run_id: fields.run_id,
-            task_run_id: fields.task_run_id,
-            routing_input: fields.routing_input,
-            config_source_revision: fields.config_source_revision,
-            source_event_id: fields.source_event_id,
-            config_generation_id: fields.config_generation_id,
-            policy_channel: fields.policy_channel,
-            policy_sender: fields.policy_sender,
-            policy_chat_type: fields.policy_chat_type,
-            surface,
-            memory_scope: MemoryWriteContext {
-                // CARRY 01c2 (target_switch_and_delegate_keep_partition): RecallScope has no partition.
-                agent_partition: None,
-                session_key: None,
-                workspace_id: fields.memory_scope.workspace_id,
-                channel: fields.memory_scope.channel,
-                chat_type: fields.memory_scope.chat_type,
-                chat_id: fields.memory_scope.chat_id,
-                sender_id: fields.memory_scope.sender_id,
-                raw_sender: fields.memory_scope.raw_sender,
-                owner_id: fields.memory_scope.owner_id,
-                require_owner_match: fields.memory_scope.require_owner_match,
-            },
-        })
-    }
 }
 
 #[cfg(test)]
@@ -666,7 +461,6 @@ mod tests {
         parent.surface = TurnSurfaceKind::Worker;
         parent.task_run_id = Some("prx_task_run".to_owned());
         assert_eq!(parent.run_id(), "prx_parent_run");
-        assert_eq!(parent.spawn_run_id(), "prx_task_run");
         let snapshot = parent.bind_process(decision, &key).unwrap();
         let mut fields: SourceFields = serde_json::from_str(&snapshot.payload).unwrap();
         assert_eq!(fields.run_id, "prx_parent_run");

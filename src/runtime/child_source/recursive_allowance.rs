@@ -3,7 +3,7 @@ use crate::runtime::turn_source::TurnSourceProof;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, OnceLock, Weak,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 type Registry = parking_lot::Mutex<BTreeMap<[u8; 32], Arc<RecursiveAllowance>>>;
@@ -17,7 +17,6 @@ pub(in crate::runtime) struct RunAllowances(OnceLock<Arc<Registry>>);
 
 pub(crate) struct RecursiveAllowance {
     money: Arc<AtomicU64>,
-    claimed: AtomicBool,
     retention: Option<Weak<Registry>>,
     contexts: AtomicUsize,
 }
@@ -26,7 +25,6 @@ impl RecursiveAllowance {
     pub(crate) fn new(micro_usd: u64) -> Self {
         Self {
             money: Arc::new(AtomicU64::new(micro_usd)),
-            claimed: AtomicBool::new(false),
             retention: None,
             contexts: AtomicUsize::new(0),
         }
@@ -34,31 +32,6 @@ impl RecursiveAllowance {
 
     pub(crate) fn money(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.money)
-    }
-
-    pub(crate) fn ensure_available(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.claimed.load(Ordering::Acquire),
-            "recursive grant already allocated its one child allowance"
-        );
-        Ok(())
-    }
-
-    /// Claim once and subtract a whole-cent strict share before publication.
-    /// A failed publication keeps its allocation consumed, never reissues it.
-    pub(crate) fn carve_child(&self, ceiling_cents: u32) -> anyhow::Result<(u32, Arc<Self>)> {
-        anyhow::ensure!(
-            self.claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "recursive grant already allocated its one child allowance"
-        );
-        let allocation = self.carve_ordinary_child(ceiling_cents)?;
-        anyhow::ensure!(
-            allocation.0 > 0,
-            "recursive parent allowance cannot fund a strict whole-cent child share"
-        );
-        Ok(allocation)
     }
 
     /// Each ordinary launch atomically reserves a strict share of the balance.
@@ -144,7 +117,6 @@ impl RunAllowances {
         ContextAllowance::new(Arc::clone(entries.entry(key).or_insert_with(|| {
             Arc::new(RecursiveAllowance {
                 money,
-                claimed: AtomicBool::new(false),
                 retention: Some(Arc::downgrade(registry)),
                 contexts: AtomicUsize::new(0),
             })

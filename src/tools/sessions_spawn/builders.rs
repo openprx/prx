@@ -1,6 +1,6 @@
 use super::{AbortOnDrop, ParentToolRegistry, SessionsSpawnTool, SubAgentRun, process_terminal};
 #[cfg(test)]
-use super::{TestWorkerExecutable, TestWorkerProtocolControl, TestWorkerRecoveryResult, TestWorkerRouteCapture};
+use super::{TestWorkerExecutable, TestWorkerProtocolControl};
 use crate::agent::turn_request::SpawnEventSink;
 use crate::channels::traits::Channel;
 use crate::config::{DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -154,34 +154,6 @@ impl SessionsSpawnTool {
         self
     }
 
-    /// One actual bounded recovery page, retaining every per-launch error.
-    /// This exposes no grant, signing key, or alternate verification path.
-    #[cfg(test)]
-    pub(crate) async fn recover_process_page_for_test(
-        &self,
-        after_id: i64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<TestWorkerRecoveryResult>> {
-        let fabric = self
-            .memory_fabric()
-            .context("recovery fixture requires source fabric")?;
-        let workspace = PathBuf::from(fabric.workspace_id());
-        let page = process_terminal::recover_restart_page(&fabric, &workspace, after_id, limit).await?;
-        let mut outcomes = Vec::with_capacity(page.outcomes.len());
-        for item in page.outcomes {
-            let result = match item.result {
-                Ok(Some(recovered)) => recovered.restore(&self.active_runs).await.map(Some),
-                Ok(None) => Ok(None),
-                Err(error) => Err(error),
-            };
-            outcomes.push(TestWorkerRecoveryResult {
-                launch_event_id: item.launch_event_id,
-                result,
-            });
-        }
-        Ok(outcomes)
-    }
-
     /// Isolated AUT only: the caller validates a root-frozen build/profile manifest.
     /// Production launch always resolves current_exe and has no override.
     #[cfg(test)]
@@ -195,7 +167,6 @@ impl SessionsSpawnTool {
             path,
             sha256,
             private_home,
-            route_observer: None,
             protocol: None,
         };
         executable.verify()?;
@@ -209,19 +180,6 @@ impl SessionsSpawnTool {
             .as_mut()
             .context("protocol control requires an attested worker artifact")?
             .protocol = Some(control);
-        Ok(self)
-    }
-
-    /// Optional per-instance readback only; does not construct or mutate authority.
-    #[cfg(test)]
-    pub(crate) fn with_test_route_observer(
-        mut self,
-        observer: Arc<parking_lot::Mutex<TestWorkerRouteCapture>>,
-    ) -> anyhow::Result<Self> {
-        self.test_worker_executable
-            .as_mut()
-            .context("route observation requires an attested worker artifact")?
-            .route_observer = Some(observer);
         Ok(self)
     }
 

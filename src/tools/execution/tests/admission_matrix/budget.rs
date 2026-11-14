@@ -19,16 +19,6 @@ fn operator_turn(mut context: ToolExecutionContext) -> ToolExecutionContext {
 }
 
 #[tokio::test]
-async fn segment_context_carries_budget() {
-    let child = crate::agent::turn_tests::engine_switch::admit_bound_child_segment().await;
-    assert!(
-        child.turn.adapter().tool_execution_context.call_budget.is_some(),
-        "segment admission stamps a call budget"
-    );
-    child.shutdown().await;
-}
-
-#[tokio::test]
 async fn model_turn_without_call_budget_is_denied() {
     let fixture = fixture();
     let service = fixture.service(CONFIG_RELOAD, vec![], ToolExecutionDecision::Allow, approved(), true);

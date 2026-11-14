@@ -83,7 +83,6 @@ async fn named_memory_recall_is_reached_by_search_without_publishing_peers() {
             let service = build_publication(
                 TurnSurfaceKind::AgentLoop,
                 PublicationInputs {
-                    parent_grant: None,
                     generation: Arc::clone(&generation),
                     registry,
                     execution,
@@ -219,7 +218,6 @@ async fn default_greeting_exposes_search_without_pre_admitting_hits() {
     let service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -331,7 +329,6 @@ async fn direct_native_write_can_discover_read_peers_through_search() {
         let service = build_publication(
             TurnSurfaceKind::AgentLoop,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution,
@@ -521,7 +518,6 @@ async fn discovery_turn(spec: DiscoveryTurnSpec<'_>) -> DiscoveryTurn {
             TurnSurfaceKind::AgentLoop
         },
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -1053,7 +1049,6 @@ async fn production_discovery_selects_a_skill_and_loads_its_body_only_on_executi
     let service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,

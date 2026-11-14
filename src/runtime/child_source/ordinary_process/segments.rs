@@ -72,8 +72,7 @@ impl OrdinaryProcessSegments {
                 })
                 .to_string(),
             ),
-            None,
-        )
+)
         .await?;
         self.authority.verify()?;
         super::journal::OrdinarySegmentJournal::new(&self.authority)?

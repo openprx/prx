@@ -159,7 +159,6 @@ pub(crate) struct RecoveryScope {
     pub(super) recordable: bool,
     pub(super) surface: crate::tools::capability::turn_state::TurnSurfaceKind,
     pub(super) authority: Arc<RecoveryAuthority>,
-    pub(super) parent_authority_id: Option<crate::tools::capability::child::ParentAuthorityId>,
     #[cfg(test)]
     pub(crate) spies: Arc<RepairSpies>,
 }
@@ -179,7 +178,6 @@ impl RecoveryScope {
                 repository: None,
                 legacy: None,
             }),
-            parent_authority_id: None,
             #[cfg(test)]
             spies: Arc::new(RepairSpies::default()),
         }
@@ -214,7 +212,6 @@ impl RecoveryScope {
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn Memory>,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
-        parent_grant: Option<&super::child_source::IssuedChildGrant>,
         owner: &Arc<super::turn_cleanup::CleanupTracker>,
         workspace_key: Option<Arc<DecisionKey>>,
         advisory: PreparedAdvisory,
@@ -259,7 +256,6 @@ impl RecoveryScope {
                 repository: repository_ready.then_some(ActivatedRepository),
                 legacy,
             }),
-            parent_authority_id: parent_grant.map(|grant| grant.scope().gate_inputs().0.parent_authority_id),
             #[cfg(test)]
             spies: Arc::new(RepairSpies::default()),
         });

@@ -31,7 +31,7 @@ use super::turn_publication::{PublicationInputs, build_publication};
 mod call_approval;
 #[cfg(test)]
 pub(crate) use crate::runtime::ingress_recovery::child_telemetry::child_recovery_gate;
-mod delegation;
+mod child_scope;
 mod discovery;
 mod execution;
 use super::child_source::publication::OrdinaryChildPublication;
@@ -631,15 +631,6 @@ impl TurnDecisionService {
         super::turn_terminal::settlement::terminal_binding(self, context)
     }
 
-    /// Issue a terminal link only after this service returned a recordable
-    /// decision. The caller cannot choose its decision id or writer scope.
-    pub(crate) fn settlement_ref(
-        &self,
-        context: Arc<TurnDecisionContext>,
-    ) -> Result<crate::agent::terminal::DecisionSettlementRef, SettlementRefUnavailable> {
-        super::turn_terminal::settlement::settlement_ref(self, context)
-    }
-
     /// The publication-scoped runtime holder shared with every opened turn.
     pub(crate) const fn runtime_holder(&self) -> &Arc<crate::runtime::turn_context::TurnRuntimeHolder> {
         &self.runtime
@@ -978,9 +969,6 @@ impl TurnDecisionService {
             .collect()
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::with_worker_probe_manifest;
 
 #[cfg(test)]
 pub(crate) mod tests;

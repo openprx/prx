@@ -1000,11 +1000,8 @@ impl super::ingress_recovery::RecoveryScope {
             "terminal replay belongs to another ingress surface"
         );
         anyhow::ensure!(
-            replay
-                .parent_decision_id()
-                .map(crate::tools::capability::child::ParentAuthorityId::from)
-                == self.parent_authority_id,
-            "terminal replay belongs to another parent decision"
+            replay.parent_decision_id().is_none(),
+            "terminal replay belongs to a delegated parent decision"
         );
         #[cfg(test)]
         stage.next(super::turn_cleanup::diagnostic::StageName::RejoinFacts);
@@ -1248,7 +1245,6 @@ impl super::ingress_recovery::RecoveryScope {
             return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("run").into());
         }
         let surface = self.surface.as_str().to_owned();
-        let parent = self.parent_authority_id.map(|parent| parent.to_string());
         let terminal_id = terminal_id.to_owned();
         let read_memory = Arc::clone(&memory);
         let read_chain = chain.clone();
@@ -1271,7 +1267,9 @@ impl super::ingress_recovery::RecoveryScope {
             if facts.surface != surface {
                 return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("surface").into());
             }
-            if facts.parent_authority_id != parent {
+            // Delegated child issuance is removed (P2-G4): no settled
+            // terminal carries a parent decision authority.
+            if facts.parent_authority_id.is_some() {
                 return Err(
                     crate::memory::ingress_recovery::IngressAttestationError::Mismatch("parent_authority_id").into(),
                 );

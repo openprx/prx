@@ -1,13 +1,11 @@
 #![cfg(test)]
 
 #[cfg(unix)]
-mod authority;
 mod credentials;
 mod hybrid;
 #[cfg(unix)]
 mod manifest_reference_tests;
 mod manifest_validation;
-pub(crate) mod probe;
 mod spawn_context;
 mod steering;
 mod tool_selection;
@@ -15,11 +13,9 @@ mod tool_selection;
 use crate::session_worker::protocol::WorkerManifest;
 use std::path::Path;
 
-pub(super) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifest {
+pub(crate) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifest {
     WorkerManifest {
         parent_capability: Some(capability.to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-worker".to_string(),

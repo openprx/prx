@@ -206,7 +206,7 @@ async fn a_worker_hands_its_inherited_exclusions_to_everything_it_spawns() {
     let mut manifest = base_manifest(workspace.path(), "capability");
     manifest.session_scope_key = "sessions_spawn:parent".to_string();
     manifest.channel_excluded_tools = vec!["gateway".to_string()];
-    let inherited = with_manifest_spawn_context(&manifest, None, None, None, None, async {
+    let inherited = with_manifest_spawn_context(&manifest, None, async {
         crate::tools::sessions_spawn::ambient_channel_excluded_tools()
     })
     .await;
@@ -217,7 +217,7 @@ async fn a_worker_hands_its_inherited_exclusions_to_everything_it_spawns() {
     );
 
     manifest.channel_excluded_tools.clear();
-    let operator = with_manifest_spawn_context(&manifest, None, None, None, None, async {
+    let operator = with_manifest_spawn_context(&manifest, None, async {
         crate::tools::sessions_spawn::ambient_channel_excluded_tools()
     })
     .await;

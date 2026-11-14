@@ -178,7 +178,7 @@ fn config_destructuring_is_recognised_on_the_left_hand_side_only() {
 /// provider it was issued for: no other production code under
 /// `src/session_worker/**` may read the manifest's agent key or the root
 /// `api_key`/`api_url`, and the worker's provider chain is built only by
-/// `worker_provider`.
+/// the sealed ordinary or operator binding.
 #[test]
 pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
     let mut factory_sites = Vec::new();
@@ -282,20 +282,8 @@ pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
                         .into_iter()
                         .rev()
                         .collect();
-                    let owner_checked_selection = match function.as_str() {
-                        "validate_worker_route" => ["selected.credential()", "resolved.credential()"],
-                        "build_worker_provider_selection" => ["resolved.credential()", "sealed_connection"],
-                        _ => ["", ""],
-                    }
-                    .iter()
-                    .any(|source| !source.is_empty() && normalized[..at].ends_with(source));
-                    let owner_checked_agent = matches!(function.as_str(), "validate_worker_route" | "worker_provider")
-                        && receiver.ends_with("agent")
-                        && field == ".api_key";
                     assert!(
                         matches!(receiver.as_str(), "credentials.provider" | "config.composio")
-                            || owner_checked_agent
-                            || owner_checked_selection
                             || (relative == "src/session_worker/runner/ordinary_source.rs"
                                 && function == "restore"
                                 && field == ".api_key"
@@ -313,8 +301,8 @@ pub(super) fn session_worker_credentials_are_decided_in_one_scoped_place() {
     }
     assert_eq!(
         factory_sites,
-        vec!["src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for".to_string()],
-        "a session worker builds its provider only through `worker_provider`"
+        Vec::<String>::new(),
+        "a session worker builds no provider of its own; ordinary and operator workers use their sealed bindings"
     );
 }
 
@@ -436,7 +424,6 @@ pub(super) fn provider_construction_outside_the_provider_module_is_pinned() {
         "src/runtime/evolution_model.rs:from_config:create_provider_for",
         "src/runtime/decision_accounting/auxiliary.rs:auxiliary_accounting:create_provider_for",
         "src/runtime/decision_accounting/auxiliary.rs:smart_group_accounting:create_provider_for",
-        "src/session_worker/runner/provider.rs:build_worker_provider_selection:create_provider_for",
     ]
     .iter()
     .map(|site| (*site).to_string())

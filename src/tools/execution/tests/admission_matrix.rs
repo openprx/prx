@@ -995,7 +995,7 @@ async fn spawn_without_parent_authority_is_refused() {
     let policy = crate::security::SecurityPolicy::default();
     let operator = crate::chat::dispatcher::chat_tool_execution_context(&policy, None, None, "operator-control");
     assert!(operator.is_local_operator());
-    assert!(operator.child_scope.is_none() && operator.child_pin.is_none() && operator.child_grant.is_none());
+    assert!(operator.child_scope.is_none() && operator.child_pin.is_none());
     assert!(operator.admitted_binding.is_none() && operator.turn_surface.is_none());
     for (index, name) in ["delegate", "sessions_spawn"].into_iter().enumerate() {
         assert_eq!(
@@ -1005,50 +1005,6 @@ async fn spawn_without_parent_authority_is_refused() {
         );
         assert_eq!(case.fixture.calls.load(Ordering::SeqCst), index + 1);
     }
-}
-
-/// Launcher cells that need a real issued outgoing grant. The caller supplies one
-/// from a fixture that builds a decision-enabled parent; the grant is only checked
-/// for presence at dispatch. No decision context, binding or surface is involved.
-pub(crate) async fn launcher_authority_cells(grant: Arc<crate::runtime::child_source::IssuedChildGrant>) {
-    let members = ["config_reload", "delegate", "sessions_spawn"];
-    let launchers = ["delegate", "sessions_spawn"];
-    let with_grant = |case: &child_fixture::ChildCase| {
-        let mut context = case.context(true, true);
-        context.child_grant = Some(Arc::clone(&grant));
-        context
-    };
-    // Depth zero with valid outgoing authority: only depth can refuse.
-    let exhausted = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::Full, 1);
-    for name in launchers {
-        assert_eq!(
-            exhausted.call(name, with_grant(&exhausted)).await,
-            ToolExecutionStatus::Denied,
-            "{name} at depth zero"
-        );
-    }
-    assert_eq!(exhausted.fixture.calls.load(Ordering::SeqCst), 0);
-    // Live depth with valid authority: exactly one backend entry per launcher.
-    let live = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::Full, 2);
-    for (index, name) in launchers.into_iter().enumerate() {
-        assert_eq!(
-            live.call(name, with_grant(&live)).await,
-            ToolExecutionStatus::Succeeded,
-            "{name} with live depth"
-        );
-        assert_eq!(live.fixture.calls.load(Ordering::SeqCst), index + 1);
-    }
-    // The same admitted launchers under a ReadOnly child: policy Deny, no approval, no backend.
-    let readonly = child_fixture::ChildCase::build(&members, "owner-a", AutonomyLevel::ReadOnly, 2);
-    for name in launchers {
-        assert_eq!(
-            readonly.call(name, with_grant(&readonly)).await,
-            ToolExecutionStatus::Denied,
-            "{name} under a ReadOnly child"
-        );
-    }
-    assert_eq!(readonly.fixture.calls.load(Ordering::SeqCst), 0);
-    assert!(!readonly.fixture.stages.lock().contains(&"approval"));
 }
 
 /// The money ceiling is re-read at admission and again after the approval wait,

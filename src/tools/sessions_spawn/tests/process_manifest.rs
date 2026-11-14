@@ -186,8 +186,6 @@ async fn spawn_agent_uses_identity_prompt() {
 fn process_mode_task_arg_is_not_json_encoded() {
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run".to_string(),

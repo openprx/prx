@@ -158,38 +158,6 @@ impl ChildInputReceipt {
         &self.event
     }
 
-    /// Project the original durable task identity, not a worker segment envelope.
-    /// This is metadata only; logical terminal issuance still verifies the grant,
-    /// backend identity and every semantic field against this receipt.
-    pub(crate) fn logical_task_scope(&self) -> MessageEventScope {
-        let event = self.event();
-        MessageEventScope {
-            // CARRY 01c2 (target_switch_and_delegate_keep_partition): logical_task_scope has no partition input
-            agent_partition: None,
-            source: event.source.clone(),
-            owner_id: event.owner_id.clone(),
-            channel: event.channel.clone(),
-            session_key: event.session_key.clone(),
-            parent_session_key: event.parent_session_key.clone(),
-            run_id: event.run_id.clone(),
-            parent_run_id: event.parent_run_id.clone(),
-            agent_id: event.agent_id.clone(),
-            persona_id: event.persona_id.clone(),
-            sender: event.sender.clone(),
-            recipient: event.recipient.clone(),
-            subject: event.subject.clone(),
-            goal_id: event.goal_id.clone(),
-            causation_event_id: event.causation_event_id.clone(),
-            correlation_id: event.correlation_id.clone(),
-            attempt_id: event.attempt_id.clone(),
-            lease_epoch: event.lease_epoch,
-            config_generation_id: event.config_generation_id,
-            config_source_revision: event.config_source_revision.clone(),
-            authority_guard: self.authority_guard.clone(),
-            visibility: event.visibility.clone(),
-        }
-    }
-
     pub(crate) fn verify_backend(&self, memory: &Arc<dyn crate::memory::Memory>) -> anyhow::Result<()> {
         anyhow::ensure!(
             Arc::ptr_eq(&self.memory, memory),
@@ -261,11 +229,10 @@ impl ChildInputReceipt {
 /// The caller must require Some before entering enabled child decisions.
 pub(crate) async fn record_child_input(
     fabric: &MemoryFabric,
-    mut scope: MessageEventScope,
+    scope: MessageEventScope,
     input: &str,
     idempotency_key: Option<String>,
     payload: Option<String>,
-    grant: Option<&IssuedChildGrant>,
 ) -> anyhow::Result<Option<Arc<ChildInputReceipt>>> {
     anyhow::ensure!(
         matches!(
@@ -274,18 +241,10 @@ pub(crate) async fn record_child_input(
         ) && scope.visibility == MemoryVisibility::Workspace,
         "unsupported child input source"
     );
-    if let Some(grant) = grant {
-        anyhow::ensure!(
-            fabric.workspace_id() == grant.parent().workspace_id(),
-            "child input workspace differs from parent grant"
-        );
-        grant.bind_event_scope(&mut scope)?;
-    }
     let event = fabric
         .record_inbound_user_message(scope.clone(), input, idempotency_key, payload)
         .await?;
     if event.id == 0 {
-        anyhow::ensure!(grant.is_none(), "delegated child input must be durable");
         return Ok(None);
     }
     anyhow::ensure!(
@@ -341,687 +300,7 @@ pub(crate) async fn record_child_input(
         event,
         authority_guard: scope.authority_guard,
     });
-    if let Some(grant) = grant {
-        grant.verify_receipt(&receipt)?;
-    }
     Ok(Some(receipt))
-}
-
-/// Recover the exact parent-recorded spawn input without appending another
-/// event. This issues an input receipt only, never a source proof or grant.
-pub(crate) async fn restore_worker_input(
-    fabric: &MemoryFabric,
-    worker: &crate::session_worker::protocol::WorkerManifest,
-    scope: &crate::tools::capability::child::VerifiedChildScope,
-) -> anyhow::Result<Arc<ChildInputReceipt>> {
-    use crate::tools::capability::child::ChildCapabilityManifest;
-    let source = worker.child_source.as_ref().context("worker child source missing")?;
-    let wire = worker
-        .capability_manifest
-        .as_ref()
-        .context("worker child capabilities missing")?;
-    let (child, parent) = scope.gate_inputs();
-    anyhow::ensure!(
-        ChildCapabilityManifest::from_worker_manifest(wire, parent)? == *child
-            && fabric.workspace_id() == child.authority.workspace
-            && source.parent_constraints.workspace == child.authority.workspace
-            && worker.owner_id.as_deref() == Some(child.authority.owner.as_str()),
-        "worker input lookup differs from verified child scope"
-    );
-    let event = fabric
-        .memory()
-        .find_owned_message_event(fabric.workspace_id(), &child.authority.owner, &source.input_event_id)
-        .await?
-        .context("worker child input is not durable")?;
-    verify_worker_input(fabric.workspace_id(), worker, scope, &event)?;
-    Ok(Arc::new(ChildInputReceipt {
-        previous_segment_input: None,
-        segment_issued: false,
-        memory: fabric.memory(),
-        input: Arc::from(worker.task.as_str()),
-        event,
-        // A recovered worker authenticates through its verified manifest; a
-        // parent process closure is neither durable nor transferable.
-        authority_guard: None,
-    }))
-}
-
-/// Check the exact durable receipt against the same authenticated manifest
-/// whose execution directory will be used. A valid receipt from another worker
-/// must not be combined with an independently valid transport proof.
-fn verify_worker_input(
-    workspace_id: &str,
-    worker: &crate::session_worker::protocol::WorkerManifest,
-    scope: &crate::tools::capability::child::VerifiedChildScope,
-    event: &MessageEvent,
-) -> anyhow::Result<()> {
-    use crate::tools::capability::child::ChildCapabilityManifest;
-    let source = worker.child_source.as_ref().context("worker child source missing")?;
-    let wire = worker
-        .capability_manifest
-        .as_ref()
-        .context("worker child capabilities missing")?;
-    let (child, parent) = scope.gate_inputs();
-    anyhow::ensure!(
-        worker.ordinary_source.is_none()
-            && worker.operator_source.is_none()
-            && ChildCapabilityManifest::from_worker_manifest(wire, parent)? == *child
-            && workspace_id == child.authority.workspace
-            && source.parent_constraints.workspace == child.authority.workspace
-            && worker.owner_id.as_deref() == Some(child.authority.owner.as_str()),
-        "worker input differs from authenticated capability scope"
-    );
-    anyhow::ensure!(
-        parent.key.verify_hmac(
-            crate::security::runtime_key::KeyDomain::StateFingerprint,
-            &[
-                b"worker-child-input-v1",
-                child.parent_authority_id.to_string().as_bytes(),
-                &serde_json::to_vec(&event)?
-            ],
-            &source.input_event_mac
-        ),
-        "worker child input differs from issued receipt"
-    );
-    anyhow::ensure!(
-        event.id > 0
-            && event.event_id == source.input_event_id
-            && event.workspace_id == workspace_id
-            && event.owner_id.as_deref() == Some(child.authority.owner.as_str())
-            && event.source == MessageEventSource::SessionsSpawn
-            && event.visibility == MemoryVisibility::Workspace
-            && event.role == "user"
-            && event.event_type == "message.created"
-            && event.content == worker.task
-            && event.run_id.as_deref() == Some(worker.run_id.as_str())
-            && event.session_key.as_deref() == Some(worker.session_scope_key.as_str())
-            && event.parent_run_id == worker.parent_run_id
-            && event.run_id != event.parent_run_id
-            && event.parent_session_key.as_deref().is_some_and(|id| !id.is_empty())
-            && event.causation_event_id.as_deref().is_some_and(|id| !id.is_empty())
-            && event.config_generation_id == worker.runtime_config_generation_id
-            && event.config_source_revision == worker.runtime_config_source_revision
-            && event.channel == worker.scope_channel
-            && event.sender == worker.scope_sender
-            && event.agent_id == worker.agent_id,
-        "worker durable input differs from manifest lineage"
-    );
-    Ok(())
-}
-
-/// Durable input identity for each execution segment of one logical child task.
-/// The task's own final result keeps its original run id; segment decisions
-/// and terminals use disjoint ids, including when steering cancels a segment.
-pub(crate) struct ChildSegmentSequence {
-    grant: Arc<IssuedChildGrant>,
-    task_input: Arc<ChildInputReceipt>,
-    segment_source: MessageEventSource,
-    next: u64,
-    previous_input: Option<SegmentPredecessor>,
-}
-
-impl ChildSegmentSequence {
-    pub(crate) fn new(grant: Arc<IssuedChildGrant>, task_input: Arc<ChildInputReceipt>) -> anyhow::Result<Self> {
-        grant.verify_receipt(&task_input)?;
-        Ok(Self {
-            grant,
-            segment_source: task_input.event().source.clone(),
-            task_input,
-            next: 0,
-            previous_input: None,
-        })
-    }
-
-    pub(crate) const fn recorded_count(&self) -> u64 {
-        self.next
-    }
-
-    pub(crate) fn new_worker(grant: Arc<IssuedChildGrant>, task_input: Arc<ChildInputReceipt>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            task_input.event().source == MessageEventSource::SessionsSpawn,
-            "worker segments require the original spawn input"
-        );
-        let mut sequence = Self::new(grant, task_input)?;
-        sequence.segment_source = MessageEventSource::SessionWorker;
-        Ok(sequence)
-    }
-
-    pub(crate) async fn record(
-        &mut self,
-        fabric: &MemoryFabric,
-        input: &str,
-    ) -> anyhow::Result<Arc<ChildInputReceipt>> {
-        let following = self.next.checked_add(1).context("child segment identity exhausted")?;
-        let event = self.task_input.event();
-        let task_run = event.run_id.as_deref().context("child task run missing")?;
-        let segment_run = format!("child-segment:{}:{}", event.event_id, self.next);
-        let scope = MessageEventScope {
-            // CARRY 01c2 (target_switch_and_delegate_keep_partition): segment record has no partition input
-            agent_partition: None,
-            source: self.segment_source.clone(),
-            owner_id: event.owner_id.clone(),
-            channel: event.channel.clone(),
-            session_key: event.session_key.clone(),
-            parent_session_key: event.parent_session_key.clone(),
-            run_id: Some(segment_run.clone()),
-            parent_run_id: event.parent_run_id.clone(),
-            agent_id: event.agent_id.clone(),
-            persona_id: event.persona_id.clone(),
-            sender: event.sender.clone(),
-            recipient: event.recipient.clone(),
-            subject: Some(crate::memory::MessageEventSubject::Task(task_run.to_owned())),
-            goal_id: event.goal_id.clone(),
-            causation_event_id: event.causation_event_id.clone(),
-            correlation_id: event.correlation_id.clone().or_else(|| Some(event.event_id.clone())),
-            attempt_id: event.attempt_id.clone(),
-            lease_epoch: event.lease_epoch,
-            config_generation_id: event.config_generation_id,
-            config_source_revision: event.config_source_revision.clone(),
-            authority_guard: self.task_input.authority_guard.clone(),
-            visibility: event.visibility.clone(),
-        };
-        let (manifest, _) = self.grant.scope().gate_inputs();
-        let payload = serde_json::json!({
-            "task_run_id": task_run,
-            "task_input_event_id": event.event_id,
-            "segment_index": self.next,
-            "previous_segment_input_event_id": self.previous_input.as_ref().map(SegmentPredecessor::event_id),
-            "parent_decision_id": manifest.parent_authority_id.to_string(),
-        })
-        .to_string();
-        let mut receipt = record_child_input(
-            fabric,
-            scope,
-            input,
-            Some(format!("{segment_run}:input")),
-            Some(payload),
-            Some(&self.grant),
-        )
-        .await?
-        .context("child segment input must be durable")?;
-        // A failed/cancelled write retries the same identity; it cannot skip an
-        // input or turn a changed body into a successful idempotent receipt.
-        let next_previous = ChildInputReceipt::advance_segment(&mut receipt, self.previous_input.as_ref())?;
-        self.next = following;
-        self.previous_input = Some(next_previous);
-        Ok(receipt)
-    }
-}
-
-/// Source-bound issuance retained across the background child's lifetime.
-/// Only runtime admission can mint it; tools may carry or inspect it.
-#[derive(Clone)]
-pub(crate) struct IssuedChildGrant(Arc<ChildGrantData>);
-
-mod recursive;
-
-pub(crate) struct ChildGrantRuntime {
-    pub(crate) recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
-    pub(crate) decision_store: Option<Arc<crate::runtime::decision_journal::store::CausalDecisionStore>>,
-    pub(crate) source_fabric: MemoryFabric,
-    pub(crate) security: Arc<crate::security::SecurityPolicy>,
-    /// Present only for live issuance. Restored grants cannot write authority rows.
-    pub(crate) parent_issuer: Option<authority_journal::ParentIssuerEvidence>,
-}
-
-#[derive(Clone)]
-struct ParentModelSelection {
-    provider: String,
-    model: String,
-    credential: crate::providers::credentials::CredentialRef,
-}
-
-struct ChildGrantData {
-    recursive_child_claimed: Option<Arc<recursive_allowance::RecursiveAllowance>>,
-    // Only a live parent decision can issue default child-model selection.
-    // Restored incoming authority is used to admit that child, not to spawn
-    // another child without a fresh decision-issued outgoing grant.
-    parent_model: Option<ParentModelSelection>,
-    source_fabric: MemoryFabric,
-    security: Arc<crate::security::SecurityPolicy>,
-    parent_record_binding: (Arc<str>, String),
-    parent_issuer: Option<authority_journal::ParentIssuerEvidence>,
-    provider_catalog: Arc<crate::providers::catalog::CatalogView>,
-    catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
-    generation: Arc<crate::config::ConfigGeneration>,
-    scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-    parent: parent::ParentSource,
-}
-
-impl std::fmt::Debug for IssuedChildGrant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IssuedChildGrant").finish_non_exhaustive()
-    }
-}
-impl PartialEq for IssuedChildGrant {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for IssuedChildGrant {}
-
-impl IssuedChildGrant {
-    pub(super) fn new(
-        scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-        parent: &dyn crate::runtime::turn_source::TurnSourceProof,
-        catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
-        generation: Arc<crate::config::ConfigGeneration>,
-        provider_catalog: Arc<crate::providers::catalog::CatalogView>,
-        parent_record_binding: (Arc<str>, String),
-        execution_policy: publication::ChildExecutionPolicy,
-        runtime: ChildGrantRuntime,
-    ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            runtime.decision_store.is_some(),
-            "live child issuer requires its admitted store"
-        );
-        anyhow::ensure!(
-            execution_policy.matches(&runtime.security),
-            "child execution policy differs from admitted service"
-        );
-        let execution_security = Arc::clone(&runtime.security);
-        Self::from_parent(
-            scope,
-            (
-                parent::ParentSource::capture(parent),
-                Some(ParentModelSelection {
-                    provider: parent.provider_name().to_owned(),
-                    model: parent.model_name().to_owned(),
-                    credential: parent.model_binding().credential_reference().clone(),
-                }),
-            ),
-            catalog,
-            generation,
-            provider_catalog,
-            parent_record_binding,
-            runtime,
-            &execution_security.workspace_dir,
-        )
-    }
-
-    fn from_parent(
-        scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-        source: (parent::ParentSource, Option<ParentModelSelection>),
-        catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
-        generation: Arc<crate::config::ConfigGeneration>,
-        provider_catalog: Arc<crate::providers::catalog::CatalogView>,
-        parent_record_binding: (Arc<str>, String),
-        runtime: ChildGrantRuntime,
-        execution_workspace: &std::path::Path,
-    ) -> anyhow::Result<Self> {
-        let (parent, parent_model) = source;
-        let ChildGrantRuntime {
-            recursive_child_claimed,
-            decision_store,
-            source_fabric,
-            security,
-            parent_issuer,
-        } = runtime;
-        let actual_store = match decision_store {
-            Some(store) => store.workspace_id().context("child decision store namespace missing")?,
-            None => Arc::clone(&parent_record_binding.0),
-        };
-        let (manifest, _) = scope.gate_inputs();
-        anyhow::ensure!(
-            source_fabric.workspace_id() == parent.workspace_id()
-                && security.workspace_dir == execution_workspace
-                && manifest.catalog_generation == catalog.view(&Default::default()).generation()
-                && parent_record_binding.0 == actual_store
-                && parent_record_binding.1.len() == 64
-                && parent_record_binding.1.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && generation.id.0 == parent.config_generation_id()
-                && generation.source_revision.fingerprint_sha256 == parent.config_source_revision()
-                && generation.effective.workspace_dir.to_string_lossy() == parent.workspace_id()
-                && manifest.authority.owner == parent.owner_id()
-                && manifest.authority.workspace == parent.workspace_id()
-                && !parent.run_id().is_empty()
-                && !parent.session_key().is_empty()
-                && parent.source_event_id().is_some_and(|id| !id.is_empty()),
-            "child grant differs from admitted parent source"
-        );
-        Ok(Self(Arc::new(ChildGrantData {
-            recursive_child_claimed: Some(recursive_child_claimed.unwrap_or_else(|| {
-                Arc::new(recursive_allowance::RecursiveAllowance::new(
-                    u64::from(manifest.authority.max_cost_cents) * 10_000,
-                ))
-            })),
-            parent_model,
-            source_fabric,
-            security,
-            parent_record_binding,
-            parent_issuer,
-            provider_catalog,
-            catalog,
-            generation,
-            scope,
-            parent,
-        })))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn restore_process(
-        scope: Arc<crate::tools::capability::child::VerifiedChildScope>,
-        parent: parent::ParentSource,
-        catalog: Arc<crate::tools::capability::catalog::CapabilityCatalog>,
-        generation: Arc<crate::config::ConfigGeneration>,
-        provider_catalog: Arc<crate::providers::catalog::CatalogView>,
-        parent_record_binding: (Arc<str>, String),
-        runtime: ChildGrantRuntime,
-        receipt: &ChildInputReceipt,
-        worker: &crate::session_worker::protocol::WorkerManifest,
-        transport: &crate::session_worker::runner::AuthenticatedWorkerTransport,
-    ) -> anyhow::Result<Arc<Self>> {
-        transport.verify_manifest(worker)?;
-        anyhow::ensure!(
-            runtime.decision_store.is_some()
-                || authority_journal::verify(worker, &generation.effective.workspace_dir, &scope.gate_inputs().1.key)?,
-            "worker restoration requires journal or legacy store"
-        );
-        receipt.verify_backend(&runtime.source_fabric.memory())?;
-        verify_worker_input(runtime.source_fabric.workspace_id(), worker, &scope, receipt.event())?;
-        let source = worker.child_source.as_ref().context("worker child source missing")?;
-        let (child, constraints) = scope.gate_inputs();
-        let expected_parent = parent.bind_process(child.parent_authority_id, &constraints.key)?;
-        anyhow::ensure!(
-            source.parent_store_workspace == parent_record_binding.0.as_ref()
-                && source.parent_decision_digest == parent_record_binding.1
-                && source.parent_source.matches_binding(&expected_parent),
-            "worker restore arguments differ from authenticated manifest provenance"
-        );
-        let grant = Self::from_parent(
-            scope,
-            (parent, None),
-            catalog,
-            generation,
-            provider_catalog,
-            parent_record_binding,
-            runtime,
-            &worker.workspace_dir,
-        )?;
-        grant.verify_receipt(receipt)?;
-        grant.verify_child_model(&worker.provider_name, &worker.model)?;
-        Ok(Arc::new(grant))
-    }
-
-    /// Attach only authority already issued to this exact durable spawn input.
-    /// The caller signs the complete worker manifest after this method returns.
-    pub(crate) fn bind_worker_manifest(
-        &self,
-        worker: &mut crate::session_worker::protocol::WorkerManifest,
-        receipt: &ChildInputReceipt,
-        selection: &crate::session_worker::protocol::WorkerProviderSelection,
-    ) -> anyhow::Result<()> {
-        self.verify_receipt(receipt)?;
-        let event = receipt.event();
-        let parent = self.parent();
-        let (manifest, constraints) = self.scope().gate_inputs();
-        manifest.verify(constraints)?;
-        anyhow::ensure!(
-            worker.capability_manifest.is_none()
-                && worker.ordinary_source.is_none()
-                && worker.child_source.is_none()
-                && worker.parent_capability.is_none()
-                && event.source == MessageEventSource::SessionsSpawn
-                && receipt.input() == worker.task
-                && event.run_id.as_deref() == Some(worker.run_id.as_str())
-                && event.session_key.as_deref() == Some(worker.session_scope_key.as_str())
-                && worker.owner_id.as_deref() == Some(parent.owner_id())
-                && worker.parent_run_id.as_deref() == Some(parent.spawn_run_id())
-                && worker.runtime_config_generation_id == Some(parent.config_generation_id())
-                && worker.runtime_config_source_revision.as_deref() == Some(parent.config_source_revision())
-                && worker.scope_channel.as_deref() == Some(parent.policy_channel())
-                && worker.scope_sender.as_deref() == Some(parent.policy_sender())
-                && worker.scope_chat_type.as_deref() == Some(parent.policy_chat_type())
-                && worker.agent_id == event.agent_id,
-            "worker manifest differs from issued child source"
-        );
-        let (workspace, digest) = self.parent_record_binding();
-        let parent_constraints = constraints.to_worker_constraints()?;
-        let config_generation = self.generation().bind_process(&constraints.key)?;
-        let catalog = self.catalog().bind_process(&constraints.key)?;
-        let provider_catalog = self
-            .provider_catalog()
-            .bind_process(&constraints.key, manifest.parent_authority_id)?;
-        let parent_source = self
-            .0
-            .parent
-            .bind_process(manifest.parent_authority_id, &constraints.key)?;
-        let input_event_mac = constraints.key.hmac(
-            crate::security::runtime_key::KeyDomain::StateFingerprint,
-            &[
-                b"worker-child-input-v1",
-                manifest.parent_authority_id.to_string().as_bytes(),
-                &serde_json::to_vec(event)?,
-            ],
-        );
-        let resolved = crate::providers::selection::check_with(
-            &self.generation().effective,
-            self.provider_catalog(),
-            &selection.provider,
-            &selection.model,
-            selection.credential.clone(),
-            &crate::providers::catalog::Requirement::chat(),
-            crate::providers::catalog::UnknownPolicy::Invocation,
-        )?;
-        self.verify_child_model(resolved.provider_label(), resolved.model())?;
-        anyhow::ensure!(
-            crate::providers::ProviderId::of(resolved.provider_label())
-                == crate::providers::ProviderId::of(&worker.provider_name)
-                && resolved.model() == worker.model,
-            "worker selected provider differs from issued model request"
-        );
-        let route =
-            crate::providers::selection::route_target(self.provider_catalog(), &selection.provider, &selection.model)?;
-        anyhow::ensure!(
-            route.map(|route| route.hint.as_str()) == worker.route_hint.as_deref(),
-            "worker selected route differs from issued model request"
-        );
-        let root = matches!(
-            resolved.credential().reference(),
-            crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
-        );
-        worker.api_key = resolved.credential().api_key().map(str::to_owned);
-        worker.direct_uses_root_connection = route.is_none() && root;
-        worker.route_uses_root_connection = route.is_some() && root;
-        worker.route_source_provider = route.map(|_| selection.provider.clone());
-        worker.route_credential = route.map(|_| resolved.credential().reference().clone());
-        worker.capability_manifest = Some(manifest.to_worker_manifest());
-        worker.child_source = Some(crate::session_worker::protocol::WorkerChildSource {
-            input_event_id: event.event_id.clone(),
-            provider_selection: selection.clone(),
-            input_event_mac,
-            parent_source,
-            provider_catalog,
-            parent_store_workspace: workspace.to_owned(),
-            parent_decision_digest: digest.to_owned(),
-            parent_constraints,
-            config_generation,
-            catalog,
-            journal_version: self.journal_version(),
-        });
-        let issuer = self.parent_issuer_evidence()?;
-        let launch_parent = authority_journal::LaunchParentRow {
-            version: authority_journal::LAUNCH_PARENT_VERSION,
-            run: worker.run_id.clone(),
-            owner: parent.owner_id().to_owned(),
-            parent_decision: manifest.parent_authority_id.to_string(),
-            parent_digest: digest.to_owned(),
-            store_workspace: workspace.to_owned(),
-            parent_run_id: issuer.run_id.clone(),
-            session_key: issuer.session_key.clone(),
-            source_event_id: issuer.source_event_id.clone(),
-            parent_task_run_id: issuer.task_id.clone(),
-            config_generation_id: parent.config_generation_id(),
-            config_source_revision: parent.config_source_revision().to_owned(),
-            enabled_snapshot: issuer.enabled_snapshot,
-            legacy_v1: issuer.legacy_v1,
-            admits_issued_child: issuer.admits_issued_child,
-        };
-        authority_journal::persist(worker, &constraints.key, &launch_parent)?;
-        Ok(())
-    }
-
-    pub(crate) fn provider_catalog(&self) -> &crate::providers::catalog::CatalogView {
-        &self.0.provider_catalog
-    }
-
-    pub(crate) fn catalog(&self) -> &Arc<crate::tools::capability::catalog::CapabilityCatalog> {
-        &self.0.catalog
-    }
-
-    pub(crate) fn generation(&self) -> &Arc<crate::config::ConfigGeneration> {
-        &self.0.generation
-    }
-
-    pub(crate) fn scope(&self) -> &Arc<crate::tools::capability::child::VerifiedChildScope> {
-        &self.0.scope
-    }
-
-    /// A process worker cannot own tools whose backend lives only in the
-    /// interactive parent's event loop. Re-derive a sibling child scope from
-    /// the same authenticated parent so the transport carries only executable
-    /// worker capabilities, without consuming another delegation depth.
-    pub(crate) fn for_process_worker(&self) -> anyhow::Result<Self> {
-        let (manifest, parent) = self.scope().gate_inputs();
-        let catalog = self.catalog().view(&Default::default());
-        let requested = manifest
-            .allowed
-            .iter()
-            .filter(|reference| {
-                catalog
-                    .entry_any(&reference.id)
-                    .is_some_and(|entry| entry.process_worker_compatible)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if requested.len() == manifest.allowed.len() {
-            return Ok(self.clone());
-        }
-        let narrowed = manifest.narrow_allowed(parent, &requested)?;
-        let scope = Arc::new(crate::tools::capability::child::VerifiedChildScope::new(
-            narrowed, parent,
-        )?);
-        Ok(Self(Arc::new(ChildGrantData {
-            parent_issuer: self.0.parent_issuer.clone(),
-            recursive_child_claimed: self.0.recursive_child_claimed.clone(),
-            parent_model: self.0.parent_model.clone(),
-            source_fabric: self.0.source_fabric.clone(),
-            security: Arc::clone(&self.0.security),
-            parent_record_binding: self.0.parent_record_binding.clone(),
-            provider_catalog: Arc::clone(&self.0.provider_catalog),
-            catalog: Arc::clone(&self.0.catalog),
-            generation: Arc::clone(&self.0.generation),
-            scope,
-            parent: self.0.parent.clone(),
-        })))
-    }
-
-    pub(crate) fn source_fabric(&self) -> &MemoryFabric {
-        &self.0.source_fabric
-    }
-
-    pub(crate) fn security(&self) -> &Arc<crate::security::SecurityPolicy> {
-        &self.0.security
-    }
-
-    pub(crate) fn model_source(&self) -> anyhow::Result<(&str, &str, &crate::providers::credentials::CredentialRef)> {
-        let source = self
-            .0
-            .parent_model
-            .as_ref()
-            .context("restored incoming grant cannot select a new child model")?;
-        Ok((&source.provider, &source.model, &source.credential))
-    }
-
-    /// Grants are issued by the live parent, so their terminals are journal-required.
-    pub(crate) const fn journal_version(&self) -> Option<u8> {
-        Some(authority_journal::JOURNAL_REQUIRED_VERSION)
-    }
-
-    pub(crate) fn parent_record_binding(&self) -> (&str, &str) {
-        (&self.0.parent_record_binding.0, &self.0.parent_record_binding.1)
-    }
-
-    pub(crate) fn parent(&self) -> &parent::ParentSource {
-        &self.0.parent
-    }
-
-    /// Only live issuance has this evidence. A restored grant cannot author rows.
-    pub(crate) fn parent_issuer_evidence(&self) -> anyhow::Result<&authority_journal::ParentIssuerEvidence> {
-        self.0
-            .parent_issuer
-            .as_ref()
-            .context("live parent issuer evidence missing for a restored grant")
-    }
-
-    /// Fill absent lineage only from the issued parent; contradictory existing
-    /// fields are errors rather than silently rewritten authority.
-    pub(crate) fn bind_event_scope(&self, scope: &mut MessageEventScope) -> anyhow::Result<()> {
-        let parent = self.parent();
-        anyhow::ensure!(
-            scope
-                .run_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty() && id != parent.run_id() && id != parent.spawn_run_id())
-                && scope.session_key.as_deref().is_some_and(|id| !id.is_empty()),
-            "child input requires a distinct run and a session"
-        );
-        for (field, expected) in [
-            (&mut scope.owner_id, parent.owner_id()),
-            (&mut scope.parent_run_id, parent.spawn_run_id()),
-            (&mut scope.parent_session_key, parent.session_key()),
-            (
-                &mut scope.causation_event_id,
-                parent.source_event_id().context("parent source missing")?,
-            ),
-            (&mut scope.channel, parent.policy_channel()),
-            (&mut scope.sender, parent.policy_sender()),
-            (&mut scope.config_source_revision, parent.config_source_revision()),
-        ] {
-            anyhow::ensure!(
-                field.as_deref().is_none_or(|actual| actual == expected),
-                "child input lineage contradicts issued parent"
-            );
-            if field.is_none() {
-                *field = Some(expected.to_owned());
-            }
-        }
-        anyhow::ensure!(
-            scope
-                .config_generation_id
-                .is_none_or(|id| id == parent.config_generation_id()),
-            "child input generation contradicts issued parent"
-        );
-        scope.config_generation_id = Some(parent.config_generation_id());
-        Ok(())
-    }
-
-    pub(crate) fn verify_receipt(&self, receipt: &ChildInputReceipt) -> anyhow::Result<()> {
-        let parent = self.parent();
-        let event = receipt.event();
-        anyhow::ensure!(
-            event.workspace_id == parent.workspace_id()
-                && event.owner_id.as_deref() == Some(parent.owner_id())
-                && event.parent_run_id.as_deref() == Some(parent.spawn_run_id())
-                && event
-                    .run_id
-                    .as_deref()
-                    .is_some_and(|id| !id.is_empty() && id != parent.run_id() && id != parent.spawn_run_id())
-                && event.parent_session_key.as_deref() == Some(parent.session_key())
-                && event.causation_event_id.as_deref() == parent.source_event_id()
-                && event.channel.as_deref() == Some(parent.policy_channel())
-                && event.sender.as_deref() == Some(parent.policy_sender())
-                && event.config_generation_id == Some(parent.config_generation_id())
-                && event.config_source_revision.as_deref() == Some(parent.config_source_revision()),
-            "child input does not descend from the issued parent decision"
-        );
-        Ok(())
-    }
-}
-
-// None deliberately shadows ambient authority on every service dispatch.
-tokio::task_local! {
-    static OUTGOING_GRANT: Option<Arc<IssuedChildGrant>>;
 }
 
 /// Reliability settings for a child whose provider was pinned on purpose
@@ -1080,27 +359,6 @@ pub(crate) async fn scope_ordinary_provider_fixture<F: std::future::Future>(
         .await
 }
 
-pub(crate) async fn scope_outgoing_grant<F: std::future::Future>(
-    grant: Option<Arc<IssuedChildGrant>>,
-    work: F,
-) -> F::Output {
-    OUTGOING_GRANT.scope(grant, work).await
-}
-
-pub(crate) fn outgoing_grant() -> Option<Arc<IssuedChildGrant>> {
-    OUTGOING_GRANT.try_with(Clone::clone).ok().flatten()
-}
-
-/// The exact PMM selection used by the child provider factory. Fields are
-/// runtime-private; the child obtains it only for the actual provider Arc.
-pub(crate) struct ChildModelSelection<'a> {
-    pub(super) grant: &'a IssuedChildGrant,
-    pub(super) provider_name: &'a str,
-    pub(super) model_name: &'a str,
-    pub(super) resolved: &'a crate::providers::catalog::ResolvedModel,
-    pub(super) route: Option<crate::providers::catalog::RouteTarget>,
-}
-
 pub(super) struct OrdinaryChildModelSelection<'a> {
     pub(super) generation: &'a crate::config::ConfigGeneration,
     pub(super) provider_name: &'a str,
@@ -1112,7 +370,6 @@ pub(super) struct OrdinaryChildModelSelection<'a> {
 /// Owns actual factory output and its source selection. Debug is opaque and
 /// serialization is unavailable because the resolved model retains credentials.
 pub(crate) struct ChildProviderBinding {
-    grant: Option<Arc<IssuedChildGrant>>,
     generation: Arc<crate::config::ConfigGeneration>,
     provider: Arc<dyn crate::providers::Provider>,
     requested_provider: String,
@@ -1128,42 +385,12 @@ impl std::fmt::Debug for ChildProviderBinding {
 }
 
 impl ChildProviderBinding {
-    pub(crate) fn build(
-        grant: Arc<IssuedChildGrant>,
-        provider_name: &str,
-        model_name: &str,
-        credential: crate::providers::credentials::CredentialRef,
-    ) -> anyhow::Result<Self> {
-        let config = &grant.generation().effective;
-        let catalog = grant.provider_catalog();
-        let route = crate::providers::selection::route_target(catalog, provider_name, model_name)?.cloned();
-        let resolved = crate::providers::selection::check_with(
-            config,
-            catalog,
-            provider_name,
-            model_name,
-            credential,
-            &crate::providers::catalog::Requirement::chat(),
-            crate::providers::catalog::UnknownPolicy::Invocation,
-        )?;
-        Self::from_selection(
-            Some(Arc::clone(&grant)),
-            Arc::clone(grant.generation()),
-            catalog,
-            provider_name,
-            model_name,
-            resolved,
-            route,
-        )
-    }
-
     /// Preserve the provider instance authenticated by the explicit operator
     /// ingress. This model binding alone does not grant child capabilities.
     pub(crate) fn build_operator(source: &super::operator_spawn::OperatorSpawnSource) -> anyhow::Result<Self> {
         use super::turn_source::TurnSourceProof;
         source.verify_live()?;
         let binding = Self {
-            grant: None,
             generation: Arc::clone(source.generation()),
             provider: Arc::clone(source.provider()),
             requested_provider: source.proof().provider_name().to_owned(),
@@ -1184,8 +411,7 @@ impl ChildProviderBinding {
     ) -> anyhow::Result<()> {
         use super::turn_source::TurnSourceProof;
         anyhow::ensure!(
-            self.grant.is_none()
-                && Arc::ptr_eq(&self.generation, source.generation())
+            Arc::ptr_eq(&self.generation, source.generation())
                 && Arc::ptr_eq(&self.provider, source.provider())
                 && self.requested_provider == source.proof().provider_name()
                 && self.requested_model == source.proof().model_name()
@@ -1194,53 +420,6 @@ impl ChildProviderBinding {
             "operator child model binding differs from pinned source"
         );
         Ok(())
-    }
-
-    pub(crate) fn build_worker(
-        grant: Arc<IssuedChildGrant>,
-        worker: &crate::session_worker::protocol::WorkerManifest,
-    ) -> anyhow::Result<Self> {
-        let selection = &worker
-            .child_source
-            .as_ref()
-            .context("worker provider selection missing")?
-            .provider_selection;
-        let catalog = grant.provider_catalog();
-        let route = crate::providers::selection::route_target(catalog, &selection.provider, &selection.model)?.cloned();
-        let resolved = crate::providers::selection::check_with(
-            &grant.generation().effective,
-            catalog,
-            &selection.provider,
-            &selection.model,
-            selection.credential.clone(),
-            &crate::providers::catalog::Requirement::chat(),
-            crate::providers::catalog::UnknownPolicy::Invocation,
-        )?;
-        let root = matches!(
-            resolved.credential().reference(),
-            crate::providers::credentials::CredentialRef::LegacyInline(crate::providers::credentials::LegacySlot::Root)
-        );
-        anyhow::ensure!(
-            crate::providers::ProviderId::of(resolved.provider_label())
-                == crate::providers::ProviderId::of(&worker.provider_name)
-                && resolved.model() == worker.model
-                && resolved.credential().api_key() == worker.api_key.as_deref()
-                && route.as_ref().map(|route| route.hint.as_str()) == worker.route_hint.as_deref()
-                && worker.direct_uses_root_connection == (route.is_none() && root)
-                && worker.route_uses_root_connection == (route.is_some() && root)
-                && worker.route_source_provider.as_deref() == route.as_ref().map(|_| selection.provider.as_str())
-                && worker.route_credential.as_ref() == route.as_ref().map(|_| resolved.credential().reference()),
-            "worker provider or credential provenance differs from issued selection"
-        );
-        Self::from_selection(
-            Some(Arc::clone(&grant)),
-            Arc::clone(grant.generation()),
-            catalog,
-            &selection.provider,
-            &selection.model,
-            resolved,
-            route,
-        )
     }
 
     /// A disabled ordinary child has model provenance, but no parent authority.
@@ -1254,13 +433,9 @@ impl ChildProviderBinding {
     ) -> anyhow::Result<Self> {
         let generation = match publication {
             Some(publication) => Arc::clone(publication.generation()),
-            None => crate::config::ConfigGeneration::for_disabled_child(config)?,
+            None => crate::config::ConfigGeneration::for_child(config)?,
         };
         let catalog = publication.map_or(catalog, |publication| publication.provider_catalog());
-        anyhow::ensure!(
-            !generation.effective.causal_tree.enabled,
-            "ordinary child requires disabled decision plane"
-        );
         let route = crate::providers::selection::route_target(catalog, provider_name, model_name)?.cloned();
         let resolved = crate::providers::selection::check_with(
             &generation.effective,
@@ -1281,7 +456,6 @@ impl ChildProviderBinding {
                 .then(|| Arc::clone(&fixture.provider))
         }) {
             return Ok(Self {
-                grant: None,
                 generation,
                 provider,
                 requested_provider: provider_name.to_owned(),
@@ -1290,11 +464,10 @@ impl ChildProviderBinding {
                 route,
             });
         }
-        Self::from_selection(None, generation, catalog, provider_name, model_name, resolved, route)
+        Self::from_selection(generation, catalog, provider_name, model_name, resolved, route)
     }
 
     fn from_selection(
-        grant: Option<Arc<IssuedChildGrant>>,
         generation: Arc<crate::config::ConfigGeneration>,
         catalog: &crate::providers::catalog::CatalogView,
         provider_name: &str,
@@ -1302,19 +475,10 @@ impl ChildProviderBinding {
         resolved: crate::providers::catalog::ResolvedModel,
         route: Option<crate::providers::catalog::RouteTarget>,
     ) -> anyhow::Result<Self> {
-        if let Some(grant) = &grant {
-            grant.verify_child_model(resolved.provider_label(), resolved.model())?;
-        }
         let config = &generation.effective;
-        // A delegated provider remains pinned to its selected vendor, matching
+        // A child provider remains pinned to its selected vendor, matching
         // the existing child contract. The factory validates model fallbacks.
-        let mut reliability = pinned_provider_reliability(&config.reliability);
-        if grant
-            .as_ref()
-            .is_some_and(|grant| grant.scope().gate_inputs().0.authority.delegation.is_some())
-        {
-            reliability.model_fallbacks.clear();
-        }
+        let reliability = pinned_provider_reliability(&config.reliability);
         let options = crate::providers::provider_runtime_options_from_config(config);
         let provider = Arc::from(crate::providers::create_provider_for(
             &resolved,
@@ -1324,7 +488,6 @@ impl ChildProviderBinding {
             &options,
         )?);
         Ok(Self {
-            grant,
             generation,
             provider,
             requested_provider: provider_name.to_owned(),
@@ -1355,9 +518,7 @@ impl ChildProviderBinding {
         caller: Option<&crate::tools::execution::ChildCallContext>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.grant.is_none()
-                && !self.generation.effective.causal_tree.enabled
-                && Arc::ptr_eq(provider, &self.provider)
+            Arc::ptr_eq(provider, &self.provider)
                 && workspace_id == self.generation.effective.workspace_dir.to_string_lossy(),
             "ordinary child input differs from its provider snapshot"
         );
@@ -1567,40 +728,6 @@ impl ChildProviderBinding {
             .with_dispatch_origin(crate::tools::DispatchOrigin::ModelTurn)
             .with_incoming_child(proof.as_ref())?;
         Ok((proof, execution))
-    }
-
-    pub(crate) fn source_proof(
-        &self,
-        grant: &IssuedChildGrant,
-        receipt: &ChildInputReceipt,
-        provider: &Arc<dyn crate::providers::Provider>,
-    ) -> anyhow::Result<super::turn_source::OwnedTurnSourceProof> {
-        super::turn_source::OwnedTurnSourceProof::from_child_receipt(
-            grant,
-            receipt,
-            &self.generation,
-            self.selection_for(provider)?,
-        )
-    }
-
-    pub(crate) fn selection_for(
-        &self,
-        provider: &Arc<dyn crate::providers::Provider>,
-    ) -> anyhow::Result<ChildModelSelection<'_>> {
-        anyhow::ensure!(
-            Arc::ptr_eq(provider, &self.provider),
-            "child provider instance changed after selection"
-        );
-        Ok(ChildModelSelection {
-            grant: self
-                .grant
-                .as_deref()
-                .context("ordinary child has no delegated parent authority")?,
-            provider_name: &self.requested_provider,
-            model_name: &self.requested_model,
-            resolved: &self.resolved,
-            route: self.route.clone(),
-        })
     }
 }
 

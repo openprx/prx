@@ -225,7 +225,6 @@ async fn selected_skill_target_turn(lifecycle: bool, execute: bool) -> SelectedS
     let mut service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -405,7 +404,11 @@ async fn crashed_after_marker(
     crate::agent::terminal::finalize_turn_stop_after_marker(
         &fabric,
         crate::agent::terminal::TurnTerminalDraft {
-            decision: Some(service.settlement_ref(Arc::clone(&context)).expect("test: link")),
+            decision: Some(
+                service
+                    .terminal_settlement_ref(Arc::clone(&context))
+                    .expect("test: link"),
+            ),
             binding: Some(service.terminal_binding(&context).expect("test: binding")),
             terminal_id: terminal_id.to_owned(),
             scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)

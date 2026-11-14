@@ -219,18 +219,6 @@ pub(super) fn worker_message_event_scope(manifest: &WorkerManifest) -> MessageEv
     scope
 }
 
-pub(super) fn worker_lineage_payload(manifest: &WorkerManifest) -> serde_json::Value {
-    serde_json::json!({
-        "owner_id": manifest.owner_id.as_deref(),
-        "topic_id": manifest.topic_id.as_deref(),
-        "parent_task_id": manifest.parent_task_id.as_deref(),
-        "source_message_event_id": manifest.source_message_event_id.as_deref(),
-        "parent_run_id": manifest.parent_run_id.as_deref(),
-        "session_scope_key": manifest.session_scope_key.as_str(),
-        "spawn_depth": manifest.spawn_depth
-    })
-}
-
 #[inline(never)]
 pub(super) fn boxed_worker_segments<F, Fut>(make_work: F) -> std::pin::Pin<Box<Fut>>
 where
@@ -242,9 +230,6 @@ where
 
 pub(super) async fn with_manifest_spawn_context<T, Fut>(
     manifest: &WorkerManifest,
-    input_receipt: Option<Arc<crate::runtime::child_source::ChildInputReceipt>>,
-    incoming_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    provider_binding: Option<Arc<crate::runtime::child_source::ChildProviderBinding>>,
     terminal_usage: Option<Arc<crate::runtime::turn_terminal::TerminalUsageCollector>>,
     fut: Fut,
 ) -> T
@@ -252,11 +237,7 @@ where
     Fut: Future<Output = T>,
 {
     if !manifest.session_scope_key.trim().is_empty() {
-        let source_message_event_id = if incoming_grant.is_some() {
-            input_receipt.as_ref().map(|receipt| receipt.event().event_id.clone())
-        } else {
-            manifest.source_message_event_id.clone()
-        };
+        let source_message_event_id = manifest.source_message_event_id.clone();
         SPAWN_EXECUTION_CONTEXT
             .scope(
                 SpawnExecutionContext {
@@ -265,10 +246,9 @@ where
                     },
                     operator_authority: None,
                     ordinary_authority: None,
-                    incoming_grant,
-                    provider_binding,
+                    provider_binding: None,
                     terminal_usage,
-                    input_receipt,
+                    input_receipt: None,
                     run_id: manifest.run_id.clone(),
                     session_scope_key: manifest.session_scope_key.clone(),
                     spawn_depth: manifest.spawn_depth,

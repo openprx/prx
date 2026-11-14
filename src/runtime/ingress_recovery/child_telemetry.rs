@@ -99,10 +99,6 @@ pub(crate) async fn reconcile_child_telemetry(
         return Ok(skipped);
     }
     anyhow::ensure!(
-        service.runtime.parent_grant().is_none(),
-        "child repair requires the published ingress owner"
-    );
-    anyhow::ensure!(
         scope.workspace_id == service.generation.effective.workspace_dir.to_string_lossy()
             && !scope.owner_id.is_empty()
             && scope.owner_id.len() <= 4096,

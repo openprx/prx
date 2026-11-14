@@ -226,7 +226,6 @@ fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
         &resolved.config,
         &[],
         None,
-        None,
         &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0x20; 32]),
         None,
     )
@@ -309,7 +308,6 @@ fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal
             None,
             &resolved.config,
             excluded,
-            None,
             None,
             &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0x20; 32]),
             None,

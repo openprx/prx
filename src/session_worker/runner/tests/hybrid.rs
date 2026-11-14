@@ -51,8 +51,6 @@ async fn hybrid_worker_shared_context_reads_parent_fabric() {
         .unwrap();
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-hybrid".to_string(),
@@ -172,8 +170,6 @@ async fn process_mode_worker_prompt_carries_no_other_owners_spawn_text() {
     }
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-hybrid".to_string(),
@@ -253,7 +249,6 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         .with_agent_id("agent-a")
         .with_persona_id("persona-a");
     let result = WorkerResult {
-        completion_evidence: None,
         ordinary_completion: None,
         operator_completion: None,
         success: true,
@@ -267,8 +262,6 @@ async fn hybrid_worker_result_creates_private_draft_and_parent_merge_request() {
         .unwrap();
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-hybrid".to_string(),
@@ -408,7 +401,6 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
         .with_session_key("telegram:chat-1:alice")
         .with_run_id("run-hybrid");
     let result = WorkerResult {
-        completion_evidence: None,
         ordinary_completion: None,
         operator_completion: None,
         success: true,
@@ -418,8 +410,6 @@ async fn hybrid_worker_draft_obeys_readonly_resource_gate() {
     };
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-hybrid".to_string(),

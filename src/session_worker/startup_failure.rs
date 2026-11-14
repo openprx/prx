@@ -30,7 +30,6 @@ fn validate_failure(result: &WorkerResult) -> anyhow::Result<()> {
             && result.output.is_empty()
             && result.error.as_deref().is_some_and(|error| !error.is_empty())
             && result.tokens_used.is_none()
-            && result.completion_evidence.is_none()
             && result.ordinary_completion.is_none()
             && result.operator_completion.is_none(),
         "startup failure conflicts with execution or completion evidence"
@@ -87,7 +86,6 @@ impl AuthenticatedStartupFailure {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!run_id.is_empty(), "startup failure run identity missing");
         let result = WorkerResult {
-            completion_evidence: None,
             ordinary_completion: None,
             operator_completion: None,
             success: false,

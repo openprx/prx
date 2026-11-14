@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::base_manifest;
-use super::probe::{retain_worker_probe_directory, with_worker_probe_manifest};
 use crate::session_worker::protocol::WorkerManifest;
 use crate::session_worker::runner::capability::{
     compute_worker_capability, manifest_signing_payload, validate_worker_capability_with_env,
@@ -368,32 +367,6 @@ async fn worker_missing_config_source_fails_without_initializing_defaults() {
     assert!(
         !config_dir.exists(),
         "session-worker must not initialize a missing parent config source"
-    );
-}
-
-#[tokio::test]
-async fn worker_rejects_changed_config_generation_before_workspace_side_effects() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let tmp = retain_worker_probe_directory(tmp);
-    let config_dir = tmp.path().join("config");
-    let workspace = tmp.path().join("worker");
-    let error = with_worker_probe_manifest(&tmp, "custom:http://127.0.0.1:1".to_owned(), |manifest| async move {
-        // The real parent has already issued this manifest against the
-        // actual config bytes. Change only those private bytes afterwards.
-        let config_path = config_dir.join("config.toml");
-        let mut config: crate::config::Config = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
-        config.default_temperature = 0.6;
-        std::fs::write(config_path, toml::to_string(&config)?)?;
-        let config_dir_arg = config_dir.to_string_lossy().to_string();
-        run_validated_manifest(manifest, None, Some(&config_dir_arg)).await
-    })
-    .await
-    .unwrap_err();
-
-    assert!(format!("{error:#}").contains("generation mismatch"));
-    assert!(
-        !workspace.exists(),
-        "generation mismatch must fail before worker side effects"
     );
 }
 

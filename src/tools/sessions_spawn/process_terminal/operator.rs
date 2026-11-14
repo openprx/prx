@@ -2,13 +2,10 @@
 pub(in crate::tools::sessions_spawn) mod launch;
 mod segments;
 use super::{
-    CausalDecisionStore, ConfirmedProcessRepair, Context, Digest, MemoryFabric, MessageEvent, MessageEventSource,
-    MessageEventSubject, RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage, Sha256,
-    TurnTerminalStatus, WorkerResult, authority_journal, read_terminal, replay_requires_journal,
-    verify_terminal_replay, verify_terminal_replay_journal,
+    ConfirmedProcessRepair, Context, Digest, MemoryFabric, MessageEvent, MessageEventSource, MessageEventSubject,
+    RecoveredProcessOutcome, RecoveredProcessRun, RecoveredWorkerUsage, Sha256, TurnTerminalStatus, WorkerResult,
+    read_terminal,
 };
-use crate::agent::terminal::authenticated_replay_store_workspace;
-use crate::runtime::child_source::completion::ChildOutcomeHook;
 use crate::session_worker::protocol::WorkerManifest;
 
 /// Read-only completion provenance. Deliberately excludes task text, credentials,
@@ -117,7 +114,7 @@ async fn verify_bound(
     domain: &[u8],
 ) -> anyhow::Result<VerifiedOperatorWorkerCompletion> {
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.ordinary_completion.is_none(),
+        result.ordinary_completion.is_none(),
         "operator completion rejects granted evidence"
     );
     let (key, lineage) = authenticate_launch(fabric, worker, generation, transport_key).await?;
@@ -230,7 +227,7 @@ async fn verify_completion(
         .as_deref()
         .context("operator completion owner missing")?;
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.ordinary_completion.is_none(),
+        result.ordinary_completion.is_none(),
         "operator completion rejects granted evidence"
     );
     let evidence = result
@@ -335,7 +332,7 @@ async fn verify_completion(
                 payload.get("terminal_id").and_then(serde_json::Value::as_str) == Some(reference.terminal_id.as_str()),
                 "operator segment asserts a different decision or terminal"
             );
-            verify_segment_replay(fabric, owner, &reference.terminal_id, &event, &payload).await?;
+            verify_segment_replay(&payload)?;
             let usage: Option<crate::llm::route_decision::MeteredTokenUsageRecord> = serde_json::from_value(
                 payload
                     .get("usage_settlement")
@@ -410,7 +407,7 @@ pub(crate) async fn recover_completion(
     transport_key: &ring::hmac::Key,
 ) -> anyhow::Result<Option<VerifiedOperatorWorkerCompletion>> {
     anyhow::ensure!(
-        worker.operator_source.is_some() && worker.child_source.is_none(),
+        worker.operator_source.is_some(),
         "operator recovery requires an operator launch"
     );
     if !generation.effective.memory.event_recording_config().enabled {
@@ -466,99 +463,16 @@ async fn recover_journal(
     .map(Some)
 }
 
-async fn verify_segment_replay(
-    fabric: &MemoryFabric,
-    owner: &str,
-    run: &str,
-    event: &MessageEvent,
-    payload: &serde_json::Value,
-) -> anyhow::Result<()> {
-    if !payload
-        .get("decision_id")
-        .context("operator segment decision field missing")?
-        .is_null()
-    {
-        let workspace = std::path::Path::new(fabric.workspace_id());
-        let decision_key = crate::security::runtime_key::DecisionKey::load_existing(workspace)?;
-        let journal = replay_requires_journal(&decision_key, event, None)?;
-        let store = (!journal).then(|| CausalDecisionStore::open_unshared_read_only(workspace));
-        let reader = store.as_ref().map(|store| store.reader());
-        let store_workspace: std::sync::Arc<str> = if journal {
-            std::sync::Arc::from(authenticated_replay_store_workspace(&decision_key, event)?)
-        } else {
-            store
-                .as_ref()
-                .and_then(|store| store.workspace_id())
-                .context("operator decision store namespace missing")?
-        };
-        let memory = fabric.memory();
-        let replay = if journal {
-            verify_terminal_replay_journal(
-                memory.as_ref(),
-                workspace,
-                &decision_key,
-                &store_workspace,
-                fabric.workspace_id(),
-                owner,
-                run,
-                event,
-            )
-            .await?
-        } else {
-            verify_terminal_replay(
-                memory.as_ref(),
-                reader.as_ref().context("operator decision reader missing")?,
-                &decision_key,
-                &store_workspace,
-                fabric.workspace_id(),
-                owner,
-                run,
-                event,
-            )
-            .await?
-        };
-        anyhow::ensure!(
-            replay.parent_decision_id().is_none(),
-            "operator segment asserts model delegation"
-        );
-        let facts = crate::causal_tree::outcome::TerminalFacts::from_persisted_marker(
-            event,
-            replay.decision(),
-            owner,
-            fabric.workspace_id(),
-        )?
-        .with_verified_resume(&replay);
-        let outcome = crate::causal_tree::outcome::OutcomeCorrelator::persisted_record(replay.decision(), &facts)?;
-        let hook = crate::runtime::child_source::completion::JournalChildOutcomeHook::new(
-            workspace.to_path_buf(),
-            std::sync::Arc::clone(&decision_key),
-            std::sync::Arc::clone(&store_workspace),
-        );
-        hook.persist(&replay, event, None, None).await?;
-        if journal {
-            anyhow::ensure!(
-                authority_journal::verify_child_outcome(
-                    workspace,
-                    &decision_key,
-                    &hook.expected_row(&replay, event)?,
-                    Some(authority_journal::JOURNAL_REQUIRED_VERSION),
-                )?,
-                "operator segment outcome is missing or conflicts"
-            );
-        } else {
-            let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
-                workspace_id: store_workspace,
-                owner_id: std::sync::Arc::from(owner),
-            };
-            anyhow::ensure!(
-                reader
-                    .as_ref()
-                    .context("operator decision reader missing")?
-                    .outcome_matches(&scope, &outcome)?,
-                "operator segment outcome is missing or conflicts"
-            );
-        }
-    }
+fn verify_segment_replay(payload: &serde_json::Value) -> anyhow::Result<()> {
+    // Decision-recorded segments belonged to the removed delegated issuance
+    // (P2-G4); an operator segment never carries a decision record.
+    anyhow::ensure!(
+        payload
+            .get("decision_id")
+            .context("operator segment decision field missing")?
+            .is_null(),
+        "operator segment carries a decision record"
+    );
     Ok(())
 }
 

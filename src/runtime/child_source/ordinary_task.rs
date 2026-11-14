@@ -212,8 +212,7 @@ impl OrdinaryTaskSegments {
                 })
                 .to_string(),
             ),
-            None,
-        )
+)
         .await?;
         self.authority.verify()?;
         let next_previous = receipt

@@ -449,25 +449,6 @@ pub(crate) fn configured_connection_for<'a>(
     }
 }
 
-/// The reliability settings a chain may be built with for `connection`.
-///
-/// `reliability.api_keys` are rotation credentials for the root `api_key`, so
-/// they belong to the same provider identity and travel only with the root
-/// connection. A selection the root connection was withheld from gets the same
-/// settings with the rotation keys cleared; nothing else changes, and
-/// `fallback_providers` stay because the factory builds every fallback without
-/// a credential already.
-pub(crate) fn scoped_reliability<'a>(
-    reliability: &'a crate::config::ReliabilityConfig,
-    connection: &ProviderConnection<'_>,
-) -> std::borrow::Cow<'a, crate::config::ReliabilityConfig> {
-    if connection.released || reliability.api_keys.is_empty() {
-        std::borrow::Cow::Borrowed(reliability)
-    } else {
-        std::borrow::Cow::Owned(without_rotation_keys(reliability))
-    }
-}
-
 /// The one credential a selected provider may receive.
 ///
 /// `owned` pairs each credential in scope with the provider it was issued for.
@@ -485,15 +466,6 @@ pub(crate) fn credential_for_provider_identity<'a>(
         let owner = owner.map(str::trim).filter(|value| !value.is_empty())?;
         (canonical_provider_key(owner) == selected_key).then_some(credential)
     })
-}
-
-pub(super) fn without_rotation_keys(
-    reliability: &crate::config::ReliabilityConfig,
-) -> crate::config::ReliabilityConfig {
-    crate::config::ReliabilityConfig {
-        api_keys: Vec::new(),
-        ..reliability.clone()
-    }
 }
 
 /// PMM-B-2: one namespaced identity, and the canonicalizers folded into it.

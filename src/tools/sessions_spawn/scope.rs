@@ -8,8 +8,6 @@ pub(crate) struct SpawnExecutionContext {
     pub(crate) task_input: crate::messaging::TaskInput,
     pub(crate) operator_authority: Option<Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
     pub(crate) ordinary_authority: Option<Arc<crate::runtime::child_source::ordinary_task::OrdinaryTaskAuthority>>,
-    /// Incoming authority for this child, never an outgoing grant for its tools.
-    pub(crate) incoming_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
     pub(crate) provider_binding: Option<Arc<crate::runtime::child_source::ChildProviderBinding>>,
     pub(crate) terminal_usage: Option<Arc<crate::runtime::turn_terminal::TerminalUsageCollector>>,
     pub(crate) input_receipt: Option<Arc<crate::runtime::child_source::ChildInputReceipt>>,
@@ -53,7 +51,6 @@ impl SpawnExecutionContext {
             },
             operator_authority: None,
             ordinary_authority: None,
-            incoming_grant: None,
             provider_binding: None,
             terminal_usage: None,
             input_receipt: None,

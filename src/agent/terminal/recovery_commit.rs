@@ -364,11 +364,6 @@ pub(super) async fn finalize_recovery_terminal(
     // The pinned trusted surface of the turn (R22), byte-identical to the
     // former final-hop value.
     let surface = commit.binding.runtime().trusted.surface.as_str().to_owned();
-    let parent_authority_id = commit
-        .binding
-        .parent_grant
-        .as_ref()
-        .map(|grant| grant.scope().gate_inputs().0.parent_authority_id.to_string());
     let (skill_status, awaiting_approval, verified) = recovered_skill(&commit, execution_trace.as_ref());
     let settled = SettledTerminalFacts {
         v: 1,
@@ -380,7 +375,9 @@ pub(super) async fn finalize_recovery_terminal(
         semantic_mac_v3,
         status: status.to_owned(),
         surface,
-        parent_authority_id,
+        // Delegated child issuance is removed (P2-G4); the closed facts
+        // schema keeps the field, always absent.
+        parent_authority_id: None,
         pricing: pricing.as_str().to_owned(),
         usage_digest,
         key_id: key_id.clone(),

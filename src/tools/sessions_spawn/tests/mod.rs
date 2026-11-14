@@ -13,7 +13,6 @@
 mod actions;
 mod announce;
 mod chat_assign;
-mod child_authority;
 mod credential_containment;
 mod credential_resolution;
 mod join;

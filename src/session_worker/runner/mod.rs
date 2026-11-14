@@ -15,8 +15,6 @@ mod validate;
 pub(crate) use self::capability::AuthenticatedWorkerTransport;
 use self::capability::capability_expiry_from_env;
 use self::paths::parse_tools_override;
-#[cfg(test)]
-pub(crate) use self::provider::build_worker_provider_selection;
 use self::provider::worker_credentials;
 use self::run::run_authenticated_manifest;
 pub(crate) use self::run::worker_child_skill_reader;
@@ -157,7 +155,6 @@ pub async fn run_from_stdin(
         Ok(value) => value,
         Err(error) => {
             let result = WorkerResult {
-                completion_evidence: None,
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,
@@ -184,7 +181,6 @@ pub async fn run_from_stdin(
         explicit_config_dir.as_deref(),
     ) {
         let result = WorkerResult {
-            completion_evidence: None,
             ordinary_completion: None,
             operator_completion: None,
             success: false,
@@ -203,7 +199,6 @@ pub async fn run_from_stdin(
                 return write_worker_result(failure.envelope());
             }
             WorkerResult {
-                completion_evidence: None,
                 ordinary_completion: None,
                 operator_completion: None,
                 success: false,

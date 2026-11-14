@@ -189,7 +189,6 @@ impl<'a> PublicationScope<'a> {
 
     pub(crate) fn child_scope(&self) -> Option<&'a Arc<VerifiedChildScope>> {
         crate::runtime::child_source::turn_scope::issued_child_scope(
-            self.holder.parent_grant().map(AsRef::as_ref),
             self.ordinary_parent,
             self.ordinary_task,
             self.ordinary_process,

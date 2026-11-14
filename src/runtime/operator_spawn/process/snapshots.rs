@@ -43,9 +43,7 @@ impl OperatorProcessSnapshots {
             .as_ref()
             .context("operator worker source missing")?;
         anyhow::ensure!(
-            manifest.child_source.is_none()
-                && manifest.capability_manifest.is_none()
-                && manifest.ordinary_source.is_none()
+            manifest.ordinary_source.is_none()
                 && !manifest.run_id.is_empty()
                 && !manifest.session_scope_key.is_empty()
                 && manifest.runtime_config_generation_id == Some(source.config_generation.id.0)

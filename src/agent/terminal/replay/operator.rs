@@ -54,10 +54,6 @@ pub(super) async fn prepare(
     let Some(parent) = &binding.operator_parent else {
         return Ok(None);
     };
-    anyhow::ensure!(
-        binding.parent_grant.is_none(),
-        "operator replay cannot also claim model delegation"
-    );
     let event = binding
         .memory
         .find_owned_message_event(

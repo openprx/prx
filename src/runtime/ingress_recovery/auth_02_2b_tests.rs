@@ -150,7 +150,6 @@ pub(super) async fn recovery_store_without_writer_rejoin_fails_closed() {
         &generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        None,
         &tracker,
         Some(key),
         crate::runtime::ingress_recovery::PreparedAdvisory {
@@ -257,7 +256,6 @@ async fn prepare_recovery_only(workspace: &Path, memory: Arc<dyn Memory>) -> (Ar
         &generation,
         memory,
         crate::tools::capability::turn_state::TurnSurfaceKind::AgentLoop,
-        None,
         &tracker,
         None,
         PreparedAdvisory::default(),

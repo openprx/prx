@@ -29,7 +29,6 @@ async fn enabled_agent_rejects_memory_without_message_events_before_key_or_store
         let result = build_publication(
             TurnSurfaceKind::AgentLoop,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution,
@@ -71,7 +70,6 @@ async fn enabled_agent_rejects_disabled_user_event_recording_before_key_or_store
     let result = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -200,7 +198,6 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
     let stale = build_publication(
         TurnSurfaceKind::Interactive,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry: Arc::clone(&registry),
             execution: Arc::clone(&execution),
@@ -217,7 +214,6 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
     assert!(matches!(stale, Err(PublicationBuildError::SourceGeneration)));
     assert!(!workspace.path().join("self/causal_tree/.decision_key").exists());
     let bundle = PublicationInputs {
-        parent_grant: None,
         generation: Arc::clone(&generation),
         registry: Arc::clone(&registry),
         execution: Arc::clone(&execution),
@@ -261,7 +257,6 @@ async fn disabled_service_keeps_workspace_key_absent_and_builtin_only() {
     let second = build_publication(
         TurnSurfaceKind::Interactive,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -311,7 +306,6 @@ async fn disabled_service_uses_an_independent_read_only_view_when_a_writer_is_sh
     let result = build_publication(
         TurnSurfaceKind::Interactive,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -359,7 +353,6 @@ async fn enabled_service_with_unavailable_key_does_not_open_a_writable_store() {
     let service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,

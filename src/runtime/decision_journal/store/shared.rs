@@ -26,12 +26,6 @@ fn slot(path: PathBuf) -> Arc<StoreSlot> {
     slot
 }
 
-pub(super) fn existing_writer(workspace: &Path) -> Option<Arc<CausalDecisionStore>> {
-    let slot = STORES.lock().get(&db_path(workspace)).and_then(Weak::upgrade)?;
-    let existing = slot.current.lock().upgrade();
-    existing.filter(|store| store.mode == StoreMode::ReadWrite && store.writer.is_some())
-}
-
 pub(super) fn open(
     workspace: &Path,
     retention: Retention,
@@ -62,6 +56,3 @@ pub(super) fn open_with(
     *slot.current.lock() = Arc::downgrade(&store);
     Ok(store)
 }
-
-#[cfg(test)]
-mod tests;

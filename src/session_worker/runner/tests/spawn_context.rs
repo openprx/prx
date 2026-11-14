@@ -2,15 +2,13 @@
 
 use crate::session_worker::protocol::WorkerManifest;
 use crate::session_worker::runner::context::{
-    with_manifest_spawn_context, worker_lineage_payload, worker_message_event_scope, worker_runtime_envelope,
+    with_manifest_spawn_context, worker_message_event_scope, worker_runtime_envelope,
 };
 
 #[tokio::test]
 async fn process_mode_restores_spawn_context_for_nested_runs() {
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-child".to_string(),
@@ -60,7 +58,7 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
         compaction_config: None,
     };
 
-    let snapshot = with_manifest_spawn_context(&manifest, None, None, None, None, async {
+    let snapshot = with_manifest_spawn_context(&manifest, None, async {
         crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
             .try_with(|ctx| {
                 (
@@ -92,8 +90,6 @@ async fn process_mode_restores_spawn_context_for_nested_runs() {
 fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
     let manifest = WorkerManifest {
         parent_capability: Some("capability".to_string()),
-        capability_manifest: None,
-        child_source: None,
         ordinary_source: None,
         operator_source: None,
         run_id: "run-child".to_string(),
@@ -171,23 +167,4 @@ fn worker_event_scope_preserves_spawn_lineage_and_owner_isolation() {
     assert_eq!(write_context.channel.as_deref(), Some("telegram"));
     assert_eq!(write_context.chat_id.as_deref(), Some("chat-1"));
     assert_eq!(write_context.raw_sender.as_deref(), Some("alice"));
-    let payload = worker_lineage_payload(&manifest);
-    assert_eq!(
-        payload.get("owner_id").and_then(serde_json::Value::as_str),
-        Some("owner-a")
-    );
-    assert_eq!(
-        payload.get("topic_id").and_then(serde_json::Value::as_str),
-        Some("topic-a")
-    );
-    assert_eq!(
-        payload.get("parent_task_id").and_then(serde_json::Value::as_str),
-        Some("run-parent")
-    );
-    assert_eq!(
-        payload
-            .get("source_message_event_id")
-            .and_then(serde_json::Value::as_str),
-        Some("msg-a")
-    );
 }

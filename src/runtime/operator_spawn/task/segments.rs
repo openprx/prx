@@ -55,8 +55,7 @@ impl OperatorTaskSegments {
                 "previous_segment_input_event_id": self.previous_input.as_ref().map(crate::runtime::child_source::SegmentPredecessor::event_id)})
                 .to_string(),
             ),
-            None,
-        )
+)
         .await?;
         authority.verify()?;
         let next_previous = receipt

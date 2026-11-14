@@ -11,7 +11,6 @@ use crate::runtime::turn_context::validate_agent_turn_origin;
 use crate::runtime::turn_decision::{TurnDecisionContext, TurnDecisionService, pinned_policy_version};
 use crate::runtime::turn_publication::PublicationLoopRuntime;
 use crate::runtime::turn_source::TurnSourceProof;
-use crate::security::SecurityPolicy;
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -21,25 +20,6 @@ use anyhow::Context;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-
-/// Proof that child execution retains the exact policy of an admitted service.
-/// Only this module constructs its fields, and only from an admitted service.
-pub(crate) struct ChildExecutionPolicy {
-    security: Arc<SecurityPolicy>,
-}
-
-impl ChildExecutionPolicy {
-    /// The exact policy of the admitted service that issues the child grant.
-    pub(in crate::runtime) fn of_service(service: &TurnDecisionService) -> Self {
-        Self {
-            security: Arc::clone(&service.security),
-        }
-    }
-
-    pub(super) fn matches(&self, security: &Arc<SecurityPolicy>) -> bool {
-        Arc::ptr_eq(&self.security, security)
-    }
-}
 
 /// Read-only provenance for ordinary disabled children. Retaining the actual
 /// service preserves its catalog, PMM and runtime extension generation.
@@ -96,10 +76,6 @@ impl OrdinaryChildPublication {
         authority: crate::runtime::child_source::ParentAuthority,
         requested: &[CapabilityRef],
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            !service.generation.effective.causal_tree.enabled,
-            "ordinary publication requires disabled plane"
-        );
         let manifest = crate::tools::capability::child::ChildCapabilityManifest::derive_strict_subset(
             &authority.constraints,
             requested,
@@ -122,8 +98,7 @@ impl OrdinaryChildPublication {
         let envelope = &caller.envelope;
         validate_agent_turn_origin(&self.0.service.generation, self.0.service.surface, source)?;
         anyhow::ensure!(
-            !self.0.service.generation.effective.causal_tree.enabled
-                && !self.0.context.execution_closed.load(Ordering::Acquire)
+            !self.0.context.execution_closed.load(Ordering::Acquire)
                 && caller.execution_trace.as_ref() == self.0.context.execution_trace.get()
                 && envelope.workspace_id == source.workspace_id()
                 && envelope.resolved_owner_id() == source.owner_id()
@@ -153,8 +128,7 @@ impl OrdinaryChildPublication {
     /// A child cannot outlive the parent execution that selected its manifest.
     pub(in crate::runtime) fn verify_live(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.0.service.generation.effective.causal_tree.enabled
-                && !self.0.context.execution_closed.load(Ordering::Acquire)
+            !self.0.context.execution_closed.load(Ordering::Acquire)
                 && self
                     .0
                     .context
@@ -268,7 +242,6 @@ impl OrdinaryChildPublication {
                     TurnSurfaceKind::Worker,
                 )),
                 Some(self.allocate_child_budget()?.1.money()),
-                None,
                 &parent.generation.effective,
                 &parent.security,
             )),
@@ -316,10 +289,6 @@ impl OrdinaryChildPublication {
     /// Validate frozen scope and live backend bindings for an already issued
     /// task. The task authority separately checks its own cancellation lease.
     pub(crate) fn verify_task_scope(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.0.service.generation.effective.causal_tree.enabled,
-            "ordinary task requires disabled plane"
-        );
         self.0.scope.validate_runtime(
             &self.0.service.state_key,
             self.0.source.owner_id(),

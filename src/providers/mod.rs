@@ -78,7 +78,7 @@ pub(crate) use identity::canonical_auth_profile_provider;
 use identity::split_byo_provider;
 pub(crate) use identity::{
     ByoDialect, ProviderConnection, ProviderIdentity, byo_dialect_of, canonical_provider_key, classify_provider,
-    configured_connection_for, credential_for_provider_identity, scoped_reliability,
+    configured_connection_for, credential_for_provider_identity,
 };
 pub use identity::{ProviderId, ProviderNamespace, default_provider_for_unset};
 

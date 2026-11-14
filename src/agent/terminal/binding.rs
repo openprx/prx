@@ -2,7 +2,7 @@
 //!
 //! [`TerminalBinding`] carries the non-decision half of the former settlement
 //! link: the pinned turn runtime context, the source channel captured at
-//! opening, the incoming child grant or operator parent, the workspace and
+//! opening, the operator parent, the workspace and
 //! cost configuration of the pinned generation, and the turn's memory. Terminal
 //! scope checks compare against the trusted parts pinned in
 //! [`TurnRuntimeContext`] (R22), never against a decision hop.
@@ -21,7 +21,6 @@ use super::TurnTerminalStatus;
 pub struct TerminalBinding {
     runtime: Arc<TurnRuntimeContext>,
     source_channel: Arc<str>,
-    pub(super) parent_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
     pub(super) operator_parent: Option<Arc<crate::runtime::child_source::parent::ParentSource>>,
     pub(super) workspace_dir: PathBuf,
     cost_config: CostConfig,
@@ -49,20 +48,11 @@ impl TerminalBinding {
         Self {
             runtime,
             source_channel,
-            parent_grant: None,
             operator_parent: None,
             workspace_dir,
             cost_config,
             memory,
         }
-    }
-
-    pub(crate) fn with_parent_grant(
-        mut self,
-        grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
-    ) -> Self {
-        self.parent_grant = grant;
-        self
     }
 
     pub(crate) fn with_operator_parent(

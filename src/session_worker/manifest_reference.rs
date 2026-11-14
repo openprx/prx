@@ -272,7 +272,8 @@ pub(crate) fn restore(
             && <[u8; 32]>::from(Sha256::digest(&bytes)) == body.digest,
         "worker manifest snapshot content differs"
     );
-    let manifest: WorkerManifest = serde_json::from_slice(&bytes)?;
+    let manifest: WorkerManifest =
+        serde_json::from_slice(&bytes).map_err(|_| crate::session_worker::protocol::WorkerManifestUnsupported)?;
     anyhow::ensure!(
         manifest.run_id == body.run_id
             && manifest.config_generation == body.config_generation

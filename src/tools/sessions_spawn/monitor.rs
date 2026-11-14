@@ -208,8 +208,6 @@ pub(super) fn watch_process_mode_monitor(
     run_id: String,
     process_control: Arc<ProcessRunControl>,
     mut work_guard: crate::runtime::registry::WorkGuard,
-    verified_terminal: Arc<parking_lot::Mutex<Option<process_terminal::VerifiedWorkerCompletion>>>,
-    recovery: Option<Arc<process_terminal::ProcessRecovery>>,
     ordinary_terminal: Arc<parking_lot::Mutex<Option<process_terminal::ordinary::VerifiedOrdinaryWorkerCompletion>>>,
     ordinary_recovery: Option<process_terminal::ordinary::OrdinaryProcessRecovery>,
     operator_terminal: Arc<parking_lot::Mutex<Option<process_terminal::operator::VerifiedOperatorWorkerCompletion>>>,
@@ -217,64 +215,6 @@ pub(super) fn watch_process_mode_monitor(
 ) {
     tokio::spawn(async move {
         let joined = handle.await;
-        if !matches!(
-            process_control.finalization(),
-            Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)
-        ) {
-            let mut retained = verified_terminal.lock().clone();
-            if retained.is_none() {
-                if let Some(recovery) = recovery.as_ref() {
-                    match recovery.recover().await {
-                        Ok(completion) => retained = completion,
-                        Err(error) => tracing::error!(run_id = %run_id, error = %error,
-                            "process observer journal recovery remains unconfirmed"),
-                    }
-                }
-            }
-            if let Some(completion) = retained {
-                if completion.run_id() == run_id {
-                    let repair = recovery
-                        .as_ref()
-                        .map(|owner| owner.repair(completion.clone()))
-                        .transpose();
-                    let repair = match repair {
-                        Ok(repair) => repair,
-                        Err(error) => {
-                            tracing::error!(run_id = %run_id, error = %error, "process repair authority unavailable");
-                            None
-                        }
-                    };
-                    let (result, usage) = completion.into_parts();
-                    let status = if result.success {
-                        SubAgentStatus::Completed(result.output)
-                    } else {
-                        SubAgentStatus::Failed(sub_agent_reported_failure(
-                            result.error.as_deref().unwrap_or("worker failed"),
-                        ))
-                    };
-                    if let Some(repair) = repair {
-                        if let Err(error) = commit_process_terminal_state(
-                            &active_runs,
-                            &run_id,
-                            status,
-                            usage,
-                            process_control.as_ref(),
-                            ProcessFinalization::Natural,
-                            Some(&repair),
-                            #[cfg(test)]
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::error!(run_id = %run_id, error = %error,
-                            "retained worker completion could not be reconciled");
-                        }
-                    }
-                } else {
-                    tracing::error!(run_id = %run_id, "retained worker completion belongs to another run");
-                }
-            }
-        }
         if !matches!(
             process_control.finalization(),
             Some(ProcessFinalization::Natural | ProcessFinalization::Terminated)

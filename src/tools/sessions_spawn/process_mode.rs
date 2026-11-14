@@ -3,15 +3,12 @@ use super::{
     PROCESS_MEMORY_STRATEGY_ISOLATED, PROCESS_MEMORY_STRATEGY_SHARED, PROCESS_OWNER_PANICKED_PREFIX, ProcessRunControl,
     ProcessWorkerOutcome, SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV, SpawnLineage, SpawnScope,
     WorkerSteerPipe, build_session_worker_cli_args, build_session_worker_manifest, cleanup_owned_child_after_panic,
-    cleanup_process_worker_workspace, copy_dir_recursive, current_spawn_execution_context, describe_worker_exit,
-    normalize_process_memory_strategy, private_worker_memory_db_path, process_terminal, recover_operator_interruption,
-    recover_ordinary_interruption, run_spawned_child_lifecycle, shared_worker_memory_db_path,
-    start_kill_and_reap_direct_child,
+    cleanup_process_worker_workspace, copy_dir_recursive, describe_worker_exit, normalize_process_memory_strategy,
+    private_worker_memory_db_path, process_terminal, recover_operator_interruption, recover_ordinary_interruption,
+    run_spawned_child_lifecycle, shared_worker_memory_db_path, start_kill_and_reap_direct_child,
 };
 #[cfg(test)]
-use super::{
-    TestWorkerExecutable, TestWorkerRouteObservation, test_worker_cleanup_error_class, test_worker_process_identity,
-};
+use super::{TestWorkerExecutable, test_worker_cleanup_error_class, test_worker_process_identity};
 use crate::config::AgentCompactionConfig;
 use crate::memory::{MemoryEventRecording, MemoryFabric};
 use crate::providers;
@@ -56,9 +53,7 @@ pub(super) async fn run_sub_agent_process(
     steer_rx: tokio::sync::mpsc::Receiver<String>,
     history: Arc<RwLock<Vec<HistoryEntry>>>,
     progress: Arc<crate::agent::idle::ProgressBeat>,
-    provider_selection: Option<&crate::session_worker::protocol::WorkerProviderSelection>,
     source_fabric: Option<&MemoryFabric>,
-    recovery: Option<&process_terminal::ProcessRecovery>,
     source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
     batch_id: Option<&str>,
     mailbox: Option<&Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
@@ -93,36 +88,9 @@ pub(super) async fn run_sub_agent_process(
             "process source storage differs from captured launch"
         );
     }
-    let execution = current_spawn_execution_context();
-    let child_source = execution
-        .as_ref()
-        .and_then(|context| context.incoming_grant.as_deref())
-        .map(|grant| {
-            let receipt = execution
-                .as_ref()
-                .and_then(|context| context.input_receipt.as_deref())
-                .context("process child input receipt is missing")?;
-            grant.verify_receipt(receipt)?;
-            let selection = provider_selection.context("process child provider selection missing")?;
-            Ok::<_, anyhow::Error>((grant, receipt, selection))
-        })
-        .transpose()?;
-    let logical_workspace_root = child_source.as_ref().map_or_else(
-        || {
-            process_generation.as_ref().map_or(workspace_root, |generation| {
-                generation.effective.workspace_dir.as_path()
-            })
-        },
-        |(grant, _, _)| grant.generation().effective.workspace_dir.as_path(),
-    );
-    if let Some((grant, _, _)) = child_source.as_ref() {
-        let fabric = source_fabric.context("process child logical source fabric missing")?;
-        anyhow::ensure!(
-            fabric.workspace_id() == grant.source_fabric().workspace_id()
-                && Arc::ptr_eq(&fabric.memory(), &grant.source_fabric().memory()),
-            "process child source storage differs from issued grant"
-        );
-    }
+    let logical_workspace_root = process_generation.as_ref().map_or(workspace_root, |generation| {
+        generation.effective.workspace_dir.as_path()
+    });
     let worker_workspace = worker_workspace_root.join(run_id);
     #[cfg(all(test, unix))]
     {
@@ -244,7 +212,6 @@ pub(super) async fn run_sub_agent_process(
         parent_run_id,
         compaction_config,
         channel_excluded_tools,
-        child_source,
         source_launch,
         &launch_transport_key,
         mailbox,
@@ -266,33 +233,6 @@ pub(super) async fn run_sub_agent_process(
     } else {
         std::env::current_exe().context("resolve the current executable path for the session worker child")?
     };
-    #[cfg(test)]
-    if let Some(observer) = test_worker_executable.and_then(|artifact| artifact.route_observer.as_ref()) {
-        use sha2::{Digest as _, Sha256};
-        let mut capture = observer.lock();
-        capture.total = capture.total.saturating_add(1);
-        if capture.first.is_none() {
-            capture.first = Some(TestWorkerRouteObservation {
-                run_id: manifest.run_id.clone(),
-                parent_run_id: manifest.parent_run_id.clone(),
-                owner_id: manifest.owner_id.clone(),
-                source_event_id: manifest.source_message_event_id.clone(),
-                provider: manifest.provider_name.clone(),
-                model: manifest.model.clone(),
-                route_hint: manifest.route_hint.clone(),
-                route_source_provider: manifest.route_source_provider.clone(),
-                route_credential: manifest.route_credential.clone(),
-                key_sha256: manifest
-                    .api_key
-                    .as_ref()
-                    .map(|key| Sha256::digest(key.as_bytes()).into()),
-                route_uses_root_connection: manifest.route_uses_root_connection,
-                direct_uses_root_connection: manifest.direct_uses_root_connection,
-                child_source_present: manifest.child_source.is_some(),
-                child_allowed_count: manifest.capability_manifest.as_ref().map(|scope| scope.allowed.len()),
-            });
-        }
-    }
     let cli_args = build_session_worker_cli_args(&manifest)?;
     let mut command = tokio::process::Command::new(executable);
     #[cfg(test)]
@@ -410,9 +350,6 @@ pub(super) async fn run_sub_agent_process(
                     "session-worker process group setup failed: {error:#}; snapshot cleanup failed: {cleanup_error:#}"
                 )
             })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Err(error);
         }
@@ -423,11 +360,6 @@ pub(super) async fn run_sub_agent_process(
         process_group.protocol_diagnostic = Some(Arc::clone(&control.diagnostic));
     }
     let owned_phase = std::panic::AssertUnwindSafe(async {
-        if let Some(recovery) = recovery {
-            recovery
-                .persist_launch(child.id().context("worker process id unavailable before launch")?)
-                .await?;
-        }
         if let Some(generation) = &ordinary_generation {
             process_terminal::ordinary::launch::persist(
                 source_fabric.context("ordinary launch source storage missing")?,
@@ -553,9 +485,6 @@ pub(super) async fn run_sub_agent_process(
                         "session-worker lifecycle failed: {error:#}; snapshot cleanup failed: {cleanup_error:#}"
                     )
                 })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             return Err(error);
         }
@@ -597,9 +526,6 @@ pub(super) async fn run_sub_agent_process(
                 .map_err(|cleanup_error| {
                     anyhow::anyhow!("{PROCESS_OWNER_PANICKED_PREFIX}; snapshot cleanup failed: {cleanup_error:#}")
                 })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
             cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
             anyhow::bail!("{PROCESS_OWNER_PANICKED_PREFIX} while owning session-worker child");
         }
@@ -621,9 +547,6 @@ pub(super) async fn run_sub_agent_process(
                     manifest.workspace_dir.display()
                 )
             })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
             (status, stdout, stderr)
         }
         OwnedProcessPhase::Terminated(reason) => {
@@ -642,9 +565,6 @@ pub(super) async fn run_sub_agent_process(
                     manifest.workspace_dir.display()
                 )
             })?;
-            if let Some(recovery) = recovery {
-                recovery.confirm_exit(run_id)?;
-            }
             if let Some(generation) = &ordinary_generation {
                 let recovered = recover_ordinary_interruption(
                     source_fabric.context("ordinary interrupted source storage missing")?,
@@ -689,7 +609,7 @@ pub(super) async fn run_sub_agent_process(
     let outcome = classify_worker_output(status, &stdout_raw, &stderr_raw);
     #[cfg(all(test, unix))]
     if let (Some(artifact), Ok(ProcessWorkerOutcome::Finished(result))) = (test_worker_executable, &outcome) {
-        if !result.success && result.completion_evidence.is_none() {
+        if !result.success {
             if let Some(error) = result.error.as_deref() {
                 // Diagnostic only for the explicitly attested local AUT. Keep
                 // unsigned failure evidence private; it grants no authority.
@@ -771,7 +691,7 @@ pub(super) async fn run_sub_agent_process(
         match outcome? {
             ProcessWorkerOutcome::UnverifiedStartupFailure(envelope) => {
                 anyhow::ensure!(
-                    child_source.is_none() && ordinary_generation.is_none(),
+                    ordinary_generation.is_none(),
                     "startup failure requires the original operator launch"
                 );
                 let generation = operator_generation
@@ -794,20 +714,7 @@ pub(super) async fn run_sub_agent_process(
                 Ok(ProcessWorkerOutcome::VerifiedStartupFailure(envelope.result))
             }
             ProcessWorkerOutcome::Finished(result) => {
-                if let Some((grant, input, _)) = child_source {
-                    anyhow::ensure!(
-                        input.event().run_id.as_deref() == Some(run_id),
-                        "worker result belongs to another launched run"
-                    );
-                    let verified = process_terminal::verify(
-                        source_fabric.context("worker logical source storage missing")?,
-                        grant,
-                        input,
-                        result,
-                    )
-                    .await?;
-                    Ok(ProcessWorkerOutcome::VerifiedFinished(verified))
-                } else if let Some(generation) = &ordinary_generation {
+                if let Some(generation) = &ordinary_generation {
                     let mut verified = process_terminal::ordinary::verify(
                         source_fabric.context("ordinary process source storage missing")?,
                         &manifest,
@@ -835,9 +742,7 @@ pub(super) async fn run_sub_agent_process(
                     Ok(ProcessWorkerOutcome::OperatorVerifiedFinished(verified))
                 } else {
                     anyhow::ensure!(
-                        result.completion_evidence.is_none()
-                            && result.ordinary_completion.is_none()
-                            && result.operator_completion.is_none(),
+                        result.ordinary_completion.is_none() && result.operator_completion.is_none(),
                         "ordinary worker completion requires its authenticated verifier"
                     );
                     Ok(ProcessWorkerOutcome::Finished(result))

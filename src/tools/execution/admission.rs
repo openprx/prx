@@ -297,7 +297,7 @@ pub(super) fn admit_child(
     // launcher bodies repeat their own checks, but none may be reached without them.
     if matches!(name, "delegate" | "sessions_spawn") {
         let depth = scope.gate_inputs().0.authority.remaining_depth;
-        if depth == 0 || (context.child_grant.is_none() && context.ordinary_child_publication.is_none()) {
+        if depth == 0 || context.ordinary_child_publication.is_none() {
             return Err((
                 ToolExecutionStatus::Denied,
                 format!("tool '{name}' has no spawn depth or parent authority for this child"),

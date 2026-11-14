@@ -1,4 +1,4 @@
-//! Construct outgoing authority from exact mentions or admitted discoveries.
+//! Construct the ordinary outgoing child scope from exact mentions or admitted discoveries.
 use super::{
     Arc, CapabilityRef, Context, Exposure, Ordering, TurnDecisionContext, TurnDecisionService, TurnSourceProof,
 };
@@ -7,11 +7,6 @@ use super::{
 };
 use crate::tools::capability::child::AuthorityEnvelope;
 use crate::tools::capability::child::CapabilityConstraints;
-use std::time::Duration;
-
-/// Durability verification is a correctness gate with its own bound. It must
-/// not share the decision latency budget (`extra_latency_budget_ms`).
-const DELEGATION_DURABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct OutgoingDelegation {
     pub parent: CapabilityConstraints,
@@ -34,55 +29,6 @@ impl TurnDecisionService {
         (crate::agent::classifier::classify_intent(task, projected.as_ref()).intent
             == crate::agent::classifier::TaskIntent::Delegate)
             .then_some("sessions_spawn")
-    }
-
-    /// Children may read the parent immediately, including in another process.
-    /// Queue admission alone cannot authorize that launch.
-    pub(super) async fn validate_delegation_storage(&self, context: Arc<TurnDecisionContext>) -> anyhow::Result<()> {
-        #[cfg(test)]
-        crate::decision_engine::access_spy::record_delegation_storage(&self.generation.effective.workspace_dir);
-        let deadline = crate::runtime::logical_clock::now()
-            .checked_add(DELEGATION_DURABILITY_TIMEOUT)
-            .context("delegation durability deadline cannot be represented")?;
-        anyhow::ensure!(
-            crate::runtime::logical_clock::now() < deadline,
-            "delegation persistence exceeded the decision deadline"
-        );
-        // Preserve the issued-context authority checks before reading storage.
-        let _settlement = self.settlement_ref(Arc::clone(&context))?;
-        let workspace = self.store.workspace_id().context("parent decision store missing")?;
-        let trusted = context.engine.state.trusted.parts();
-        let scope = crate::runtime::decision_journal::store::DecisionScope::Owner {
-            workspace_id: Arc::clone(&workspace),
-            owner_id: trusted.owner_id.clone().context("parent decision owner missing")?,
-        };
-        let records =
-            crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(&context, &self.state_key, true)?;
-        let writer = self.store.writer().context("parent decision writer missing")?;
-        let rows = writer.replay_chain(scope, context.hop_ids().to_vec(), deadline).await?;
-        anyhow::ensure!(rows.len() == records.len(), "delegation chain readback count conflicts");
-        for (position, (record, stored)) in records.iter().zip(rows).enumerate() {
-            let stored = stored.context("delegation parent hop was not durably stored")?;
-            let view = &stored.decision;
-            anyhow::ensure!(
-                view.enabled_snapshot
-                    && !view.legacy_v1
-                    && view.prior_decision_id
-                        == position.checked_sub(1).and_then(|n| context.hop_ids().get(n)).copied()
-                    && view.session_key.as_deref() == trusted.session_key.as_deref()
-                    && view.run_id.as_deref() == trusted.run_id.as_deref()
-                    && view.channel.is_none()
-                    && view.policy_version == trusted.policy_version.as_ref()
-                    && view.decision_id == record.decision_id
-                    && stored.digest == record.replay_digest(&workspace)?,
-                "stored delegation parent differs from the issued decision chain"
-            );
-        }
-        anyhow::ensure!(
-            crate::runtime::logical_clock::now() < deadline,
-            "delegation readback exceeded the decision deadline"
-        );
-        Ok(())
     }
 
     /// Verify the selected subset independently of durable grant issuance.
@@ -145,46 +91,6 @@ impl TurnDecisionService {
         )?)
     }
 
-    pub(super) fn issue_child_grant(
-        &self,
-        proof: &dyn TurnSourceProof,
-        context: &TurnDecisionContext,
-    ) -> anyhow::Result<Arc<crate::runtime::child_source::IssuedChildGrant>> {
-        self.agent_execution_specs(proof, context)?;
-        anyhow::ensure!(
-            !context.execution_closed.load(Ordering::Acquire)
-                && context.record_admitted.load(Ordering::Acquire)
-                && self.generation.effective.causal_tree.enabled
-                && self.durable_key,
-            "parent decision cannot issue child authority"
-        );
-        let scope = self.verified_delegation_scope(context)?;
-        let store_workspace = self.store.workspace_id().context("parent decision store missing")?;
-        let records =
-            crate::causal_tree::outcome::DecisionRecordBuilder::build_enabled_chain(context, &self.state_key, true)?;
-        let parent_record = records.last().context("parent decision record missing")?;
-        let parent_digest = parent_record.replay_digest(&store_workspace)?;
-        let parent_issuer =
-            crate::runtime::child_source::authority_journal::ParentIssuerEvidence::from_record(parent_record)?;
-        Ok(Arc::new(crate::runtime::child_source::IssuedChildGrant::new(
-            Arc::new(scope),
-            proof,
-            Arc::clone(&self.catalog),
-            Arc::clone(&self.generation),
-            Arc::new(self.provider_catalog.clone()),
-            (store_workspace, parent_digest),
-            crate::runtime::child_source::publication::ChildExecutionPolicy::of_service(self),
-            crate::runtime::child_source::ChildGrantRuntime {
-                recursive_child_claimed: context.runtime().issue_recursive_allowance(proof),
-                decision_store: Some(Arc::clone(&self.store)),
-                source_fabric: crate::memory::MemoryFabric::new(Arc::clone(&self.memory), proof.workspace_id())
-                    .with_event_recording(self.generation.effective.memory.event_recording_config()),
-                security: Arc::clone(&self.security),
-                parent_issuer: Some(parent_issuer),
-            },
-        )?))
-    }
-
     pub(super) fn outgoing_delegation(
         &self,
         proof: &dyn TurnSourceProof,
@@ -195,11 +101,8 @@ impl TurnDecisionService {
     ) -> Option<OutgoingDelegation> {
         // Ordinary turns without a discovery or an exact delegator name
         // keep the allocation-free absence path; never scan the catalog.
-        // Enabled delegation requires a durable parent grant. Disabled turns
-        // carry the same strict subset through an ordinary child publication.
-        if self.generation.effective.causal_tree.enabled && (!self.durable_key || !self.recordable) {
-            return None;
-        }
+        // Every child carries the strict subset through an ordinary child
+        // publication.
         let trusted = state.trusted.parts();
         let permitted = |entry: &crate::tools::capability::catalog::CapabilityEntry| {
             catalog.contains(&entry.id)

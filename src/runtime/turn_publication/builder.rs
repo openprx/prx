@@ -13,7 +13,7 @@ use crate::providers::catalog::CatalogView as ProviderCatalogView;
 use crate::runtime::decision_journal::store::StoreMode;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::security::SecurityPolicy;
-use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
+use crate::tools::capability::catalog::{CapabilityCatalog, CatalogSources, SurfacePolicy};
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::execution::ToolExecutionService;
 use crate::tools::traits::Tool;
@@ -22,7 +22,6 @@ use crate::tools::traits::Tool;
 /// A caller supplies the finalized registry and its execution service,
 /// rather than letting the decision plane infer capabilities from config.
 pub(crate) struct PublicationInputs<'a> {
-    pub parent_grant: Option<Arc<crate::runtime::child_source::IssuedChildGrant>>,
     pub generation: Arc<ConfigGeneration>,
     pub registry: Arc<Vec<Box<dyn Tool>>>,
     pub execution: Arc<ToolExecutionService>,
@@ -53,10 +52,9 @@ pub(crate) async fn build_publication(
     if build.catalog_sources.config_generation_id != build.generation.id.0.to_string() {
         return Err(PublicationBuildError::SourceGeneration);
     }
-    match (&build.parent_grant, surface) {
-        (Some(grant), TurnSurfaceKind::Worker) if Arc::ptr_eq(grant.generation(), &build.generation) => {}
-        (None, surface) if surface != TurnSurfaceKind::Worker => {}
-        _ => return Err(PublicationBuildError::ChildAuthority),
+    // Worker children publish through the ordinary or operator process path.
+    if surface == TurnSurfaceKind::Worker {
+        return Err(PublicationBuildError::ChildAuthority);
     }
     let config = &build.generation.effective;
     if config.causal_tree.enabled && !crate::memory::serves_tool_execution_ledger(build.memory.name()) {
@@ -70,37 +68,6 @@ pub(crate) async fn build_publication(
     let runtime_key = crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
     let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
     let durable_key = workspace_key.is_some();
-    if let Some(grant) = &build.parent_grant {
-        let key = workspace_key
-            .as_ref()
-            .filter(|_| durable_key)
-            .ok_or(PublicationBuildError::ChildAuthority)?;
-        let (manifest, _) = grant.scope().gate_inputs();
-        grant
-            .scope()
-            .validate_runtime(
-                key,
-                &manifest.authority.owner,
-                &config.workspace_dir.to_string_lossy(),
-                grant.catalog().view(&CatalogScope::default()).generation(),
-            )
-            .map_err(|_| PublicationBuildError::ChildAuthority)?;
-        for reference in &manifest.allowed {
-            let view = grant.catalog().view(&CatalogScope::default());
-            let entry = view
-                .entry_any(&reference.id)
-                .ok_or(PublicationBuildError::ChildAuthority)?;
-            if !build
-                .surface_policy
-                .permits(&entry.public_name, &entry.root, &entry.target)
-                || build.surface_policy.excluded_names.contains(&entry.public_name)
-                || build.surface_policy.excluded_names.contains(&entry.root)
-            {
-                return Err(PublicationBuildError::ChildAuthority);
-            }
-        }
-        grant.catalog().check_child_parity(&build.execution, grant.scope())?;
-    }
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
     let opened = if durable_key {
         Some(
@@ -137,7 +104,6 @@ pub(crate) async fn build_publication(
         &build.generation,
         Arc::clone(&build.memory),
         surface,
-        build.parent_grant.clone(),
         crate::runtime::turn_context::RecoveryPreparation {
             owner: recovery_owner,
             workspace_key: workspace_key.clone(),
@@ -160,18 +126,12 @@ pub(crate) async fn build_publication(
     // Node ids and engine child seals must use the same key in this service.
     // The source's independent key cannot assert workspace provenance.
     catalog_sources.node_key = Some(Arc::clone(&state_key));
-    let catalog = match &build.parent_grant {
-        Some(grant) => Arc::clone(grant.catalog()),
-        None => {
-            let catalog = Arc::new(CapabilityCatalog::build(
-                build.registry.as_ref(),
-                &catalog_sources,
-                &build.surface_policy,
-            )?);
-            catalog.check_parity(&build.execution)?;
-            catalog
-        }
-    };
+    let catalog = Arc::new(CapabilityCatalog::build(
+        build.registry.as_ref(),
+        &catalog_sources,
+        &build.surface_policy,
+    )?);
+    catalog.check_parity(&build.execution)?;
 
     let factory = DecisionBackendFactory::from_config(
         config,

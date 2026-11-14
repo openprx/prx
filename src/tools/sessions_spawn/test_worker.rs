@@ -1,46 +1,11 @@
 #[cfg(test)]
 use super::ProcessFinalization;
 #[cfg(test)]
-use crate::providers;
-#[cfg(test)]
 use anyhow::Context as _;
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Arc;
-
-#[cfg(test)]
-pub(crate) struct TestWorkerRecoveryResult {
-    pub(crate) launch_event_id: i64,
-    pub(crate) result: anyhow::Result<Option<bool>>,
-}
-
-/// Read-only fixture observation of the actual built worker manifest. No key,
-/// transport seal or grant bytes leave the launch producer through this seam.
-#[cfg(test)]
-pub(crate) struct TestWorkerRouteObservation {
-    pub(crate) run_id: String,
-    pub(crate) parent_run_id: Option<String>,
-    pub(crate) owner_id: Option<String>,
-    pub(crate) source_event_id: Option<String>,
-    pub(crate) provider: String,
-    pub(crate) model: String,
-    pub(crate) route_hint: Option<String>,
-    pub(crate) route_source_provider: Option<String>,
-    pub(crate) route_credential: Option<providers::credentials::CredentialRef>,
-    pub(crate) key_sha256: Option<[u8; 32]>,
-    pub(crate) route_uses_root_connection: bool,
-    pub(crate) direct_uses_root_connection: bool,
-    pub(crate) child_source_present: bool,
-    pub(crate) child_allowed_count: Option<usize>,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct TestWorkerRouteCapture {
-    pub(crate) total: usize,
-    pub(crate) first: Option<TestWorkerRouteObservation>,
-}
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -298,7 +263,6 @@ pub(super) struct TestWorkerExecutable {
     pub(super) path: PathBuf,
     pub(super) sha256: String,
     pub(super) private_home: PathBuf,
-    pub(super) route_observer: Option<Arc<parking_lot::Mutex<TestWorkerRouteCapture>>>,
     pub(super) protocol: Option<Arc<TestWorkerProtocolControl>>,
 }
 

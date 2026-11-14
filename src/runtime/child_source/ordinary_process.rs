@@ -20,12 +20,10 @@ pub(crate) async fn restore_input(
         .context("ordinary worker source missing")?;
     let (child, parent) = scope.gate_inputs();
     anyhow::ensure!(
-        worker.child_source.is_none()
-            && worker.capability_manifest.is_none()
-            && crate::tools::capability::child::ChildCapabilityManifest::from_worker_manifest(
-                &source.capability_manifest,
-                parent,
-            )? == *child
+        crate::tools::capability::child::ChildCapabilityManifest::from_worker_manifest(
+            &source.capability_manifest,
+            parent,
+        )? == *child
             && fabric.workspace_id() == child.authority.workspace
             && parent_source.workspace_id() == fabric.workspace_id()
             && parent_source.owner_id() == child.authority.owner
@@ -186,7 +184,6 @@ impl OrdinaryProcessSnapshots {
             crate::providers::catalog::UnknownPolicy::Invocation,
         )?;
         let binding = Arc::new(ChildProviderBinding::from_selection(
-            None,
             Arc::clone(&self.generation),
             &self.provider_catalog,
             &selection.provider,
@@ -245,8 +242,7 @@ impl OrdinaryProcessAuthority {
         anyhow::ensure!(!self.cancellation.is_cancelled(), "ordinary worker authority is closed");
         let source = &self.snapshots;
         anyhow::ensure!(
-            !source.generation.effective.causal_tree.enabled
-                && Arc::ptr_eq(&self.binding.generation, &source.generation)
+            Arc::ptr_eq(&self.binding.generation, &source.generation)
                 && source.parent.workspace_id() == self.fabric.workspace_id()
                 && source.parent.config_generation_id() == source.generation.id.0
                 && source.parent.config_source_revision() == source.generation.source_revision.fingerprint_sha256,

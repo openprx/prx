@@ -1,82 +1,6 @@
 //! Privacy-safe worker completion journal, written only after runtime cleanup.
 use super::protocol::WorkerResult;
-use crate::memory::{MemoryFabric, MessageEventScope};
-use crate::runtime::child_source::IssuedChildGrant;
 use anyhow::Context;
-
-pub(crate) async fn persist(
-    fabric: &MemoryFabric,
-    scope: MessageEventScope,
-    grant: &IssuedChildGrant,
-    result: &WorkerResult,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        result.ordinary_completion.is_none() && result.operator_completion.is_none(),
-        "durable completion journal rejects ordinary evidence"
-    );
-    let mut projection = result.clone();
-    projection.output = crate::agent::terminal::redact_persisted_text(&projection.output);
-    projection.error = projection
-        .error
-        .as_deref()
-        .map(crate::agent::terminal::redact_persisted_text);
-    let mut evidence = projection
-        .completion_evidence
-        .take()
-        .context("worker completion evidence missing")?;
-    let (child, constraints) = grant.scope().gate_inputs();
-    anyhow::ensure!(
-        fabric.workspace_id() == child.authority.workspace
-            && scope.owner_id.as_deref() == Some(child.authority.owner.as_str())
-            && scope.run_id.as_deref() == Some(evidence.run_id.as_str()),
-        "worker completion journal differs from issued scope"
-    );
-    evidence.validate_inventory(projection.success)?;
-    // The durable representation carries redacted result text and its own MAC.
-    // The stdout result retains the independently signed original representation.
-    evidence.seal = constraints.key.hmac(
-        crate::security::runtime_key::KeyDomain::StateFingerprint,
-        &[
-            b"worker-completion-journal-v1",
-            child.parent_authority_id.to_string().as_bytes(),
-            &evidence.signing_bytes(&projection)?,
-        ],
-    );
-    let key = format!("worker:{}:completion", evidence.run_id);
-    projection.completion_evidence = Some(evidence);
-    let payload = serde_json::to_string(&projection)?;
-    let event = fabric
-        .record_runtime_event_idempotent(
-            scope.clone(),
-            "worker.completion.confirmed",
-            "worker completion confirmed",
-            Some(payload.clone()),
-            key.clone(),
-        )
-        .await?;
-    anyhow::ensure!(
-        event.id > 0
-            && event.workspace_id == fabric.workspace_id()
-            && event.owner_id == scope.owner_id
-            && event.run_id == scope.run_id
-            && event.session_key == scope.session_key
-            && event.source == scope.source
-            && event.event_type == "worker.completion.confirmed"
-            && event.idempotency_key.as_deref() == Some(key.as_str())
-            && event.raw_payload_json.as_deref() == Some(payload.as_str()),
-        "worker completion journal receipt differs from projection"
-    );
-    let stored = fabric
-        .memory()
-        .find_owned_message_event(fabric.workspace_id(), &child.authority.owner, &event.event_id)
-        .await?
-        .context("worker completion journal is not durable")?;
-    anyhow::ensure!(
-        serde_json::to_value(&stored)? == serde_json::to_value(&event)?,
-        "worker completion journal differs from durable record"
-    );
-    Ok(())
-}
 
 /// Ordinary completion uses its authenticated process source, never a fabricated
 /// durable decision grant. The caller must finish runtime cleanup first.
@@ -94,7 +18,7 @@ pub(crate) async fn persist_ordinary(
         .memory
         .event_recording_config();
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.operator_completion.is_none(),
+        result.operator_completion.is_none(),
         "ordinary journal rejects granted evidence"
     );
     let mut projection = result.clone();
@@ -188,7 +112,7 @@ pub(crate) async fn persist_operator(
         .memory
         .event_recording_config();
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.ordinary_completion.is_none(),
+        result.ordinary_completion.is_none(),
         "operator journal rejects granted evidence"
     );
     let mut projection = result.clone();

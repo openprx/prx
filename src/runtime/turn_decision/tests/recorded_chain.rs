@@ -67,7 +67,6 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry,
             execution,
@@ -103,7 +102,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         assert!(mutable.record_admitted.swap(false, Ordering::AcqRel));
     }
     assert!(
-        service.settlement_ref(Arc::clone(&context)).is_err(),
+        service.terminal_settlement_ref(Arc::clone(&context)).is_err(),
         "unadmitted context cannot be linked"
     );
     {
@@ -112,7 +111,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         mutable.service_id = uuid::Uuid::nil();
     }
     assert!(
-        service.settlement_ref(Arc::clone(&context)).is_err(),
+        service.terminal_settlement_ref(Arc::clone(&context)).is_err(),
         "a foreign service context cannot be linked"
     );
     Arc::get_mut(&mut context)
@@ -161,7 +160,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let linked_commit = crate::agent::terminal::TurnTerminalDraft {
         decision: Some(
             service
-                .settlement_ref(Arc::clone(&context))
+                .terminal_settlement_ref(Arc::clone(&context))
                 .expect("recordable service issues the terminal link"),
         ),
         binding: Some(service.terminal_binding(&context).expect("test: terminal binding")),
@@ -277,7 +276,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let mut conflicting_commit = linked_commit.clone();
     conflicting_commit.decision = Some(
         service
-            .settlement_ref(Arc::clone(&conflicting_context))
+            .terminal_settlement_ref(Arc::clone(&conflicting_context))
             .expect("second decision is recordable"),
     );
     conflicting_commit.binding = Some(
@@ -327,7 +326,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let mut concurrent_a = linked_commit.clone();
     concurrent_a.decision = Some(
         service
-            .settlement_ref(Arc::clone(&race_a_context))
+            .terminal_settlement_ref(Arc::clone(&race_a_context))
             .expect("test: first race link"),
     );
     concurrent_a.binding = Some(
@@ -341,7 +340,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let mut concurrent_b = concurrent_a.clone();
     concurrent_b.decision = Some(
         service
-            .settlement_ref(Arc::clone(&race_b_context))
+            .terminal_settlement_ref(Arc::clone(&race_b_context))
             .expect("second concurrent decision link"),
     );
     concurrent_b.binding = Some(
@@ -442,7 +441,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let mut divergent_a = linked_commit.clone();
     divergent_a.decision = Some(
         service
-            .settlement_ref(Arc::clone(&divergent_context))
+            .terminal_settlement_ref(Arc::clone(&divergent_context))
             .expect("test: divergent link"),
     );
     divergent_a.binding = Some(
@@ -502,7 +501,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let mut scope_commit = linked_commit.clone();
     scope_commit.decision = Some(
         service
-            .settlement_ref(Arc::clone(&scope_context))
+            .terminal_settlement_ref(Arc::clone(&scope_context))
             .expect("test: scope replay link"),
     );
     scope_commit.binding = Some(
@@ -555,7 +554,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         crate::agent::terminal::TurnTerminalDraft {
             decision: Some(
                 service
-                    .settlement_ref(Arc::clone(&rejoin_context))
+                    .terminal_settlement_ref(Arc::clone(&rejoin_context))
                     .expect("recordable link"),
             ),
             binding: Some(
@@ -601,7 +600,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let late_commit = crate::agent::terminal::TurnTerminalDraft {
         decision: Some(
             service
-                .settlement_ref(Arc::clone(&late_context))
+                .terminal_settlement_ref(Arc::clone(&late_context))
                 .expect("delayed decision link"),
         ),
         binding: Some(service.terminal_binding(&late_context).expect("test: terminal binding")),
@@ -721,7 +720,6 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let reopened = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&generation),
             registry: reopened_registry,
             execution: reopened_execution,
@@ -775,7 +773,6 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
     let foreign_service = build_publication(
         TurnSurfaceKind::AgentLoop,
         PublicationInputs {
-            parent_grant: None,
             generation: Arc::clone(&foreign_generation),
             registry: foreign_registry,
             execution: foreign_execution,
@@ -857,7 +854,7 @@ async fn enabled_agent_service_records_only_a_successful_decision_chain() {
         crate::agent::terminal::TurnTerminalDraft {
             decision: Some(
                 reopened
-                    .settlement_ref(Arc::clone(&completed_context))
+                    .terminal_settlement_ref(Arc::clone(&completed_context))
                     .expect("completed link"),
             ),
             binding: Some(

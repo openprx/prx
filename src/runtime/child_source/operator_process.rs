@@ -57,7 +57,6 @@ impl OperatorProcessSnapshots {
         let route = self.route.clone();
         let resolved = self.resolved.clone();
         let binding = Arc::new(ChildProviderBinding::from_selection(
-            None,
             Arc::clone(&self.generation),
             &self.provider_catalog,
             &selection.provider,
@@ -125,7 +124,6 @@ impl OperatorProcessAuthority {
         anyhow::ensure!(
             source.publication.owner() == source.parent.owner_id()
                 && source.publication.workspace() == self.fabric.workspace_id()
-                && self.binding.grant.is_none()
                 && self.binding.requested_provider == source.selection.provider
                 && self.binding.requested_model == source.selection.model
                 && self.binding.resolved == source.resolved

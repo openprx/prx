@@ -25,29 +25,6 @@ impl std::fmt::Debug for WorkerProviderSelection {
     }
 }
 
-/// Source identifiers covered by the outer worker signature. These are lookup
-/// bindings, not authority: admission must re-read and verify the parent decision
-/// and durable child input before constructing a source proof.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerChildSource {
-    pub input_event_id: String,
-    pub provider_selection: WorkerProviderSelection,
-    pub input_event_mac: [u8; 32],
-    pub parent_source: crate::runtime::child_source::parent::ParentSourceSnapshot,
-    pub provider_catalog: crate::providers::catalog::process_snapshot::ProcessProviderCatalog,
-    pub parent_store_workspace: String,
-    pub parent_decision_digest: String,
-    pub parent_constraints: crate::tools::capability::child::wire::WorkerParentConstraints,
-    pub config_generation: crate::config::generation::ProcessGenerationBinding,
-    pub catalog: crate::tools::capability::catalog::process_snapshot::ProcessCatalogSnapshot,
-    /// Authenticated journal version. Absent means a pre-upgrade (legacy) child,
-    /// and the field is omitted from JSON so historical manifests stay byte-identical.
-    /// Version 3 and later require the authority journal row to be present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_version: Option<u8>,
-}
-
 /// Optional durable input evidence for an ordinary worker. Absence means
 /// recording was disabled; it must never be replaced by a synthetic event ID.
 #[derive(Clone, Serialize, Deserialize)]
@@ -125,20 +102,24 @@ impl std::fmt::Debug for WorkerOperatorSource {
     }
 }
 
+/// A worker manifest that is not an ordinary or operator child manifest:
+/// it does not decode (for example a pre-strip delegated manifest with
+/// retired fields) or carries no, or both, sources.
+#[derive(Debug, thiserror::Error)]
+#[error("session-worker manifest is unsupported: exactly one ordinary or operator source is required")]
+pub struct WorkerManifestUnsupported;
+
 /// Manifest passed from parent `sessions_spawn` to `session-worker`.
+/// Unknown fields are refused, so a pre-strip delegated manifest fails to start.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerManifest {
     #[serde(default)]
     pub parent_capability: Option<String>,
-    /// Included in the outer worker HMAC payload whenever present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_manifest: Option<WorkerChildCapabilityManifest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub child_source: Option<WorkerChildSource>,
-    /// Mutually exclusive with durable child authority; covered by the outer HMAC.
+    /// Mutually exclusive with operator source authority; covered by the outer HMAC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinary_source: Option<WorkerOrdinarySource>,
-    /// Explicit operator root provenance, mutually exclusive with delegated sources.
+    /// Explicit operator root provenance, mutually exclusive with the ordinary source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_source: Option<WorkerOperatorSource>,
     pub run_id: String,
@@ -386,74 +367,9 @@ pub struct WorkerSegmentTerminal {
     pub event_digest: String,
 }
 
-/// Authenticated inventory of a logical worker completion and its segments.
-/// This is transport evidence, not a verified usage receipt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerCompletionEvidence {
-    pub run_id: String,
-    pub input_event_id: String,
-    pub terminal_event_id: String,
-    pub terminal_event_digest: String,
-    pub recorded_segments: u64,
-    pub segments: Vec<WorkerSegmentTerminal>,
-    pub seal: [u8; 32],
-}
-
-impl WorkerCompletionEvidence {
-    pub(crate) fn validate_inventory(&self, success: bool) -> anyhow::Result<()> {
-        let confirmed = u64::try_from(self.segments.len())?;
-        anyhow::ensure!(
-            confirmed <= self.recorded_segments,
-            "worker inventory exceeds recorded segments"
-        );
-        anyhow::ensure!(
-            !success || (self.recorded_segments > 0 && confirmed == self.recorded_segments),
-            "successful worker inventory has unconfirmed segments"
-        );
-        let prefix = format!("child-segment:{}:", self.input_event_id);
-        let mut indices = std::collections::BTreeSet::new();
-        let mut events = std::collections::BTreeSet::new();
-        events.insert(self.terminal_event_id.as_str());
-        for segment in &self.segments {
-            let index = segment
-                .terminal_id
-                .strip_prefix(&prefix)
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or_else(|| anyhow::anyhow!("worker segment identity differs from original input"))?;
-            anyhow::ensure!(
-                index < self.recorded_segments
-                    && segment.terminal_id == format!("{prefix}{index}")
-                    && indices.insert(index)
-                    && !segment.event_id.is_empty()
-                    && events.insert(segment.event_id.as_str()),
-                "worker inventory contains duplicate or invalid segment references"
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) fn signing_bytes(&self, result: &WorkerResult) -> anyhow::Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&(
-            &self.run_id,
-            &self.input_event_id,
-            &self.terminal_event_id,
-            &self.terminal_event_digest,
-            self.recorded_segments,
-            &self.segments,
-            result.success,
-            &result.output,
-            &result.error,
-            &result.tokens_used,
-        ))?)
-    }
-}
-
 /// Result returned by `session-worker` on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_evidence: Option<WorkerCompletionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinary_completion: Option<OrdinaryWorkerCompletionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -473,8 +389,6 @@ mod tests {
     fn worker_manifest_roundtrip_json_preserves_owner_isolation() {
         let manifest = WorkerManifest {
             parent_capability: Some("capability".into()),
-            capability_manifest: None,
-            child_source: None,
             ordinary_source: None,
             operator_source: None,
             run_id: "run-1".into(),
@@ -661,8 +575,6 @@ mod tests {
     fn inherited_provenance_is_sealed_into_worker_manifest() {
         let mut manifest = WorkerManifest {
             parent_capability: None,
-            capability_manifest: None,
-            child_source: None,
             ordinary_source: None,
             operator_source: None,
             run_id: "run-1".into(),
@@ -734,7 +646,6 @@ mod tests {
     #[test]
     fn worker_result_roundtrip_json() {
         let result = WorkerResult {
-            completion_evidence: None,
             ordinary_completion: None,
             operator_completion: None,
             success: false,

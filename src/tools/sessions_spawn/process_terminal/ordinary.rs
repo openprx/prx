@@ -115,7 +115,7 @@ async fn verify_bound(
     domain: &[u8],
 ) -> anyhow::Result<VerifiedOrdinaryWorkerCompletion> {
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.operator_completion.is_none(),
+        result.operator_completion.is_none(),
         "ordinary completion rejects granted evidence"
     );
     let (key, lineage) = authenticate_launch(fabric, worker, generation, transport_key).await?;
@@ -136,10 +136,7 @@ pub(super) async fn authenticate_launch(
         .as_ref()
         .context("ordinary launch source missing")?;
     anyhow::ensure!(
-        worker.child_source.is_none()
-            && worker.capability_manifest.is_none()
-            && !generation.effective.causal_tree.enabled
-            && fabric.workspace_id() == generation.effective.workspace_dir.to_string_lossy(),
+        fabric.workspace_id() == generation.effective.workspace_dir.to_string_lossy(),
         "ordinary completion requires its exact launch source"
     );
     let recording = generation.effective.memory.event_recording_config();
@@ -192,7 +189,7 @@ async fn verify_completion(
         .as_deref()
         .context("ordinary completion owner missing")?;
     anyhow::ensure!(
-        result.completion_evidence.is_none() && result.operator_completion.is_none(),
+        result.operator_completion.is_none(),
         "ordinary completion rejects granted evidence"
     );
     let evidence = result
@@ -370,7 +367,7 @@ pub(crate) async fn recover_completion(
     transport_key: &ring::hmac::Key,
 ) -> anyhow::Result<Option<VerifiedOrdinaryWorkerCompletion>> {
     anyhow::ensure!(
-        worker.ordinary_source.is_some() && worker.child_source.is_none(),
+        worker.ordinary_source.is_some(),
         "ordinary recovery requires an ordinary launch"
     );
     if !generation.effective.memory.event_recording_config().enabled {

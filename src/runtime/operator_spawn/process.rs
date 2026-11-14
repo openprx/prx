@@ -218,8 +218,6 @@ impl OperatorProcessLaunch {
         )?;
         anyhow::ensure!(
             worker.parent_capability.is_none()
-                && worker.child_source.is_none()
-                && worker.capability_manifest.is_none()
                 && worker.ordinary_source.is_none()
                 && worker.operator_source.is_none()
                 && worker.task == source.task.trim()

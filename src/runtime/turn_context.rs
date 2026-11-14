@@ -19,7 +19,6 @@ use crate::decision_engine::state::{ObservedState, RawRoutingInput};
 use crate::providers::catalog::ReleaseCatalog;
 use crate::providers::catalog::parameters::ResolvedParameters;
 use crate::providers::parameter_capture::Capture;
-use crate::runtime::child_source::IssuedChildGrant;
 use crate::runtime::child_source::recursive_allowance::{ContextAllowance, RecursiveAllowance, RunAllowances};
 use crate::runtime::decision_accounting::AccountingScope;
 use crate::runtime::ingress_recovery::RecoveryScope;
@@ -83,7 +82,6 @@ pub(crate) struct TurnRuntimeHolder {
     recovery: Arc<RecoveryScope>,
     recursive_allowances: RunAllowances,
     ordinary_money: Option<Arc<AtomicU64>>,
-    parent_grant: Option<Arc<IssuedChildGrant>>,
     cost: crate::config::schema::CostConfig,
     workspace_dir: PathBuf,
     security_cents: u32,
@@ -93,7 +91,6 @@ impl TurnRuntimeHolder {
     pub(crate) fn new(
         recovery: Arc<RecoveryScope>,
         ordinary_money: Option<Arc<AtomicU64>>,
-        parent_grant: Option<Arc<IssuedChildGrant>>,
         config: &crate::config::Config,
         security: &crate::security::SecurityPolicy,
     ) -> Self {
@@ -101,20 +98,18 @@ impl TurnRuntimeHolder {
             recovery,
             recursive_allowances: RunAllowances::default(),
             ordinary_money,
-            parent_grant,
             cost: config.cost.clone(),
             workspace_dir: config.workspace_dir.clone(),
             security_cents: security.max_cost_per_day_cents,
         }
     }
 
-    /// Prepare the recovery holder of a root (or incoming-grant) publication
+    /// Prepare the recovery holder of a root publication
     /// and hold it with the publication's spend inputs.
     pub(crate) async fn prepare(
         generation: &crate::config::ConfigGeneration,
         memory: Arc<dyn crate::memory::Memory>,
         surface: crate::tools::capability::turn_state::TurnSurfaceKind,
-        parent_grant: Option<Arc<IssuedChildGrant>>,
         recovery: RecoveryPreparation,
         security: &crate::security::SecurityPolicy,
     ) -> anyhow::Result<Self> {
@@ -122,13 +117,12 @@ impl TurnRuntimeHolder {
             generation,
             memory,
             surface,
-            parent_grant.as_deref(),
             &recovery.owner,
             recovery.workspace_key,
             recovery.advisory,
         )
         .await?;
-        Ok(Self::new(scope, None, parent_grant, &generation.effective, security))
+        Ok(Self::new(scope, None, &generation.effective, security))
     }
 
     /// Recovery retains its own pins and queues independently of any
@@ -141,17 +135,9 @@ impl TurnRuntimeHolder {
         &self.recursive_allowances
     }
 
-    pub(crate) const fn parent_grant(&self) -> Option<&Arc<IssuedChildGrant>> {
-        self.parent_grant.as_ref()
-    }
-
-    /// The money that funds this run's recursive children: the incoming
-    /// grant's allowance, the publication's own child budget, or the run's
-    /// issued allowance.
+    /// The money that funds this run's recursive children: the publication's
+    /// own child budget, or the run's issued allowance.
     pub(crate) fn recursive_money(&self, proof: &dyn TurnSourceProof) -> Option<Arc<AtomicU64>> {
-        if let Some(incoming) = &self.parent_grant {
-            return incoming.recursive_child_allowance().map(|owner| owner.money());
-        }
         if let Some(money) = &self.ordinary_money {
             return Some(Arc::clone(money));
         }
@@ -270,13 +256,9 @@ impl TurnRuntimeContext {
     }
 
     /// Retain (or issue once) the allowance that funds this run's recursive
-    /// children. An incoming grant funds them; otherwise the turn's
-    /// accounting scope, the publication's child money or the turn's opening
+    /// children. The turn's accounting scope, the publication's child money or the turn's opening
     /// money does.
     pub(crate) fn issue_recursive_allowance(&self, proof: &dyn TurnSourceProof) -> Option<Arc<RecursiveAllowance>> {
-        if let Some(incoming) = self.holder.parent_grant() {
-            return incoming.recursive_child_allowance();
-        }
         Some(Arc::clone(self.recursive_allowance.get_or_init(|| {
             let money = self.accounting.as_ref().map_or_else(
                 || {
@@ -392,8 +374,6 @@ pub(crate) enum AgentDecisionError {
     RecordWriterUnavailable,
     #[error("decision evidence could not be durably recorded")]
     DecisionEvidence(#[source] anyhow::Error),
-    #[error("delegation parent could not be durably verified")]
-    DelegationStorage(#[source] anyhow::Error),
     #[error("ordinary delegation scope could not be verified")]
     DelegationScope(#[source] anyhow::Error),
     #[error("decision event memory could not be bound to its source")]

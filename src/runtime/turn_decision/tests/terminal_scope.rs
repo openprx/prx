@@ -51,7 +51,6 @@ impl LinkedFixture {
         let service = build_publication(
             TurnSurfaceKind::AgentLoop,
             PublicationInputs {
-                parent_grant: None,
                 generation: Arc::clone(&generation),
                 registry,
                 execution,
@@ -596,7 +595,6 @@ async fn recorded_terminal_rejoins_after_service_drop_with_independent_recovery(
         &generation,
         Arc::clone(&fixture.memory),
         TurnSurfaceKind::AgentLoop,
-        None,
         &cleanup,
         Some(key),
         crate::runtime::ingress_recovery::PreparedAdvisory::opened(store, events).expect("independent advisory writer"),

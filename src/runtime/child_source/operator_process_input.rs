@@ -13,9 +13,7 @@ pub(crate) async fn restore_input(
     let parent_source = &snapshots.parent;
     let recording = snapshots.generation.effective.memory.event_recording_config();
     anyhow::ensure!(
-        worker.child_source.is_none()
-            && worker.capability_manifest.is_none()
-            && worker.ordinary_source.is_none()
+        worker.ordinary_source.is_none()
             && fabric.workspace_id() == snapshots.publication.workspace()
             && parent_source.workspace_id() == fabric.workspace_id()
             && parent_source.owner_id() == snapshots.publication.owner()
