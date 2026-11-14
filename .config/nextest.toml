@@ -30,5 +30,11 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 # PTY and child-process end-to-end tests drive a real `prx` binary plus its
 # children; give each two of the four slots.
 [[profile.ci.overrides]]
-filter = 'binary(chat_pty_e2e) | binary(session_worker_stdin_protocol)'
+filter = 'binary(chat_pty_e2e) | binary(session_worker_stdin_protocol) | binary(ordinary_process_worker)'
 threads-required = 2
+
+# G5b real-parent worker tests run several `prx` parents and their process
+# workers; their own deadlines are 180 s (parent::PARENT_DEADLINE).
+[[profile.ci.overrides]]
+filter = 'binary(ordinary_process_worker) | test(=sealed_route_worker_sends_only_its_route_key_on_wire)'
+slow-timeout = { period = "60s", terminate-after = 3 }

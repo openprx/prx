@@ -32,16 +32,651 @@
 //! it does not change the runtime's decision budgets. The negative control
 //! uses a real EOF-waiting child and proves it remains alive until stdin closes.
 //!
-//! The baseline steering tests stop at config-generation validation.
+//! The baseline steering tests stop at config-generation validation. The
+//! route-credential test below also runs sealed workers under a real parent
+//! and a loopback provider and checks the authorization headers on the wire.
 
 use base64::Engine as _;
-use openprx::memory::MemoryEventRecording;
+use openprx::memory::{Memory as _, MemoryEventRecording};
 use openprx::session_worker::protocol::{WorkerControlFrame, WorkerManifest, WorkerResult};
 use ring::hmac;
 use sha2::{Digest, Sha256};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+// The real-parent harness is shared with `tests/ordinary_process_worker.rs`;
+// this binary uses the wire-test subset of it.
+#[allow(dead_code)]
+#[path = "ordinary_process_worker/parent.rs"]
+mod parent;
+#[allow(dead_code)]
+#[path = "ordinary_process_worker/provider.rs"]
+mod provider;
+
+const RECURSIVE_CHILD_TASK: &str = "Use sessions_spawn in process mode for PRX-NESTED-CHILD";
+const FANOUT_CHILD_TASK: &str = "Use sessions_spawn in process mode for PRX-FANOUT-CHILD";
+const WIRE_ROUTE_KEY: &str = "PRX-WORKER-ROUTE-KEY";
+const WIRE_ROOT_KEY: &str = "PRX-WORKER-ROOT-KEY";
+const WIRE_AGENT_KEY: &str = "PRX-WORKER-AGENT-KEY";
+const WIRE_UNCHANGED: &str =
+    "sealed route worker sends only its route key on wire: IPC identity or delivery state changed";
+
+/// Markers in classification priority order.
+const WIRE_MARKERS: [&str; 15] = [
+    "PRX-ROUTE-PARENT",
+    "PRX-AGENT-PARENT",
+    "PRX-ROUTE-CHILD",
+    "PRX-AGENT-CHILD",
+    "PRX-OPTIN-PARENT",
+    "PRX-OPTIN-CHILD",
+    "PRX-NESTED-PARENT",
+    "PRX-NESTED-CHILD",
+    "PRX-NESTED-LEAF",
+    "PRX-FANOUT-PARENT",
+    "PRX-FANOUT-CHILD",
+    "PRX-FANOUT-LEAF-A",
+    "PRX-FANOUT-LEAF-B",
+    "PRX-FANOUT-SECOND",
+    "PRX-ROUTE-NONE",
+];
+
+const WIRE_PARENTS: [&str; 5] = [
+    "PRX-ROUTE-PARENT",
+    "PRX-AGENT-PARENT",
+    "PRX-OPTIN-PARENT",
+    "PRX-NESTED-PARENT",
+    "PRX-FANOUT-PARENT",
+];
+
+fn wire_script(call: &provider::Call<'_>) -> provider::Reply {
+    use provider::{scripted_join_call, scripted_spawn_call, text_reply};
+    match (call.marker, call.index) {
+        ("PRX-ROUTE-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-ROUTE-CHILD"]
+        })),
+        ("PRX-AGENT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": [
+                {"task": "PRX-AGENT-CHILD", "agent": "prx_agent"}
+            ]
+        })),
+        ("PRX-OPTIN-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "allow_delegation": true,
+            "tasks": ["PRX-OPTIN-CHILD"]
+        })),
+        ("PRX-NESTED-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": [
+                {"task": RECURSIVE_CHILD_TASK, "allow_delegation": true}
+            ]
+        })),
+        // An explicit `false` keeps the leaf non-delegating (an omitted flag
+        // now asks for recursion by default).
+        ("PRX-NESTED-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": [
+                {"task": "PRX-NESTED-LEAF", "allow_delegation": false}
+            ]
+        })),
+        ("PRX-FANOUT-PARENT", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": [
+                {"task": FANOUT_CHILD_TASK, "allow_delegation": true}
+            ]
+        })),
+        ("PRX-FANOUT-CHILD", 1) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process",
+            "tasks": ["PRX-FANOUT-LEAF-A", "PRX-FANOUT-LEAF-B"]
+        })),
+        ("PRX-FANOUT-CHILD", 3) => scripted_spawn_call(&serde_json::json!({
+            "action": "spawn_batch", "mode": "process", "tasks": ["PRX-FANOUT-SECOND"]
+        })),
+        (
+            "PRX-ROUTE-PARENT" | "PRX-AGENT-PARENT" | "PRX-OPTIN-PARENT" | "PRX-NESTED-PARENT" | "PRX-NESTED-CHILD"
+            | "PRX-FANOUT-PARENT",
+            2,
+        )
+        | ("PRX-FANOUT-CHILD", 2 | 4) => scripted_join_call(call.body),
+        _ => text_reply("PRX-WORKER-OK"),
+    }
+}
+
+fn write_wire_config(config: &openprx::config::Config) {
+    std::fs::write(
+        &config.config_path,
+        toml::to_string_pretty(config).expect("test: serialize worker config"),
+    )
+    .expect("test: write worker config");
+}
+
+/// Exercise the real worker executable with a sealed route and an isolated
+/// loopback provider. The listener records headers from the OS child, while
+/// HOME, config, state, and every credential remain inside this fixture.
+#[test]
+fn sealed_route_worker_sends_only_its_route_key_on_wire() {
+    use openprx::providers::credentials::{CredentialRef, LegacySlot};
+    use provider::{assert_join_summary, assert_parent_join, is_assessment_request};
+
+    let fixture = parent::ParentFixture::new();
+    let config_dir = fixture.config_dir.clone();
+    let home = fixture.home.clone();
+    let parent_workspace = fixture.parent_workspace.clone();
+    let mut server = provider::OwnedProviderServer::start(provider::ProviderSpec {
+        markers: WIRE_MARKERS.to_vec(),
+        parents: WIRE_PARENTS.to_vec(),
+        execution: WIRE_PARENTS
+            .iter()
+            .copied()
+            .chain(["PRX-NESTED-CHILD", "PRX-FANOUT-CHILD"])
+            .collect(),
+        manifest_root: fixture.worker_root.clone(),
+        tasks: [
+            ("PRX-NESTED-CHILD", RECURSIVE_CHILD_TASK.to_owned()),
+            ("PRX-FANOUT-CHILD", FANOUT_CHILD_TASK.to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        hold: None,
+        script: Box::new(wire_script),
+    });
+    let destination = server.destination().to_owned();
+    let mut config = openprx::config::Config {
+        config_path: config_dir.join("config.toml"),
+        workspace_dir: parent_workspace.clone(),
+        default_provider: Some(destination.clone()),
+        default_model: Some("hint:fast".to_string()),
+        api_key: Some(WIRE_ROOT_KEY.to_string()),
+        ..openprx::config::Config::default()
+    };
+    config.secrets.encrypt = false;
+    config.sessions_spawn.process_memory_strategy = "isolated_private".to_string();
+    config.sessions_spawn.worker_workspace_root = Some(fixture.worker_root.to_string_lossy().into_owned());
+    config.sessions_spawn.cleanup_on_complete = false;
+    config.tool_tiering.always_include.push("sessions_spawn".to_string());
+    config.model_routes.push(openprx::config::ModelRouteConfig {
+        settings: openprx::config::model_settings::ModelSettings::default(),
+        hint: "fast".to_string(),
+        provider: destination.clone(),
+        model: provider::PROVIDER_MODEL.to_string(),
+        api_key: Some(WIRE_ROUTE_KEY.to_string()),
+        credential_ref: None,
+    });
+    provider::add_provider_fixture_model(&mut config, &destination, provider::PROVIDER_MODEL);
+    write_wire_config(&config);
+
+    // P1: route parent.
+    let route_output = parent::run_parent(&config_dir, &home, &parent::spawn_request("PRX-ROUTE-PARENT"));
+    route_output.assert_success("route");
+    assert!(route_output.stdout.contains("PRX-WORKER-OK"), "{WIRE_UNCHANGED}");
+    assert_parent_join(&server.requests(), "PRX-ROUTE-PARENT", 1);
+    let route = server
+        .manifest("PRX-ROUTE-CHILD")
+        .expect("test: production route manifest");
+    provider::assert_ordinary_manifest(&route);
+    assert_sealed_child(&route.manifest, &server.requests(), "PRX-ROUTE-CHILD");
+    parent::assert_completion_journal(&parent_workspace, &route.manifest);
+    let served_requests = server.requests().len();
+    assert!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.marker == "PRX-ROUTE-CHILD")
+            .all(|request| request.head.contains(WIRE_ROUTE_KEY)),
+        "{WIRE_UNCHANGED}"
+    );
+
+    // P2: replay the genuine production-issued source with only the selected
+    // credential changed. A fresh outer HMAC under `T` cannot make that
+    // mutation match the authenticated model selection in the ordinary source.
+    let transport_secret = fixture.transport_secret();
+    let mut manifest = route.manifest.clone();
+    assert_eq!(manifest.route_hint.as_deref(), Some("fast"), "{WIRE_UNCHANGED}");
+    assert_eq!(
+        manifest.route_credential,
+        Some(CredentialRef::LegacyInline(LegacySlot::ModelRoute("fast".to_string()))),
+        "{WIRE_UNCHANGED}"
+    );
+    manifest.api_key = Some(WIRE_ROOT_KEY.to_string());
+    let expiry = far_future_expiry();
+    let bad_run = run_forged_worker(&mut manifest, &home, &transport_secret, expiry);
+    assert!(
+        bad_run.status.success(),
+        "refused worker exits cleanly: {:?}",
+        bad_run.status
+    );
+    let bad_result = assert_single_json_line(&bad_run.stdout);
+    assert!(!bad_result.success, "wrong sealed key must be refused");
+    // The worker reports the full error chain (path context first); the
+    // refusal reason must stay the innermost cause.
+    let bad_result_error = bad_result.error.as_deref().unwrap_or_default();
+    assert!(
+        bad_result_error.ends_with("ordinary worker provider differs from authenticated selection"),
+        "unexpected refusal: {bad_result_error}"
+    );
+    assert_eq!(server.requests().len(), served_requests, "{WIRE_UNCHANGED}");
+
+    // P3: a second worker inherits a named agent's profile on a same-provider
+    // route with no route key. The sealed credential reference, not
+    // `agent_id`, is the source of authority.
+    let profile = openprx::config::manage::credentials::CredentialReferences::for_config(&config)
+        .expect("test: isolated credential store")
+        .set(&destination, "prx-agent-route", WIRE_AGENT_KEY)
+        .expect("test: store isolated agent credential");
+    config.model_routes.push(openprx::config::ModelRouteConfig {
+        settings: openprx::config::model_settings::ModelSettings::default(),
+        hint: "agent".to_string(),
+        provider: destination.clone(),
+        model: "agent-model".to_string(),
+        api_key: None,
+        credential_ref: None,
+    });
+    provider::add_provider_fixture_model(&mut config, &destination, "agent-model");
+    config.agents.insert(
+        "prx_agent".to_string(),
+        toml::from_str(&format!(
+            "provider = \"{destination}\"\nmodel = \"hint:agent\"\ncredential_ref = \"{}\"\n",
+            profile.id
+        ))
+        .expect("test: agent config"),
+    );
+    write_wire_config(&config);
+    parent::run_parent(&config_dir, &home, &parent::spawn_request("PRX-AGENT-PARENT")).assert_success("agent");
+    assert_parent_join(&server.requests(), "PRX-AGENT-PARENT", 1);
+    let agent = server
+        .manifest("PRX-AGENT-CHILD")
+        .expect("test: production agent manifest");
+    provider::assert_ordinary_manifest(&agent);
+    assert_sealed_child(&agent.manifest, &server.requests(), "PRX-AGENT-CHILD");
+    assert_eq!(
+        agent.manifest.route_credential,
+        Some(CredentialRef::Profile { id: profile.id }),
+        "{WIRE_UNCHANGED}"
+    );
+    parent::assert_completion_journal(&parent_workspace, &agent.manifest);
+
+    // P4: the same parent, with no config change, opts a child in to
+    // recursive delegation; the child is spawned and completes.
+    parent::run_parent(&config_dir, &home, &parent::spawn_request("PRX-OPTIN-PARENT")).assert_success("opt-in");
+    {
+        let requests = server.requests();
+        assert_parent_join(&requests, "PRX-OPTIN-PARENT", 1);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.body.contains("disabled by operator configuration")),
+            "{WIRE_UNCHANGED}"
+        );
+    }
+    let opt_in = server
+        .manifest("PRX-OPTIN-CHILD")
+        .expect("test: production opt-in manifest");
+    provider::assert_ordinary_manifest(&opt_in);
+    assert!(
+        is_recursive(&opt_in.manifest),
+        "an explicit opt-in derives a recursive child"
+    );
+    assert_sealed_child(&opt_in.manifest, &server.requests(), "PRX-OPTIN-CHILD");
+    parent::assert_completion_journal(&parent_workspace, &opt_in.manifest);
+
+    // P5: a real recursive worker spawns a real leaf.
+    let nested_output = parent::run_parent(&config_dir, &home, &parent::spawn_request("PRX-NESTED-PARENT"));
+    nested_output.assert_success("nested");
+    assert!(
+        nested_output.stdout.contains("PRX-WORKER-OK"),
+        "nested parent stdout: {}",
+        nested_output.stdout
+    );
+    {
+        let requests = server.requests();
+        assert_parent_join(&requests, "PRX-NESTED-PARENT", 1);
+        assert_parent_join(&requests, "PRX-NESTED-CHILD", 1);
+    }
+    let nested = server
+        .manifest("PRX-NESTED-CHILD")
+        .expect("test: actual nested worker manifest");
+    let leaf = server
+        .manifest("PRX-NESTED-LEAF")
+        .expect("test: actual grandchild manifest");
+    provider::assert_ordinary_manifest(&nested);
+    provider::assert_ordinary_manifest(&leaf);
+    let nested_source = nested
+        .manifest
+        .ordinary_source
+        .as_ref()
+        .expect("test: nested ordinary source");
+    let scope = &nested_source.capability_manifest;
+    let parent_constraints = &nested_source.parent_constraints;
+    assert!(
+        is_recursive(&nested.manifest),
+        "the recursive child keeps sessions_spawn"
+    );
+    assert!(
+        scope.allowed.len() < parent_constraints.allowed.len(),
+        "{WIRE_UNCHANGED}"
+    );
+    assert!(
+        scope
+            .allowed
+            .iter()
+            .all(|reference| parent_constraints.allowed.iter().any(|allowed| {
+                allowed.id == reference.id
+                    && allowed.fingerprint == reference.fingerprint
+                    && allowed.generation == reference.generation
+            })),
+        "{WIRE_UNCHANGED}"
+    );
+    assert_eq!(
+        Some(scope.remaining_depth),
+        parent_constraints.remaining_depth.checked_sub(1),
+        "{WIRE_UNCHANGED}"
+    );
+    assert!(
+        scope.max_cost_cents <= parent_constraints.max_cost_cents,
+        "{WIRE_UNCHANGED}"
+    );
+    assert!(scope.delegation.is_none(), "{WIRE_UNCHANGED}");
+    assert_eq!(
+        leaf.manifest.parent_run_id.as_deref(),
+        Some(nested.manifest.run_id.as_str()),
+        "{WIRE_UNCHANGED}"
+    );
+    assert_eq!(leaf.manifest.owner_id, nested.manifest.owner_id, "{WIRE_UNCHANGED}");
+    let leaf_scope = &leaf
+        .manifest
+        .ordinary_source
+        .as_ref()
+        .expect("test: leaf ordinary source")
+        .capability_manifest;
+    assert_eq!(
+        Some(leaf_scope.remaining_depth),
+        scope.remaining_depth.checked_sub(1),
+        "{WIRE_UNCHANGED}"
+    );
+    assert!(!is_recursive(&leaf.manifest), "the leaf carries no sessions_spawn ref");
+    assert!(leaf_scope.max_cost_cents <= scope.max_cost_cents, "{WIRE_UNCHANGED}");
+    {
+        let requests = server.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.marker == "PRX-NESTED-LEAF" && !is_assessment_request(request))
+                .count(),
+            1,
+            "{WIRE_UNCHANGED}"
+        );
+        for marker in ["PRX-NESTED-CHILD", "PRX-NESTED-LEAF"] {
+            assert!(
+                requests
+                    .iter()
+                    .filter(|request| request.marker == marker)
+                    .all(|request| request.head.contains(WIRE_ROUTE_KEY)
+                        && request.body.contains(provider::PROVIDER_MODEL)),
+                "{WIRE_UNCHANGED}"
+            );
+        }
+        assert_sealed_child(&nested.manifest, &requests, "PRX-NESTED-CHILD");
+        assert_sealed_child(&leaf.manifest, &requests, "PRX-NESTED-LEAF");
+    }
+    parent::assert_completion_journal(&parent_workspace, &nested.manifest);
+    parent::assert_completion_journal(&parent_workspace, &leaf.manifest);
+    assert_ordinary_input_record(&nested.manifest);
+    assert_ordinary_input_record(&leaf.manifest);
+
+    // P6: the genuine leaf manifest re-signed under `T` with only its parent
+    // run changed is refused before any provider request.
+    let requests_before_wrong_parent = server.requests().len();
+    let mut wrong_parent = leaf.manifest.clone();
+    wrong_parent.parent_run_id = Some("prx_unrelated_parent".to_owned());
+    let wrong_parent_run = run_forged_worker(&mut wrong_parent, &home, &transport_secret, expiry);
+    let wrong_parent_result = assert_single_json_line(&wrong_parent_run.stdout);
+    assert!(wrong_parent_run.status.success(), "{WIRE_UNCHANGED}");
+    assert!(!wrong_parent_result.success, "{WIRE_UNCHANGED}");
+    let wrong_parent_result_error = wrong_parent_result.error.as_deref().unwrap_or_default();
+    assert!(
+        wrong_parent_result_error.ends_with("ordinary worker parent provenance differs from verified scope"),
+        "unexpected refusal: {wrong_parent_result_error}"
+    );
+    assert_eq!(
+        server.requests().len(),
+        requests_before_wrong_parent,
+        "{WIRE_UNCHANGED}"
+    );
+
+    // P7: a fresh recursive worker fans out to two leaves in one batch, then
+    // spawns a third in a later turn. Every carve comes from the child's own
+    // funded balance.
+    let fanout_config_dir = fixture.root().join("fanout-config");
+    std::fs::create_dir_all(&fanout_config_dir).expect("test: isolated fanout config");
+    let fanout_workspace = fanout_config_dir.join("workspace");
+    let mut fanout_config = config.clone();
+    fanout_config.config_path = fanout_config_dir.join("config.toml");
+    fanout_config.workspace_dir = fanout_workspace.clone();
+    fanout_config.cost.prices.insert(
+        format!("{destination}/{}", provider::PROVIDER_MODEL),
+        openprx::config::schema::ModelPricing {
+            input: 1.0,
+            output: 1.0,
+            cache_write: 1.0,
+            cache_read: 1.0,
+        },
+    );
+    write_wire_config(&fanout_config);
+    let fanout_output = parent::run_parent(&fanout_config_dir, &home, &parent::spawn_request("PRX-FANOUT-PARENT"));
+    fanout_output.assert_success("fanout");
+    assert!(fanout_output.stdout.contains("PRX-WORKER-OK"), "{WIRE_UNCHANGED}");
+    {
+        let requests = server.requests();
+        assert_parent_join(&requests, "PRX-FANOUT-PARENT", 1);
+        let child: Vec<_> = requests
+            .iter()
+            .filter(|request| request.marker == "PRX-FANOUT-CHILD" && !is_assessment_request(request))
+            .collect();
+        assert_eq!(
+            child.len(),
+            5,
+            "both spawns, both joins and the final reply reach the model"
+        );
+        assert_join_summary(child[2], 2);
+        assert_join_summary(child[4], 1);
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.body.contains("at most one child")
+                    && !request.body.contains("already allocated")),
+            "{WIRE_UNCHANGED}"
+        );
+    }
+    let fanout = server
+        .manifest("PRX-FANOUT-CHILD")
+        .expect("test: real recursive worker");
+    provider::assert_ordinary_manifest(&fanout);
+    let allowance = fanout
+        .manifest
+        .ordinary_source
+        .as_ref()
+        .expect("test: fanout ordinary source")
+        .capability_manifest
+        .max_cost_cents;
+    assert!(allowance > 0, "the fanout child must hold a funded allowance");
+    let mut carved = 0_u32;
+    for marker in ["PRX-FANOUT-LEAF-A", "PRX-FANOUT-LEAF-B", "PRX-FANOUT-SECOND"] {
+        let leaf = server.manifest(marker).expect("test: real fanout leaf");
+        provider::assert_ordinary_manifest(&leaf);
+        assert_eq!(
+            leaf.manifest.parent_run_id.as_deref(),
+            Some(fanout.manifest.run_id.as_str()),
+            "{WIRE_UNCHANGED}"
+        );
+        let cents = leaf
+            .manifest
+            .ordinary_source
+            .as_ref()
+            .expect("test: leaf ordinary source")
+            .capability_manifest
+            .max_cost_cents;
+        // Leaves are carved in launch order; each fits the balance left.
+        assert!(
+            cents <= allowance - carved,
+            "{marker} exceeds the child's balance at its carve"
+        );
+        carved += cents;
+        parent::assert_completion_journal(&fanout_workspace, &leaf.manifest);
+    }
+    assert!(carved <= allowance, "fanout leaves exceed the child's funded allowance");
+    parent::assert_completion_journal(&fanout_workspace, &fanout.manifest);
+    write_wire_config(&config);
+    let agent_requests = server.requests().len();
+
+    // Keep the physical refusal control from the original contract: the
+    // genuine agent source with its route provenance removed, re-signed under
+    // `T`, may not reach the provider.
+    let requests_before_missing_source = server.requests().len();
+    let mut missing_source_manifest = agent.manifest.clone();
+    missing_source_manifest.route_source_provider = None;
+    let missing_source_run = run_forged_worker(&mut missing_source_manifest, &home, &transport_secret, expiry);
+    let missing_source_result = assert_single_json_line(&missing_source_run.stdout);
+    server.stop();
+    server.assert_no_failures();
+    let requests = server.requests();
+    assert!(
+        missing_source_run.status.success(),
+        "refused missing-source worker exits cleanly"
+    );
+    assert!(!missing_source_result.success, "missing provenance must be refused");
+    let missing_source_result_error = missing_source_result.error.as_deref().unwrap_or_default();
+    assert!(
+        missing_source_result_error.ends_with("ordinary worker provider differs from authenticated selection"),
+        "unexpected refusal: {missing_source_result_error}"
+    );
+    assert_eq!(
+        requests.len(),
+        requests_before_missing_source,
+        "missing source caused outbound I/O"
+    );
+    assert!(requests.len() > served_requests, "agent worker must call the route");
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.marker == "PRX-ROUTE-CHILD")
+            .all(|request| request.head.contains(WIRE_ROUTE_KEY) && request.body.contains(provider::PROVIDER_MODEL)),
+        "route child request used the wrong key or model"
+    );
+    assert!(
+        requests.iter().all(|request| !request.head.contains(WIRE_ROOT_KEY)),
+        "{WIRE_UNCHANGED}"
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.marker == "PRX-AGENT-CHILD")
+            .all(|request| request.head.contains(WIRE_AGENT_KEY) && request.body.contains("agent-model")),
+        "named-agent child request used the wrong key or model"
+    );
+    assert!(agent_requests > served_requests, "{WIRE_UNCHANGED}");
+}
+
+/// Whether the worker's sealed ordinary scope keeps `sessions_spawn`.
+fn is_recursive(manifest: &WorkerManifest) -> bool {
+    manifest
+        .ordinary_source
+        .as_ref()
+        .expect("test: ordinary source")
+        .capability_manifest
+        .allowed
+        .iter()
+        .any(|reference| reference.id.ends_with(":sessions_spawn"))
+}
+
+/// A sealed child widens no explicit tool list, and its provider request
+/// lists `sessions_spawn` exactly when its sealed scope keeps it: never for a
+/// non-recursive child, always for a recursive one.
+fn assert_sealed_child(manifest: &WorkerManifest, requests: &[provider::ProviderRequest], marker: &str) {
+    assert!(
+        manifest.allowed_tools.is_empty(),
+        "sealed child widened its explicit tool allowlist"
+    );
+    let request = requests
+        .iter()
+        .find(|request| request.marker == marker && !provider::is_assessment_request(request))
+        .expect("test: sealed child provider request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("test: sealed child request JSON");
+    let lists_spawn = body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.pointer("/function/name").and_then(serde_json::Value::as_str) == Some("sessions_spawn"))
+    });
+    assert_eq!(
+        lists_spawn,
+        is_recursive(manifest),
+        "{marker}: published sessions_spawn differs from its sealed scope"
+    );
+}
+
+/// The `SessionsSpawn` input event the ordinary source names exists for the
+/// child's owner, run and task, and carries no `delegation` record.
+fn assert_ordinary_input_record(manifest: &WorkerManifest) {
+    let source = manifest.ordinary_source.as_ref().expect("test: ordinary source");
+    let input = source.input.as_ref().expect("test: recorded ordinary input");
+    let workspace = std::path::Path::new(&source.parent_constraints.workspace);
+    let memory = openprx::memory::SqliteMemory::new(workspace).expect("test: parent input memory");
+    let event = parent::runtime()
+        .block_on(memory.find_owned_message_event(
+            &source.parent_constraints.workspace,
+            parent::owner(manifest),
+            &input.event_id,
+        ))
+        .expect("test: input event lookup")
+        .expect("test: durable child input record");
+    assert_eq!(event.owner_id, manifest.owner_id, "input record owner");
+    assert_eq!(
+        event.run_id.as_deref(),
+        Some(manifest.run_id.as_str()),
+        "input record run"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(event.raw_payload_json.as_deref().unwrap_or("{}")).expect("test: input payload JSON");
+    assert!(
+        payload["task"].as_str() == Some(manifest.task.as_str()) || event.content.contains(&manifest.task),
+        "input record task: {payload}"
+    );
+    assert!(
+        payload.get("delegation").is_none(),
+        "input record carries a delegation key"
+    );
+}
+
+/// Re-sign `manifest` under the parents' transport secret `T` and run the real
+/// worker with the parents' environment. Returns the reaped run.
+fn run_forged_worker(manifest: &mut WorkerManifest, home: &Path, secret: &[u8], expiry: u64) -> WorkerRun {
+    manifest.parent_capability = None;
+    let capability = worker_capability_under(manifest, expiry, secret);
+    manifest.parent_capability = Some(capability.clone());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
+    command
+        .arg("--config-dir")
+        .arg(&manifest.config_dir)
+        .arg("session-worker");
+    parent::parent_environment(&mut command, home);
+    command
+        .env("OPENPRX_SESSION_WORKER_CAPABILITY", &capability)
+        .env("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY", expiry.to_string())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null());
+    let capture = tempfile::NamedTempFile::new_in(home).expect("test: private worker stdout capture");
+    command.stdout(Stdio::from(
+        capture.as_file().try_clone().expect("test: capture writer"),
+    ));
+    let mut child = OwnedWorker::new(
+        command.spawn().expect("test: session-worker binary spawns"),
+        Some(capture),
+    );
+    let mut stdin = take_stdin(&mut child);
+    let line = serde_json::to_string(manifest).expect("test: forged manifest JSON");
+    stdin
+        .write_all(line.as_bytes())
+        .expect("test: write forged manifest line");
+    stdin.write_all(b"\n").expect("test: write forged manifest newline");
+    stdin.flush().expect("test: flush forged manifest");
+    drop(stdin);
+    finish(child, None)
+}
 
 /// Shared HMAC secret handed to the worker through `SESSION_WORKER_SECRET`, so
 /// the test can mint a capability the worker will accept without reaching for
@@ -119,6 +754,11 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
 /// blanked. Written out here rather than reused from the crate on purpose — the
 /// test re-derives the wire contract independently of the code under test.
 fn worker_capability(manifest: &WorkerManifest, expiry_unix: u64) -> String {
+    worker_capability_under(manifest, expiry_unix, TEST_SECRET.as_bytes())
+}
+
+/// [`worker_capability`] under an explicit transport secret.
+fn worker_capability_under(manifest: &WorkerManifest, expiry_unix: u64, secret: &[u8]) -> String {
     let mut value = serde_json::to_value(manifest).expect("test: manifest serializes");
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -139,7 +779,7 @@ fn worker_capability(manifest: &WorkerManifest, expiry_unix: u64) -> String {
     signed.push(0);
     signed.extend_from_slice(manifest_hex.as_bytes());
 
-    let key = hmac::Key::new(hmac::HMAC_SHA256, TEST_SECRET.as_bytes());
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hmac::sign(&key, &signed).as_ref())
 }
 
