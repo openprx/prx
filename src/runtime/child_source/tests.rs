@@ -653,7 +653,7 @@ async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> any
 /// execution binding, which captures the ordinary publication.
 #[tokio::test]
 async fn recursive_derivation_shares_the_authenticated_parent() -> anyhow::Result<()> {
-    use super::publication::{OrdinaryChildPublication, RecursiveDelegationRefused};
+    use super::publication::{DelegationRequest, OrdinaryChildPublication, RecursiveDelegationRefused};
     let workspace = tempfile::tempdir()?;
     let memory: Arc<dyn crate::memory::Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path())?);
     let cleanup = Arc::new(crate::runtime::turn_cleanup::CleanupTracker::default());
@@ -739,13 +739,24 @@ async fn recursive_derivation_shares_the_authenticated_parent() -> anyhow::Resul
                 shallow.with_recursive_delegation(&shallow_caller),
                 Err(RecursiveDelegationRefused::DepthExhausted)
             ));
+            // An explicit `true` keeps the typed refusal; an omitted flag
+            // falls back to the captured, non-delegating object.
+            assert!(matches!(
+                shallow.select_for_spawn(&shallow_caller, DelegationRequest::Explicit(true)),
+                Err(RecursiveDelegationRefused::DepthExhausted)
+            ));
+            let fallback = shallow.select_for_spawn(&shallow_caller, DelegationRequest::Omitted)?;
+            assert!(
+                fallback == shallow,
+                "an omitted flag at the bound keeps the captured object"
+            );
 
             // (d) An explicit `allow_delegation: false` keeps the captured
             // object itself; the default derives the recursive scope.
-            let kept = publication.select_for_spawn(&bound, false)?;
+            let kept = publication.select_for_spawn(&bound, DelegationRequest::Explicit(false))?;
             assert!(kept == publication, "opt-out keeps the captured object");
             assert!(Arc::ptr_eq(kept.scope(), publication.scope()));
-            let selected = publication.select_for_spawn(&bound, true)?;
+            let selected = publication.select_for_spawn(&bound, DelegationRequest::Omitted)?;
             assert!(selected.same_parent(&publication) && selected != publication);
             drop(other);
             Ok::<(), anyhow::Error>(())

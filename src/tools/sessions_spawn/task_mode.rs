@@ -335,7 +335,17 @@ pub(super) async fn run_sub_agent_task(
             // suspend.
             let approval_manager = approval_resolver_iter
                 .as_ref()
-                .map(|_| crate::approval::ApprovalManager::new());
+                .map(|_| Arc::new(crate::approval::ApprovalManager::new()));
+            // G5b ruling 1: the child's dispatch approval is the run's
+            // production strategy, as at the root; without a resolver it
+            // refuses exactly as the root does.
+            let run_approval = crate::agent::execution_policy::run_approval_strategy(
+                approval_manager.clone(),
+                approval_resolver_iter.clone(),
+                "sessions_spawn",
+                Arc::clone(&security),
+                Some(cancel_token_owned.clone()),
+            );
             let result = async {
                 let child_turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
                     child_service,
@@ -405,9 +415,9 @@ pub(super) async fn run_sub_agent_task(
                             observer: observer.as_ref(),
                             hooks: hooks.as_ref(),
                             // silent — never print to the chat terminal (see note above)
-                            approval: approval_manager.map(Arc::new),
+                            approval: approval_manager,
                             approval_resolver: approval_resolver_iter,
-                            runtime_adapter: Some(child_turn.adapter()),
+                            runtime_adapter: Some(child_turn.adapter_with_approval(run_approval)),
                             memory: crate::agent::turn_request::ToolLoopMemory::new(
                                 &memory_owned,
                                 &workspace_dir_owned,

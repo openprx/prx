@@ -250,7 +250,7 @@ async fn generation_swap_changes_git_outcome_between_calls() {
             let runtime = owner.pin();
             let service = runtime.publication_slot.publish(&runtime, &state).await.expect("test: live publication");
             let context = crate::tools::ToolExecutionContext::new(crate::runtime::envelope::RuntimeEnvelope::agent("workspace-a", "parity-reload").with_owner_id("prx_user").with_channel("terminal"), "dm");
-            let outcome = service.execution().with_test_approval(Arc::new(Approve)).execute(crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command":"git --version"})), context, None).await;
+            let outcome = service.execution().with_approval(Arc::new(Approve)).execute(crate::tools::ToolExecutionCommand::new("shell", serde_json::json!({"command":"git --version"})), context, None).await;
             let success = outcome.result.as_ref().is_some_and(|result| result.success);
             assert_eq!(success, level == crate::security::AutonomyLevel::Full, "test: existing gateway adopts generation policy");
             if level == crate::security::AutonomyLevel::Supervised {

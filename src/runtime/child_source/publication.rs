@@ -56,6 +56,33 @@ pub(crate) enum RecursiveDelegationRefused {
     Caller(#[source] anyhow::Error),
 }
 
+impl RecursiveDelegationRefused {
+    /// The derivation hit a real bound (no delegator in the sealed parent set,
+    /// no strict subset left, or no depth left), not an integrity failure.
+    const fn is_bound(&self) -> bool {
+        matches!(
+            self,
+            Self::NoDelegator
+                | Self::DepthExhausted
+                | Self::Manifest(
+                    crate::tools::capability::child::ChildManifestError::NotStrictSubset
+                        | crate::tools::capability::child::ChildManifestError::DepthExhausted
+                )
+        )
+    }
+}
+
+/// How a `sessions_spawn` call set `allow_delegation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DelegationRequest {
+    /// The flag was omitted: recursive when it can be derived, otherwise a
+    /// non-delegating child, so an omitted flag never fails where `false`
+    /// succeeds.
+    Omitted,
+    /// An explicit value: `true` must derive, `false` never does.
+    Explicit(bool),
+}
+
 impl std::fmt::Debug for OrdinaryChildPublication {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OrdinaryChildPublication")
@@ -162,18 +189,27 @@ impl OrdinaryChildPublication {
         })
     }
 
-    /// The publication a `sessions_spawn` child issues from: the derived
-    /// recursive scope by default, or this captured object itself, unchanged,
-    /// for an explicit `allow_delegation: false`.
+    /// The publication a `sessions_spawn` child issues from. An explicit
+    /// `true` must derive the recursive scope; an explicit `false` keeps this
+    /// captured object itself, unchanged. An omitted flag derives the
+    /// recursive scope and, when a bound refuses it, keeps this object as
+    /// `false` does. Integrity refusals are never masked.
     pub(crate) fn select_for_spawn(
         &self,
         caller: &crate::tools::ToolExecutionContext,
-        recursive: bool,
+        request: DelegationRequest,
     ) -> Result<Self, RecursiveDelegationRefused> {
-        if recursive {
-            self.with_recursive_delegation(caller)
-        } else {
-            Ok(self.clone())
+        match request {
+            DelegationRequest::Explicit(false) => Ok(self.clone()),
+            DelegationRequest::Explicit(true) => self.with_recursive_delegation(caller),
+            DelegationRequest::Omitted => match self.with_recursive_delegation(caller) {
+                Ok(derived) => Ok(derived),
+                Err(refused) if refused.is_bound() => {
+                    tracing::debug!(reason = %refused, "omitted allow_delegation: issuing a non-delegating child");
+                    Ok(self.clone())
+                }
+                Err(refused) => Err(refused),
+            },
         }
     }
 

@@ -1,5 +1,7 @@
 //! Read-only projection of the authority issued to a spawned run.
 
+pub(super) use crate::runtime::child_source::publication::DelegationRequest;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnDelegationStatus {
@@ -34,18 +36,20 @@ pub(super) fn request_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "boolean",
         "default": true,
-        "description": "For 'spawn' and 'spawn_batch', default true: let this child spawn its own children, as the parent can. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks. Set false for a child that cannot spawn."
+        "description": "For 'spawn' and 'spawn_batch', default true: let this child spawn its own children, as the parent can. The child keeps sessions_spawn in its sealed manifest; nesting is bounded only by spawn depth, the funded budget and integrity checks. Where the bound leaves no room, an omitted flag gives a child that cannot spawn and an explicit true is refused. Set false for a child that cannot spawn."
     })
 }
 
 /// Read the recursive delegation flag. A child session equals the main
-/// session, so a missing flag means `true`: the child gets a derived scope
-/// that keeps `sessions_spawn`, under the same gates as a root spawn. Only an
-/// explicit `false` keeps the captured, non-delegating child scope.
-pub(super) fn requested(args: &serde_json::Value) -> anyhow::Result<bool> {
+/// session, so a missing flag asks for recursion: the child gets a derived
+/// scope that keeps `sessions_spawn`, under the same gates as a root spawn,
+/// and falls back to a non-delegating child when a bound refuses the
+/// derivation. An explicit `true` must derive; an explicit `false` keeps the
+/// captured, non-delegating child scope.
+pub(super) fn requested(args: &serde_json::Value) -> anyhow::Result<DelegationRequest> {
     match args.get("allow_delegation") {
-        None | Some(serde_json::Value::Bool(true)) => Ok(true),
-        Some(serde_json::Value::Bool(false)) => Ok(false),
+        None => Ok(DelegationRequest::Omitted),
+        Some(serde_json::Value::Bool(flag)) => Ok(DelegationRequest::Explicit(*flag)),
         Some(_) => anyhow::bail!("allow_delegation must be a boolean"),
     }
 }
@@ -74,9 +78,15 @@ mod tests {
 
     #[test]
     fn recursive_request_parses_only_booleans() {
-        assert!(requested(&serde_json::json!({})).unwrap());
-        assert!(!requested(&serde_json::json!({"allow_delegation": false})).unwrap());
-        assert!(requested(&serde_json::json!({"allow_delegation": true})).unwrap());
+        assert_eq!(requested(&serde_json::json!({})).unwrap(), DelegationRequest::Omitted);
+        assert_eq!(
+            requested(&serde_json::json!({"allow_delegation": false})).unwrap(),
+            DelegationRequest::Explicit(false)
+        );
+        assert_eq!(
+            requested(&serde_json::json!({"allow_delegation": true})).unwrap(),
+            DelegationRequest::Explicit(true)
+        );
         for invalid in [
             serde_json::json!({"allow_delegation": "true"}),
             serde_json::json!({"allow_delegation": 1}),

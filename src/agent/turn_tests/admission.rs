@@ -827,7 +827,23 @@ impl AdmittedTurn {
         name: &str,
         arguments: serde_json::Value,
     ) -> anyhow::Result<crate::tools::ToolResult> {
-        let (execution, context) = self.bind_selected(name)?;
+        self.execute_tool_with_approval(name, arguments, None).await
+    }
+
+    /// Execute one selected tool as `execute_tool` does; with `approval`, the
+    /// bound execution runs under that strategy, as a root turn's runtime
+    /// adapter runs it under the run's approval strategy.
+    pub(crate) async fn execute_tool_with_approval(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        approval: Option<Arc<dyn crate::tools::ApprovalStrategy>>,
+    ) -> anyhow::Result<crate::tools::ToolResult> {
+        let (published, context) = self.bind_selected(name)?;
+        let execution = match approval {
+            Some(approval) => Arc::new(published.with_approval(approval)),
+            None => published,
+        };
         let outcome = execution
             .execute(
                 crate::tools::ToolExecutionCommand::new(name, arguments),

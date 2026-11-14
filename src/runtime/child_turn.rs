@@ -245,6 +245,18 @@ impl ChildSegmentTurn {
         }
     }
 
+    /// A task segment's adapter (G5b ruling 1): its published execution under
+    /// its run's approval strategy, the production strategy a root turn uses,
+    /// so a Supervised `Ask` reaches the same resolver as the root's.
+    pub(crate) fn adapter_with_approval(
+        &self,
+        approval: Arc<dyn crate::tools::ApprovalStrategy>,
+    ) -> ToolLoopRuntimeAdapter {
+        let mut adapter = self.adapter();
+        adapter.tool_execution_service = Some(Arc::new(self.service.execution.with_approval(approval)));
+        adapter
+    }
+
     fn proposal(
         &self,
         status: TurnTerminalStatus,

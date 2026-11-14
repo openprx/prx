@@ -1537,8 +1537,10 @@ requirements above or bypass the normal launch and execution gates.
 
 A `sessions_spawn` child can spawn its own children by default: a child
 session equals the main session, so an omitted `allow_delegation` means `true`,
-on the spawn request and on a batch entry. Only an explicit
-`allow_delegation: false` makes a child that cannot spawn. There is no
+on the spawn request and on a batch entry. An explicit
+`allow_delegation: false` makes a child that cannot spawn. Where the depth
+bound leaves no room for a child that can spawn, an omitted flag falls back to
+a child that cannot, while an explicit `true` is refused. There is no
 operator setting: a child's `sessions_spawn` passes exactly the same gates as a
 root session's `sessions_spawn` at the same autonomy level, and nothing
 recursion-specific is added. In Full autonomy there is no approval and no

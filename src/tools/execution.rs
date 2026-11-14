@@ -1640,7 +1640,7 @@ fn tool_descriptor(
 }
 
 /// Mandatory application pipeline for native tools and MCP aliases.
-#[cfg_attr(test, derive(Clone))]
+#[derive(Clone)]
 pub struct ToolExecutionService {
     backends: Arc<[Arc<dyn ToolBackend>]>,
     catalog: ToolCatalog,
@@ -1661,9 +1661,12 @@ struct TestPostReservationGate {
 }
 
 impl ToolExecutionService {
-    /// Preserve the published generation and ports while approving a test call.
-    #[cfg(test)]
-    pub(crate) fn with_test_approval(&self, approval: Arc<dyn ApprovalStrategy>) -> Self {
+    /// The same service under another approval strategy. The backends,
+    /// catalog, effect policy, preparation, audit and idempotency ledger are
+    /// shared, so only the approval decision differs (a task child's turn runs
+    /// its published service under its run's approval strategy).
+    #[must_use]
+    pub(crate) fn with_approval(&self, approval: Arc<dyn ApprovalStrategy>) -> Self {
         let mut service = self.clone();
         service.approval = approval;
         service

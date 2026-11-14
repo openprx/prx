@@ -730,20 +730,31 @@ fn admission_clone(tool: &SessionsSpawnTool) -> SessionsSpawnTool {
 /// the tool this way; a raw unit call has neither a parent grant nor an
 /// ordinary publication and must fail closed.
 async fn execute_admitted_spawn(tool: &SessionsSpawnTool, arguments: serde_json::Value) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, false).await
+    execute_admitted_spawn_with_plane(tool, arguments, false, None).await
+}
+
+/// `execute_admitted_spawn` with the root dispatch under `approval`, as a
+/// root turn's runtime adapter runs it under the run's approval strategy.
+async fn execute_admitted_spawn_with_approval(
+    tool: &SessionsSpawnTool,
+    arguments: serde_json::Value,
+    approval: Arc<dyn crate::tools::ApprovalStrategy>,
+) -> anyhow::Result<ToolResult> {
+    execute_admitted_spawn_with_plane(tool, arguments, false, Some(approval)).await
 }
 
 async fn execute_enabled_admitted_spawn(
     tool: &SessionsSpawnTool,
     arguments: serde_json::Value,
 ) -> anyhow::Result<ToolResult> {
-    execute_admitted_spawn_with_plane(tool, arguments, true).await
+    execute_admitted_spawn_with_plane(tool, arguments, true, None).await
 }
 
 async fn execute_admitted_spawn_with_plane(
     tool: &SessionsSpawnTool,
     arguments: serde_json::Value,
     decision_enabled: bool,
+    approval: Option<Arc<dyn crate::tools::ApprovalStrategy>>,
 ) -> anyhow::Result<ToolResult> {
     fn fixture_price() -> crate::config::schema::ModelPricing {
         crate::config::schema::ModelPricing {
@@ -942,7 +953,7 @@ async fn execute_admitted_spawn_with_plane(
                 provider,
                 provider_name.clone(),
                 model_name.clone(),
-                admitted.execute_tool("sessions_spawn", arguments),
+                admitted.execute_tool_with_approval("sessions_spawn", arguments, approval),
             )
             .await
         }))

@@ -114,11 +114,12 @@ impl SessionsSpawnTool {
         if let Some(caller) = &caller {
             caller.verify_tool("sessions_spawn")?;
         }
-        // Recursive delegation (the default; only an explicit `false` opts
-        // out) re-scopes the caller onto a derived publication that shares
-        // its authenticated parent, so task issuance, process launch and
-        // funding all read that one object. An operator source opens its
-        // children as roots, so the flag changes nothing there.
+        // Recursive delegation (the default; an omitted flag falls back to a
+        // non-delegating child at a bound, an explicit `false` opts out)
+        // re-scopes the caller onto a publication that shares its
+        // authenticated parent, so task issuance, process launch and funding
+        // all read that one object. An operator source opens its children as
+        // roots, so the flag changes nothing there.
         let recursive = delegation::requested(args)?;
         let caller = match caller {
             Some(caller) => match caller.context().ordinary_child_publication.as_ref() {

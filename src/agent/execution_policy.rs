@@ -309,20 +309,40 @@ pub(super) struct AgentToolRuntimeInputs<'a> {
     pub unscoped_policy: Option<Arc<SecurityPolicy>>,
 }
 
+/// The run's approval strategy: the production strategy a root turn's
+/// execution adapter uses. A task child's turn runs under the same strategy,
+/// built from its run's approval manager and resolver, so a Supervised `Ask`
+/// is resolved exactly as at the root (no manager: refused).
+pub(crate) fn run_approval_strategy(
+    manager: Option<Arc<ApprovalManager>>,
+    resolver: Option<Arc<dyn ApprovalResolver>>,
+    channel_name: &str,
+    policy: Arc<SecurityPolicy>,
+    cancellation: Option<CancellationToken>,
+) -> Arc<dyn crate::tools::ApprovalStrategy> {
+    Arc::new(AgentToolApprovalStrategy {
+        manager,
+        resolver,
+        channel: channel_name.to_owned(),
+        policy,
+        cancellation,
+    })
+}
+
 pub(super) fn build_agent_tool_runtime_adapter(inputs: AgentToolRuntimeInputs<'_>) -> ToolLoopRuntimeAdapter {
     let (policy, tool_execution_context) =
         agent_tool_execution_context(inputs.scope, inputs.channel_name, inputs.unscoped_policy);
-    let approval_strategy = AgentToolApprovalStrategy {
-        manager: inputs.approval,
-        resolver: inputs.approval_resolver,
-        channel: inputs.channel_name.to_string(),
-        policy: Arc::clone(&policy),
-        cancellation: inputs.cancellation,
-    };
+    let approval_strategy = run_approval_strategy(
+        inputs.approval,
+        inputs.approval_resolver,
+        inputs.channel_name,
+        Arc::clone(&policy),
+        inputs.cancellation,
+    );
     let mut service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
         inputs.tools_registry,
         Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
-        Arc::new(approval_strategy),
+        approval_strategy,
         Arc::new(crate::tools::AdapterOwnedPreparation),
         Arc::new(crate::tools::TracingToolExecutionAudit),
     );

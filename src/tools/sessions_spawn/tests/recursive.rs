@@ -207,7 +207,36 @@ struct Options {
     daily_cap_cents: Option<u32>,
 }
 
+/// An operator resolver that grants every request and counts consultations.
+#[derive(Default)]
+struct GrantingResolver {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::agent::turn_contracts::ApprovalResolver for GrantingResolver {
+    async fn resolve(
+        &self,
+        request: &crate::approval::ApprovalRequest,
+        _channel: &str,
+    ) -> crate::agent::turn_contracts::ApprovalDecision {
+        if request.tool_name == "sessions_spawn" {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        crate::agent::turn_contracts::ApprovalDecision::Grant
+    }
+}
+
 async fn fixture(options: Options) -> Fixture {
+    fixture_with(options, None).await
+}
+
+/// `factory` is the run approval resolver factory each task child's run
+/// mints its resolver from (production: chat `/bg`).
+async fn fixture_with(
+    options: Options,
+    factory: Option<crate::agent::turn_request::SpawnApprovalResolverFactory>,
+) -> Fixture {
     let workspace = tempfile::tempdir().expect("test: recursive fixture workspace");
     let script = Script::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -264,6 +293,9 @@ async fn fixture(options: Options) -> Fixture {
         config.sessions_spawn.clone(),
     )
     .with_shared_memory(Arc::clone(&memory));
+    if let Some(factory) = factory {
+        tool = tool.with_approval_resolver_factory(factory);
+    }
     tool.workspace_dir = workspace.path().to_owned();
     tool.hint_config = Some(Arc::new(config));
     // A child's task registry is the parent's registry: the same tool
@@ -399,9 +431,12 @@ async fn full_root_and_child_spawn_without_grant() {
     assert_eq!(grandchild.parent.as_deref(), Some(child.id.as_str()));
 }
 
-/// Supervised, root and recursive child alike: without an approval resolver
-/// both dispatches are refused at dispatch approval with the same literal,
-/// with no run and no model request for the refused spawn.
+/// Supervised, root and recursive child alike, in two layers. (1) Without an
+/// approval resolver both dispatches are refused at dispatch approval with
+/// the same literal, with no run and no model request for the refused spawn.
+/// (2) Through the production run approval strategy with an approving
+/// resolver both dispatches are approved, the runtime grant each approval
+/// issues passes the spawn's side-effect gate, and the child runs.
 #[tokio::test]
 async fn supervised_child_follows_root_dispatch_approval() {
     // (1) Root: the execution service's default strategy refuses.
@@ -436,6 +471,53 @@ async fn supervised_child_follows_root_dispatch_approval() {
         "the child's spawn is refused at dispatch approval: {child:?}"
     );
     assert!(refused.script.for_task("PRX-REFUSED-LEAF.").is_empty());
+
+    // (2) The root runs under the run approval strategy (an approval manager
+    // and the approving resolver); each task child's run mints the same
+    // resolver from the run factory. Neither dispatch carries a grant.
+    let resolver = Arc::new(GrantingResolver::default());
+    let minted: Arc<dyn crate::agent::turn_contracts::ApprovalResolver> = resolver.clone();
+    let approving = fixture_with(
+        Options {
+            level: AutonomyLevel::Supervised,
+            daily_cap_cents: None,
+        },
+        Some(crate::agent::turn_request::SpawnApprovalResolverFactory::new(
+            move |_| Arc::clone(&minted),
+        )),
+    )
+    .await;
+    let root_approval = crate::agent::execution_policy::run_approval_strategy(
+        Some(Arc::new(crate::approval::ApprovalManager::new())),
+        Some(Arc::clone(&resolver) as Arc<dyn crate::agent::turn_contracts::ApprovalResolver>),
+        "wacli",
+        Arc::clone(&approving.tool.security),
+        None,
+    );
+    let task = chain("PRX-APPROVED-CHILD.", Some(spawn_args("PRX-APPROVED-LEAF.".to_owned())));
+    let started = execute_admitted_spawn_with_approval(&approving.tool, spawn_args(task), root_approval)
+        .await
+        .expect("test: approved root spawn");
+    assert!(started.success, "{:?}", started.error);
+    let runs = settled(&approving.tool, 2).await;
+    let child = run_for(&runs, "PRX-APPROVED-CHILD.");
+    let leaf = run_for(&runs, "PRX-APPROVED-LEAF.");
+    assert_eq!(child.output(), Some(DONE));
+    assert_eq!(leaf.output(), Some(DONE));
+    assert_eq!(leaf.parent.as_deref(), Some(child.id.as_str()));
+    assert!(
+        approving
+            .script
+            .for_task("PRX-APPROVED-CHILD.")
+            .iter()
+            .all(|seen| seen.results.iter().all(|result| !result.contains(NO_RESOLVER))),
+        "the child's spawn is not refused at dispatch approval"
+    );
+    assert_eq!(
+        resolver.asked.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the resolver decided the root spawn and the child spawn"
+    );
 }
 
 /// ReadOnly: the opt-in changes nothing; the root spawn is refused exactly
@@ -533,11 +615,12 @@ async fn exhausted_allowance_spawns_a_zero_funded_child() {
     assert!(!fixture.script.for_task("PRX-FREE.").is_empty());
 }
 
-/// Parity default (controller ruling, G5b c2a): an omitted flag derives a
-/// child that can spawn. Nesting ends at the sealed depth bound: each level
-/// keeps a strict subset of its parent, and the root's sealed depth is its
-/// set size, so the last level's recursive derivation is refused by the
-/// strict-subset rule. An explicit `false` there still spawns a leaf.
+/// Parity default (controller rulings, G5b c2a and 2b): an omitted flag
+/// derives a child that can spawn. Nesting ends at the sealed bound: each
+/// level keeps a strict subset of its parent and the root's sealed depth is
+/// its set size, so the last level's recursive derivation is refused by the
+/// strict-subset rule. There an omitted flag falls back to a non-delegating
+/// leaf, as `false` does, while an explicit `true` keeps the typed refusal.
 #[tokio::test]
 async fn omitted_flag_child_spawns_until_the_depth_bound() {
     let fixture = fixture(Options {
@@ -550,18 +633,18 @@ async fn omitted_flag_child_spawns_until_the_depth_bound() {
         .await
         .expect("test: default root spawn");
     assert!(result.success, "{:?}", result.error);
-    let mut leaf = spawn_args("PRX-LEAF.".to_owned());
-    leaf["allow_delegation"] = json!(false);
-    let task = chain("PRX-OPT-OUT.", Some(leaf));
+    let mut refused = spawn_args("PRX-REFUSED-LEAF.".to_owned());
+    refused["allow_delegation"] = json!(true);
+    let task = chain("PRX-EXPLICIT.", Some(refused));
     let result = execute_admitted_spawn(&fixture.tool, spawn_args(task))
         .await
-        .expect("test: default root spawn with an opting-out child");
+        .expect("test: default root spawn with an explicitly recursive child");
     assert!(result.success, "{:?}", result.error);
     let runs = settled(&fixture.tool, 3).await;
     assert_eq!(
         runs.len(),
         3,
-        "exactly level 1, the opting-out child and its leaf: {runs:?}"
+        "exactly level 1, its fallback leaf and the explicit child: {runs:?}"
     );
 
     let level_one = fixture.script.for_task("PRX-LEVEL-1.");
@@ -571,24 +654,27 @@ async fn omitted_flag_child_spawns_until_the_depth_bound() {
             .is_some_and(|seen| seen.tools.iter().any(|tool| tool == "sessions_spawn")),
         "the default child can spawn: {level_one:?}"
     );
-    assert!(
-        level_one
-            .iter()
-            .any(|seen| seen.results.iter().any(|result| result.contains(NOT_STRICT))),
-        "the last level is refused at the sealed bound: {level_one:?}"
-    );
-    assert!(fixture.script.for_task("PRX-LEVEL-2.").is_empty());
-
-    let opt_out = run_for(&runs, "PRX-OPT-OUT.");
-    let leaf = run_for(&runs, "PRX-LEAF.");
-    assert_eq!(leaf.output(), Some(DONE));
-    assert_eq!(leaf.parent.as_deref(), Some(opt_out.id.as_str()));
+    let level_one = run_for(&runs, "PRX-LEVEL-1.");
+    let level_two = run_for(&runs, "PRX-LEVEL-2.");
+    assert_eq!(level_one.output(), Some(DONE));
+    assert_eq!(level_two.output(), Some(DONE));
+    assert_eq!(level_two.parent.as_deref(), Some(level_one.id.as_str()));
     assert!(
         fixture
             .script
-            .for_task("PRX-LEAF.")
+            .for_task("PRX-LEVEL-2.")
             .first()
             .is_some_and(|seen| !seen.tools.iter().any(|tool| tool == "sessions_spawn")),
-        "the opted-out leaf cannot spawn"
+        "the fallback leaf at the bound cannot spawn"
     );
+
+    let explicit = fixture.script.for_task("PRX-EXPLICIT.");
+    assert!(
+        explicit
+            .iter()
+            .any(|seen| seen.results.iter().any(|result| result.contains(NOT_STRICT))),
+        "an explicit true at the bound is refused: {explicit:?}"
+    );
+    assert_eq!(run_for(&runs, "PRX-EXPLICIT.").output(), Some(DONE));
+    assert!(fixture.script.for_task("PRX-REFUSED-LEAF.").is_empty());
 }

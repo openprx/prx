@@ -1253,8 +1253,10 @@ For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches
 
 Recursive child delegation is the default: a child session equals the main
 session, so a spawn without `allow_delegation` (or with `true`) lets the child
-spawn its own children, and only an explicit `allow_delegation: false` makes a
-child that cannot. There is no operator setting. A child's `sessions_spawn` passes
+spawn its own children, and an explicit `allow_delegation: false` makes a
+child that cannot. Where the depth bound leaves no room, a spawn without the
+flag gives a child that cannot spawn, while an explicit `true` is refused.
+There is no operator setting. A child's `sessions_spawn` passes
 the same gates as a root session's at the same autonomy level (Full: no
 approval; Supervised: the ordinary side-effect approval; ReadOnly: refused).
 Only spawn depth, the funded budget and integrity checks bound nesting. See
