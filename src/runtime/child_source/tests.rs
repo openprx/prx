@@ -779,6 +779,32 @@ fn golden_state_fingerprint(key: &[u8], parts: &[&[u8]]) -> String {
     hex::encode(context.sign().as_ref())
 }
 
+/// The effective-config vector input: defaults, empty paths, the effective
+/// backend written explicitly, and two prices inserted out of order.
+fn golden_effective_config() -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = std::path::PathBuf::new();
+    config.config_path = std::path::PathBuf::new();
+    config.decision_engine.backend =
+        Some(crate::config::schema::decision_engine::effective_engine_backend(&config).clone());
+    for model in ["zeta/model", "alpha/model"] {
+        config.cost.prices.insert(
+            model.to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
+    config
+}
+
+/// The serialized object of [`golden_effective_config`]: sorted-key compact
+/// JSON, written by an independent encoder (not the production one).
+const GOLDEN_EFFECTIVE_CONFIG: &[u8] = include_bytes!("golden_effective_config.json");
+
 fn golden_hex(value: &str) -> Vec<u8> {
     hex::decode(value).expect("test: golden hex literal")
 }
@@ -912,20 +938,7 @@ fn golden_constraints_and_effective_config_payloads() {
 
     // Effective config: the metadata prefix is a literal; nested maps inserted
     // out of order serialize sorted.
-    let mut config = crate::config::Config::default();
-    config.workspace_dir = std::path::PathBuf::new();
-    config.config_path = std::path::PathBuf::new();
-    for model in ["zeta/model", "alpha/model"] {
-        config.cost.prices.insert(
-            model.to_owned(),
-            crate::config::schema::ModelPricing {
-                input: 1.0,
-                output: 2.0,
-                cache_write: 0.0,
-                cache_read: 0.0,
-            },
-        );
-    }
+    let config = golden_effective_config();
     let binding = crate::config::generation::ProcessGenerationBinding {
         working_root: None,
         id: crate::config::generation::ConfigGenerationId(7),
@@ -943,34 +956,31 @@ fn golden_constraints_and_effective_config_payloads() {
     let payload = binding
         .signing_payload(&config)
         .expect("test: effective config payload");
+    // The complete expected bytes are literals: the metadata prefix written
+    // here, the effective-config object established independently of the
+    // production encoder (sorted-key compact JSON per §2; nested maps
+    // inserted out of order appear sorted), and the closing bracket.
     let prefix = format!(
-        r#"[7,{{"disk_generation":null,"fingerprint_sha256":"{}"}},"2026-01-02T03:04:05Z","startup",[],"","",{{"#,
+        r#"[7,{{"disk_generation":null,"fingerprint_sha256":"{}"}},"2026-01-02T03:04:05Z","startup",[],"","","#,
         "f".repeat(64)
     );
-    assert!(
-        payload.starts_with(prefix.as_bytes()),
-        "effective-config metadata prefix differs"
-    );
-    let text = std::str::from_utf8(&payload).expect("test: utf-8 payload");
-    let alpha = text.find(r#""alpha/model":{"#).expect("test: alpha price");
-    let zeta = text.find(r#""zeta/model":{"#).expect("test: zeta price");
-    assert!(
-        alpha < zeta,
-        "nested maps serialize sorted regardless of insertion order"
-    );
-    let value: serde_json::Value = serde_json::from_slice(&payload).expect("test: payload JSON");
-    let mut resorted = value;
-    resorted.sort_all_objects();
+    let expected = [prefix.as_bytes(), GOLDEN_EFFECTIVE_CONFIG, b"]"].concat();
+    assert_eq!(payload, expected, "effective-config payload differs from the literal");
+    let literal = std::str::from_utf8(GOLDEN_EFFECTIVE_CONFIG).expect("test: utf-8 literal");
+    let alpha = literal.find(r#""alpha/model":{"#).expect("test: alpha price");
+    let zeta = literal.find(r#""zeta/model":{"#).expect("test: zeta price");
+    assert!(alpha < zeta, "the literal holds the nested maps sorted");
+    // The seal is recomputed with `ring` over the literal and pinned.
+    const EFFECTIVE_CONFIG_SEAL: &str = "4b492db5f4b3bd565e3397e53f893c7d81d3ae0840ca3496f5e8875eb506b97c";
     assert_eq!(
-        serde_json::to_vec(&resorted).expect("test: resorted"),
-        payload,
-        "every object is sorted"
+        golden_state_fingerprint(&k_child, &[b"process-effective-config-v1", &expected]),
+        EFFECTIVE_CONFIG_SEAL
     );
     assert_eq!(
         hex::encode(child.hmac(
             crate::security::runtime_key::KeyDomain::StateFingerprint,
             &[b"process-effective-config-v1", &payload]
         )),
-        golden_state_fingerprint(&k_child, &[b"process-effective-config-v1", &payload])
+        EFFECTIVE_CONFIG_SEAL
     );
 }

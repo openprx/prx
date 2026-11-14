@@ -1213,14 +1213,36 @@ mod tests {
     #[test]
     fn for_child_fingerprint_encoding_is_unchanged() {
         use sha2::Digest as _;
+        // The vector input of `runtime::child_source::tests::golden_effective_config`
+        // with the two paths set; its serialized object is the same literal.
         let mut config = crate::config::Config::default();
+        config.decision_engine.backend =
+            Some(crate::config::schema::decision_engine::effective_engine_backend(&config).clone());
+        for model in ["zeta/model", "alpha/model"] {
+            config.cost.prices.insert(
+                model.to_owned(),
+                crate::config::schema::ModelPricing {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_write: 0.0,
+                    cache_read: 0.0,
+                },
+            );
+        }
         config.workspace_dir = std::path::PathBuf::from("/prx/ws-1");
         config.config_path = std::path::PathBuf::from("/prx/config.toml");
         let generation = super::ConfigGeneration::for_child(&config).unwrap();
-        let mut value = serde_json::to_value((&config.workspace_dir, &config.config_path, &config)).unwrap();
-        value.sort_all_objects();
-        let expected = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&value).unwrap()));
-        assert_eq!(generation.source_revision.fingerprint_sha256, expected);
+        // §2: SHA-256 of the sorted array `[workspace, config_path, config]`,
+        // spelled out from literals, and the pinned digest of those bytes.
+        let preimage = [
+            br#"["/prx/ws-1","/prx/config.toml","#.as_slice(),
+            include_bytes!("../runtime/child_source/golden_effective_config.json").as_slice(),
+            b"]",
+        ]
+        .concat();
+        const FOR_CHILD_FINGERPRINT: &str = "5e2fd3dac199ce39b9faf18545b70eae2116376b8892c596c472a59ac15e293d";
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&preimage)), FOR_CHILD_FINGERPRINT);
+        assert_eq!(generation.source_revision.fingerprint_sha256, FOR_CHILD_FINGERPRINT);
         assert_eq!(generation.id.0, 0);
         assert!(generation.source_revision.disk_generation.is_none());
     }
