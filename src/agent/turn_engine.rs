@@ -140,6 +140,12 @@ pub(crate) async fn run_turn(
     // second copy of it in this frame — enough to overflow a tokio worker's
     // stack on the chat path. A pointer costs nothing here and keeps the guard's
     // own future tiny.
+    // The terminal settles a failed, cancelled or refused turn from this same
+    // retained provider evidence; the outcome cost reads it too (P2-R10).
+    let retained = services
+        .runtime_adapter
+        .as_ref()
+        .and_then(|adapter| adapter.provider_trace.clone());
     let started = std::time::Instant::now();
     let inner = Box::pin(run_turn_unguarded(history, request, services, delivery));
     let result = crate::agent::idle::run_guarded(
@@ -149,7 +155,17 @@ pub(crate) async fn run_turn(
         inner,
     )
     .await;
-    let usage = result.as_ref().ok().and_then(|(_, trace)| {
+    // A completed turn settles its returned trace; any other turn settles the
+    // metered usage retained before it ended, as the terminal does.
+    let settled_trace = match &result {
+        Ok(_) => None,
+        Err(_) => retained.as_ref().and_then(|retained| retained.snapshot().0),
+    };
+    let usage = match &result {
+        Ok((_, trace)) => Some(trace),
+        Err(_) => settled_trace.as_ref(),
+    }
+    .and_then(|trace| {
         Some(crate::runtime::decision_advisory::TurnUsage {
             provider: trace.final_provider.as_deref()?,
             model: trace.final_model.as_deref()?,

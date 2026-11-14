@@ -1117,3 +1117,222 @@ async fn analysis_is_identical_before_and_after_core_move() {
     assert_eq!(driven, composed, "the driver composes exactly the moved modules");
     assert_eq!(driven, repeated, "the analysis is repeatable");
 }
+
+/// How the metered turn of [`metered_turn_outcome`] ends after its first,
+/// metered provider round.
+#[derive(Clone, Copy, Debug)]
+enum TurnEnding {
+    Failure,
+    Cancellation,
+    SendRefusal,
+}
+
+/// The first round reports metered usage and asks for `file_read`; the second
+/// round fails, is cancelled while in flight, or is refused at send admission.
+struct MeteredThenEnds {
+    ending: TurnEnding,
+    calls: AtomicUsize,
+    cancel: CancellationToken,
+}
+#[async_trait::async_trait]
+impl Provider for MeteredThenEnds {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+    async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+        anyhow::bail!("unexpected completion path")
+    }
+    async fn chat_traced(
+        &self,
+        _: ChatRequest<'_>,
+        model: &str,
+        _: f64,
+    ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            return match self.ending {
+                TurnEnding::Failure => Err(anyhow::anyhow!("test: the second provider round fails")),
+                TurnEnding::Cancellation => {
+                    self.cancel.cancel();
+                    std::future::pending::<anyhow::Result<crate::providers::traits::ChatTrace>>().await
+                }
+                TurnEnding::SendRefusal => Err(anyhow::anyhow!("test: a refused send never reaches the provider")),
+            };
+        }
+        if matches!(self.ending, TurnEnding::SendRefusal) {
+            // Drain the live G6 tokens after the metered round, so the next
+            // send is refused at admission.
+            crate::agent::send_admission::TEST_TOKEN_CAP.set(0);
+        }
+        let now = chrono::Utc::now();
+        Ok(crate::providers::traits::ChatTrace {
+            response: ChatResponse {
+                text: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_a".into(),
+                    name: "file_read".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                seq: 1,
+                provider: "ollama".into(),
+                model: model.into(),
+                started_at: now,
+                finished_at: now,
+                status: crate::llm::route_decision::AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "ollama".into(),
+            final_model: model.into(),
+            served_member: None,
+            tokens_used: crate::llm::route_decision::TokenUsage {
+                prompt_tokens: Some(500_000),
+                completion_tokens: Some(250_000),
+                total_tokens: Some(750_000),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+            },
+        })
+    }
+}
+
+/// One real turn whose provider is metered once and then `ending`; returns
+/// the result of the turn and the outcome the engine persisted.
+async fn metered_turn_outcome(ending: TurnEnding) -> (anyhow::Result<()>, Vec<TurnOutcome>) {
+    use crate::agent::turn_request::*;
+    let _reset = crate::agent::send_admission::HookReset;
+    let directory = tempfile::tempdir().unwrap();
+    let mut runtime = crate::config::Config {
+        workspace_dir: directory.path().to_path_buf(),
+        ..Default::default()
+    };
+    runtime.autonomy.level = crate::security::AutonomyLevel::Full;
+    runtime.tool_tiering.always_include.push("file_read".into());
+    runtime.decision_engine = enabled(DecisionMode::Post);
+    // 500 000 prompt tokens at 2 USD and 250 000 completion tokens at 4 USD
+    // per million: exactly 2 USD, 2 000 000 micro-USD.
+    runtime.cost.prices.insert(
+        crate::config::schema::usage_pricing_key("ollama", "prx-local-model"),
+        crate::config::schema::ModelPricing {
+            input: 2.0,
+            output: 4.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools: Arc<Vec<Box<dyn crate::tools::Tool>>> = Arc::new(vec![Box::new(DispatchSpy(Arc::clone(&calls)))]);
+    let admission = crate::agent::test_admission::AdmittedTurn::with_config(
+        runtime,
+        "Use file_read to inspect ./fixture.txt.",
+        Arc::clone(&tools),
+    )
+    .await;
+    let cancel = CancellationToken::new();
+    let provider = MeteredThenEnds {
+        ending,
+        calls: AtomicUsize::new(0),
+        cancel: cancel.clone(),
+    };
+    // The same retained evidence the turn's terminal settles from.
+    let retained = Arc::new(crate::agent::turn_contracts::RetainedProviderTrace::default());
+    let mut adapter = admission.adapter();
+    adapter.provider_trace = Some(Arc::clone(&retained));
+    let mut history = vec![
+        ChatMessage::system("system policy"),
+        ChatMessage::user("Use file_read to inspect ./fixture.txt."),
+    ];
+    let result = crate::agent::turn_engine::run_turn(
+        &mut history,
+        TurnRequest {
+            advice: None,
+            channel_name: "cli",
+            scope: None,
+            mode: Default::default(),
+            silent: true,
+            expose_stay_silent: false,
+            multimodal: &crate::config::MultimodalConfig::default(),
+            schedule: TurnSchedule {
+                read_only_tool_concurrency_window: 1,
+                priority_scheduling_enabled: false,
+                low_priority_tool_names: vec![],
+            },
+            compaction: None,
+            decision: admission.decision(),
+        },
+        TurnServices {
+            provider: &provider,
+            provider_name: "ollama",
+            model: "prx-local-model",
+            temperature: 0.0,
+            tools_registry: tools,
+            observer: &crate::observability::NoopObserver {},
+            hooks: &crate::hooks::HookManager::new(directory.path().to_path_buf()),
+            approval: None,
+            approval_resolver: None,
+            runtime_adapter: Some(adapter),
+            memory: ToolLoopMemory::none(),
+        },
+        TurnDelivery {
+            cancellation: Some(cancel),
+            on_delta: None,
+            on_tool_call: None,
+        },
+    )
+    .await
+    .map(|_| ());
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        match ending {
+            TurnEnding::SendRefusal => 1,
+            TurnEnding::Failure | TurnEnding::Cancellation => 2,
+        }
+    );
+    assert!(
+        retained.snapshot().0.is_some(),
+        "the metered round is retained for the terminal settlement"
+    );
+    assert!(
+        admission
+            .decision()
+            .service
+            .drain_writes(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await
+    );
+    let probe = TurnProbe {
+        requests: Vec::new(),
+        store: directory.path().join("decision-engine.sqlite"),
+        dispatches: calls.load(Ordering::SeqCst),
+        store_opens: 0,
+        credential_reads: 0,
+        _directory: directory,
+    };
+    let outcomes = recorded(&probe).await;
+    drop(admission);
+    (result, outcomes)
+}
+
+/// P2-R10: a turn that is metered and then fails, is cancelled or is refused
+/// at send records the settled cost of its metered usage, the same usage the
+/// terminal settles from the retained provider evidence, with its class.
+#[tokio::test]
+async fn ended_turns_record_the_settled_metered_cost() {
+    for (ending, class) in [
+        (TurnEnding::Failure, TurnResultClass::Failed),
+        (TurnEnding::Cancellation, TurnResultClass::Cancelled),
+        (TurnEnding::SendRefusal, TurnResultClass::Refused),
+    ] {
+        let (result, outcomes) = metered_turn_outcome(ending).await;
+        assert!(result.is_err(), "{ending:?}: the turn does not complete");
+        assert_eq!(outcomes.len(), 1, "{ending:?}");
+        let outcome = outcomes.first().expect("test: outcome");
+        assert_eq!(outcome.result(), class, "{ending:?}");
+        assert_eq!(outcome.cost_micro_usd(), Some(2_000_000), "{ending:?}");
+    }
+}

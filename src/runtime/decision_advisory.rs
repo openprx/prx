@@ -662,7 +662,9 @@ pub(crate) mod tests;
 pub(crate) struct TurnEnd<'a> {
     pub result: TurnResultClass,
     pub duration_ms: u64,
-    /// The serving provider, model and aggregated usage of a completed turn.
+    /// The serving provider, model and aggregated usage the terminal settles:
+    /// the returned trace of a completed turn, the retained provider evidence
+    /// of a failed, cancelled or refused one.
     pub usage: Option<TurnUsage<'a>>,
 }
 
