@@ -3353,7 +3353,9 @@ bot_token = "***"
             "http://[redacted]@127.0.0.1:16",
             "http://[redacted]@127.0.0.1:19/health",
             "ws://[redacted]@127.0.0.1:26",
-            "https://[redacted]@127.0.0.1:27/v1",
+            // The decision backend endpoint (`[causal_tree.backend]`, :27, was
+            // deleted with its table in P2-R24).
+            "https://[redacted]@127.0.0.1:28/v1",
         ] {
             assert!(rendered.contains(endpoint), "{endpoint} is missing from: {rendered}");
         }

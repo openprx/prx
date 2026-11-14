@@ -1411,9 +1411,10 @@ fn sealing_refuses_duplicate_candidate_ids() {
 #[test]
 fn a_fifo_at_the_key_path_is_refused_without_blocking() {
     let dir = tempfile::tempdir().expect("test: tempdir");
-    let key_dir = dir.path().join("self/causal_tree");
+    // OV-2 (P2-R2): the runtime key lives at `self/runtime/runtime.key`.
+    let key_dir = dir.path().join("self/runtime");
     std::fs::create_dir_all(&key_dir).expect("test: key dir");
-    let fifo = key_dir.join(".decision_key");
+    let fifo = key_dir.join("runtime.key");
     let made = std::process::Command::new("mkfifo")
         .arg(&fifo)
         .status()

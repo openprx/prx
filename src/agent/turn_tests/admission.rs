@@ -584,6 +584,10 @@ impl AdmittedTurn {
             &config.autonomy,
             workspace,
         ));
+        let loop_hooks = registry
+            .iter()
+            .find_map(|tool| tool.live_hook_manager())
+            .unwrap_or_else(|| Arc::new(crate::hooks::HookManager::new(workspace.to_owned())));
         let execution = Arc::new(
             ToolExecutionService::from_shared_boxed_registry(
                 Arc::clone(&registry),
@@ -635,7 +639,9 @@ impl AdmittedTurn {
         .await
         .expect("actual fixture decision service")
         .with_loop_runtime(crate::runtime::turn_publication::PublicationLoopRuntime {
-            hooks: Arc::new(crate::hooks::HookManager::new(workspace.to_owned())),
+            // As in production, the turn's hooks are the manager whose
+            // control tools the registry carries (an inert one without them).
+            hooks: loop_hooks,
             observer: Arc::new(crate::observability::noop::NoopObserver),
         })
         .expect("fixture loop runtime");

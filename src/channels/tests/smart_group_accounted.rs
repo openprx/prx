@@ -429,10 +429,12 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
                 .list_message_events_since(&principal, 0, 100)
                 .await
                 .expect("smart-group runtime events");
-            let input = events
-                .iter()
-                .find(|event| event.role == "user" && event.content == content)
-                .expect("durable smart-group input");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.role == "user" && event.content == content),
+                "durable smart-group input"
+            );
             let auxiliary = events
                 .iter()
                 .find(|event| event.event_type == "provider.auxiliary.settled")
@@ -465,19 +467,13 @@ async fn exercise_accounted_classifier_with(content: &str, verdict: Verdict, pla
                 "classifier silence must not invent assistant history"
             );
 
-            let connection = rusqlite::Connection::open_with_flags(
-                workspace.path().join("self/causal_tree/decisions.db"),
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .expect("actual smart-group decision store");
-            let admitted: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM decisions WHERE source_event_id=?1",
-                    [input.event_id.as_str()],
-                    |row| row.get(0),
-                )
-                .expect("source-bound smart-group decisions");
-            assert!(admitted > 0, "the source decision must exist before classifier silence");
+            // P2-R20/P2-I1: admission writes no decision row; the classifier
+            // runs after the admitted turn opened, and no legacy decision
+            // store is ever created.
+            assert!(
+                !workspace.path().join("self/causal_tree/decisions.db").exists(),
+                "the smart-group turn must not create a decision store"
+            );
 
             let rows: Vec<Value> = std::fs::read_to_string(workspace.path().join("state/costs.reservations.jsonl"))
                 .expect("classifier physical accounting journal")

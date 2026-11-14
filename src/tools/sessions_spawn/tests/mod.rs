@@ -949,13 +949,21 @@ async fn execute_admitted_spawn_with_plane(
                 )
                 .await
             };
-            crate::runtime::child_source::scope_ordinary_provider_fixture(
-                provider,
-                provider_name.clone(),
-                model_name.clone(),
-                admitted.execute_tool_with_approval("sessions_spawn", arguments, approval),
-            )
-            .await
+            let spawn = admitted.execute_tool_with_approval("sessions_spawn", arguments, approval);
+            // The enabled-engine form keeps the child on the production
+            // provider selection (one issuance path, P2-R15): its child
+            // reaches the configured endpoint, not the in-memory parent model.
+            if decision_enabled {
+                spawn.await
+            } else {
+                crate::runtime::child_source::scope_ordinary_provider_fixture(
+                    provider,
+                    provider_name.clone(),
+                    model_name.clone(),
+                    spawn,
+                )
+                .await
+            }
         }))
         .await
 }

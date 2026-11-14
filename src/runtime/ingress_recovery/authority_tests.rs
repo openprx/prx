@@ -71,7 +71,17 @@ async fn recovery_mac_runs_off_the_async_worker() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn recovery_wrapped_backends_keep_duplicate_suppression() -> anyhow::Result<()> {
-    for backend in ["sqlite", "lucid", "encrypted", "postgres_class"] {
+    // P2-R21: a backend without a recovery repository gets no recorder.
+    {
+        let dir = directory()?;
+        let workspace = dir.path().canonicalize()?;
+        let unavailable = recorder(backend_memory("postgres_class", &workspace)?, &workspace).await;
+        anyhow::ensure!(
+            unavailable.is_err(),
+            "a repository-less backend must not prepare a recorder"
+        );
+    }
+    for backend in ["sqlite", "lucid", "encrypted"] {
         let dir = directory()?;
         let workspace = dir.path().canonicalize()?;
         let memory = backend_memory(backend, &workspace)?;
@@ -81,7 +91,7 @@ async fn recovery_wrapped_backends_keep_duplicate_suppression() -> anyhow::Resul
             .append(source.clone())
             .await?;
         anyhow::ensure!(
-            capsule_from_event(&event)?.version == if backend == "postgres_class" { 2 } else { 3 },
+            capsule_from_event(&event)?.version == 3,
             "wrapper lost repository capability: {backend}"
         );
         source.run_id = Some("prx_retry".into());

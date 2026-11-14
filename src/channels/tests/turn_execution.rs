@@ -546,9 +546,12 @@ async fn run_outcome_turn(
                 Ok::<_, anyhow::Error>(())
             })
             .await;
+        // P2-R20/P2-R22: no decision store is opened under the blocked
+        // workspace any more; the refused turn's terminal is unrecorded and
+        // its cleanup confirms.
         assert!(
-            outcome.is_err(),
-            "the unadmittable turn must report failed terminal cleanup"
+            outcome.is_ok(),
+            "the unadmittable turn's unrecorded terminal cleanup must confirm: {outcome:?}"
         );
     }
     (

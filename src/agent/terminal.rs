@@ -984,18 +984,25 @@ mod tests {
                 service.model_can_call_tools(&proof),
                 "fixture's actual traced provider supports verified native tools"
             );
-            let source = memory
-                .find_owned_message_event(
-                    &workspace.to_string_lossy(),
-                    proof.owner_id(),
-                    proof.source_event_id().unwrap(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(source.content, input);
-            assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
-            assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
+            // With user-message recording off the inbound receipt is
+            // synthetic: the proof carries no source event (OV-13).
+            let source = match proof.source_event_id() {
+                Some(event_id) => {
+                    let source = memory
+                        .find_owned_message_event(&workspace.to_string_lossy(), proof.owner_id(), event_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(source.content, input);
+                    assert_eq!(source.owner_id.as_deref(), Some(proof.owner_id()));
+                    assert_eq!(source.session_key.as_deref(), Some(proof.session_key()));
+                    Some(source)
+                }
+                None => {
+                    assert!(!recording, "a recorded turn carries its inbound source event");
+                    None
+                }
+            };
             if scoped_retrieval {
                 let mut write_scope = proof.memory_scope().clone();
                 write_scope.owner_id = Some(proof.owner_id().to_owned());
@@ -1008,10 +1015,10 @@ mod tests {
                         Some(proof.session_key()),
                         Some(&write_scope),
                         crate::memory::MemoryStoreMetadata {
-                            workspace_id: Some(source.workspace_id.clone()),
-                            owner_id: source.owner_id.clone(),
-                            channel: source.channel.clone(),
-                            source_event_id: Some(source.event_id.clone()),
+                            workspace_id: Some(workspace.to_string_lossy().into_owned()),
+                            owner_id: Some(proof.owner_id().to_owned()),
+                            channel: source.as_ref().and_then(|source| source.channel.clone()),
+                            source_event_id: source.as_ref().map(|source| source.event_id.clone()),
                             ..Default::default()
                         },
                     )
@@ -1127,12 +1134,17 @@ mod tests {
                             stream_provider: false,
                             tool_execution_service: None,
                             tool_execution_context: crate::tools::ToolExecutionContext::new(
-                                crate::runtime::envelope::RuntimeEnvelope::agent(
-                                    workspace.to_string_lossy(),
-                                    proof.run_id(),
-                                )
-                                .with_config_generation(&generation)
-                                .with_source_message_event_id(proof.source_event_id().unwrap()),
+                                {
+                                    let envelope = crate::runtime::envelope::RuntimeEnvelope::agent(
+                                        workspace.to_string_lossy(),
+                                        proof.run_id(),
+                                    )
+                                    .with_config_generation(&generation);
+                                    match proof.source_event_id() {
+                                        Some(event_id) => envelope.with_source_message_event_id(event_id),
+                                        None => envelope,
+                                    }
+                                },
                                 "private",
                             ),
                             allowed_tool_names: None,
@@ -1217,7 +1229,13 @@ mod tests {
             for issued_silent in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
-                let fabric = MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy());
+                // Disabled mode is user-message recording off (OV-13): the
+                // terminal fabric and the proof both see it.
+                let fabric = MemoryFabric::new(Arc::clone(&memory), temp.path().to_string_lossy())
+                    .with_event_recording(crate::memory::MemoryEventRecording {
+                        record_user_messages: enabled,
+                        ..crate::memory::MemoryEventRecording::default()
+                    });
                 let mut draft = completed_commit("prx_silent_consistency");
                 if issued_silent {
                     draft.status = TurnTerminalStatus::Silent;
@@ -1234,10 +1252,12 @@ mod tests {
                 .await;
                 let principal = terminal_fixture_principal(temp.path(), &draft.scope);
                 let before = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
-                assert!(
+                assert_eq!(
                     before
                         .iter()
-                        .any(|event| event.role == "user" && event.event_type == "message.created")
+                        .any(|event| event.role == "user" && event.event_type == "message.created"),
+                    enabled,
+                    "only a recorded turn persists its inbound user message"
                 );
                 draft.status = if issued_silent {
                     TurnTerminalStatus::Completed

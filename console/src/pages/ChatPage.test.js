@@ -18,8 +18,7 @@ vi.mock('../lib/api', () => ({
     postByApiPath: vi.fn(),
     getDecisionApproval: vi.fn(),
     reviewDecisionApproval: vi.fn(),
-    revokeDecisionApproval: vi.fn(),
-    resumeDecisionApprovalAsync: vi.fn()
+    revokeDecisionApproval: vi.fn()
   }
 }));
 

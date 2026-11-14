@@ -3495,8 +3495,9 @@ pub(crate) mod tests {
         .await
     }
 
-    /// Finding 96b: a delegate child without an Ordinary parent runtime
-    /// emits its hook events through the parent registry's live manager.
+    /// Finding 96b: a delegate child emits its hook events through the
+    /// parent's live manager. Every delegate child runs under its ordinary
+    /// parent runtime (P2-R15), whose hooks are that manager.
     #[tokio::test]
     async fn a_delegate_child_shares_the_parents_hook_manager() {
         let temp = tempfile::tempdir().unwrap();

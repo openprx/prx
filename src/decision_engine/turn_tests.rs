@@ -466,6 +466,19 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// Outcome rows already in the telemetry store; an absent file or table
+/// counts as none.
+fn recorded_outcome_rows(store: &std::path::Path) -> i64 {
+    if !store.exists() {
+        return 0;
+    }
+    let connection = rusqlite::Connection::open_with_flags(store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("test: read-only telemetry store");
+    connection
+        .query_row("SELECT COUNT(*) FROM engine_outcomes", [], |row| row.get(0))
+        .unwrap_or(0)
+}
+
 #[derive(Default)]
 struct RequestSpy {
     requests: Mutex<Vec<serde_json::Value>>,
@@ -483,8 +496,15 @@ impl Provider for RequestSpy {
         anyhow::bail!("unexpected completion path")
     }
     async fn chat(&self, request: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+        // P2-R10: pre/both modes record the analysis with the brief the
+        // first send carries, so the store may exist here; the outcome row
+        // is written only after the final provider outcome.
         if let Some(store) = &self.store {
-            assert!(!store.exists(), "observe must run after the final provider outcome");
+            assert_eq!(
+                recorded_outcome_rows(store),
+                0,
+                "observe must run after the final provider outcome"
+            );
         }
         let mut requests = self.requests.lock();
         let first = requests.is_empty();

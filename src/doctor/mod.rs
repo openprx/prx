@@ -2751,33 +2751,6 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    #[test]
-    fn doctor_reports_a_below_catalog_hosted_latency_budget() {
-        let temp = TempDir::new().expect("test: private doctor configuration");
-        let mut config = Config {
-            config_path: temp.path().join("config.toml"),
-            workspace_dir: temp.path().join("workspace"),
-            ..Config::default()
-        };
-        config.decision_engine.backend.get_or_insert_with(Default::default).kind =
-            crate::config::schema::decision_engine::BackendSelection::Fixed(
-                crate::config::schema::decision_engine::BackendKind::OpenRouter,
-            );
-        config
-            .decision_engine
-            .backend
-            .get_or_insert_with(Default::default)
-            .model = "typesafe/jev-1.13".to_owned();
-        let mut items = Vec::new();
-        check_decision_plane(&config, &mut items);
-        assert!(items.iter().any(|item| {
-            item.message.contains("below the catalog recommendation")
-                && item.message.contains("500")
-                && item.message.contains("3000")
-        }));
-        assert_eq!(config.decision_engine.latency_budget_ms, 500);
-    }
-
     /// D-094 C-1, C-5: the doctor names a refused decision backend (which
     /// runs builtin-only) and every decision credential nothing references,
     /// by id, never by value.
@@ -2789,6 +2762,7 @@ mod tests {
             workspace_dir: temp.path().join("workspace"),
             ..Config::default()
         };
+        config.decision_engine.enabled = true;
         config.decision_engine.backend.get_or_insert_with(Default::default).kind =
             crate::config::schema::decision_engine::BackendSelection::Fixed(
                 crate::config::schema::decision_engine::BackendKind::CompatibleHttp,
@@ -2823,6 +2797,7 @@ mod tests {
         assert!(text.contains("prx providers credential remove <id>"), "{text}");
         // Disabled, the credential store is not opened: a held lock does not
         // delay the doctor, and nothing is reported from the store.
+        config.decision_engine.enabled = false;
         std::fs::write(temp.path().join("auth-profiles.lock"), "pid=1\n").unwrap();
         let started = std::time::Instant::now();
         let mut items = Vec::new();

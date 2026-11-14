@@ -459,8 +459,10 @@ pub(super) async fn recovery_terminal_claim_each_bound_field_is_refused() {
     service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 
     let mut unrecorded = completed_commit("prx-claim-unrecorded");
+    // P2-R22: with the decision plane gone, every repository terminal writes
+    // the same closed claim schema; this cell's terminal records its input.
     let unrecorded_service =
-        bind_terminal_fixture_mode(&workspace, Arc::clone(&memory), &mut unrecorded, &cost, false, None).await;
+        bind_terminal_fixture_mode(&workspace, Arc::clone(&memory), &mut unrecorded, &cost, true, None).await;
     finalize_turn(&fabric, unrecorded, &cost, &workspace)
         .await
         .expect("test: unrecorded");
@@ -953,15 +955,28 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await
             .expect("test: drain cleanup");
+        // P2-R5/P2-I3: preparing a scope never projects; the process-level
+        // projector acknowledges the deferred usage, whatever the recording.
+        assert_eq!(
+            first_outbox(&workspace).state,
+            "pending",
+            "recovery scope preparation projected usage"
+        );
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&memory),
+            workspace.clone(),
+            cost.clone(),
+        )
+        .await;
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: enabled recovery must acknowledge the usage deferred while recording was disabled"
+            "test: the projector must acknowledge the usage deferred while recording was disabled"
         );
         assert_eq!(
             ledger_lines(&workspace, "prx-skip-inline"),
             1,
-            "test: enabled recovery must charge the deferred usage exactly once"
+            "test: the projector must charge the deferred usage exactly once"
         );
         service.shutdown(Instant::now() + Duration::from_secs(5)).await;
         drop(dir);
@@ -1104,13 +1119,14 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             .open(&lock_path)
             .expect("test: open ledger lock");
         lock_file.lock().expect("test: hold ledger lock");
-        let (recovery, tracker) = prepare_scope(&workspace, Arc::clone(&memory), true, cost.clone()).await;
+        // P2-R5: the projector pass, not scope preparation, projects usage.
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&memory),
+            workspace.clone(),
+            cost.clone(),
+        )
+        .await;
         drop(lock_file);
-        drop(recovery);
-        tracker
-            .drain(tokio::time::Instant::now() + Duration::from_secs(5))
-            .await
-            .expect("test: drain cleanup");
         assert_eq!(
             first_outbox(&workspace).state,
             "error",
@@ -1560,6 +1576,14 @@ pub(super) async fn fresh_process_recovery_child() {
             .drain(tokio::time::Instant::now() + Duration::from_secs(5))
             .await
             .expect("test: restarted process drain");
+        // P2-R5: the restarted process's cost outbox projector pass, not the
+        // recovery scope, acknowledges the interrupted settlement.
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&memory),
+            workspace.clone(),
+            priced_cost_config(),
+        )
+        .await;
         println!(
             "PRX_RECOVERY_ACK:{}",
             serde_json::json!({"outbox_state": first_outbox(&workspace).state})

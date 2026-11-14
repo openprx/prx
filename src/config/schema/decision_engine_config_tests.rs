@@ -107,13 +107,15 @@ async fn save_reload_keeps_backend_and_explicit_disable() {
     assert!(!c.decision_engine.enabled);
     assert_eq!(c.decision_engine.backend.unwrap().timeout_ms, 200);
 }
+/// R24 ruling (2): with `migrate_backend` deleted, an explicitly empty
+/// backend table and an absent one both read the backend's serde default,
+/// which survives save and reload unchanged.
 #[tokio::test]
 async fn explicit_empty_backend_survives_save_reload() {
     for explicit in ["[decision_engine.backend]", "[decision_engine.backend.circuit_breaker]"] {
         let c = round_trip(explicit).await;
-        assert_eq!(c.decision_engine.backend, Some(DecisionBackendConfig::default()));
-        let saved = toml::to_string(&c.decision_engine).unwrap();
-        assert!(saved.contains("[backend]") && saved.contains("pinned_snapshot = \"\""));
+        assert_eq!(effective_engine_backend(&c), &DecisionBackendConfig::default());
+        assert_eq!(effective_engine_backend(&c), effective_engine_backend(&load("")));
     }
 }
 

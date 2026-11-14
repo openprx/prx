@@ -880,8 +880,12 @@ mod tests {
         let entry = catalog
             .model(&crate::providers::ProviderId::of("openrouter"), "typesafe/jev-1.13")
             .expect("hosted decision entry");
+        // The operator raises the budget to the catalog recommendation first
+        // (code audit r1, finding 6).
+        let mut base = Config::default();
+        base.decision_engine.latency_budget_ms = 3_000;
         let hosted = CausalConfigService::mutate(
-            &Config::default(),
+            &base,
             &[
                 CausalMutation::SetBackend {
                     kind: BackendKind::OpenRouter,

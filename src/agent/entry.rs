@@ -1093,7 +1093,7 @@ mod agent_turn_origin_tests {
     }
 
     #[tokio::test]
-    async fn enabled_agent_cannot_issue_proof_without_inbound_receipt() {
+    async fn missing_or_synthetic_inbound_receipt_confers_no_source_event() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -1125,25 +1125,29 @@ mod agent_turn_origin_tests {
                 .is_err(),
             "an enabled record path must report a failed append"
         );
+        // P2-R22: an unrecorded turn is never refused, but a missing or
+        // synthetic receipt never attests a source event for it.
         for receipt in [None, Some(&synthetic)] {
-            assert!(
-                issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "raw", receipt, &choice).is_err(),
-                "missing inbound receipt cannot confer Agent authority"
+            let proof = issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "raw", receipt, &choice)
+                .expect("an unrecorded CLI turn is not refused");
+            assert_eq!(
+                proof.source_event_id(),
+                None,
+                "a missing or synthetic receipt confers no source event"
             );
         }
         let persisted = inbound_event(&envelope, &generation, "raw");
-        assert!(
-            issue_cli_agent_turn_proof(
-                None,
-                &envelope,
-                &generation,
-                "prx_run",
-                "raw",
-                Some(&persisted),
-                &choice,
-            )
-            .is_ok()
-        );
+        let proof = issue_cli_agent_turn_proof(
+            None,
+            &envelope,
+            &generation,
+            "prx_run",
+            "raw",
+            Some(&persisted),
+            &choice,
+        )
+        .expect("a persisted receipt issues the proof");
+        assert_eq!(proof.source_event_id(), Some(persisted.event_id.as_str()));
         let mut foreign = persisted;
         foreign.run_id = Some("other_run".to_string());
         assert!(

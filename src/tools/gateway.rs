@@ -829,6 +829,8 @@ mod tests {
             ..Config::default()
         };
         cfg.decision_engine.max_candidates = 5;
+        // A non-default budget, so the `null` deletion below is a change.
+        cfg.decision_engine.latency_budget_ms = 3_000;
 
         cfg.save().await.unwrap();
         let tool = GatewayTool::new(new_shared(cfg), "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(

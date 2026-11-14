@@ -155,12 +155,11 @@ fn unpriced_single_shot_prints_reason_and_exits_two() {
             "a pre-send refusal cannot fabricate a provider attempt",
         );
     }
-    assert_eq!(
-        payload
-            .get("execution_trace")
-            .and_then(|trace| trace.get("provider_requests"))
-            .and_then(serde_json::Value::as_u64),
-        Some(0),
-        "durable execution evidence must retain zero physical provider requests",
+    // P2-R3 (D§4.2): the repository terminal carries no execution trace;
+    // the zero physical requests are evidenced by the provider spy above and
+    // by the empty provider attempts.
+    assert!(
+        payload.get("execution_trace").is_none_or(serde_json::Value::is_null),
+        "the terminal payload carries no execution trace: {payload}",
     );
 }

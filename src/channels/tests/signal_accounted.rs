@@ -373,9 +373,11 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
                 .any(|event| event.role == "user" && event.run_id.is_some())
         );
         if !text_only {
-            let input_event = events.iter().find(|event| event.role == "user" && event.content == input)
-                .expect("actual input receipt");
-            assert_decision_path(workspace.path(), &input_event.event_id);
+            assert!(
+                events.iter().any(|event| event.role == "user" && event.content == input),
+                "actual input receipt"
+            );
+            assert_no_decision_store(workspace.path());
         }
         let auxiliary: Vec<_> = events
             .iter()
@@ -428,36 +430,13 @@ async fn exercise_work(scenario: ReportScenario, priced: bool) {
     }
 }
 
-// Read-only observer of actual persisted decisions, never an authority producer.
-fn assert_decision_path(workspace: &std::path::Path, source_event_id: &str) {
-    let conn = rusqlite::Connection::open_with_flags(
-        workspace.join("self/causal_tree/decisions.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .expect("actual decision store");
-    let mut statement = conn.prepare(
-        "SELECT directive_kind,candidates_json,gates_json FROM decisions WHERE source_event_id=?1 ORDER BY created_at_ms,decision_id LIMIT 3",
-    ).expect("bounded source-bound decision observer");
-    let rows = statement
-        .query_map([source_event_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .expect("actual decision rows")
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("decode actual rows");
-    // Prediction-free opening (R9): one decision row on the Answer path,
-    // whether priced or not. The engine never retrieves, discovers or
-    // refuses on its own; an unpriced turn is refused by execution's send
-    // admission (asserted by the reply and journal checks above).
-    assert_eq!(rows.len(), 1, "one prediction-free decision row");
-    assert_eq!(rows[0].0, "answer");
+// P2-R20/P2-I1: the admitted Signal turn writes no decision row and never
+// creates the legacy decision store; accounting and the single finalized
+// terminal are asserted above.
+fn assert_no_decision_store(workspace: &std::path::Path) {
     assert!(
-        rows.iter()
-            .all(|row| !matches!(row.0.as_str(), "retrieve" | "discover" | "refuse"))
+        !workspace.join("self/causal_tree/decisions.db").exists(),
+        "the Signal turn must not create a decision store"
     );
 }
 

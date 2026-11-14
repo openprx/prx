@@ -409,11 +409,15 @@ async fn crashed_after_marker(
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(workspace.path()).expect("test: memory"));
     let provider_catalog = ProviderCatalogView::from_config(&config);
     let service = agent_service_with_memory(&generation, &provider_catalog, Arc::clone(&memory)).await;
-    let proof = crate::agent::entry::test_recorded_cli_agent_turn_proof_with_input(
+    // P2-R3/P2-R21: a rejoinable terminal needs v3 ingress evidence, so the
+    // inbound input is recorded through the recovery ingress fabric.
+    let proof = crate::agent::entry::test_recovery_cli_agent_turn_proof_with_selection(
         &generation,
         Arc::clone(&memory),
         input,
-        "prx_rejoin_receipts_run",
+        // The terminal is the run, as on every live surface.
+        terminal_id,
+        ("ollama", "prx-local-model"),
     )
     .await;
     let context = service
@@ -439,11 +443,16 @@ async fn crashed_after_marker(
         crate::agent::terminal::TurnTerminalDraft {
             binding: Some(service.terminal_binding(&context).expect("test: binding")),
             terminal_id: terminal_id.to_owned(),
-            scope: crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
-                .with_owner_id(proof.owner_id())
-                .with_channel("cli")
-                .with_session_key(proof.session_key())
-                .with_run_id(proof.run_id()),
+            // A recorded terminal claim is caused by the turn's inbound
+            // source event, as the live terminal's scope carries it.
+            scope: crate::memory::MessageEventScope {
+                causation_event_id: proof.source_event_id().map(str::to_owned),
+                ..crate::memory::MessageEventScope::new("agent", crate::memory::MemoryVisibility::Session)
+                    .with_owner_id(proof.owner_id())
+                    .with_channel("cli")
+                    .with_session_key(proof.session_key())
+                    .with_run_id(proof.run_id())
+            },
             status,
             history: None,
             history_scope: None,
