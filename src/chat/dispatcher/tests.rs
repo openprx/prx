@@ -856,3 +856,42 @@ fn s5_release_p0_3_full_autonomy_skips_approval_entirely() {
         crate::security::policy::ToolDecision::Allow
     );
 }
+
+// ── CF-R3: session-wide "always" approval ───────────────────────────────
+
+#[test]
+fn approval_router_always_allows_the_tool_for_the_session() {
+    let router = ApprovalRouter::new();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    assert!(router.register_tool("call-1".to_owned(), "file_edit".to_owned(), tx));
+    assert!(router.is_pending("call-1"));
+    assert!(router.resolve_decision("call-1", true, true));
+    assert_eq!(rx.try_recv(), Ok(true));
+    assert!(!router.is_pending("call-1"));
+    assert!(router.is_session_allowed("file_edit"));
+    assert!(!router.is_session_allowed("shell"));
+
+    router.clear_session_allowlist();
+    assert!(!router.is_session_allowed("file_edit"));
+}
+
+#[test]
+fn approval_router_once_deny_and_unnamed_approvals_allow_nothing_further() {
+    let router = ApprovalRouter::new();
+    for (approved, always) in [(true, false), (false, true), (false, false)] {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(router.register_tool("call".to_owned(), "shell".to_owned(), tx));
+        assert!(router.resolve_decision("call", approved, always));
+        assert!(
+            !router.is_session_allowed("shell"),
+            "approved={approved} always={always}"
+        );
+    }
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    assert!(router.register("rewind-1".to_owned(), tx));
+    assert!(router.resolve_decision("rewind-1", true, true));
+    assert!(
+        !router.is_session_allowed("rewind-1"),
+        "a non-tool approval names no tool"
+    );
+}

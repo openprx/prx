@@ -94,6 +94,7 @@ mod session_glue;
 mod session_store;
 mod session_switch;
 mod terminal;
+mod terminal_approval;
 mod tui_loop;
 mod views;
 

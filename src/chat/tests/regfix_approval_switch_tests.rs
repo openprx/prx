@@ -138,7 +138,7 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     let mut saw_clear = false;
     while let Ok(action) = action_rx.try_recv() {
         match action {
-            Action::ToolApprovalReceived { tool_id, approved } => received.push((tool_id, approved)),
+            Action::ToolApprovalReceived { tool_id, approved, .. } => received.push((tool_id, approved)),
             Action::ToolApprovalCleared => saw_clear = true,
             _ => {}
         }

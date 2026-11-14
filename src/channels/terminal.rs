@@ -17,6 +17,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+pub(crate) mod prompt_line;
+
 // ── Terminal output sanitization ────────────────────────────────────────────
 
 /// Strip dangerous terminal escape sequences from untrusted text (LLM/tool output).
@@ -996,6 +998,9 @@ async fn terminal_input_loop(mut tx: crate::runtime::h2_entry::TerminalInputSink
             use std::io::BufRead as _;
 
             let stdin_is_tty = io::stdin().is_terminal();
+            // On a terminal an approval prompt claims its answer from this
+            // thread instead of racing it for the same line.
+            let _tty_guard = stdin_is_tty.then(prompt_line::TtyInputLoopGuard::enter);
             let stdin = io::stdin();
             let mut lines = stdin.lock().lines();
             loop {
@@ -1006,6 +1011,9 @@ async fn terminal_input_loop(mut tx: crate::runtime::h2_entry::TerminalInputSink
                 let line = match lines.next() {
                     Some(Ok(line)) => line,
                     Some(Err(_)) | None => break,
+                };
+                let Some(line) = prompt_line::deliver(line) else {
+                    continue;
                 };
                 let trimmed = line.trim().to_string();
                 if trimmed.is_empty() {

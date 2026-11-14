@@ -284,6 +284,7 @@ async fn effect_executor_handles_all_variants() {
         Effect::ResolveApproval {
             tool_id: "call-shadow".to_string(),
             approved: false,
+            always: false,
         },
     ];
 

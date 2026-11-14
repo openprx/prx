@@ -164,8 +164,6 @@ pub(crate) fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Op
             "file_write:write:*".to_string(),
             RiskLevel::Medium,
         )),
-        // Decision approval resolves this discriminator to a canonical exact
-        // file operation; the legacy callback must not issue this glob.
         "file_edit" => Some(GrantOp::ResourceGlob("file_edit:edit:*".to_string(), RiskLevel::Medium)),
         "http_request" => {
             let url = reqwest::Url::parse(string_arg("url")?.trim()).ok()?;

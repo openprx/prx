@@ -142,10 +142,11 @@ impl ChatState {
         if key.modifiers != KeyModifiers::NONE {
             return vec![Effect::RequestRedraw];
         }
-        let approved = match key.code {
-            KeyCode::Char('y' | 'Y') => Some(true),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
-            KeyCode::Enter => Some(pending.selected_approval),
+        let decision = match key.code {
+            KeyCode::Char('y' | 'Y') => Some((true, false)),
+            KeyCode::Char('a' | 'A') => Some((true, true)),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some((false, false)),
+            KeyCode::Enter => Some((pending.selected_approval, false)),
             KeyCode::Left | KeyCode::Up => {
                 if let Some(pending) = self.ui.pending_tool_approval.as_mut() {
                     pending.selected_approval = false;
@@ -160,7 +161,7 @@ impl ChatState {
             }
             _ => None,
         };
-        let Some(approved) = approved else {
+        let Some((approved, always)) = decision else {
             return vec![Effect::RequestRedraw];
         };
         self.ui.pending_tool_approval = None;
@@ -171,6 +172,7 @@ impl ChatState {
             Effect::ResolveApproval {
                 tool_id: pending.tool_id,
                 approved,
+                always,
             },
             Effect::RequestRedraw,
         ]

@@ -450,6 +450,7 @@ impl ChatState {
             effects.push(Effect::ResolveApproval {
                 tool_id: pending.tool_id,
                 approved: false,
+                always: false,
             });
         }
         effects.push(Effect::CancelDraft(draft_id));

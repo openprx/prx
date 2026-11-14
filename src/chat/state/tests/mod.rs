@@ -788,7 +788,7 @@ fn redux_approval_arrows_select_and_enter_resolves() {
     assert!(effects.iter().any(|effect| {
         matches!(
             effect,
-            Effect::ResolveApproval { tool_id, approved: true } if tool_id == "call-arrow-approve"
+            Effect::ResolveApproval { tool_id, approved: true, always: false } if tool_id == "call-arrow-approve"
         )
     }));
 }
@@ -806,6 +806,7 @@ fn tool_approval_received_closes_approval_child_view() {
     let effects = state.reduce(Action::ToolApprovalReceived {
         tool_id: "call-deny".to_string(),
         approved: false,
+        always: false,
     });
     assert!(state.ui.pending_tool_approval.is_none());
     assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
@@ -845,7 +846,7 @@ fn redux_esc_approval_generating_denies_without_cancelling_turn() {
     assert!(effects.iter().any(|effect| {
         matches!(
             effect,
-            Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-esc-deny"
+            Effect::ResolveApproval { tool_id, approved: false, .. } if tool_id == "call-esc-deny"
         )
     }));
     assert!(
@@ -909,7 +910,7 @@ fn cancel_requested_clears_pending_approval_and_resolves_false() {
     assert!(effects.iter().any(|effect| {
         matches!(
             effect,
-            Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-cancel-deny"
+            Effect::ResolveApproval { tool_id, approved: false, .. } if tool_id == "call-cancel-deny"
         )
     }));
     assert!(

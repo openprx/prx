@@ -134,7 +134,13 @@ pub enum KeyDispatch {
     /// P6b2: open the current draft in an external editor.
     ExternalEditorRequested,
     /// P6c1: resolve the foreground tool approval prompt.
-    ToolApprovalDecision { tool_id: String, approved: bool },
+    /// `always`: `a` approves this call and later calls of the same tool for
+    /// the session.
+    ToolApprovalDecision {
+        tool_id: String,
+        approved: bool,
+        always: bool,
+    },
     /// P8: cycle the in-session chat mode via Shift+Tab.
     ModeChanged(ChatMode),
 }
@@ -346,6 +352,16 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                     return KeyDispatch::ToolApprovalDecision {
                         tool_id: pending.tool_id,
                         approved: true,
+                        always: false,
+                    };
+                }
+                KeyCode::Char('a' | 'A') => {
+                    state.pending_tool_approval = None;
+                    state.focus = crate::chat::sessions::FocusTarget::Main;
+                    return KeyDispatch::ToolApprovalDecision {
+                        tool_id: pending.tool_id,
+                        approved: true,
+                        always: true,
                     };
                 }
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => {
@@ -354,6 +370,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                     return KeyDispatch::ToolApprovalDecision {
                         tool_id: pending.tool_id,
                         approved: false,
+                        always: false,
                     };
                 }
                 KeyCode::Left | KeyCode::Up => {
@@ -374,6 +391,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                     return KeyDispatch::ToolApprovalDecision {
                         tool_id: pending.tool_id,
                         approved: pending.selected_approval,
+                        always: false,
                     };
                 }
                 _ => return KeyDispatch::Consumed,

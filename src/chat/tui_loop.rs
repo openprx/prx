@@ -963,9 +963,17 @@ pub(super) fn run_tui_unified_loop(
                             }
                         }
                     }
-                    tui::KeyDispatch::ToolApprovalDecision { tool_id, approved } => {
+                    tui::KeyDispatch::ToolApprovalDecision {
+                        tool_id,
+                        approved,
+                        always,
+                    } => {
                         let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::ToolApprovalReceived { tool_id, approved },
+                            crate::chat::action::Action::ToolApprovalReceived {
+                                tool_id,
+                                approved,
+                                always,
+                            },
                             "chat.tool_approval_decision",
                         );
                         let _ = redraw_tx.try_send(());

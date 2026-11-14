@@ -264,7 +264,12 @@ pub enum Effect {
     /// `ToolApprovalReceived` Action. Used by pure key handling paths where the
     /// reducer owns the key event and must return the approval decision to the
     /// dispatcher/executor as an effect.
-    ResolveApproval { tool_id: String, approved: bool },
+    /// `always` has the meaning of [`Action::ToolApprovalReceived`]'s field.
+    ResolveApproval {
+        tool_id: String,
+        approved: bool,
+        always: bool,
+    },
     /// Exit the main loop gracefully
     Quit,
 }
@@ -1198,7 +1203,7 @@ impl ChatState {
                 name,
                 args,
             } => self.reduce_tool_approval_requested(task_id, tool_id, name, args),
-            Action::ToolApprovalReceived { tool_id, approved } => {
+            Action::ToolApprovalReceived { tool_id, approved, .. } => {
                 self.reduce_tool_approval_received(&tool_id, approved)
             }
             Action::ToolApprovalCleared => self.reduce_tool_approval_cleared(),

@@ -375,6 +375,8 @@ pub fn render_approval(
         Line::from(vec![
             Span::styled(format!("{approve_marker} [y]"), approve_style),
             Span::raw(" approve  "),
+            Span::styled("[a]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" always  "),
             Span::styled(format!("{deny_marker} [n]"), deny_style),
             Span::raw(" deny  "),
             Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),

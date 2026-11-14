@@ -275,3 +275,63 @@ fn preview_tool_arguments_truncates_long_payloads() {
     // truncate_with_ellipsis caps at 160 chars and appends "..."
     assert!(preview.chars().count() <= 163, "preview length unexpected: {preview}");
 }
+
+/// A human approval of `file_edit` mints the same signed, single-use,
+/// principal-bound `file_edit:edit:*` grant as `file_write`: it authorizes the
+/// tool's real resolved operation once and is refused on replay.
+#[test]
+fn file_edit_grant_authorizes_once() {
+    let workspace = tempfile::tempdir().expect("test workspace");
+    let target = workspace.path().join("notes.txt");
+    std::fs::write(&target, "one\n").expect("test target");
+    let policy = SecurityPolicy {
+        autonomy: crate::security::AutonomyLevel::Supervised,
+        workspace_dir: workspace.path().to_path_buf(),
+        ..SecurityPolicy::default()
+    };
+    let scope = ScopeContext {
+        policy: &policy,
+        sender: "user",
+        channel: "terminal",
+        chat_type: "private",
+        chat_id: "terminal:user",
+        session_key: Some("terminal:user"),
+        owner_id: None,
+        owner_isolated: false,
+        topic_id: None,
+        task_id: None,
+        source_message_event_id: None,
+        config_generation_id: None,
+        config_source_revision: None,
+    };
+    let args = serde_json::json!({"path": "notes.txt", "old_string": "one", "new_string": "two"});
+    let issued = runtime_approval_grant_for_call("file_edit", &args, Some(&scope)).expect("file_edit grant");
+    // The tool reads the grant from its runtime arguments with the trusted
+    // scope the executor attaches, which binds the caller principal.
+    let mut runtime_args = args.clone();
+    runtime_args[crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG] =
+        serde_json::to_value(&issued).expect("serialize grant");
+    runtime_args["_zc_scope_trusted"] = serde_json::Value::Bool(true);
+    runtime_args["_zc_scope"] = serde_json::json!({
+        "workspace_id": workspace.path().to_string_lossy(),
+        "channel": "terminal",
+        "sender": "user",
+        "chat_id": "terminal:user",
+    });
+    let grant = ApprovalGrant::from_runtime_args("file_edit", &runtime_args).expect("runtime grant");
+    let resolved = std::fs::canonicalize(&target).expect("canonical target");
+    let canonical_workspace = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let (operation, risk, launch, git) =
+        crate::security::approval_operation::file_operation("file_edit", &canonical_workspace, &resolved);
+    assert!(!launch && !git, "an ordinary file is a medium-risk edit");
+    let gate = crate::security::SideEffectGate::new(&policy);
+    gate.authorize_resource_operation("file_edit", &operation, risk, Some(&grant))
+        .expect("the grant authorizes the resolved edit");
+    let replay = crate::security::SideEffectGate::new(&policy)
+        .authorize_resource_operation("file_edit", &operation, risk, Some(&grant))
+        .expect_err("a single-use grant is refused on replay");
+    assert!(
+        replay.contains("approval"),
+        "replay refusal names the approval: {replay}"
+    );
+}

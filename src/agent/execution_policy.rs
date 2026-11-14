@@ -45,12 +45,6 @@ pub(crate) fn runtime_approval_grant_for_call(
 ) -> Option<ApprovalGrant> {
     use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, OpIdMatch, Subject, WitnessKeyring};
 
-    // The legacy callback has no canonical file target resolver. Preserve its
-    // refusal for file_edit; only the exact decision-call producer can bind it.
-    if tool_name == "file_edit" {
-        return None;
-    }
-
     let (operation, op_id_match, risk) = match grant_op_for_call(tool_name, args)? {
         GrantOp::Command(command) => {
             // Legacy v1 command-hash binding (cron/runner compatible).

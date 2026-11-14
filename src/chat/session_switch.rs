@@ -93,6 +93,8 @@ fn clear_pending_approvals_for_session_switch(ctx: &mut ChatSwitchCtx<'_>) -> us
         for tool_id in router.resolve_all(false) {
             cleared_ids.push(tool_id);
         }
+        // "Always" allowances belong to the session being left.
+        router.clear_session_allowlist();
     }
     if let Some(pending) = ctx.pending_chat_rewind.take() {
         if !cleared_ids.iter().any(|existing| existing == &pending.tool_id) {
@@ -109,6 +111,7 @@ fn clear_pending_approvals_for_session_switch(ctx: &mut ChatSwitchCtx<'_>) -> us
             crate::chat::action::Action::ToolApprovalReceived {
                 tool_id: tool_id.clone(),
                 approved: false,
+                always: false,
             },
             "chat.session_switch_fail_closed_approval",
         );

@@ -61,16 +61,24 @@ pub const ACTION_CHANNEL_CAPACITY: usize = 2048;
 /// resolve to false; they never override the human approval currently displayed/awaited.
 #[derive(Default)]
 pub struct ApprovalRouter {
-    pending: ParkingMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
+    pending: ParkingMutex<std::collections::HashMap<String, PendingApproval>>,
+    /// Tools the operator allowed for the rest of the chat session ("always").
+    /// Each later call still mints its own single-use grant.
+    session_allowlist: ParkingMutex<std::collections::HashSet<String>>,
+}
+
+/// One waiting approval: the driver's oneshot and, for a tool call, the tool
+/// name an "always" decision allows for the session.
+struct PendingApproval {
+    tx: tokio::sync::oneshot::Sender<bool>,
+    tool_name: Option<String>,
 }
 
 impl ApprovalRouter {
     /// Construct an empty router.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a pending approval on behalf of the driver (`tool_id`→`tx`).
@@ -78,6 +86,22 @@ impl ApprovalRouter {
     /// If any approval is already pending, the new request immediately fails closed (sends false on the
     /// new tx) and returns false; the caller must not render a second approval prompt.
     pub fn register(&self, tool_id: String, tx: tokio::sync::oneshot::Sender<bool>) -> bool {
+        self.register_entry(tool_id, PendingApproval { tx, tool_name: None })
+    }
+
+    /// Register a pending tool-call approval; an "always" decision for it
+    /// allows `tool_name` for the rest of the session.
+    pub fn register_tool(&self, tool_id: String, tool_name: String, tx: tokio::sync::oneshot::Sender<bool>) -> bool {
+        self.register_entry(
+            tool_id,
+            PendingApproval {
+                tx,
+                tool_name: Some(tool_name),
+            },
+        )
+    }
+
+    fn register_entry(&self, tool_id: String, entry: PendingApproval) -> bool {
         let mut guard = self.pending.lock();
         if !guard.is_empty() {
             tracing::warn!(
@@ -86,10 +110,10 @@ impl ApprovalRouter {
                 "ApprovalRouter::register: rejecting concurrent approval request"
             );
             drop(guard);
-            let _ = tx.send(false);
+            let _ = entry.tx.send(false);
             return false;
         }
-        if guard.insert(tool_id.clone(), tx).is_some() {
+        if guard.insert(tool_id.clone(), entry).is_some() {
             tracing::warn!(tool_id = %tool_id, "ApprovalRouter::register: replacing existing pending tx");
         }
         true
@@ -101,14 +125,32 @@ impl ApprovalRouter {
         !self.pending.lock().is_empty()
     }
 
+    /// True while `tool_id` still waits for a decision (not resolved, not
+    /// cancelled with its turn).
+    #[must_use]
+    pub fn is_pending(&self, tool_id: &str) -> bool {
+        self.pending.lock().contains_key(tool_id)
+    }
+
+    /// True when the operator allowed `tool_name` for the rest of the session.
+    #[must_use]
+    pub fn is_session_allowed(&self, tool_name: &str) -> bool {
+        self.session_allowlist.lock().contains(tool_name)
+    }
+
+    /// Forget every session-wide allowance (a different chat session starts).
+    pub fn clear_session_allowlist(&self) {
+        self.session_allowlist.lock().clear();
+    }
+
     /// Resolve every pending approval with one decision and return their ids.
     ///
     /// Used by session-switch cleanup to fail closed before swapping sessions.
     pub fn resolve_all(&self, approved: bool) -> Vec<String> {
         let pending = std::mem::take(&mut *self.pending.lock());
         let mut resolved = Vec::with_capacity(pending.len());
-        for (tool_id, tx) in pending {
-            let _ = tx.send(approved);
+        for (tool_id, entry) in pending {
+            let _ = entry.tx.send(approved);
             resolved.push(tool_id);
         }
         resolved
@@ -118,22 +160,30 @@ impl ApprovalRouter {
     ///
     /// Returns false when the `tool_id` is not found (driver already cleaned up on timeout / cancel path).
     pub fn resolve(&self, tool_id: &str, approved: bool) -> bool {
-        let tx_opt = self.pending.lock().remove(tool_id);
-        tx_opt.map_or_else(
-            || {
-                tracing::debug!(tool_id = %tool_id, "ApprovalRouter::resolve: no pending entry");
-                false
-            },
-            |tx| {
-                if tx.send(approved).is_err() {
-                    tracing::debug!(
-                        tool_id = %tool_id,
-                        "ApprovalRouter::resolve: rx already dropped (driver cancelled)"
-                    );
-                }
-                true
-            },
-        )
+        self.resolve_decision(tool_id, approved, false)
+    }
+
+    /// Resolve with an optional "always": an approved tool-call decision with
+    /// `always` also allows that tool for the rest of the session.
+    pub fn resolve_decision(&self, tool_id: &str, approved: bool, always: bool) -> bool {
+        let entry = self.pending.lock().remove(tool_id);
+        let Some(entry) = entry else {
+            tracing::debug!(tool_id = %tool_id, "ApprovalRouter::resolve: no pending entry");
+            return false;
+        };
+        if approved
+            && always
+            && let Some(name) = entry.tool_name
+        {
+            self.session_allowlist.lock().insert(name);
+        }
+        if entry.tx.send(approved).is_err() {
+            tracing::debug!(
+                tool_id = %tool_id,
+                "ApprovalRouter::resolve: rx already dropped (driver cancelled)"
+            );
+        }
+        true
     }
 }
 
@@ -149,9 +199,21 @@ struct ChatTuiApprovalStrategy {
 #[async_trait]
 impl ApprovalStrategy for ChatTuiApprovalStrategy {
     async fn resolve(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // "Always" covers a tool, never a call the tool only accepts with its
+        // own approval; each covered call still gets its own grant.
+        if self.router.is_session_allowed(&request.descriptor.public_name)
+            && !crate::security::approval_operation::requires_explicit_grant(
+                &request.descriptor.public_name,
+                &request.command.arguments,
+            )
+        {
+            return self.approved(&request);
+        }
         let tool_id = request.command.operation_id.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        let registered = self.router.register(tool_id.clone(), tx);
+        let registered = self
+            .router
+            .register_tool(tool_id.clone(), request.descriptor.public_name.clone(), tx);
         if registered
             && self
                 .action_tx
@@ -189,7 +251,13 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
                 },
             };
         }
+        self.approved(&request)
+    }
+}
 
+impl ChatTuiApprovalStrategy {
+    /// An approved call with its own single-use runtime grant.
+    fn approved(&self, request: &ToolApprovalRequest) -> ToolApprovalDecision {
         let envelope = &request.context.envelope;
         let sender = envelope.sender.as_deref().unwrap_or("unknown");
         let channel = envelope.channel.as_deref().unwrap_or("unknown");
@@ -1551,6 +1619,7 @@ impl EffectExecutor {
                                 .send(Action::ToolApprovalReceived {
                                     tool_id,
                                     approved: false,
+                                    always: false,
                                 })
                                 .await
                             {
@@ -1560,35 +1629,32 @@ impl EffectExecutor {
                         return;
                     }
                 }
-                let env_value = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok();
-                let approved = resolve_supervised_approval_override(env_value.as_deref());
-                if env_value.is_none() {
-                    tracing::warn!(
-                        tool_id = %tool_id,
-                        name = %name,
-                        args_len = args.len(),
-                        "RequestApproval effect: non-TUI approval has no override, failing closed"
-                    );
-                } else {
-                    tracing::info!(
-                        security_event = "openprx_approval_override_applied",
-                        tool_id = %tool_id,
-                        name = %name,
-                        args_len = args.len(),
-                        approved,
-                        "RequestApproval effect: non-TUI OPENPRX_APPROVAL_OVERRIDE applied"
-                    );
-                }
-                let _ = args;
+                // Line mode (`--plain`): ask on the controlling terminal; without
+                // one only OPENPRX_APPROVAL_OVERRIDE can allow (CR-2).
+                let router = Arc::clone(&deps.approval_router);
                 let action_tx = deps.action_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = action_tx.send(Action::ToolApprovalReceived { tool_id, approved }).await {
-                        tracing::debug!(error = %e, "RequestApproval stub: action_tx closed");
+                    let decision =
+                        crate::chat::terminal_approval::prompt(&name, &args, || router.is_pending(&tool_id)).await;
+                    let (approved, always) = decision.flags();
+                    if let Err(e) = action_tx
+                        .send(Action::ToolApprovalReceived {
+                            tool_id,
+                            approved,
+                            always,
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "RequestApproval terminal prompt: action_tx closed");
                     }
                 });
             }
-            Effect::ResolveApproval { tool_id, approved } => {
-                deps.approval_router.resolve(&tool_id, approved);
+            Effect::ResolveApproval {
+                tool_id,
+                approved,
+                always,
+            } => {
+                deps.approval_router.resolve_decision(&tool_id, approved, always);
             }
             Effect::Quit => {
                 // shutdown signal: the real cancel + drop implicit protocol is finished off by chat::run
@@ -2872,10 +2938,10 @@ pub fn spawn_dispatcher_task_full(
                         }
                         let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
                         push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
-                        if let (Some((tool_id, approved)), Some(router)) =
+                        if let (Some((tool_id, approved, always)), Some(router)) =
                             (approval_response, approval_router.as_ref())
                         {
-                            router.resolve(&tool_id, approved);
+                            router.resolve_decision(&tool_id, approved, always);
                         }
                         // turn_signal must fire during shutdown too, otherwise the last turn before shutdown
                         // preempts the chat::run await and hangs forever (causing the round 2 hang
@@ -2917,10 +2983,10 @@ pub fn spawn_dispatcher_task_full(
                             push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                             // S3 T3-1: once the reducer has handled ToolApprovalReceived, hand the decision
                             // to the driver's pending oneshot through approval_router.
-                            if let (Some((tool_id, approved)), Some(router)) =
+                            if let (Some((tool_id, approved, always)), Some(router)) =
                                 (approval_response, approval_router.as_ref())
                             {
-                                router.resolve(&tool_id, approved);
+                                router.resolve_decision(&tool_id, approved, always);
                             }
                             if let Some(ref sig) = turn_signal {
                                 record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
@@ -2980,10 +3046,10 @@ pub fn spawn_dispatcher_task_full(
                             executor.execute(effect).await;
                         }
                         let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                        if let (Some((tool_id, approved)), Some(router)) =
+                        if let (Some((tool_id, approved, always)), Some(router)) =
                             (approval_response, approval_router.as_ref())
                         {
-                            router.resolve(&tool_id, approved);
+                            router.resolve_decision(&tool_id, approved, always);
                         }
                         if let Some(ref sig) = turn_signal {
                             record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
@@ -3010,10 +3076,10 @@ pub fn spawn_dispatcher_task_full(
                                 executor.execute(effect).await;
                             }
                             let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                            if let (Some((tool_id, approved)), Some(router)) =
+                            if let (Some((tool_id, approved, always)), Some(router)) =
                                 (approval_response, approval_router.as_ref())
                             {
-                                router.resolve(&tool_id, approved);
+                                router.resolve_decision(&tool_id, approved, always);
                             }
                             if let Some(ref sig) = turn_signal {
                                 record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
@@ -3034,13 +3100,17 @@ pub fn spawn_dispatcher_task_full(
     })
 }
 
-/// **S3 T3-1**: extract the (tool_id, approved) tuple from `Action::ToolApprovalReceived`.
+/// **S3 T3-1**: extract the (tool_id, approved, always) tuple from `Action::ToolApprovalReceived`.
 ///
 /// Only used for approval_router forwarding before / after the reducer handles it; other Actions return None.
 /// Borrows to avoid cloning early — the tuple is extracted before the reducer consumes the action.
-fn extract_approval_response(action: &Action) -> Option<(String, bool)> {
+fn extract_approval_response(action: &Action) -> Option<(String, bool, bool)> {
     match action {
-        Action::ToolApprovalReceived { tool_id, approved } => Some((tool_id.clone(), *approved)),
+        Action::ToolApprovalReceived {
+            tool_id,
+            approved,
+            always,
+        } => Some((tool_id.clone(), *approved, *always)),
         _ => None,
     }
 }

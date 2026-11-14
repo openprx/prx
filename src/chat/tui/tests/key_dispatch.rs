@@ -445,7 +445,24 @@ fn approval_child_y_sends_tool_approval_received_true() {
         out,
         KeyDispatch::ToolApprovalDecision {
             tool_id: "call-1".to_string(),
-            approved: true
+            approved: true,
+            always: false,
+        }
+    );
+    assert!(state.pending_tool_approval.is_none());
+    assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+}
+
+#[test]
+fn approval_child_a_approves_for_the_session() {
+    let mut state = approval_state();
+    let out = dispatch_global_key(key(KeyCode::Char('a')), &mut state);
+    assert_eq!(
+        out,
+        KeyDispatch::ToolApprovalDecision {
+            tool_id: "call-1".to_string(),
+            approved: true,
+            always: true,
         }
     );
     assert!(state.pending_tool_approval.is_none());
@@ -461,7 +478,8 @@ fn approval_child_n_or_esc_sends_tool_approval_received_false() {
             out,
             KeyDispatch::ToolApprovalDecision {
                 tool_id: "call-1".to_string(),
-                approved: false
+                approved: false,
+                always: false,
             }
         );
         assert!(state.pending_tool_approval.is_none());
@@ -511,7 +529,8 @@ fn approval_child_arrows_select_and_enter_confirms() {
         out,
         KeyDispatch::ToolApprovalDecision {
             tool_id: "call-1".to_string(),
-            approved: true
+            approved: true,
+            always: false,
         }
     );
     assert!(state.pending_tool_approval.is_none());
@@ -526,7 +545,8 @@ fn approval_child_enter_uses_default_deny_and_left_selects_deny() {
         out,
         KeyDispatch::ToolApprovalDecision {
             tool_id: "call-1".to_string(),
-            approved: false
+            approved: false,
+            always: false,
         }
     );
 
@@ -544,7 +564,8 @@ fn approval_child_enter_uses_default_deny_and_left_selects_deny() {
         out,
         KeyDispatch::ToolApprovalDecision {
             tool_id: "call-1".to_string(),
-            approved: false
+            approved: false,
+            always: false,
         }
     );
 }

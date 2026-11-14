@@ -440,7 +440,14 @@ pub enum Action {
     /// When the dispatcher receives this Action it forwards the decision to the waiting driver over
     /// `approval_response_tx` (the single mpsc entry point injected into the driver); the driver side
     /// matches it by `tool_id` to the pending oneshot::Sender<bool> and resolves it.
-    ToolApprovalReceived { tool_id: String, approved: bool },
+    ///
+    /// `always` (with `approved`) also allows later calls of the same tool for
+    /// the rest of the chat session; each call still gets its own grant.
+    ToolApprovalReceived {
+        tool_id: String,
+        approved: bool,
+        always: bool,
+    },
     /// Clear any visible approval prompt without approving anything.
     ///
     /// Used when a session switch fail-closes outstanding approval routes before
