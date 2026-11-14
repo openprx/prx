@@ -879,8 +879,7 @@ async fn finalize_turn_impl(
         // persistence redactor changes text. Only bounded digests are retained.
         let reply_reference = if fabric.records_recovery_terminal() {
             commit.history.as_ref().map(|history| {
-                let model = &link.context.audit_hops().last()
-                    .context("decision has no final hop")?.state.trusted.parts().resolved_model_id;
+                let model = &commit.binding.runtime().trusted.resolved_model_id;
                 oversized_reply::ReplyReference::new(&history.assistant_content, model)
             }).transpose()?
         } else { None };
@@ -1189,6 +1188,8 @@ mod tests {
     use crate::llm::route_decision::RouteDecision;
     use crate::memory::{Memory, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use std::sync::Arc;
+
+    include!("terminal/restart_tests.rs");
 
     pub(crate) fn completed_commit(terminal_id: &str) -> TurnTerminalDraft {
         let started_at = chrono::Utc::now();

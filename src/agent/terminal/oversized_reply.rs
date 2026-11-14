@@ -92,7 +92,7 @@ pub(crate) fn from_receipt(receipt: &super::TurnTerminalReceipt) -> anyhow::Resu
         .transpose()
 }
 
-fn verify_scope(event: &MessageEvent, scope: &Value) -> anyhow::Result<()> {
+pub(crate) fn verify_scope(event: &MessageEvent, scope: &Value) -> anyhow::Result<()> {
     let event = serde_json::to_value(event)?;
     for (field, expected) in scope.as_object().context("claim scope missing")? {
         anyhow::ensure!(

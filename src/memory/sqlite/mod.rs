@@ -586,6 +586,8 @@ mod tests;
 /// No arbitrary SQL or raw connection is exposed to fixture callers.
 #[cfg(test)]
 pub(crate) mod fixture_readback;
+#[cfg(test)]
+pub(crate) mod golden_vectors;
 
 #[cfg(test)]
 impl SqliteMemory {

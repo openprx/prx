@@ -61,9 +61,9 @@ use crate::tools::capability::contract::{CapabilityRef, CatalogGeneration};
 
 use crate::causal_tree::outcome::DecisionRecordBuilder;
 use crate::config::ConfigGeneration;
+use crate::decision_engine::prediction::factory::DecisionBackendFactory;
 #[cfg(test)]
 use crate::decision_engine::prediction::factory::DecisionTransports;
-use crate::decision_engine::prediction::factory::{DecisionBackendFactory, FactoryDeps};
 use crate::decision_engine::state::{CausalState, DerivedState, HopLineage, RawRoutingInput};
 use crate::memory::Memory;
 use crate::observability::causal_event::CausalEventSink;

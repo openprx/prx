@@ -155,7 +155,7 @@ fn normalized_process_config(config: &Config) -> anyhow::Result<serde_json::Valu
 }
 
 impl ProcessGenerationBinding {
-    fn signing_payload(&self, config: &Config) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn signing_payload(&self, config: &Config) -> anyhow::Result<Vec<u8>> {
         // Config excludes both paths from serde; bind them explicitly. Sort
         // nested maps so process-specific HashMap iteration cannot change a tag.
         let workspace = process_path_identity(&config.workspace_dir)?;

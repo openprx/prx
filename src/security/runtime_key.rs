@@ -1,9 +1,10 @@
-//! The per-workspace decision key (CDP-PLAN 1.2, mismatch M15).
+//! The per-workspace runtime key (CDP-PLAN 1.2, mismatch M15; Part-2 OV-2).
 //!
-//! One 32-byte random key, stored at
-//! `<workspace>/self/causal_tree/.decision_key` with mode `0600`, keys every
-//! HMAC the decision plane computes: wire-id salting, state fingerprints, the
-//! v1 feedback import and the exploration seed. Each use has its own
+//! One 32-byte random key, stored at `<workspace>/self/runtime/runtime.key`
+//! with mode `0600`, keys the runtime HMACs: wire-id salting, state
+//! fingerprints, approval state and terminal-claim bindings. The pre-Part-2
+//! `<workspace>/self/causal_tree/.decision_key` is a legacy file that is never
+//! read. Each use has its own
 //! [`KeyDomain`], so a value computed for one purpose never equals a value for
 //! another.
 
@@ -27,7 +28,7 @@ const KEY_LEN: usize = 32;
 const HMAC_BLOCK_LEN: usize = 64;
 
 /// The key file, relative to the workspace directory.
-const KEY_RELATIVE_PATH: [&str; 3] = ["self", "causal_tree", ".decision_key"];
+const KEY_RELATIVE_PATH: [&str; 3] = ["self", "runtime", "runtime.key"];
 
 /// What an HMAC is computed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,9 +80,9 @@ impl fmt::Debug for DecisionKey {
 }
 
 impl DecisionKey {
-    /// A generation-local key for builtin decisions when the persistent
-    /// workspace key must not be read or is unavailable. Its fingerprints
-    /// and seals must never be persisted or handed to another process.
+    /// A random in-memory key for test fixtures only. Production has no
+    /// ephemeral fallback: the turn state key is the runtime key (OV-2).
+    #[cfg(test)]
     pub(crate) fn ephemeral() -> Arc<Self> {
         Arc::new(Self::from_bytes(&rand::random::<[u8; KEY_LEN]>()))
     }
@@ -293,8 +294,8 @@ fn read_key_with_permissions(path: &Path, fix: bool) -> Result<Option<[u8; KEY_L
 }
 
 /// Check the key's directories before the key is read or created:
-/// `<workspace>/self` and `<workspace>/self/causal_tree` must be plain
-/// directories (not symlinks) when they exist. `causal_tree` is narrowed to
+/// `<workspace>/self` and `<workspace>/self/runtime` must be plain
+/// directories (not symlinks) when they exist. `runtime` is narrowed to
 /// `0700` (D-057 L-6). `self` is shared with other subsystems that create it
 /// under the process umask, so (D-057 amendment 2, N-5) a `self` that is
 /// group-writable is narrowed with a warning, and it is refused only when
@@ -377,7 +378,7 @@ fn create_key(path: &Path, bytes: &[u8; KEY_LEN]) -> Result<(), CreateError> {
         .parent()
         .ok_or_else(|| CreateError::Io("the key path has no parent directory".to_string()))?;
     create_private_dir(parent).map_err(CreateError::Io)?;
-    let temp = parent.join(format!(".decision_key.tmp-{}", uuid::Uuid::new_v4()));
+    let temp = parent.join(format!(".runtime_key.tmp-{}", uuid::Uuid::new_v4()));
     let written = write_private_file(&temp, bytes).and_then(|()| match std::fs::hard_link(&temp, path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -395,7 +396,7 @@ fn create_key(path: &Path, bytes: &[u8; KEY_LEN]) -> Result<(), CreateError> {
     }
 }
 
-/// Check the decision plane's directories (`self` and `self/causal_tree`,
+/// Check the runtime key's directories (`self` and `self/runtime`,
 /// as for the key) without creating or changing anything, not even a mode:
 /// `Ok(false)` when they do not exist yet.
 ///
@@ -411,7 +412,7 @@ pub fn check_decision_dir(workspace_dir: &Path) -> Result<bool, String> {
         .is_dir())
 }
 
-/// The decision plane's directory (`<workspace>/self/causal_tree`), created
+/// The runtime key's directory (`<workspace>/self/runtime`), created
 /// `0700` when missing, after and again before use the same checks as the
 /// key's directory: never a symlink, never another user's.
 ///
@@ -497,7 +498,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("test: tempdir");
         let first = DecisionKey::load_or_create(workspace.path()).expect("test: create key");
         let second = DecisionKey::load_or_create(workspace.path()).expect("test: load key");
-        let path = workspace.path().join("self/causal_tree/.decision_key");
+        let path = workspace.path().join("self/runtime/runtime.key");
         assert_eq!(std::fs::read(&path).expect("test: read key").len(), KEY_LEN);
         assert_eq!(
             first.hmac(KeyDomain::WireSalt, &[b"a"]),
@@ -523,6 +524,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_key_lives_under_self_runtime_and_ignores_legacy_file() {
+        let workspace = tempfile::tempdir().expect("test: tempdir");
+        let legacy_dir = workspace.path().join("self/causal_tree");
+        std::fs::create_dir_all(&legacy_dir).expect("test: legacy dir");
+        let legacy = legacy_dir.join(".decision_key");
+        std::fs::write(&legacy, [0x5a; KEY_LEN]).expect("test: legacy key");
+        let legacy_key = DecisionKey::from_bytes(&[0x5a; KEY_LEN]);
+        let legacy_modified = std::fs::metadata(&legacy)
+            .and_then(|m| m.modified())
+            .expect("test: mtime");
+
+        let key = DecisionKey::load_or_create(workspace.path()).expect("test: runtime key");
+        let path = workspace.path().join("self/runtime/runtime.key");
+        assert_eq!(std::fs::read(&path).expect("test: new key").len(), KEY_LEN);
+        assert_ne!(
+            key.hmac(KeyDomain::WireSalt, &[b"probe"]),
+            legacy_key.hmac(KeyDomain::WireSalt, &[b"probe"]),
+            "the legacy key bytes must not be read"
+        );
+        assert_eq!(std::fs::read(&legacy).expect("test: legacy bytes"), vec![0x5a; KEY_LEN]);
+        assert_eq!(
+            std::fs::metadata(&legacy)
+                .and_then(|m| m.modified())
+                .expect("test: mtime"),
+            legacy_modified,
+            "the legacy key is left untouched"
+        );
+        let reloaded = DecisionKey::load_existing(workspace.path()).expect("test: existing runtime key");
+        assert_eq!(
+            reloaded.hmac(KeyDomain::WireSalt, &[b"probe"]),
+            key.hmac(KeyDomain::WireSalt, &[b"probe"])
+        );
+    }
+
+    #[test]
     fn domains_and_part_boundaries_separate_every_hmac() {
         let workspace = tempfile::tempdir().expect("test: tempdir");
         let key = DecisionKey::load_or_create(workspace.path()).expect("test: key");
@@ -539,7 +575,7 @@ mod tests {
     fn the_padded_block_key_equals_the_variable_length_hmac() {
         let workspace = tempfile::tempdir().expect("test: tempdir");
         let key = DecisionKey::load_or_create(workspace.path()).expect("test: key");
-        let bytes = std::fs::read(workspace.path().join("self/causal_tree/.decision_key")).expect("test: read");
+        let bytes = std::fs::read(workspace.path().join("self/runtime/runtime.key")).expect("test: read");
         let mut reference = <Hmac<Sha256> as KeyInit>::new_from_slice(&bytes).expect("test: hmac key");
         let label = KeyDomain::StateFingerprint.label();
         reference.update(&(label.len() as u64).to_be_bytes());
@@ -553,7 +589,7 @@ mod tests {
     #[test]
     fn a_corrupt_or_symlinked_key_is_refused_not_replaced() {
         let workspace = tempfile::tempdir().expect("test: tempdir");
-        let path = workspace.path().join("self/causal_tree/.decision_key");
+        let path = workspace.path().join("self/runtime/runtime.key");
         std::fs::create_dir_all(path.parent().expect("test: parent")).expect("test: mkdir");
         std::fs::write(&path, b"short").expect("test: write");
         assert_eq!(
@@ -564,7 +600,7 @@ mod tests {
         #[cfg(unix)]
         {
             let other = tempfile::tempdir().expect("test: tempdir");
-            let link = other.path().join("self/causal_tree/.decision_key");
+            let link = other.path().join("self/runtime/runtime.key");
             std::fs::create_dir_all(link.parent().expect("test: parent")).expect("test: mkdir");
             std::os::unix::fs::symlink(&path, &link).expect("test: symlink");
             assert_eq!(
@@ -580,7 +616,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let workspace = tempfile::tempdir().expect("test: tempdir");
         DecisionKey::load_or_create(workspace.path()).expect("test: create");
-        let path = workspace.path().join("self/causal_tree/.decision_key");
+        let path = workspace.path().join("self/runtime/runtime.key");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("test: chmod");
         DecisionKey::load_or_create(workspace.path()).expect("test: reload");
         let mode = std::fs::metadata(&path).expect("test: stat").permissions().mode();
@@ -594,7 +630,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("test: tempdir");
         DecisionKey::load_or_create(workspace.path()).expect("test: create");
         let self_dir = workspace.path().join("self");
-        let key_dir = self_dir.join("causal_tree");
+        let key_dir = self_dir.join("runtime");
 
         std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(0o755)).expect("test: chmod");
         DecisionKey::load_or_create(workspace.path()).expect("test: narrowed");
@@ -619,7 +655,7 @@ mod tests {
         std::fs::create_dir(other.path().join("self")).expect("test: mkdir");
         std::fs::set_permissions(other.path().join("self"), std::fs::Permissions::from_mode(0o700))
             .expect("test: chmod");
-        std::os::unix::fs::symlink(&key_dir, other.path().join("self/causal_tree")).expect("test: symlink");
+        std::os::unix::fs::symlink(&key_dir, other.path().join("self/runtime")).expect("test: symlink");
         assert_eq!(
             DecisionKey::load_or_create(other.path()).expect_err("test: symlinked key dir"),
             DecisionError::Unavailable
@@ -633,9 +669,9 @@ mod tests {
         let planted = elsewhere.path().join("planted_key");
         std::fs::write(&planted, [7_u8; KEY_LEN]).expect("test: write planted key");
         let workspace = tempfile::tempdir().expect("test: tempdir");
-        let key_dir = workspace.path().join("self/causal_tree");
+        let key_dir = workspace.path().join("self/runtime");
         create_private_dir(&key_dir).expect("test: key dir");
-        std::os::unix::fs::symlink(&planted, key_dir.join(".decision_key")).expect("test: symlink");
+        std::os::unix::fs::symlink(&planted, key_dir.join("runtime.key")).expect("test: symlink");
         assert_eq!(
             DecisionKey::load_or_create(workspace.path()).expect_err("test: symlinked key"),
             DecisionError::Unavailable
@@ -646,7 +682,7 @@ mod tests {
     #[test]
     fn an_oversized_key_file_is_refused_before_it_is_read() {
         let workspace = tempfile::tempdir().expect("test: tempdir");
-        let path = workspace.path().join("self/causal_tree/.decision_key");
+        let path = workspace.path().join("self/runtime/runtime.key");
         std::fs::create_dir_all(path.parent().expect("test: parent")).expect("test: mkdir");
         std::fs::write(&path, vec![7_u8; 1024 * 1024]).expect("test: write");
         assert_eq!(
@@ -661,18 +697,5 @@ mod tests {
         let workspace = tempfile::tempdir().expect("test: tempdir");
         let key = DecisionKey::load_or_create(workspace.path()).expect("test: key");
         assert_eq!(format!("{key:?}"), "DecisionKey([REDACTED])");
-    }
-
-    #[test]
-    fn ephemeral_keys_need_no_workspace_and_do_not_share_fingerprints() {
-        let workspace = tempfile::tempdir().expect("test: tempdir");
-        let first = DecisionKey::ephemeral();
-        let repeated = Arc::clone(&first);
-        let second = DecisionKey::ephemeral();
-        let parts: &[&[u8]] = &[b"prx_turn"];
-        let fingerprint = first.hmac(KeyDomain::StateFingerprint, parts);
-        assert_eq!(fingerprint, repeated.hmac(KeyDomain::StateFingerprint, parts));
-        assert_ne!(fingerprint, second.hmac(KeyDomain::StateFingerprint, parts));
-        assert!(!workspace.path().join("self").exists());
     }
 }

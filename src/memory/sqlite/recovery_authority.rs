@@ -168,21 +168,9 @@ pub(in crate::memory::sqlite) fn event(
             let value = row.get_ref(index)?;
             // An unstamped scope column is absent from digests bound before the column existed.
             if matches!(value, ValueRef::Null) && row.as_ref().column_name(index)? == "ma_scope_id" { continue; }
-            let (tag, bytes) = match value {
-                ValueRef::Null => (0, Vec::new()),
-                ValueRef::Integer(value) => (1, value.to_be_bytes().to_vec()),
-                ValueRef::Real(value) => (2, value.to_bits().to_be_bytes().to_vec()),
-                ValueRef::Text(value) | ValueRef::Blob(value) => {
-                    if value.len() > MAX_RECORD { return Err(rusqlite::Error::InvalidQuery); }
-                    (if matches!(row.get_ref(index)?, ValueRef::Text(_)) { 3 } else { 4 }, value.to_vec())
-                }
-            };
-            if record.len().saturating_add(bytes.len()).saturating_add(9) > MAX_RECORD {
+            if !push_column(&mut record, value) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            record.push(tag);
-            record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-            record.extend_from_slice(&bytes);
         }
         Ok(record)
     })?;
@@ -190,6 +178,31 @@ pub(in crate::memory::sqlite) fn event(
         event_id: id.to_owned(),
         record,
     })
+}
+
+/// E3: append one column as `u8 tag ‖ u64be len ‖ bytes` (tags 0 NULL,
+/// 1 INTEGER BE, 2 REAL bits BE, 3 TEXT, 4 BLOB). False when the record would
+/// exceed its bound.
+pub(in crate::memory::sqlite) fn push_column(record: &mut Vec<u8>, value: ValueRef<'_>) -> bool {
+    let (tag, bytes): (u8, std::borrow::Cow<'_, [u8]>) = match value {
+        ValueRef::Null => (0, std::borrow::Cow::Borrowed(&[])),
+        ValueRef::Integer(value) => (1, std::borrow::Cow::Owned(value.to_be_bytes().to_vec())),
+        ValueRef::Real(value) => (2, std::borrow::Cow::Owned(value.to_bits().to_be_bytes().to_vec())),
+        ValueRef::Text(value) => (3, std::borrow::Cow::Borrowed(value)),
+        ValueRef::Blob(value) => (4, std::borrow::Cow::Borrowed(value)),
+    };
+    if bytes.len() > MAX_RECORD || record.len().saturating_add(bytes.len()).saturating_add(9) > MAX_RECORD {
+        return false;
+    }
+    record.push(tag);
+    record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    record.extend_from_slice(&bytes);
+    true
+}
+
+/// E4: the event digest over an E3 record.
+pub(in crate::memory::sqlite) fn event_digest(key: &ring::hmac::Key, record: &[u8]) -> Vec<u8> {
+    domain_mac(key, b"prx.recovery.event.v1", record)
 }
 
 pub(in crate::memory::sqlite) fn framed(domain: &[u8], bytes: &[u8]) -> Vec<u8> {
@@ -215,7 +228,7 @@ fn bind(
     );
     Ok(BoundEvent {
         id: evidence.event_id.clone(),
-        digest: domain_mac(key, b"prx.recovery.event.v1", &evidence.record),
+        digest: event_digest(key, &evidence.record),
     })
 }
 fn receipt_bytes(receipt: &RecoveryReceipt) -> anyhow::Result<Vec<u8>> {
@@ -234,7 +247,7 @@ fn receipt_domain(state: &str) -> anyhow::Result<&'static [u8]> {
         _ => anyhow::bail!("invalid recovery state"),
     }
 }
-fn sign(receipt: &mut RecoveryReceipt, key: &ring::hmac::Key) -> anyhow::Result<()> {
+pub(in crate::memory::sqlite) fn sign(receipt: &mut RecoveryReceipt, key: &ring::hmac::Key) -> anyhow::Result<()> {
     receipt.mac = domain_mac(key, receipt_domain(&receipt.state)?, &receipt_bytes(receipt)?);
     Ok(())
 }
@@ -898,13 +911,23 @@ impl RecoveryRepository for SqliteMemory {
         tx.commit()?;
         Ok(receipt)
     }
-    fn pending_recovery_costs(
+    fn scan_recovery_costs(
         &self,
         workspace_id: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> anyhow::Result<Vec<crate::memory::recovery_authority::RecoveryCostRow>> {
-        super::recovery_outbox::pending_recovery_costs(self, workspace_id, after, limit)
+    ) -> anyhow::Result<crate::memory::recovery_authority::RecoveryCostScan> {
+        super::recovery_outbox::scan_recovery_costs(self, workspace_id, after, limit)
+    }
+    fn recovery_outbox_present(&self) -> anyhow::Result<bool> {
+        super::recovery_outbox::outbox_present(&self.pool.write())
+    }
+    fn recovery_cost_row(
+        &self,
+        workspace_id: &str,
+        settlement_id: &str,
+    ) -> anyhow::Result<Option<crate::memory::recovery_authority::RecoveryCostRow>> {
+        super::recovery_outbox::recovery_cost_row(self, workspace_id, settlement_id)
     }
     fn finish_recovery_cost(
         &self,

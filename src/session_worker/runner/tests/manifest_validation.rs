@@ -106,7 +106,7 @@ fn cap_now() -> u64 {
 fn seal(mut manifest: WorkerManifest, expiry: u64) -> (WorkerManifest, String, u64) {
     manifest.parent_capability = None;
     let payload = manifest_signing_payload(&manifest).expect("payload");
-    let cap = compute_worker_capability(&manifest.run_id, expiry, &payload);
+    let cap = compute_worker_capability(&manifest.run_id, expiry, &payload).expect("transport secret");
     manifest.parent_capability = Some(cap.clone());
     (manifest, cap, expiry)
 }

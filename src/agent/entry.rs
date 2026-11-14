@@ -1788,6 +1788,14 @@ pub(crate) async fn run_with_runtime_envelope(
             .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for the agent CLI"))?;
         let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
             .with_event_recording(config.memory.event_recording_config());
+        // One cost outbox pass before the turn (one-shot entry; D§5.2).
+        crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&mem),
+            config.workspace_dir.clone(),
+            config.cost.clone(),
+        )
+        .await;
         // D8-3: run_id is per-turn (generated inside each turn branch as `turn_run_id`),
         // no longer a single per-run id held here.
         let mut fabric_turn_seq: u64 = 0;

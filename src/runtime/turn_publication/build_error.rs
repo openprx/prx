@@ -19,6 +19,8 @@ pub(crate) enum PublicationBuildError {
     Parity(#[from] ParityError),
     #[error(transparent)]
     Factory(#[from] FactoryBuildError),
+    #[error("workspace runtime key unavailable")]
+    RuntimeKey(#[source] crate::cost::decision_attempt::DecisionError),
     #[error("pinned decision policy cannot be fingerprinted")]
     PolicyFingerprint(#[source] serde_json::Error),
     #[error("decision service storage preparation task failed")]

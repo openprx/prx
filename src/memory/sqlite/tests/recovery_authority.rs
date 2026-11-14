@@ -1951,7 +1951,7 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
     let path = memory.db_path.clone();
     drop(memory);
     let reopened = SqliteMemory::new_with_path(path.clone())?;
-    let page = reopened.pending_recovery_costs(workspace, None, 8)?;
+    let page = reopened.scan_recovery_costs(workspace, None, 8).map(|scan| scan.rows)?;
     assert_eq!(page.len(), 1);
     assert_eq!(page.first().expect("test: pending row").settlement_id, settlement);
     drop(reopened);
@@ -1965,7 +1965,8 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
             .expect("test: clear");
         mutate(&memory);
         let listed = memory
-            .pending_recovery_costs(workspace, None, 8)
+            .scan_recovery_costs(workspace, None, 8)
+            .map(|scan| scan.rows)
             .expect("test: invalid outbox row must not fail the listing");
         assert!(
             listed.is_empty(),
@@ -1975,7 +1976,10 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
 
     let workspace_err = {
         let memory = SqliteMemory::new_with_path(path.clone())?;
-        memory.pending_recovery_costs("", None, 8).expect_err("workspace")
+        memory
+            .scan_recovery_costs("", None, 8)
+            .map(|scan| scan.rows)
+            .expect_err("workspace")
     };
     assert_outbox_error(
         &workspace_err,
@@ -2153,7 +2157,9 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
         )?;
         drop(memory);
         let reopened = SqliteMemory::new_with_path(path.clone())?;
-        let listed = reopened.pending_recovery_costs(changed_workspace, None, 8)?;
+        let listed = reopened
+            .scan_recovery_costs(changed_workspace, None, 8)
+            .map(|scan| scan.rows)?;
         assert!(
             listed.is_empty(),
             "test: changed {field} must invalidate authentication and prevent projection"
@@ -2181,7 +2187,7 @@ fn recovery_cost_outbox_each_bound_field_is_refused() -> anyhow::Result<()> {
         "UPDATE recovery_cost_outbox SET state='error' WHERE settlement_id=?1",
         rusqlite::params![settlement],
     )?;
-    let listed = memory.pending_recovery_costs(workspace, None, 8)?;
+    let listed = memory.scan_recovery_costs(workspace, None, 8).map(|scan| scan.rows)?;
     assert!(
         listed.is_empty(),
         "test: relabeled state without its MAC must never authorize projection"

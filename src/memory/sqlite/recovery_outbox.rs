@@ -1,7 +1,9 @@
 //! Authenticated recovery cost outbox. Projection (3b) is the only writer of state.
 
 use super::{SqliteMemory, recovery_authority, recovery_keys::KeyDirectory};
-use crate::memory::recovery_authority::{RecoveryCostRow, RecoveryCostState, RecoveryMacDomain, RecoveryPricing};
+use crate::memory::recovery_authority::{
+    RecoveryCostRow, RecoveryCostScan, RecoveryCostState, RecoveryMacDomain, RecoveryPricing,
+};
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
@@ -144,25 +146,31 @@ pub(super) enum InsertOutbox {
     Replayed,
 }
 
-pub(super) fn pending_recovery_costs(
+pub(super) fn outbox_present(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_cost_outbox' AND type='table')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn scan_recovery_costs(
     memory: &SqliteMemory,
     workspace_id: &str,
     after: Option<&str>,
     limit: usize,
-) -> anyhow::Result<Vec<RecoveryCostRow>> {
+) -> anyhow::Result<RecoveryCostScan> {
     validate_identity(workspace_id, "workspace_id")?;
     anyhow::ensure!(limit > 0, "recovery cost outbox page limit is invalid");
     let limit = limit.min(crate::memory::ingress_recovery::MAX_RECOVERY_PAGE);
     let writer = memory.pool.write();
-    let present: bool = writer.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='recovery_cost_outbox' AND type='table')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !present {
-        return Ok(Vec::new());
+    if !outbox_present(&writer)? {
+        return Ok(RecoveryCostScan {
+            rows: Vec::new(),
+            cursor: None,
+            exhausted: true,
+        });
     }
-    let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
     let mut statement = writer.prepare(
         "SELECT workspace_id, owner_id, settlement_id, version, key_id, usage_digest, pricing, state, facts, mac, state_mac
          FROM recovery_cost_outbox
@@ -171,19 +179,63 @@ pub(super) fn pending_recovery_costs(
          ORDER BY settlement_id ASC
          LIMIT ?3",
     )?;
-    let rows = statement.query_map(params![workspace_id, after, limit as i64], read_raw)?;
-    let mut out = Vec::new();
-    for row in rows {
-        let raw = row?;
-        let settlement_id = raw.settlement_id.clone();
-        match authenticate(&directory, raw) {
-            Ok(row) => out.push(row),
+    let raw = statement
+        .query_map(params![workspace_id, after, limit as i64], read_raw)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Exhaustion and the cursor are raw-page properties, decided before any
+    // row is authenticated, so a page of rejected rows still advances.
+    let exhausted = raw.len() < limit;
+    let cursor = raw.last().map(|row| row.settlement_id.clone());
+    if raw.is_empty() {
+        return Ok(RecoveryCostScan {
+            rows: Vec::new(),
+            cursor,
+            exhausted,
+        });
+    }
+    let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
+    let mut rows = Vec::with_capacity(raw.len());
+    for row in raw {
+        let settlement_id = row.settlement_id.clone();
+        match authenticate(&directory, row) {
+            Ok(row) => rows.push(row),
             Err(_) => {
                 tracing::warn!(%settlement_id, "recovery cost outbox row failed authentication; left unprojected")
             }
         }
     }
-    Ok(out)
+    Ok(RecoveryCostScan {
+        rows,
+        cursor,
+        exhausted,
+    })
+}
+
+pub(super) fn recovery_cost_row(
+    memory: &SqliteMemory,
+    workspace_id: &str,
+    settlement_id: &str,
+) -> anyhow::Result<Option<RecoveryCostRow>> {
+    validate_identity(workspace_id, "workspace_id")?;
+    validate_identity(settlement_id, "settlement_id")?;
+    let writer = memory.pool.write();
+    if !outbox_present(&writer)? {
+        return Ok(None);
+    }
+    let raw = writer
+        .query_row(
+            "SELECT workspace_id, owner_id, settlement_id, version, key_id, usage_digest,
+                    pricing, state, facts, mac, state_mac FROM recovery_cost_outbox
+             WHERE workspace_id=?1 AND settlement_id=?2",
+            params![workspace_id, settlement_id],
+            read_raw,
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
+    authenticate(&directory, raw).map(Some)
 }
 
 pub(super) fn finish_recovery_cost(
@@ -402,7 +454,7 @@ fn usage_digest_mac(key: &ring::hmac::Key, facts: &[u8]) -> anyhow::Result<[u8; 
         .context("recovery cost outbox usage_digest is invalid")
 }
 
-fn sign_outbox(
+pub(super) fn sign_outbox(
     key: &ring::hmac::Key,
     workspace_id: &str,
     owner_id: &str,
@@ -431,7 +483,7 @@ fn sign_outbox(
     .to_vec())
 }
 
-fn sign_state(
+pub(super) fn sign_state(
     key: &ring::hmac::Key,
     workspace_id: &str,
     owner_id: &str,

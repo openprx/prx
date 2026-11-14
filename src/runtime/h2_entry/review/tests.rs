@@ -52,7 +52,7 @@ fn local_stamp_binds_pending_sealed_call_and_original_boot() {
 fn verifying_stamp_without_key_never_creates_replacement() {
     let fixture = Fixture::new(EntryKind::Gateway);
     let stamp = signed(&fixture);
-    let key = fixture.config.workspace_dir.join("self/causal_tree/.decision_key");
+    let key = fixture.config.workspace_dir.join("self/runtime/runtime.key");
     std::fs::remove_file(&key).unwrap();
     assert!(LocalOwnerReview::from_signed(fixture.origin(), stamp).is_err());
     assert!(!key.exists());
@@ -63,7 +63,7 @@ fn verifying_stamp_with_open_key_permissions_refuses_without_repair() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new(EntryKind::Gateway);
     let stamp = signed(&fixture);
-    let key = fixture.config.workspace_dir.join("self/causal_tree/.decision_key");
+    let key = fixture.config.workspace_dir.join("self/runtime/runtime.key");
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(LocalOwnerReview::from_signed(fixture.origin(), stamp).is_err());
     assert_eq!(std::fs::metadata(key).unwrap().permissions().mode() & 0o777, 0o644);

@@ -49,16 +49,7 @@ async fn read_evidence(
             && evidence.index == index
             && !process.is_nil()
             && process.to_string() == evidence.process_id
-            && key.verify_hmac(
-                crate::security::runtime_key::KeyDomain::StateFingerprint,
-                &[
-                    b"ordinary-worker-segment-v1",
-                    kind.as_bytes(),
-                    lineage.parent_scope_id.as_bytes(),
-                    &evidence.signing_bytes()?
-                ],
-                &evidence.seal
-            ),
+            && evidence.verify_under(key, kind, &lineage.parent_scope_id)?,
         "ordinary segment journal signature or inventory differs"
     );
     anyhow::ensure!(

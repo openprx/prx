@@ -7,7 +7,6 @@ use crate::memory::{Memory, MemoryFabric};
 use crate::providers::Provider;
 use crate::security::SecurityPolicy;
 use crate::session_worker::protocol::WorkerManifest;
-use crate::session_worker::runner::capability::session_secret_path;
 use crate::session_worker::runner::context::boxed_worker_segments;
 use crate::session_worker::runner::provider::{
     validate_worker_route, worker_credentials, worker_provider, worker_spawn_tool,
@@ -579,9 +578,9 @@ fn session_worker_secret_follows_the_resolved_config_dir_instead_of_home() {
     let _lock = crate::config::schema::process_config_dir_test_lock();
     let scoped = std::path::PathBuf::from("/tmp/openprx-secret-scope");
     let previous = crate::config::schema::swap_process_config_dir_for_tests(Some(scoped.clone()));
-    let scoped_path = session_secret_path();
+    let scoped_path = crate::session_worker::transport_key::secret_path().ok();
     crate::config::schema::swap_process_config_dir_for_tests(None);
-    let unscoped_path = session_secret_path();
+    let unscoped_path = crate::session_worker::transport_key::secret_path().ok();
     crate::config::schema::swap_process_config_dir_for_tests(previous);
 
     assert_eq!(

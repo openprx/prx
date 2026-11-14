@@ -512,6 +512,12 @@ pub async fn start_channels_with_config(
             .with_event_recording(config.memory.event_recording_config())
             .with_process_recovery(config.causal_tree.enabled)?;
         let handle = spawn_tool.tools_handle();
+        crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+        crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(
+            Arc::clone(&mem),
+            config.workspace_dir.clone(),
+            config.cost.clone(),
+        );
         let active_runs = spawn_tool.active_runs_arc();
 
         // sessions_list: dedicated listing tool (OpenClaw alignment)

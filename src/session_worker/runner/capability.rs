@@ -59,7 +59,8 @@ pub(super) fn authenticate_worker_capability_with_env(
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     anyhow::ensure!(now <= expiry, "session-worker capability expired");
-    authenticate_worker_capability_with_key(manifest, env_capability, expiry, now, session_worker_signing_key())
+    let key = crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key();
+    authenticate_worker_capability_with_key(manifest, env_capability, expiry, now, key)
 }
 
 fn matching_worker_capability<'a>(manifest: &'a WorkerManifest, env_capability: Option<&str>) -> Result<&'a str> {
@@ -133,8 +134,14 @@ pub(super) fn manifest_signing_payload(manifest: &WorkerManifest) -> Result<Stri
 /// Recompute `HMAC_SHA256(secret, run_id \0 expiry \0 sha256_hex(manifest))` as
 /// base64url (no padding). Mirror of `sessions_spawn::compute_worker_capability`.
 #[cfg(test)]
-pub(super) fn compute_worker_capability(run_id: &str, expiry_unix: u64, manifest_json: &str) -> String {
-    compute_worker_capability_with_key(&session_worker_signing_key(), run_id, expiry_unix, manifest_json)
+pub(super) fn compute_worker_capability(run_id: &str, expiry_unix: u64, manifest_json: &str) -> Result<String> {
+    let key = crate::session_worker::transport_key::TransportSecret::for_launch()?.hmac_key();
+    Ok(compute_worker_capability_with_key(
+        &key,
+        run_id,
+        expiry_unix,
+        manifest_json,
+    ))
 }
 
 pub(super) fn compute_worker_capability_with_key(
@@ -185,72 +192,4 @@ fn capability_constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
-}
-
-/// Process-level fallback secret (mirror of the minting side).
-static SESSION_WORKER_FALLBACK_SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-
-/// Return the shared HMAC verification key. Resolution order mirrors the minting
-/// side exactly so parent and child derive the same key:
-/// `SESSION_WORKER_SECRET` env → persisted state-dir secret → per-process random.
-pub(super) fn session_worker_signing_key() -> ring::hmac::Key {
-    use ring::hmac;
-    if let Ok(secret) = std::env::var("SESSION_WORKER_SECRET") {
-        if !secret.is_empty() {
-            return hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-        }
-    }
-    if let Some(bytes) = load_or_create_persisted_session_secret() {
-        return hmac::Key::new(hmac::HMAC_SHA256, &bytes);
-    }
-    let bytes = SESSION_WORKER_FALLBACK_SECRET.get_or_init(generate_session_secret);
-    hmac::Key::new(hmac::HMAC_SHA256, bytes)
-}
-
-/// Generate 32 random bytes, time-derived fallback on RNG failure (never panics).
-fn generate_session_secret() -> [u8; 32] {
-    use ring::rand::SecureRandom as _;
-    let rng = ring::rand::SystemRandom::new();
-    let mut buf = [0u8; 32];
-    if rng.fill(&mut buf).is_err() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            .to_le_bytes();
-        for (i, b) in buf.iter_mut().enumerate() {
-            // `i % now.len()` is always within `now` (non-empty fixed-size array);
-            // `.get().copied()` keeps the seed fill panic-free.
-            *b = now.get(i % now.len()).copied().unwrap_or(0);
-        }
-    }
-    buf
-}
-
-/// Path to the persisted session-worker secret under the OpenPRX state dir
-/// (mirror of the minting side; resolved config directory, else `HOME`).
-pub(super) fn session_secret_path() -> Option<std::path::PathBuf> {
-    if let Some(explicit) = std::env::var_os("OPENPRX_SESSION_WORKER_SECRET_PATH") {
-        return Some(std::path::PathBuf::from(explicit));
-    }
-    // Follows the resolved config directory so the secret minted by a
-    // `--config-dir` run is the one its workers read back, and no run writes
-    // key material into a configuration it was told not to touch.
-    if let Some(config_dir) = crate::config::process_config_dir() {
-        return Some(config_dir.join("keys").join("session_worker.secret"));
-    }
-    crate::config::default_openprx_dir().map(|dir| dir.join("keys").join("session_worker.secret"))
-}
-
-/// Load the persisted 32-byte secret, creating it on first use. Returns `None`
-/// when no state dir is resolvable or filesystem ops fail.
-fn load_or_create_persisted_session_secret() -> Option<[u8; 32]> {
-    let path = session_secret_path()?;
-    match crate::session_worker::transport_key::load_or_create(&path, generate_session_secret) {
-        Ok(secret) => Some(secret),
-        Err(error) => {
-            tracing::warn!("failed to load or persist session-worker secret: {error}");
-            None
-        }
-    }
 }

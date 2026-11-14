@@ -1,7 +1,7 @@
 use super::{
     PROCESS_MEMORY_STRATEGY_HYBRID, PROCESS_MEMORY_STRATEGY_ISOLATED, PROCESS_MEMORY_STRATEGY_SHARED,
     SESSION_WORKER_CAP_TTL_SECS, SpawnLineage, SpawnScope, capability_now_unix, compute_worker_capability_with_key,
-    manifest_signing_payload, seal_worker_capability,
+    manifest_signing_payload,
 };
 use crate::config::AgentCompactionConfig;
 use crate::memory::MemoryEventRecording;
@@ -105,10 +105,8 @@ pub(super) fn build_session_worker_manifest(
         &crate::runtime::child_source::ChildInputReceipt,
         &crate::session_worker::protocol::WorkerProviderSelection,
     )>,
-    source_launch: Option<(
-        crate::runtime::operator_spawn::process::ProcessSourceLaunch,
-        &ring::hmac::Key,
-    )>,
+    source_launch: Option<crate::runtime::operator_spawn::process::ProcessSourceLaunch>,
+    transport_key: &ring::hmac::Key,
     mailbox: Option<&std::sync::Arc<dyn crate::session_worker::mailbox_binding::WorkerMailboxFactory>>,
 ) -> anyhow::Result<(
     WorkerManifest,
@@ -148,7 +146,7 @@ pub(super) fn build_session_worker_manifest(
         agent_id: agent_id.map(str::to_string),
         persona_id: source_launch
             .as_ref()
-            .and_then(|(launch, _)| launch.persona_id().map(str::to_owned)),
+            .and_then(|launch| launch.persona_id().map(str::to_owned)),
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
         channel_excluded_tools: channel_excluded_tools.to_vec(),
@@ -176,12 +174,9 @@ pub(super) fn build_session_worker_manifest(
         grant.bind_worker_manifest(&mut manifest, receipt, selection)?;
     }
 
-    let source_key = if let Some((launch, key)) = source_launch {
-        launch.bind_worker_manifest(key, &mut manifest)?;
-        Some(key)
-    } else {
-        None
-    };
+    if let Some(launch) = source_launch {
+        launch.bind_worker_manifest(transport_key, &mut manifest)?;
+    }
     let mailbox = mailbox
         .map(|factory| {
             crate::session_worker::mailbox_binding::BoundWorkerMailbox::bind(
@@ -191,16 +186,12 @@ pub(super) fn build_session_worker_manifest(
         })
         .transpose()?;
     let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
-    let sealed_capability = if let Some(key) = source_key {
-        compute_worker_capability_with_key(
-            key,
-            &manifest.run_id,
-            capability_expiry,
-            &manifest_signing_payload(&manifest)?,
-        )
-    } else {
-        seal_worker_capability(&manifest, capability_expiry)?
-    };
+    let sealed_capability = compute_worker_capability_with_key(
+        transport_key,
+        &manifest.run_id,
+        capability_expiry,
+        &manifest_signing_payload(&manifest)?,
+    );
     manifest.parent_capability = Some(sealed_capability.clone());
     Ok((manifest, sealed_capability, capability_expiry, mailbox))
 }

@@ -9,6 +9,8 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 mod batch_journal;
+#[cfg(test)]
+pub(crate) use self::batch_journal::{GoldenPlan, golden_plan_seal};
 mod delegation;
 pub use delegation::SpawnDelegationStatus;
 mod process_terminal;
@@ -113,12 +115,9 @@ use self::test_worker::{
 pub(crate) use self::test_worker::{TestWorkerProtocolCase, TestWorkerProtocolControl, TestWorkerRouteCapture};
 use self::tool_proxy::AllowedToolProxy;
 pub(crate) use self::tool_proxy::{refresh_tools_for_explicit_allowlist, resolve_tools_for_agent};
-#[cfg(test)]
-use self::worker_capability::session_secret_path;
 pub(crate) use self::worker_capability::{SESSION_WORKER_CAP_ENV, SESSION_WORKER_CAP_EXPIRY_ENV};
 use self::worker_capability::{
-    SESSION_WORKER_CAP_TTL_SECS, capability_now_unix, compute_worker_capability_with_key,
-    existing_session_worker_signing_key, manifest_signing_payload, seal_worker_capability, session_worker_signing_key,
+    SESSION_WORKER_CAP_TTL_SECS, capability_now_unix, compute_worker_capability_with_key, manifest_signing_payload,
 };
 use self::worker_manifest::{
     build_session_worker_cli_args, build_session_worker_manifest, copy_dir_recursive,

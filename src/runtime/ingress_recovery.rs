@@ -265,29 +265,6 @@ impl RecoveryScope {
         });
         owner.retain_recovery(Arc::clone(&scope))?;
         recovery_ready(Arc::clone(&scope)).await?;
-        if recording_on && repository_ready {
-            let memory = Arc::clone(&scope.memory);
-            let workspace = scope.workspace.clone();
-            let workspace_id = workspace.to_string_lossy().into_owned();
-            let cost = config.cost.clone();
-            match tokio::time::timeout(
-                Duration::from_secs(15),
-                owned_store_operation(owner, move || {
-                    crate::agent::terminal::recovery_commit::scan_pending_recovery_costs(
-                        memory.as_ref(),
-                        &workspace_id,
-                        &workspace,
-                        &cost,
-                    )
-                }),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "recovery cost restart scan failed"),
-                Err(_) => tracing::warn!("recovery cost restart scan exceeded its deadline"),
-            }
-        }
         Ok(scope)
     }
 

@@ -5,8 +5,8 @@ use super::{
     WorkerSteerPipe, build_session_worker_cli_args, build_session_worker_manifest, cleanup_owned_child_after_panic,
     cleanup_process_worker_workspace, copy_dir_recursive, current_spawn_execution_context, describe_worker_exit,
     normalize_process_memory_strategy, private_worker_memory_db_path, process_terminal, recover_operator_interruption,
-    recover_ordinary_interruption, run_spawned_child_lifecycle, session_worker_signing_key,
-    shared_worker_memory_db_path, start_kill_and_reap_direct_child,
+    recover_ordinary_interruption, run_spawned_child_lifecycle, shared_worker_memory_db_path,
+    start_kill_and_reap_direct_child,
 };
 #[cfg(test)]
 use super::{
@@ -80,7 +80,11 @@ pub(super) async fn run_sub_agent_process(
         operator_generation.is_none() || batch_id.is_none(),
         "operator process cannot claim model batch provenance"
     );
-    let source_transport_key = source_launch.as_ref().map(|_| session_worker_signing_key());
+    // The strict transport secret `T` for this launch: it seals the capability,
+    // the manifest snapshot, every child source record and the launch record.
+    // Any error refuses the launch; there is no fallback key.
+    let launch_transport_key = crate::session_worker::transport_key::TransportSecret::for_launch()?.hmac_key();
+    let source_transport_key = source_launch.as_ref().map(|_| launch_transport_key.clone());
     if let Some(launch) = &source_launch {
         let fabric = source_fabric.context("process source fabric missing")?;
         let issued = launch.source_fabric();
@@ -241,7 +245,8 @@ pub(super) async fn run_sub_agent_process(
         compaction_config,
         channel_excluded_tools,
         child_source,
-        source_launch.zip(source_transport_key.as_ref()),
+        source_launch,
+        &launch_transport_key,
         mailbox,
     )?;
 
@@ -313,7 +318,7 @@ pub(super) async fn run_sub_agent_process(
     #[cfg(unix)]
     let mut prepared_manifest = crate::session_worker::manifest_reference::PreparedManifest::prepare(
         &manifest,
-        &source_transport_key.clone().unwrap_or_else(session_worker_signing_key),
+        &launch_transport_key,
         capability_expiry,
     )
     .with_context(|| {

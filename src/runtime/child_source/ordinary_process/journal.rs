@@ -28,6 +28,44 @@ impl SegmentEvidence {
             &self.terminal,
         ))?)
     }
+
+    /// The segment seal under `K_child`: `StateFingerprint` over
+    /// `["ordinary-worker-segment-v1", kind, parent_scope_id, signing_bytes]`.
+    pub(crate) fn seal_under(
+        &self,
+        key: &crate::security::runtime_key::DecisionKey,
+        kind: &str,
+        parent_scope_id: &str,
+    ) -> anyhow::Result<[u8; 32]> {
+        Ok(key.hmac(
+            KeyDomain::StateFingerprint,
+            &[
+                b"ordinary-worker-segment-v1",
+                kind.as_bytes(),
+                parent_scope_id.as_bytes(),
+                &self.signing_bytes()?,
+            ],
+        ))
+    }
+
+    /// Verify [`Self::seal_under`] in constant time.
+    pub(crate) fn verify_under(
+        &self,
+        key: &crate::security::runtime_key::DecisionKey,
+        kind: &str,
+        parent_scope_id: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(key.verify_hmac(
+            KeyDomain::StateFingerprint,
+            &[
+                b"ordinary-worker-segment-v1",
+                kind.as_bytes(),
+                parent_scope_id.as_bytes(),
+                &self.signing_bytes()?,
+            ],
+            &self.seal,
+        ))
+    }
 }
 
 /// Only a live admitted process can create this signer. Its terminal-only
@@ -136,15 +174,7 @@ impl OrdinarySegmentJournal {
             terminal,
             seal: [0; 32],
         };
-        evidence.seal = self.key.hmac(
-            KeyDomain::StateFingerprint,
-            &[
-                b"ordinary-worker-segment-v1",
-                kind.as_bytes(),
-                self.parent_scope_id.as_bytes(),
-                &evidence.signing_bytes()?,
-            ],
-        );
+        evidence.seal = evidence.seal_under(&self.key, kind, &self.parent_scope_id)?;
         let payload = serde_json::to_string(&evidence)?;
         let event_type = format!("worker.ordinary.segment.{kind}");
         let lookup = format!("worker:{}:segment:{index}:{kind}", self.task_run_id);

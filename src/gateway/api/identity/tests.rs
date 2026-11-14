@@ -63,7 +63,7 @@ async fn startup_identity_requires_existing_private_mac_and_never_repairs_missin
     assert_eq!(status, 200, "{body}");
     let config = served.state.config.load_full();
     let principal = ApiPrincipal::of_token(TOKEN).owner_id;
-    let key = config.workspace_dir.join("self/causal_tree/.decision_key");
+    let key = config.workspace_dir.join("self/runtime/runtime.key");
     std::fs::remove_file(&key).unwrap();
     assert!(verify_startup_identity(&config, &principal).await.is_err());
     assert!(!key.exists());

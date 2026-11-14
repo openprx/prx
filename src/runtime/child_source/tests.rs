@@ -596,3 +596,210 @@ async fn child_publication_builds_the_advisory_driver_only_when_enabled() -> any
     }
     Ok(())
 }
+
+/// HMAC-SHA256 over `lp(label) ‖ Σ lp(part)`, computed with `ring` directly.
+fn golden_state_fingerprint(key: &[u8], parts: &[&[u8]]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let mut context = ring::hmac::Context::with_key(&key);
+    for part in std::iter::once(b"prx.decision.state_fingerprint.v1".as_slice()).chain(parts.iter().copied()) {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    hex::encode(context.sign().as_ref())
+}
+
+fn golden_hex(value: &str) -> Vec<u8> {
+    hex::decode(value).expect("test: golden hex literal")
+}
+
+/// D§4.5: `K_child`, `K_batch`, the batch seal and the segment seal. Expected
+/// values are independently computed literals, never production output.
+#[test]
+fn golden_child_seal_vectors() {
+    use crate::security::runtime_key::{DecisionKey, KeyDomain};
+    let transport: Vec<u8> = (0x20u8..=0x3f).collect();
+    let transport = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &transport);
+
+    const K_CHILD: &str = "27d4adfc09c6ddf85b638f9f1a9e0870988240161549824fd1e11da715cdec4f";
+    const K_BATCH: &str = "e4184f14d8a0d42c0f17b4bd527834eb34450edbf753e106c3d0da296db78b01";
+    const BATCH_SEAL: &str = "edbc083f3912ad65d4f089e6ca4ab409791c85d7caece2e62d32f6d94b42a0b3";
+    const SEGMENT_SEAL: &str = "03ce00b207929043257d261dac5a88856098e4ed5c21d34dc9f5299794f6e69e";
+
+    // The production key equals the literal K_child: identical HMACs.
+    let child = DecisionKey::from_worker_channel(&transport, "ws-1", "run-1", "gen-1").expect("test: K_child");
+    assert_eq!(
+        hex::encode(child.hmac(KeyDomain::StateFingerprint, &[b"probe"])),
+        golden_state_fingerprint(&golden_hex(K_CHILD), &[b"probe"])
+    );
+    let revision = "f".repeat(64);
+    let batch_key = DecisionKey::from_worker_channel(&transport, "ws-1", "batch-1", &revision).expect("test: K_batch");
+    assert_eq!(
+        hex::encode(batch_key.hmac(KeyDomain::StateFingerprint, &[b"probe"])),
+        golden_state_fingerprint(&golden_hex(K_BATCH), &[b"probe"])
+    );
+
+    let batch_seal = crate::tools::sessions_spawn::golden_plan_seal(
+        &batch_key,
+        &crate::tools::sessions_spawn::GoldenPlan {
+            workspace: "ws-1",
+            owner: "owner-1",
+            batch: "batch-1",
+            parent_run: "run-0",
+            parent_session: "sess-0",
+            config_generation: 1,
+            config_revision: &revision,
+            members: &[("run-1", "t")],
+        },
+    )
+    .expect("test: batch seal");
+    assert_eq!(hex::encode(batch_seal), BATCH_SEAL);
+
+    let segment = crate::runtime::child_source::ordinary_process::journal::SegmentEvidence {
+        version: 1,
+        task_run_id: "run-1".into(),
+        process_id: "proc-1".into(),
+        index: 0,
+        input: None,
+        terminal: None,
+        seal: [0; 32],
+    };
+    assert_eq!(
+        segment.signing_bytes().expect("test: segment bytes"),
+        br#"[1,"run-1","proc-1",0,null,null]"#.to_vec()
+    );
+    let seal = segment
+        .seal_under(&child, "terminal", "scope-1")
+        .expect("test: segment seal");
+    assert_eq!(hex::encode(seal), SEGMENT_SEAL);
+}
+
+/// D§3.3: the constraints tuple (with and without the delegation suffix) and
+/// the effective-config payload against hand-written byte literals; the seals
+/// are recomputed with `ring` over those literals.
+#[test]
+fn golden_constraints_and_effective_config_payloads() {
+    use crate::tools::capability::child::wire::{WorkerDelegationAuthority, WorkerParentConstraints};
+    let mut wire = WorkerParentConstraints {
+        decision_id: "00000000-0000-4000-8000-000000000001".into(),
+        allowed: Vec::new(),
+        owner: "owner-1".into(),
+        workspace: "ws-1".into(),
+        level: crate::security::AutonomyLevel::Supervised,
+        max_cost_cents: 25,
+        remaining_depth: 2,
+        delegation: None,
+        catalog_generation: [7; 32],
+        seal: [0; 32],
+    };
+    let without = concat!(
+        r#"["00000000-0000-4000-8000-000000000001",[],"owner-1","ws-1","supervised",25,2,"#,
+        "[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7]]"
+    );
+    let payload = crate::tools::capability::child::worker_constraints_signing_payload(&wire)
+        .map_err(|_| anyhow::anyhow!("constraints payload"))
+        .expect("test: constraints payload");
+    assert_eq!(payload, without.as_bytes());
+    // The production key and helper seal the production payload exactly as
+    // `ring` seals the literal under the literal K_child.
+    let transport: Vec<u8> = (0x20u8..=0x3f).collect();
+    let child = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &transport),
+        "ws-1",
+        "run-1",
+        "gen-1",
+    )
+    .expect("test: K_child");
+    let k_child = golden_hex("27d4adfc09c6ddf85b638f9f1a9e0870988240161549824fd1e11da715cdec4f");
+    assert_eq!(
+        hex::encode(child.hmac(
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
+            &[b"worker-parent-constraints-v1", &payload]
+        )),
+        golden_state_fingerprint(&k_child, &[b"worker-parent-constraints-v1", without.as_bytes()])
+    );
+
+    wire.delegation = Some(WorkerDelegationAuthority {
+        requested: true,
+        provider: "openai".into(),
+        model: "gpt-x".into(),
+    });
+    let with = format!(
+        "{without}\nrecursive-delegation-v1\n{}",
+        r#"{"requested":true,"provider":"openai","model":"gpt-x"}"#
+    );
+    let payload = crate::tools::capability::child::worker_constraints_signing_payload(&wire)
+        .map_err(|_| anyhow::anyhow!("constraints payload"))
+        .expect("test: delegated constraints payload");
+    assert_eq!(payload, with.as_bytes());
+    assert_eq!(
+        hex::encode(child.hmac(
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
+            &[b"worker-parent-constraints-v1", &payload]
+        )),
+        golden_state_fingerprint(&k_child, &[b"worker-parent-constraints-v1", with.as_bytes()])
+    );
+
+    // Effective config: the metadata prefix is a literal; nested maps inserted
+    // out of order serialize sorted.
+    let mut config = crate::config::Config::default();
+    config.workspace_dir = std::path::PathBuf::new();
+    config.config_path = std::path::PathBuf::new();
+    for model in ["zeta/model", "alpha/model"] {
+        config.cost.prices.insert(
+            model.to_owned(),
+            crate::config::schema::ModelPricing {
+                input: 1.0,
+                output: 2.0,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
+    let binding = crate::config::generation::ProcessGenerationBinding {
+        working_root: None,
+        id: crate::config::generation::ConfigGenerationId(7),
+        source_revision: crate::config::generation::ConfigSourceRevision {
+            fingerprint_sha256: "f".repeat(64),
+            disk_generation: None,
+        },
+        applied_at: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .expect("test: timestamp")
+            .with_timezone(&chrono::Utc),
+        trigger: crate::config::generation::ConfigReloadTrigger::Startup,
+        deferred_changes: Vec::new(),
+        seal: [0; 32],
+    };
+    let payload = binding
+        .signing_payload(&config)
+        .expect("test: effective config payload");
+    let prefix = format!(
+        r#"[7,{{"disk_generation":null,"fingerprint_sha256":"{}"}},"2026-01-02T03:04:05Z","startup",[],"","",{{"#,
+        "f".repeat(64)
+    );
+    assert!(
+        payload.starts_with(prefix.as_bytes()),
+        "effective-config metadata prefix differs"
+    );
+    let text = std::str::from_utf8(&payload).expect("test: utf-8 payload");
+    let alpha = text.find(r#""alpha/model":{"#).expect("test: alpha price");
+    let zeta = text.find(r#""zeta/model":{"#).expect("test: zeta price");
+    assert!(
+        alpha < zeta,
+        "nested maps serialize sorted regardless of insertion order"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&payload).expect("test: payload JSON");
+    let mut resorted = value.clone();
+    resorted.sort_all_objects();
+    assert_eq!(
+        serde_json::to_vec(&resorted).expect("test: resorted"),
+        payload,
+        "every object is sorted"
+    );
+    assert_eq!(
+        hex::encode(child.hmac(
+            crate::security::runtime_key::KeyDomain::StateFingerprint,
+            &[b"process-effective-config-v1", &payload]
+        )),
+        golden_state_fingerprint(&k_child, &[b"process-effective-config-v1", &payload])
+    );
+}

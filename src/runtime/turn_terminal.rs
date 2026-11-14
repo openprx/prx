@@ -1,5 +1,6 @@
 //! Exact terminal proposals retained across cancellation and future drop.
 pub(crate) mod execution_close;
+pub(crate) mod restart_verify;
 pub(crate) mod settlement;
 pub(crate) mod silence;
 
@@ -1249,12 +1250,15 @@ impl super::ingress_recovery::RecoveryScope {
         let surface = self.surface.as_str().to_owned();
         let parent = self.parent_authority_id.map(|parent| parent.to_string());
         let terminal_id = terminal_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let Some(repository) = memory.recovery_repository() else {
+        let read_memory = Arc::clone(&memory);
+        let read_chain = chain.clone();
+        // Steps 1–2: the settled receipt (E5 over E4) and its closed facts.
+        let facts = tokio::task::spawn_blocking(move || {
+            let Some(repository) = read_memory.recovery_repository() else {
                 return Ok(None);
             };
             repository.activate_recovery_authority()?;
-            let Some(receipt) = repository.read_recovery_receipt(&chain)? else {
+            let Some(receipt) = repository.read_recovery_receipt(&read_chain)? else {
                 return Ok(None);
             };
             if receipt.state != "settled" {
@@ -1275,25 +1279,50 @@ impl super::ingress_recovery::RecoveryScope {
             if facts.key_id != receipt.key_id {
                 return Err(crate::memory::ingress_recovery::IngressAttestationError::Mismatch("key_id").into());
             }
-            let claim = repository.recovery_event_evidence(&chain, &facts.claim_event_id)?;
-            if claim.event_id != facts.claim_event_id {
-                return Err(
-                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("claim_event_id").into(),
-                );
-            }
-            let terminal = repository.recovery_event_evidence(&chain, &facts.final_event_id)?;
-            if terminal.event_id != facts.final_event_id {
-                return Err(
-                    crate::memory::ingress_recovery::IngressAttestationError::Mismatch("final_event_id").into(),
-                );
+            for id in [&facts.claim_event_id, &facts.final_event_id] {
+                let evidence = repository.recovery_event_evidence(&read_chain, id)?;
+                if &evidence.event_id != id {
+                    return Err(
+                        restart_verify::TerminalNotReplayable("chain event differs from the settled facts").into(),
+                    );
+                }
             }
             if let Some(id) = &facts.assistant_event_id {
-                repository.recovery_event_evidence(&chain, id)?;
+                repository.recovery_event_evidence(&read_chain, id)?;
             }
-            if let Some(id) = &facts.usage_event_id {
-                repository.recovery_event_evidence(&chain, id)?;
-            }
-            Ok(Some(facts))
+            Ok::<_, anyhow::Error>(Some(facts))
+        })
+        .await??;
+        let Some(facts) = facts else {
+            return Ok(None);
+        };
+        // Steps 3–6: the claim and final payloads, read by event id.
+        let scope = crate::memory::ingress_recovery::IngressRecoveryScope {
+            workspace_id: chain.workspace_id.clone(),
+            owner_id: chain.owner_id.clone(),
+            source: event.source.clone(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let read = |id: &str| {
+            let lookup = crate::memory::ingress_recovery::IngressEventLookup::OwnedEventId(id.to_owned());
+            let memory = Arc::clone(&memory);
+            let scope = scope.clone();
+            async move { memory.read_ingress_event(&scope, &lookup, deadline).await }
+        };
+        let claim = read(&facts.claim_event_id)
+            .await?
+            .ok_or(restart_verify::TerminalNotReplayable("claim event missing"))?;
+        let terminal = read(&facts.final_event_id)
+            .await?
+            .ok_or(restart_verify::TerminalNotReplayable("final event missing"))?;
+        let preimage = restart_verify::verify_semantics(&facts, &chain.workspace_id, &claim, &terminal)?;
+        // Steps 5 and 7: E2 over the persisted semantic, usage and outbox.
+        tokio::task::spawn_blocking(move || {
+            let repository = memory
+                .recovery_repository()
+                .ok_or(restart_verify::TerminalNotReplayable("recovery repository unavailable"))?;
+            restart_verify::verify_claim_and_cost(repository, &chain, &facts, &preimage)?;
+            Ok::<_, anyhow::Error>(Some(facts))
         })
         .await?
     }

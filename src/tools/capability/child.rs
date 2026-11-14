@@ -1,6 +1,8 @@
 mod cost_allowance;
 pub(crate) mod wire;
 mod worker_constraints;
+#[cfg(test)]
+pub(crate) use worker_constraints::signing_payload as worker_constraints_signing_payload;
 
 use crate::security::AutonomyLevel;
 use crate::security::decision_id::DecisionId;

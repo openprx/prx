@@ -7,9 +7,9 @@ fn session_worker_secret_follows_the_resolved_config_dir_instead_of_home() {
     let _lock = crate::config::schema::process_config_dir_test_lock();
     let scoped = std::path::PathBuf::from("/tmp/openprx-secret-scope");
     let previous = crate::config::schema::swap_process_config_dir_for_tests(Some(scoped.clone()));
-    let scoped_path = session_secret_path();
+    let scoped_path = crate::session_worker::transport_key::secret_path().ok();
     crate::config::schema::swap_process_config_dir_for_tests(None);
-    let unscoped_path = session_secret_path();
+    let unscoped_path = crate::session_worker::transport_key::secret_path().ok();
     crate::config::schema::swap_process_config_dir_for_tests(previous);
 
     assert_eq!(
@@ -227,6 +227,7 @@ fn sessions_spawn_process_manifest_carries_compaction_and_owner_isolation() {
         &[],
         None,
         None,
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0x20; 32]),
         None,
     )
     .expect("manifest");
@@ -310,6 +311,7 @@ fn sessions_spawn_process_manifest_carries_the_channel_exclusions_under_the_seal
             excluded,
             None,
             None,
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0x20; 32]),
             None,
         )
         .expect("manifest")

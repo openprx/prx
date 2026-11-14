@@ -124,7 +124,13 @@ async fn configured_http_wrong_model_is_refused_before_send() {
 
 #[tokio::test]
 async fn mismatched_model_ignores_a_primed_cache() {
-    let key = DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+        "test-workspace",
+        "test-run",
+        "test-generation",
+    )
+    .expect("test: key");
     let request = request(&key);
     let (backend, mock) = scripted(&key, "prx_cache_route", Vec::new());
     let mut factory = DecisionBackendFactory::from_slots(
@@ -173,7 +179,13 @@ async fn mismatched_model_ignores_a_primed_cache() {
 
 #[test]
 fn request_model_only_comes_from_coherent_retained_slots() {
-    let key = DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+        "test-workspace",
+        "test-run",
+        "test-generation",
+    )
+    .expect("test: key");
     let (backend, _) = scripted(&key, "prx_route_a", Vec::new());
     let factory = DecisionBackendFactory::from_slots(
         vec![backend],

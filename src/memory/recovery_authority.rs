@@ -218,6 +218,17 @@ pub struct RecoveryCostRow {
     pub facts: Vec<u8>,
 }
 
+/// One page of the cost outbox scan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryCostScan {
+    /// Authenticated retryable rows; rejected rows are skipped with a warning.
+    pub rows: Vec<RecoveryCostRow>,
+    /// Settlement id of the last raw row scanned, `None` for an empty raw page.
+    pub cursor: Option<String>,
+    /// The raw page was shorter than the limit.
+    pub exhausted: bool,
+}
+
 /// Atomic terminal commit: claim, optional assistant/usage, final, attestation, outbox.
 pub struct RecoveryTerminalCommit {
     pub events: Vec<super::traits::MessageEventInput>,
@@ -261,13 +272,21 @@ pub trait RecoveryRepository: Send + Sync {
     fn record_recovery_pending(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt>;
     fn settle_recovery(&self, publication: &RecoveryPublication) -> anyhow::Result<RecoveryReceipt>;
     fn read_recovery_receipt(&self, chain: &RecoveryChain) -> anyhow::Result<Option<RecoveryReceipt>>;
-    /// Retryable outbox rows (`pending` or `error`), authenticated, ascending by settlement id.
-    fn pending_recovery_costs(
+    /// One keyset page of retryable outbox rows (`pending` or `error`),
+    /// ascending by settlement id. `rows` holds only the authenticated rows;
+    /// `cursor` is the last raw row scanned (accepted or rejected) and
+    /// `exhausted` is computed from the raw page before authentication.
+    fn scan_recovery_costs(
         &self,
         workspace_id: &str,
         after: Option<&str>,
         limit: usize,
-    ) -> anyhow::Result<Vec<RecoveryCostRow>>;
+    ) -> anyhow::Result<RecoveryCostScan>;
+    /// Whether the cost outbox table exists. Read-only: never creates a key,
+    /// a namespace or the table.
+    fn recovery_outbox_present(&self) -> anyhow::Result<bool>;
+    /// The authenticated outbox row of one settlement in any state, if present.
+    fn recovery_cost_row(&self, workspace_id: &str, settlement_id: &str) -> anyhow::Result<Option<RecoveryCostRow>>;
     /// Write `state` and `state_mac` in one transaction. The outbox trigger enforces the transition.
     fn finish_recovery_cost(
         &self,

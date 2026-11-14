@@ -194,7 +194,7 @@ pub(super) async fn read(
             .context("operator launch payload missing")?,
     )?;
     let fields = record.fields;
-    let transport = crate::tools::sessions_spawn::existing_session_worker_signing_key()?;
+    let transport = crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key();
     let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
         &transport,
         fabric.workspace_id(),

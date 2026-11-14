@@ -293,7 +293,7 @@ fn chat_provider_override_process_child_keeps_non_root_connection() {
         .env("NO_COLOR", "1")
         .env("TERM", "xterm-256color")
         .env("RUST_LOG", "off")
-        .env("SESSION_WORKER_SECRET", "PRX-CHAT-ISOLATED-SECRET")
+        .env("SESSION_WORKER_SECRET", "PRX-CHAT-ISOLATED-SECRET-32BYTES")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -1509,7 +1509,13 @@ mod tests {
 
     #[tokio::test]
     async fn unproven_budget_gate_excludes_configured_slot_before_wire_or_cache() {
-        let key = Arc::new(DecisionKey::ephemeral());
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+            "test-workspace",
+            "test-run",
+            "test-generation",
+        )
+        .expect("test: key");
         let (backend, mock, received) = recorded(&key, "prx-budget-model", Vec::new());
         let factory = DecisionBackendFactory::from_slots(
             vec![backend],
@@ -1541,7 +1547,13 @@ mod tests {
 
     #[tokio::test]
     async fn unproven_budget_gate_ignores_a_primed_decision_cache() {
-        let key = Arc::new(DecisionKey::ephemeral());
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+            "test-workspace",
+            "test-run",
+            "test-generation",
+        )
+        .expect("test: key");
         let initial = request(&key);
         let (backend, mock) = scripted(
             &key,

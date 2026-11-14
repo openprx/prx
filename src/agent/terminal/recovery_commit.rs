@@ -17,6 +17,7 @@ use crate::memory::recovery_authority::{
     RecoveryPricing, RecoveryPublication, RecoveryTerminalCommit, RecoveryTerminalOutcome,
 };
 use crate::memory::{Memory, MessageEventInput, MessageEventScope};
+use crate::runtime::cost_recovery::{is_blocked, usage_from_facts};
 use crate::runtime::decision_journal::store::Enqueue;
 use crate::runtime::ingress_recovery::{SettledTerminalFacts, SkillObservation};
 use crate::security::runtime_key::KeyDomain;
@@ -145,6 +146,12 @@ pub(super) async fn finalize_recovery_terminal(
                 .context("recovery terminal claim key is missing")?,
             None => active_id,
         };
+        // E2 concatenates the semantic bytes and the key id without a
+        // separator, so only a canonical 36-character UUID is accepted.
+        anyhow::ensure!(
+            key_id.len() == 36 && uuid::Uuid::parse_str(&key_id).is_ok_and(|id| id.to_string() == key_id),
+            "recovery terminal claim key id is not canonical"
+        );
         let (semantic, reply_reference) = claim_semantic(
             &commit,
             &mac_workspace,
@@ -245,12 +252,12 @@ pub(super) async fn finalize_recovery_terminal(
                 .context("claim payload")?
                 .insert("semantic_mac_v2".into(), serde_json::Value::String(mac));
         }
-        if reply_reference.is_some() {
-            payload
-                .as_object_mut()
-                .context("claim payload")?
-                .insert("semantic".into(), semantic.clone());
-        }
+        // The semantic preimage is always persisted so that a restart can
+        // authenticate it with E2 instead of reconstructing it (OV-9).
+        payload
+            .as_object_mut()
+            .context("claim payload")?
+            .insert("semantic".into(), semantic.clone());
         payload.to_string()
     };
 
@@ -354,12 +361,9 @@ pub(super) async fn finalize_recovery_terminal(
         TurnTerminalStatus::Failed => "failed",
         TurnTerminalStatus::Cancelled => "cancelled",
     };
-    let surface = link
-        .context
-        .audit_hops()
-        .last()
-        .map(|hop| hop.state.trusted.parts().surface.as_str().to_owned())
-        .context("terminal decision has no surface")?;
+    // The pinned trusted surface of the turn (R22), byte-identical to the
+    // former final-hop value.
+    let surface = commit.binding.runtime().trusted.surface.as_str().to_owned();
     let parent_authority_id = commit
         .binding
         .parent_grant
@@ -502,7 +506,10 @@ pub(super) async fn finalize_recovery_terminal(
             .await
             .context("recovery cost projection worker failed")
             .and_then(|result| result)
-            .unwrap_or_else(|_error| tracing::warn!(settlement_id = %commit.terminal_id, "recovery cost projection deferred to the restart scan"));
+            .unwrap_or_else(|_error| {
+                tracing::warn!(settlement_id = %commit.terminal_id, "recovery cost projection deferred to the cost outbox projector");
+                crate::runtime::cost_recovery::rearm();
+            });
         }
     }
 
@@ -720,16 +727,7 @@ fn claim_semantic(
             .as_ref()
             .filter(|history| !history.assistant_content.is_empty())
         {
-            let model = &commit
-                .link()?
-                .context
-                .audit_hops()
-                .last()
-                .context("decision has no final hop")?
-                .state
-                .trusted
-                .parts()
-                .resolved_model_id;
+            let model = &commit.binding.runtime().trusted.resolved_model_id;
             let reply = match original_reference {
                 Some(reference) => reference,
                 None => ReplyReference::new(&history.assistant_content, model)?,
@@ -890,23 +888,22 @@ fn find_pending_cost(
     workspace_id: &str,
     settlement_id: &str,
 ) -> anyhow::Result<Option<RecoveryCostRow>> {
+    // Same keyset rule as the projector: advance by the raw cursor, so rows
+    // rejected by authentication never hide a later valid row.
     let mut after: Option<String> = None;
     loop {
-        let page = repository.pending_recovery_costs(
+        let scan = repository.scan_recovery_costs(
             workspace_id,
             after.as_deref(),
             crate::memory::ingress_recovery::MAX_RECOVERY_PAGE,
         )?;
-        if page.is_empty() {
-            return Ok(None);
-        }
-        if let Some(row) = page.iter().find(|row| row.settlement_id == settlement_id).cloned() {
+        if let Some(row) = scan.rows.into_iter().find(|row| row.settlement_id == settlement_id) {
             return Ok(Some(row));
         }
-        if page.len() < crate::memory::ingress_recovery::MAX_RECOVERY_PAGE {
+        if scan.exhausted {
             return Ok(None);
         }
-        after = page.last().map(|row| row.settlement_id.clone());
+        after = scan.cursor;
     }
 }
 
@@ -971,104 +968,6 @@ fn project_committed_usage(
         Err(_) => RecoveryCostState::Error,
     };
     repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)
-}
-
-fn is_blocked(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<crate::cost::tracker::LedgerBlocked>())
-}
-
-/// Restart scan: project pending/error rows. Failures never fail prepare.
-pub(crate) fn scan_pending_recovery_costs(
-    memory: &dyn Memory,
-    workspace_id: &str,
-    workspace_dir: &Path,
-    cost_config: &CostConfig,
-) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let Some(repository) = memory.recovery_repository() else {
-        return Ok(());
-    };
-    let rows =
-        match repository.pending_recovery_costs(workspace_id, None, crate::memory::ingress_recovery::MAX_RECOVERY_PAGE)
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "recovery cost restart scan could not list pending rows");
-                return Ok(());
-            }
-        };
-    if rows.is_empty() || Instant::now() >= deadline {
-        return Ok(());
-    }
-    let tracker = match crate::cost::tracker::CostTracker::for_workspace(cost_config.clone(), workspace_dir) {
-        Ok(tracker) => tracker,
-        Err(error) => {
-            tracing::warn!(%error, "recovery cost restart scan could not open the ledger");
-            let state = if is_blocked(&error) {
-                RecoveryCostState::Blocked
-            } else {
-                RecoveryCostState::Error
-            };
-            for row in rows {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                if row.pricing != RecoveryPricing::Metered {
-                    continue;
-                }
-                if let Err(finish_error) =
-                    repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)
-                {
-                    tracing::warn!(%finish_error, settlement_id = %row.settlement_id, "recovery cost finish failed");
-                }
-            }
-            return Ok(());
-        }
-    };
-    for row in rows {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if row.pricing != RecoveryPricing::Metered {
-            continue;
-        }
-        let usage = match usage_from_facts(&row.facts) {
-            Ok(Some(usage)) => usage,
-            Ok(None) => continue,
-            Err(error) => {
-                tracing::warn!(%error, settlement_id = %row.settlement_id, "recovery cost row facts are unreadable");
-                continue;
-            }
-        };
-        let projected = tracker.project_recovery_usage(&usage);
-        #[cfg(test)]
-        if projected
-            .as_ref()
-            .is_err_and(|error| error.is::<crate::cost::tracker::TestCrash>())
-        {
-            continue;
-        }
-        let state = match projected {
-            Ok(()) => RecoveryCostState::Acknowledged,
-            Err(error) if is_blocked(&error) => RecoveryCostState::Blocked,
-            Err(_) => RecoveryCostState::Error,
-        };
-        if let Err(error) = repository.finish_recovery_cost(workspace_id, &row.settlement_id, &row.usage_digest, state)
-        {
-            tracing::warn!(%error, settlement_id = %row.settlement_id, "recovery cost finish failed");
-        }
-    }
-    Ok(())
-}
-
-fn usage_from_facts(facts: &[u8]) -> anyhow::Result<Option<MeteredTokenUsageRecord>> {
-    let value: serde_json::Value = serde_json::from_slice(facts)?;
-    match value.get("usage") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(usage) => Ok(Some(serde_json::from_value(usage.clone())?)),
-    }
 }
 
 async fn terminal_event_id(

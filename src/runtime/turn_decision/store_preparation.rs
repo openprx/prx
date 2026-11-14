@@ -1,7 +1,7 @@
 //! Filesystem preparation runs off Tokio workers and retains cleanup ownership.
 use super::{
-    Arc, CausalDecisionStore, CausalEventSink, ConfigGeneration, DecisionKey, FactoryDeps, PublicationBuildError,
-    Retention, StoreMode, TurnDecisionService,
+    Arc, CausalDecisionStore, CausalEventSink, ConfigGeneration, DecisionKey, PublicationBuildError, Retention,
+    StoreMode, TurnDecisionService,
 };
 use crate::runtime::{causal_events::DurableCausalEventSink, turn_cleanup};
 use tokio_util::sync::CancellationToken;
@@ -17,22 +17,27 @@ impl TurnDecisionService {
     }
 }
 
+/// The turn's state key: the workspace runtime key at
+/// `<ws>/self/runtime/runtime.key` (OV-2), loaded or created off the Tokio
+/// workers. There is no plane condition and no ephemeral fallback: an
+/// unavailable runtime key refuses the publication.
 pub(in crate::runtime) async fn load_key(
     generation: Arc<ConfigGeneration>,
-) -> Result<Option<Arc<DecisionKey>>, PublicationBuildError> {
+) -> Result<Arc<DecisionKey>, PublicationBuildError> {
     let ticket = turn_cleanup::current_tracker()
         .map(|owner| owner.register(CancellationToken::new()))
         .transpose()
         .map_err(PublicationBuildError::PreparationOwner)?;
-    Ok(tokio::task::spawn_blocking(move || {
+    let key = tokio::task::spawn_blocking(move || {
         crate::runtime::decision_accounting::initialize_tokenizers();
-        let key = FactoryDeps::load_key(&generation.effective);
+        let key = DecisionKey::load_or_create(&generation.effective.workspace_dir);
         if let Some(ticket) = ticket {
             ticket.finish(true);
         }
         key
     })
-    .await?)
+    .await?;
+    key.map_err(PublicationBuildError::RuntimeKey)
 }
 
 pub(in crate::runtime) async fn open_store(

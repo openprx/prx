@@ -7,7 +7,6 @@ use crate::decision_engine::prediction::factory::{DecisionBackendFactory, Factor
 use crate::observability::causal_event::CausalEventSink;
 use crate::runtime::decision_journal::store::StoreMode;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
-use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::catalog::CatalogScope;
 use crate::tools::capability::contract::CapabilityRef;
 use crate::tools::capability::turn_state::TurnSurfaceKind;
@@ -67,9 +66,11 @@ pub(super) async fn operator_process_publication(
                 && config.memory.events.record_user_messages),
         "operator worker decision recording is unavailable"
     );
-    let workspace_key =
-        crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
-    let durable_key = config.causal_tree.enabled && workspace_key.is_some();
+    // The runtime key is the turn's state key always (OV-2). The legacy plane
+    // consumers still see it only while the plane is enabled.
+    let runtime_key = crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
+    let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
+    let durable_key = workspace_key.is_some();
     let recovery_owner = crate::runtime::turn_cleanup::current_tracker().unwrap_or_default();
     let opened = if durable_key {
         Some(
@@ -116,7 +117,7 @@ pub(super) async fn operator_process_publication(
         },
     )
     .await?;
-    let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
+    let state_key = runtime_key;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(PublicationBuildError::PolicyFingerprint)?;
 

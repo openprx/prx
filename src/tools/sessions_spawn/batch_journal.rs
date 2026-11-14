@@ -60,6 +60,59 @@ struct Signed {
     seal: [u8; 32],
 }
 
+const BATCH_SEAL_LABEL: &[u8] = b"child-batch-journal-v1";
+
+/// The batch journal seal: `StateFingerprint` over
+/// `["child-batch-journal-v1", serde_json::to_vec(&Fields)]` (struct order).
+fn seal_fields(key: &DecisionKey, fields: &Fields) -> anyhow::Result<[u8; 32]> {
+    Ok(key.hmac(
+        KeyDomain::StateFingerprint,
+        &[BATCH_SEAL_LABEL, &serde_json::to_vec(fields)?],
+    ))
+}
+
+/// Golden-vector access to the production batch seal of a v2 ordinary plan.
+#[cfg(test)]
+pub(crate) struct GoldenPlan<'a> {
+    pub(crate) workspace: &'a str,
+    pub(crate) owner: &'a str,
+    pub(crate) batch: &'a str,
+    pub(crate) parent_run: &'a str,
+    pub(crate) parent_session: &'a str,
+    pub(crate) config_generation: u64,
+    pub(crate) config_revision: &'a str,
+    pub(crate) members: &'a [(&'a str, &'a str)],
+}
+
+#[cfg(test)]
+pub(crate) fn golden_plan_seal(key: &DecisionKey, plan: &GoldenPlan<'_>) -> anyhow::Result<[u8; 32]> {
+    let fields = Fields {
+        version: 2,
+        workspace: plan.workspace.to_owned(),
+        store_workspace: None,
+        owner: plan.owner.to_owned(),
+        batch: plan.batch.to_owned(),
+        parent_decision: String::new(),
+        parent_digest: String::new(),
+        ordinary_source: Some(OrdinarySource {
+            parent_run: plan.parent_run.to_owned(),
+            parent_session: plan.parent_session.to_owned(),
+            config_generation: plan.config_generation,
+            config_revision: plan.config_revision.to_owned(),
+        }),
+        members: plan
+            .members
+            .iter()
+            .map(|(run_id, task)| Member {
+                run_id: (*run_id).to_owned(),
+                task: (*task).to_owned(),
+            })
+            .collect(),
+        dispatched: None,
+    };
+    seal_fields(key, &fields)
+}
+
 pub(super) struct PreparedBatch {
     fabric: MemoryFabric,
     key: Arc<DecisionKey>,
@@ -146,7 +199,7 @@ impl PreparedBatch {
             config_revision: generation.source_revision.fingerprint_sha256.clone(),
         };
         let key = DecisionKey::from_worker_channel(
-            &super::session_worker_signing_key(),
+            &crate::session_worker::transport_key::TransportSecret::for_launch()?.hmac_key(),
             fabric.workspace_id(),
             batch,
             &source.config_revision,
@@ -187,10 +240,7 @@ impl PreparedBatch {
     }
 
     async fn persist(&self, phase: &str) -> anyhow::Result<()> {
-        let seal = self.key.hmac(
-            KeyDomain::StateFingerprint,
-            &[b"child-batch-journal-v1", &serde_json::to_vec(&self.fields)?],
-        );
+        let seal = seal_fields(&self.key, &self.fields)?;
         let payload = serde_json::to_string(&Signed {
             fields: self.fields.clone(),
             seal,
@@ -262,7 +312,7 @@ pub(super) async fn read(
             "ordinary batch cannot satisfy a durable parent grant"
         );
         DecisionKey::from_worker_channel(
-            &super::existing_session_worker_signing_key()?,
+            &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
             fabric.workspace_id(),
             batch,
             &source.config_revision,
@@ -409,7 +459,7 @@ fn verify(
     anyhow::ensure!(
         key.verify_hmac(
             KeyDomain::StateFingerprint,
-            &[b"child-batch-journal-v1", &serde_json::to_vec(&signed.fields)?],
+            &[BATCH_SEAL_LABEL, &serde_json::to_vec(&signed.fields)?],
             &signed.seal
         ),
         "batch journal signature invalid"
@@ -478,7 +528,7 @@ pub(super) async fn verify_ordinary_member(
         .as_ref()
         .context("ordinary launch requires ordinary batch provenance")?;
     let key = DecisionKey::from_worker_channel(
-        &super::existing_session_worker_signing_key()?,
+        &crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key(),
         fabric.workspace_id(),
         batch,
         &source.config_revision,

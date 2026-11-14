@@ -13,7 +13,6 @@ use crate::providers::catalog::CatalogView as ProviderCatalogView;
 use crate::runtime::decision_journal::store::StoreMode;
 use crate::runtime::turn_decision::{TurnDecisionService, pinned_policy_version};
 use crate::security::SecurityPolicy;
-use crate::security::runtime_key::DecisionKey;
 use crate::tools::capability::catalog::{CapabilityCatalog, CatalogScope, CatalogSources, SurfacePolicy};
 use crate::tools::capability::turn_state::TurnSurfaceKind;
 use crate::tools::execution::ToolExecutionService;
@@ -66,12 +65,11 @@ pub(crate) async fn build_publication(
     if config.causal_tree.enabled && !config.memory.events.record_user_messages {
         return Err(PublicationBuildError::InboundEventsDisabled);
     }
-    // `load_key` deliberately does not touch the workspace key while the
-    // plane is disabled. Its single preparation result is shared with recovery;
-    // an unavailable key leaves both the factory builtin-only and recovery unrecorded.
-    let workspace_key =
-        crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
-    let durable_key = config.causal_tree.enabled && workspace_key.is_some();
+    // The runtime key is the turn's state key always (OV-2). The legacy plane
+    // consumers still see it only while the plane is enabled.
+    let runtime_key = crate::runtime::turn_decision::store_preparation::load_key(Arc::clone(&build.generation)).await?;
+    let workspace_key = config.causal_tree.enabled.then(|| Arc::clone(&runtime_key));
+    let durable_key = workspace_key.is_some();
     if let Some(grant) = &build.parent_grant {
         let key = workspace_key
             .as_ref()
@@ -155,7 +153,7 @@ pub(crate) async fn build_publication(
     )
     .await
     .map_err(PublicationBuildError::RecoveryPreparation)?;
-    let state_key = workspace_key.clone().unwrap_or_else(DecisionKey::ephemeral);
+    let state_key = runtime_key;
     let policy_version = pinned_policy_version(config, &build.security, &build.surface_policy, &state_key)
         .map_err(PublicationBuildError::PolicyFingerprint)?;
     let mut catalog_sources = build.catalog_sources;

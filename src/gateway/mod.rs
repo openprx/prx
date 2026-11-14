@@ -1480,6 +1480,12 @@ fn register_gateway_turn_tools(
         .with_event_recording(config.memory.event_recording_config())
         .with_process_recovery(config.causal_tree.enabled)?;
         let handle = spawn_tool.tools_handle();
+        crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+        crate::runtime::cost_recovery::CostOutboxProjector::start_for_process(
+            Arc::clone(memory),
+            config.workspace_dir.clone(),
+            config.cost.clone(),
+        );
 
         // `sessions_list` / `sessions_history` read back what `sessions_spawn`
         // started, so they are bound to that tool's own run registry — the same

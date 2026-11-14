@@ -5,7 +5,7 @@ use super::{
 };
 use wire::{WorkerChildCapabilityRef, WorkerParentConstraints};
 
-fn signing_payload(wire: &WorkerParentConstraints) -> Result<Vec<u8>, ChildManifestError> {
+pub(crate) fn signing_payload(wire: &WorkerParentConstraints) -> Result<Vec<u8>, ChildManifestError> {
     let mut payload = serde_json::to_vec(&(
         &wire.decision_id,
         &wire.allowed,

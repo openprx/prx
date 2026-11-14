@@ -13,7 +13,7 @@ mod tools;
 mod validate;
 
 pub(crate) use self::capability::AuthenticatedWorkerTransport;
-use self::capability::{capability_expiry_from_env, session_worker_signing_key};
+use self::capability::capability_expiry_from_env;
 use self::paths::parse_tools_override;
 #[cfg(test)]
 pub(crate) use self::provider::build_worker_provider_selection;
@@ -131,7 +131,8 @@ fn parse_worker_manifest_line(raw: &str) -> Result<WorkerManifest> {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
-            super::manifest_reference::restore(value, &session_worker_signing_key(), &capability, expiry, now)
+            let transport = crate::session_worker::transport_key::TransportSecret::existing()?.hmac_key();
+            super::manifest_reference::restore(value, &transport, &capability, expiry, now)
         }
         #[cfg(not(unix))]
         anyhow::bail!("worker manifest references are unsupported on this platform")

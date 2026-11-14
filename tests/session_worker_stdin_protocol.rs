@@ -1335,7 +1335,7 @@ fn scripted_join_call(request_body: &str) -> serde_json::Value {
 /// Shared HMAC secret handed to the worker through `SESSION_WORKER_SECRET`, so
 /// the test can mint a capability the worker will accept without reaching for
 /// any state the developer's machine owns.
-const TEST_SECRET: &str = "t6-session-worker-stdin-protocol-secret";
+const TEST_SECRET: &str = "t6-stdin-protocol-secret-32bytes";
 
 // The first check the worker performs *after* authentication has passed and
 // the stdin control-frame reader has been started. Seeing this error is the
