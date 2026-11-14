@@ -263,12 +263,14 @@ impl DecisionSetup {
     ///
     /// A hosted kind, or the refusal of the rules or the check.
     pub fn check(&self) -> Result<()> {
-        let mutations = self.mutations()?;
-        let candidate = crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(
-            &Config::default(),
-            &mutations,
-        )
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let defaults = Config::default();
+        let mutations = crate::config::manage::mutation::decision_engine::with_recommended_latency_budget(
+            &defaults,
+            self.mutations()?,
+        );
+        let candidate =
+            crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(&defaults, &mutations)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
         crate::config::manage::validate::check_decision_plane(None, &candidate)
             .map_err(|refusal| anyhow::anyhow!(refusal))?;
         Ok(())
@@ -355,7 +357,10 @@ impl DecisionSetup {
                 self.kind.as_str()
             ))),
         ];
-        crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(&Config::default(), &mutations)
+        let defaults = Config::default();
+        let mutations =
+            crate::config::manage::mutation::decision_engine::with_recommended_latency_budget(&defaults, mutations);
+        crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(&defaults, &mutations)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok(())
     }
@@ -479,6 +484,10 @@ impl DecisionSetup {
     }
 
     async fn apply_mutations(&self, config: Config, mutations: Vec<CausalMutation>, hosted: bool) -> Result<String> {
+        // Setup writes the catalog's latency recommendation explicitly, in the
+        // same transaction, when the written budget is lower.
+        let mutations =
+            crate::config::manage::mutation::decision_engine::with_recommended_latency_budget(&config, mutations);
         let service = crate::config::manage::ManagementService::deferred(crate::config::new_shared(config));
         let plan = service
             .plan_causal(&mutations, crate::config::manage::ConfigActor::Cli)
@@ -581,3 +590,7 @@ pub fn hosted_setup_steps(kind: BackendKind, owner: &str, model: Option<&str>) -
         model = model.unwrap_or("<exact version>"),
     )
 }
+
+#[cfg(test)]
+#[path = "decision_engine_cli/tests.rs"]
+mod tests;

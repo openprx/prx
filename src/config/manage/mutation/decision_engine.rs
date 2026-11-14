@@ -521,6 +521,61 @@ pub fn paired(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMuta
     }
 }
 
+/// The release catalog's `latency_budget_ms` recommendation for the backend a
+/// `SetBackend` with `kind`, `endpoint` and `model` selects over `config`, if
+/// the catalog has one.
+#[must_use]
+pub fn recommended_latency_budget(
+    config: &Config,
+    kind: BackendKind,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+) -> Option<u64> {
+    let mut backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
+    backend.kind = BackendSelection::Fixed(kind);
+    if let Some(endpoint) = endpoint {
+        backend.endpoint = endpoint.trim().to_string();
+    }
+    if let Some(model) = model {
+        backend.model = model.trim().to_string();
+    }
+    let selection = crate::config::schema::decision_engine::configured_selection(&backend)?;
+    let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().ok()?;
+    catalog
+        .model(
+            &crate::providers::ProviderId::of(&selection.provider),
+            backend.model.trim(),
+        )?
+        .transport
+        .extra_latency_budget_ms
+}
+
+/// Setup and onboarding only: `mutations` led by an explicit
+/// `latency_budget_ms` = the catalog recommendation when a backend selection
+/// in them recommends more than `config` has, so the operator's setup choice
+/// writes the budget in the same transaction. The plain mutation API never
+/// calls this and keeps refusing such a selection.
+#[must_use]
+pub fn with_recommended_latency_budget(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMutation> {
+    let recommended = mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            CausalMutation::SetBackend {
+                kind, endpoint, model, ..
+            } => recommended_latency_budget(config, *kind, endpoint.as_deref(), model.as_deref()),
+            _ => None,
+        })
+        .max();
+    match recommended {
+        Some(recommended) if recommended > config.decision_engine.latency_budget_ms => {
+            std::iter::once(CausalMutation::SetEngine(EngineSetting::LatencyBudgetMs(recommended)))
+                .chain(mutations)
+                .collect()
+        }
+        _ => mutations,
+    }
+}
+
 /// Apply one mutation to `config`.
 ///
 /// A backend change starts from the effective engine backend (R55) and
