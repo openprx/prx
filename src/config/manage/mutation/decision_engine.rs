@@ -76,6 +76,22 @@ pub enum CausalMutation {
     SetEngine(EngineSetting),
 }
 
+impl CausalMutation {
+    /// Whether the mutation selects the decision backend: its kind, endpoint
+    /// or model, through any entrypoint (`SetBackend` from setup, the
+    /// allowlisted `backend.*` keys of `config set` and the Gateway).
+    const fn selects_backend(&self) -> bool {
+        match self {
+            Self::SetBackend { .. } | Self::ResetBackendToAuto => true,
+            Self::SetEngine(setting) => matches!(
+                setting,
+                EngineSetting::BackendKind(_) | EngineSetting::BackendEndpoint(_) | EngineSetting::BackendModel(_)
+            ),
+            Self::SetRemote(_) | Self::SetCredentialRef(_) => false,
+        }
+    }
+}
+
 /// One allowlisted `[decision_engine]` setting with its parsed value
 /// (P2-R8). Backend settings change the effective engine backend.
 #[derive(Debug, Clone, PartialEq)]
@@ -381,7 +397,10 @@ impl CausalConfigService {
     pub fn mutate(config: &Config, mutations: &[CausalMutation]) -> Result<Config, CausalMutationError> {
         let mut next = config.clone();
         for mutation in mutations {
-            apply_one(&mut next, mutation)?;
+            apply_one(&mut next, mutation);
+        }
+        if mutations.iter().any(CausalMutation::selects_backend) {
+            refuse_budget_below_recommendation(&next)?;
         }
 
         next.decision_engine
@@ -539,7 +558,13 @@ pub fn recommended_latency_budget(
     if let Some(model) = model {
         backend.model = model.trim().to_string();
     }
-    let selection = crate::config::schema::decision_engine::configured_selection(&backend)?;
+    backend_recommendation(&backend)
+}
+
+/// The release catalog's `latency_budget_ms` recommendation for the model
+/// `backend` selects, if the catalog has one.
+fn backend_recommendation(backend: &DecisionBackendConfig) -> Option<u64> {
+    let selection = crate::config::schema::decision_engine::configured_selection(backend)?;
     let catalog = crate::providers::catalog::ReleaseCatalog::embedded_ref().ok()?;
     catalog
         .model(
@@ -548,6 +573,29 @@ pub fn recommended_latency_budget(
         )?
         .transport
         .extra_latency_budget_ms
+}
+
+/// Refuse the resulting backend selection of `config` when its catalog
+/// recommendation exceeds the configured `latency_budget_ms`, whether the
+/// engine is on or off. Backend selection never changes the budget: the
+/// operator raises it explicitly (in an earlier change, or in the same
+/// one), and setup writes it explicitly (`with_recommended_latency_budget`).
+///
+/// # Errors
+///
+/// [`CausalMutationError::LatencyBudgetBelowRecommendation`] naming the
+/// model and both values.
+fn refuse_budget_below_recommendation(config: &Config) -> Result<(), CausalMutationError> {
+    let backend = crate::config::schema::decision_engine::effective_engine_backend(config);
+    let configured = config.decision_engine.latency_budget_ms;
+    match backend_recommendation(backend) {
+        Some(recommended) if configured < recommended => Err(CausalMutationError::LatencyBudgetBelowRecommendation {
+            model: backend.model.trim().to_string(),
+            configured,
+            recommended,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Setup and onboarding only: `mutations` led by an explicit
@@ -580,14 +628,9 @@ pub fn with_recommended_latency_budget(config: &Config, mutations: Vec<CausalMut
 ///
 /// A backend change starts from the effective engine backend (R55) and
 /// writes `[decision_engine.backend]`, so the change is the one the engine
-/// builds from.
-///
-/// # Errors
-///
-/// [`CausalMutationError::LatencyBudgetBelowRecommendation`] when a backend
-/// selection's catalog recommendation exceeds the configured
-/// `latency_budget_ms`, whether the engine is on or off.
-fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), CausalMutationError> {
+/// builds from. The latency recommendation is checked once on the result
+/// ([`CausalConfigService::mutate`]).
+fn apply_one(config: &mut Config, mutation: &CausalMutation) {
     let backend_change = matches!(
         mutation,
         CausalMutation::ResetBackendToAuto
@@ -644,18 +687,6 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
                     {
                         backend.timeout_ms = recommended;
                     }
-                    // Backend selection never changes `latency_budget_ms`: a
-                    // budget below the catalog recommendation refuses the
-                    // selection, naming both values.
-                    if let Some(recommended) = entry.transport.extra_latency_budget_ms
-                        && config.decision_engine.latency_budget_ms < recommended
-                    {
-                        return Err(CausalMutationError::LatencyBudgetBelowRecommendation {
-                            model,
-                            configured: config.decision_engine.latency_budget_ms,
-                            recommended,
-                        });
-                    }
                 }
                 declare_decision_model(config, &selection.provider, &model);
             }
@@ -687,7 +718,6 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
                 .credential_ref = reference.clone();
         }
     }
-    Ok(())
 }
 /// The setting that names `operation`.
 const fn operation_setting(operation: ModelOperation) -> ModelOperationSetting {
@@ -979,6 +1009,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raised_first.decision_engine.latency_budget_ms, 3_000);
+    }
+
+    /// The `config set` / Gateway keys select a backend through `SetEngine`:
+    /// the resulting selection is held to the same recommendation, with the
+    /// engine on or off, and a budget raised in the same change (in any
+    /// order) admits it.
+    #[test]
+    fn set_engine_backend_selection_is_held_to_the_latency_recommendation() {
+        let selection = || {
+            vec![
+                CausalMutation::SetEngine(engine_setting("backend.kind", "openrouter").unwrap()),
+                CausalMutation::SetEngine(engine_setting("backend.model", "typesafe/jev-1.13").unwrap()),
+                CausalMutation::SetEngine(
+                    engine_setting("backend.pinned_snapshot", "typesafe/jev-1.13-20260917").unwrap(),
+                ),
+            ]
+        };
+        for enabled in [false, true] {
+            let mut config = Config::default();
+            config.decision_engine.enabled = enabled;
+            let configured = config.decision_engine.latency_budget_ms;
+            match CausalConfigService::mutate(&config, &selection()) {
+                Err(CausalMutationError::LatencyBudgetBelowRecommendation {
+                    model,
+                    configured: named,
+                    recommended,
+                }) => {
+                    assert_eq!(model, "typesafe/jev-1.13");
+                    assert_eq!(named, configured);
+                    assert_eq!(recommended, 3_000);
+                }
+                other => panic!("enabled = {enabled}: expected the typed refusal, got {other:?}"),
+            }
+        }
+        let raise = CausalMutation::SetEngine(engine_setting("latency_budget_ms", "3000").unwrap());
+        let mut after = selection();
+        after.push(raise.clone());
+        let mut before = vec![raise];
+        before.extend(selection());
+        for mutations in [after, before] {
+            let next = CausalConfigService::mutate(&Config::default(), &mutations)
+                .unwrap_or_else(|error| panic!("the raised budget admits the selection: {error}"));
+            assert_eq!(next.decision_engine.latency_budget_ms, 3_000);
+            assert_eq!(
+                crate::config::schema::decision_engine::effective_engine_backend(&next).model,
+                "typesafe/jev-1.13"
+            );
+        }
+        // A change that selects nothing is not refused for the budget.
+        let unrelated = CausalConfigService::mutate(
+            &Config::default(),
+            &[CausalMutation::SetEngine(
+                engine_setting("telemetry_cap", "10").unwrap(),
+            )],
+        );
+        assert!(unrelated.is_ok(), "{unrelated:?}");
     }
 
     /// D-094 C-2: a model-scoped entry without its own list (here one

@@ -83,6 +83,30 @@ fn bounded_cli_output(command: Command) -> Output {
         })
 }
 
+/// The largest `config.toml` a test reads back.
+const MAX_CONFIG_BYTES: u64 = 1_048_576;
+
+/// `config.toml` of `dir` as stored, read under [`MAX_CONFIG_BYTES`]; a
+/// larger file fails the test.
+fn config_bytes(dir: &Path) -> Vec<u8> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(dir.join("config.toml")).expect("test: open config.toml");
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .expect("test: read config.toml");
+    assert!(
+        bytes.len() as u64 <= MAX_CONFIG_BYTES,
+        "config.toml exceeded its test bound of {MAX_CONFIG_BYTES} bytes"
+    );
+    bytes
+}
+
+/// `config.toml` of `dir` as UTF-8 text, bounded as [`config_bytes`].
+fn config_text(dir: &Path) -> String {
+    String::from_utf8(config_bytes(dir)).expect("test: config.toml is UTF-8")
+}
+
 fn prx_in(dir: &Path, args: &[&str]) -> Output {
     // HOME and the XDG directories point into the test's own directory
     // (D-091 F-15): nothing of the developer's home is read or written.
@@ -164,7 +188,7 @@ fn causal_command_prints_one_deprecation_line() {
 fn decision_engine_config_set_rejects_unknown_and_secret_keys() {
     let temp = TempDir::new().expect("test: temp");
     let dir = config_dir(&temp, &[]);
-    let before = std::fs::read(dir.join("config.toml")).expect("test: config");
+    let before = config_bytes(&dir);
     for (key, value) in [
         ("policy.max_candidates", "3"),
         ("backend.credential_ref", "cred-decision-x"),
@@ -181,7 +205,7 @@ fn decision_engine_config_set_rejects_unknown_and_secret_keys() {
             "{key}: the value is never echoed"
         );
     }
-    assert_eq!(std::fs::read(dir.join("config.toml")).expect("test: config"), before);
+    assert_eq!(config_bytes(&dir), before);
     let output = prx_in(
         &dir,
         &["decision-engine", "config", "set", "telemetry_cap", "10", "--yes"],
@@ -192,7 +216,7 @@ fn decision_engine_config_set_rejects_unknown_and_secret_keys() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let written = std::fs::read_to_string(dir.join("config.toml")).expect("test: config");
+    let written = config_text(&dir);
     assert!(written.contains("telemetry_cap = 10"), "{written}");
     // Allowlisted keys whose names contain a credential word are accepted.
     for (key, value, expected) in [
@@ -206,8 +230,90 @@ fn decision_engine_config_set_rejects_unknown_and_secret_keys() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let written = std::fs::read_to_string(dir.join("config.toml")).expect("test: config");
+        let written = config_text(&dir);
         assert!(written.contains(expected), "{key}: {written}");
+    }
+}
+
+/// Audit r2 F1: `prx decision-engine config set backend.model` selecting a
+/// model whose catalog recommendation exceeds the configured
+/// `latency_budget_ms` is refused with both values, with the engine on or
+/// off, and `config.toml` is unchanged; after `latency_budget_ms` is raised
+/// explicitly the same selection is applied.
+#[test]
+fn decision_engine_config_set_refuses_a_backend_below_its_latency_recommendation() {
+    let declaration = |model: &str| {
+        let mut entry = toml::map::Map::new();
+        entry.insert("provider".into(), toml::Value::String("openrouter".into()));
+        entry.insert("model".into(), toml::Value::String(model.into()));
+        entry.insert(
+            "operations".into(),
+            toml::Value::Array(vec![toml::Value::String("decision_endpoint".into())]),
+        );
+        toml::Value::Table(entry)
+    };
+    let models = toml::Value::Array(vec![declaration("openai/gpt-5-mini"), declaration("typesafe/jev-1.13")]);
+    let select = [
+        "decision-engine",
+        "config",
+        "set",
+        "backend.model",
+        "typesafe/jev-1.13",
+        "--yes",
+    ];
+    for enabled in [false, true] {
+        let temp = TempDir::new().expect("test: temp");
+        let dir = config_dir(
+            &temp,
+            &[
+                (&["decision_engine", "enabled"], toml::Value::Boolean(enabled)),
+                (&["decision_engine", "backend", "kind"], "openrouter".into()),
+                (&["decision_engine", "backend", "model"], "openai/gpt-5-mini".into()),
+                (
+                    &["decision_engine", "backend", "pinned_snapshot"],
+                    "typesafe/jev-1.13-20260917".into(),
+                ),
+                (
+                    &["decision_engine", "backend", "credential_ref"],
+                    "cred-openrouter-decision".into(),
+                ),
+                (&["providers", "models"], models.clone()),
+            ],
+        );
+        let before = config_bytes(&dir);
+        let output = prx_in(&dir, &select);
+        assert!(!output.status.success(), "enabled = {enabled}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("typesafe/jev-1.13") && stderr.contains("3000") && stderr.contains("500"),
+            "enabled = {enabled}: {stderr}"
+        );
+        assert_eq!(config_bytes(&dir), before, "enabled = {enabled}: nothing is written");
+        if enabled {
+            continue;
+        }
+        for args in [
+            &["decision-engine", "config", "set", "latency_budget_ms", "3000", "--yes"][..],
+            &select[..],
+        ] {
+            let output = prx_in(&dir, args);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let loaded: Config = toml::from_str(&config_text(&dir)).expect("test: written config");
+        assert_eq!(loaded.decision_engine.latency_budget_ms, 3_000);
+        assert_eq!(
+            loaded
+                .decision_engine
+                .backend
+                .as_ref()
+                .map(|backend| backend.model.as_str()),
+            Some("typesafe/jev-1.13")
+        );
     }
 }
 

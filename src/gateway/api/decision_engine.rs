@@ -513,4 +513,86 @@ mod tests {
         assert_eq!(loaded.decision_engine.prompt_budget_tokens, 300);
         assert!((loaded.decision_engine.token_ratio_limit - 0.5).abs() < f32::EPSILON);
     }
+
+    /// Audit r2 F1: a backend selected through the allowlisted Gateway keys
+    /// (`SetEngine`) whose catalog recommendation exceeds the configured
+    /// `latency_budget_ms` is refused on plan and apply, with the engine on
+    /// or off, naming both values; the stored configuration is unchanged.
+    /// Raising the budget explicitly in the change admits the selection.
+    #[tokio::test]
+    async fn config_apply_refuses_a_backend_below_its_latency_recommendation() {
+        let seed = |enabled: bool| {
+            move |config: &mut crate::config::Config| {
+                config.decision_engine.enabled = enabled;
+                config
+                    .decision_engine
+                    .backend
+                    .get_or_insert_with(Default::default)
+                    .credential_ref = crate::config::schema::decision_engine::CredentialRefSetting::Profile(
+                    "cred-openrouter-decision".to_string(),
+                );
+                config.providers.models.push(
+                    serde_json::from_value(json!({
+                        "provider": "openrouter",
+                        "model": "typesafe/jev-1.13",
+                        "operations": ["decision_endpoint"],
+                    }))
+                    .expect("test: declaration"),
+                );
+            }
+        };
+        let selection = json!({"changes": {
+            "backend.kind": "openrouter",
+            "backend.model": "typesafe/jev-1.13",
+            "backend.pinned_snapshot": "typesafe/jev-1.13-20260917",
+        }});
+        for enabled in [false, true] {
+            let served = serve_config(seed(enabled)).await;
+            let before = served.loaded();
+            for path in ["/api/decision-engine/config/plan", "/api/decision-engine/config/apply"] {
+                let (status, response) = served.call(Method::POST, path, Some(selection.clone())).await;
+                assert_eq!(status, 400, "enabled = {enabled}, {path}: {response}");
+                let error = json(&response)["error"].as_str().unwrap_or_default().to_string();
+                assert!(
+                    error.contains("typesafe/jev-1.13")
+                        && error.contains("3000")
+                        && error.contains(&before.decision_engine.latency_budget_ms.to_string()),
+                    "enabled = {enabled}, {path}: {error}"
+                );
+            }
+            let after = served.loaded();
+            assert_eq!(after.decision_engine, before.decision_engine, "enabled = {enabled}");
+            assert_eq!(after.providers.models.len(), before.providers.models.len());
+        }
+        let served = serve_config(seed(false)).await;
+        let mut raised = selection;
+        raised["changes"]["latency_budget_ms"] = json!(3000);
+        let (status, response) = served
+            .call(Method::POST, "/api/decision-engine/config/plan", Some(raised.clone()))
+            .await;
+        assert_eq!(status, 200, "{response}");
+        let revision = json(&response)["revision"]
+            .as_str()
+            .expect("test: plan revision")
+            .to_string();
+        let (status, response) = served
+            .call_if_match(
+                Method::POST,
+                "/api/decision-engine/config/apply",
+                &revision,
+                Some(raised),
+            )
+            .await;
+        assert_eq!(status, 200, "{response}");
+        let loaded = served.loaded();
+        assert_eq!(loaded.decision_engine.latency_budget_ms, 3_000);
+        let backend = crate::config::schema::decision_engine::effective_engine_backend(&loaded);
+        assert_eq!(backend.model, "typesafe/jev-1.13");
+        assert_eq!(
+            backend.kind,
+            crate::config::schema::decision_engine::BackendSelection::Fixed(
+                crate::config::schema::decision_engine::BackendKind::OpenRouter
+            )
+        );
+    }
 }
