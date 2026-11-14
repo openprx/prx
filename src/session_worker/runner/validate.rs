@@ -11,36 +11,6 @@ pub(super) fn validate_worker_manifest_with_capability_env(
     env_capability: Option<&str>,
 ) -> Result<AuthenticatedWorkerTransport> {
     let transport = authenticate_worker_capability_with_env(manifest, env_capability)?;
-    // Exactly one source: the ordinary/operator publication is the only
-    // child issuance path (P2-R17). Pre-strip delegated manifests carry
-    // unknown fields and fail to decode before reaching this check.
-    if manifest.ordinary_source.is_some() == manifest.operator_source.is_some() {
-        return Err(WorkerManifestUnsupported.into());
-    }
-    if let Some(source) = &manifest.operator_source {
-        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
-            &transport.key,
-            &source.publication.workspace,
-            &manifest.run_id,
-            &manifest.config_generation,
-        )?;
-        let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
-            &source.catalog,
-            &key,
-            crate::tools::capability::contract::CatalogGeneration(source.publication.catalog_generation),
-        )?;
-        let publication = source.publication.verify(&key, &catalog)?;
-        anyhow::ensure!(
-            manifest.owner_id.as_deref() == Some(publication.owner()),
-            "operator worker owner differs from publication"
-        );
-        crate::providers::catalog::CatalogView::restore_operator_process(
-            &source.provider_catalog,
-            &key,
-            publication.id(),
-        )?;
-        crate::runtime::child_source::parent::ParentSource::restore_operator_process(manifest, &publication, &key)?;
-    }
     let run_id = manifest.run_id.trim();
     if run_id.is_empty()
         || run_id.contains('/')
@@ -105,6 +75,39 @@ pub(super) fn validate_worker_manifest_with_capability_env(
             .as_ref()
             .context("shared_memory_db_path is required for hybrid session-worker memory")?;
         ensure_clean_path(shared_memory_db_path, "shared_memory_db_path")?;
+    }
+
+    // The structural inputs above are validated first; the source steps
+    // then follow the P2-R17 order (exactly one source, then restore).
+    // Exactly one source: the ordinary/operator publication is the only
+    // child issuance path (P2-R17). Pre-strip delegated manifests carry
+    // unknown fields and fail to decode before reaching this check.
+    if manifest.ordinary_source.is_some() == manifest.operator_source.is_some() {
+        return Err(WorkerManifestUnsupported.into());
+    }
+    if let Some(source) = &manifest.operator_source {
+        let key = crate::security::runtime_key::DecisionKey::from_worker_channel(
+            &transport.key,
+            &source.publication.workspace,
+            &manifest.run_id,
+            &manifest.config_generation,
+        )?;
+        let catalog = crate::tools::capability::catalog::CapabilityCatalog::restore_process(
+            &source.catalog,
+            &key,
+            crate::tools::capability::contract::CatalogGeneration(source.publication.catalog_generation),
+        )?;
+        let publication = source.publication.verify(&key, &catalog)?;
+        anyhow::ensure!(
+            manifest.owner_id.as_deref() == Some(publication.owner()),
+            "operator worker owner differs from publication"
+        );
+        crate::providers::catalog::CatalogView::restore_operator_process(
+            &source.provider_catalog,
+            &key,
+            publication.id(),
+        )?;
+        crate::runtime::child_source::parent::ParentSource::restore_operator_process(manifest, &publication, &key)?;
     }
 
     Ok(transport)

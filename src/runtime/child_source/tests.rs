@@ -744,10 +744,10 @@ async fn recursive_derivation_shares_the_authenticated_parent() -> anyhow::Resul
             // An explicit `true` keeps the typed refusal; an omitted flag
             // falls back to the captured, non-delegating object.
             assert!(matches!(
-                shallow.select_for_spawn(&shallow_caller, DelegationRequest::Explicit(true)),
+                shallow.select_for_spawn(&shallow_caller, DelegationRequest::Explicit(true), true),
                 Err(RecursiveDelegationRefused::DepthExhausted)
             ));
-            let fallback = shallow.select_for_spawn(&shallow_caller, DelegationRequest::Omitted)?;
+            let fallback = shallow.select_for_spawn(&shallow_caller, DelegationRequest::Omitted, true)?;
             assert!(
                 fallback == shallow,
                 "an omitted flag at the bound keeps the captured object"
@@ -755,11 +755,24 @@ async fn recursive_derivation_shares_the_authenticated_parent() -> anyhow::Resul
 
             // (d) An explicit `allow_delegation: false` keeps the captured
             // object itself; the default derives the recursive scope.
-            let kept = publication.select_for_spawn(&bound, DelegationRequest::Explicit(false))?;
+            let kept = publication.select_for_spawn(&bound, DelegationRequest::Explicit(false), true)?;
             assert!(kept == publication, "opt-out keeps the captured object");
             assert!(Arc::ptr_eq(kept.scope(), publication.scope()));
-            let selected = publication.select_for_spawn(&bound, DelegationRequest::Omitted)?;
+            let selected = publication.select_for_spawn(&bound, DelegationRequest::Omitted, true)?;
             assert!(selected.same_parent(&publication) && selected != publication);
+
+            // (e) A child whose own executor or surface cannot run the
+            // delegator gets no recursive scope: an omitted flag keeps the
+            // captured object, an explicit `true` is refused as NoDelegator.
+            let unserved = publication.select_for_spawn(&bound, DelegationRequest::Omitted, false)?;
+            assert!(
+                unserved == publication,
+                "an unserved delegator keeps the captured object"
+            );
+            assert!(matches!(
+                publication.select_for_spawn(&bound, DelegationRequest::Explicit(true), false),
+                Err(RecursiveDelegationRefused::NoDelegator)
+            ));
             drop(other);
             Ok::<(), anyhow::Error>(())
         }))

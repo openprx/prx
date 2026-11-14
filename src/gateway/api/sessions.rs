@@ -382,6 +382,23 @@ fn console_recordable(config: &crate::config::Config, memory: &dyn crate::memory
     recording.enabled && recording.record_user_messages && memory.recovery_repository().is_some()
 }
 
+/// Run-keyed approvals need recording on and a recovery repository (OV-13).
+/// Recording turned off is the operator's choice (409, disabled); a memory
+/// backend that keeps no repository fails closed (503), never "disabled".
+fn approvals_unavailable(config: &crate::config::Config, memory: &dyn crate::memory::Memory) -> Option<Response> {
+    let recording = config.memory.event_recording_config();
+    if !(recording.enabled && recording.record_user_messages) {
+        return Some(json_error(StatusCode::CONFLICT, "Decision approvals are disabled"));
+    }
+    if memory.recovery_repository().is_none() {
+        return Some(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Decision approvals are unavailable: the memory backend keeps no recovery repository",
+        ));
+    }
+    None
+}
+
 async fn recover_console_history(
     state: &AppState,
     runtime: &crate::gateway::TurnRuntimeGeneration,
@@ -1269,8 +1286,8 @@ pub(super) async fn get_session_approvals(
     axum::Extension(principal): axum::Extension<super::ApiPrincipal>,
 ) -> Response {
     let runtime = state.pin_turn_runtime();
-    if !console_recordable(&runtime.config_generation.effective, state.mem.as_ref()) {
-        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
+        return response;
     }
     let after_id = match parse_inbox_cursor(query.cursor.as_deref()) {
         Ok(id) => id,
@@ -2130,7 +2147,7 @@ async fn run_console_message_job_work(
             .service
             .terminal_binding(&decision.context)
             .map_err(|error| error.to_string())?;
-        match crate::gateway::turn_source::publication_slot::commit_terminal(
+        let receipt = match crate::gateway::turn_source::publication_slot::commit_terminal(
             Some(&terminal_guard),
             &terminal_fabric,
             crate::agent::terminal::TurnTerminalDraft {
@@ -2160,14 +2177,24 @@ async fn run_console_message_job_work(
         )
         .await
         {
-            Ok(_) => (),
+            Ok(receipt) => receipt,
             Err(error) => {
                 tracing::warn!(error = %error, "Failed to commit shared console terminal event");
                 return Err("Console terminal persistence is unconfirmed".to_owned());
             }
         };
 
-        if !console_recordable(config, state.mem.as_ref()) {
+        if console_recordable(config, state.mem.as_ref()) {
+            // A recorded console turn's transcript is the projection of its
+            // committed, redacted assistant event, exactly as its input was
+            // projected at admission.
+            if let Some(assistant) = receipt.assistant_event.as_ref() {
+                if let Err(error) = state.mem.project_console_message(assistant).await {
+                    tracing::error!("Failed to project assistant session turn: {error}");
+                    return Err("Failed to persist assistant response".to_string());
+                }
+            }
+        } else {
             let record_event = matches!(
                 turn.envelope.agent_partition.as_ref().map(|partition| &partition.key),
                 Some(crate::memory::PartitionKey::Named { .. })
@@ -3758,6 +3785,8 @@ mod tests {
     async fn approval_inbox_disabled_plane_is_conflict() {
         let mut config = Config::default();
         config.workspace_dir = std::env::temp_dir();
+        // OV-13: approvals are disabled when user-message recording is off.
+        config.memory.events.record_user_messages = false;
         let state = test_app_state(config, Arc::new(CapturingProvider::default()));
         let response = super::get_session_approvals(
             State(state),
@@ -4024,8 +4053,8 @@ async fn call_approval_action(
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid call id"),
     };
     let runtime = state.pin_turn_runtime();
-    if !console_recordable(&runtime.config_generation.effective, state.mem.as_ref()) {
-        return json_error(StatusCode::CONFLICT, "Decision approvals are disabled");
+    if let Some(response) = approvals_unavailable(&runtime.config_generation.effective, state.mem.as_ref()) {
+        return response;
     }
     if change.is_some() {
         if let Err(message) = console_decision_control_policy(&runtime.config_generation.effective) {

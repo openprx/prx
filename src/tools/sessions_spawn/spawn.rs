@@ -100,6 +100,47 @@ impl SessionsSpawnTool {
         boxed_spawn_field(|| self.execute_spawn_with_id(args, batch_id, None)).await
     }
 
+    /// Whether the child this spawn issues could run `sessions_spawn` itself:
+    /// a task child runs on this tool's registry, every child keeps the
+    /// inherited surface exclusions, and a named agent's allowance bounds its
+    /// tools. A recursive scope is derived only for a child that can serve it.
+    fn child_serves_delegator(&self, args: &serde_json::Value, config: &crate::config::Config) -> anyhow::Result<bool> {
+        let name = self.name();
+        let mode = args
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or(config.sessions_spawn.default_mode.as_str());
+        if !mode.eq_ignore_ascii_case("process")
+            && !self
+                .tools
+                .get()?
+                .is_some_and(|registry| registry.iter().any(|tool| tool.name() == name))
+        {
+            return Ok(false);
+        }
+        if current_spawn_execution_context()
+            .is_some_and(|context| context.channel_excluded_tools.iter().any(|tool| tool == name))
+        {
+            return Ok(false);
+        }
+        let agent = args
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+            .and_then(|agent| config.agents.get(agent));
+        Ok(agent.is_none_or(|agent| {
+            agent.allowed_tools.is_empty()
+                || agent
+                    .allowed_tools
+                    .iter()
+                    .map(|tool| tool.trim())
+                    .any(|tool| tool == "*" || tool == name)
+        }))
+    }
+
     pub(super) async fn execute_spawn_with_id(
         &self,
         args: &serde_json::Value,
@@ -124,7 +165,8 @@ impl SessionsSpawnTool {
         let caller = match caller {
             Some(caller) => match caller.context().ordinary_child_publication.as_ref() {
                 Some(publication) => {
-                    let selected = publication.select_for_spawn(caller.context(), recursive)?;
+                    let served = self.child_serves_delegator(args, &publication.generation().effective)?;
+                    let selected = publication.select_for_spawn(caller.context(), recursive, served)?;
                     Some(caller.with_ordinary_publication(selected)?)
                 }
                 None => Some(caller),

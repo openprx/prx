@@ -194,15 +194,29 @@ impl OrdinaryChildPublication {
     /// captured object itself, unchanged. An omitted flag derives the
     /// recursive scope and, when a bound refuses it, keeps this object as
     /// `false` does. Integrity refusals are never masked.
+    ///
+    /// `delegator_served` states whether the child's own executor and surface
+    /// can run `sessions_spawn` (its task registry holds the tool, and neither
+    /// the inherited surface exclusions nor the named agent's allowance hide
+    /// it). A child that could not run the delegator gets no recursive scope:
+    /// the delegator is then absent for it ([`RecursiveDelegationRefused::NoDelegator`]).
     pub(crate) fn select_for_spawn(
         &self,
         caller: &crate::tools::ToolExecutionContext,
         request: DelegationRequest,
+        delegator_served: bool,
     ) -> Result<Self, RecursiveDelegationRefused> {
+        let derive = || {
+            if delegator_served {
+                self.with_recursive_delegation(caller)
+            } else {
+                Err(RecursiveDelegationRefused::NoDelegator)
+            }
+        };
         match request {
             DelegationRequest::Explicit(false) => Ok(self.clone()),
-            DelegationRequest::Explicit(true) => self.with_recursive_delegation(caller),
-            DelegationRequest::Omitted => match self.with_recursive_delegation(caller) {
+            DelegationRequest::Explicit(true) => derive(),
+            DelegationRequest::Omitted => match derive() {
                 Ok(derived) => Ok(derived),
                 Err(refused) if refused.is_bound() => {
                     tracing::debug!(reason = %refused, "omitted allow_delegation: issuing a non-delegating child");
@@ -324,13 +338,19 @@ impl OrdinaryChildPublication {
         let (registry, execution) = task_registry.map_or_else(
             || (Arc::clone(&parent.registry), Arc::clone(&parent.execution)),
             |registry| {
-                let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
-                    Arc::clone(&registry),
-                    Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
-                    Arc::new(crate::tools::DenyApprovalStrategy),
-                    Arc::new(crate::tools::AdapterOwnedPreparation),
-                    Arc::new(crate::tools::TracingToolExecutionAudit),
-                ));
+                // The task executor keeps the parent's durable idempotency
+                // ledger, as every published executor does: a side-effecting
+                // child tool is never refused for a missing ledger.
+                let execution = Arc::new(
+                    ToolExecutionService::from_shared_boxed_registry(
+                        Arc::clone(&registry),
+                        Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
+                        Arc::new(crate::tools::DenyApprovalStrategy),
+                        Arc::new(crate::tools::AdapterOwnedPreparation),
+                        Arc::new(crate::tools::TracingToolExecutionAudit),
+                    )
+                    .with_idempotency_memory(Arc::clone(&parent.memory)),
+                );
                 (registry, execution)
             },
         );

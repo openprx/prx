@@ -207,8 +207,14 @@ impl TurnRuntimeService {
                 let (manifest, constraints) = scope.gate_inputs();
                 (Arc::new(manifest.clone()), Arc::new(constraints.clone()))
             }),
+            // Discovery needs the search tool on this child's own surface: a
+            // child whose allowance or exclusions hide it cannot search, so
+            // its manifest members are published directly.
             child_discovery: proof.child_scope().is_some()
-                && self.execution.current_descriptor("capability_search").is_some(),
+                && self.execution.current_descriptor("capability_search").is_some()
+                && catalog
+                    .iter_entries()
+                    .any(|entry| entry.public_name == "capability_search"),
             child_served: (proof.child_scope().is_some()
                 && self.security.autonomy == crate::security::AutonomyLevel::Full)
                 .then(|| Arc::new(self.child_served_entries(&catalog))),

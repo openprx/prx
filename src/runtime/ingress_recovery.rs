@@ -863,7 +863,15 @@ fn unverifiable_ingress(error: &anyhow::Error) -> Option<&'static str> {
         "original terminal source event is missing",
         "terminal replay decision row is missing",
     ];
+    // A terminal whose restart verification fails (D§4.4) or that carries
+    // no settled receipt is never re-executed or settled: the scan
+    // quarantines it like any other unauthenticated terminal.
     error.chain().find_map(|cause| {
+        if cause.is::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()
+            || cause.is::<authority::LegacyUnconfirmed>()
+        {
+            return Some("terminal replay authentication failed");
+        }
         let text = cause.to_string();
         REASONS.iter().copied().find(|reason| text == *reason)
     })

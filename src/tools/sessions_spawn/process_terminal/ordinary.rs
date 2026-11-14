@@ -339,21 +339,42 @@ fn terminal_payload(event: &MessageEvent) -> anyhow::Result<serde_json::Value> {
 }
 
 fn verify_lineage(event: &MessageEvent, lineage: &CompletionLineage) -> anyhow::Result<()> {
+    // Name the differing fields (never their values) so a refused terminal
+    // is diagnosable without echoing stored identities.
+    let differing: Vec<&str> = [
+        (
+            "session_key",
+            event.session_key.as_deref() == Some(lineage.session_key.as_str()),
+        ),
+        ("parent_run_id", event.parent_run_id == lineage.parent_run_id),
+        (
+            "parent_session_key",
+            event.parent_session_key.as_deref() == Some(lineage.parent_session.as_str()),
+        ),
+        ("owner_id", event.owner_id == lineage.owner_id),
+        (
+            "config_generation_id",
+            event.config_generation_id == lineage.config_generation_id,
+        ),
+        (
+            "config_source_revision",
+            event.config_source_revision == lineage.config_source_revision,
+        ),
+        ("channel", event.channel == lineage.channel),
+        ("sender", event.sender == lineage.sender),
+        ("recipient", event.recipient == lineage.recipient),
+        ("agent_id", event.agent_id == lineage.agent_id),
+        ("persona_id", event.persona_id == lineage.persona_id),
+        ("attempt_id", event.attempt_id == lineage.attempt_id),
+        ("lease_epoch", event.lease_epoch == lineage.lease_epoch),
+    ]
+    .into_iter()
+    .filter_map(|(field, equal)| (!equal).then_some(field))
+    .collect();
     anyhow::ensure!(
-        event.session_key.as_deref() == Some(lineage.session_key.as_str())
-            && event.parent_run_id == lineage.parent_run_id
-            && event.parent_session_key.as_deref() == Some(lineage.parent_session.as_str())
-            && event.owner_id == lineage.owner_id
-            && event.config_generation_id == lineage.config_generation_id
-            && event.config_source_revision == lineage.config_source_revision
-            && event.channel == lineage.channel
-            && event.sender == lineage.sender
-            && event.recipient == lineage.recipient
-            && event.agent_id == lineage.agent_id
-            && event.persona_id == lineage.persona_id
-            && event.attempt_id == lineage.attempt_id
-            && event.lease_epoch == lineage.lease_epoch,
-        "ordinary terminal lineage differs from launch"
+        differing.is_empty(),
+        "ordinary terminal lineage differs from launch: {}",
+        differing.join(", ")
     );
     Ok(())
 }
