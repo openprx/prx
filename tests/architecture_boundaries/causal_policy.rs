@@ -7,11 +7,11 @@ use super::tool_scanner::contains_identifier;
 /// The only production files that may write the decision-plane
 /// configuration (CDP-04, SP-CDP-A 5.4): its own module, for the legacy
 /// migration and the derived legacy view. CDP-12 adds the typed mutation
-/// service (`src/config/manage/mutation/causal.rs`).
+/// service (`src/config/manage/mutation/decision_engine.rs`).
 const CAUSAL_POLICY_WRITERS: &[&str] = &[
     "src/config/schema/causal_tree.rs",
     // CDP-12: the one decision-plane mutation service (AG-13).
-    "src/config/manage/mutation/causal.rs",
+    "src/config/manage/mutation/decision_engine.rs",
 ];
 
 /// Methods that only read a value, and so may be called on a

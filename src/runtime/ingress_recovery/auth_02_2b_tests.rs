@@ -229,7 +229,12 @@ fn events() -> Arc<RecordingSink> {
 }
 
 fn seeded_record(n: u8) -> crate::runtime::decision_journal::store::DecisionRecord {
-    record(DecisionId::legacy(&[n; 32]), "ws", Some("prx_user"), 10)
+    record(
+        DecisionId::parse(&format!("0192f0c4-0000-7000-8000-{:012x}", n)).expect("test: id"),
+        "ws",
+        Some("prx_user"),
+        10,
+    )
 }
 
 async fn flush(store: &CausalDecisionStore) {
@@ -310,7 +315,10 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
         crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: key");
         let store = open_private(workspace, events());
         assert_eq!(
-            store.writer().expect("test: writer").record_decision(seeded_record(1)),
+            store
+                .writer()
+                .expect("test: writer")
+                .record_chain(vec![seeded_record(1)]),
             Enqueue::Queued
         );
         flush(&store).await;
@@ -349,7 +357,10 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
         crate::security::runtime_key::DecisionKey::load_or_create(workspace).expect("test: key");
         let store = open_private(workspace, events());
         assert_eq!(
-            store.writer().expect("test: writer").record_decision(seeded_record(1)),
+            store
+                .writer()
+                .expect("test: writer")
+                .record_chain(vec![seeded_record(1)]),
             Enqueue::Queued
         );
         flush(&store).await;
@@ -394,7 +405,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
             writer_store
                 .writer()
                 .expect("test: writer")
-                .record_decision(seeded_record(1)),
+                .record_chain(vec![seeded_record(1)]),
             Enqueue::Queued
         );
         flush(&writer_store).await;
@@ -424,7 +435,7 @@ pub(super) async fn recovery_legacy_reader_creates_no_files() {
             writer_store
                 .writer()
                 .expect("test: writer")
-                .record_decision(seeded_record(2)),
+                .record_chain(vec![seeded_record(2)]),
             Enqueue::Queued
         );
         flush(&writer_store).await;

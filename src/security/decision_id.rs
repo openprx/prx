@@ -36,14 +36,6 @@ impl DecisionId {
         Self(Uuid::now_v7())
     }
 
-    /// The id of an imported v1 decision: a UUIDv8 over the first 16 bytes
-    /// of `digest`, a keyed digest of the line's origin.
-    pub(crate) fn legacy(digest: &[u8; 32]) -> Self {
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        Self(uuid::Builder::from_custom_bytes(bytes).into_uuid())
-    }
-
     /// Parse the hyphenated form an operator types.
     ///
     /// # Errors
@@ -63,17 +55,6 @@ impl fmt::Display for DecisionId {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_legacy_id_is_stable_and_round_trips() {
-        let digest = [7_u8; 32];
-        let id = DecisionId::legacy(&digest);
-        assert_eq!(id, DecisionId::legacy(&digest), "the same origin gives the same id");
-        assert_ne!(id, DecisionId::legacy(&[8_u8; 32]));
-        assert_eq!(DecisionId::parse(&id.to_string()), Ok(id));
-        assert_eq!(id.0.get_version_num(), 8);
-        assert_eq!(DecisionId::parse("not-a-uuid"), Err(InvalidDecisionId));
-    }
 
     #[test]
     fn runtime_id_is_v7_and_round_trips() {

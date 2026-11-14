@@ -55,7 +55,7 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         let interactive = *interactive;
         // The decision flags use the one setup service (CDP-14); they are
         // quick-mode flags, like --provider.
-        let decision = decision_backend.map(|kind| openprx::causal_cli::DecisionSetup {
+        let decision = decision_backend.map(|kind| openprx::decision_engine_cli::DecisionSetup {
             kind: kind.into(),
             endpoint: decision_endpoint.clone(),
             model: decision_model.clone(),
@@ -66,11 +66,11 @@ pub(crate) async fn run(cli: &Cli) -> Result<()> {
         }
         let hosted = decision
             .as_ref()
-            .is_some_and(|decision| openprx::causal_cli::hosted_owner(decision.kind).is_some());
+            .is_some_and(|decision| openprx::decision_engine_cli::hosted_owner(decision.kind).is_some());
         if hosted && !*decision_credential_stdin {
             bail!(
                 "a hosted decision backend needs its credential: add --decision-credential-stdin (the value is read \
-                 from standard input and stored as a credential reference), or use `prx causal config set backend`"
+                 from standard input and stored as a credential reference), or use `prx decision-engine config set backend.kind`"
             );
         }
         if *decision_credential_stdin && !hosted {

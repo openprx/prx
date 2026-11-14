@@ -238,10 +238,10 @@ pub(super) fn setup_memory() -> Result<MemoryConfig> {
 /// written, and tested locally once the configuration is written. A hosted
 /// service needs a credential: it is read hidden, stored as a credential
 /// reference and referenced in the same setup; remote processing stays off
-/// until `prx causal config enable-remote`.
+/// until `prx decision-engine config set backend.remote_enabled true`.
 pub(super) fn setup_decision_plane() -> Result<
     Option<(
-        crate::causal_cli::DecisionSetup,
+        crate::decision_engine_cli::DecisionSetup,
         Option<crate::config::manage::credentials::SecretString>,
     )>,
 > {
@@ -268,7 +268,7 @@ pub(super) fn setup_decision_plane() -> Result<
                 .with_prompt("  Turn the decision plane on now?")
                 .default(true)
                 .interact()?;
-            let setup = crate::causal_cli::DecisionSetup {
+            let setup = crate::decision_engine_cli::DecisionSetup {
                 kind: crate::config::schema::causal_tree::BackendKind::CompatibleHttp,
                 endpoint: Some(endpoint.trim().to_string()),
                 model: Some(model.trim().to_string()),
@@ -279,7 +279,9 @@ pub(super) fn setup_decision_plane() -> Result<
         }
         2 => {
             print_bullet("A hosted service needs a credential. Decision state is sent to it only after you run");
-            print_bullet("`prx causal config enable-remote`; until then the builtin decides locally.");
+            print_bullet(
+                "`prx decision-engine config set backend.remote_enabled true`; until then the builtin decides locally.",
+            );
             let kinds = [
                 crate::config::schema::causal_tree::BackendKind::TypeSafe,
                 crate::config::schema::causal_tree::BackendKind::OpenRouter,
@@ -311,7 +313,7 @@ pub(super) fn setup_decision_plane() -> Result<
                 );
                 return Ok(None);
             }
-            let setup = crate::causal_cli::DecisionSetup {
+            let setup = crate::decision_engine_cli::DecisionSetup {
                 kind,
                 endpoint: None,
                 model: Some(model.trim().to_string()),

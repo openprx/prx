@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn recursive_parent_snapshot_seals_the_task_and_segment_separately() {
-        let key = DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let decision = crate::tools::capability::child::ParentAuthorityId::from(
             crate::security::decision_id::DecisionId::new_runtime(),
         );
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn parent_snapshots_bind_explicit_execution_isolation() {
-        let key = DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let decision = crate::tools::capability::child::ParentAuthorityId::from(
             crate::security::decision_id::DecisionId::new_runtime(),
         );

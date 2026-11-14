@@ -2,9 +2,9 @@
 use super::{
     Arc, CausalLineage, Connection, DecisionId, DecisionScope, DecisionStoreReader, DecisionStoreWriter,
     EncodedOutcome, Enqueue, IncompleteReason, Instant, OptionalExtension, OutcomeRecord, StoreError, WriterMessage,
-    WriterThread, bounded_code, emit_incomplete, outcome_lineage, outcome_matches_on_connection,
-    outcome_matches_on_connection_until, params, recovery_schema, recovery_scope_bounds, recovery_size_sql,
-    recovery_time_left, replay_record_on_connection, replay_record_on_connection_until, store_schema,
+    WriterThread, emit_incomplete, outcome_lineage, outcome_matches_on_connection, outcome_matches_on_connection_until,
+    params, recovery_schema, recovery_scope_bounds, recovery_size_sql, recovery_time_left, replay_record_on_connection,
+    replay_record_on_connection_until, store_schema,
 };
 
 pub(crate) struct ChildOutcomeLink {
@@ -147,64 +147,6 @@ impl WriterThread {
                 emit_incomplete(self.events.as_ref(), lineage, IncompleteReason::StoreFailed);
             }
         }
-    }
-}
-
-/// Bounded inspection metadata; this does not aggregate child work into a
-/// successful parent terminal or expose the child's input/result text.
-pub(crate) struct ChildOutcomeView {
-    pub(crate) child_decision_id: String,
-    pub(crate) settlement_id: String,
-    pub(crate) classification: String,
-    pub(crate) completeness: String,
-}
-
-impl DecisionStoreReader {
-    pub(crate) fn child_outcomes(
-        &self,
-        scope: &DecisionScope,
-        parent: &DecisionId,
-        limit: usize,
-    ) -> Result<(Vec<ChildOutcomeView>, bool), StoreError> {
-        let limit = limit.min(64);
-        self.with((Vec::new(), false), |conn| {
-            if store_schema::version(conn)? < 5 {
-                return Ok((Vec::new(), false));
-            }
-            let (clause, [first, second]) = scope.clause();
-            let sql = format!(
-                "SELECT c.decision_id, o.settlement_id, o.classification, o.completeness \
-                 FROM child_outcomes l JOIN decisions d ON d.decision_id = l.parent_decision_id \
-                 JOIN decisions c ON c.decision_id = l.child_decision_id \
-                 JOIN outcomes o ON o.decision_id = l.child_decision_id AND o.settlement_id = l.settlement_id \
-                 WHERE d.decision_id = ?1 AND {clause} AND c.workspace_id = d.workspace_id \
-                 AND c.owner_id = d.owner_id ORDER BY c.decision_id, o.settlement_id LIMIT ?4"
-            );
-            let mut statement = conn.prepare_cached(&sql)?;
-            let mut values = statement
-                .query_map(params![parent.to_string(), first, second, (limit + 1) as i64], |row| {
-                    Ok(ChildOutcomeView {
-                        child_decision_id: row.get(0)?,
-                        settlement_id: row.get(1)?,
-                        classification: row.get(2)?,
-                        completeness: row.get(3)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let truncated = values.len() > limit;
-            values.truncate(limit);
-            if values.iter().any(|value| {
-                DecisionId::parse(&value.child_decision_id).is_err()
-                    || !bounded_code(&value.settlement_id, 128)
-                    || !bounded_code(&value.classification, 32)
-                    || !matches!(value.completeness.as_str(), "complete" | "partial")
-            }) {
-                return Err(StoreError::Unsafe(
-                    "child outcome inspection metadata is malformed".to_owned(),
-                ));
-            }
-            Ok((values, truncated))
-        })
     }
 }
 

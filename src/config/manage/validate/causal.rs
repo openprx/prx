@@ -134,7 +134,7 @@ pub(crate) fn check_decision_plane(current: Option<&Config>, candidate: &Config)
 /// be read is said so.
 #[must_use]
 pub(crate) fn orphaned_credentials_warning(config: &Config) -> Option<String> {
-    match crate::config::manage::mutation::causal::orphaned_decision_credentials(config) {
+    match crate::config::manage::mutation::decision_engine::orphaned_decision_credentials(config) {
         Ok(orphans) if orphans.is_empty() => None,
         Ok(orphans) => Some(format!(
             "{} decision credential(s) nothing references are left in the credential store ({}): a process \

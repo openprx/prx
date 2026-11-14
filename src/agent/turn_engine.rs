@@ -140,6 +140,7 @@ pub(crate) async fn run_turn(
     // second copy of it in this frame — enough to overflow a tokio worker's
     // stack on the chat path. A pointer costs nothing here and keeps the guard's
     // own future tiny.
+    let started = std::time::Instant::now();
     let inner = Box::pin(run_turn_unguarded(history, request, services, delivery));
     let result = crate::agent::idle::run_guarded(
         crate::agent::idle::configured(),
@@ -148,12 +149,46 @@ pub(crate) async fn run_turn(
         inner,
     )
     .await;
-    advisory_service.advisory().observe(
-        || advisory_context.terminal_execution_trace(),
-        advisory_id,
-        result.is_ok(),
-    );
+    let usage = result.as_ref().ok().and_then(|(_, trace)| {
+        Some(crate::runtime::decision_advisory::TurnUsage {
+            provider: trace.final_provider.as_deref()?,
+            model: trace.final_model.as_deref()?,
+            tokens: &trace.tokens_used,
+        })
+    });
+    let ended = crate::runtime::decision_advisory::TurnEnd {
+        result: turn_result_class(&result),
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        usage,
+    };
+    advisory_service
+        .advisory()
+        .observe(|| advisory_context.terminal_execution_trace(), advisory_id, ended);
     result
+}
+
+/// The telemetry class of a finished turn: cancellation and a refused send
+/// are told apart from other failures (P2-R10).
+fn turn_result_class(result: &Result<(ToolLoopOutcome, ToolLoopTrace)>) -> crate::decision_engine::TurnResultClass {
+    use crate::decision_engine::TurnResultClass;
+    match result {
+        Ok(_) => TurnResultClass::Completed,
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<crate::agent::turn_contracts::ToolLoopCancelled>()) =>
+        {
+            TurnResultClass::Cancelled
+        }
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<crate::agent::send_admission::ProviderSendRefused>()) =>
+        {
+            TurnResultClass::Refused
+        }
+        Err(_) => TurnResultClass::Failed,
+    }
 }
 
 /// The history an inbound middleware plugin handed back, with every `user`
@@ -318,6 +353,8 @@ async fn run_turn_unguarded(
             fits
         });
     let mut decision_brief_sha256 = decision_brief.as_deref().map(crate::agent::prompt::prompt_sha256);
+    // The analysis is recorded once, with the brief the first send carries.
+    let mut analysis_recorded = false;
     let cache_series = super::prompt_cache_metrics::Series::for_turn(scope_ctx, &memory_runtime);
     let TurnDelivery {
         cancellation: cancellation_token,
@@ -978,6 +1015,12 @@ async fn run_turn_unguarded(
                 decision_brief = None;
                 decision_brief_sha256 = None;
             }
+        }
+        if let (Some(analysis), Some(brief)) = (advice.as_ref(), decision_brief.as_deref())
+            && !analysis_recorded
+        {
+            service.advisory().record_analysis(analysis, brief);
+            analysis_recorded = true;
         }
         crate::decision_engine::turn::append_brief(&mut prepared_messages.messages, decision_brief.as_deref());
         coalesce_system_messages_at_front(&mut prepared_messages.messages);

@@ -193,7 +193,9 @@ mod tests {
     #[test]
     fn dropped_started_observation_and_capacity_are_explicitly_incomplete() {
         let trace = ExecutionTrace::default();
-        trace.bind_exact_call_key(DecisionKey::ephemeral()).expect("key");
+        trace
+            .bind_exact_call_key(crate::security::runtime_key::test_support::ephemeral_key())
+            .expect("key");
         let context = ToolExecutionContext::new(RuntimeEnvelope::agent("prx_workspace", "prx_session"), "dm");
         let command = ToolExecutionCommand::new("prx_tool", serde_json::json!({})).with_idempotency_key("prx_call");
         let pending = trace
@@ -212,7 +214,9 @@ mod tests {
         facts.validate().expect("unknown is explicit");
 
         let trace = ExecutionTrace::default();
-        trace.bind_exact_call_key(DecisionKey::ephemeral()).expect("key");
+        trace
+            .bind_exact_call_key(crate::security::runtime_key::test_support::ephemeral_key())
+            .expect("key");
         for _ in 0..MAX_EXACT_CALLS {
             trace
                 .begin_exact_call(&command, &context, "digest")

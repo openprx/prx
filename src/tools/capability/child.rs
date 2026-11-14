@@ -438,7 +438,9 @@ mod tests {
             generation,
         };
         let parent = CapabilityConstraints {
-            parent_authority_id: DecisionId::legacy(&[9; 32]).into(),
+            parent_authority_id: DecisionId::parse("0192f0c4-0000-7000-8000-000000000009")
+                .expect("test: id")
+                .into(),
             allowed: BTreeSet::from([first.clone(), second.clone()]),
             authority: AuthorityEnvelope {
                 owner: "prx_user".to_string(),

@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{any, delete, get, patch, post, put},
 };
 
 mod causal;
@@ -16,6 +16,7 @@ mod chat_sessions;
 mod config;
 mod cost;
 mod cron_jobs;
+mod decision_engine;
 mod hooks;
 mod identity;
 pub(in crate::gateway) use identity::verify_startup_identity;
@@ -116,18 +117,19 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/config/rollback", post(manage::post_rollback))
         .route_layer(middleware::from_fn(manage::refuse_secrets_in_url));
 
-    let causal_routes = Router::new()
-        .route("/causal/status", get(causal::get_status))
-        .route("/causal/backends", get(causal::get_backends))
-        .route("/causal/test", post(causal::post_test))
-        .route("/causal/decisions", get(causal::get_decisions))
-        .route("/causal/decisions/{id}", get(causal::get_decision))
-        .route("/causal/reports", get(causal::get_report))
-        .route("/causal/reports/saved", get(causal::get_saved_reports))
-        .route("/causal/config/plans", post(causal::post_plan))
-        .route("/causal/config/apply", post(causal::post_apply))
-        .route("/causal/credential", put(causal::put_credential))
-        .route_layer(middleware::from_fn(causal::refuse_secrets_in_url));
+    let causal_routes = causal::RETIRED_ROUTES
+        .into_iter()
+        .fold(Router::new(), |router, path| router.route(path, any(causal::gone)));
+
+    let decision_engine_routes = Router::new()
+        .route("/decision-engine/status", get(decision_engine::get_status))
+        .route("/decision-engine/backends", get(decision_engine::get_backends))
+        .route("/decision-engine/analyses", get(decision_engine::get_analyses))
+        .route("/decision-engine/outcomes", get(decision_engine::get_outcomes))
+        .route("/decision-engine/config/plan", post(decision_engine::post_plan))
+        .route("/decision-engine/config/apply", post(decision_engine::post_apply))
+        .route("/decision-engine/credential", put(decision_engine::put_credential))
+        .route_layer(middleware::from_fn(decision_engine::refuse_secrets_in_url));
 
     let protected_routes = Router::new()
         .route("/status", get(status::get_status))
@@ -238,6 +240,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/skills/lifecycle/h2", post(skills_h2::post_h2))
         // The decision plane (CDP-15, SP-CDP-A 5.14).
         .merge(causal_routes)
+        .merge(decision_engine_routes)
         .merge(management_routes)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

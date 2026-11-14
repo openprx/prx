@@ -98,15 +98,17 @@ extra_latency_budget_ms = 500
     assert!(!loaded.causal_tree.policy.extra_latency_budget_ms_explicit);
     assert_eq!(loaded.causal_tree.policy.extra_latency_budget_ms, 500);
 
-    let upgraded = crate::config::manage::mutation::causal::CausalConfigService::mutate(
+    let upgraded = crate::config::manage::mutation::decision_engine::CausalConfigService::mutate(
         &loaded,
-        &[crate::config::manage::mutation::causal::CausalMutation::SetBackend {
-            kind: crate::config::schema::causal_tree::BackendKind::OpenRouter,
-            endpoint: None,
-            model: Some("typesafe/jev-1.13".to_owned()),
-            pinned_snapshot: None,
-            timeout_ms: None,
-        }],
+        &[
+            crate::config::manage::mutation::decision_engine::CausalMutation::SetBackend {
+                kind: crate::config::schema::causal_tree::BackendKind::OpenRouter,
+                endpoint: None,
+                model: Some("typesafe/jev-1.13".to_owned()),
+                pinned_snapshot: None,
+                timeout_ms: None,
+            },
+        ],
     )
     .expect("a stored old default adopts the hosted catalog budget");
     assert_eq!(upgraded.causal_tree.policy.extra_latency_budget_ms, 3_000);

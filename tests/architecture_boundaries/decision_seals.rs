@@ -179,7 +179,6 @@ pub(super) fn only_reviewed_production_sites_seal_decision_requests() {
     assert_eq!(
         found,
         BTreeMap::from([
-            ("src/causal_tree/admin.rs".to_string(), (1, 0, 0)),
             ("src/decision_engine/questions.rs".to_string(), (0, 0, 1)),
             ("src/decision_engine/prediction/factory.rs".to_string(), (1, 0, 0)),
         ]),

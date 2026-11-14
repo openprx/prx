@@ -45,8 +45,10 @@ pub enum KeyDomain {
     TerminalClaim,
     /// Authenticated pending approval metadata and original-input binding.
     ApprovalState,
-    /// Ownership and content bindings for persisted evaluation reports.
-    ReportOwnership,
+    /// Seals of persisted skill lesson-delivery and study records. The
+    /// evaluation reports that first used this label are deleted (P2-R11);
+    /// the label stays byte-identical so these seals are unchanged.
+    SkillRecordSeal,
     /// Durable ingress reception and interruption evidence.
     IngressRecovery,
 }
@@ -61,7 +63,7 @@ impl KeyDomain {
             Self::ExplorationSeed => b"prx.decision.exploration_seed.v1",
             Self::TerminalClaim => b"prx.decision.terminal_claim.v1",
             Self::ApprovalState => b"prx.decision.approval_state.v1",
-            Self::ReportOwnership => b"prx.decision.report_ownership.v1",
+            Self::SkillRecordSeal => b"prx.decision.report_ownership.v1",
             Self::IngressRecovery => b"prx.decision.ingress_recovery.v1",
         }
     }
@@ -80,13 +82,6 @@ impl fmt::Debug for DecisionKey {
 }
 
 impl DecisionKey {
-    /// A random in-memory key for test fixtures only. Production has no
-    /// ephemeral fallback: the turn state key is the runtime key (OV-2).
-    #[cfg(test)]
-    pub(crate) fn ephemeral() -> Arc<Self> {
-        Arc::new(Self::from_bytes(&rand::random::<[u8; KEY_LEN]>()))
-    }
-
     /// Load existing authority without creating a key or repairing permissions.
     /// Missing or unsafe state cannot be replaced during worker admission.
     pub(crate) fn load_existing(workspace_dir: &Path) -> Result<Arc<Self>, DecisionError> {
@@ -486,6 +481,20 @@ fn sync_dir(dir: &Path) -> Result<(), String> {
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Test tooling: fixtures that need a throwaway key. Production has no
+/// ephemeral key; the turn state key is always the runtime key (OV-2).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use super::{DecisionKey, KEY_LEN};
+
+    /// A random in-memory key that is never persisted.
+    pub(crate) fn ephemeral_key() -> Arc<DecisionKey> {
+        Arc::new(DecisionKey::from_bytes(&rand::random::<[u8; KEY_LEN]>()))
     }
 }
 

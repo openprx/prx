@@ -200,7 +200,6 @@ const CATCH_UNWIND_FILES: &[&str] = &[
     "src/agent/turn_tests/engine_surface.rs",
     "src/agent/turn_tests/entry_provider_selection.rs",
     "src/agent/turn_tests/turn_engine.rs",
-    "src/causal_cli/backend_transport_tests.rs",
     "src/channels/tests/factory_reload_fixture.rs",
     "src/channels/tests/mod.rs",
     "src/channels/tests/persistence_probe.rs",

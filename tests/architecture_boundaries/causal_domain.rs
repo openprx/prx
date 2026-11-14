@@ -499,11 +499,6 @@ pub(super) fn the_causal_domain_imports_no_backend_and_no_network() {
                     "tools::capability::catalog::CatalogView",
                 ],
                 "src/causal_tree/outcome.rs" => CAUSAL_OUTCOME_CRATE_PATHS,
-                "src/causal_tree/admin.rs" => &[
-                    "config::files::with_consistent_config_snapshot",
-                    "config::files::read_merged_toml_with_gate_once",
-                    "config::deprecations::file_holding",
-                ],
                 "src/runtime/decision_journal/store/child_outcome.rs" => &["agent::terminal::VerifiedTerminalReplay"],
                 // R21: `HardGatesProbe` (until Part 2) reads the same catalog
                 // view the generator's admission port reads.

@@ -346,9 +346,11 @@ async fn full_parent_attenuated_child_runs_native_tools_at_full() {
             generation: entry.generation,
         }
     };
-    let key = crate::security::runtime_key::DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::test_support::ephemeral_key();
     let parent = CapabilityConstraints {
-        parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
+        parent_authority_id: crate::security::decision_id::DecisionId::parse("0192f0c4-0000-7000-8000-000000000007")
+            .expect("test: id")
+            .into(),
         allowed: ["shell", "file_write", "file_read"]
             .into_iter()
             .map(reference)

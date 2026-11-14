@@ -26,6 +26,7 @@ pub enum CliCommand {
     Cron,
     Xin,
     Causal,
+    DecisionEngine,
     Models,
     Providers,
     Routes,
@@ -84,7 +85,7 @@ impl CliCommand {
 mod tests {
     use super::{CliCommand, CliTracingDefaults};
 
-    fn all_commands() -> [CliCommand; 32] {
+    fn all_commands() -> [CliCommand; 33] {
         [
             CliCommand::Init,
             CliCommand::Go,
@@ -104,6 +105,7 @@ mod tests {
             CliCommand::Cron,
             CliCommand::Xin,
             CliCommand::Causal,
+            CliCommand::DecisionEngine,
             CliCommand::Models,
             CliCommand::Providers,
             CliCommand::Routes,
@@ -142,6 +144,7 @@ mod tests {
             | CliCommand::Cron
             | CliCommand::Xin
             | CliCommand::Causal
+            | CliCommand::DecisionEngine
             | CliCommand::Models
             | CliCommand::Providers
             | CliCommand::Routes

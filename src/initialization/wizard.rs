@@ -177,10 +177,13 @@ pub async fn run_wizard(config_dir: Option<&str>, spec: Spec, force: bool) -> Re
             }
         }
         config = Config::load_from_path(&config_path, workspace_dir.clone())?;
-        let outcome = crate::causal_cli::test_configured_locally(&config)
-            .await
-            .context("Configuration committed; local decision diagnostic failed")?;
-        println!("Decision backend local test: {outcome}");
+        let status = crate::decision_engine::status::snapshot(&config);
+        println!(
+            "Decision engine: {} (mode {}, backend {})",
+            if status.enabled { "enabled" } else { "disabled" },
+            status.mode,
+            status.backend_kind
+        );
     }
     persist_workspace_selection(&config_path)
         .await

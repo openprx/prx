@@ -1,6 +1,6 @@
 //! Typed decision-plane mutations (SP-CDP-A 5.5 under D-040; CDP-12).
 //!
-//! The one mutation service of `[causal_tree]`: the CLI (`prx causal
+//! The one mutation service of `[causal_tree]`: the CLI (`prx decision-engine
 //! config`), init and onboarding (CDP-14) and the Gateway (CDP-15) all build
 //! their change here, so the plan and the refusal text are the same on every
 //! surface. [`CausalConfigService::mutate`] is pure; [`CausalConfigService::plan`]
@@ -18,9 +18,9 @@
 //!   `decision_endpoint`, because `operations` is a complete list and a
 //!   shorter one would take the others away. Declarations are never
 //!   removed: a declaration enables nothing by itself.
-//! - `ApplyCalibration` copies the thresholds a stored evaluation report
-//!   proposes, with its calibration profile; the report must have been
-//!   measured on the configured, pinned backend.
+//! - `SetEngine` sets one key of the `[decision_engine]` allowlist
+//!   ([`engine_setting`]); any other key, a secret-bearing key and the
+//!   retired `apply-calibration` are refused with [`EngineKeyError`].
 //! - `store_credential` stores a decision credential write-only under a new
 //!   reference owned by the backend's provider, plans the reference in the
 //!   same call and removes the new credential when the plan is refused
@@ -33,8 +33,6 @@
 //!   by a process that stopped in between is reported by
 //!   [`orphaned_decision_credentials`] (`prx doctor`, and at startup).
 
-use std::path::Path;
-
 use super::super::credentials::{CredentialReferenceError, CredentialReferences, CredentialStatus, SecretString};
 use super::super::history::ConfigActor;
 use super::super::transaction::{
@@ -43,7 +41,7 @@ use super::super::transaction::{
 use crate::config::Config;
 use crate::config::files::ConfigRevisionConflict;
 use crate::config::schema::causal_tree::BackendKind;
-use crate::config::schema::causal_tree::{BackendSelection, CalibrationProfile, CausalPolicy, CredentialRefSetting};
+use crate::config::schema::causal_tree::{BackendSelection, CausalPolicy, CredentialRefSetting};
 use crate::config::schema::{ModelOperationSetting, ProviderModelConfig};
 use crate::providers::catalog::{ModelOperation, Support};
 
@@ -75,9 +73,9 @@ pub enum CausalMutation {
     SetCredentialRef(CredentialRefSetting),
     /// Change explicit policy fields.
     SetPolicy(PolicyPatch),
-    /// Copy the thresholds and the calibration profile a stored evaluation
-    /// report proposes.
-    ApplyCalibration { report_id: String },
+    /// Set one allowlisted `[decision_engine]` key (`prx decision-engine
+    /// config set`, the Gateway's `/api/decision-engine/config/*`).
+    SetEngine(EngineSetting),
     /// Put every policy field back to its default.
     ResetPolicyToDefaults,
 }
@@ -94,15 +92,149 @@ pub struct PolicyPatch {
     pub extra_token_ratio_limit: Option<f32>,
 }
 
+/// One allowlisted `[decision_engine]` setting with its parsed value
+/// (P2-R8). Backend settings change the effective engine backend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineSetting {
+    Enabled(bool),
+    Mode(crate::config::schema::decision_engine::DecisionMode),
+    PromptBudgetTokens(u32),
+    Candidates(u32),
+    TimeoutMs(u32),
+    TelemetryCap(u32),
+    ObserveQueue(u32),
+    BackendKind(BackendSelection),
+    BackendEndpoint(String),
+    BackendModel(String),
+    BackendPinnedSnapshot(String),
+    BackendRemoteEnabled(bool),
+    BackendTimeoutMs(u32),
+    BackendMaxRequestBytes(u32),
+    BackendMaxResponseBytes(u32),
+    BackendFailureThreshold(u32),
+    BackendCooldownSecs(u32),
+}
+
+impl EngineSetting {
+    /// Whether the setting changes the backend.
+    #[must_use]
+    pub const fn is_backend(&self) -> bool {
+        !matches!(
+            self,
+            Self::Enabled(_)
+                | Self::Mode(_)
+                | Self::PromptBudgetTokens(_)
+                | Self::Candidates(_)
+                | Self::TimeoutMs(_)
+                | Self::TelemetryCap(_)
+                | Self::ObserveQueue(_)
+        )
+    }
+
+    fn apply(&self, config: &mut Config) {
+        let engine = &mut config.decision_engine;
+        let backend = &mut config.causal_tree.backend;
+        match self {
+            Self::Enabled(value) => engine.enabled = *value,
+            Self::Mode(value) => engine.mode = *value,
+            Self::PromptBudgetTokens(value) => engine.prompt_budget_tokens = *value,
+            Self::Candidates(value) => engine.candidates = *value,
+            Self::TimeoutMs(value) => engine.timeout_ms = *value,
+            Self::TelemetryCap(value) => engine.telemetry_cap = *value,
+            Self::ObserveQueue(value) => engine.observe_queue = *value,
+            Self::BackendKind(value) => backend.kind = *value,
+            Self::BackendEndpoint(value) => backend.endpoint.clone_from(value),
+            Self::BackendModel(value) => backend.model.clone_from(value),
+            Self::BackendPinnedSnapshot(value) => backend.pinned_snapshot.clone_from(value),
+            Self::BackendRemoteEnabled(value) => backend.remote_enabled = *value,
+            Self::BackendTimeoutMs(value) => backend.timeout_ms = *value,
+            Self::BackendMaxRequestBytes(value) => backend.max_request_bytes = *value,
+            Self::BackendMaxResponseBytes(value) => backend.max_response_bytes = *value,
+            Self::BackendFailureThreshold(value) => backend.circuit_breaker.failure_threshold = *value,
+            Self::BackendCooldownSecs(value) => backend.circuit_breaker.cooldown_secs = *value,
+        }
+    }
+}
+
+/// Why a `config set` key was refused. Credentials are set only through
+/// `PUT /api/decision-engine/credential`; the message never echoes a value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EngineKeyError {
+    /// The key is not in the allowlist, names a credential or secret, or is
+    /// the retired `apply-calibration`.
+    #[error("decision_engine key `{key}` cannot be set here{hint}")]
+    Refused { key: String, hint: &'static str },
+    /// The value does not parse for the key.
+    #[error("decision_engine key `{key}` takes {expected}")]
+    InvalidValue { key: String, expected: &'static str },
+}
+
+/// Words that mark a credential or secret-bearing key.
+const SECRET_WORDS: [&str; 7] = ["credential", "api_key", "apikey", "token", "secret", "password", "auth"];
+
+/// The allowlisted setting `key` = `value` (P2-R8). Any other key, every
+/// credential or secret-bearing key and `apply-calibration` are refused.
+///
+/// # Errors
+///
+/// [`EngineKeyError`] for a refused key or a value that does not parse.
+pub fn engine_setting(key: &str, value: &str) -> Result<EngineSetting, EngineKeyError> {
+    let normalized = key.trim().to_ascii_lowercase();
+    let refused = |hint: &'static str| EngineKeyError::Refused {
+        key: crate::providers::redact_endpoint_userinfo(key.trim())
+            .chars()
+            .take(64)
+            .collect(),
+        hint,
+    };
+    if SECRET_WORDS.iter().any(|word| normalized.contains(word)) {
+        return Err(refused("; set credentials with PUT /api/decision-engine/credential"));
+    }
+    let value = value.trim();
+    let invalid = |expected: &'static str| EngineKeyError::InvalidValue {
+        key: normalized.clone(),
+        expected,
+    };
+    let boolean = || value.parse::<bool>().map_err(|_| invalid("`true` or `false`"));
+    let number = || value.parse::<u32>().map_err(|_| invalid("an unsigned integer"));
+    Ok(match normalized.as_str() {
+        "enabled" => EngineSetting::Enabled(boolean()?),
+        "mode" => EngineSetting::Mode(match value {
+            "pre" => crate::config::schema::decision_engine::DecisionMode::Pre,
+            "post" => crate::config::schema::decision_engine::DecisionMode::Post,
+            "both" => crate::config::schema::decision_engine::DecisionMode::Both,
+            _ => return Err(invalid("`pre`, `post` or `both`")),
+        }),
+        "prompt_budget_tokens" => EngineSetting::PromptBudgetTokens(number()?),
+        "candidates" => EngineSetting::Candidates(number()?),
+        "timeout_ms" => EngineSetting::TimeoutMs(number()?),
+        "telemetry_cap" => EngineSetting::TelemetryCap(number()?),
+        "observe_queue" => EngineSetting::ObserveQueue(number()?),
+        "backend.kind" => EngineSetting::BackendKind(
+            BackendSelection::try_from(value.to_string()).map_err(|_| invalid("a backend kind"))?,
+        ),
+        "backend.endpoint" => EngineSetting::BackendEndpoint(value.to_string()),
+        "backend.model" => EngineSetting::BackendModel(value.to_string()),
+        "backend.pinned_snapshot" => EngineSetting::BackendPinnedSnapshot(value.to_string()),
+        "backend.remote_enabled" => EngineSetting::BackendRemoteEnabled(boolean()?),
+        "backend.timeout_ms" => EngineSetting::BackendTimeoutMs(number()?),
+        "backend.max_request_bytes" => EngineSetting::BackendMaxRequestBytes(number()?),
+        "backend.max_response_bytes" => EngineSetting::BackendMaxResponseBytes(number()?),
+        "backend.circuit_breaker.failure_threshold" => EngineSetting::BackendFailureThreshold(number()?),
+        "backend.circuit_breaker.cooldown_secs" => EngineSetting::BackendCooldownSecs(number()?),
+        "apply-calibration" | "apply_calibration" => {
+            return Err(refused("; calibration from evaluation reports was removed"));
+        }
+        _ => return Err(refused("; it is not in the decision_engine allowlist")),
+    })
+}
+
 /// Why a decision-plane change was refused. No message carries a secret.
 #[derive(Debug, thiserror::Error)]
 pub enum CausalMutationError {
     /// The resulting configuration is not valid.
     #[error("the decision plane change is refused: {0}")]
     Invalid(String),
-    /// The evaluation report cannot be applied.
-    #[error("the calibration cannot be applied: {0}")]
-    Calibration(String),
     /// The credential could not be stored or referenced.
     #[error(transparent)]
     Credential(#[from] CredentialReferenceError),
@@ -203,33 +335,6 @@ fn compensate(references: &CredentialReferences, id: String, cause: CausalMutati
     }
 }
 
-/// The thresholds a report proposes (the `calibration` section of an
-/// evaluation report).
-#[derive(Debug, serde::Deserialize)]
-struct Proposal {
-    profile: String,
-    /// The endpoint the report measured (D-102 H-2).
-    endpoint: String,
-    minimum_choice_confidence: f64,
-    minimum_top_margin: f64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum ProposalSection {
-    Available { value: Proposal },
-    Unavailable { reason: String },
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct StoredReport {
-    report_version: u32,
-    calibration: ProposalSection,
-}
-
-/// The largest evaluation report read.
-const MAX_REPORT_BYTES: u64 = 16 << 20;
-
 /// The decision-plane mutation service over one configuration's
 /// transaction layer.
 #[derive(Debug, Clone)]
@@ -244,8 +349,8 @@ impl CausalConfigService {
     }
 
     /// `config` with `mutations` applied in order, normalized and
-    /// validated. Nothing is read but a report an `ApplyCalibration` names
-    /// and, for `SetBackend`, the model metadata cache.
+    /// validated. Nothing is read but, for `SetBackend`, the model metadata
+    /// cache.
     ///
     /// # Errors
     ///
@@ -258,6 +363,9 @@ impl CausalConfigService {
         }
 
         next.causal_tree
+            .validate()
+            .map_err(|error| CausalMutationError::Invalid(error.to_string()))?;
+        next.decision_engine
             .validate()
             .map_err(|error| CausalMutationError::Invalid(error.to_string()))?;
         Ok(next)
@@ -366,7 +474,7 @@ impl CausalConfigService {
 /// remote processing is on (in `config`, and not turned off by the
 /// mutations themselves) also turns it off, first, in the same plan: the
 /// decision check refuses the pair otherwise. Every surface plans through
-/// it (`prx causal config`, the Gateway), so an equal change gives an equal
+/// it (`prx decision-engine config set`, the Gateway), so an equal change gives an equal
 /// plan (V8.08).
 #[must_use]
 pub fn paired(config: &Config, mutations: Vec<CausalMutation>) -> Vec<CausalMutation> {
@@ -406,7 +514,7 @@ fn apply_one(config: &mut Config, mutation: &CausalMutation) -> Result<(), Causa
             | CausalMutation::SetRemote(_)
             | CausalMutation::SetCredentialRef(_)
             | CausalMutation::SetBackend { .. }
-    );
+    ) || matches!(mutation, CausalMutation::SetEngine(setting) if setting.is_backend());
     if backend_change {
         config.causal_tree.backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
     }
@@ -514,32 +622,7 @@ fn apply_section(config: &mut Config, mutation: &CausalMutation) -> Result<(), C
             }
         }
         CausalMutation::ResetPolicyToDefaults => section.policy = CausalPolicy::default(),
-        CausalMutation::ApplyCalibration { report_id } => {
-            let proposal = read_proposal(&config.workspace_dir, report_id)?;
-            let backend = crate::config::schema::decision_engine::effective_engine_backend(config).clone();
-            let section = &mut config.causal_tree;
-            let (kind, model) =
-                CalibrationProfile::measured(&proposal.profile).map_err(CausalMutationError::Calibration)?;
-            let pinned = backend.kind == BackendSelection::Fixed(kind)
-                && backend.model.trim() == model
-                && backend.endpoint.trim() == proposal.endpoint.trim()
-                && !crate::providers::model_pin::is_unpinned_model(&model);
-            if !pinned {
-                return Err(CausalMutationError::Calibration(
-                    "the report was measured on another backend, endpoint or model than the configured, pinned one"
-                        .to_string(),
-                ));
-            }
-            section.policy.minimum_choice_confidence = proposal.minimum_choice_confidence;
-            section.policy.minimum_top_margin = proposal.minimum_top_margin;
-            // The profile names the endpoint it is applied to: another server
-            // serving the same model does not inherit it (D-094 C-7).
-            section.policy.calibration_profile = Some(CalibrationProfile {
-                kind,
-                endpoint: backend.endpoint.trim().to_string(),
-                model,
-            });
-        }
+        CausalMutation::SetEngine(setting) => setting.apply(config),
     }
     Ok(())
 }
@@ -603,43 +686,10 @@ fn declare_decision_model(config: &mut Config, provider: &str, model: &str) {
     }
 }
 
-/// The calibration proposal of the stored report `report_id`.
-fn read_proposal(workspace_dir: &Path, report_id: &str) -> Result<Proposal, CausalMutationError> {
-    use std::io::Read as _;
-    let refused = |reason: &str| CausalMutationError::Calibration(reason.to_string());
-    let id = uuid::Uuid::parse_str(report_id.trim()).map_err(|_| refused("the report id is not an id"))?;
-    let path = workspace_dir
-        .join("self")
-        .join("causal_tree")
-        .join("reports")
-        .join(format!("{}.json", id.as_hyphenated()));
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(&path).map_err(|_| refused("no such report"))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_REPORT_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|_| refused("the report cannot be read"))?;
-    let report: StoredReport = serde_json::from_slice(&bytes).map_err(|_| refused("the report does not parse"))?;
-    if report.report_version != crate::causal_tree::evaluate::REPORT_VERSION {
-        return Err(refused("the report was written by another version"));
-    }
-    match report.calibration {
-        ProposalSection::Available { value } => Ok(value),
-        ProposalSection::Unavailable { reason } => Err(CausalMutationError::Calibration(format!(
-            "the report proposes no thresholds: {reason}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use super::*;
@@ -912,117 +962,63 @@ mod tests {
         ));
     }
 
-    fn write_report(workspace: &Path, id: uuid::Uuid, calibration: &serde_json::Value) {
-        let dir = workspace.join("self/causal_tree/reports");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join(format!("{id}.json")),
-            serde_json::to_vec(&serde_json::json!({
-                "report_version": crate::causal_tree::evaluate::REPORT_VERSION,
-                "calibration": calibration,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// D-092: a calibration applies only from a stored report that proposes
-    /// thresholds for the configured, pinned backend.
+    /// P2-R8: the allowlist parses every listed key; any other key, every
+    /// secret-bearing key and `apply-calibration` are refused.
     #[test]
-    fn apply_calibration_needs_a_report_and_a_pin() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let mut config = Config {
-            workspace_dir: temp.path().to_path_buf(),
-            ..Config::default()
-        };
-        config = CausalConfigService::mutate(&config, &[loopback_backend("decider-2026-09")]).unwrap();
-        let id = uuid::Uuid::now_v7();
-        let apply = |config: &Config, id: &str| {
-            CausalConfigService::mutate(
-                config,
-                &[CausalMutation::ApplyCalibration {
-                    report_id: id.to_string(),
-                }],
-            )
-        };
-        assert!(
-            matches!(
-                apply(&config, &id.to_string()),
-                Err(CausalMutationError::Calibration(_))
-            ),
-            "no report"
-        );
-        write_report(
-            temp.path(),
-            id,
-            &serde_json::json!({
-                "status": "available",
-                "value": {
-                    "profile": "compatible_http:decider-2026-09",
-                    "endpoint": LOOPBACK,
-                    "decisions": 120,
-                    "minimum_choice_confidence": 0.7,
-                    "minimum_top_margin": 0.15,
-                }
-            }),
-        );
-        let applied = apply(&config, &id.to_string()).unwrap();
-        let policy = &applied.causal_tree.policy;
-        assert!((policy.minimum_choice_confidence - 0.7).abs() < f64::EPSILON);
-        assert!((policy.minimum_top_margin - 0.15).abs() < f64::EPSILON);
-        assert_eq!(
-            policy
-                .calibration_profile
-                .as_ref()
-                .map(|profile| (profile.model.as_str(), profile.endpoint.as_str())),
-            Some(("decider-2026-09", LOOPBACK))
-        );
-        // D-094 C-7: another server serving the same model is not
-        // calibrated by it.
-        let mut moved = applied.clone();
-        moved.causal_tree.backend.endpoint = "http://127.0.0.2:8900/v1".to_string();
-        assert!(moved.causal_tree.validate().is_err());
-
-        // D-102 H-2: a report measured on another endpoint serving the same
-        // model is not applied after a re-point.
-        let repointed = CausalConfigService::mutate(
-            &config,
-            &[CausalMutation::SetBackend {
-                kind: BackendKind::CompatibleHttp,
-                endpoint: Some("http://127.0.0.2:8900/v1".to_string()),
-                model: Some("decider-2026-09".to_string()),
-                pinned_snapshot: None,
-                timeout_ms: None,
-            }],
+    fn engine_setting_accepts_only_the_allowlist() {
+        for (key, value) in [
+            ("enabled", "true"),
+            ("mode", "both"),
+            ("prompt_budget_tokens", "300"),
+            ("candidates", "5"),
+            ("timeout_ms", "1500"),
+            ("telemetry_cap", "0"),
+            ("observe_queue", "64"),
+            ("backend.kind", "builtin"),
+            ("backend.endpoint", LOOPBACK),
+            ("backend.model", "decider-1"),
+            ("backend.pinned_snapshot", "snap"),
+            ("backend.remote_enabled", "false"),
+            ("backend.timeout_ms", "500"),
+            ("backend.max_request_bytes", "65536"),
+            ("backend.max_response_bytes", "65536"),
+            ("backend.circuit_breaker.failure_threshold", "3"),
+            ("backend.circuit_breaker.cooldown_secs", "30"),
+        ] {
+            assert!(engine_setting(key, value).is_ok(), "{key}");
+        }
+        for key in [
+            "backend.credential_ref",
+            "backend.api_key",
+            "token",
+            "apply-calibration",
+            "policy.max_candidates",
+        ] {
+            assert!(
+                matches!(engine_setting(key, "x"), Err(EngineKeyError::Refused { .. })),
+                "{key}"
+            );
+        }
+        assert!(matches!(
+            engine_setting("enabled", "maybe"),
+            Err(EngineKeyError::InvalidValue { .. })
+        ));
+        let next = CausalConfigService::mutate(
+            &Config::default(),
+            &[CausalMutation::SetEngine(
+                engine_setting("telemetry_cap", "10").unwrap(),
+            )],
         )
         .unwrap();
+        assert_eq!(next.decision_engine.telemetry_cap, 10);
         assert!(
-            matches!(
-                apply(&repointed, &id.to_string()),
-                Err(CausalMutationError::Calibration(_))
-            ),
-            "measured on another endpoint"
+            CausalConfigService::mutate(
+                &Config::default(),
+                &[CausalMutation::SetEngine(engine_setting("candidates", "0").unwrap())],
+            )
+            .is_err(),
+            "the engine section is validated"
         );
-
-        let other = CausalConfigService::mutate(&config, &[loopback_backend("decider-2027-01")]).unwrap();
-        assert!(
-            matches!(apply(&other, &id.to_string()), Err(CausalMutationError::Calibration(_))),
-            "measured on another model"
-        );
-        let unavailable = uuid::Uuid::now_v7();
-        write_report(
-            temp.path(),
-            unavailable,
-            &serde_json::json!({"status": "unavailable", "reason": "the window ran on more than one backend or model"}),
-        );
-        assert!(matches!(
-            apply(&config, &unavailable.to_string()),
-            Err(CausalMutationError::Calibration(_))
-        ));
-        assert!(matches!(
-            apply(&config, "../../etc/passwd"),
-            Err(CausalMutationError::Calibration(_))
-        ));
     }
 
     /// A service over a configuration written to `dir`.

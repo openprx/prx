@@ -177,27 +177,6 @@ pub struct FactoryDeps<'a> {
     pub events: Arc<dyn CausalEventSink>,
 }
 
-impl FactoryDeps<'_> {
-    /// Load the workspace decision key of `config` for the legacy decision
-    /// plane (store, recovery, node ids), or `None` when it is unavailable
-    /// (the cause is logged by the key module). While the plane is disabled
-    /// the key is neither read nor created (D-079 L-14). The advisory engine
-    /// never selects or enables a backend through this switch (R55): its
-    /// factory is built from the effective engine backend with the turn's
-    /// state key.
-    #[must_use]
-    pub fn load_key(config: &Config) -> Option<Arc<DecisionKey>> {
-        if !config.causal_tree.enabled {
-            return None;
-        }
-        DecisionKey::load_or_create(&config.workspace_dir)
-            .inspect_err(|error| {
-                tracing::warn!(error = %error, "decision key unavailable; only the builtin decision backend runs");
-            })
-            .ok()
-    }
-}
-
 /// Why a factory could not be built. The generation that asked for it is
 /// rejected; the running one stays.
 #[derive(Debug, thiserror::Error)]
@@ -2086,14 +2065,7 @@ mod tests {
     #[tokio::test]
     async fn an_unavailable_key_falls_back_to_the_builtin() {
         let temp = tempfile::TempDir::new().expect("test: temp dir");
-        let key_dir = temp.path().join("self").join("causal_tree");
-        std::fs::create_dir_all(&key_dir).expect("test: key dir");
-        std::fs::write(key_dir.join(".decision_key"), b"short").expect("test: a malformed key");
         let loopback = config(&temp, compatible(LOOPBACK, false));
-        assert!(
-            FactoryDeps::load_key(&loopback).is_none(),
-            "a malformed key is refused, not replaced"
-        );
         let transports = CountingTransports::refusing();
         let factory = build(
             &loopback,
@@ -2221,26 +2193,6 @@ mod tests {
             build(&enabled, &declared, Some(key(&temp)), &transports),
             Err(FactoryBuildError::Selection(ResolutionError::CredentialMissing { .. }))
         ));
-    }
-
-    /// D-079 L-14: while the plane is disabled the decision key is neither
-    /// read nor created.
-    #[test]
-    fn a_disabled_plane_creates_no_key() {
-        let temp = tempfile::TempDir::new().expect("test: temp dir");
-        let mut disabled = config(&temp, compatible(LOOPBACK, false));
-        disabled.causal_tree.enabled = false;
-        assert!(FactoryDeps::load_key(&disabled).is_none());
-        assert!(!temp.path().join("self").exists(), "no key file was written");
-        let enabled = config(&temp, compatible(LOOPBACK, false));
-        assert!(FactoryDeps::load_key(&enabled).is_some());
-        assert!(
-            temp.path()
-                .join("self")
-                .join("causal_tree")
-                .join(".decision_key")
-                .exists()
-        );
     }
 
     /// V2.07 (and D-079 L-13): breakers are per backend. The first

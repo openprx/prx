@@ -101,7 +101,14 @@ fn expected_score() -> IntentValue {
     }
 }
 fn outcome(id: &str) -> TurnOutcome {
-    TurnOutcome::new(Some(id.into()), vec!["file_read".into()], true).unwrap()
+    TurnOutcome::new(
+        Some(id.into()),
+        vec!["file_read".into()],
+        TurnResultClass::Completed,
+        None,
+        1,
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -113,7 +120,7 @@ async fn observe_queue_full_drops_and_counts_without_blocking() {
         written: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
     impl TelemetryWriter for GatedWriter {
-        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+        fn append_fifo(&mut self, _: TelemetryRecord, _: usize) -> anyhow::Result<()> {
             if let Some(started) = self.started.take() {
                 let _ = started.send(());
                 self.release.recv()?;
@@ -155,11 +162,11 @@ async fn observe_queue_full_drops_and_counts_without_blocking() {
     .unwrap();
     assert!(worker.is_none());
     assert_eq!(disabled.observe(outcome("c")), ObserveAdmission::Disabled);
-    assert!(TurnOutcome::new(None, vec!["x".into(); 65], false).is_err());
-    assert!(TurnOutcome::new(None, vec!["x".repeat(129)], false).is_err());
+    assert!(TurnOutcome::new(None, vec!["x".into(); 65], TurnResultClass::Failed, None, 0).is_err());
+    assert!(TurnOutcome::new(None, vec!["x".repeat(129)], TurnResultClass::Failed, None, 0).is_err());
     struct FailingWriter;
     impl TelemetryWriter for FailingWriter {
-        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+        fn append_fifo(&mut self, _: TelemetryRecord, _: usize) -> anyhow::Result<()> {
             anyhow::bail!("test store failure")
         }
     }
@@ -184,26 +191,165 @@ async fn observe_evicts_fifo_at_telemetry_cap() {
     drop(queue);
     worker.unwrap().await.unwrap();
     let mut store = SqliteTelemetryWriter::open(&path).unwrap();
-    assert_eq!(store.outcomes().unwrap(), vec![outcome("b"), outcome("c")]);
-    store.append_fifo(outcome("d"), 2).unwrap();
-    assert_eq!(store.outcomes().unwrap(), vec![outcome("c"), outcome("d")]);
+    assert_eq!(store.outcomes(10).unwrap(), vec![outcome("c"), outcome("b")]);
+    store.append_fifo(TelemetryRecord::Outcome(outcome("d")), 2).unwrap();
+    assert_eq!(store.outcomes(10).unwrap(), vec![outcome("d"), outcome("c")]);
 }
 
-#[test]
-fn engine_outcomes_gains_a_scope_column_once() {
+fn analysis(id: &str) -> IntentAnalysis {
+    IntentAnalysis {
+        decision_id: id.into(),
+        global: BTreeMap::from([("risk".into(), IntentValue::Probability(0.25))]),
+        candidates: BTreeMap::from([
+            (
+                "a".into(),
+                BTreeMap::from([("success".into(), IntentValue::Probability(0.5))]),
+            ),
+            ("b".into(), BTreeMap::new()),
+        ]),
+    }
+}
+
+/// P2-R10: the fresh store holds exactly `engine_analyses` and
+/// `engine_outcomes`, each FIFO-capped; a zero cap opens no file; an old
+/// `user_version` is recreated; CHECK refuses oversize values; no user text.
+#[tokio::test]
+async fn telemetry_store_holds_only_analyses_and_outcomes() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("engine.db");
-    drop(SqliteTelemetryWriter::open(&path).unwrap());
-    drop(SqliteTelemetryWriter::open(&path).unwrap());
+    let path = dir.path().join(observe::TELEMETRY_FILE);
+    // Caps and FIFO, per table.
+    let mut store = SqliteTelemetryWriter::open(&path).unwrap();
+    for id in ["a1", "a2", "a3"] {
+        let record = AnalysisRecord::new(&analysis(id), format!("brief {id}"), 7, 5).unwrap();
+        store.append_fifo(TelemetryRecord::Analysis(record), 2).unwrap();
+    }
+    store.append_fifo(TelemetryRecord::Outcome(outcome("o1")), 2).unwrap();
+    let analyses = store.analyses(10).unwrap();
+    assert_eq!(
+        analyses.iter().map(AnalysisRecord::decision_id).collect::<Vec<_>>(),
+        vec!["a3", "a2"]
+    );
+    assert_eq!(analyses[0].brief_sha256().len(), 64);
+    assert_eq!(store.outcomes(10).unwrap(), vec![outcome("o1")]);
     let connection = rusqlite::Connection::open(&path).unwrap();
-    let columns: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM pragma_table_info('engine_outcomes') WHERE name = 'ma_scope_id'",
-            [],
-            |row| row.get(0),
-        )
+    let tables: Vec<String> = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(columns, 1);
+    assert_eq!(tables, vec!["engine_analyses", "engine_outcomes"]);
+    // Oversize values are refused by CHECK.
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO engine_analyses (decision_id, created_at_ms, brief_redacted, brief_sha256, values_json) \
+                 VALUES ('x', 0, ?1, ?2, '{}')",
+                rusqlite::params!["b".repeat(16_385), "0".repeat(64)],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO engine_outcomes (decision_id, tools, result, duration_ms) VALUES (?1, '[]', 'completed', 0)",
+                [ "d".repeat(129) ],
+            )
+            .is_err()
+    );
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO engine_outcomes (tools, result, duration_ms) VALUES ('[]', 'succeeded', 0)",
+                [],
+            )
+            .is_err()
+    );
+    drop(connection);
+    drop(store);
+    // An old `user_version` is dropped and recreated.
+    let legacy_dir = tempfile::tempdir().unwrap();
+    let legacy = legacy_dir.path().join(observe::TELEMETRY_FILE);
+    {
+        let connection = rusqlite::Connection::open(&legacy).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE engine_outcomes (sequence INTEGER PRIMARY KEY, decision_id TEXT, tools TEXT NOT NULL, succeeded INTEGER NOT NULL);
+                 INSERT INTO engine_outcomes (decision_id, tools, succeeded) VALUES ('old', '[]', 1);",
+            )
+            .unwrap();
+    }
+    let reopened = SqliteTelemetryWriter::open(&legacy).unwrap();
+    assert!(reopened.outcomes(10).unwrap().is_empty());
+    let version: i64 = rusqlite::Connection::open(&legacy)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    // A zero cap never opens a file.
+    let empty = tempfile::tempdir().unwrap();
+    let never = empty.path().join(observe::TELEMETRY_FILE);
+    let (queue, worker) = ObserveQueue::start(1, 0, CancellationToken::new(), || {
+        Ok(Box::new(SqliteTelemetryWriter::open(&never)?))
+    })
+    .unwrap();
+    assert!(worker.is_none());
+    assert_eq!(queue.observe(outcome("x")), ObserveAdmission::Disabled);
+    assert!(!never.exists());
+    // No user text: the analysis keeps only the brief and typed values.
+    let record = AnalysisRecord::new(&analysis("u"), "redacted brief".into(), 1, 1).unwrap();
+    let values: serde_json::Value = serde_json::from_str(record.values_json()).unwrap();
+    assert_eq!(
+        values["candidates"].as_array().map(Vec::len),
+        Some(1),
+        "capped to `candidates`"
+    );
+    assert_eq!(values["global"]["risk"]["probability"], 0.25);
+    assert!(!record.values_json().contains("user"));
+}
+
+/// P2-R10: `result` replaces `succeeded`; cost and duration are bounded and
+/// stored as given.
+#[test]
+fn turn_outcome_records_cost_duration_and_result_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SqliteTelemetryWriter::open(&dir.path().join(observe::TELEMETRY_FILE)).unwrap();
+    let cells = [
+        (TurnResultClass::Completed, Some(1_250), 40),
+        (TurnResultClass::Failed, None, 0),
+        (TurnResultClass::Cancelled, None, 9),
+        (TurnResultClass::Refused, Some(0), 3),
+    ];
+    for (result, cost, duration) in cells {
+        let outcome = TurnOutcome::new(Some("d".into()), vec!["shell".into()], result, cost, duration).unwrap();
+        store.append_fifo(TelemetryRecord::Outcome(outcome), 10).unwrap();
+    }
+    let stored = store.outcomes(10).unwrap();
+    let mut seen: Vec<_> = stored
+        .iter()
+        .map(|outcome| (outcome.result(), outcome.cost_micro_usd(), outcome.duration_ms()))
+        .collect();
+    seen.reverse();
+    assert_eq!(seen, cells.to_vec());
+    for result in ["completed", "failed", "cancelled", "refused"] {
+        assert_eq!(
+            TurnResultClass::parse(result).map(TurnResultClass::as_str),
+            Some(result)
+        );
+    }
+    assert!(TurnOutcome::new(None, Vec::new(), TurnResultClass::Completed, Some(u64::MAX), 0).is_err());
+    assert!(TurnOutcome::new(None, Vec::new(), TurnResultClass::Completed, None, u64::MAX).is_err());
+    assert!(TurnOutcome::new(Some(String::new()), Vec::new(), TurnResultClass::Completed, None, 0).is_err());
+    let columns: Vec<String> = rusqlite::Connection::open(dir.path().join(observe::TELEMETRY_FILE))
+        .unwrap()
+        .prepare("SELECT name FROM pragma_table_info('engine_outcomes')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!columns.iter().any(|column| column == "succeeded"));
 }
 
 #[test]
@@ -216,7 +362,7 @@ fn observe_without_runtime_returns_typed_error_before_opening_store() {
 fn dedicated_observation_worker_does_not_hold_runtime_shutdown() {
     struct Writer;
     impl TelemetryWriter for Writer {
-        fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+        fn append_fifo(&mut self, _: TelemetryRecord, _: usize) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -496,7 +642,7 @@ async fn recorded(probe: &TurnProbe) -> Vec<TurnOutcome> {
     loop {
         if probe.store.exists() {
             let store = SqliteTelemetryWriter::open(&probe.store).unwrap();
-            let records = store.outcomes().unwrap();
+            let records = store.outcomes(100).unwrap();
             if !records.is_empty() {
                 return records;
             }
@@ -616,7 +762,7 @@ async fn post_mode_records_outcome_without_brief() {
     let outcome = records
         .get(0)
         .expect("post_mode_records_outcome_without_brief: recorded outcome missing");
-    assert!(outcome.succeeded());
+    assert_eq!(outcome.result(), TurnResultClass::Completed);
     assert!(outcome.decision_id().is_none());
     assert_eq!(probe.dispatches, 1);
 }

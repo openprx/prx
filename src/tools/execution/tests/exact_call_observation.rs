@@ -62,7 +62,7 @@ fn only_call(
 async fn failed_cached_call_is_not_another_physical_failure_and_fresh_ids_still_execute() {
     let temp = tempfile::tempdir().expect("temporary SQLite workspace");
     let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("SQLite"));
-    let key = crate::security::runtime_key::DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::test_support::ephemeral_key();
     let fixture = fixture();
     let service = ToolExecutionService::new(
         vec![Arc::new(FailingTool(Arc::clone(&fixture.calls)))],
@@ -175,7 +175,7 @@ async fn actual_unsent_abandonment_continues_but_dropped_reservation_stays_unkno
     for cancel_before_drop in [true, false] {
         let temp = tempfile::tempdir().expect("temporary SQLite workspace");
         let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("SQLite"));
-        let key = crate::security::runtime_key::DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let fixture = fixture();
         let gate = Arc::new(TestPostReservationGate {
             armed: AtomicBool::new(true),
@@ -283,7 +283,7 @@ async fn discovered_mcp_trace_preserves_the_published_server_namespace() {
     };
     let catalog =
         CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).expect("test: discovered MCP catalog");
-    let key = crate::security::runtime_key::DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::test_support::ephemeral_key();
     let (mut context, trace) = traced_context(workspace.path(), &key, "prx_mcp_run");
     let security = crate::security::SecurityPolicy {
         workspace_dir: workspace.path().to_owned(),

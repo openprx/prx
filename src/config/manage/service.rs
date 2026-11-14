@@ -378,7 +378,7 @@ impl ManagementService {
 
     /// Plan decision-plane `mutations` (CDP-14, `prx causal config`) over
     /// the desired configuration: the candidate comes from the one mutation
-    /// service (`mutation::causal`), and the plan, its text, the decision
+    /// service (`mutation::decision_engine`), and the plan, its text, the decision
     /// backend check and the apply are this service's, the same as for every
     /// other management change. Nothing is written.
     ///
@@ -388,12 +388,12 @@ impl ManagementService {
     /// or the transaction's refusal.
     pub async fn plan_causal(
         &self,
-        mutations: &[super::mutation::causal::CausalMutation],
+        mutations: &[super::mutation::decision_engine::CausalMutation],
         actor: ConfigActor,
     ) -> Result<ManagedPlan, ManageError> {
         let desired = self.shared.desired();
-        let candidate =
-            super::mutation::causal::CausalConfigService::mutate(&desired.config, mutations).map_err(causal_error)?;
+        let candidate = super::mutation::decision_engine::CausalConfigService::mutate(&desired.config, mutations)
+            .map_err(causal_error)?;
         let revision = ConfigTransactions::base_revision(&desired);
         self.plan_candidate(candidate, revision, actor).await
     }
@@ -413,8 +413,8 @@ impl ManagementService {
         secret: super::credentials::SecretString,
         actor: ConfigActor,
         confirmed_revision: Option<&str>,
-    ) -> Result<super::mutation::causal::StoredCredential, ManageError> {
-        super::mutation::causal::CausalConfigService::new(self.transactions.clone())
+    ) -> Result<super::mutation::decision_engine::StoredCredential, ManageError> {
+        super::mutation::decision_engine::CausalConfigService::new(self.transactions.clone())
             .store_credential(
                 secret,
                 actor,
@@ -691,10 +691,10 @@ impl ManagementService {
 /// A decision-plane mutation's refusal as a management error: the
 /// transaction's own refusal keeps its type (confirmation, conflict), the rest
 /// is invalid input. No message carries a secret.
-fn causal_error(error: super::mutation::causal::CausalMutationError) -> ManageError {
+fn causal_error(error: super::mutation::decision_engine::CausalMutationError) -> ManageError {
     match error {
-        super::mutation::causal::CausalMutationError::Transaction(error) => ManageError::Transaction(error),
-        super::mutation::causal::CausalMutationError::Credential(error) => ManageError::Credential(error),
+        super::mutation::decision_engine::CausalMutationError::Transaction(error) => ManageError::Transaction(error),
+        super::mutation::decision_engine::CausalMutationError::Credential(error) => ManageError::Credential(error),
         other => ManageError::Invalid(other.to_string()),
     }
 }

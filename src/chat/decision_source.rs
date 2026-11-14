@@ -108,7 +108,11 @@ mod tests {
             service.advisory().observe(
                 || context.terminal_execution_trace(),
                 binding.decision_advice().map(|a| a.decision_id),
-                true,
+                crate::runtime::decision_advisory::TurnEnd {
+                    result: crate::decision_engine::TurnResultClass::Completed,
+                    duration_ms: 1,
+                    usage: None,
+                },
             );
             // P1-04: the store is opened in the background, never on the
             // turn's path; shutdown drain waits for that opening.
@@ -123,7 +127,11 @@ mod tests {
                     &dir.path().join("decision-engine.sqlite"),
                 )
                 .unwrap();
-                assert_eq!(store.outcomes().unwrap().len(), 1, "shutdown flushes accepted outcome");
+                assert_eq!(
+                    store.outcomes(10).unwrap().len(),
+                    1,
+                    "shutdown flushes accepted outcome"
+                );
             }
         }
     }

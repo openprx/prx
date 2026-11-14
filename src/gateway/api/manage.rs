@@ -127,11 +127,6 @@ pub(super) struct WriteQuery {
 }
 
 impl WriteQuery {
-    /// Whether the request confirms a high-risk operation.
-    pub(super) const fn confirms(&self) -> bool {
-        self.confirm_high_risk
-    }
-
     /// The write query of an endpoint whose own query also carries the
     /// confirmation.
     pub(super) const fn confirming(confirm_high_risk: bool) -> Self {

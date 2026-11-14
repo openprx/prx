@@ -130,9 +130,9 @@ pub(crate) fn persist_lesson_delivery(
     let key_parts: &[&[u8]] = &[b"lesson-delivery-owner-key-v1", store.owner_scope().as_str().as_bytes()];
     ensure!(
         store_key.verify_hmac(
-            KeyDomain::ReportOwnership,
+            KeyDomain::SkillRecordSeal,
             key_parts,
-            &key.hmac(KeyDomain::ReportOwnership, key_parts)
+            &key.hmac(KeyDomain::SkillRecordSeal, key_parts)
         ),
         "lesson physical accounting key belongs to another workspace"
     );
@@ -201,7 +201,7 @@ fn valid_digest(digest: &str) -> bool {
 
 fn delivery_id(key: &DecisionKey, owner: &OwnerScope, turn: &str, attempt: &str) -> String {
     hex::encode(key.hmac(
-        KeyDomain::ReportOwnership,
+        KeyDomain::SkillRecordSeal,
         &[
             b"lesson-delivery-id-v1",
             owner.as_str().as_bytes(),
@@ -228,7 +228,7 @@ fn write_confirmed(
     key: &DecisionKey,
 ) -> Result<()> {
     let payload = serde_json::to_vec(&record.payload)?;
-    record.seal = hex::encode(key.hmac(KeyDomain::ReportOwnership, &[b"lesson-delivery-seal-v1", &payload]));
+    record.seal = hex::encode(key.hmac(KeyDomain::SkillRecordSeal, &[b"lesson-delivery-seal-v1", &payload]));
     let bytes = record_bytes(record, path)?;
     ensure!(
         u64::try_from(bytes.len())? <= MAX_RECORD_BYTES,
@@ -351,7 +351,7 @@ impl SkillLifecycleStore {
             let sealed = serde_json::to_vec(payload)?;
             let tag = hex::decode(&record.seal)?;
             ensure!(
-                key.verify_hmac(KeyDomain::ReportOwnership, &[b"lesson-delivery-seal-v1", &sealed], &tag),
+                key.verify_hmac(KeyDomain::SkillRecordSeal, &[b"lesson-delivery-seal-v1", &sealed], &tag),
                 "lesson delivery seal is invalid"
             );
             for reference in payload.refs.iter().cloned() {

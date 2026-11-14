@@ -195,7 +195,7 @@ impl GatewayTool {
         if patched.causal_tree != desired.config.causal_tree {
             return Ok(refused(
                 "config.patch does not change `[causal_tree]`, the decision plane: its backend, remote processing, \
-                 policy and thresholds are set by the operator with `prx causal config`. Nothing was written."
+                 policy and thresholds are set by the operator with `prx decision-engine config set`. Nothing was written."
                     .to_string(),
             ));
         }
@@ -868,7 +868,7 @@ mod tests {
             assert!(!result.success, "{patch} was written");
             let error = result.error.unwrap_or_default();
             assert!(
-                error.contains("[causal_tree]") && error.contains("prx causal config"),
+                error.contains("[causal_tree]") && error.contains("prx decision-engine config set"),
                 "{error}"
             );
             assert_eq!(

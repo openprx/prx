@@ -271,7 +271,9 @@ fn full_turn_discovery_ignores_an_attenuated_child_manifest() {
     ] {
         let trusted = trusted_for(&catalog, mode, &[]);
         let parent = CapabilityConstraints {
-            parent_authority_id: DecisionId::legacy(&[7; 32]).into(),
+            parent_authority_id: DecisionId::parse("0192f0c4-0000-7000-8000-000000000007")
+                .expect("test: id")
+                .into(),
             allowed: ["memory_recall", "file_write", "shell"]
                 .into_iter()
                 .map(|name| entry_ref(entry(name)))

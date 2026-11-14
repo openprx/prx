@@ -734,9 +734,13 @@ pub(in crate::tools::execution::tests) mod child_fixture {
                     generation: entry.generation,
                 }
             };
-            let key = DecisionKey::ephemeral();
+            let key = crate::security::runtime_key::test_support::ephemeral_key();
             let parent = CapabilityConstraints {
-                parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
+                parent_authority_id: crate::security::decision_id::DecisionId::parse(
+                    "0192f0c4-0000-7000-8000-000000000007",
+                )
+                .expect("test: id")
+                .into(),
                 allowed: [
                     "config_reload",
                     "file_write",
@@ -861,7 +865,7 @@ async fn child_provenance_without_scope_is_stale() {
     let mut foreign_key = case.context(true, true);
     foreign_key.child_pin = Some(Arc::new(crate::tools::capability::child::ChildDispatchPin {
         catalog: Arc::clone(&case.catalog),
-        key: crate::security::runtime_key::DecisionKey::ephemeral(),
+        key: crate::security::runtime_key::test_support::ephemeral_key(),
         owner: "owner-a".into(),
         workspace: "workspace-a".into(),
     }));

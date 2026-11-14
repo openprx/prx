@@ -28,7 +28,9 @@ use crate::decision_engine::prediction::{CandidateQuestion, GlobalQuestion, Ques
 use crate::decision_engine::prediction_port::PredictionPort;
 use crate::decision_engine::questions::{CompilerPolicy, QuestionCompiler};
 use crate::decision_engine::state::{CausalState, DerivedState, HopLineage};
-use crate::decision_engine::{DecisionEngine, IntentAnalysis, IntentInput, TurnOutcome};
+use crate::decision_engine::{
+    AnalysisRecord, IntentAnalysis, IntentInput, TelemetryRecord, TurnOutcome, TurnResultClass,
+};
 use crate::observability::causal_event::CausalLineage;
 use crate::providers::catalog::ResolvedModel;
 use crate::runtime::decision_accounting::AccountingScope;
@@ -231,7 +233,7 @@ enum PendingTelemetry {
     /// like the [`ObserveQueue`] they move to; an outcome that does not fit
     /// is dropped and counted in `dropped`.
     Opening {
-        outcomes: tokio::sync::mpsc::Sender<TurnOutcome>,
+        outcomes: tokio::sync::mpsc::Sender<TelemetryRecord>,
         dropped: u64,
     },
     /// The opener moved the queue and its drops into the open store's
@@ -299,9 +301,13 @@ impl DecisionAdvisory {
     /// disabled queue.
     async fn start_runtime(config: &Config) -> AdvisoryRuntime {
         let engine_config = &config.decision_engine;
-        let cap = crate::decision_engine::status::effective_telemetry_cap(engine_config);
+        // Analyses (pre/both) and outcomes (post/both) share one cap, each
+        // table FIFO-evicted to it; 0 opens no file (P2-R10).
+        let cap = engine_config.telemetry_cap;
         let queue_size = engine_config.observe_queue as usize;
-        let path = config.workspace_dir.join("decision-engine.sqlite");
+        let path = config
+            .workspace_dir
+            .join(crate::decision_engine::observe::TELEMETRY_FILE);
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let opened = tokio::task::spawn_blocking(move || {
@@ -565,22 +571,60 @@ impl DecisionAdvisory {
         &self,
         trace: impl FnOnce() -> ExecutionTraceSnapshot,
         decision_id: Option<String>,
-        succeeded: bool,
+        ended: TurnEnd<'_>,
     ) {
         let config = self.config();
         if !config.enabled || config.mode == DecisionMode::Pre {
             return;
         }
         let tools = trace().calls.into_iter().map(|call| call.capability_id).collect();
-        let outcome = match TurnOutcome::new(decision_id, tools, succeeded) {
+        let cost_micro_usd = ended.usage.and_then(|usage| self.settled_cost_micro_usd(&usage));
+        let outcome = match TurnOutcome::new(decision_id, tools, ended.result, cost_micro_usd, ended.duration_ms) {
             Ok(outcome) => outcome,
             Err(_) => {
                 tracing::warn!("decision engine outcome exceeds observation bounds");
                 return;
             }
         };
+        self.admit(TelemetryRecord::Outcome(outcome));
+    }
+
+    /// Record the analysis whose redacted `brief` was sent to the serving
+    /// model (P2-R10). Only `pre`/`both` produce a brief.
+    pub(crate) fn record_analysis(&self, analysis: &IntentAnalysis, brief: &str) {
+        let config = self.config();
+        if !config.enabled || config.mode == DecisionMode::Post || config.telemetry_cap == 0 {
+            return;
+        }
+        let redacted = crate::agent::terminal::redact_persisted_text(brief);
+        let created_at_ms = chrono::Utc::now().timestamp_millis();
+        let candidates = usize::try_from(config.candidates).unwrap_or(usize::MAX);
+        match AnalysisRecord::new(analysis, redacted, created_at_ms, candidates) {
+            Ok(record) => self.admit(TelemetryRecord::Analysis(record)),
+            Err(_) => tracing::warn!("decision engine analysis exceeds observation bounds"),
+        }
+    }
+
+    /// The turn's settled cost: the same priced usage record the terminal
+    /// settles as `turn:<id>:usage`. `None` for unknown or subscription
+    /// pricing.
+    fn settled_cost_micro_usd(&self, usage: &TurnUsage<'_>) -> Option<u64> {
+        let provider = crate::providers::redact_endpoint_userinfo(usage.provider);
+        let record = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+            &provider,
+            usage.model,
+            usage.tokens,
+            &self.config.cost,
+        )?;
+        let cost = record.cost_usd?;
+        let micro = crate::cost::tracker::ceil_micro_usd(cost).ok()?;
+        u64::try_from(micro).ok()
+    }
+
+    fn admit(&self, outcome: TelemetryRecord) {
+        let config = self.config();
         if let Some(runtime) = self.telemetry.get() {
-            runtime.engine.observe(outcome);
+            runtime.engine.observations.record(outcome);
             return;
         }
         let mut pending = self.pending.lock();
@@ -589,7 +633,7 @@ impl DecisionAdvisory {
         // takeover or observed directly after it.
         if let Some(runtime) = self.telemetry.get() {
             drop(pending);
-            runtime.engine.observe(outcome);
+            runtime.engine.observations.record(outcome);
             return;
         }
         if matches!(*pending, PendingTelemetry::Idle) {
@@ -634,15 +678,15 @@ impl DecisionAdvisory {
         cell: Arc<tokio::sync::OnceCell<AdvisoryRuntime>>,
         config: Arc<Config>,
         pending: Arc<parking_lot::Mutex<PendingTelemetry>>,
-        mut receiver: tokio::sync::mpsc::Receiver<TurnOutcome>,
+        mut receiver: tokio::sync::mpsc::Receiver<TelemetryRecord>,
     ) {
         let runtime = Self::open_telemetry(&cell, &config).await;
         let mut admission = pending.lock();
         // Every queued send completes under this lock, and later observations
         // see the open store, so this drains the whole queue.
         receiver.close();
-        while let Ok(outcome) = receiver.try_recv() {
-            runtime.engine.observe(outcome);
+        while let Ok(record) = receiver.try_recv() {
+            runtime.engine.observations.record(record);
         }
         let dropped = match &*admission {
             PendingTelemetry::Opening { dropped, .. } => *dropped,
@@ -707,3 +751,18 @@ impl Drop for AdvisoryRuntime {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// How one turn ended, for its telemetry outcome (P2-R10).
+pub(crate) struct TurnEnd<'a> {
+    pub result: TurnResultClass,
+    pub duration_ms: u64,
+    /// The serving provider, model and aggregated usage of a completed turn.
+    pub usage: Option<TurnUsage<'a>>,
+}
+
+/// The serving label and usage the terminal settles.
+pub(crate) struct TurnUsage<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub tokens: &'a crate::llm::route_decision::TokenUsage,
+}

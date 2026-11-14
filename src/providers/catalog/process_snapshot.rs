@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn authenticated_catalog_roundtrips_provider_namespaces_in_both_process_domains() {
-        let key = DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let publication = uuid::Uuid::new_v4();
         let original = catalog();
@@ -335,7 +335,7 @@ mod tests {
         let mut parent_release = (*embedded).clone();
         parent_release.revision.push_str("-different-binary");
         let parent_catalog = CatalogView::default().with_release_catalog(parent_release);
-        let key = DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let snapshot = parent_catalog
             .bind_process(&key, parent)
@@ -363,7 +363,7 @@ mod tests {
         assert_ne!(changed.content_sha256(), embedded.content_sha256());
 
         let parent_catalog = CatalogView::default().with_release_catalog(changed);
-        let key = DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let parent = ParentAuthorityId::from(DecisionId::new_runtime());
         let snapshot = parent_catalog
             .bind_process(&key, parent)

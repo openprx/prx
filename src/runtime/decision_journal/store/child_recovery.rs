@@ -33,9 +33,7 @@ impl DecisionStoreReader {
         deadline: Instant,
     ) -> Result<Vec<ChildRecoveryCandidate>, StoreError> {
         recovery_scope_bounds(scope)?;
-        let DecisionScope::Owner { workspace_id, owner_id } = scope else {
-            return Err(StoreError::RecoveryBounds);
-        };
+        let DecisionScope::Owner { workspace_id, owner_id } = scope;
         if owner_id.is_empty() || !(1..=64).contains(&limit) {
             return Err(StoreError::RecoveryBounds);
         }

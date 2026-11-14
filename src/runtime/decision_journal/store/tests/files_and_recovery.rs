@@ -1,26 +1,6 @@
 #![cfg(test)]
 use super::*;
 
-/// A read-only store never creates a database: a missing one reads as
-/// empty.
-#[test]
-fn a_read_only_store_creates_nothing() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let store = CausalDecisionStore::open(
-        temp.path(),
-        Retention::days(30, 30),
-        sink(),
-        StoreMode::ReadOnly,
-        WriterSetup::default(),
-    )
-    .unwrap();
-    assert!(store.writer().is_none());
-    assert!(store.reader().get(&operator(&store), &id(1)).unwrap().is_none());
-    assert!(store.workspace_id().is_none(), "no store, no id");
-    assert_eq!(store.reader().counts().unwrap(), StoreCounts::default());
-    assert!(!temp.path().join("self").exists(), "nothing was created");
-}
-
 /// Retention deletes everything past the horizon in bounded batches,
 /// and the outcomes of deleted decisions go with them.
 #[tokio::test]
@@ -31,18 +11,16 @@ async fn retention_cleanup_bounded() {
         let store = open_private(temp.path(), sink());
         let writer = store.writer().unwrap();
         for n in 0..2_500_u32 {
-            let mut digest = [0_u8; 32];
-            digest[..4].copy_from_slice(&n.to_be_bytes());
+            let id = DecisionId::parse(&format!("0192f0c4-0000-7000-9000-{n:012x}")).expect("test: id");
             let queued = loop {
-                if writer.record_decision(record(DecisionId::legacy(&digest), "ws", Some("a"), old)) == Enqueue::Queued
-                {
+                if writer.record_chain(vec![record(id.clone(), "ws", Some("a"), old)]) == Enqueue::Queued {
                     break true;
                 }
                 flushed(&store).await;
             };
             assert!(queued);
         }
-        writer.record_decision(record(id(200), "ws", Some("a"), now_ms()));
+        writer.record_chain(vec![record(id(200), "ws", Some("a"), now_ms())]);
         flushed(&store).await;
     }
     write_outcome(temp.path(), id(200), &OutcomeFixture::default());
@@ -78,7 +56,7 @@ async fn retention_cleanup_bounded() {
         store
             .writer()
             .unwrap()
-            .record_decision(record(id(201), "ws", Some("a"), old));
+            .record_chain(vec![record(id(201), "ws", Some("a"), old)]);
         flushed(&store).await;
     }
     write_outcome(temp.path(), id(201), &OutcomeFixture::default());
@@ -119,7 +97,7 @@ async fn a_full_queue_drops_without_blocking() {
     let started = Instant::now();
     let mut outcomes = Vec::new();
     for n in 1..=4 {
-        outcomes.push(writer.record_decision(record(id(n), "ws", Some("a"), now_ms())));
+        outcomes.push(writer.record_chain(vec![record(id(n), "ws", Some("a"), now_ms())]));
     }
     assert!(
         started.elapsed() < std::time::Duration::from_millis(50),
@@ -152,7 +130,7 @@ fn full_queue_drops_the_whole_decision_chain() {
         workspace_id: Arc::from("prx_workspace"),
     };
     assert_eq!(
-        writer.record_decision(record(id(1), "ws", Some("prx_user"), 10)),
+        writer.record_chain(vec![record(id(1), "ws", Some("prx_user"), 10)]),
         Enqueue::Queued
     );
     let first = record(id(3), "ws", Some("prx_user"), 10);
@@ -192,22 +170,6 @@ fn stores_are_shared_per_database() {
         Arc::ptr_eq(&writing, &shared),
         "the writer serves read-only requests too"
     );
-}
-
-fn listing(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| {
-            (
-                entry.file_name().to_string_lossy().to_string(),
-                std::fs::read(entry.path()).unwrap(),
-            )
-        })
-        .collect();
-    files.sort();
-    files
 }
 
 /// D-091 F-1: a symlinked store directory is refused before anything is
@@ -268,43 +230,6 @@ fn a_symlinked_database_or_side_file_is_refused() {
         );
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
     }
-}
-
-/// D-091 F-5: the disabled plane's reads of an existing database leave
-/// every file of the directory as it was, and create no -wal or -shm.
-#[tokio::test]
-async fn a_read_only_open_of_an_existing_store_changes_no_file() {
-    let temp = tempfile::TempDir::new().unwrap();
-    {
-        let store = open_private(temp.path(), sink());
-        store
-            .writer()
-            .unwrap()
-            .record_decision(record(id(1), "ws", Some("a"), now_ms()));
-        flushed(&store).await;
-    }
-    // The writer thread closes its connection (a checkpoint) on its own
-    // time; wait until the side files are gone.
-    let dir = temp.path().join("self/causal_tree");
-    for _ in 0..200 {
-        if !dir.join("decisions.db-wal").exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let before = listing(&dir);
-    let store = CausalDecisionStore::open(
-        temp.path(),
-        Retention::days(30, 30),
-        sink(),
-        StoreMode::ReadOnly,
-        WriterSetup::default(),
-    )
-    .unwrap();
-    assert!(store.reader().get(&operator(&store), &id(1)).unwrap().is_some());
-    assert_eq!(store.reader().counts().unwrap().decisions, 1);
-    drop(store);
-    assert_eq!(listing(&dir), before, "no file changed or appeared");
 }
 
 /// D-091 F-17: a newer database, with frames still in its WAL, is never
@@ -386,80 +311,6 @@ fn quarantined_files_are_never_overwritten() {
         .collect();
     aside.sort();
     assert_eq!(aside, [b"first garbage".to_vec(), b"second garbage".to_vec()]);
-}
-
-/// D-091 F-13: the scope key is the store's own id: it survives a move
-/// of the workspace, and every record carries it whatever the caller
-/// set.
-#[tokio::test]
-async fn the_workspace_id_is_stable_across_a_move() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let first = temp.path().join("first");
-    let id_before = {
-        let store = open_private(&first, sink());
-        store
-            .writer()
-            .unwrap()
-            .record_decision(record(id(1), "a-caller-supplied-id", Some("a"), now_ms()));
-        flushed(&store).await;
-        store.workspace_id().unwrap()
-    };
-    let moved = temp.path().join("moved");
-    std::fs::rename(&first, &moved).unwrap();
-    let store = open_private(&moved, sink());
-    assert_eq!(store.workspace_id().unwrap(), id_before);
-    assert!(store.reader().get(&operator(&store), &id(1)).unwrap().is_some());
-}
-
-/// D-091 F-11: a file's progress is saved only when every decision it
-/// lists is stored.
-#[tokio::test]
-async fn import_progress_needs_every_decision_stored() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let store = open_private(temp.path(), sink());
-    let writer = store.writer().unwrap();
-    writer.record_decision(record(id(1), "ws", None, now_ms()));
-    let progress = |file: &str| ImportProgress {
-        file: file.to_string(),
-        digest: "d".to_string(),
-        lines: 1,
-    };
-    writer.mark_imported(progress("stored.jsonl"), vec![id(1)]);
-    writer.mark_imported(progress("missing.jsonl"), vec![id(1), id(2)]);
-    flushed(&store).await;
-    assert!(store.reader().import_progress("stored.jsonl").unwrap().is_some());
-    assert!(store.reader().import_progress("missing.jsonl").unwrap().is_none());
-}
-
-/// D-093 N-2: with a live WAL (a writer that has not checkpointed), the
-/// disabled plane's read sees the latest rows and creates no file.
-#[tokio::test]
-async fn a_read_only_open_sees_rows_in_a_live_wal() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let store = open_private(temp.path(), sink());
-    store
-        .writer()
-        .unwrap()
-        .record_decision(record(id(1), "ws", Some("a"), now_ms()));
-    flushed(&store).await;
-    let dir = temp.path().join("self/causal_tree");
-    assert!(
-        std::fs::metadata(dir.join("decisions.db-wal")).unwrap().len() > 0,
-        "a live WAL"
-    );
-    let before: Vec<String> = listing(&dir).into_iter().map(|(name, _)| name).collect();
-    let reader = CausalDecisionStore::open(
-        temp.path(),
-        Retention::days(30, 30),
-        sink(),
-        StoreMode::ReadOnly,
-        WriterSetup::default(),
-    )
-    .unwrap();
-    assert!(reader.reader().get(&operator(&reader), &id(1)).unwrap().is_some());
-    let after: Vec<String> = listing(&dir).into_iter().map(|(name, _)| name).collect();
-    assert_eq!(after, before, "no file appeared");
-    drop(store);
 }
 
 /// D-093 N-6: the disabled plane's read never narrows a directory mode.

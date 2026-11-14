@@ -1,5 +1,5 @@
 //! `prx providers`, `prx models`, `prx routes`, the management part of
-//! `prx config` (PMM-E) and `prx causal config` (CDP-14).
+//! `prx config` (PMM-E) and `prx decision-engine config` (P2-R8).
 //!
 //! Every command calls the library's management service
 //! (`config::manage::ManagementService`) in-process: the same candidate
@@ -38,7 +38,7 @@ pub(crate) enum ManageCommand {
     Routes(RoutesCommands),
     Models(ModelCommands),
     Config(ConfigCommands),
-    Causal(openprx::causal_cli::CausalConfigCommands),
+    DecisionEngine(openprx::decision_engine_cli::DecisionEngineConfigCommands),
 }
 
 /// Where a command writes and reads: the process's streams in production,
@@ -76,7 +76,7 @@ pub(crate) async fn run(command: ManageCommand, config: Config, io: &mut Io<'_>)
         ManageCommand::Routes(command) => run_routes(command, config, io).await,
         ManageCommand::Models(command) => run_models(command, config, io).await,
         ManageCommand::Config(command) => run_config(command, config, io).await,
-        ManageCommand::Causal(command) => run_causal(command, config, io).await,
+        ManageCommand::DecisionEngine(command) => run_decision_engine(command, config, io).await,
     }
 }
 
@@ -175,98 +175,30 @@ fn refusal(error: ManageError) -> anyhow::Error {
     }
 }
 
-// ── prx causal config (CDP-14) ───────────────────────────────────────
+// ── prx decision-engine config (P2-R8) ──────────────────────────────
 
-fn causal_apply(apply: openprx::causal_cli::CausalApplyArgs) -> ApplyArgs {
-    ApplyArgs {
-        yes: apply.yes,
-        confirm_high_risk: apply.confirm_high_risk,
-    }
-}
-
-async fn run_causal(command: openprx::causal_cli::CausalConfigCommands, config: Config, io: &mut Io<'_>) -> Result<()> {
-    use openprx::causal_cli::CausalConfigChange;
-    let service = service(config);
-    match openprx::causal_cli::config_change(command, &service.config())? {
-        CausalConfigChange::Plan { mutations, apply } => {
-            let plan = service
-                .plan_causal(&mutations, ConfigActor::Cli)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            finish(&service, plan, &causal_apply(apply), io).await
-        }
-        CausalConfigChange::Secret {
-            from_stdin,
-            from_env,
-            apply,
-        } => store_decision_credential(&service, from_stdin, from_env.as_deref(), &causal_apply(apply), io).await,
-    }
-}
-
-/// `prx causal config set secret`: a credential change is high risk, so
-/// the secret is read only once the change is confirmed; the dry run names
-/// the revision to confirm and reads nothing.
-async fn store_decision_credential(
-    service: &ManagementService,
-    from_stdin: bool,
-    from_env: Option<&str>,
-    apply: &ApplyArgs,
+/// `prx decision-engine config set <key> <value>`: one allowlisted key,
+/// planned and applied like every management change. A refused key is one
+/// typed error (exit ≠ 0).
+async fn run_decision_engine(
+    command: openprx::decision_engine_cli::DecisionEngineConfigCommands,
+    config: Config,
     io: &mut Io<'_>,
 ) -> Result<()> {
-    let config = service.config();
-    let Some(selection) = openprx::config::schema::causal_tree::configured_selection(
-        openprx::config::schema::decision_engine::effective_engine_backend(&config),
-    ) else {
-        bail!(
-            "no decision backend that takes a credential is configured; choose one with `prx causal config set backend`"
-        );
-    };
-    let revision = service.revision().unwrap_or_else(|| "none".to_string());
-    writeln!(
-        io.out,
-        "Store a new decision credential for {} and reference it from causal_tree.backend.credential_ref (high \
-         risk: credential_changed). The previous decision credential of that provider is removed once the \
-         change applies.",
-        providers::redact_endpoint_userinfo(&selection.provider)
-    )?;
-    let Some(confirmed) = apply.confirm_high_risk.as_deref().filter(|_| apply.yes) else {
-        writeln!(
-            io.out,
-            "Dry run: nothing was read or written. Apply it with --yes --confirm-high-risk {revision}"
-        )?;
-        return Ok(());
-    };
-    let secret = read_secret(from_stdin, from_env, io)?;
-    let stored = service
-        .store_decision_credential(
-            openprx::config::manage::credentials::SecretString::new(secret),
-            ConfigActor::Cli,
-            Some(confirmed),
-        )
+    use openprx::config::manage::mutation::decision_engine::{CausalMutation, engine_setting};
+    use openprx::decision_engine_cli::DecisionEngineConfigCommands;
+    let DecisionEngineConfigCommands::Set { key, value, apply } = command;
+    let setting = engine_setting(&key, &value)?;
+    let service = service(config);
+    let plan = service
+        .plan_causal(&[CausalMutation::SetEngine(setting)], ConfigActor::Cli)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    writeln!(
-        io.out,
-        "Stored decision credential {} (encrypted at rest when secrets.encrypt = true) and referenced it{}.",
-        stored.id,
-        stored
-            .outcome
-            .record_id
-            .as_deref()
-            .map(|record| format!(" (history record {record}; activation deferred to the daemon)"))
-            .unwrap_or_default()
-    )?;
-    if let Some(previous) = &stored.removed_previous {
-        writeln!(io.out, "Removed the previous decision credential {previous}.")?;
-    }
-    if let Some((previous, error)) = &stored.previous_left {
-        writeln!(
-            io.out,
-            "The previous decision credential {previous} could not be removed ({error}); remove it with `prx \
-             providers credential remove {previous}`."
-        )?;
-    }
-    Ok(())
+    let apply = ApplyArgs {
+        yes: apply.yes,
+        confirm_high_risk: apply.confirm_high_risk,
+    };
+    finish(&service, plan, &apply, io).await
 }
 
 // ── prx providers ─────────────────────────────────────────────────────
@@ -1396,10 +1328,10 @@ mod tests {
                 executable: false,
             })),
             Commands::Config { config_command } => ManageCommand::Config(config_command),
-            Commands::Causal {
-                causal_command: openprx::causal_cli::CausalCommands::Config { command },
+            Commands::DecisionEngine {
+                command: openprx::decision_engine_cli::DecisionEngineCommands::Config { command },
                 ..
-            } => ManageCommand::Causal(command),
+            } => ManageCommand::DecisionEngine(command),
             other => panic!("test: not a management command: {other:?}"),
         }
     }
@@ -1529,60 +1461,6 @@ mod tests {
             &vec!["gpt-5.6".to_owned()]
         );
         assert_eq!(config.reliability.fallback_providers, Vec::<String>::new());
-    }
-
-    /// CDP-14: `prx causal config set secret` reads the credential only once
-    /// the high-risk change is confirmed: the dry run names the revision and
-    /// reads nothing, from standard input, the environment or a prompt.
-    #[tokio::test]
-    async fn a_decision_secret_is_read_only_after_confirmation() {
-        let (_dir, config) = fixture(|config| {
-            config.causal_tree.backend.kind = String::from("compatible_http").try_into().expect("test: kind");
-            config.causal_tree.backend.endpoint = "http://127.0.0.1:8900/v1".into();
-            config.causal_tree.backend.model = "decider-1".into();
-            config.providers.models.push(
-                serde_json::from_value(serde_json::json!({
-                    "provider": "custom:http://127.0.0.1:8900/v1",
-                    "model": "decider-1",
-                    "operations": ["decision_endpoint"],
-                }))
-                .expect("test: declaration"),
-            );
-        })
-        .await;
-        let read = std::cell::Cell::new(false);
-        let asked = std::cell::Cell::new(false);
-        let mut out = Vec::new();
-        let mut stdin = Watched {
-            bytes: b"sk-DECISION-READ-SENTINEL-01\n",
-            read: &read,
-        };
-        let env = |_: &str| {
-            asked.set(true);
-            None
-        };
-        let prompt = |_: &str| -> Result<String> {
-            asked.set(true);
-            bail!("test: no terminal")
-        };
-        let result = {
-            let mut io = Io {
-                out: &mut out,
-                stdin: &mut stdin,
-                env: &env,
-                prompt: &prompt,
-            };
-            run(
-                manage_command(&["causal", "config", "set", "secret", "--from-stdin"]),
-                config,
-                &mut io,
-            )
-            .await
-        };
-        let text = String::from_utf8(out).expect("test: utf-8");
-        result.expect("test: the dry run succeeds");
-        assert!(text.contains("Dry run: nothing was read or written"), "{text}");
-        assert!(!read.get() && !asked.get(), "nothing was read before the confirmation");
     }
 
     /// E-1 guard: `prx providers` with no subcommand still lists the

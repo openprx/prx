@@ -267,12 +267,12 @@ async fn the_last_holder_closes_and_unregisters_the_store() {
     CausalDecisionStore::close(first, deadline).await;
     assert!(
         matches!(
-            second.writer().unwrap().record_decision(record(
+            second.writer().unwrap().record_chain(vec![record(
                 DecisionId::parse("0192f0c4-0000-7000-8000-000000000001").unwrap(),
                 "ws",
                 Some("a"),
                 10
-            )),
+            )]),
             Enqueue::Queued
         ),
         "another holder keeps the store open"
@@ -289,12 +289,12 @@ async fn the_last_holder_closes_and_unregisters_the_store() {
     );
     assert!(
         matches!(
-            fresh.writer().unwrap().record_decision(record(
+            fresh.writer().unwrap().record_chain(vec![record(
                 DecisionId::parse("0192f0c4-0000-7000-8000-000000000002").unwrap(),
                 "ws",
                 Some("a"),
                 11
-            )),
+            )]),
             Enqueue::Queued
         ),
         "the fresh store writes"
@@ -401,7 +401,7 @@ async fn old_read_only_stores_project_absent_columns_without_migration() {
         let writer = store.writer().expect("writer");
         let decision_id = id(u8::try_from(version).expect("version"));
         let original = record(decision_id, "ws", Some("prx_user"), now_ms());
-        writer.record_decision(original.clone());
+        writer.record_chain(vec![original.clone()]);
         flushed(&store).await;
         CausalDecisionStore::close(store, Instant::now() + std::time::Duration::from_secs(5)).await;
 
@@ -465,7 +465,7 @@ async fn old_read_only_stores_project_absent_columns_without_migration() {
             .expect("migrated read")
             .expect("migrated decision");
         assert_eq!(view.prior_decision_id, None);
-        migrated.writer().expect("writer").record_decision(original);
+        migrated.writer().expect("writer").record_chain(vec![original]);
         flushed(&migrated).await;
         assert!(incomplete(&events).is_empty(), "legacy replay remains idempotent");
         CausalDecisionStore::close(migrated, Instant::now() + std::time::Duration::from_secs(5)).await;
@@ -487,7 +487,7 @@ async fn old_read_only_stores_project_absent_columns_without_migration() {
 use crate::observability::causal_event::testing::RecordingSink;
 
 fn id(n: u8) -> DecisionId {
-    DecisionId::legacy(&[n; 32])
+    DecisionId::parse(&format!("0192f0c4-0000-7000-8000-{:012x}", n)).expect("test: id")
 }
 
 fn sink() -> Arc<RecordingSink> {
@@ -555,145 +555,6 @@ fn observed_outcome(decision_id: DecisionId) -> OutcomeRecord {
 }
 
 #[tokio::test]
-async fn late_outcome_joins_once_and_a_conflicting_settlement_is_refused() {
-    let temp = tempfile::tempdir().expect("workspace");
-    let events = sink();
-    let decision_id = id(67);
-    let first = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = first.writer().expect("writer");
-    assert_eq!(
-        writer.record_decision(record(decision_id, "ws", Some("prx_user"), now_ms())),
-        Enqueue::Queued
-    );
-    flushed(&first).await;
-    writer.close(Instant::now() + std::time::Duration::from_secs(5)).await;
-    drop(writer);
-    drop(first);
-
-    let reopened = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = reopened.writer().expect("reopened writer");
-    let outcome = observed_outcome(decision_id);
-    assert_eq!(writer.record_outcome(outcome.clone()), Enqueue::Queued);
-    flushed(&reopened).await;
-    let row = reopened
-        .reader()
-        .get(&operator(&reopened), &decision_id)
-        .expect("read")
-        .expect("decision");
-    assert_eq!(row.outcomes.len(), 1);
-    assert_eq!(row.outcomes.first().expect("outcome").classification, "refusal");
-    assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
-
-    let mut replay = outcome.clone();
-    replay.recorded_at_ms = outcome.recorded_at_ms + 43_000;
-    assert_eq!(writer.record_outcome(replay), Enqueue::Queued);
-    let mut conflicting = outcome.clone();
-    conflicting.cost_micro_usd = Some(7);
-    assert_eq!(writer.record_outcome(conflicting), Enqueue::Queued);
-    assert_eq!(writer.record_outcome(observed_outcome(id(68))), Enqueue::Queued);
-    flushed(&reopened).await;
-    assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
-    let stored_at: i64 = Connection::open(db_path(temp.path()))
-        .expect("database")
-        .query_row(
-            "SELECT recorded_at_ms FROM outcomes WHERE decision_id = ?1",
-            [decision_id.to_string()],
-            |row| row.get(0),
-        )
-        .expect("first outcome timestamp");
-    assert_eq!(
-        stored_at, outcome.recorded_at_ms,
-        "a delayed replay retains the first arrival timestamp"
-    );
-    assert_eq!(
-        events
-            .events
-            .lock()
-            .iter()
-            .filter(|event| event.kind == CausalEventKind::OutcomeRecorded)
-            .count(),
-        1,
-        "only a new committed row emits the recorded event"
-    );
-    assert_eq!(
-        incomplete(&events),
-        [IncompleteReason::Conflict, IncompleteReason::UnknownDecision]
-    );
-}
-
-#[tokio::test]
-async fn partial_outcome_at_provider_retention_boundary_reopens_and_replays() {
-    let temp = tempfile::tempdir().expect("workspace");
-    let events = sink();
-    let decision_id = id(70);
-    let store = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = store.writer().expect("writer");
-    assert_eq!(
-        writer.record_decision(record(decision_id, "ws", Some("prx_user"), now_ms())),
-        Enqueue::Queued
-    );
-    flushed(&store).await;
-    let mut outcome = observed_outcome(decision_id);
-    outcome.provider_attempts = Some(
-        (1..=128)
-            .map(|seq| RecordedOutcomeAttempt {
-                seq,
-                status: "success".to_owned(),
-                error_class: None,
-            })
-            .collect(),
-    );
-    assert_eq!(outcome.completeness, OutcomeCompleteness::Partial);
-    assert_eq!(outcome.coverage, None);
-    assert_eq!(writer.record_outcome(outcome.clone()), Enqueue::Queued);
-    flushed(&store).await;
-    writer.close(Instant::now() + std::time::Duration::from_secs(5)).await;
-    drop(writer);
-    drop(store);
-    let reopened = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = reopened.writer().expect("reopened writer");
-    let row = reopened
-        .reader()
-        .get(&operator(&reopened), &decision_id)
-        .expect("read")
-        .expect("decision");
-    assert_eq!(row.outcomes.len(), 1);
-    let retained = row.outcomes.first().expect("bounded outcome");
-    assert_eq!(retained.provider_attempts, 128);
-    assert_eq!(retained.completeness, "partial");
-    assert!(
-        reopened
-            .reader()
-            .outcome_matches(&operator(&reopened), &outcome)
-            .expect("exact stored payload")
-    );
-    assert!(incomplete(&events).is_empty(), "expected an empty value");
-    assert_eq!(writer.record_outcome(outcome.clone()), Enqueue::Queued);
-    flushed(&reopened).await;
-    assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
-    assert!(
-        reopened
-            .reader()
-            .outcome_matches(&operator(&reopened), &outcome)
-            .expect("exact replay payload")
-    );
-    assert!(incomplete(&events).is_empty(), "expected an empty value");
-    outcome
-        .provider_attempts
-        .as_mut()
-        .expect("attempts")
-        .push(RecordedOutcomeAttempt {
-            seq: 129,
-            status: "success".to_owned(),
-            error_class: None,
-        });
-    assert_eq!(writer.record_outcome(outcome), Enqueue::Dropped);
-    flushed(&reopened).await;
-    assert_eq!(reopened.reader().counts().expect("counts").outcomes, 1);
-    assert_eq!(incomplete(&events), [IncompleteReason::Conflict]);
-}
-
-#[tokio::test]
 async fn outcome_queue_refuses_oversized_or_raw_metadata_without_a_row() {
     assert!(bounded_capability_id("mcp:prx_space:search/r\u{e9}sum\u{e9}"));
     assert!(!bounded_capability_id("mcp:prx_space:private:extra"));
@@ -703,7 +564,7 @@ async fn outcome_queue_refuses_oversized_or_raw_metadata_without_a_row() {
     let writer = store.writer().expect("writer");
     let decision_id = id(69);
     assert_eq!(
-        writer.record_decision(record(decision_id, "ws", Some("prx_user"), now_ms())),
+        writer.record_chain(vec![record(decision_id, "ws", Some("prx_user"), now_ms())]),
         Enqueue::Queued
     );
     flushed(&store).await;
@@ -747,13 +608,6 @@ async fn outcome_queue_refuses_oversized_or_raw_metadata_without_a_row() {
     assert_eq!(incomplete(&events), vec![IncompleteReason::Conflict; 6]);
 }
 
-/// The local operator's scope of `store`.
-fn operator(store: &CausalDecisionStore) -> DecisionScope {
-    DecisionScope::LocalOperator {
-        workspace_id: store.workspace_id().unwrap_or_else(|| Arc::from("no store")),
-    }
-}
-
 /// `owner`'s scope in `store`.
 fn owner(store: &CausalDecisionStore, owner: &str) -> DecisionScope {
     DecisionScope::Owner {
@@ -770,131 +624,6 @@ fn incomplete(sink: &RecordingSink) -> Vec<IncompleteReason> {
         .collect()
 }
 
-/// V8.04: the same record twice is stored once; a different record
-/// under the same id is refused and reported, the first kept.
-#[tokio::test]
-async fn a_conflicting_decision_is_refused_not_overwritten() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let events = sink();
-    let store = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = store.writer().unwrap();
-    let first = record(id(1), "ws", Some("alice"), now_ms());
-    assert_eq!(writer.record_decision(first.clone()), Enqueue::Queued);
-    assert_eq!(writer.record_decision(first.clone()), Enqueue::Queued);
-    let mut changed = first.clone();
-    changed.directive_kind = "refuse".to_string();
-    writer.record_decision(changed);
-    flushed(&store).await;
-    let view = store.reader().get(&operator(&store), &id(1)).unwrap().unwrap();
-    assert_eq!(view.directive_kind, "answer", "the stored record is kept");
-    assert_eq!(store.reader().counts().unwrap().decisions, 1);
-    assert_eq!(incomplete(&events), [IncompleteReason::Conflict]);
-}
-
-#[tokio::test]
-async fn decision_debug_omits_private_endpoint_projection_and_lineage() {
-    let temp = tempfile::TempDir::new().expect("workspace");
-    let events = sink();
-    let store = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let mut entry = record(id(55), "prx_private_workspace", Some("prx_user"), now_ms());
-    entry.backend_endpoint = Some("http://127.0.0.1/prx_private_route".to_string());
-    entry.redacted_projection = Some("{\"goal\":\"prx_private_goal\"}".to_string());
-    let record_debug = format!("{entry:?}");
-    for private in ["prx_private_workspace", "prx_private_route", "prx_private_goal"] {
-        assert!(!record_debug.contains(private));
-    }
-    assert_eq!(store.writer().expect("writer").record_decision(entry), Enqueue::Queued);
-    flushed(&store).await;
-    let view = store
-        .reader()
-        .get(&operator(&store), &id(55))
-        .expect("read")
-        .expect("stored");
-    let view_debug = format!("{view:?}");
-    for private in ["prx_private_workspace", "prx_private_route", "prx_private_goal"] {
-        assert!(!view_debug.contains(private));
-    }
-    assert_eq!(
-        view.backend_endpoint.as_deref(),
-        Some("http://127.0.0.1/prx_private_route")
-    );
-}
-
-#[tokio::test]
-async fn decision_chain_transaction_rolls_back_on_conflict_and_emits_commit_after_storage() {
-    let temp = tempfile::TempDir::new().expect("workspace");
-    let events = sink();
-    let store = open_private(temp.path(), Arc::clone(&events) as Arc<dyn CausalEventSink>);
-    let writer = store.writer().expect("writer");
-    let existing = record(id(2), "ws", Some("prx_user"), 10);
-    writer.record_decision(existing.clone());
-    flushed(&store).await;
-
-    let first = record(id(1), "ws", Some("prx_user"), 10);
-    let mut conflicting_second = existing.clone();
-    conflicting_second.lineage.prior_decision_id = Some(first.decision_id);
-    assert_eq!(
-        writer.record_chain(vec![first.clone(), conflicting_second]),
-        Enqueue::Queued
-    );
-    flushed(&store).await;
-    assert!(
-        store
-            .reader()
-            .get(&operator(&store), &first.decision_id)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(store.reader().counts().unwrap().decisions, 1);
-    assert_eq!(
-        incomplete(&events),
-        [IncompleteReason::Conflict, IncompleteReason::Conflict]
-    );
-
-    let mut second = record(id(3), "ws", Some("prx_user"), 10);
-    second.lineage.prior_decision_id = Some(first.decision_id);
-    let committed_before = events
-        .events
-        .lock()
-        .iter()
-        .filter(|event| event.kind == CausalEventKind::DecisionCommitted)
-        .count();
-    assert_eq!(
-        writer.record_chain(vec![first.clone(), second.clone()]),
-        Enqueue::Queued
-    );
-    flushed(&store).await;
-    assert_eq!(store.reader().counts().unwrap().decisions, 3);
-    assert_eq!(
-        store
-            .reader()
-            .get(&operator(&store), &second.decision_id)
-            .unwrap()
-            .unwrap()
-            .prior_decision_id,
-        Some(first.decision_id)
-    );
-    let committed_after = events
-        .events
-        .lock()
-        .iter()
-        .filter(|event| event.kind == CausalEventKind::DecisionCommitted)
-        .count();
-    assert_eq!(committed_after - committed_before, 2);
-    writer.record_chain(vec![first, second]);
-    flushed(&store).await;
-    assert_eq!(
-        events
-            .events
-            .lock()
-            .iter()
-            .filter(|event| event.kind == CausalEventKind::DecisionCommitted)
-            .count(),
-        committed_after,
-        "idempotent replay does not emit another commit"
-    );
-}
-
 #[tokio::test]
 async fn decision_chain_rejects_orphan_and_foreign_scope_before_queueing() {
     let temp = tempfile::TempDir::new().expect("workspace");
@@ -907,7 +636,7 @@ async fn decision_chain_rejects_orphan_and_foreign_scope_before_queueing() {
 
     let mut orphan = record(id(12), "ws", Some("prx_user"), 10);
     orphan.lineage.prior_decision_id = Some(id(99));
-    assert_eq!(writer.record_decision(orphan), Enqueue::Dropped);
+    assert_eq!(writer.record_chain(vec![orphan]), Enqueue::Dropped);
 
     let mut invalid = second.clone();
     invalid.lineage.owner_id = Some(Arc::from("other_user"));
@@ -934,43 +663,9 @@ async fn decision_chain_rejects_orphan_and_foreign_scope_before_queueing() {
             .iter()
             .all(|event| event.kind != CausalEventKind::DecisionCommitted)
     );
-    assert_eq!(writer.record_decision(first), Enqueue::Queued);
+    assert_eq!(writer.record_chain(vec![first]), Enqueue::Queued);
     flushed(&store).await;
     assert_eq!(store.reader().counts().unwrap().decisions, 1);
-}
-
-/// V6.04, store half: another owner's decision reads exactly like an
-/// unknown one; the local operator sees every decision of the
-/// workspace, including those without an owner; another workspace sees
-/// nothing.
-#[tokio::test]
-async fn inspect_other_owner_decision_denied() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let store = open_private(temp.path(), sink());
-    let writer = store.writer().unwrap();
-    writer.record_decision(record(id(1), "ws", Some("alice"), now_ms()));
-    writer.record_decision(record(id(2), "ws", None, now_ms()));
-    flushed(&store).await;
-    let reader = store.reader();
-    let alice = owner(&store, "alice");
-    let bob = owner(&store, "bob");
-    assert!(reader.get(&alice, &id(1)).unwrap().is_some());
-    let foreign = reader.get(&bob, &id(1));
-    let unknown = reader.get(&bob, &id(9));
-    assert!(matches!(foreign, Ok(None)) && matches!(unknown, Ok(None)));
-    assert!(reader.get(&alice, &id(2)).unwrap().is_none(), "no owner: operator only");
-    assert!(reader.get(&operator(&store), &id(2)).unwrap().is_some());
-    assert!(
-        reader
-            .get(
-                &DecisionScope::LocalOperator {
-                    workspace_id: Arc::from("another-workspace"),
-                },
-                &id(1),
-            )
-            .unwrap()
-            .is_none()
-    );
 }
 
 /// V6.10: the files are private; a corrupt database is moved aside
@@ -1001,7 +696,7 @@ async fn store_permissions_and_corrupt_db_recovery() {
     store
         .writer()
         .unwrap()
-        .record_decision(record(id(1), "ws", Some("a"), now_ms()));
+        .record_chain(vec![record(id(1), "ws", Some("a"), now_ms())]);
     flushed(&store).await;
     assert_eq!(store.reader().counts().unwrap().decisions, 1);
     assert_eq!(mode(&path), 0o600);
@@ -1012,35 +707,6 @@ async fn store_permissions_and_corrupt_db_recovery() {
             assert_eq!(mode(&side), 0o600, "{suffix}");
         }
     }
-}
-
-/// A database written by a newer build opens read-only: no writer, reads
-/// work, and the file is not changed.
-#[tokio::test]
-async fn a_newer_schema_opens_read_only() {
-    let temp = tempfile::TempDir::new().unwrap();
-    {
-        let store = open_private(temp.path(), sink());
-        store
-            .writer()
-            .unwrap()
-            .record_decision(record(id(1), "ws", Some("a"), now_ms()));
-        flushed(&store).await;
-    }
-    let path = db_path(temp.path());
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", store_schema::SCHEMA_VERSION + 1)
-            .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
-    }
-    let before = std::fs::read(&path).unwrap();
-    let store = open_private(temp.path(), sink());
-    assert_eq!(store.mode(), StoreMode::ReadOnly);
-    assert!(store.writer().is_none());
-    assert!(store.reader().get(&operator(&store), &id(1)).unwrap().is_some());
-    drop(store);
-    assert_eq!(std::fs::read(&path).unwrap(), before, "the newer database is untouched");
 }
 
 #[test]

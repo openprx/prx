@@ -106,7 +106,7 @@ pub(crate) fn sources(generation: &ConfigGeneration, config: &crate::config::Con
 
 #[test]
 fn pinned_policy_version_is_order_independent_and_tracks_policy_changes() {
-    let key = DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::test_support::ephemeral_key();
     let security = SecurityPolicy::default();
     let surface = SurfacePolicy::default();
     let mut first = crate::config::Config::default();

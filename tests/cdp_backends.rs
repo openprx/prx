@@ -1,5 +1,4 @@
 //! External callers cannot fund physical decision IO without a real sealed owner.
-//! Original16 transport oracles are mapped to private `causal_cli::backend_transport_tests`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use openprx::cost::decision_attempt::error::DecisionError;
 use openprx::decision_engine::prediction::factory::{AttemptOutcome, DecisionBackendFactory, FactoryDeps, ServedBy};
@@ -46,7 +45,7 @@ async fn plane() -> Plane {
         operations: Some(vec![ModelOperation::DecisionEndpoint]),
         ..CuratedModel::new(ProviderId::of(&format!("custom:{endpoint}")), Some("jev-1.13.0"))
     }]);
-    let key = FactoryDeps::load_key(&config).unwrap();
+    let key = openprx::security::runtime_key::DecisionKey::load_or_create(&config.workspace_dir).unwrap();
     let factory = DecisionBackendFactory::from_config(
         &config,
         FactoryDeps {

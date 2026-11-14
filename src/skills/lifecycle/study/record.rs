@@ -76,7 +76,7 @@ impl SkillLifecycleStore {
         let payload = serde_json::to_vec(value)?;
         let sha256 = digest(domain, value)?;
         let mac = hex::encode(self.study_key()?.hmac(
-            KeyDomain::ReportOwnership,
+            KeyDomain::SkillRecordSeal,
             &[domain, self.owner_scope().as_str().as_bytes(), &payload],
         ));
         let bytes = record_bytes(&Sealed { value, sha256, mac }, path)?;
@@ -105,7 +105,7 @@ impl SkillLifecycleStore {
         ensure!(
             sealed.sha256 == digest(domain, &sealed.value)?
                 && self.study_key()?.verify_hmac(
-                    KeyDomain::ReportOwnership,
+                    KeyDomain::SkillRecordSeal,
                     &[domain, self.owner_scope().as_str().as_bytes(), &payload],
                     &tag
                 ),
@@ -516,7 +516,7 @@ impl SkillLifecycleStore {
         let payload = serde_json::to_vec(&value)?;
         let sha256 = digest(REPORT_DOMAIN, &value)?;
         let mac = hex::encode(self.study_key()?.hmac(
-            KeyDomain::ReportOwnership,
+            KeyDomain::SkillRecordSeal,
             &[REPORT_DOMAIN, self.owner_scope().as_str().as_bytes(), &payload],
         ));
         let bytes = serde_json::to_vec(&Sealed { value, sha256, mac })?;

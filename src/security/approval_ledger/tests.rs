@@ -192,7 +192,7 @@ impl LifecycleFixture {
         if journal {
             crate::runtime::child_source::authority_journal::write_decision_evidence(path, &key, &evidence).unwrap();
         }
-        writer.record_decision(row);
+        writer.record_chain(vec![row]);
         assert!(
             writer
                 .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))

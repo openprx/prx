@@ -2,7 +2,7 @@ use super::*;
 use crate::tools::capability::contract::{CapabilityId, CapabilityTarget, SchemaFingerprint};
 
 fn parent() -> CapabilityConstraints {
-    let key = DecisionKey::ephemeral();
+    let key = crate::security::runtime_key::test_support::ephemeral_key();
     let generation = CatalogGeneration([7; 32]);
     let allowed = ["prx_read", "prx_write"]
         .into_iter()
@@ -46,7 +46,7 @@ fn run_rooted_parent_derives_sealed_strict_subset() {
     );
     assert_ne!(
         parent.parent_authority_id,
-        ParentAuthorityId::for_run("prx_run", &DecisionKey::ephemeral())
+        ParentAuthorityId::for_run("prx_run", &crate::security::runtime_key::test_support::ephemeral_key())
     );
     let child = child(&parent);
     assert_eq!(child.parent_authority_id, parent.parent_authority_id);

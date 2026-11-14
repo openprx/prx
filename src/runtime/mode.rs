@@ -535,14 +535,19 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             evolution_command,
         } => evolution_cli::handle_command(evolution_command, json, &config).await,
 
-        Commands::Causal { json, causal_command } => match causal_command {
-            openprx::causal_cli::CausalCommands::Read(command) => {
-                openprx::causal_cli::run(&config, json, command).await
-            }
+        Commands::Causal { .. } => {
+            println!("{}", openprx::decision_engine_cli::CAUSAL_DEPRECATION);
+            Ok(())
+        }
+        Commands::DecisionEngine { json, command } => match command {
             // Configuration changes go through the management CLI: the same
-            // plan text, apply flags and credential input as `prx providers`.
-            openprx::causal_cli::CausalCommands::Config { command } => {
-                manage_cli::run_process(ManageCommand::Causal(command), config).await
+            // plan text and apply flags as `prx providers`.
+            openprx::decision_engine_cli::DecisionEngineCommands::Config { command } => {
+                manage_cli::run_process(ManageCommand::DecisionEngine(command), config).await
+            }
+            read => {
+                let mut stdout = std::io::stdout().lock();
+                openprx::decision_engine_cli::run_read(&config, json, &read, &mut stdout)
             }
         },
         Commands::Fitness { json, fitness_command } => {

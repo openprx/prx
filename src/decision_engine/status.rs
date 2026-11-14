@@ -1,5 +1,5 @@
 //! Read existing process-local observation counters without starting an engine.
-use super::{TurnOutcome, observe::ObserveCounters};
+use super::{TelemetryRecord, observe::ObserveCounters};
 use crate::config::Config;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -11,12 +11,12 @@ use tokio::sync::mpsc::WeakSender;
 
 struct Entry {
     workspace: PathBuf,
-    sender: WeakSender<TurnOutcome>,
+    sender: WeakSender<TelemetryRecord>,
     counters: Weak<ObserveCounters>,
 }
 static QUEUES: LazyLock<Mutex<Vec<Entry>>> = LazyLock::new(Default::default);
 
-pub(super) fn register(workspace: &Path, sender: WeakSender<TurnOutcome>, counters: Weak<ObserveCounters>) {
+pub(super) fn register(workspace: &Path, sender: WeakSender<TelemetryRecord>, counters: Weak<ObserveCounters>) {
     let mut queues = QUEUES.lock();
     queues.retain(|entry| entry.counters.strong_count() > 0);
     queues.push(Entry {

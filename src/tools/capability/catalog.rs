@@ -1882,7 +1882,7 @@ mod tests {
             Box::new(DocumentCategoryProbe("document_sync")),
         ];
         let catalog = CapabilityCatalog::build(&registry, &sources, &SurfacePolicy::default()).unwrap();
-        let key = crate::security::runtime_key::DecisionKey::ephemeral();
+        let key = crate::security::runtime_key::test_support::ephemeral_key();
         let snapshot = catalog.bind_process(&key).unwrap();
         let restored = CapabilityCatalog::restore_process(&snapshot, &key, *catalog.generation()).unwrap();
         for (name, family) in [
@@ -1899,7 +1899,12 @@ mod tests {
             assert_eq!(entry.generation, parent.generation);
         }
         assert!(
-            CapabilityCatalog::restore_process(&snapshot, &DecisionKey::ephemeral(), *catalog.generation()).is_err(),
+            CapabilityCatalog::restore_process(
+                &snapshot,
+                &crate::security::runtime_key::test_support::ephemeral_key(),
+                *catalog.generation()
+            )
+            .is_err(),
             "identity compatibility cannot bypass catalog authentication"
         );
         let entry = restored.entry_for_public_name(&alias).unwrap();
@@ -2090,7 +2095,11 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let key = DecisionKey::load_or_create(workspace.path()).unwrap();
         let parent = CapabilityConstraints {
-            parent_authority_id: crate::security::decision_id::DecisionId::legacy(&[7; 32]).into(),
+            parent_authority_id: crate::security::decision_id::DecisionId::parse(
+                "0192f0c4-0000-7000-8000-000000000007",
+            )
+            .expect("test: id")
+            .into(),
             allowed,
             authority: AuthorityEnvelope {
                 owner: "prx_user".into(),

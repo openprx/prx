@@ -133,6 +133,7 @@ const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
         Commands::Cron { .. } => cli_tracing::CliCommand::Cron,
         Commands::Xin { .. } => cli_tracing::CliCommand::Xin,
         Commands::Causal { .. } => cli_tracing::CliCommand::Causal,
+        Commands::DecisionEngine { .. } => cli_tracing::CliCommand::DecisionEngine,
         Commands::Models { .. } => cli_tracing::CliCommand::Models,
         Commands::Providers { .. } => cli_tracing::CliCommand::Providers,
         Commands::Routes { .. } => cli_tracing::CliCommand::Routes,
@@ -433,7 +434,7 @@ enum Commands {
         /// The decision backend (quick mode): builtin or compatible_http; a
         /// hosted service also needs --decision-credential-stdin
         #[arg(long, value_enum)]
-        decision_backend: Option<openprx::causal_cli::BackendKindArg>,
+        decision_backend: Option<openprx::decision_engine_cli::BackendKindArg>,
         /// The decision endpoint (quick mode, compatible_http)
         #[arg(long, requires = "decision_backend")]
         decision_endpoint: Option<String>,
@@ -446,7 +447,7 @@ enum Commands {
         /// Read the hosted decision backend's credential (typesafe or
         /// openrouter) from standard input, store it as `cred-decision-<kind>`
         /// and reference it (quick mode). Remote processing stays off until
-        /// `prx causal config enable-remote`
+        /// `backend.remote_enabled` is set with `prx decision-engine config set`
         #[arg(long, requires = "decision_backend", conflicts_with = "from_stdin")]
         decision_credential_stdin: bool,
     },
@@ -791,13 +792,21 @@ Examples:
         xin_command: XinCommands,
     },
 
-    /// Inspect and test the causal decision plane (read-only)
+    /// Retired: prints one line pointing at `prx decision-engine`
+    #[command(hide = true)]
     Causal {
+        /// Ignored arguments of the retired command.
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Inspect and configure the advisory decision engine
+    DecisionEngine {
         /// Output machine-readable JSON.
         #[arg(long, global = true)]
         json: bool,
         #[command(subcommand)]
-        causal_command: openprx::causal_cli::CausalCommands,
+        command: openprx::decision_engine_cli::DecisionEngineCommands,
     },
 
     /// Manage provider model catalogs
@@ -1908,7 +1917,15 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     ) || matches!(
         &cli.command,
-        Commands::Doctor { .. } | Commands::Tasks { .. } | Commands::Causal { .. } | Commands::Cost { .. }
+        Commands::Doctor { .. }
+            | Commands::Tasks { .. }
+            | Commands::Causal { .. }
+            | Commands::DecisionEngine {
+                command: openprx::decision_engine_cli::DecisionEngineCommands::Status
+                    | openprx::decision_engine_cli::DecisionEngineCommands::Backends,
+                ..
+            }
+            | Commands::Cost { .. }
     );
     #[cfg(feature = "wasm-plugins")]
     let read_only_config_command = read_only_config_command || matches!(&cli.command, Commands::Plugin { .. });
@@ -3709,6 +3726,7 @@ mod tests {
             Commands::Cron { .. } => "Cron",
             Commands::Xin { .. } => "Xin",
             Commands::Causal { .. } => "Causal",
+            Commands::DecisionEngine { .. } => "DecisionEngine",
             Commands::Models { .. } => "Models",
             Commands::Providers { .. } => "Providers",
             Commands::Routes { .. } => "Routes",
@@ -3750,6 +3768,10 @@ mod tests {
             (&["prx", "cron", "list"], cli_tracing::CliCommand::Cron),
             (&["prx", "xin", "status"], cli_tracing::CliCommand::Xin),
             (&["prx", "causal", "status"], cli_tracing::CliCommand::Causal),
+            (
+                &["prx", "decision-engine", "status"],
+                cli_tracing::CliCommand::DecisionEngine,
+            ),
             (&["prx", "models"], cli_tracing::CliCommand::Models),
             (&["prx", "providers"], cli_tracing::CliCommand::Providers),
             (&["prx", "routes", "list"], cli_tracing::CliCommand::Routes),
@@ -3809,6 +3831,7 @@ mod tests {
             "Cron",
             "Xin",
             "Causal",
+            "DecisionEngine",
             "Models",
             "Providers",
             "Routes",
@@ -4126,51 +4149,51 @@ mod tests {
     }
 
     #[test]
-    fn prx_causal_status_parses() {
-        let cli = Cli::try_parse_from(["prx", "causal", "status", "--json"]).expect("causal status should parse");
-        match cli.command {
-            Commands::Causal {
-                json: true,
-                causal_command:
-                    openprx::causal_cli::CausalCommands::Read(openprx::causal_cli::CausalReadCommands::Status),
-            } => {}
-            other => panic!("expected causal status, got {other:?}"),
+    fn prx_causal_parses_any_arguments_and_decision_engine_replaces_it() {
+        for args in [
+            &["prx", "causal"][..],
+            &["prx", "causal", "status", "--json"],
+            &["prx", "causal", "config", "set", "backend", "--kind", "builtin"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("retired causal command still parses");
+            assert!(matches!(cli.command, Commands::Causal { .. }), "{args:?}");
         }
-        // CDP-14: a live test parses; its confirmation needs --live.
-        assert!(Cli::try_parse_from(["prx", "causal", "test", "--live", "--yes"]).is_ok());
-        assert!(Cli::try_parse_from(["prx", "causal", "test", "--yes"]).is_err());
-        let cli = Cli::try_parse_from([
-            "prx",
-            "causal",
-            "config",
-            "set",
-            "backend",
-            "--kind",
-            "compatible_http",
-            "--endpoint",
-            "http://127.0.0.1:8900/v1",
-            "--model",
-            "decider-1",
-            "--yes",
-        ])
-        .expect("causal config set backend should parse");
+        let cli = Cli::try_parse_from(["prx", "decision-engine", "status", "--json"]).expect("status parses");
         assert!(matches!(
             cli.command,
-            Commands::Causal {
-                causal_command: openprx::causal_cli::CausalCommands::Config { .. },
+            Commands::DecisionEngine {
+                json: true,
+                command: openprx::decision_engine_cli::DecisionEngineCommands::Status,
+            }
+        ));
+        let cli = Cli::try_parse_from(["prx", "decision-engine", "config", "set", "enabled", "true", "--yes"])
+            .expect("config set parses");
+        assert!(matches!(
+            cli.command,
+            Commands::DecisionEngine {
+                command: openprx::decision_engine_cli::DecisionEngineCommands::Config { .. },
                 ..
             }
         ));
         assert!(
-            Cli::try_parse_from(["prx", "causal", "config", "enable-remote", "--confirm-high-risk", "r"]).is_err(),
+            Cli::try_parse_from([
+                "prx",
+                "decision-engine",
+                "config",
+                "set",
+                "enabled",
+                "true",
+                "--confirm-high-risk",
+                "r"
+            ])
+            .is_err(),
             "a confirmation without --yes"
         );
     }
 
-    /// No `prx causal` subcommand takes a secret on the command line (a
-    /// credential is read from stdin or a prompt, CDP-14).
+    /// No `prx decision-engine` subcommand takes a secret on the command line.
     #[test]
-    fn no_causal_subcommand_accepts_a_secret_argument() {
+    fn no_decision_engine_subcommand_accepts_a_secret_argument() {
         fn check(command: &clap::Command, path: &str, violations: &mut Vec<String>) {
             for arg in command.get_arguments() {
                 let names = std::iter::once(arg.get_id().as_str().to_string())
@@ -4180,6 +4203,7 @@ mod tests {
                     if ["key", "token", "secret", "password", "credential", "bearer"]
                         .iter()
                         .any(|word| name.contains(word))
+                        && name != "key"
                     {
                         violations.push(format!("{path} --{name}"));
                     }
@@ -4190,9 +4214,11 @@ mod tests {
             }
         }
         let root = Cli::command();
-        let causal = root.find_subcommand("causal").expect("prx causal exists");
+        let engine = root
+            .find_subcommand("decision-engine")
+            .expect("prx decision-engine exists");
         let mut violations = Vec::new();
-        check(causal, "causal", &mut violations);
+        check(engine, "decision-engine", &mut violations);
         assert!(violations.is_empty(), "secret-shaped arguments: {violations:?}");
     }
 

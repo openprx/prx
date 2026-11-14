@@ -26,7 +26,7 @@ async fn a_second_physical_attempt_reaches_the_gate_but_expires_while_the_first_
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::new(config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [4; 32],
         budgets,
@@ -88,7 +88,7 @@ async fn a_blocked_settlement_overlaps_admission_but_keeps_its_hold_and_cleanup_
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::new(config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [3; 32],
         budgets,
@@ -182,7 +182,7 @@ async fn an_unconfirmed_background_settlement_closes_further_accounting() -> any
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::new(config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [4; 32],
         budgets,
@@ -251,7 +251,7 @@ async fn request_preparation_overlaps_the_gate_without_authorizing_an_expired_se
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::new(config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [7; 32],
         budgets,
@@ -327,7 +327,7 @@ fn binding_a_stricter_scope_can_only_reduce_the_original_money_owner() {
     let scope = |micro_usd| {
         AccountingScope::new(
             Arc::clone(&config),
-            DecisionKey::ephemeral(),
+            crate::security::runtime_key::test_support::ephemeral_key(),
             Arc::clone(&cleanup),
             [9; 32],
             TurnBudgets {
@@ -360,7 +360,7 @@ async fn a_subscription_decision_settles_without_a_priced_row() -> anyhow::Resul
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::new(config.clone()),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [8; 32],
         budgets,

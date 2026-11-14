@@ -709,7 +709,7 @@ async fn ingress_recovery_off_with_causal_tree_disabled_creates_no_key_or_store(
             1,
         );
         let writer = store.writer().expect("test: read-write store has a writer");
-        let _ = writer.record_decision(record);
+        let _ = writer.record_chain(vec![record]);
     }
     let legacy_db = crate::runtime::decision_journal::store::db_path(dir.path());
     assert!(legacy_db.exists(), "test: the legacy database is populated");

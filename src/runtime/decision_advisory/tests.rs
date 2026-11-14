@@ -8,7 +8,7 @@ struct GatedWriter {
 }
 
 impl TelemetryWriter for GatedWriter {
-    fn append_fifo(&mut self, _: TurnOutcome, _: usize) -> anyhow::Result<()> {
+    fn append_fifo(&mut self, _: crate::decision_engine::TelemetryRecord, _: usize) -> anyhow::Result<()> {
         if let Some(entered) = self.entered.take() {
             let _ = entered.send(());
         }
@@ -41,7 +41,16 @@ async fn late_advisory_drain_closes_admission_and_completes_after_release() {
     })
     .unwrap();
     assert_eq!(
-        observations.observe(TurnOutcome::new(None, vec![], true).unwrap()),
+        observations.observe(
+            TurnOutcome::new(
+                None,
+                vec![],
+                crate::decision_engine::TurnResultClass::Completed,
+                None,
+                0
+            )
+            .unwrap()
+        ),
         crate::decision_engine::ObserveAdmission::Accepted
     );
     entered_rx.await.unwrap();
@@ -471,11 +480,38 @@ async fn forced_drop_is_reported_only_for_its_workspace() {
         observations.register_status(workspace);
         if workspace == a.path() {
             // One outcome blocks the writer, one fills the queue, the third drops.
-            observations.observe(TurnOutcome::new(None, vec![], true).unwrap());
+            observations.observe(
+                TurnOutcome::new(
+                    None,
+                    vec![],
+                    crate::decision_engine::TurnResultClass::Completed,
+                    None,
+                    0,
+                )
+                .unwrap(),
+            );
             entered_rx.await.unwrap();
-            observations.observe(TurnOutcome::new(None, vec![], true).unwrap());
+            observations.observe(
+                TurnOutcome::new(
+                    None,
+                    vec![],
+                    crate::decision_engine::TurnResultClass::Completed,
+                    None,
+                    0,
+                )
+                .unwrap(),
+            );
             assert_eq!(
-                observations.observe(TurnOutcome::new(None, vec![], true).unwrap()),
+                observations.observe(
+                    TurnOutcome::new(
+                        None,
+                        vec![],
+                        crate::decision_engine::TurnResultClass::Completed,
+                        None,
+                        0
+                    )
+                    .unwrap()
+                ),
                 crate::decision_engine::ObserveAdmission::Dropped
             );
         }
@@ -530,7 +566,16 @@ async fn late_advisory_drain_warns_exactly_once() {
         }))
     })
     .unwrap();
-    observations.observe(TurnOutcome::new(None, vec![], true).unwrap());
+    observations.observe(
+        TurnOutcome::new(
+            None,
+            vec![],
+            crate::decision_engine::TurnResultClass::Completed,
+            None,
+            0,
+        )
+        .unwrap(),
+    );
     entered_rx.await.unwrap();
     assert!(
         advisory
@@ -668,7 +713,11 @@ async fn observation_never_waits_for_the_telemetry_open() {
     let mut config = (*enabled_config(temp.path())).clone();
     config.decision_engine.mode = DecisionMode::Both;
     let advisory = DecisionAdvisory::new(Arc::new(config), None);
-    advisory.observe(ExecutionTraceSnapshot::default, Some("decision-1".into()), true);
+    advisory.observe(
+        ExecutionTraceSnapshot::default,
+        Some("decision-1".into()),
+        completed_end(),
+    );
     assert!(!advisory.initialized(), "observe returned before any telemetry open");
     assert!(!temp.path().join("decision-engine.sqlite").exists());
     assert!(
@@ -680,7 +729,7 @@ async fn observation_never_waits_for_the_telemetry_open() {
     assert!(advisory.initialized());
     let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
     assert_eq!(
-        store.outcomes().unwrap().len(),
+        store.outcomes(100_000).unwrap().len(),
         1,
         "the outcome was admitted and flushed"
     );
@@ -705,7 +754,11 @@ async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
     // `observe` is synchronous: each observation returns without yielding,
     // so the opener cannot run in between.
     for index in 0..OBSERVED {
-        advisory.observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true);
+        advisory.observe(
+            ExecutionTraceSnapshot::default,
+            Some(format!("decision-{index}")),
+            completed_end(),
+        );
     }
     assert!(!advisory.initialized(), "the opener has not run");
     assert!(!temp.path().join("decision-engine.sqlite").exists());
@@ -739,7 +792,7 @@ async fn stalled_opener_leaves_a_bounded_queue_and_counts_the_overflow() {
     );
     let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
     assert_eq!(
-        store.outcomes().unwrap().len(),
+        store.outcomes(100_000).unwrap().len(),
         BOUND as usize,
         "every queued outcome is flushed"
     );
@@ -779,7 +832,11 @@ async fn drain_during_the_pre_open_handover_waits_for_the_transfer() {
     entered_rx.await.unwrap();
 
     for index in 0..OBSERVED {
-        advisory.observe(ExecutionTraceSnapshot::default, Some(format!("decision-{index}")), true);
+        advisory.observe(
+            ExecutionTraceSnapshot::default,
+            Some(format!("decision-{index}")),
+            completed_end(),
+        );
     }
     {
         let pending = advisory.pending.lock();
@@ -841,7 +898,16 @@ async fn drain_during_the_pre_open_handover_waits_for_the_transfer() {
         .dropped
         .load(std::sync::atomic::Ordering::SeqCst);
     let store = SqliteTelemetryWriter::open(&temp.path().join("decision-engine.sqlite")).unwrap();
-    let stored = store.outcomes().unwrap().len() as u64;
+    let stored = store.outcomes(100_000).unwrap().len() as u64;
     assert_eq!(stored + dropped, OBSERVED, "no queued outcome is lost");
     assert_eq!(stored, u64::from(BOUND), "every queued outcome is stored");
+}
+
+/// A completed turn without usage, for observation cells.
+fn completed_end() -> super::TurnEnd<'static> {
+    super::TurnEnd {
+        result: crate::decision_engine::TurnResultClass::Completed,
+        duration_ms: 1,
+        usage: None,
+    }
 }

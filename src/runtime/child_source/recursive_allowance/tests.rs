@@ -70,7 +70,7 @@ fn recursive_allowance_exhausted_refuses_spawn_without_decision_service() -> any
             delegation: None,
         },
         generation,
-        crate::security::runtime_key::DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::new(RecursiveAllowance::new(100_000)),
     );
     let child = ChildCapabilityManifest::derive_strict_subset(&parent.constraints, &[])?;

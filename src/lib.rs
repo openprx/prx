@@ -109,7 +109,6 @@ pub mod agent;
 pub mod approval;
 pub mod auth;
 pub mod capability;
-pub mod causal_cli;
 pub(crate) mod causal_tree;
 pub mod channels;
 #[allow(private_interfaces)]
@@ -121,6 +120,7 @@ pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod decision_engine;
+pub mod decision_engine_cli;
 pub mod doctor;
 pub mod evolution_cli;
 pub mod fitness_cli;
@@ -729,7 +729,7 @@ mod module_ownership_tests {
             "mod agent;",
             "mod approval;",
             "mod auth;",
-            "mod causal_cli;",
+            "mod decision_engine_cli;",
             "mod causal_tree;",
             "mod channels;",
             "mod chat;",

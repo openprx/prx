@@ -63,21 +63,5 @@ pub(super) fn open_with(
     Ok(store)
 }
 
-/// Check holder count and detach under the same short state lock used by
-/// borrowers. Neither this lock nor the registry participates in SQLite I/O.
-pub(super) fn detach_last(store: &Arc<CausalDecisionStore>) -> bool {
-    let Some(slot) = &store.shared_slot else {
-        return Arc::strong_count(store) == 1;
-    };
-    let mut current = slot.current.lock();
-    if Arc::strong_count(store) > 1 {
-        return false;
-    }
-    if current.ptr_eq(&Arc::downgrade(store)) {
-        *current = Weak::new();
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests;

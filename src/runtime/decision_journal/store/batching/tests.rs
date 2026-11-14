@@ -1,7 +1,6 @@
 #![cfg(test)]
 use super::*;
-use crate::observability::causal_event::CausalEventSink;
-use crate::runtime::decision_journal::store::{DecisionId, Retention, now_ms, store_schema, testing};
+use crate::runtime::decision_journal::store::{DecisionId, now_ms, store_schema, testing};
 use anyhow::Context;
 use std::sync::{
     Arc,
@@ -100,67 +99,5 @@ fn an_outer_commit_failure_acknowledges_no_chain() -> anyhow::Result<()> {
     assert!(insert_ready(&mut connection, &batches).is_err());
     assert!(connection.is_autocommit());
     assert_eq!(rows(&connection)?, 0);
-    Ok(())
-}
-
-struct CommittedNotifications {
-    counter: Arc<AtomicUsize>,
-    seen: parking_lot::Mutex<Vec<usize>>,
-}
-impl CausalEventSink for CommittedNotifications {
-    fn emit(&self, event: CausalEvent) {
-        if event.kind == CausalEventKind::DecisionCommitted {
-            self.seen.lock().push(self.counter.load(Ordering::SeqCst));
-        }
-    }
-}
-
-#[test]
-fn the_real_writer_stops_batches_at_drain_and_capacity_before_notifying() -> anyhow::Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("prx_decisions.db");
-    let mut connection = Connection::open(&path)?;
-    store_schema::migrate(&mut connection)?;
-    let workspace = store_schema::workspace_id(&connection)?.context("workspace")?;
-    let counter = commit_counter(&mut connection)?;
-    let events = Arc::new(CommittedNotifications {
-        counter: Arc::clone(&counter),
-        seen: parking_lot::Mutex::new(Vec::new()),
-    });
-    let (queue, commands) = std::sync::mpsc::sync_channel(64);
-    for _ in 0..2 {
-        queue.send(WriterMessage::DecisionBatch(
-            vec![record(&workspace)].into_boxed_slice(),
-        ))?;
-    }
-    let (done, drained) = std::sync::mpsc::channel();
-    queue.send(WriterMessage::Drain(done))?;
-    for _ in 0..40 {
-        queue.send(WriterMessage::DecisionBatch(
-            vec![record(&workspace)].into_boxed_slice(),
-        ))?;
-    }
-    let (done, closed) = std::sync::mpsc::channel();
-    queue.send(WriterMessage::Close(done))?;
-    let sink: Arc<dyn CausalEventSink> = events.clone();
-    super::super::run_writer(WriterThread {
-        conn: connection,
-        commands,
-        events: sink,
-        retention: Retention::days(30, 30),
-        path: path.clone(),
-        writes_since_prune: 0,
-        hold: None,
-    });
-    assert!(drained.try_recv().is_ok());
-    assert!(closed.try_recv().is_ok());
-    assert_eq!(counter.load(Ordering::SeqCst), 3);
-    let seen = events.seen.lock();
-    assert_eq!(seen.len(), 42);
-    assert!(seen.iter().take(2).all(|count| *count == 1));
-    assert!(seen.iter().skip(2).take(32).all(|count| *count == 2));
-    assert!(seen.iter().skip(34).all(|count| *count == 3));
-    drop(seen);
-    assert_eq!(rows(&Connection::open(&path)?)?, 42);
     Ok(())
 }

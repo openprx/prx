@@ -170,7 +170,7 @@ async fn cancelled_reservation_handoff_releases_only_the_unclaimed_attempt() -> 
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::clone(&config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [1; 32],
         budgets,
@@ -232,7 +232,7 @@ async fn cancelled_reservation_handoff_releases_only_the_unclaimed_attempt() -> 
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         Arc::clone(&config),
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [2; 32],
         budgets,
@@ -281,7 +281,7 @@ async fn a_request_above_the_retry_share_can_use_the_existing_owner_allowance() 
     let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
     let scope = AccountingScope::new(
         config,
-        DecisionKey::ephemeral(),
+        crate::security::runtime_key::test_support::ephemeral_key(),
         Arc::clone(&cleanup),
         [3; 32],
         budgets,
@@ -364,7 +364,7 @@ async fn a_failed_price_or_money_claim_restores_only_the_acquired_allowance() ->
         let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
         let scope = AccountingScope::new(
             Arc::new(config),
-            DecisionKey::ephemeral(),
+            crate::security::runtime_key::test_support::ephemeral_key(),
             Arc::clone(&cleanup),
             [4; 32],
             budgets,
@@ -468,7 +468,7 @@ async fn run_case(case: Case) -> anyhow::Result<()> {
         CleanupScope::new(None, cancellation)?
             .with_acknowledgement(Some(ack))
             .run(async {
-                let key = DecisionKey::ephemeral();
+                let key = crate::security::runtime_key::test_support::ephemeral_key();
                 let owner = current_tracker().context("actual cleanup scope missing")?;
                 // A test-owned accounting operation, not a fabricated ingress grant.
                 let scope_id = key.hmac(
@@ -695,7 +695,7 @@ async fn recursive_parent_child_and_leaf_reservations_share_the_original_money()
                 let deadline = Instant::now() + Duration::from_millis(budgets.latency_ms);
                 let scope = AccountingScope::new(
                     Arc::clone(&config),
-                    DecisionKey::ephemeral(),
+                    crate::security::runtime_key::test_support::ephemeral_key(),
                     Arc::clone(&cleanup),
                     [id; 32],
                     budgets,
@@ -721,7 +721,7 @@ async fn recursive_parent_child_and_leaf_reservations_share_the_original_money()
                 assert_eq!(owner.load(Ordering::Acquire), micro_usd - reserved);
                 let overdraw = AccountingScope::new(
                     Arc::clone(&config),
-                    DecisionKey::ephemeral(),
+                    crate::security::runtime_key::test_support::ephemeral_key(),
                     Arc::clone(&cleanup),
                     [id + 3; 32],
                     TurnBudgets {

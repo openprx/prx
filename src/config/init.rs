@@ -58,7 +58,7 @@ impl Spec {
         self,
         target_dir: &Path,
         force: bool,
-        decision: Option<&crate::causal_cli::DecisionSetup>,
+        decision: Option<&crate::decision_engine_cli::DecisionSetup>,
     ) -> Result<()> {
         if let Some(decision) = decision {
             decision.check()?;

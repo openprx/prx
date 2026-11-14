@@ -560,9 +560,6 @@ planted_violation_probes! {
     probe_decision_compiler_untrusted_option: decision_compiler_uses_typed_ids_and_only_redacted_state,
         "src/decision_engine/questions.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn d0_planted_option(state: &CausalState) { let _ = OptionId::code(state.routing_input.as_str()); }\n";
-    probe_causal_admin_commit_neighbor: the_causal_domain_imports_no_backend_and_no_network,
-        "src/causal_tree/admin.rs", Planted::AppendedTo, Reads::ProductionText,
-        "fn planted_commit() { let _ = crate::config::files::commit_mutation_guarded; }\n";
     probe_causal_child_replay_memory_neighbor: the_causal_domain_imports_no_backend_and_no_network,
         "src/runtime/decision_journal/store/child_outcome.rs", Planted::AppendedTo, Reads::ProductionText,
         "fn planted_memory() { let _ = crate::memory::MemoryFabric::new; }\n";

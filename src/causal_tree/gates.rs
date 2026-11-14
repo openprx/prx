@@ -1610,7 +1610,9 @@ mod tests {
             .collect();
         let key = fixtures::key();
         let parent = CapabilityConstraints {
-            parent_authority_id: DecisionId::legacy(&[9; 32]).into(),
+            parent_authority_id: DecisionId::parse("0192f0c4-0000-7000-8000-000000000009")
+                .expect("test: id")
+                .into(),
             allowed: refs.iter().cloned().collect(),
             authority: AuthorityEnvelope {
                 owner: "owner-1".into(),

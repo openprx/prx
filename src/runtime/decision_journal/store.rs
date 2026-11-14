@@ -1036,28 +1036,10 @@ pub(crate) enum Enqueue {
     Dropped,
 }
 
-/// The import progress of one v1 feedback file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImportProgress {
-    pub(crate) file: String,
-    pub(crate) digest: String,
-    pub(crate) lines: u64,
-}
-
-impl ImportProgress {
-    fn meta_key(file: &str) -> String {
-        format!("v1_import:{file}")
-    }
-
-    fn meta_value(&self) -> String {
-        format!("{} {}", self.digest, self.lines)
-    }
-}
-
 mod child_recovery;
 pub(crate) use child_recovery::{ChildRecoveryCursor, ChildRecoveryLineage};
 mod child_outcome;
-pub(crate) use child_outcome::{ChildOutcomeLink, ChildOutcomeView};
+pub(crate) use child_outcome::ChildOutcomeLink;
 
 enum WriterMessage {
     ChildOutcome(Box<ChildOutcomeLink>),
@@ -1065,13 +1047,7 @@ enum WriterMessage {
 
     ReplayChain(Box<acknowledged::ReplayChain>),
     Outcome(Box<OutcomeRecord>),
-    /// A v1 file's progress, saved only when every listed decision is
-    /// stored (a record the writer failed to store is never marked done).
-    Imported(ImportProgress, Vec<DecisionId>),
     Drain(std::sync::mpsc::Sender<()>),
-    /// Checkpoint the WAL, close the connection and stop the writer; the
-    /// sender is answered once the connection is closed.
-    Close(std::sync::mpsc::Sender<()>),
 }
 
 mod acknowledged;
@@ -1093,12 +1069,6 @@ impl std::fmt::Debug for DecisionStoreWriter {
 }
 
 impl DecisionStoreWriter {
-    /// Queue `record`. Never blocks: when the queue is full the record is
-    /// dropped, counted and reported (D-040 OQ-A8).
-    pub(crate) fn record_decision(&self, record: DecisionRecord) -> Enqueue {
-        self.record_chain(vec![record])
-    }
-
     /// Admit one bounded hop chain as a single queue item. The writer uses
     /// one SQLite transaction; a full queue loses the entire chain.
     pub(crate) fn record_chain(&self, mut records: Vec<DecisionRecord>) -> Enqueue {
@@ -1162,26 +1132,10 @@ impl DecisionStoreWriter {
         }
     }
 
-    /// Queue the import progress of one v1 file, after its records; it is
-    /// saved only when every decision of `imported` is stored (D-091 F-11).
-    pub(crate) fn mark_imported(&self, progress: ImportProgress, imported: Vec<DecisionId>) -> Enqueue {
-        match self.queue.try_send(WriterMessage::Imported(progress, imported)) {
-            Ok(()) => Enqueue::Queued,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Enqueue::Dropped,
-        }
-    }
-
     /// Wait, until `deadline` at most, for everything queued before this
     /// call to be written (shutdown, and the importer's pacing).
     pub(crate) async fn drain(&self, deadline: Instant) -> bool {
         self.send_and_wait(WriterMessage::Drain, deadline).await
-    }
-
-    /// Write everything queued, checkpoint the WAL and close the writer's
-    /// connection, waiting until `deadline` at most. Later records are
-    /// dropped and reported.
-    async fn close(&self, deadline: Instant) {
-        let _ = self.send_and_wait(WriterMessage::Close, deadline).await;
     }
 
     async fn send_and_wait(
@@ -1270,9 +1224,6 @@ fn emit_incomplete(events: &dyn CausalEventSink, lineage: CausalLineage, reason:
 pub(crate) enum DecisionScope {
     /// One owner's decisions in a workspace.
     Owner { workspace_id: Arc<str>, owner_id: Arc<str> },
-    /// Every decision of the workspace, including those without an owner:
-    /// the local operator (D-019 Q-5).
-    LocalOperator { workspace_id: Arc<str> },
 }
 
 impl DecisionScope {
@@ -1284,16 +1235,8 @@ impl DecisionScope {
                 "d.workspace_id = ?2 AND d.owner_id = ?3",
                 [workspace_id.as_ref(), owner_id.as_ref()],
             ),
-            Self::LocalOperator { workspace_id } => ("d.workspace_id = ?2 AND ?3 = ?3", [workspace_id.as_ref(), ""]),
         }
     }
-}
-
-/// A half-open time window `[from_ms, to_ms)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TimeWindow {
-    pub(crate) from_ms: i64,
-    pub(crate) to_ms: i64,
 }
 
 /// One outcome of a decision, as read back.
@@ -1381,14 +1324,6 @@ impl DecisionView {
 /// The directive kinds whose decisions may name an issued child as their parent.
 pub(crate) fn directive_admits_issued_child(directive_kind: &str) -> bool {
     matches!(directive_kind, "delegate" | "answer")
-}
-
-/// The rows evaluation reads (CDP-10): the non-legacy decisions of a window
-/// with their outcomes, and how many legacy rows were left out.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct EvaluationRows {
-    pub(crate) decisions: Vec<DecisionView>,
-    pub(crate) legacy_excluded: u64,
 }
 
 const DECISION_COLUMNS_BASE: &str = "d.decision_id, d.created_at_ms, d.owner_id IS NOT NULL, d.run_id, d.task_id, \
@@ -1814,57 +1749,6 @@ impl DecisionStoreReader {
         })
     }
 
-    /// Read gate diagnostics only for the same authorized decision scope.
-    /// Oversized payloads are unavailable to inspection, never truncated into
-    /// apparently valid evidence. Callers must project a safe summary.
-    pub(crate) fn inspection_gates(
-        &self,
-        scope: &DecisionScope,
-        id: &DecisionId,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
-        self.with(None, |conn| {
-            let (clause, [first, second]) = scope.clause();
-            let sql = format!(
-                "SELECT CASE WHEN length(d.gates_json) <= 1048576 THEN d.gates_json ELSE NULL END \
-                 FROM decisions d WHERE d.decision_id = ?1 AND {clause}"
-            );
-            let raw: Option<Option<String>> = conn
-                .prepare_cached(&sql)?
-                .query_row(params![id.to_string(), first, second], |row| row.get(0))
-                .optional()?;
-            raw.flatten()
-                .map(|text| serde_json::from_str(&text))
-                .transpose()
-                .map_err(StoreError::from)
-        })
-    }
-
-    /// Read only the opt-in projection actually stored for this decision.
-    /// The byte bound prevents oversized history from becoming an unbounded
-    /// inspection response; absent and oversized projections stay absent.
-    pub(crate) fn inspection_projection(
-        &self,
-        scope: &DecisionScope,
-        id: &DecisionId,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
-        self.with(None, |conn| {
-            let (clause, [first, second]) = scope.clause();
-            let sql = format!(
-                "SELECT CASE WHEN length(CAST(d.redacted_projection AS BLOB)) <= 1048576 \
-                 THEN d.redacted_projection ELSE NULL END FROM decisions d \
-                 WHERE d.decision_id = ?1 AND {clause}"
-            );
-            let raw: Option<Option<String>> = conn
-                .prepare_cached(&sql)?
-                .query_row(params![id.to_string(), first, second], |row| row.get(0))
-                .optional()?;
-            raw.flatten()
-                .map(|text| serde_json::from_str(&text))
-                .transpose()
-                .map_err(StoreError::from)
-        })
-    }
-
     /// Read the decision and its replay binding in one SQLite statement. Legacy
     /// schemas cannot provide the full binding and therefore cannot be replayed.
     pub(crate) fn replay_record(
@@ -1881,131 +1765,6 @@ impl DecisionStoreReader {
     pub(crate) fn outcome_matches(&self, scope: &DecisionScope, record: &OutcomeRecord) -> Result<bool, StoreError> {
         self.with(false, |conn| outcome_matches_on_connection(conn, scope, record))
     }
-
-    /// The non-legacy decisions of `scope` created in `window`, with their
-    /// outcomes, and the number of legacy rows left out.
-    ///
-    /// # Errors
-    ///
-    /// A failed read or an undecodable row.
-    pub(crate) fn evaluation_rows(
-        &self,
-        scope: &DecisionScope,
-        window: TimeWindow,
-    ) -> Result<EvaluationRows, StoreError> {
-        self.with(EvaluationRows::default(), |conn| {
-            let (clause, [first, second]) = scope.clause();
-            let columns = decision_columns(conn)?;
-            let sql = format!(
-                "SELECT {columns} FROM decisions d WHERE ?1 = ?1 AND {clause} \
-                 AND d.created_at_ms >= ?4 AND d.created_at_ms < ?5 ORDER BY d.created_at_ms, d.decision_id"
-            );
-            let mut statement = conn.prepare_cached(&sql)?;
-            let raws = statement
-                .query_map(
-                    params!["", first, second, window.from_ms, window.to_ms],
-                    RawDecision::read,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut rows = EvaluationRows::default();
-            for raw in raws {
-                if raw.legacy_v1 {
-                    rows.legacy_excluded += 1;
-                    continue;
-                }
-                let outcomes = outcomes_of(conn, &raw.id)?;
-                rows.decisions.push(raw.decode(outcomes)?);
-            }
-            Ok(rows)
-        })
-    }
-
-    /// The decisions of `scope` in `window`, newest first, at most `limit`
-    /// (the Gateway's list, deferred from CDP-09 by D-090). Imported v1 rows
-    /// have no owner, so an owner scope never lists them.
-    ///
-    /// # Errors
-    ///
-    /// A failed read.
-    pub(crate) fn list(
-        &self,
-        scope: &DecisionScope,
-        window: TimeWindow,
-        limit: u32,
-    ) -> Result<Vec<DecisionView>, StoreError> {
-        self.with(Vec::new(), |conn| {
-            let (clause, [first, second]) = scope.clause();
-            let columns = decision_columns(conn)?;
-            let sql = format!(
-                "SELECT {columns} FROM decisions d WHERE ?1 = ?1 AND {clause} \
-                 AND d.created_at_ms >= ?4 AND d.created_at_ms < ?5 \
-                 ORDER BY d.created_at_ms DESC, d.decision_id DESC LIMIT ?6"
-            );
-            let mut statement = conn.prepare_cached(&sql)?;
-            let raws = statement
-                .query_map(
-                    params!["", first, second, window.from_ms, window.to_ms, i64::from(limit)],
-                    RawDecision::read,
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut views = Vec::with_capacity(raws.len());
-            for raw in raws {
-                let outcomes = outcomes_of(conn, &raw.id)?;
-                views.push(raw.decode(outcomes)?);
-            }
-            Ok(views)
-        })
-    }
-
-    /// The recorded import progress of the v1 file `file`.
-    ///
-    /// # Errors
-    ///
-    /// A failed read.
-    pub(crate) fn import_progress(&self, file: &str) -> Result<Option<ImportProgress>, StoreError> {
-        self.with(None, |conn| {
-            let value: Option<String> = conn
-                .prepare_cached("SELECT value FROM store_meta WHERE key = ?1")?
-                .query_row([ImportProgress::meta_key(file)], |row| row.get(0))
-                .optional()?;
-            Ok(value.and_then(|value| {
-                let (digest, lines) = value.split_once(' ')?;
-                Some(ImportProgress {
-                    file: file.to_string(),
-                    digest: digest.to_string(),
-                    lines: lines.parse().ok()?,
-                })
-            }))
-        })
-    }
-
-    /// Store facts for `prx causal status`: the schema version and the
-    /// number of decisions and outcomes.
-    ///
-    /// # Errors
-    ///
-    /// A failed read.
-    pub(crate) fn counts(&self) -> Result<StoreCounts, StoreError> {
-        self.with(StoreCounts::default(), |conn| {
-            Ok(StoreCounts {
-                schema_version: store_schema::version(conn)?,
-                decisions: conn.query_row("SELECT count(*) FROM decisions", [], |row| row.get(0))?,
-                legacy_decisions: conn.query_row("SELECT count(*) FROM decisions WHERE legacy_v1 = 1", [], |row| {
-                    row.get(0)
-                })?,
-                outcomes: conn.query_row("SELECT count(*) FROM outcomes", [], |row| row.get(0))?,
-            })
-        })
-    }
-}
-
-/// Row counts of the store.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct StoreCounts {
-    pub(crate) schema_version: i64,
-    pub(crate) decisions: i64,
-    pub(crate) legacy_decisions: i64,
-    pub(crate) outcomes: i64,
 }
 
 /// A read-only connection that never follows a symlink. An `immutable` one
@@ -2157,7 +1916,6 @@ fn uri_path(path: &Path) -> Result<String, StoreError> {
 /// The causal decision store of one workspace.
 pub(crate) struct CausalDecisionStore {
     shared_slot: Option<Arc<shared::StoreSlot>>,
-    path: PathBuf,
     mode: StoreMode,
     /// The store's stable id; `None` only when no database exists yet.
     workspace_id: Option<Arc<str>>,
@@ -2201,7 +1959,6 @@ impl CausalDecisionStore {
             tracing::warn!(%error, "decision store read-only view unavailable; using empty view");
             Self {
                 shared_slot: None,
-                path: db_path(workspace_dir),
                 mode: StoreMode::ReadOnly,
                 workspace_id: None,
                 reader: DecisionStoreReader {
@@ -2349,7 +2106,6 @@ impl CausalDecisionStore {
             })?;
         Ok(Self {
             shared_slot: None,
-            path,
             mode,
             workspace_id: Some(Arc::clone(&workspace_id)),
             reader,
@@ -2391,7 +2147,6 @@ impl CausalDecisionStore {
             .map(Arc::<str>::from);
         Ok(Some(Self {
             shared_slot: None,
-            path,
             mode: StoreMode::ReadOnly,
             workspace_id,
             reader,
@@ -2436,36 +2191,11 @@ impl CausalDecisionStore {
         };
         Ok(Self {
             shared_slot: None,
-            path,
             mode: StoreMode::ReadOnly,
             workspace_id,
             reader,
             writer: None,
         })
-    }
-
-    /// Close `store` for this holder: everything queued is written, and when
-    /// no other holder in the process shares it, the idle readers are closed
-    /// and the writer checkpoints the WAL and closes its connection, so no
-    /// `-wal` or `-shm` file is left (R-I1-phase2 R-1). Waits until
-    /// `deadline` at most.
-    ///
-    /// The other holders are counted under the per-path state lock, and the last
-    /// holder removes the store from the registry in the same critical
-    /// section, so no concurrent [`Self::open_shared`] can pick up a store
-    /// that is closing: it opens a fresh one (R-I1-confirm Note 1). A holder
-    /// keeps the `Arc<CausalDecisionStore>`, never only a writer clone: a
-    /// writer clone is not counted (the CDP-22 contract).
-    pub(crate) async fn close(store: Arc<Self>, deadline: Instant) {
-        let Some(writer) = store.writer() else {
-            return;
-        };
-        writer.drain(deadline).await;
-        if !shared::detach_last(&store) {
-            return;
-        }
-        store.reader.idle.lock().clear();
-        writer.close(deadline).await;
     }
 
     /// The writer; `None` when the store is read-only (a disabled plane, or
@@ -2482,11 +2212,6 @@ impl CausalDecisionStore {
     /// Whether the store may write.
     pub(crate) const fn mode(&self) -> StoreMode {
         self.mode
-    }
-
-    /// The database path, for status output.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 
     /// The store's stable workspace id, the one scope key; `None` when no
@@ -2690,17 +2415,6 @@ fn restrict(_path: &Path, _mode: u32) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Whether every decision of `ids` is stored.
-fn all_stored(conn: &Connection, ids: &[DecisionId]) -> Result<bool, StoreError> {
-    let mut statement = conn.prepare_cached("SELECT 1 FROM decisions WHERE decision_id = ?1")?;
-    for id in ids {
-        if !statement.exists([id.to_string()])? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Delete decisions created before `cutoff_ms`, [`PRUNE_BATCH`] per
 /// transaction; their outcomes cascade. Returns the number deleted.
 fn prune(conn: &mut Connection, cutoff_ms: i64) -> Result<u64, StoreError> {
@@ -2878,14 +2592,6 @@ fn outcome_lineage(conn: &Connection, decision_id: DecisionId) -> Result<CausalL
     })
 }
 
-fn save_progress(conn: &Connection, progress: &ImportProgress) -> rusqlite::Result<usize> {
-    conn.execute(
-        "INSERT INTO store_meta (key, value) VALUES (?1, ?2) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![ImportProgress::meta_key(&progress.file), progress.meta_value()],
-    )
-}
-
 struct WriterThread {
     conn: Connection,
     commands: Receiver<WriterMessage>,
@@ -2917,47 +2623,14 @@ fn run_writer(mut thread: WriterThread) {
             WriterMessage::ReplayChain(read) => read.finish(&mut thread),
             WriterMessage::Outcome(record) => thread.write_outcome(&record),
             WriterMessage::ChildOutcome(record) => thread.write_child_outcome(&record),
-            WriterMessage::Imported(progress, imported) => match all_stored(&thread.conn, &imported) {
-                Ok(true) => {
-                    if let Err(error) = save_progress(&thread.conn, &progress) {
-                        tracing::warn!("decision store could not record v1 import progress: {error}");
-                    }
-                }
-                Ok(false) => {
-                    tracing::warn!("a v1 feedback file was not fully stored; it is imported again on the next open");
-                }
-                Err(error) => {
-                    tracing::warn!("decision store could not check v1 import progress: {error}")
-                }
-            },
             WriterMessage::Drain(done) => {
                 let _ = done.send(());
-            }
-            WriterMessage::Close(done) => {
-                thread.close();
-                let _ = done.send(());
-                return;
             }
         }
     }
 }
 
 impl WriterThread {
-    /// Checkpoint the WAL into the database and close the connection. The
-    /// last connection to close removes `-wal` and `-shm`, so an enabled run
-    /// leaves no pending WAL behind (R-I1-phase2 R-1).
-    fn close(self) {
-        if let Err(error) = self
-            .conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))
-        {
-            tracing::warn!("decision store could not checkpoint its WAL on close: {error}");
-        }
-        if let Err((_, error)) = self.conn.close() {
-            tracing::warn!("decision store connection did not close cleanly: {error}");
-        }
-    }
-
     fn write_decisions(&mut self, records: &[DecisionRecord]) {
         match insert_decision_batch(&mut self.conn, records) {
             Ok(Some(inserted)) => {

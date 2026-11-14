@@ -139,3 +139,45 @@ pub(crate) fn open_private(workspace_dir: &Path, events: Arc<dyn CausalEventSink
     )
     .expect("test: open")
 }
+
+/// Row counts of the store, read by tests only (the admin readers that
+/// reported them in production were deleted with the admin service).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StoreCounts {
+    pub(crate) schema_version: i64,
+    pub(crate) decisions: i64,
+    pub(crate) legacy_decisions: i64,
+    pub(crate) outcomes: i64,
+}
+
+impl DecisionStoreReader {
+    /// The store's row counts, for test assertions.
+    pub(crate) fn counts(&self) -> Result<StoreCounts, StoreError> {
+        self.with(StoreCounts::default(), |conn| {
+            Ok(StoreCounts {
+                schema_version: store_schema::version(conn)?,
+                decisions: conn.query_row("SELECT count(*) FROM decisions", [], |row| row.get(0))?,
+                legacy_decisions: conn.query_row("SELECT count(*) FROM decisions WHERE legacy_v1 = 1", [], |row| {
+                    row.get(0)
+                })?,
+                outcomes: conn.query_row("SELECT count(*) FROM outcomes", [], |row| row.get(0))?,
+            })
+        })
+    }
+}
+
+impl CausalDecisionStore {
+    /// Write everything queued, then release this holder, for tests that
+    /// reopen a store. The production close went with the admin service.
+    pub(crate) async fn close(store: Arc<Self>, deadline: Instant) {
+        if let Some(writer) = store.writer() {
+            let _ = writer.drain(deadline).await;
+        }
+        drop(store);
+    }
+
+    /// The database path of the workspace this store serves, for tests.
+    pub(crate) fn path(&self) -> PathBuf {
+        self.reader.path.as_deref().map_or_else(PathBuf::new, Path::to_path_buf)
+    }
+}
