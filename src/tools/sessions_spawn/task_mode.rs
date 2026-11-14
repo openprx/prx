@@ -1,4 +1,6 @@
-use super::{HistoryEntry, SPAWN_EXECUTION_CONTEXT, SubAgentRun, SubAgentStatus, steering_instruction};
+use super::{
+    HistoryEntry, SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext, SubAgentRun, SubAgentStatus, steering_instruction,
+};
 use crate::agent::channel_approval::spawn as spawn_scoped;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::turn_contracts::ScopeContext;
@@ -307,162 +309,166 @@ pub(super) async fn run_sub_agent_task(
         let loop_cleanup =
             crate::runtime::turn_cleanup::CleanupScope::new(cleanup_parent.as_ref(), CancellationToken::new())?
                 .with_acknowledgement(Some(cleanup_ack));
-        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(Some(run_beat), async move {
-            // Carry the segment proof across the spawn boundary explicitly.
-            let child_source = child_source_owned;
-            let child_service = child_service_owned;
-            let (observer, hooks): (Arc<dyn crate::observability::Observer>, Arc<HookManager>) =
-                match ordinary_runtime_owned {
-                    Some(runtime) => (runtime.observer, runtime.hooks),
-                    None => (
-                        Arc::new(NoopObserver),
-                        crate::tools::child_hooks::child_hooks(parent_hooks_owned, &workspace_dir_owned),
-                    ),
-                };
-            let context = &child_source.1;
-            let envelope = &context.envelope;
-            let scope_ctx = ScopeContext::from_execution_context(
-                &security,
-                context,
-                envelope.recipient.as_deref().unwrap_or_default(),
-            );
-            let memory_owned = child_fabric_owned.memory();
-            // Only build an `ApprovalManager` when a resolver is attached. Under
-            // permission-model Phase 1 the unified `SecurityPolicy::decide`
-            // (supervised: act-tools → Ask) is what routes a call into the
-            // resolver suspend path; the manager is just the UI/grant layer. Built
-            // from the live policy's autonomy level so `Full` / `ReadOnly` never
-            // suspend.
-            let approval_manager = approval_resolver_iter
-                .as_ref()
-                .map(|_| Arc::new(crate::approval::ApprovalManager::new()));
-            // G5b ruling 1: the child's dispatch approval is the run's
-            // production strategy, as at the root; without a resolver it
-            // refuses exactly as the root does.
-            let run_approval = crate::agent::execution_policy::run_approval_strategy(
-                approval_manager.clone(),
-                approval_resolver_iter.clone(),
-                "sessions_spawn",
-                Arc::clone(&security),
-                Some(cancel_token_owned.clone()),
-            );
-            let result = async {
-                let child_turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
-                    child_service,
-                    child_source.clone(),
-                    child_fabric_owned.clone(),
-                    child_config_owned,
-                    cleanup_parent.as_ref().context("child segment cleanup owner missing")?,
-                    &cancel_token_owned,
-                    child_usage_owned,
-                )
-                .await?
-                .with_child_cleanup(cleanup_confirmed);
-                let _ = segment_admitted.send(());
-
-                if let Some(system) = initial_system {
-                    let system = child_turn.prompt_with_skills(&system)?;
-                    if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {
-                        *previous = ChatMessage::system(system);
-                    } else {
-                        task_history.insert(0, ChatMessage::system(system));
-                    }
-                }
-                if let Some(task) = initial_task {
-                    task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
-                }
-                child_turn.enrich_input(&mut task_history)?;
-                // R9/R26: an enabled engine analyses the child task turn on
-                // its own runtime context and accounting scope.
-                let advice = {
-                    let routing = child_turn.routing();
-                    routing
-                        .service
-                        .advisory()
-                        .analyze_turn(routing.runtime, &cancel_token_owned)
-                        .await
-                };
-                let loop_outcome = loop_cleanup
-                    .run(crate::agent::turn_engine::run_turn(
-                        &mut task_history,
-                        crate::agent::turn_request::TurnRequest {
-                            advice,
-                            channel_name: "sessions_spawn",
-                            // chat event bridge: incremental loop output (v1.1a)
-                            scope: Some(&scope_ctx),
-                            mode: crate::agent::turn_contracts::ChatMode::default(),
-                            silent: true,
-                            expose_stay_silent: false,
-                            multimodal: &multimodal_config_owned,
-                            schedule: crate::agent::turn_request::TurnSchedule {
-                                read_only_tool_concurrency_window: 2,
-                                priority_scheduling_enabled: false,
-                                low_priority_tool_names: vec![
-                                    "sessions_spawn".to_string(),
-                                    "delegate".to_string(),
-                                    "cron".to_string(),
-                                ],
-                            },
-                            compaction: Some(child_turn.compaction()),
-                            decision: child_turn.routing(),
-                        },
-                        crate::agent::turn_request::TurnServices {
-                            provider: provider_instance.as_ref(),
-                            provider_name: &provider_name_owned,
-                            model: &model_name,
-                            temperature: temperature_value,
-                            tools_registry: tools_registry_owned,
-                            observer: observer.as_ref(),
-                            hooks: hooks.as_ref(),
-                            // silent — never print to the chat terminal (see note above)
-                            approval: approval_manager,
-                            approval_resolver: approval_resolver_iter,
-                            runtime_adapter: Some(child_turn.adapter_with_approval(run_approval)),
-                            memory: crate::agent::turn_request::ToolLoopMemory::new(
-                                &memory_owned,
-                                &workspace_dir_owned,
-                                Some(
-                                    DocumentIngestRuntime::from_scope(memory_owned.clone(), &scope_ctx)
-                                        .into_nested_turn(),
-                                ),
-                            )
-                            .with_event_fabric(child_fabric_owned),
-                        },
-                        crate::agent::turn_request::TurnDelivery {
-                            cancellation: Some(cancel_token_owned.clone()),
-                            on_delta: on_delta_iter,
-                            on_tool_call: on_tool_call_iter,
-                        },
-                    ))
-                    .await;
-                let (outcome, trace) = match loop_outcome {
-                    Ok(result) => result,
-                    Err(error) => {
-                        child_turn
-                            .fail(
-                                &error,
-                                cancel_token_owned.is_cancelled()
-                                    || crate::agent::turn_contracts::is_tool_loop_cancelled(&error),
-                            )
-                            .await?;
-                        return Err(error);
-                    }
-                };
-                let segment_usage = child_turn
-                    .complete(&outcome, &trace)
+        let spawn_context_owned = SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone).ok();
+        let mut loop_handle = spawn_scoped(crate::agent::idle::scope_beat(
+            Some(run_beat),
+            with_spawn_context(spawn_context_owned, async move {
+                // Carry the segment proof across the spawn boundary explicitly.
+                let child_source = child_source_owned;
+                let child_service = child_service_owned;
+                let (observer, hooks): (Arc<dyn crate::observability::Observer>, Arc<HookManager>) =
+                    match ordinary_runtime_owned {
+                        Some(runtime) => (runtime.observer, runtime.hooks),
+                        None => (
+                            Arc::new(NoopObserver),
+                            crate::tools::child_hooks::child_hooks(parent_hooks_owned, &workspace_dir_owned),
+                        ),
+                    };
+                let context = &child_source.1;
+                let envelope = &context.envelope;
+                let scope_ctx = ScopeContext::from_execution_context(
+                    &security,
+                    context,
+                    envelope.recipient.as_deref().unwrap_or_default(),
+                );
+                let memory_owned = child_fabric_owned.memory();
+                // Only build an `ApprovalManager` when a resolver is attached. Under
+                // permission-model Phase 1 the unified `SecurityPolicy::decide`
+                // (supervised: act-tools → Ask) is what routes a call into the
+                // resolver suspend path; the manager is just the UI/grant layer. Built
+                // from the live policy's autonomy level so `Full` / `ReadOnly` never
+                // suspend.
+                let approval_manager = approval_resolver_iter
+                    .as_ref()
+                    .map(|_| Arc::new(crate::approval::ApprovalManager::new()));
+                // G5b ruling 1: the child's dispatch approval is the run's
+                // production strategy, as at the root; without a resolver it
+                // refuses exactly as the root does.
+                let run_approval = crate::agent::execution_policy::run_approval_strategy(
+                    approval_manager.clone(),
+                    approval_resolver_iter.clone(),
+                    "sessions_spawn",
+                    Arc::clone(&security),
+                    Some(cancel_token_owned.clone()),
+                );
+                let result = async {
+                    let child_turn = crate::runtime::child_turn::ChildSegmentTurn::admit(
+                        child_service,
+                        child_source.clone(),
+                        child_fabric_owned.clone(),
+                        child_config_owned,
+                        cleanup_parent.as_ref().context("child segment cleanup owner missing")?,
+                        &cancel_token_owned,
+                        child_usage_owned,
+                    )
                     .await?
-                    .usage_settlement
-                    .into_iter()
-                    .collect();
-                Ok(SubAgentTaskResult {
-                    segment_usage,
-                    output: outcome.into_text(),
-                    history_commit_len: task_history.len(),
-                })
-            }
-            .await;
-            (task_history, result)
-        }));
+                    .with_child_cleanup(cleanup_confirmed);
+                    let _ = segment_admitted.send(());
+
+                    if let Some(system) = initial_system {
+                        let system = child_turn.prompt_with_skills(&system)?;
+                        if let Some(previous) = task_history.first_mut().filter(|message| message.role == "system") {
+                            *previous = ChatMessage::system(system);
+                        } else {
+                            task_history.insert(0, ChatMessage::system(system));
+                        }
+                    }
+                    if let Some(task) = initial_task {
+                        task_history.push(crate::agent::turn_contracts::inbound_user_message(&task));
+                    }
+                    child_turn.enrich_input(&mut task_history)?;
+                    // R9/R26: an enabled engine analyses the child task turn on
+                    // its own runtime context and accounting scope.
+                    let advice = {
+                        let routing = child_turn.routing();
+                        routing
+                            .service
+                            .advisory()
+                            .analyze_turn(routing.runtime, &cancel_token_owned)
+                            .await
+                    };
+                    let loop_outcome = loop_cleanup
+                        .run(crate::agent::turn_engine::run_turn(
+                            &mut task_history,
+                            crate::agent::turn_request::TurnRequest {
+                                advice,
+                                channel_name: "sessions_spawn",
+                                // chat event bridge: incremental loop output (v1.1a)
+                                scope: Some(&scope_ctx),
+                                mode: crate::agent::turn_contracts::ChatMode::default(),
+                                silent: true,
+                                expose_stay_silent: false,
+                                multimodal: &multimodal_config_owned,
+                                schedule: crate::agent::turn_request::TurnSchedule {
+                                    read_only_tool_concurrency_window: 2,
+                                    priority_scheduling_enabled: false,
+                                    low_priority_tool_names: vec![
+                                        "sessions_spawn".to_string(),
+                                        "delegate".to_string(),
+                                        "cron".to_string(),
+                                    ],
+                                },
+                                compaction: Some(child_turn.compaction()),
+                                decision: child_turn.routing(),
+                            },
+                            crate::agent::turn_request::TurnServices {
+                                provider: provider_instance.as_ref(),
+                                provider_name: &provider_name_owned,
+                                model: &model_name,
+                                temperature: temperature_value,
+                                tools_registry: tools_registry_owned,
+                                observer: observer.as_ref(),
+                                hooks: hooks.as_ref(),
+                                // silent — never print to the chat terminal (see note above)
+                                approval: approval_manager,
+                                approval_resolver: approval_resolver_iter,
+                                runtime_adapter: Some(child_turn.adapter_with_approval(run_approval)),
+                                memory: crate::agent::turn_request::ToolLoopMemory::new(
+                                    &memory_owned,
+                                    &workspace_dir_owned,
+                                    Some(
+                                        DocumentIngestRuntime::from_scope(memory_owned.clone(), &scope_ctx)
+                                            .into_nested_turn(),
+                                    ),
+                                )
+                                .with_event_fabric(child_fabric_owned),
+                            },
+                            crate::agent::turn_request::TurnDelivery {
+                                cancellation: Some(cancel_token_owned.clone()),
+                                on_delta: on_delta_iter,
+                                on_tool_call: on_tool_call_iter,
+                            },
+                        ))
+                        .await;
+                    let (outcome, trace) = match loop_outcome {
+                        Ok(result) => result,
+                        Err(error) => {
+                            child_turn
+                                .fail(
+                                    &error,
+                                    cancel_token_owned.is_cancelled()
+                                        || crate::agent::turn_contracts::is_tool_loop_cancelled(&error),
+                                )
+                                .await?;
+                            return Err(error);
+                        }
+                    };
+                    let segment_usage = child_turn
+                        .complete(&outcome, &trace)
+                        .await?
+                        .usage_settlement
+                        .into_iter()
+                        .collect();
+                    Ok(SubAgentTaskResult {
+                        segment_usage,
+                        output: outcome.into_text(),
+                        history_commit_len: task_history.len(),
+                    })
+                }
+                .await;
+                (task_history, result)
+            }),
+        ));
         let _loop_abort = AbortLoopOnDrop(loop_handle.abort_handle());
 
         // A queued steer may arrive immediately after the run is published.
@@ -544,5 +550,15 @@ pub(super) async fn run_sub_agent_task(
                 }
             }
         }
+    }
+}
+
+/// Task-locals do not cross `tokio::spawn`: the child loop re-installs this
+/// run's spawn context, so a recursive `sessions_spawn` from the child records
+/// this run as its parent and nests one level deeper (CR-CI-3).
+async fn with_spawn_context<F: std::future::Future>(context: Option<SpawnExecutionContext>, work: F) -> F::Output {
+    match context {
+        Some(context) => SPAWN_EXECUTION_CONTEXT.scope(context, work).await,
+        None => work.await,
     }
 }

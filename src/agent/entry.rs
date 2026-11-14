@@ -1352,8 +1352,11 @@ mod agent_turn_origin_tests {
         rejected(&nested, None);
     }
 
+    /// P2-R22 and controller ruling CR-CI-1: no spelling check exists at
+    /// proof issuance. A receipt-less CLI proof issues and binds the
+    /// PMM-trimmed model on the direct and the hint route.
     #[test]
-    fn raw_model_spelling_must_match_the_pmm_model_on_direct_and_hint_routes() {
+    fn raw_model_spelling_issues_a_proof_bound_to_the_pmm_model_on_direct_and_hint_routes() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -1363,18 +1366,18 @@ mod agent_turn_origin_tests {
         let direct_generation = crate::config::new_shared(config.clone()).pin();
         let direct_envelope = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run")
             .with_config_generation(&direct_generation);
-        assert!(
-            issue_cli_agent_turn_proof(
-                None,
-                &direct_envelope,
-                &direct_generation,
-                "prx_run",
-                "ping",
-                None,
-                &direct,
-            )
-            .is_err()
-        );
+        let proof = issue_cli_agent_turn_proof(
+            None,
+            &direct_envelope,
+            &direct_generation,
+            "prx_run",
+            "ping",
+            None,
+            &direct,
+        )
+        .expect("the direct route issues a proof");
+        assert_eq!(proof.model_binding().pinned_model(), "prx-local-model");
+        assert_eq!(proof.source_event_id(), None);
 
         config.default_model = Some("prx-local-model".to_string());
         config.model_routes.push(crate::config::ModelRouteConfig {
@@ -1389,13 +1392,17 @@ mod agent_turn_origin_tests {
         let hint_generation = crate::config::new_shared(config).pin();
         let hint_envelope = RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run")
             .with_config_generation(&hint_generation);
-        assert!(
-            issue_cli_agent_turn_proof(None, &hint_envelope, &hint_generation, "prx_run", "ping", None, &hint).is_err()
-        );
+        let proof = issue_cli_agent_turn_proof(None, &hint_envelope, &hint_generation, "prx_run", "ping", None, &hint)
+            .expect("the hint route issues a proof");
+        assert_eq!(proof.model_binding().pinned_model(), "prx-route-model");
     }
 
+    /// P2-R22 and controller ruling CR-CI-1: the OAuth placeholder root
+    /// issues a proof on the resolved provider and model. Whether the
+    /// placeholder becomes key material is decided at provider construction
+    /// (the OAuth context), not at the proof boundary.
     #[test]
-    fn oauth_placeholder_cannot_attest_to_root_wire_material() {
+    fn oauth_placeholder_root_issues_a_proof_on_the_resolved_provider_and_model() {
         let workspace = tempfile::tempdir().expect("test workspace");
         let mut config = Config::default();
         config.workspace_dir = workspace.path().to_path_buf();
@@ -1406,7 +1413,11 @@ mod agent_turn_origin_tests {
         let generation = crate::config::new_shared(config).pin();
         let envelope =
             RuntimeEnvelope::agent(workspace.path().to_string_lossy(), "prx_run").with_config_generation(&generation);
-        assert!(issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice).is_err());
+        let proof = issue_cli_agent_turn_proof(None, &envelope, &generation, "prx_run", "ping", None, &choice)
+            .expect("the placeholder root issues a proof");
+        assert_eq!(proof.model_binding().pinned_model(), "qwen3-coder-plus");
+        assert_eq!(proof.model_binding().pinned_model(), choice.binding().pinned_model());
+        assert_eq!(proof.provider_name(), choice.provider_name());
     }
 }
 

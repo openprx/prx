@@ -207,6 +207,7 @@ impl ChildInputReceipt {
         };
         envelope.source_message_event_id = Some(event.event_id.clone());
         envelope.parent_run_id = event.parent_run_id.clone();
+        envelope.parent_session_key = event.parent_session_key.clone();
         envelope.agent_id = event.agent_id.clone();
         envelope.persona_id = event.persona_id.clone();
         envelope.channel = Some(proof.policy_channel().to_owned());
@@ -551,19 +552,23 @@ impl ChildProviderBinding {
                 MessageEventSource::SessionsSpawn => "sessions_spawn",
                 _ => anyhow::bail!("unsupported ordinary child source"),
             })?;
-            match &caller.context().ordinary_child_publication {
+            let spawn_run = match &caller.context().ordinary_child_publication {
                 Some(publication) => {
                     publication.verify_caller(caller.context())?;
                     anyhow::ensure!(
                         Arc::ptr_eq(&self.generation, publication.generation()),
                         "ordinary child config differs from its parent publication"
                     );
+                    Some(publication.spawn_run_id().to_owned())
                 }
-                None => anyhow::ensure!(
-                    caller.context().admitted_binding.is_none(),
-                    "ordinary model child has no issued publication snapshot"
-                ),
-            }
+                None => {
+                    anyhow::ensure!(
+                        caller.context().admitted_binding.is_none(),
+                        "ordinary model child has no issued publication snapshot"
+                    );
+                    None
+                }
+            };
             let envelope = &caller.context().envelope;
             anyhow::ensure!(
                 envelope.workspace_id == workspace_id
@@ -584,7 +589,7 @@ impl ChildProviderBinding {
                 "ordinary delegate input differs from its issued caller"
             );
             scope.owner_id = Some(envelope.resolved_owner_id());
-            scope.parent_run_id = envelope.run_id.clone();
+            scope.parent_run_id = spawn_run.or_else(|| envelope.run_id.clone());
             scope.parent_session_key = Some(envelope.session_key.clone());
             scope.causation_event_id = envelope.source_message_event_id.clone();
             scope.attempt_id = envelope.attempt_id.clone();

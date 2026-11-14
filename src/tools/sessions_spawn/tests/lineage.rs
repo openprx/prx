@@ -684,14 +684,14 @@ async fn operator_spawn_without_ambient_context_uses_source_run_as_parent() -> a
 }
 
 #[tokio::test]
-async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
+async fn task_child_turn_runs_under_its_own_spawn_context() {
     type Observation = (Option<SpawnExecutionContext>, Vec<String>, String);
     struct ContextProbe(tokio::sync::mpsc::Sender<Observation>);
     #[async_trait::async_trait]
     impl crate::providers::Provider for ContextProbe {
         fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
             // This runs on the real turn-preparation task. Ignore admission
-            // on the parent; its context must not cross the inner task hop.
+            // on the parent; the child turn observes its own run context.
             let context = current_spawn_execution_context();
             if context.as_ref().is_none_or(|context| context.run_id != "prx-parent") {
                 let key = spawn_session_scope_key(context.as_ref(), None);
@@ -746,14 +746,16 @@ async fn task_child_turn_keeps_main_lineage_when_provenance_is_present() {
         .await
         .expect("real child turn preparation")
         .expect("probe observation");
-    // Main's in-process loop has no spawn context: nested calls retain its
-    // depth-zero/no-parent fallback, empty hidden tools, and global scope.
-    assert!(
-        context.is_none(),
-        "dormant foundation must not install child lineage: {context:?}"
-    );
-    assert_eq!(context.as_ref().map_or(0, |context| context.spawn_depth + 1), 0);
-    assert_eq!(context.as_ref().map(|context| &context.run_id), None);
-    assert_eq!(hidden, Vec::<String>::new());
-    assert_eq!(scope, "sessions_spawn:global");
+    // CR-CI-3: the child's turn runs under its own run's spawn context, so a
+    // recursive spawn from the child names it as parent, nests one level
+    // deeper, keeps the parent's hidden tools and session scope, and carries
+    // the inherited provenance.
+    let context = context.expect("the child turn runs under its own spawn context");
+    assert_ne!(context.run_id, "prx-parent");
+    assert!(!context.is_turn_root);
+    assert_eq!(context.spawn_depth, 5);
+    assert_eq!(context.topic_id.as_deref(), Some("prx-topic"));
+    assert!(context.task_input.inherited_provenance.is_some());
+    assert_eq!(hidden, vec!["prx_hidden".to_owned()]);
+    assert_eq!(scope, "prx-parent-session");
 }

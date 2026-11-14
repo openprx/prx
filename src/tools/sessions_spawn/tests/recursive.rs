@@ -82,11 +82,19 @@ fn spawn_args(task: String) -> serde_json::Value {
 }
 
 /// The in-process scripted model: the root parent's model and the first
-/// child's model (through the ordinary provider fixture).
+/// child's model (through the ordinary provider fixture). It calls tools
+/// natively, so each request carries the turn's published tool specs.
 struct ScriptedProvider(Script);
 
 #[async_trait]
 impl crate::providers::Provider for ScriptedProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
     async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
         Ok(DONE.to_owned())
     }
@@ -126,18 +134,22 @@ impl crate::providers::Provider for ScriptedProvider {
             },
             first_user,
         );
-        let text = next.map_or_else(
-            || DONE.to_owned(),
+        let (text, tool_calls) = next.map_or_else(
+            || (Some(DONE.to_owned()), Vec::new()),
             |arguments| {
-                format!(
-                    "<tool_call>\n{}\n</tool_call>",
-                    json!({"name": "sessions_spawn", "arguments": arguments})
+                (
+                    None,
+                    vec![crate::providers::ToolCall {
+                        id: "prx-recursive-spawn".to_owned(),
+                        name: "sessions_spawn".to_owned(),
+                        arguments: arguments.to_string(),
+                    }],
                 )
             },
         );
         Ok(crate::providers::ChatResponse {
-            text: Some(text),
-            tool_calls: Vec::new(),
+            text,
+            tool_calls,
             reasoning_content: None,
         })
     }
@@ -222,6 +234,19 @@ impl crate::agent::turn_contracts::ApprovalResolver for GrantingResolver {
         }
         crate::agent::turn_contracts::ApprovalDecision::Grant
     }
+}
+
+/// The production run approval strategy a root turn's adapter runs under:
+/// an approval manager and `resolver` (CR-CI-3: a Supervised root spawn is
+/// approved through it, never through a grant in the arguments).
+fn run_approval(tool: &SessionsSpawnTool, resolver: Arc<GrantingResolver>) -> Arc<dyn crate::tools::ApprovalStrategy> {
+    crate::agent::execution_policy::run_approval_strategy(
+        Some(Arc::new(crate::approval::ApprovalManager::new())),
+        Some(resolver as Arc<dyn crate::agent::turn_contracts::ApprovalResolver>),
+        "wacli",
+        Arc::clone(&tool.security),
+        None,
+    )
 }
 
 async fn fixture(options: Options) -> Fixture {
@@ -448,15 +473,17 @@ async fn supervised_child_follows_root_dispatch_approval() {
     assert_eq!(error.to_string(), NO_RESOLVER);
     assert!(refused.tool.active_runs_snapshot().await.is_empty());
     assert!(refused.script.for_task("PRX-REFUSED-ROOT.").is_empty());
-    // (1) Child: a granted root spawn starts a child with no resolver; its
-    // own spawn is refused with the same literal and starts nothing.
+    // (1) Child: a root spawn approved by the run approval resolver starts a
+    // child whose run has no resolver (no factory); its own spawn is refused
+    // with the same literal and starts nothing.
     let task = chain(
         "PRX-SUPERVISED-CHILD.",
         Some(spawn_args("PRX-REFUSED-LEAF.".to_owned())),
     );
-    let started = execute_admitted_spawn(&refused.tool, with_spawn_grant(spawn_args(task)))
+    let root_approval = run_approval(&refused.tool, Arc::new(GrantingResolver::default()));
+    let started = execute_admitted_spawn_with_approval(&refused.tool, spawn_args(task), root_approval)
         .await
-        .expect("test: granted root spawn");
+        .expect("test: approved root spawn");
     assert!(started.success, "{:?}", started.error);
     let runs = settled(&refused.tool, 1).await;
     assert_eq!(runs.len(), 1, "the refused child spawn registered no run: {runs:?}");
@@ -484,13 +511,7 @@ async fn supervised_child_follows_root_dispatch_approval() {
         )),
     )
     .await;
-    let root_approval = crate::agent::execution_policy::run_approval_strategy(
-        Some(Arc::new(crate::approval::ApprovalManager::new())),
-        Some(Arc::clone(&resolver) as Arc<dyn crate::agent::turn_contracts::ApprovalResolver>),
-        "wacli",
-        Arc::clone(&approving.tool.security),
-        None,
-    );
+    let root_approval = run_approval(&approving.tool, Arc::clone(&resolver));
     let task = chain("PRX-APPROVED-CHILD.", Some(spawn_args("PRX-APPROVED-LEAF.".to_owned())));
     let started = execute_admitted_spawn_with_approval(&approving.tool, spawn_args(task), root_approval)
         .await
@@ -557,12 +578,11 @@ async fn root_without_delegate_derives_a_recursive_child() {
         fixture.registry.iter().all(|tool| tool.name() != "delegate") && fixture.registry.len() > 1,
         "test: the catalog has other tools and no delegate"
     );
-    let result = execute_admitted_spawn(
-        &fixture.tool,
-        with_spawn_grant(spawn_args("PRX-NO-DELEGATE.".to_owned())),
-    )
-    .await
-    .expect("test: granted root spawn");
+    let root_approval = run_approval(&fixture.tool, Arc::new(GrantingResolver::default()));
+    let result =
+        execute_admitted_spawn_with_approval(&fixture.tool, spawn_args("PRX-NO-DELEGATE.".to_owned()), root_approval)
+            .await
+            .expect("test: approved root spawn");
     assert!(result.success, "{:?}", result.error);
     let runs = settled(&fixture.tool, 1).await;
     assert_eq!(run_for(&runs, "PRX-NO-DELEGATE.").output(), Some(DONE));

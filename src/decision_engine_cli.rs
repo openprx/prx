@@ -221,7 +221,7 @@ pub struct DecisionSetup {
     pub kind: BackendKind,
     pub endpoint: Option<String>,
     pub model: Option<String>,
-    /// Turn the decision plane on too.
+    /// Turn the advisory decision engine on too (`[decision_engine] enabled`).
     pub enable: bool,
 }
 

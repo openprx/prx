@@ -101,6 +101,7 @@ impl OrdinaryProcessSegments {
                 envelope.owner_isolated = proof.owner_isolated();
                 envelope.task_id = Some(self.authority.run_id().to_owned());
                 envelope.parent_run_id = scope.parent_run_id;
+                envelope.parent_session_key = scope.parent_session_key;
                 envelope.agent_id = scope.agent_id;
                 envelope.persona_id = scope.persona_id;
                 envelope.channel = scope.channel;

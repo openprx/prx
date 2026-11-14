@@ -105,6 +105,11 @@ impl OrdinaryChildPublication {
         self.inner.source.intercepts_writes()
     }
 
+    /// The run a child issued from this publication names as its parent.
+    pub(crate) fn spawn_run_id(&self) -> &str {
+        crate::runtime::child_source::parent::spawn_run_of(&self.inner.source)
+    }
+
     pub(crate) fn dispatch_pin(
         &self,
         owner: &str,

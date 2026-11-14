@@ -336,7 +336,8 @@ fn prx(root: &Path, args: &[&str]) -> Output {
 
 /// CDP-14: `prx init` with a loopback decision backend writes a
 /// configuration that loads and passes the decision check, with the model
-/// declared for the decision endpoint.
+/// declared for the decision endpoint. `--decision-enable` turns the advisory
+/// decision engine on (P2-R24, controller ruling CR-CI-2).
 #[test]
 fn init_with_a_loopback_decision_backend_writes_a_valid_config() {
     let temp = TempDir::new().expect("test: temp");
@@ -367,14 +368,15 @@ fn init_with_a_loopback_decision_backend_writes_a_valid_config() {
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(
         help.status.success()
-            && help_text.contains("Enable causal recovery")
-            && help_text.contains("decision_engine.enabled"),
-        "test: help names recovery and the separate advisory switch: {help_text}"
+            && help_text.contains("Enable the advisory decision engine")
+            && help_text.contains("decision_engine.enabled")
+            && !help_text.contains("causal recovery"),
+        "test: help names the advisory engine switch: {help_text}"
     );
     let status = stdout_json(&prx_in(&target, &["decision-engine", "status", "--json"]));
     assert_eq!(
-        status["enabled"], false,
-        "test: init keeps the advisory engine off: {status}"
+        status["enabled"], true,
+        "test: --decision-enable turns the advisory engine on: {status}"
     );
 }
 

@@ -28,7 +28,7 @@ pub(crate) async fn restore_input(
             && parent_source.workspace_id() == fabric.workspace_id()
             && parent_source.owner_id() == child.authority.owner
             && worker.owner_id.as_deref() == Some(parent_source.owner_id())
-            && worker.parent_run_id.as_deref() == Some(parent_source.run_id()),
+            && worker.parent_run_id.as_deref() == Some(parent_source.spawn_run_id()),
         "ordinary worker input lookup differs from verified source"
     );
     if let Some(id) = parent_source.source_event_id() {
@@ -88,7 +88,7 @@ pub(crate) async fn restore_input(
             && event.content == worker.task
             && event.run_id.as_deref() == Some(worker.run_id.as_str())
             && event.session_key.as_deref() == Some(worker.session_scope_key.as_str())
-            && event.parent_run_id.as_deref() == Some(parent_source.run_id())
+            && event.parent_run_id.as_deref() == Some(parent_source.spawn_run_id())
             && event.parent_session_key.as_deref() == Some(parent_source.session_key())
             && event.causation_event_id.as_deref() == parent_source.source_event_id()
             && event.run_id != event.parent_run_id
@@ -203,7 +203,7 @@ impl OrdinaryProcessSnapshots {
         initial_scope.session_key = Some(worker.session_scope_key.clone());
         initial_scope.parent_session_key = Some(self.parent.session_key().to_owned());
         initial_scope.run_id = Some(worker.run_id.clone());
-        initial_scope.parent_run_id = Some(self.parent.run_id().to_owned());
+        initial_scope.parent_run_id = Some(self.parent.spawn_run_id().to_owned());
         initial_scope.agent_id = worker.agent_id.clone();
         initial_scope.persona_id = worker.persona_id.clone();
         initial_scope.causation_event_id = self.parent.source_event_id().map(str::to_owned);

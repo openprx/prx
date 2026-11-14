@@ -33,6 +33,10 @@ pub struct RuntimeEnvelope {
     pub source_message_event_id: Option<String>,
     pub run_id: Option<String>,
     pub parent_run_id: Option<String>,
+    /// The launching parent's session key for a child turn (sessions_spawn,
+    /// session worker, delegate). `None` for every root origin. A child's
+    /// terminal carries it so its lineage equals its launch (CR-CI-3).
+    pub parent_session_key: Option<String>,
     pub attempt_id: Option<String>,
     pub lease_epoch: Option<i64>,
     pub config_generation_id: Option<u64>,
@@ -105,6 +109,7 @@ impl RuntimeEnvelope {
             source_message_event_id: None,
             run_id: None,
             parent_run_id: None,
+            parent_session_key: None,
             attempt_id: None,
             lease_epoch: None,
             config_generation_id: None,
@@ -636,6 +641,7 @@ impl RuntimeEnvelope {
         if let Some(parent_run_id) = &self.parent_run_id {
             scope = scope.with_parent_run_id(parent_run_id.clone());
         }
+        scope.parent_session_key = self.parent_session_key.clone();
         scope.attempt_id = self.attempt_id.clone();
         scope.lease_epoch = self.lease_epoch;
         scope.config_generation_id = self.config_generation_id;

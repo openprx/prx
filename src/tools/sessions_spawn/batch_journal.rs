@@ -126,11 +126,9 @@ impl PreparedBatch {
         }
         let fabric = publication.source_fabric();
         let source = OrdinarySource {
-            parent_run: caller
-                .envelope
-                .run_id
-                .clone()
-                .context("ordinary batch parent run missing")?,
+            // The batch parent is the run its members name (a child segment
+            // spawns as its task run, CR-CI-3).
+            parent_run: publication.spawn_run_id().to_owned(),
             parent_session: caller.envelope.session_key.clone(),
             config_generation: generation.id.0,
             config_revision: generation.source_revision.fingerprint_sha256.clone(),

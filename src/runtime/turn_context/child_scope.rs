@@ -150,7 +150,19 @@ impl TurnRuntimeService {
             || input
                 .split(|character: char| !character.is_alphanumeric() && character != '_')
                 .any(|word| word.eq_ignore_ascii_case("delegate") || word.eq_ignore_ascii_case("sessions_spawn"));
-        if !names_delegator && !direct_delegator && !deferred_chat_delegator {
+        // A child whose inherited manifest carries a delegator and depth nests
+        // through it without naming it (CR-CI-3: a child equals the main
+        // session; recursion is bounded only by depth, budget and integrity).
+        let inherited_delegator = proof.child_scope().is_some_and(|scope| {
+            let manifest = scope.gate_inputs().0;
+            manifest.authority.remaining_depth > 0
+                && manifest.allowed.iter().any(|reference| {
+                    catalog
+                        .entry_any(&reference.id)
+                        .is_some_and(|entry| crate::tools::surface_owner::publication::is_delegator(&entry.public_name))
+                })
+        });
+        if !names_delegator && !direct_delegator && !deferred_chat_delegator && !inherited_delegator {
             return None;
         }
         let direct = if names_delegator {

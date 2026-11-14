@@ -1274,10 +1274,18 @@ pub(super) async fn recovery_terminal_commit_survives_restart() {
             final_event.raw_payload_json, first.terminal_event.raw_payload_json,
             "test: successful replay must not rewrite the authenticated terminal payload"
         );
+        // P2-R5: the reopened process's cost outbox projector pass, not the
+        // rejoin, acknowledges the recovered cost intent.
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&reopened),
+            workspace.clone(),
+            priced_cost_config(),
+        )
+        .await;
         assert_eq!(
             first_outbox(&workspace).state,
             "acknowledged",
-            "test: successful replay must acknowledge the recovered cost intent"
+            "test: the projector pass must acknowledge the recovered cost intent"
         );
         assert_eq!(
             ledger_lines(&workspace, &terminal_id),

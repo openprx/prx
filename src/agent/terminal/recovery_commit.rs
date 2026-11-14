@@ -314,8 +314,7 @@ pub(super) async fn finalize_recovery_terminal(
     // The pinned trusted surface of the turn (R22), byte-identical to the
     // former final-hop value.
     let surface = commit.binding.runtime().trusted.surface.as_str().to_owned();
-    // Unrecorded terminals carry no verified decision signals.
-    let (skill_status, awaiting_approval, verified) = (commit.status, false, false);
+    let (skill_status, awaiting_approval, verified) = recovered_skill(&commit);
     let settled = SettledTerminalFacts {
         v: 1,
         terminal_id: commit.terminal_id.clone(),
@@ -478,6 +477,29 @@ pub(super) async fn finalize_recovery_terminal(
         delivery_intent: commit.delivery_intent.clone(),
     };
     Ok(receipt)
+}
+
+/// What restart recovery can trust of this terminal for the skill lifecycle:
+/// `(status, awaiting_approval, verified)`. The facts are verified only with
+/// a settled execution trace and, for a completed turn, a successful provider
+/// outcome (the rule the deleted decision-plane facts applied; the skills
+/// lifecycle keeps it).
+fn recovered_skill(commit: &TurnTerminalCommit) -> (TurnTerminalStatus, bool, bool) {
+    use crate::llm::route_decision::ExecutionStatus;
+    let trace = commit.binding.runtime().terminal_execution_trace();
+    let settled = !trace.incomplete
+        && !trace.provider_attempts_incomplete
+        && trace.provider_pending == 0
+        && trace.pending_attempts == 0;
+    let provider_ok = matches!(
+        commit.provider_outcome.as_ref().map(|outcome| &outcome.status),
+        Some(ExecutionStatus::Success | ExecutionStatus::FallbackSuccess)
+    );
+    (
+        commit.status,
+        trace.awaiting_approval_attempts > 0,
+        settled && (commit.status != TurnTerminalStatus::Completed || provider_ok),
+    )
 }
 
 fn recovery_pricing(usage: Option<&MeteredTokenUsageRecord>, cost_config: &CostConfig) -> RecoveryPricing {

@@ -91,7 +91,7 @@ impl SegmentObservation {
                 && event.config_generation_id == envelope.config_generation_id
                 && event.config_source_revision == envelope.config_source_revision
                 && event.visibility == envelope.visibility
-                && event.parent_session_key.is_none()
+                && event.parent_session_key == envelope.parent_session_key
                 && event.correlation_id.is_none()
                 && event.goal_id.is_none()
                 && event.recipient.as_deref() == envelope.recipient.as_deref().filter(|value| !value.is_empty())

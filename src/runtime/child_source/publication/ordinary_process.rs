@@ -88,21 +88,47 @@ impl OrdinaryProcessLaunch {
                 && worker.config_generation == self.config_generation,
             "ordinary worker manifest differs from captured launch"
         );
+        // Name the differing fields (never their values).
+        let differing: Vec<&str> = [
+            ("run_id", worker.run_id == proof.run_id()),
+            ("session_scope_key", worker.session_scope_key == proof.session_key()),
+            (
+                "workspace",
+                publication.generation().effective.workspace_dir.to_string_lossy() == proof.workspace_id(),
+            ),
+            ("owner_id", worker.owner_id.as_deref() == Some(proof.owner_id())),
+            ("parent_run_id", worker.parent_run_id == envelope.parent_run_id),
+            ("agent_id", worker.agent_id == envelope.agent_id),
+            ("persona_id", worker.persona_id == envelope.persona_id),
+            ("scope_chat_id", worker.scope_chat_id == envelope.recipient),
+            (
+                "scope_channel",
+                worker.scope_channel.as_deref() == Some(proof.policy_channel()),
+            ),
+            (
+                "scope_sender",
+                worker.scope_sender.as_deref() == Some(proof.policy_sender()),
+            ),
+            (
+                "scope_chat_type",
+                worker.scope_chat_type.as_deref() == Some(proof.policy_chat_type()),
+            ),
+            (
+                "config_generation_id",
+                worker.runtime_config_generation_id == Some(proof.config_generation_id()),
+            ),
+            (
+                "config_source_revision",
+                worker.runtime_config_source_revision.as_deref() == Some(proof.config_source_revision()),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, equal)| (!equal).then_some(field))
+        .collect();
         anyhow::ensure!(
-            worker.run_id == proof.run_id()
-                && worker.session_scope_key == proof.session_key()
-                && publication.generation().effective.workspace_dir.to_string_lossy() == proof.workspace_id()
-                && worker.owner_id.as_deref() == Some(proof.owner_id())
-                && worker.parent_run_id == envelope.parent_run_id
-                && worker.agent_id == envelope.agent_id
-                && worker.persona_id == envelope.persona_id
-                && worker.scope_chat_id == envelope.recipient
-                && worker.scope_channel.as_deref() == Some(proof.policy_channel())
-                && worker.scope_sender.as_deref() == Some(proof.policy_sender())
-                && worker.scope_chat_type.as_deref() == Some(proof.policy_chat_type())
-                && worker.runtime_config_generation_id == Some(proof.config_generation_id())
-                && worker.runtime_config_source_revision.as_deref() == Some(proof.config_source_revision()),
-            "ordinary worker manifest differs from its issued input"
+            differing.is_empty(),
+            "ordinary worker manifest differs from its issued input: {}",
+            differing.join(", ")
         );
         let resolved = crate::providers::selection::check_with(
             &publication.generation().effective,
@@ -114,13 +140,38 @@ impl OrdinaryProcessLaunch {
             crate::providers::catalog::UnknownPolicy::Invocation,
         )?;
         let source_provider = crate::providers::ProviderId::of(proof.provider_name());
+        // Name the differing fields (never their values).
+        let differing: Vec<&str> = [
+            (
+                "resolved_provider",
+                crate::providers::ProviderId::of(resolved.provider_label()) == source_provider,
+            ),
+            (
+                "worker_provider",
+                crate::providers::ProviderId::of(&worker.provider_name) == source_provider,
+            ),
+            // A route spelling (`hint:<name>`) resolves to the model pinned
+            // at ingress; the worker may carry either spelling of it.
+            (
+                "resolved_model",
+                resolved.model() == proof.model_binding().pinned_model(),
+            ),
+            (
+                "worker_model",
+                worker.model == proof.model_name() || worker.model == proof.model_binding().pinned_model(),
+            ),
+            (
+                "credential",
+                resolved.credential().reference() == proof.model_binding().credential_reference(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, equal)| (!equal).then_some(field))
+        .collect();
         anyhow::ensure!(
-            crate::providers::ProviderId::of(resolved.provider_label()) == source_provider
-                && crate::providers::ProviderId::of(&worker.provider_name) == source_provider
-                && resolved.model() == proof.model_name()
-                && worker.model == proof.model_name()
-                && resolved.credential().reference() == proof.model_binding().credential_reference(),
-            "ordinary worker provider selection differs from its source"
+            differing.is_empty(),
+            "ordinary worker provider selection differs from its source: {}",
+            differing.join(", ")
         );
         let route = crate::providers::selection::route_target(
             publication.provider_catalog(),

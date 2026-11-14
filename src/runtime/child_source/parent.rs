@@ -78,14 +78,7 @@ impl ParentSource {
             owner_id: proof.owner_id().to_owned(),
             session_key: proof.session_key().to_owned(),
             run_id: proof.run_id().to_owned(),
-            task_run_id: proof
-                .child_scope()
-                .filter(|scope| scope.gate_inputs().0.authority.delegation.is_some())
-                .and_then(|_| proof.task_id())
-                // An initial child turn is its own task (task == run); only a later
-                // segment names a distinct task run as its spawn parent.
-                .filter(|task| *task != proof.run_id())
-                .map(str::to_owned),
+            task_run_id: task_run_of(proof).map(str::to_owned),
             routing_input: proof.routing_input().to_owned(),
             config_source_revision: proof.config_source_revision().to_owned(),
             source_event_id: proof.source_event_id().map(str::to_owned),
@@ -111,6 +104,11 @@ impl ParentSource {
     }
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
+    }
+    /// The run a child spawned from this source names as its parent: the
+    /// task run for a later child segment, else the source run.
+    pub(crate) fn spawn_run_id(&self) -> &str {
+        self.task_run_id.as_deref().unwrap_or(&self.run_id)
     }
     pub(crate) fn routing_input(&self) -> &str {
         &self.routing_input
@@ -321,8 +319,13 @@ impl ParentSource {
             "worker" => TurnSurfaceKind::Worker,
             _ => anyhow::bail!("ordinary worker parent surface is invalid"),
         };
+        // A child segment parent spawns as its task run (CR-CI-3).
+        let spawn_run = fields.task_run_id.as_deref().unwrap_or(&fields.run_id);
         anyhow::ensure!(
-            fields.task_run_id.is_none()
+            fields
+                .task_run_id
+                .as_deref()
+                .is_none_or(|task| !task.is_empty() && task != fields.run_id && task != worker.run_id)
                 && !fields.run_id.is_empty()
                 && !fields.session_key.is_empty()
                 && fields.run_id != worker.run_id
@@ -331,7 +334,7 @@ impl ParentSource {
                 && fields.owner_id == constraints.authority.owner
                 && fields.config_generation_id == generation.id.0
                 && fields.config_source_revision == generation.source_revision.fingerprint_sha256
-                && worker.parent_run_id.as_deref() == Some(fields.run_id.as_str())
+                && worker.parent_run_id.as_deref() == Some(spawn_run)
                 && worker.owner_id.as_deref() == Some(fields.owner_id.as_str())
                 && worker.scope_channel.as_deref() == Some(fields.policy_channel.as_str())
                 && worker.scope_sender.as_deref() == Some(fields.policy_sender.as_str())
@@ -369,6 +372,22 @@ impl ParentSource {
             },
         })
     }
+}
+
+/// The distinct task run of a child segment source: a child segment spawns
+/// as its task run (CR-CI-3: a recursive child's own children name the child
+/// task, as its run roster does). An initial child turn is its own task
+/// (task == run), and a root source has none.
+pub(crate) fn task_run_of(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> Option<&str> {
+    proof
+        .child_scope()
+        .and_then(|_| proof.task_id())
+        .filter(|task| *task != proof.run_id())
+}
+
+/// The run a child spawned from `proof` names as its parent.
+pub(crate) fn spawn_run_of(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> &str {
+    task_run_of(proof).unwrap_or_else(|| proof.run_id())
 }
 
 #[cfg(test)]

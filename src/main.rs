@@ -441,7 +441,7 @@ enum Commands {
         /// The decision model, one exact version (quick mode)
         #[arg(long, requires = "decision_backend")]
         decision_model: Option<String>,
-        /// Enable causal recovery (quick mode); advisory inference separately requires decision_engine.enabled
+        /// Enable the advisory decision engine (quick mode): sets decision_engine.enabled = true
         #[arg(long, requires = "decision_backend")]
         decision_enable: bool,
         /// Read the hosted decision backend's credential (typesafe or
