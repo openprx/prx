@@ -177,9 +177,13 @@ impl<'a> PublicationScope<'a> {
         }
         if let Some(process) = self.operator_process {
             process.verify().map_err(|_| ParityError)?;
-            return self
-                .catalog
-                .check_published_parity(self.execution, process.snapshots().publication.allowed());
+            // A worker serves only the backends its executor registers.
+            return self.catalog.check_published_parity(
+                self.execution,
+                &self
+                    .catalog
+                    .served_references(self.execution, process.snapshots().publication.allowed()),
+            );
         }
         if let Some(process) = self.ordinary_process {
             process.verify().map_err(|_| ParityError)?;

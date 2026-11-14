@@ -6,10 +6,6 @@ use crate::memory::recovery_authority::{RecoveryMacDomain, RecoveryTag};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, thiserror::Error)]
-#[error("pre-v3 ingress evidence has no recovery authority; outcome remains unconfirmed")]
-pub(crate) struct LegacyUnconfirmed;
-
 const SETTLED_FACT_KEYS: [&str; 14] = [
     "v",
     "terminal_id",
@@ -91,6 +87,17 @@ impl SettledTerminalFacts {
     }
 }
 
+/// Only a v3 capsule carries a repository key. Development phase, no legacy
+/// compatibility (CR-205-1): a pre-v3 capsule is a typed version mismatch
+/// (the recovery scan already excludes such rows in SQL).
+fn ensure_v3(capsule: &IngressCapsule) -> anyhow::Result<()> {
+    if capsule.version == 3 {
+        Ok(())
+    } else {
+        Err(IngressAttestationError::Mismatch("capsule_version").into())
+    }
+}
+
 impl IngressRecorder {
     #[cfg(test)]
     pub(crate) fn backend_namespace(&self) -> &str {
@@ -103,9 +110,7 @@ impl IngressRecorder {
         domain: RecoveryMacDomain,
         bytes: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        if capsule.version != 3 {
-            return Err(LegacyUnconfirmed.into());
-        }
+        ensure_v3(capsule)?;
         let repository = self
             .memory
             .recovery_repository()
@@ -121,10 +126,7 @@ impl IngressRecorder {
         bytes: &[u8],
         tag: &[u8],
     ) -> anyhow::Result<bool> {
-        // Pre-v3 capsules have no repository key: they stay unconfirmed.
-        if capsule.version != 3 {
-            return Err(LegacyUnconfirmed.into());
-        }
+        ensure_v3(capsule)?;
         let repository = self
             .memory
             .recovery_repository()

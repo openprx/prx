@@ -1806,11 +1806,13 @@ async fn post_deletion_turn_commits_terminal_without_decision_rows() {
             .rejoin_terminal("prx_cell_d", &owner)
             .await
             .expect_err("(d) a legacy final has no settled facts");
+        // CR-205-1: no legacy compatibility; a final without a settled
+        // receipt is not replayable.
         assert!(
             error
                 .chain()
-                .any(|cause| cause.is::<crate::runtime::ingress_recovery::LegacyUnconfirmed>()),
-            "(d) the legacy final stays unconfirmed: {error:#}"
+                .any(|cause| cause.is::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>()),
+            "(d) the legacy final is not replayable: {error:#}"
         );
         assert_no_legacy_decision_files(workspace.path(), "(d)");
         service

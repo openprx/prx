@@ -169,13 +169,19 @@ impl OperatorChildPublication {
             .loop_runtime
             .clone()
             .context("operator task loop runtime missing")?;
-        let execution = Arc::new(ToolExecutionService::from_shared_boxed_registry(
-            Arc::clone(&registry),
-            Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
-            Arc::new(crate::tools::DenyApprovalStrategy),
-            Arc::new(crate::tools::AdapterOwnedPreparation),
-            Arc::new(crate::tools::TracingToolExecutionAudit),
-        ));
+        // The task executor keeps the parent's durable idempotency ledger, as
+        // every published executor does: a side-effecting child tool (a nested
+        // `sessions_spawn`) is never refused for a missing ledger.
+        let execution = Arc::new(
+            ToolExecutionService::from_shared_boxed_registry(
+                Arc::clone(&registry),
+                Arc::new(crate::tools::SecurityEffectPolicy::new(Arc::clone(&parent.security))),
+                Arc::new(crate::tools::DenyApprovalStrategy),
+                Arc::new(crate::tools::AdapterOwnedPreparation),
+                Arc::new(crate::tools::TracingToolExecutionAudit),
+            )
+            .with_idempotency_memory(Arc::clone(&parent.memory)),
+        );
         let mut policy = parent.publication_policy.clone();
         // The frozen capability set is a membership limit. Full has no
         // permission limits (R51/OV-4): a Full task publishes under the

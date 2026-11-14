@@ -378,11 +378,18 @@ impl ParentSource {
 /// as its task run (CR-CI-3: a recursive child's own children name the child
 /// task, as its run roster does). An initial child turn is its own task
 /// (task == run), and a root source has none.
+///
+/// A child source is recognised by runtime-issued authority, never by a
+/// claimed task id (a scheduled root carries its job's task id): an ordinary
+/// child holds its verified child scope, and an operator task or process
+/// child holds its operator authority id (it has no child scope). Every
+/// operator turn is a segment of its logical task run, so its children name
+/// that logical run, as its spawn execution context does (review r1 #1).
 pub(crate) fn task_run_of(proof: &dyn crate::runtime::turn_source::TurnSourceProof) -> Option<&str> {
-    proof
-        .child_scope()
-        .and_then(|_| proof.task_id())
-        .filter(|task| *task != proof.run_id())
+    let child = proof.child_scope().is_some()
+        || proof.operator_task_authority_id().is_some()
+        || proof.operator_process_authority_id().is_some();
+    proof.task_id().filter(|task| child && *task != proof.run_id())
 }
 
 /// The run a child spawned from `proof` names as its parent.

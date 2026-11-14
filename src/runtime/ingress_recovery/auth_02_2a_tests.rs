@@ -6,7 +6,7 @@ use crate::memory::SqliteMemory;
 use crate::memory::ingress_recovery::IngressAttestationError;
 use crate::memory::recovery_authority::{RecoveryChain, RecoveryPublication};
 use crate::runtime::ingress_recovery::tombstone_fixture;
-use crate::runtime::ingress_recovery::{LegacyUnconfirmed, RecoveryScope, SettledTerminalFacts, backend_memory};
+use crate::runtime::ingress_recovery::{RecoveryScope, SettledTerminalFacts, backend_memory};
 use crate::runtime::turn_cleanup::CleanupTracker;
 use std::path::Path;
 use std::sync::Arc;
@@ -167,6 +167,12 @@ fn is_mismatch(error: &anyhow::Error, field: &'static str) -> bool {
     })
 }
 
+fn is_not_replayable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::runtime::turn_terminal::restart_verify::TerminalNotReplayable>())
+}
+
 fn is_unknown_key(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -222,9 +228,7 @@ pub(super) async fn recovery_settled_receipt_each_bound_field_is_refused() {
         .await
         .expect_err("source");
     assert!(
-        error.chain().any(|cause| cause.is::<LegacyUnconfirmed>())
-            || is_mismatch(&error, "source")
-            || chain_contains(&error, "Query returned no rows"),
+        is_not_replayable(&error) || is_mismatch(&error, "source") || chain_contains(&error, "Query returned no rows"),
         "source: {error:#}"
     );
 

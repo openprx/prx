@@ -16,6 +16,8 @@
 //! (`parent::PARENT_DEADLINE`, `provider::WORKER_DEADLINE`,
 //! `provider::HOLD_WAIT`) and every guard cleans up on failure.
 
+#[path = "ordinary_process_worker/operator.rs"]
+mod operator;
 #[path = "ordinary_process_worker/parent.rs"]
 mod parent;
 #[path = "ordinary_process_worker/provider.rs"]
@@ -45,6 +47,18 @@ const ROOT_KEY: &str = "PRX-WORKER-ROOT-KEY";
 /// Write the parent config: the loopback provider as the default chat model,
 /// `sessions_spawn` always published, worker workspaces kept for inspection.
 fn write_parent_config(fixture: &ParentFixture, destination: &str) {
+    save_parent_config(&parent_config(fixture, destination));
+}
+
+fn save_parent_config(config: &openprx::config::Config) {
+    std::fs::write(
+        &config.config_path,
+        toml::to_string_pretty(config).expect("test: serialize parent config"),
+    )
+    .expect("test: write parent config");
+}
+
+fn parent_config(fixture: &ParentFixture, destination: &str) -> openprx::config::Config {
     let mut config = openprx::config::Config {
         config_path: fixture.config_dir.join("config.toml"),
         workspace_dir: fixture.parent_workspace.clone(),
@@ -58,11 +72,7 @@ fn write_parent_config(fixture: &ParentFixture, destination: &str) {
     config.sessions_spawn.cleanup_on_complete = false;
     config.tool_tiering.always_include.push("sessions_spawn".to_owned());
     add_provider_fixture_model(&mut config, destination, PROVIDER_MODEL);
-    std::fs::write(
-        &config.config_path,
-        toml::to_string_pretty(&config).expect("test: serialize parent config"),
-    )
-    .expect("test: write parent config");
+    config
 }
 
 /// A parent turn that spawns `tasks` as one process batch, joins it, and ends.

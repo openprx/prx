@@ -2312,6 +2312,7 @@ pub(crate) async fn drive_search_console_entry(config: crate::config::Config, in
 
 #[cfg(test)]
 mod tests {
+    mod console_recovery;
     mod targeting;
     use super::*;
     use crate::config::Config;
@@ -2762,6 +2763,32 @@ mod tests {
             state.mem =
                 Arc::new(crate::memory::SqliteMemory::new(&state.config.pin().effective.workspace_dir).unwrap());
         }
+        let runtime = console_test_runtime(state);
+        let principal = super::super::ApiPrincipal::of_token("prx-test-token");
+        let envelope = envelope
+            .with_run_id(uuid::Uuid::new_v4().to_string())
+            .with_config_generation(&runtime.config_generation)
+            .with_owner_id(principal.owner_id.clone())
+            .with_owner_isolation();
+        let event_id = append_console_turn(state, &envelope, "user", input, true, false)
+            .await
+            .unwrap();
+        let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
+            state.mem.as_ref(),
+            &runtime,
+            &principal,
+            &envelope,
+            input,
+            &event_id,
+        )
+        .await
+        .unwrap();
+        (runtime, proof.envelope().clone(), event_id, proof)
+    }
+
+    /// The Console turn runtime of `state`: its pinned generation with the
+    /// production provider binding and a fresh publication slot.
+    fn console_test_runtime(state: &AppState) -> Arc<crate::gateway::TurnRuntimeGeneration> {
         let mut runtime = state.pin_turn_runtime();
         let config = &runtime.config_generation.effective;
         let provider_name = config.default_provider.as_deref().unwrap();
@@ -2785,26 +2812,7 @@ mod tests {
         mutable.provider_binding = Some(Arc::new(binding));
         mutable.publication_slot =
             Arc::new(crate::gateway::turn_source::publication_slot::GatewayPublicationSlot::new(security, 0));
-        let principal = super::super::ApiPrincipal::of_token("prx-test-token");
-        let envelope = envelope
-            .with_run_id(uuid::Uuid::new_v4().to_string())
-            .with_config_generation(&runtime.config_generation)
-            .with_owner_id(principal.owner_id.clone())
-            .with_owner_isolation();
-        let event_id = append_console_turn(state, &envelope, "user", input, true, false)
-            .await
-            .unwrap();
-        let proof = crate::gateway::turn_source::GatewaySourceReceipt::console_proof(
-            state.mem.as_ref(),
-            &runtime,
-            &principal,
-            &envelope,
-            input,
-            &event_id,
-        )
-        .await
-        .unwrap();
-        (runtime, proof.envelope().clone(), event_id, proof)
+        runtime
     }
 
     #[tokio::test]

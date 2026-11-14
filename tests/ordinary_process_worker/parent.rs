@@ -146,6 +146,16 @@ fn drain(stream: impl std::io::Read + Send + 'static) -> Drain {
 /// Spawn `prx --config-dir <dir> chat --plain`, send `line` then `/exit`, and
 /// return it unwaited. stdout and stderr are drained concurrently.
 pub fn spawn_parent(config_dir: &Path, home: &Path, line: &str) -> OwnedParent {
+    let (parent, mut stdin) = spawn_held_parent(config_dir, home, line);
+    stdin.write_all(b"/exit\n").expect("test: parent exit line");
+    drop(stdin);
+    parent
+}
+
+/// Spawn `prx --config-dir <dir> chat --plain` and send `line`, keeping stdin
+/// open: the parent waits for the next line (a background child keeps running
+/// meanwhile) until the caller writes `/exit` or drops the handle.
+pub fn spawn_held_parent(config_dir: &Path, home: &Path, line: &str) -> (OwnedParent, std::process::ChildStdin) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
     command.arg("--config-dir").arg(config_dir).arg("chat").arg("--plain");
     parent_environment(&mut command, home);
@@ -166,10 +176,9 @@ pub fn spawn_parent(config_dir: &Path, home: &Path, line: &str) -> OwnedParent {
     };
     let mut stdin = parent.child.stdin.take().expect("test: parent stdin");
     stdin
-        .write_all(format!("{line}\n/exit\n").as_bytes())
+        .write_all(format!("{line}\n").as_bytes())
         .expect("test: parent script");
-    drop(stdin);
-    parent
+    (parent, stdin)
 }
 
 /// Run a parent to completion within `PARENT_DEADLINE`.

@@ -28,6 +28,9 @@ pub(super) async fn operator_process_publication(
         .verify_policy(&build.security, &snapshots.parent, &snapshots.catalog)?;
     // The frozen capability set is a membership limit; Full has no permission
     // limits (R51/OV-4), so a Full worker keeps the actual surface policy.
+    // The pinned catalog is the parent's: an entry this worker's executor
+    // never registers (an interactive-only tool) is unserved here and never
+    // published, whatever the autonomy (review r1 #1).
     let full = build.security.autonomy == crate::security::AutonomyLevel::Full;
     let view = snapshots.catalog.view(&CatalogScope::default());
     let mut names = BTreeSet::new();
@@ -37,7 +40,9 @@ pub(super) async fn operator_process_publication(
             fingerprint: entry.fingerprint,
             generation: entry.generation,
         };
-        if snapshots.publication.allowed().contains(&reference) {
+        if !crate::tools::capability::catalog::CapabilityCatalog::served_by(&build.execution, entry) {
+            build.surface_policy.excluded_names.insert(entry.public_name.clone());
+        } else if snapshots.publication.allowed().contains(&reference) {
             anyhow::ensure!(
                 build
                     .surface_policy
@@ -54,9 +59,12 @@ pub(super) async fn operator_process_publication(
     if !full {
         build.surface_policy.allowed_tools = Some(names);
     }
-    snapshots
-        .catalog
-        .check_published_parity(&build.execution, snapshots.publication.allowed())?;
+    snapshots.catalog.check_published_parity(
+        &build.execution,
+        &snapshots
+            .catalog
+            .served_references(&build.execution, snapshots.publication.allowed()),
+    )?;
     let config = &snapshots.generation.effective;
     // The runtime key is the turn's state key always (OV-2): persisted, never
     // ephemeral, so it is also the key the backend factory receives.

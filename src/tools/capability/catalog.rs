@@ -604,6 +604,39 @@ impl CapabilityCatalog {
         self.check_published_parity(exec, &manifest.allowed)
     }
 
+    /// Whether `exec` registers the backend that runs `entry`. A worker's
+    /// catalog is its parent's pinned one and can hold entries its own
+    /// executor never registers (interactive-only tools); such an entry is
+    /// unserved there, not a parity failure. A registered backend must still
+    /// match exactly ([`Self::check_published_parity`]).
+    pub(crate) fn served_by(exec: &ToolExecutionService, entry: &CapabilityEntry) -> bool {
+        match &entry.target {
+            ExecutionTarget::Tool(name) => exec.current_descriptor(name).is_some(),
+            ExecutionTarget::Skill { .. } | ExecutionTarget::Node { .. } => {
+                exec.current_descriptor(&entry.root).is_some()
+            }
+            ExecutionTarget::Hook => false,
+        }
+    }
+
+    /// The references of `allowed` whose backend `exec` registers.
+    pub(crate) fn served_references(
+        &self,
+        exec: &ToolExecutionService,
+        allowed: &std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef>,
+    ) -> std::collections::BTreeSet<crate::tools::capability::contract::CapabilityRef> {
+        allowed
+            .iter()
+            .filter(|reference| {
+                self.by_id
+                    .get(&reference.id)
+                    .and_then(|index| self.entries.get(*index))
+                    .is_none_or(|entry| Self::served_by(exec, entry))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Verify an authenticated publication's exact references against the local
     /// executor. Authority and visibility are enforced by the owning service.
     pub(crate) fn check_published_parity(

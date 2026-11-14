@@ -885,21 +885,27 @@ impl super::ingress_recovery::RecoveryScope {
         );
         #[cfg(test)]
         stage.finish();
-        self.rejoin_without_legacy(&event, terminal_id, owner_id).await
+        self.rejoin_settled(&event, terminal_id, owner_id, bounded.map(|(_, deadline, _)| deadline))
+            .await
     }
 
-    /// Plane-off rejoin: settled skill settle, zero decision writes. Unattested
-    /// legacy stays [`super::ingress_recovery::authority::LegacyUnconfirmed`].
-    async fn rejoin_without_legacy(
+    /// Rejoin a verified repository terminal: settle its skill observation and
+    /// restore its console transcript projection, with zero decision writes.
+    /// A terminal without a verifiable settled receipt is
+    /// [`restart_verify::TerminalNotReplayable`] (D§4.4, CR-205-1).
+    async fn rejoin_settled(
         &self,
         event: &crate::memory::MessageEvent,
         terminal_id: &str,
         owner_id: &str,
+        deadline: Option<Instant>,
     ) -> anyhow::Result<()> {
-        let facts = self
-            .load_settled_facts(event, terminal_id, owner_id)
-            .await?
-            .ok_or(super::ingress_recovery::LegacyUnconfirmed)?;
+        let verified = self.load_settled_facts(event, terminal_id, owner_id).await?;
+        if event.source == crate::memory::MessageEventSource::Console {
+            self.project_console_transcript(event, &verified, owner_id, deadline)
+                .await?;
+        }
+        let facts = &verified.facts;
         let observation = &facts.skill_observation;
         crate::skills::lifecycle::spawn_settle_task_terminal(
             self.workspace.clone(),
@@ -921,17 +927,59 @@ impl super::ingress_recovery::RecoveryScope {
         Ok(())
     }
 
+    /// Restore the console transcript of a verified terminal (review r1 #2):
+    /// the input the settled receipt binds and the assistant event the
+    /// settled facts name are projected into `conversation_turns`. A process
+    /// exit between terminal commit and the live projection leaves the reply
+    /// absent; the backend projection rechecks each durable event in its
+    /// transaction and is idempotent, so a repeated rejoin adds nothing.
+    async fn project_console_transcript(
+        &self,
+        terminal: &crate::memory::MessageEvent,
+        verified: &VerifiedTerminal,
+        owner_id: &str,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<()> {
+        let ids = [
+            (verified.input_event_id.as_deref(), "user"),
+            (verified.facts.assistant_event_id.as_deref(), "assistant"),
+        ];
+        for (id, role) in ids {
+            let Some(id) = id else { continue };
+            let message = self
+                .memory
+                .find_owned_message_event(&terminal.workspace_id, owner_id, id)
+                .await?
+                .ok_or(restart_verify::TerminalNotReplayable(
+                    "console transcript event missing",
+                ))?;
+            if message.source != crate::memory::MessageEventSource::Console
+                || message.run_id != terminal.run_id
+                || message.session_key != terminal.session_key
+                || message.role != role
+            {
+                return Err(restart_verify::identity_differs("console transcript event"));
+            }
+            if let Some(deadline) = deadline {
+                self.memory.project_console_message_until(&message, deadline).await?;
+            } else {
+                self.memory.project_console_message(&message).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// The settled facts of a repository terminal, verified after restart
-    /// (D§4.4). `None`: no repository, or no receipt at all (an unrecorded or
-    /// pre-Part-2 terminal, which stays unconfirmed). Every verification
-    /// failure is [`restart_verify::TerminalNotReplayable`], with its cause
-    /// kept in the error chain for diagnostics.
+    /// (D§4.4). Development phase, no legacy compatibility (CR-205-1): a
+    /// missing repository or receipt is not replayable either. Every failure
+    /// is [`restart_verify::TerminalNotReplayable`], with its cause kept in
+    /// the error chain for diagnostics.
     async fn load_settled_facts(
         &self,
         event: &crate::memory::MessageEvent,
         terminal_id: &str,
         owner_id: &str,
-    ) -> anyhow::Result<Option<super::ingress_recovery::SettledTerminalFacts>> {
+    ) -> anyhow::Result<VerifiedTerminal> {
         self.verify_settled_facts(event, terminal_id, owner_id)
             .await
             .map_err(|error| {
@@ -949,9 +997,9 @@ impl super::ingress_recovery::RecoveryScope {
         event: &crate::memory::MessageEvent,
         terminal_id: &str,
         owner_id: &str,
-    ) -> anyhow::Result<Option<super::ingress_recovery::SettledTerminalFacts>> {
+    ) -> anyhow::Result<VerifiedTerminal> {
         if self.authority.repository.is_none() {
-            return Ok(None);
+            return Err(restart_verify::TerminalNotReplayable("recovery repository unavailable").into());
         }
         let memory = Arc::clone(&self.memory);
         let chain = crate::memory::recovery_authority::RecoveryChain {
@@ -977,22 +1025,25 @@ impl super::ingress_recovery::RecoveryScope {
         let read_memory = Arc::clone(&memory);
         let read_chain = chain.clone();
         // Steps 1–2: the settled receipt (E5 over E4) and its closed facts.
-        let facts = tokio::task::spawn_blocking(move || {
-            let Some(repository) = read_memory.recovery_repository() else {
-                return Ok(None);
-            };
+        let (facts, input_event_id) = tokio::task::spawn_blocking(move || {
+            let repository = read_memory
+                .recovery_repository()
+                .ok_or(restart_verify::TerminalNotReplayable("recovery repository unavailable"))?;
             repository
                 .activate_recovery_authority()
                 .map_err(restart_verify::refused("recovery authority unavailable"))?;
-            let Some(receipt) = repository
+            let receipt = repository
                 .read_recovery_receipt(&read_chain)
                 .map_err(restart_verify::refused("settled receipt does not authenticate"))?
-            else {
-                return Ok(None);
-            };
+                .ok_or(restart_verify::TerminalNotReplayable("settled receipt missing"))?;
             if receipt.state != "settled" {
                 return Err(restart_verify::TerminalNotReplayable("receipt is not settled").into());
             }
+            // The receipt authenticated the bound input row (E4 over its
+            // current bytes), so its id names the turn's own source event.
+            let input_event_id = receipt
+                .input_event_id()
+                .map_err(restart_verify::refused("settled receipt input does not parse"))?;
             let facts = receipt
                 .settled_facts()
                 .map_err(restart_verify::refused("settled facts do not authenticate"))
@@ -1029,12 +1080,9 @@ impl super::ingress_recovery::RecoveryScope {
                     .recovery_event_evidence(&read_chain, id)
                     .map_err(restart_verify::refused("assistant event evidence does not verify"))?;
             }
-            Ok::<_, anyhow::Error>(Some(facts))
+            Ok::<_, anyhow::Error>((facts, input_event_id))
         })
         .await??;
-        let Some(facts) = facts else {
-            return Ok(None);
-        };
         // Steps 3–6: the claim and final payloads, read by event id.
         let scope = crate::memory::ingress_recovery::IngressRecoveryScope {
             workspace_id: chain.workspace_id.clone(),
@@ -1061,8 +1109,15 @@ impl super::ingress_recovery::RecoveryScope {
                 .recovery_repository()
                 .ok_or(restart_verify::TerminalNotReplayable("recovery repository unavailable"))?;
             restart_verify::verify_claim_and_cost(repository, &chain, &facts, &preimage)?;
-            Ok::<_, anyhow::Error>(Some(facts))
+            Ok::<_, anyhow::Error>(VerifiedTerminal { facts, input_event_id })
         })
         .await?
     }
+}
+
+/// A repository terminal verified after restart (D§4.4) and the input event
+/// its settled receipt binds.
+struct VerifiedTerminal {
+    facts: super::ingress_recovery::SettledTerminalFacts,
+    input_event_id: Option<String>,
 }

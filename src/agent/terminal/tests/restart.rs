@@ -285,7 +285,7 @@ async fn restart_rejoin_verifies_every_terminal_status() {
             .replace_event_payload_for_test(&claim.event_id, &payload.to_string())
             .expect("test: edit claim");
     }
-    let mutations: [(&str, Mutation); 11] = [
+    let mutations: [(&str, Mutation); 12] = [
         ("flipped tag byte", |cell, memory, claim, _terminal| {
             claim_semantic_edit(cell, memory, claim, |payload| {
                 let tag = payload["semantic_mac_v3"].as_str().unwrap_or_default();
@@ -361,6 +361,11 @@ async fn restart_rejoin_verifies_every_terminal_status() {
                 });
             },
         ),
+        // CR-205-1: a Part-2 terminal whose required receipt is missing is
+        // not replayable (no legacy-unconfirmed escape).
+        ("receipt deleted", |cell, _memory, _claim, _terminal| {
+            tamper_receipt(&cell.workspace, "DELETE FROM recovery_attestations");
+        }),
         (
             "metered facts without outbox row",
             |cell, _memory, _claim, _terminal| {
