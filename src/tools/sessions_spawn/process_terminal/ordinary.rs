@@ -220,6 +220,7 @@ async fn verify_completion(
         "ordinary completion inventory differs from launch"
     );
     let mut verified_usage = Vec::new();
+    let mut verified_classes = Vec::new();
     let finished_at = if let Some(reference) = &evidence.terminal {
         let event = read_terminal(
             fabric,
@@ -305,13 +306,22 @@ async fn verify_completion(
                     usage.settlement_id.as_deref() == Some(reference.terminal_id.as_str()),
                     "ordinary usage belongs to another segment"
                 );
+                verified_classes.push(crate::llm::route_decision::UsageSettlementClass::of_terminal_payload(
+                    &payload,
+                )?);
                 verified_usage.push(usage);
             }
         }
+        // The worker's evidence carries the authenticated usage bytes only;
+        // the registry record adds the class each stored terminal's cost
+        // settlement verifies (CF-R8).
         anyhow::ensure!(
             verified_usage == evidence.usage,
             "ordinary completion usage differs from stored terminals"
         );
+        for (usage, class) in verified_usage.iter_mut().zip(verified_classes) {
+            usage.settlement_class = class;
+        }
         Some(chrono::DateTime::parse_from_rfc3339(&event.created_at)?.with_timezone(&chrono::Utc))
     } else {
         // Only the authenticated process attests these local receipts. No

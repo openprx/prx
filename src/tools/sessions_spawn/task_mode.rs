@@ -453,10 +453,12 @@ pub(super) async fn run_sub_agent_task(
                             return Err(error);
                         }
                     };
+                    // The registry keeps the usage tagged with the class of the
+                    // terminal's verified cost settlement (CF-R8).
                     let segment_usage = child_turn
                         .complete(&outcome, &trace)
                         .await?
-                        .usage_settlement
+                        .into_session_usage()
                         .into_iter()
                         .collect();
                     Ok(SubAgentTaskResult {

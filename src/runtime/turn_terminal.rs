@@ -31,6 +31,9 @@ struct CollectedSegmentTerminal {
     reference: Option<crate::session_worker::protocol::WorkerSegmentTerminal>,
     payload_digest: Option<[u8; 32]>,
     usage: Option<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    /// The class of the receipt's verified cost settlement, kept beside the
+    /// usage so the protocol snapshot stays byte-identical (CF-R8).
+    class: Option<crate::llm::route_decision::UsageSettlementClass>,
 }
 
 impl std::fmt::Debug for TerminalUsageCollector {
@@ -195,6 +198,10 @@ impl TerminalUsageCollector {
                     reference,
                     payload_digest,
                     usage: receipt.usage_settlement.clone(),
+                    class: receipt
+                        .cost_settlement
+                        .as_ref()
+                        .and_then(crate::llm::route_decision::UsageSettlementClass::of),
                 },
             );
         }
@@ -206,6 +213,22 @@ impl TerminalUsageCollector {
             .lock()
             .values()
             .filter_map(|record| record.usage.clone())
+            .collect()
+    }
+
+    /// The collected usage as session display records, each tagged with the
+    /// class of its terminal's verified cost settlement (CF-R8). Protocol
+    /// evidence uses [`Self::snapshot`], which never carries the class.
+    pub(crate) fn session_snapshot(&self) -> Vec<crate::llm::route_decision::MeteredTokenUsageRecord> {
+        self.records
+            .lock()
+            .values()
+            .filter_map(|record| {
+                record.usage.clone().map(|mut usage| {
+                    usage.settlement_class = record.class;
+                    usage
+                })
+            })
             .collect()
     }
 

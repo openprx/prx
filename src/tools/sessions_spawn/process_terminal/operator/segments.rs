@@ -153,7 +153,9 @@ pub(super) async fn recover_usage(
                     usage.settlement_id.as_deref() == Some(run.as_str()),
                     "operator partial settlement identity differs"
                 );
-                recovered.records.push(usage);
+                recovered.records.push(
+                    crate::llm::route_decision::UsageSettlementClass::tag_from_terminal_payload(&payload, usage)?,
+                );
             }
         } else {
             recovered.unfinished_segments += 1;

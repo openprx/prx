@@ -493,3 +493,84 @@ fn live_parent_sweep_does_not_warn() {
         "the live parent warned about its own child: {log}"
     );
 }
+
+/// CF-R8 (PR #206 review r1): children of a subscription-billed parent
+/// (`kimi-code`, catalog `billing = "subscription"`, served by the loopback
+/// provider) settle as subscription. After `join`, the parent's
+/// `sessions_spawn list` shows both the task child and the process child as
+/// `subscription`, never `cost unknown`: the task child's usage takes the class
+/// of its terminal receipt, the process child's the class its stored terminal
+/// verifies.
+#[test]
+fn subscription_children_report_subscription_usage() {
+    const PARENT: &str = "PRX-SUBSCRIPTION-PARENT";
+    const TASK_CHILD: &str = "PRX-SUBSCRIPTION-TASK-CHILD";
+    const PROCESS_CHILD: &str = "PRX-SUBSCRIPTION-PROCESS-CHILD";
+    /// The fourth parent request carries the `list` result.
+    const AFTER_LIST: usize = 4;
+    let fixture = ParentFixture::new();
+    let server = OwnedProviderServer::start(ProviderSpec {
+        markers: vec![PARENT, TASK_CHILD, PROCESS_CHILD],
+        // The in-process task child has no worker manifest to capture.
+        parents: vec![PARENT, TASK_CHILD],
+        manifest_root: fixture.worker_root.clone(),
+        tasks: BTreeMap::new(),
+        hold: None,
+        script: Box::new(|call| {
+            if call.marker != PARENT {
+                return text_reply("PRX-SUBSCRIPTION-CHILD-OK");
+            }
+            match call.index {
+                1 => scripted_spawn_call(&serde_json::json!({
+                    "action": "spawn_batch",
+                    "tasks": [
+                        {"task": TASK_CHILD, "mode": "task"},
+                        {"task": PROCESS_CHILD, "mode": "process"}
+                    ]
+                })),
+                2 => scripted_join_call(call.body),
+                3 => scripted_spawn_call(&serde_json::json!({"action": "list"})),
+                _ => text_reply("PRX-SUBSCRIPTION-DONE"),
+            }
+        }),
+    });
+    let mut config = parent_config(&fixture, "kimi-code");
+    config.default_model = Some("kimi-for-coding".to_owned());
+    config.api_url = Some(
+        server
+            .destination()
+            .strip_prefix("custom:")
+            .expect("test: loopback base URL")
+            .to_owned(),
+    );
+    // No `[cost].prices` override: the catalog bills kimi-code by subscription.
+    config.cost.prices.clear();
+    save_parent_config(&config);
+
+    run_parent(&fixture.config_dir, &fixture.home, &spawn_request(PARENT)).assert_success("subscription");
+    server.assert_no_failures();
+    let requests = server.requests();
+    assert_parent_join(&requests, PARENT, 2);
+    let after_list = requests
+        .iter()
+        .filter(|request| request.marker == PARENT)
+        .nth(AFTER_LIST - 1)
+        .expect("test: parent request after list");
+    let request: serde_json::Value = serde_json::from_str(&after_list.body).expect("test: request JSON");
+    let list = request["messages"]
+        .as_array()
+        .expect("test: request messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("test: list tool result");
+    for child in [TASK_CHILD, PROCESS_CHILD] {
+        let row = list
+            .split("\n• ")
+            .find(|row| row.contains(&format!("task: {child}")))
+            .unwrap_or_else(|| panic!("list has no row for {child}: {list}"));
+        assert!(row.contains("tok | subscription,"), "{child} row: {row}");
+    }
+    assert!(!list.contains("cost unknown"), "{list}");
+}

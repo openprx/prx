@@ -185,7 +185,7 @@ impl TaskTerminalJournal {
         }
         let mut committed = self.flush().await?;
         if let Some(collector) = &self.segment_usage {
-            committed.segment_usage = collector.snapshot();
+            committed.segment_usage = collector.session_snapshot();
         }
         Ok(committed)
     }

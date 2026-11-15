@@ -211,6 +211,29 @@ impl UsageSettlementClass {
             CostSettlement::Disabled | CostSettlement::Failed { .. } => None,
         }
     }
+
+    /// The class verified by a stored terminal payload's `cost_settlement`
+    /// field; `None` when the terminal settled no classifying cost. A field
+    /// that is present but malformed is an error, never a guess.
+    pub fn of_terminal_payload(payload: &serde_json::Value) -> anyhow::Result<Option<Self>> {
+        match payload.get("cost_settlement") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => {
+                let settlement = <crate::cost::types::CostSettlement as serde::Deserialize>::deserialize(value)
+                    .map_err(|error| anyhow::anyhow!("terminal cost settlement is malformed: {error}"))?;
+                Ok(Self::of(&settlement))
+            }
+        }
+    }
+
+    /// Tag `usage` with the class its stored terminal payload verifies.
+    pub fn tag_from_terminal_payload(
+        payload: &serde_json::Value,
+        mut usage: MeteredTokenUsageRecord,
+    ) -> anyhow::Result<MeteredTokenUsageRecord> {
+        usage.settlement_class = Self::of_terminal_payload(payload)?;
+        Ok(usage)
+    }
 }
 
 impl MeteredTokenUsageRecord {

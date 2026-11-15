@@ -302,56 +302,15 @@ fn format_recovered_run(run: &RecoveredTaskRun) -> String {
     )
 }
 
+/// One child run's usage label. Subscription-settled records read
+/// `subscription`, not `cost unknown` (CF-R8), with the same labels as the
+/// chat session footer.
 pub(crate) fn format_run_usage(records: &[crate::llm::route_decision::MeteredTokenUsageRecord]) -> String {
-    let mut total_tokens = 0u64;
-    let mut estimated_tokens = 0u64;
-    let mut known_cost_usd = 0.0f64;
-    let mut unknown_cost_requests = 0u64;
-    for record in records {
-        total_tokens = total_tokens.saturating_add(record.total_tokens);
-        if record.source == crate::llm::route_decision::TokenUsageSource::Estimated {
-            estimated_tokens = estimated_tokens.saturating_add(record.total_tokens);
-        }
-        if let Some(cost) = record.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
-            known_cost_usd += cost;
-        } else {
-            unknown_cost_requests = unknown_cost_requests.saturating_add(1);
-        }
-    }
-    if total_tokens == 0 {
+    let summary = crate::chat::session::SessionTokenUsageSummary::from_records(records);
+    if summary.total_tokens == 0 {
         return "unknown".to_string();
     }
-    let prefix = if estimated_tokens > 0 { "~" } else { "" };
-    let mut out = format!("{prefix}{} tok", format_token_count_compact(total_tokens));
-    if unknown_cost_requests > 0 {
-        out.push_str(" | cost unknown");
-    } else {
-        out.push_str(" | ");
-        out.push_str(&format_cost_usd(known_cost_usd));
-    }
-    out
-}
-
-fn format_token_count_compact(tokens: u64) -> String {
-    if tokens >= 10_000_000 {
-        format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
-fn format_cost_usd(cost: f64) -> String {
-    if !cost.is_finite() || cost <= 0.0 {
-        "$0.0000".to_string()
-    } else if cost >= 1.0 {
-        format!("${cost:.2}")
-    } else {
-        format!("${cost:.4}")
-    }
+    crate::chat::session::format_session_token_usage_inline(summary).unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
