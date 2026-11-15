@@ -557,6 +557,7 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
                 content: message.content.clone(),
                 timestamp,
                 tool_calls: Vec::new(),
+                context_handoff: false,
             })
             .collect()
     }
@@ -613,6 +614,7 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
     let _ = resumed.reduce(Action::SessionLoaded {
         session: snapshot.session,
         persist: false,
+        leading_system_prompt: None,
     });
     let resumed_pairs = resumed
         .session

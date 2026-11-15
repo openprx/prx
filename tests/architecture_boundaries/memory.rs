@@ -22,6 +22,10 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/agent/turn_tests/compaction.rs::named_compaction_stamps_the_summary_memory::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",
     // Test-only: tamper the durable v3 capsule authentication to simulate an unverifiable capsule (AUTH-02-1a).
     "src/chat/tests/persist_recovery_tests.rs::chat_inbound_on_an_agent_store_survives_an_unverifiable_capsule::rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\")).expect(\"agent store database\");",
+    // Test-only (PR #207 r1): install a refusing trigger so the real database fails session-row writes,
+    // proving every save failure reaches the history-commit latch and that store errors are never logged.
+    "src/chat/tests/acked_reads_tests.rs::refuse_session_row_writes::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"test: open the real database\");",
+    "src/chat/dispatcher/real_mode_tests/log_sentinel.rs::stream_failure_retry_and_store_error_logs_carry_no_free_text::let connection = rusqlite::Connection::open(dir.path().join(\"memory\").join(\"brain.db\"))",
     // Test-only: inspect the real tables to prove erasure leaves a tombstone and no transport digest (AUTH-02-1b).
     "src/runtime/ingress_recovery/authority_tests.rs::db::rusqlite::Connection::open(workspace.join(\"memory\").join(\"brain.db\")).expect(\"brain.db\")",
     "src/chat/tests/legacy_chat_compaction_audit_tests.rs::legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable::let conn = rusqlite::Connection::open(tmp.path().join(\"memory\").join(\"brain.db\")).unwrap();",

@@ -965,6 +965,7 @@ fn session_loaded_resets_transient_holder_set() {
     let effects = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
 
     assert!(state.ui.pending_tool_approval.is_none());
@@ -990,6 +991,7 @@ fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
         content: "old turn".to_string(),
         timestamp: chrono::Utc::now(),
         tool_calls: Vec::new(),
+        context_handoff: false,
     });
     state.ui.turn_count = 1;
     state.ui.token_usage_summary = MainSessionTokenUsageSummary {
@@ -1006,6 +1008,7 @@ fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
     let _ = state.reduce(Action::SessionLoaded {
         session: fresh,
         persist: false,
+        leading_system_prompt: None,
     });
 
     assert_eq!(state.session.id, "sess-fresh");
@@ -1037,6 +1040,7 @@ fn session_loaded_is_rejected_while_generating_without_clearing_active_turn() {
     let effects = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
 
     assert_eq!(state.session.id, "sess-old");

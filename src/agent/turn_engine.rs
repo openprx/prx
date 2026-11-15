@@ -1800,7 +1800,8 @@ async fn run_turn_unguarded(
                 .find(|call| call.name == crate::tools::STAY_SILENT_TOOL_NAME)
             {
                 let reason = crate::tools::stay_silent::extract_reason(&silent_call.arguments);
-                tracing::info!(reason = reason.as_str(), "tool loop: model chose to stay silent");
+                let (reason_len, reason_sha256) = tool_parse_log_digest(&reason);
+                tracing::info!(reason_len, reason_sha256, "tool loop: model chose to stay silent");
                 if cancellation_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
                     return Err(ToolLoopCancelled.into());
                 }

@@ -2,7 +2,7 @@
 
 use super::{
     ChatState, Effect, ToolTaskKey, compact_history_in_place, conversation_lines_from_turns,
-    durable_turns_from_compacted_history,
+    durable_turns_from_compacted_history, handoff_note_contents,
 };
 use crate::chat::action::{CompactReason, ProviderUsageRecordKind};
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
@@ -15,7 +15,15 @@ impl ChatState {
     /// Every field is replaced (id/title/provider/model/mode/turns) and history is rebuilt from
     /// turns. The load starts a new `load_epoch`; `persist` (new, branch, rewind) saves it, a
     /// resume only publishes it. A load while generating is rejected unchanged.
-    pub(super) fn reduce_session_loaded(&mut self, loaded: ChatSession, persist: bool) -> Vec<Effect> {
+    /// `leading_system_prompt` opens the rebuilt history exactly as it opens
+    /// the provider view, so a compaction guard built right after the load
+    /// describes the reducer history too.
+    pub(super) fn reduce_session_loaded(
+        &mut self,
+        loaded: ChatSession,
+        persist: bool,
+        leading_system_prompt: Option<String>,
+    ) -> Vec<Effect> {
         let id = loaded.id.clone();
         if self.control.generating {
             return vec![
@@ -47,13 +55,17 @@ impl ChatState {
         // S4-B T4-B-6: keep the original session's created_at so a later save_session cannot overwrite it
         self.session.created_at = Some(loaded.created_at);
         // rebuild history from turns (only user/assistant roles enter the LLM context)
-        self.session.history = self
-            .session
-            .turns
-            .iter()
-            .filter(|t| t.role == "user" || t.role == "assistant")
-            // stored user turns are neutralised like fresh input
-            .map(|t| crate::agent::turn_contracts::stored_turn_message(t.role.clone(), t.content.clone()))
+        self.session.history = leading_system_prompt
+            .map(ChatMessage::system)
+            .into_iter()
+            .chain(
+                self.session
+                    .turns
+                    .iter()
+                    .filter(|t| t.role == "user" || t.role == "assistant")
+                    // stored user turns are neutralised like fresh input
+                    .map(|t| crate::agent::turn_contracts::stored_turn_message(t.role.clone(), t.content.clone())),
+            )
             .collect();
         // A session saved before the delivery guard existed still holds
         // fabricated `[Used tools: ...]` claims in its assistant turns. This is
@@ -256,6 +268,7 @@ impl ChatState {
             content: content.clone(),
             timestamp: now,
             tool_calls: Vec::new(),
+            context_handoff: false,
         });
         // On the first user turn with an empty title, set it automatically (as session.add_user_turn does)
         if self.session.title.is_empty() {
@@ -287,6 +300,7 @@ impl ChatState {
             content: content.clone(),
             timestamp: chrono::Utc::now(),
             tool_calls,
+            context_handoff: false,
         });
         self.session.history.push(ChatMessage::assistant(content));
         vec![Effect::LogTrace {
@@ -449,7 +463,8 @@ impl ChatState {
 
         let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
         let final_len = history.len();
-        self.session.turns = durable_turns_from_compacted_history(history);
+        let handoff_notes = handoff_note_contents(&self.session.turns);
+        self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         self.ui.turn_count = self.session.turns.len();
@@ -491,6 +506,16 @@ impl ChatState {
             compaction_config,
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
+        // Provenance of the handoff notes: those the session already kept
+        // and the one this patch (built by the compaction code) brings.
+        let mut handoff_notes = handoff_note_contents(&self.session.turns);
+        handoff_notes.extend(
+            patch
+                .replacement
+                .iter()
+                .filter(|message| crate::agent::compaction::is_context_handoff_message(message))
+                .map(|message| message.content.clone()),
+        );
         let trim_fallback = if budget.over_hard_limit {
             crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                 history,
@@ -500,7 +525,7 @@ impl ChatState {
         } else {
             false
         };
-        self.session.turns = durable_turns_from_compacted_history(history);
+        self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         self.ui.turn_count = self.session.turns.len();

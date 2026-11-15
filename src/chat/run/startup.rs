@@ -1,9 +1,9 @@
 //! Mechanical startup and teardown helpers for the interactive chat entry point.
 use super::{
     Arc, AtomicU64, Channel, Config, DOUBLE_CTRLC_WINDOW_MS, Memory, Ordering, Result, TerminalChannel, Tool,
-    TracingChatGuard, dispatcher, ensure_chat_tracing_to_file, history_for_session_with_system,
-    initial_chat_dispatcher_state, load_latest_session_with_message_events, load_session_by_id_with_message_events,
-    mpsc, now_ms, providers, session, startup_banner,
+    TracingChatGuard, dispatcher, ensure_chat_tracing_to_file, initial_chat_dispatcher_state,
+    leading_system_prompt_for_session, load_latest_session_with_message_events, load_session_by_id_with_message_events,
+    mpsc, now_ms, provider_view_for_session, providers, session, startup_banner,
 };
 #[cfg(feature = "terminal-tui")]
 use super::{
@@ -303,7 +303,8 @@ pub(super) fn initial_conversation(
     let banner = startup_banner(provider_name, model_name);
 
     // ── Conversation history ─────────────────────────────────────
-    let history = history_for_session_with_system(chat_session, config, model_name, skills, native_tools);
+    let leading_system_prompt = leading_system_prompt_for_session(config, model_name, skills, native_tools);
+    let history = provider_view_for_session(chat_session, leading_system_prompt.as_deref());
 
     (chat_session_key, fabric_turn_seq, banner, history)
 }
@@ -361,6 +362,7 @@ pub(super) fn initial_dispatcher(
     model_name: &str,
     shutdown: &CancellationToken,
     chat_session: &session::ChatSession,
+    leading_system_prompt: Option<String>,
     #[cfg(feature = "terminal-tui")] config: &Config,
     #[cfg(feature = "terminal-tui")] ui_startup: &ChatStartupUi<'_>,
 ) -> (
@@ -384,8 +386,13 @@ pub(super) fn initial_dispatcher(
     // bounded(2048): covers the Action stream of a typical chat session (user input + streaming
     // chunks + tool events + signals) while merging deltas through [`StreamChunkCoalescer`] under
     // backpressure, so it cannot grow without bound and OOM.
-    let dispatcher_shadow_state =
-        initial_chat_dispatcher_state(provider_name, model_name, shutdown.clone(), chat_session);
+    let dispatcher_shadow_state = initial_chat_dispatcher_state(
+        provider_name,
+        model_name,
+        shutdown.clone(),
+        chat_session,
+        leading_system_prompt,
+    );
     // The acknowledged session is seeded from the reducer state (load epoch 1,
     // revision 0), so a read right after startup sees the loaded session.
     let (chat_dispatcher, chat_action_rx) =

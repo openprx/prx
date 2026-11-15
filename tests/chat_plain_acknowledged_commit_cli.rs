@@ -34,6 +34,9 @@ const TURN_DEADLINE: Duration = Duration::from_secs(120);
 /// Polling interval of the real SQLite store.
 const POLL: Duration = Duration::from_millis(50);
 const SENTINEL: &str = "SENTINEL-7f3a";
+/// Largest `chat.log` the trace case reads; a bigger one fails the test
+/// rather than being loaded whole.
+const CHAT_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 fn serve(sandbox: &Sandbox, script: Script) -> LoopbackOpenAi {
     let server = LoopbackOpenAi::start(MODEL, Some(USAGE), script);
@@ -288,6 +291,24 @@ fn a_compaction_before_the_call_is_acknowledged_and_the_request_occurs_once() {
     }
 }
 
+/// `chat.log` read up to [`CHAT_LOG_MAX_BYTES`] plus one byte; more than the
+/// limit fails the test. A missing log reads as empty.
+fn read_bounded_chat_log(path: &std::path::Path) -> String {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    file.take(CHAT_LOG_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .expect("test: read chat.log");
+    assert!(
+        u64::try_from(bytes.len()).is_ok_and(|len| len <= CHAT_LOG_MAX_BYTES),
+        "chat.log exceeds CHAT_LOG_MAX_BYTES ({CHAT_LOG_MAX_BYTES} bytes)"
+    );
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[test]
 fn trace_logging_carries_no_session_content() {
     let sandbox = Sandbox::new();
@@ -301,7 +322,7 @@ fn trace_logging_carries_no_session_content() {
     let output = finish(chat);
 
     assert_clean(&output);
-    let chat_log = std::fs::read_to_string(sandbox.config_dir.join("chat.log")).unwrap_or_default();
+    let chat_log = read_bounded_chat_log(&sandbox.config_dir.join("chat.log"));
     let logs = format!("{}{chat_log}", output.stderr);
     assert!(
         logs.contains("TRACE") || logs.contains("DEBUG"),

@@ -717,12 +717,14 @@ mod tests {
                 content: "```diff\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n```".to_string(),
                 timestamp: chrono::Utc::now(),
                 tool_calls: Vec::new(),
+                context_handoff: false,
             },
             ChatTurn {
                 role: "user".to_string(),
                 content: "```diff\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-left\n+right\n```".to_string(),
                 timestamp: chrono::Utc::now(),
                 tool_calls: Vec::new(),
+                context_handoff: false,
             },
         ];
         let latest = latest_fenced_diff(&turns, 1).unwrap_or_default();

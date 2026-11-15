@@ -359,6 +359,44 @@ fn manual_compact_below_threshold() {
     assert_handoff_and_recall(&sandbox, &server, &output);
 }
 
+#[test]
+fn compact_right_after_a_restart_is_compacted() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, 2);
+    let _server = configure(&sandbox, LARGE_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    for (replies, line) in [PLANT.to_owned(), read_line(0), read_line(1)].iter().enumerate() {
+        chat.turn(line, replies + 1);
+    }
+    let first = chat.exit();
+    assert_clean(&first, "first run");
+    let session_id = current_session_id(&first.stderr);
+
+    // No turn between the resume and `/compact`: the guard describes the
+    // reducer history the resume loaded.
+    let mut resumed = HeldChat::spawn(&sandbox, &["--session", &session_id]);
+    resumed.command("/compact");
+    let second = resumed.exit();
+    assert_clean(&second, "restart");
+
+    assert!(
+        second.stdout.contains("Compacted context"),
+        "/compact right after the restart compacted; stdout: {}\nstderr: {}",
+        second.stdout,
+        second.stderr
+    );
+    assert!(
+        !second.stdout.contains("Compaction refused"),
+        "the reducer accepted the compaction of the resumed history: {}",
+        second.stdout
+    );
+    assert_eq!(
+        compaction_script::session_handoffs(&sandbox.workspace, &session_id).len(),
+        1,
+        "the restarted session stored exactly one handoff"
+    );
+}
+
 /// Rows `/branch` copied into the branch (`branch-copy:` idempotency keys).
 fn branch_copy_rows(sandbox: &Sandbox) -> usize {
     let database = rusqlite::Connection::open_with_flags(
@@ -473,7 +511,10 @@ fn branch_of_a_nested_chain_recalls_the_fact_through_its_own_copies() {
         second.stdout
     );
     assert_lookup_returned_the_stored_row(&sandbox, &server);
-    assert!(!compaction_script::over_hard_limit_after_handoff(&sandbox.workspace));
+    assert!(
+        !compaction_script::over_hard_limit_after_handoff(&sandbox.workspace),
+        "no request after the handoff exceeded the hard limit"
+    );
 }
 
 /// Controller ruling 3 (G7a): after a compaction, `[Current session context]`

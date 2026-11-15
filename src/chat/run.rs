@@ -66,9 +66,10 @@ use super::session_glue::{
 use super::session_store::rewound_chat_session_from;
 use super::session_store::{
     bind_session_to_runtime_provider_model, branched_chat_session_from, format_saved_chat_sessions,
-    format_turn_boundaries, history_for_session_with_system, list_saved_sessions,
+    format_turn_boundaries, leading_system_prompt_for_session, list_saved_sessions,
     load_latest_session_with_message_events, load_session_by_id_with_message_events, parse_turn_boundary,
-    persisted_history_for_current_turn, save_session, saved_chat_sessions, upsert_leading_system_prompt,
+    persisted_history_for_current_turn, provider_view_for_session, save_session, saved_chat_sessions,
+    upsert_leading_system_prompt,
 };
 #[cfg(feature = "terminal-tui")]
 use super::session_switch::request_diff_apply_approval;
@@ -379,8 +380,10 @@ async fn run_internal(
     // handlers below cancel this same external token, so chat remains the sole
     // owner of ctrl_c semantics while the caller can also request shutdown.
 
+    // The reducer seed opens with the startup provider view's system prompt.
+    let startup_system_prompt = history.first().filter(|message| message.role == "system").map(|message| message.content.clone());
     let (chat_dispatcher, chat_action_rx, dispatcher_shadow_state) = startup::initial_dispatcher(
-        provider_name, model_name, &shutdown, &initial_session,
+        provider_name, model_name, &shutdown, &initial_session, startup_system_prompt,
         #[cfg(feature = "terminal-tui")] &config,
         #[cfg(feature = "terminal-tui")] &ui_startup,
     );
@@ -3858,13 +3861,18 @@ Retry with a compatible model: /provider {shown} <model>",
                                 return Err(error);
                             }
                         };
-                        dispatch_final_usage(
+                        if let Err(error) = dispatch_final_usage(
                             &chat_dispatcher,
+                            &turn_signal,
                             &mut turn_scheduler,
                             provider_turn_task_id,
                             terminal_usage,
                             "chat.provider_usage_recorded_empty_response",
-                        );
+                        )
+                        .await
+                        {
+                            anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+                        }
                         #[cfg(feature = "terminal-tui")]
                         if let Some(tx) = redraw_tx_for_main.as_ref() {
                             let _ = tx.try_send(());
@@ -3938,13 +3946,18 @@ Retry with a compatible model: /provider {shown} <model>",
                     // RecordAssistantTurn + StreamCompleted (fixB B5); the
                     // reducer owns the turn, and the slash commands read its
                     // acknowledged snapshot.
-                    dispatch_final_usage(
+                    if let Err(error) = dispatch_final_usage(
                         &chat_dispatcher,
+                        &turn_signal,
                         &mut turn_scheduler,
                         provider_turn_task_id,
                         terminal_usage,
                         "chat.provider_usage_recorded",
-                    );
+                    )
+                    .await
+                    {
+                        anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+                    }
                     #[cfg(feature = "terminal-tui")]
                     if let Some(tx) = redraw_tx_for_main.as_ref() {
                         let _ = tx.try_send(());
@@ -4075,6 +4088,7 @@ Retry with a compatible model: /provider {shown} <model>",
             } else {
                 super::compaction::apply_deterministic_trim_and_sync(
                     &mut history,
+                    enriched_request,
                     crate::chat::action::CompactReason::ContextOverflow,
                     &chat_dispatcher,
                     &turn_signal,
@@ -4492,13 +4506,18 @@ Retry with a compatible model: /provider {shown} <model>",
             let inline_payload = inline_provider_turn_payload(history.len(), 0, terminal_usage.as_ref());
             // Usage first (inside the commit's acknowledged revision), then
             // the awaited commit (the user turn was recorded at admission).
-            dispatch_final_usage(
+            if let Err(error) = dispatch_final_usage(
                 &chat_dispatcher,
+                &turn_signal,
                 &mut turn_scheduler,
                 provider_turn_task_id,
                 terminal_usage,
                 "chat.provider_usage_recorded_empty_response",
-            );
+            )
+            .await
+            {
+                anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+            }
             let Some(commit_task_id) = provider_turn_task_id else {
                 anyhow::bail!("chat turn has no provider task; its history cannot be committed");
             };
@@ -4595,13 +4614,18 @@ Retry with a compatible model: /provider {shown} <model>",
         // admission).
         let inline_payload =
             inline_provider_turn_payload(history.len(), response.chars().count(), terminal_usage.as_ref());
-        dispatch_final_usage(
+        if let Err(error) = dispatch_final_usage(
             &chat_dispatcher,
+            &turn_signal,
             &mut turn_scheduler,
             provider_turn_task_id,
             terminal_usage,
             "chat.provider_usage_recorded",
-        );
+        )
+        .await
+        {
+            anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+        }
         let Some(commit_task_id) = provider_turn_task_id else {
             anyhow::bail!("chat turn has no provider task; its history cannot be committed");
         };

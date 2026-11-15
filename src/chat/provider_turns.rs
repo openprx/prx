@@ -1189,13 +1189,23 @@ async fn commit_completed_provider_turn(
         // Metered usage goes in before the commit: same-channel FIFO puts it
         // in the commit's acknowledged revision, and it is recorded even if
         // the commit then fails, because the provider charged it.
-        dispatch_final_usage(
+        if let Err(error) = dispatch_final_usage(
             chat_dispatcher,
+            turn_signal,
             turn_scheduler,
             provider_turn_task_id,
             terminal_usage,
             "chat.provider_usage_recorded_empty_response",
-        );
+        )
+        .await
+        {
+            surface_session_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+            );
+            return false;
+        }
         if let Some(tx) = redraw_tx_for_main {
             let _ = tx.try_send(());
         }
@@ -1237,13 +1247,23 @@ async fn commit_completed_provider_turn(
         return true;
     }
 
-    dispatch_final_usage(
+    if let Err(error) = dispatch_final_usage(
         chat_dispatcher,
+        turn_signal,
         turn_scheduler,
         provider_turn_task_id,
         terminal_usage,
         "chat.provider_usage_recorded",
-    );
+    )
+    .await
+    {
+        surface_session_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+        );
+        return false;
+    }
     if let Some(tx) = redraw_tx_for_main {
         let _ = tx.try_send(());
     }
@@ -1870,25 +1890,34 @@ pub(super) fn request_provider_turn_cancel(
 /// Dispatch a turn's final metered usage (`FinalAggregate`) unconditionally,
 /// before the turn's awaited commit; the reducer deduplicates per task. The
 /// scheduler bookkeeping uses the same terminal usage.
-pub(super) fn dispatch_final_usage(
+///
+/// The send waits for channel capacity within the acknowledgement bound
+/// ([`crate::chat::dispatcher::ChatDispatcher::dispatch_bounded`]); when the
+/// usage is not accepted the history commit is latched as failed and the
+/// error is returned, and the caller must not commit the turn.
+pub(super) async fn dispatch_final_usage(
     chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    commits: &crate::chat::dispatcher::TurnCompletionSignal,
     turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     terminal_usage: Option<crate::chat::session::MainSessionTokenUsageRecord>,
     site: &'static str,
-) {
+) -> Result<(), crate::chat::acked_session::AckError> {
     let Some(record) = terminal_usage else {
-        return;
+        return Ok(());
     };
     record_provider_turn_usage(turn_scheduler, task_id, &record);
-    let _ = chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::ProviderUsageRecorded {
-            task_id,
-            usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
-            record,
-        },
-        site,
-    );
+    chat_dispatcher
+        .dispatch_bounded(
+            crate::chat::action::Action::ProviderUsageRecorded {
+                task_id,
+                usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                record,
+            },
+            commits,
+        )
+        .await
+        .inspect_err(|error| tracing::error!(site, error_kind = error.kind(), "final provider usage was not accepted"))
 }
 
 pub(super) fn record_provider_turn_usage(

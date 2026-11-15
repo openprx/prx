@@ -464,7 +464,15 @@ pub enum Action {
     /// The session finished loading. The reducer starts a new load epoch and
     /// emits `SaveSession` when `persist` (new, branch, rewind) or
     /// `PublishSession` (resume); a load while generating is rejected.
-    SessionLoaded { session: ChatSession, persist: bool },
+    /// `leading_system_prompt` is the system prompt the provider view of this
+    /// load starts with (`None` when it has none), so the reducer history and
+    /// the provider view describe the same messages from the acknowledged load
+    /// on, before any turn runs.
+    SessionLoaded {
+        session: ChatSession,
+        persist: bool,
+        leading_system_prompt: Option<String>,
+    },
     /// Non-TUI completion commit for a provider turn: removes the turn's draft
     /// if visible, always saves, and is accepted once per task.
     TurnCommitRequested {

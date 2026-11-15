@@ -36,6 +36,7 @@ fn a_reloaded_user_turn_opening_with_a_reserved_marker_enters_history_defused() 
     let _ = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
     let user = state
         .session

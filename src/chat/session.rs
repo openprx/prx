@@ -26,6 +26,12 @@ pub struct ChatTurn {
     /// Optional summary of tool calls made during this turn
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallSummary>,
+    /// Provenance: the turn is a context handoff note the compaction code
+    /// wrote (kept through later compactions, loads, branches and rewinds),
+    /// never a model reply. Only such a turn's note may be persisted under
+    /// the handoff sanitizing exception.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_handoff: bool,
 }
 
 /// Condensed record of a tool call for session replay.
@@ -345,6 +351,7 @@ impl ChatSession {
             content: content.to_string(),
             timestamp: Utc::now(),
             tool_calls: Vec::new(),
+            context_handoff: false,
         });
         self.updated_at = Utc::now();
 
@@ -361,6 +368,7 @@ impl ChatSession {
             content: content.to_string(),
             timestamp: Utc::now(),
             tool_calls,
+            context_handoff: false,
         });
         self.updated_at = Utc::now();
     }

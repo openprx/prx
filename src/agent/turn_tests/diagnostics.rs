@@ -113,9 +113,9 @@ fn logged_tool_arguments_are_redacted_by_key_and_by_content() {
 fn a_tool_parse_log_digest_carries_length_and_hash_but_no_content() {
     let body = "{\"name\": \"shell\", \"arguments\": \"SENTINEL-7f3a\"";
     let (len, hash) = tool_parse_log_digest(body);
-    assert_eq!(len, body.len());
-    assert_eq!(hash.len(), 16);
-    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
-    assert!(!hash.contains("SENTINEL"));
+    assert_eq!(len, body.len(), "the digest carries the body's byte length");
+    assert_eq!(hash.len(), 16, "the digest is 16 hex digits");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "the digest is hexadecimal");
+    assert!(!hash.contains("SENTINEL"), "the digest carries no body content");
     assert_eq!(tool_parse_log_digest(body), (len, hash), "the digest is stable");
 }

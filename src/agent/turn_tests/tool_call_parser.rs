@@ -901,7 +901,7 @@ fn a_malformed_tool_call_body_logs_no_content() {
     let text = String::from_utf8_lossy(&captured.0.lock()).into_owned();
 
     let (_, calls) = parsed.expect("a malformed body is reported, not an error");
-    assert!(calls.is_empty());
+    assert!(calls.is_empty(), "a malformed body yields no tool call");
     assert!(
         text.contains("Malformed <tool_call> JSON") && text.contains("body_len") && text.contains("body_sha256"),
         "the diagnostic is captured with its length and hash:\n{text}"

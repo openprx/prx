@@ -211,10 +211,67 @@ fn pii_issues(content: &str, patterns: [std::result::Result<&Regex, &regex::Erro
 }
 
 fn mask_uuids<'a>(content: &'a str, pattern: std::result::Result<&Regex, &regex::Error>) -> std::borrow::Cow<'a, str> {
-    pattern.map_or(std::borrow::Cow::Borrowed(content), |pattern| {
+    let canonical = pattern.map_or(std::borrow::Cow::Borrowed(content), |pattern| {
         pattern.replace_all(content, "<uuid>")
+    });
+    let masked = match mask_preview_uuid_prefixes(&canonical) {
+        std::borrow::Cow::Owned(masked) => Some(masked),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    masked.map_or(canonical, std::borrow::Cow::Owned)
+}
+
+/// A stored tool-call preview (`"args_preview":"…"` of a session row) cuts
+/// its arguments at a fixed length, often inside an event id, and the digits
+/// of the cut id's groups would read as a phone number. Inside that trusted
+/// metadata field only, a valid UUID prefix ending in the preview ellipsis is
+/// masked: full 8-4-4-4 groups up to the cut, the cut group partial. Any other
+/// shape, and anything outside a preview field (user-authored text), stays
+/// visible to every numeric detector. Without the patterns nothing is masked.
+fn mask_preview_uuid_prefixes(content: &str) -> std::borrow::Cow<'_, str> {
+    let (Ok(field), Ok(prefix)) = (preview_field_regex(), preview_uuid_prefix_regex()) else {
+        return std::borrow::Cow::Borrowed(content);
+    };
+    field.replace_all(content, |captures: &regex::Captures<'_>| {
+        let part = |name: &str| captures.name(name).map_or("", |m| m.as_str());
+        format!(
+            "{}{}{}",
+            part("head"),
+            prefix.replace_all(part("value"), "<uuid-prefix>"),
+            part("tail")
+        )
     })
 }
+
+/// A session row's `"args_preview"` JSON string value (escapes included).
+fn preview_field_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static FIELD: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r#"(?P<head>"args_preview"\s*:\s*")(?P<value>(?:[^"\\]|\\.)*)(?P<tail>")"#));
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = FIELD.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
+}
+
+/// A valid UUID prefix cut by a preview ellipsis (`…` or `...`): an 8-hex
+/// group, then any number of the following full 4-4-4 groups, the group at
+/// the cut partial (the last 12-hex group at most 12).
+fn preview_uuid_prefix_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
+    static PREFIX: LazyLock<std::result::Result<Regex, regex::Error>> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b[0-9a-f]{8}(?:-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-(?:[0-9a-f]{4}-[0-9a-f]{0,12}|[0-9a-f]{0,4})|[0-9a-f]{0,4})|[0-9a-f]{0,4}))?(?:…|\.\.\.)",
+        )
+    });
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let pattern = PREFIX.as_ref();
+    if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::error!("memory safety pattern unavailable");
+    }
+    pattern
+}
+
 fn pii_pattern_match<'a>(
     content: &str,
     pattern: std::result::Result<&Regex, &'a regex::Error>,
@@ -257,15 +314,9 @@ fn pii_phone_regex() -> std::result::Result<&'static Regex, &'static regex::Erro
     pattern
 }
 
-/// A canonical UUID, or a UUID cut short by a preview ellipsis (`…` or
-/// `...`): a stored tool-call preview truncates its arguments mid-identifier,
-/// and the digits of the remaining groups would read as a phone number.
 fn canonical_uuid_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
-    static UUID: LazyLock<std::result::Result<Regex, regex::Error>> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{8}-[0-9a-f-]{0,27}(?:…|\.\.\.)",
-        )
-    });
+    static UUID: LazyLock<std::result::Result<Regex, regex::Error>> =
+        LazyLock::new(|| Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"));
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let pattern = UUID.as_ref();
     if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -418,20 +469,94 @@ mod tests {
         assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
     }
 
+    fn agent_source() -> SourceMetadata {
+        SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        }
+    }
+
+    /// A session row whose tool-call preview holds `preview_args` and whose
+    /// user turn holds `user_text`, encoded as the row is stored.
+    fn session_row(user_text: &str, preview_args: &str) -> String {
+        serde_json::json!({
+            "turns": [{
+                "role": "user",
+                "content": user_text,
+                "tool_calls": [{"name": "transcript_history_lookup", "args_preview": preview_args}]
+            }]
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn a_uuid_cut_by_a_preview_ellipsis_is_not_phone_pii() {
         let filter = MemorySafetyFilter::default();
-        let source = SourceMetadata {
-            actor: Actor::Agent,
-            historical_accuracy: None,
-        };
-        let preview = r#"{"args_preview":"{\"event_ids\":[\"dd098779-5841-4428-bce2-1…"}"#;
-        assert!(filter.check(preview, &source).await.passed);
-        let ascii = r#"{"args_preview":"{\"event_ids\":[\"dd098779-5841-4428-b..."}"#;
-        assert!(filter.check(ascii, &source).await.passed);
+        let unicode = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
+        let ascii = session_row("look it up", r#"{"event_ids":["dd098779-5841-4428-b..."#);
 
-        let with_phone = format!("{preview} call 212-555-0199");
-        assert!(!filter.check(&with_phone, &source).await.passed);
+        assert!(
+            filter.check(&unicode, &agent_source()).await.passed,
+            "a UUID cut inside its last group by `…` in a preview is an identifier"
+        );
+        assert!(
+            filter.check(&ascii, &agent_source()).await.passed,
+            "a UUID cut inside a 4-hex group by `...` in a preview is an identifier"
+        );
+        let with_phone = session_row("call 212-555-0199", r#"{"event_ids":["dd098779-5841-4428-bce2-1…"#);
+        assert!(
+            !filter.check(&with_phone, &agent_source()).await.passed,
+            "a phone number next to a masked preview id is still caught"
+        );
+    }
+
+    #[tokio::test]
+    async fn pii_inside_a_malformed_uuid_prefix_in_a_preview_is_still_caught() {
+        let filter = MemorySafetyFilter::default();
+        let cases = [
+            ("phone", r#"{"event_ids":["deadbeef-212-555-0199…"#, "phone"),
+            ("identity number", r#"{"event_ids":["deadbeef-123-45-6789…"#, "identity"),
+            (
+                "payment card",
+                r#"{"event_ids":["deadbeef-4111 1111 1111 1111…"#,
+                "payment-card",
+            ),
+        ];
+        for (label, preview, detail) in cases {
+            let result = filter.check(&session_row("look it up", preview), &agent_source()).await;
+            assert!(
+                !result.passed,
+                "{label}: a malformed UUID prefix in a preview does not hide it"
+            );
+            assert!(
+                result
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == SafetyIssueKind::Pii && issue.detail.contains(detail)),
+                "{label}: the PII detector names it: {:?}",
+                result.issues
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_uuid_prefix_shape_in_user_text_is_not_masked() {
+        let filter = MemorySafetyFilter::default();
+        // Digit-only groups in a valid UUID-prefix shape read as a phone
+        // number. Inside a preview they are a cut identifier; typed by the
+        // user they stay visible to the detector.
+        let shape = "20125550-1990-5550-1990-1…";
+        let in_preview = session_row("look it up", &format!(r#"{{"event_ids":["{shape}"#));
+        let in_user_text = session_row(&format!("my number is {shape}"), r#"{"event_ids":[]}"#);
+
+        assert!(
+            filter.check(&in_preview, &agent_source()).await.passed,
+            "the shape inside preview metadata is masked as a cut identifier"
+        );
+        assert!(
+            !filter.check(&in_user_text, &agent_source()).await.passed,
+            "the same shape in user-authored text is never masked"
+        );
     }
 
     #[tokio::test]

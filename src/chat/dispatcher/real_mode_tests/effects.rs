@@ -29,6 +29,7 @@ async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_
     let _ = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
     let _ = state.reduce(acknowledgement);
     assert_eq!(state.session.id, "prx-new-session");

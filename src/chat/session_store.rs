@@ -371,24 +371,33 @@ pub(super) fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, syste
     }
 }
 
-pub(super) fn history_for_session_with_system(
-    session: &session::ChatSession,
+/// The system prompt a loaded session's provider view starts with: none for
+/// Skill-RAG sessions (they rebuild it per turn), else the runtime prompt.
+/// Every load hands the same value to the reducer (`SessionLoaded`) and to
+/// [`provider_view_for_session`], so both histories open identically.
+pub(super) fn leading_system_prompt_for_session(
     config: &Config,
     model_name: &str,
     skills: &[crate::skills::Skill],
     native_tools: bool,
-) -> Vec<ChatMessage> {
-    let resumed_history = session_turns_to_history(session);
+) -> Option<String> {
     if config.skill_rag.available() {
-        return resumed_history;
+        return None;
     }
-    let mut history = vec![ChatMessage::system(build_runtime_system_prompt(
-        config,
-        model_name,
-        skills,
-        native_tools,
-    ))];
-    history.extend(resumed_history);
+    Some(build_runtime_system_prompt(config, model_name, skills, native_tools))
+}
+
+/// The provider view of `session`: `leading_system_prompt` (if any) followed
+/// by its stored turns, the same messages the reducer rebuilds on load.
+pub(super) fn provider_view_for_session(
+    session: &session::ChatSession,
+    leading_system_prompt: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut history = Vec::with_capacity(session.turns.len().saturating_add(1));
+    if let Some(prompt) = leading_system_prompt {
+        history.push(ChatMessage::system(prompt.to_owned()));
+    }
+    history.extend(session_turns_to_history(session));
     history
 }
 

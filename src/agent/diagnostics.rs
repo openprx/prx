@@ -26,10 +26,11 @@ pub(super) fn scrub_credentials(input: &str) -> String {
     })
 }
 
-/// Payload-free identity of a malformed tool-call body for the log: its byte
-/// length and the first 16 hex digits of its SHA-256. The body itself (model
-/// output that may carry user or tool content) is never logged.
-pub(super) fn tool_parse_log_digest(input: &str) -> (usize, String) {
+/// Payload-free identity of free text for the log (a malformed tool-call
+/// body, a provider error, a model-chosen reason): its byte length and the
+/// first 16 hex digits of its SHA-256. The text itself (model output, an
+/// upstream error that may echo user or tool content) is never logged.
+pub(crate) fn tool_parse_log_digest(input: &str) -> (usize, String) {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(input.as_bytes());
     let hex = digest.iter().take(8).fold(String::with_capacity(16), |mut out, byte| {

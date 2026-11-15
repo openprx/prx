@@ -1,7 +1,8 @@
 #![cfg(test)]
 
-//! Bug #1: `/compact` manual compaction reuses `compact_chat_history`. These
-//! tests pin the routine the slash command drives so the user-visible turn /
+//! Bug #1: the deterministic `/compact` fallback is the reducer's
+//! `compact_history_in_place` (the provider view is rebuilt from its
+//! acknowledged result). These tests pin the routine the slash command drives so the user-visible turn /
 //! token delta is meaningful.
 use super::*;
 
@@ -19,7 +20,7 @@ fn compact_drops_old_turns_beyond_keep_window() {
     let turns_before = history.len() - 1;
     let tokens_before = estimate_chat_history_tokens(&history);
 
-    compact_chat_history(&mut history);
+    crate::chat::state::compact_history_in_place(&mut history);
 
     let turns_after = history.len() - 1;
     let tokens_after = estimate_chat_history_tokens(&history);
@@ -37,7 +38,7 @@ fn compact_drops_old_turns_beyond_keep_window() {
 fn compact_is_noop_for_short_history() {
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
     let before = estimate_chat_history_tokens(&history);
-    compact_chat_history(&mut history);
+    crate::chat::state::compact_history_in_place(&mut history);
     let after = estimate_chat_history_tokens(&history);
     // A 1-turn history is already compact — nothing to drop.
     assert_eq!(history.len(), 2);
@@ -174,7 +175,7 @@ fn legacy_preflight_compaction_feedback_emits_system_message() {
     }
     let (turns_before, tokens_before) = crate::chat::compaction::chat_history_turns_and_tokens(&history);
     let messages_before = history.len();
-    compact_chat_history(&mut history);
+    crate::chat::state::compact_history_in_place(&mut history);
     let outcome = crate::chat::compaction::ManualCompactOutcome::Degraded {
         dropped_messages: messages_before.saturating_sub(history.len()),
     };
@@ -483,6 +484,7 @@ async fn deterministic_trim_publishes_a_saved_revision_that_later_reads_keep() {
 
         let outcome = crate::chat::compaction::apply_deterministic_trim_and_sync(
             &mut provider_view,
+            None,
             crate::chat::action::CompactReason::Manual,
             &harness.dispatcher,
             &harness.commits,
@@ -502,7 +504,11 @@ async fn deterministic_trim_publishes_a_saved_revision_that_later_reads_keep() {
         let crate::chat::compaction::ManualCompactOutcome::Degraded { dropped_messages } = outcome else {
             panic!("a deterministic trim reports the loss: {outcome:?}");
         };
-        assert_eq!(dropped_messages, history.len() - provider_view.len());
+        assert_eq!(
+            dropped_messages,
+            history.len() - provider_view.len(),
+            "the reported loss is the provider view's dropped messages"
+        );
         assert!(dropped_messages > 0, "twenty oversized turns must lose some");
         assert_eq!(
             after_trim.revision,
@@ -576,9 +582,98 @@ async fn a_guard_mismatched_reducer_patch_is_rejected_and_leaves_state_and_revis
         harness.stop().await;
 
         assert!(matches!(ack, crate::chat::acked_session::Ack::Rejected(_)), "{ack:?}");
-        assert_eq!((after.load_epoch, after.revision), (before.load_epoch, before.revision));
-        assert_eq!(after.session.turns.len(), before.session.turns.len());
+        assert_eq!((after.load_epoch, after.revision), (before.load_epoch, before.revision), "a rejected patch publishes no new revision");
+        assert_eq!(after.session.turns.len(), before.session.turns.len(), "a rejected patch leaves the turns");
     })
     .await
     .expect("a_guard_mismatched_reducer_patch_is_rejected_and_leaves_state_and_revision_unchanged exceeded ACK_TEST_DEADLINE");
+}
+
+#[tokio::test]
+async fn a_deterministic_trim_over_enriched_past_requests_keeps_the_view_equal_to_later_acknowledged_reads() {
+    tokio::time::timeout(ACK_TEST_DEADLINE, async {
+        let (_dir, memory) = sqlite_test_memory();
+        let reply = |seq: usize| format!("answer-{seq} {}", "detail ".repeat(42));
+        let enriched = |text: &str| format!("[Memory context]\n{}\n{text}", "recalled ".repeat(40));
+        let mut reducer_history = vec![ChatMessage::system("sys")];
+        // The TUI provider view keeps every past request enriched; the
+        // reducer stores them plain.
+        let mut provider_view = vec![ChatMessage::system("sys")];
+        for seq in 0..COMPACT_KEEP_MESSAGES {
+            let question = format!("question-{seq}");
+            reducer_history.push(ChatMessage::user(question.clone()));
+            provider_view.push(ChatMessage::user(enriched(&question)));
+            reducer_history.push(ChatMessage::assistant(reply(seq)));
+            provider_view.push(ChatMessage::assistant(reply(seq)));
+        }
+        let current = "current question";
+        reducer_history.push(ChatMessage::user(current));
+        let enriched_request = ChatMessage::user(enriched(current));
+        provider_view.push(enriched_request.clone());
+        let harness = crate::chat::acked_session::TestSessionDispatcher::spawn(
+            memory,
+            crate::chat::acked_session::TestSessionDispatcher::state_with_history(reducer_history),
+        );
+
+        let outcome = crate::chat::compaction::apply_deterministic_trim_and_sync(
+            &mut provider_view,
+            Some(enriched_request.clone()),
+            crate::chat::action::CompactReason::ContextOverflow,
+            &harness.dispatcher,
+            &harness.commits,
+        )
+        .await;
+        let later = harness
+            .dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
+                &harness.commits,
+            )
+            .await
+            .expect("test: later save acknowledged");
+        harness.stop().await;
+
+        assert!(
+            matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Degraded { .. }),
+            "a deterministic trim reports the loss: {outcome:?}"
+        );
+        let crate::chat::acked_session::Ack::Published(later) = later else {
+            panic!("a changed mode publishes a saved revision: {later:?}");
+        };
+        let (view_request, view_past) = provider_view
+            .split_last()
+            .expect("test: the trimmed view keeps the current request");
+        assert_eq!(
+            view_request.content, enriched_request.content,
+            "only the current request keeps its enrichment"
+        );
+        let view_turns: Vec<(&str, &str)> = view_past
+            .iter()
+            .skip(1)
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        let (acked_request, acked_past) = later
+            .session
+            .turns
+            .split_last()
+            .expect("test: the acknowledged turns keep the current request");
+        assert_eq!(
+            acked_request.content, current,
+            "the acknowledged current request is the stored plain one"
+        );
+        let acked_turns: Vec<(&str, &str)> = acked_past
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str()))
+            .collect();
+        assert_eq!(
+            view_turns, acked_turns,
+            "a later acknowledged read brings back no turn the trimmed provider view dropped"
+        );
+        assert!(
+            view_past.iter().all(|message| !message.content.contains("recalled")),
+            "past requests carry no enrichment after the trim"
+        );
+    })
+    .await
+    .expect("a_deterministic_trim_over_enriched_past_requests_keeps_the_view_equal_to_later_acknowledged_reads exceeded ACK_TEST_DEADLINE");
 }

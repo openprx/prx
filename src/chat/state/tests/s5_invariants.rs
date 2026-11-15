@@ -120,6 +120,7 @@ fn save_session_persistence_copy_redacts_all_authoritative_content_fields() {
             task_id: Some(7),
             sequence: Some(9),
         }],
+        context_handoff: false,
     });
     let effects = state.reduce(Action::BackgroundSessionRecorded {
         summary: crate::chat::sessions::PersistedSessionSummary {

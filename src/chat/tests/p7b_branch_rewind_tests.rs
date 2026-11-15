@@ -9,6 +9,7 @@ fn turn(role: &str, content: &str) -> session::ChatTurn {
         content: content.to_string(),
         timestamp: chrono::Utc::now(),
         tool_calls: Vec::new(),
+        context_handoff: false,
     }
 }
 

@@ -1,7 +1,8 @@
 //! Chat session switching: resume, new session and approval clearing.
 
 use super::session_store::{
-    bind_session_to_runtime_provider_model, history_for_session_with_system, load_session_by_id_with_message_events,
+    bind_session_to_runtime_provider_model, leading_system_prompt_for_session, load_session_by_id_with_message_events,
+    provider_view_for_session,
 };
 #[cfg(feature = "terminal-tui")]
 use super::tui;
@@ -306,12 +307,17 @@ pub(super) async fn apply_chat_session_switch(
     persist: bool,
 ) -> Result<()> {
     bind_session_to_runtime_provider_model(&mut loaded_session, ctx.provider_name, ctx.model_name);
+    // The reducer history and the provider view open with the same system
+    // prompt from the acknowledged load on.
+    let leading_system_prompt =
+        leading_system_prompt_for_session(ctx.config, ctx.model_name, ctx.skills, ctx.native_tools);
     let acked = match ctx
         .chat_dispatcher
         .dispatch_awaited(
             crate::chat::action::Action::SessionLoaded {
                 session: loaded_session,
                 persist,
+                leading_system_prompt: leading_system_prompt.clone(),
             },
             ctx.commits,
         )
@@ -348,7 +354,7 @@ pub(super) async fn apply_chat_session_switch(
         .iter()
         .filter(|turn| turn.role == "user")
         .fold(0_u64, |acc, _| acc.saturating_add(1));
-    *ctx.history = history_for_session_with_system(&loaded, ctx.config, ctx.model_name, ctx.skills, ctx.native_tools);
+    *ctx.history = provider_view_for_session(&loaded, leading_system_prompt.as_deref());
 
     let _ = ctx.chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::SessionFocusChanged {

@@ -2,8 +2,10 @@
 //! non-TUI persistence-only executor and the test shadow executor running
 //! `SaveSession`, `PublishSession`, `AutoTitleSession` and a compaction patch
 //! with its `LogTrace`, plus a resume of a titled session, a paste and a
-//! sentinel typed key by key. The sentinel in turn content, title, tool
-//! `args_preview` and input never reaches the captured output; the stored row
+//! sentinel typed key by key, a stream retry and failure whose text quotes
+//! the user, and a store error the database raises with the sentinel in it.
+//! The sentinel in turn content, title, tool `args_preview`, input, provider
+//! errors and store errors never reaches the captured output; the stored row
 //! is sanitized.
 
 use super::*;
@@ -87,24 +89,28 @@ fn sentinel_session() -> ChatSession {
                 task_id: None,
                 sequence: None,
             }],
+            context_handoff: false,
         },
         ChatTurn {
             role: "assistant".to_owned(),
             content: format!("reply {SENTINEL}"),
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
+            context_handoff: false,
         },
         ChatTurn {
             role: "user".to_owned(),
             content: format!("again {SENTINEL}"),
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
+            context_handoff: false,
         },
         ChatTurn {
             role: "assistant".to_owned(),
             content: format!("done {SENTINEL}"),
             timestamp: chrono::Utc::now(),
             tool_calls: Vec::new(),
+            context_handoff: false,
         },
     ];
     session
@@ -118,6 +124,7 @@ fn sentinel_effects() -> Vec<crate::chat::state::Effect> {
     let _ = state.reduce(Action::SessionLoaded {
         session: sentinel_session(),
         persist: false,
+        leading_system_prompt: None,
     });
     let history = state.session.history.clone();
     let patch = crate::agent::turn_contracts::CompactionPatch {
@@ -243,7 +250,7 @@ async fn resuming_a_titled_session_logs_no_title() {
         .expect("test: resume the titled session");
         let text = logs.text();
 
-        assert_eq!(resumed.id, session.id);
+        assert_eq!(resumed.id, session.id, "the titled session is the one resumed");
         assert!(text.contains("Resumed session"), "the resume line is captured:\n{text}");
         assert!(
             text.contains("title_len"),
@@ -253,6 +260,77 @@ async fn resuming_a_titled_session_logs_no_title() {
     })
     .await
     .expect("resuming_a_titled_session_logs_no_title exceeded DEADLINE");
+}
+
+#[tokio::test]
+async fn stream_failure_retry_and_store_error_logs_carry_no_free_text() {
+    tokio::time::timeout(DEADLINE, async {
+        let (logs, _guard) = capture_logs();
+        let mut state = crate::chat::acked_session::TestSessionDispatcher::state_with_history(Vec::new());
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-sentinel".to_owned(),
+            cancel: CancellationToken::new(),
+        });
+        let mut effects = state.reduce(Action::StreamRetryAttempt {
+            attempt: 1,
+            reason: format!("upstream echoed {SENTINEL}"),
+        });
+        effects.extend(state.reduce(Action::StreamFailed {
+            draft_id: "draft-sentinel".to_owned(),
+            err: format!("provider error quoting the user: {SENTINEL}"),
+            retryable: false,
+        }));
+        let shadow = EffectExecutor::new_shadow();
+        for effect in effects {
+            shadow.execute(effect).await;
+        }
+
+        // A store error the real database raises with the sentinel in its
+        // text: shown to the user through the latch, never logged.
+        let (dir, memory) = sqlite_memory();
+        let connection = rusqlite::Connection::open(dir.path().join("memory").join("brain.db"))
+            .expect("test: open the real database");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER test_refuse_insert BEFORE INSERT ON memories \
+                 BEGIN SELECT RAISE(ABORT, 'refused {SENTINEL}'); END;"
+            ))
+            .expect("test: install the refusing trigger");
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
+        let persistence_only = EffectExecutor::new_persistence_only(PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        })
+        .with_session_publisher(publisher());
+        persistence_only
+            .execute(crate::chat::state::Effect::SaveSession(SessionCommit {
+                session: ChatSession::new("provider", "model"),
+                load_epoch: 1,
+                revision: 1,
+            }))
+            .await;
+        let (persistence_error, publication) = persistence_only.take_action_results();
+        let text = logs.text();
+
+        assert!(
+            text.contains("stream_retry_attempt") && text.contains("reason_len") && text.contains("reason_sha256"),
+            "the retry line is captured with the reason's length and digest:\n{text}"
+        );
+        assert!(
+            text.contains("stream_failed") && text.contains("err_len") && text.contains("err_sha256"),
+            "the failure line is captured with the error's length and digest:\n{text}"
+        );
+        assert!(
+            text.contains("SaveSession effect: store failed") && text.contains("error_len"),
+            "the store failure line is captured with the error's length:\n{text}"
+        );
+        assert!(persistence_error.is_some(), "the refused save is a persistence error");
+        assert!(publication.is_none(), "a refused save publishes nothing");
+        assert_no_sentinel(&text, "failure, retry and store error");
+    })
+    .await
+    .expect("stream_failure_retry_and_store_error_logs_carry_no_free_text exceeded DEADLINE");
 }
 
 #[cfg(feature = "terminal-tui")]

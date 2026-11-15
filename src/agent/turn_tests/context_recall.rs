@@ -767,7 +767,8 @@ fn the_session_preamble_quotes_nothing_a_handoff_replaced() {
 
     assert_eq!(
         current,
-        "[Current session context]\n- [user:local-user] a later question\n- [assistant:local-user] a later answer\n\n"
+        "[Current session context]\n- [user:local-user] a later question\n- [assistant:local-user] a later answer\n\n",
+        "only rows after the newest handoff are quoted"
     );
 }
 
@@ -783,12 +784,14 @@ fn a_session_whose_rows_a_handoff_replaced_never_falls_back_to_its_turns() {
 
     assert_eq!(
         build_current_session_events_preamble(&principal, &events, "now"),
-        Some(String::new())
+        Some(String::new()),
+        "a session whose rows a handoff replaced quotes nothing instead of its turns"
     );
     let unrelated = vec![preamble_event(Some("gateway:external:1"), "user", "elsewhere")];
     assert_eq!(
         build_current_session_events_preamble(&principal, &unrelated, "now"),
-        None
+        None,
+        "an unrelated session gives no current-session preamble"
     );
 }
 
@@ -805,8 +808,8 @@ fn the_session_preamble_never_quotes_rows_a_branch_copied() {
     let current = build_current_session_events_preamble(&principal, &events, "now").unwrap();
 
     assert_eq!(
-        current,
-        "[Current session context]\n- [user:local-user] first question in the branch\n\n"
+        current, "[Current session context]\n- [user:local-user] first question in the branch\n\n",
+        "a branch-copied row is never quoted"
     );
 }
 

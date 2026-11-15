@@ -12,16 +12,20 @@ use tokio_util::sync::CancellationToken;
 /// admitted. This must also run for a brand-new session with zero turns: leaving
 /// `ChatState::new`'s placeholder id in place lets the first Redux save rename
 /// the conversation, which splits message-event provenance across session keys.
+/// `leading_system_prompt` is the one the startup provider view opens with, so
+/// a `/compact` right after a resume describes the reducer history too.
 pub(super) fn initial_chat_dispatcher_state(
     provider_name: &str,
     model_name: &str,
     shutdown: CancellationToken,
     chat_session: &session::ChatSession,
+    leading_system_prompt: Option<String>,
 ) -> state::ChatState {
     let mut state = state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown);
     let _ = state.reduce(crate::chat::action::Action::SessionLoaded {
         session: chat_session.clone(),
         persist: false,
+        leading_system_prompt,
     });
     state
 }

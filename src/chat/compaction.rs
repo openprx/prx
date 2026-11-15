@@ -27,47 +27,6 @@ pub(super) const COMPACT_CONTENT_CHARS: usize = 320;
 /// Total character budget for compacted history (excluding system prompt).
 pub(super) const COMPACT_TOTAL_CHARS: usize = 2400;
 
-/// Compact conversation history in-place to fit within context window limits.
-///
-/// Preserves the system prompt (index 0), keeps the last [`COMPACT_KEEP_MESSAGES`]
-/// non-system messages, truncates each to [`COMPACT_CONTENT_CHARS`], and enforces
-/// a total character budget of [`COMPACT_TOTAL_CHARS`].
-pub(super) fn compact_chat_history(history: &mut Vec<ChatMessage>) {
-    if history.len() <= 1 {
-        return;
-    }
-
-    // Separate system prompt from conversation turns
-    let has_system = history.first().map(|m| m.role == "system").unwrap_or(false);
-    let start = if has_system { 1 } else { 0 };
-
-    // Keep only the last COMPACT_KEEP_MESSAGES conversation turns
-    let turn_count = history.len() - start;
-    if turn_count > COMPACT_KEEP_MESSAGES {
-        let drain_end = start + turn_count - COMPACT_KEEP_MESSAGES;
-        history.drain(start..drain_end);
-    }
-
-    // Truncate individual messages
-    for msg in history.iter_mut().skip(start) {
-        if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
-            msg.content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
-        }
-    }
-
-    // Enforce total character budget (drop oldest turns first)
-    while history
-        .iter()
-        .skip(start)
-        .map(|m| m.content.chars().count())
-        .sum::<usize>()
-        > COMPACT_TOTAL_CHARS
-        && history.len() > start + 1
-    {
-        history.remove(start);
-    }
-}
-
 pub(super) fn estimate_chat_history_tokens(history: &[ChatMessage]) -> usize {
     measure_history_tokens(history)
 }
@@ -313,6 +272,7 @@ pub(super) async fn run_manual_compact(
     }
     apply_deterministic_trim_and_sync(
         history,
+        None,
         crate::chat::action::CompactReason::Manual,
         chat_dispatcher,
         commits,
@@ -320,13 +280,41 @@ pub(super) async fn run_manual_compact(
     .await
 }
 
+/// The provider view of an acknowledged snapshot: the current view's leading
+/// system prompt (if any) followed by the acknowledged turns. Older-turn
+/// enrichment is not carried (R2), so every later acknowledged read describes
+/// exactly the messages this view holds.
+fn provider_view_from_acked(
+    current_view: &[ChatMessage],
+    acked: &crate::chat::acked_session::AckedSession,
+) -> Vec<ChatMessage> {
+    let system = current_view
+        .first()
+        .filter(|message| message.role == "system")
+        .map(|message| message.content.as_str());
+    super::session_store::provider_view_for_session(&acked.session, system)
+}
+
+/// Replace the view's final user message (the current request as the reducer
+/// stored it, possibly capped by a trim) with `enriched`, or append `enriched`
+/// when the view does not end with a user message.
+fn replace_trailing_request(view: &mut Vec<ChatMessage>, enriched: ChatMessage) {
+    if view.last().is_some_and(|last| last.role == "user") {
+        view.pop();
+    }
+    view.push(enriched);
+}
+
 /// The lossy fallback when no handoff or summary can be built: the reducer
 /// trims, rebuilds and saves its session first; only after that saved
-/// revision is acknowledged is the provider view trimmed the same way. A
-/// rejection, an acknowledgement without a saved revision or a failed
-/// acknowledgement leaves the provider view unchanged.
+/// revision is acknowledged is the provider view rebuilt from it, with
+/// `enriched_request` (preflight: the current turn's enriched request)
+/// replacing the stored request. A rejection, an acknowledgement without a
+/// saved revision or a failed acknowledgement leaves the provider view
+/// unchanged.
 pub(super) async fn apply_deterministic_trim_and_sync(
     history: &mut Vec<ChatMessage>,
+    enriched_request: Option<ChatMessage>,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     commits: &dispatcher::TurnCompletionSignal,
@@ -335,9 +323,13 @@ pub(super) async fn apply_deterministic_trim_and_sync(
         .dispatch_awaited(crate::chat::action::Action::HistoryCompacted { reason }, commits)
         .await
     {
-        Ok(crate::chat::acked_session::Ack::Published(_)) => {
+        Ok(crate::chat::acked_session::Ack::Published(acked)) => {
             let messages_before = history.len();
-            compact_chat_history(history);
+            let mut view = provider_view_from_acked(history, &acked);
+            if let Some(enriched) = enriched_request {
+                replace_trailing_request(&mut view, enriched);
+            }
+            *history = view;
             ManualCompactOutcome::Degraded {
                 dropped_messages: messages_before.saturating_sub(history.len()),
             }
@@ -470,7 +462,6 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
     chat_dispatcher: &dispatcher::ChatDispatcher,
     commits: &dispatcher::TurnCompletionSignal,
 ) -> ManualCompactOutcome {
-    let replacement_len = patch.replacement.len();
     let mut compacted = source_history.to_vec();
     if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
         tracing::warn!(
@@ -484,7 +475,11 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
             reason: format!("Compaction refused: {error}. Nothing was changed."),
         };
     }
-    match chat_dispatcher
+    // The loop's own bookkeeping notes the patch appends (a summary's refresh
+    // aside) are not durable turns; they are put back after the replacement.
+    let append_after = patch.append_after.clone();
+    let replacement_tail = patch.replacement.last().cloned();
+    let acked = match chat_dispatcher
         .dispatch_awaited(
             crate::chat::action::Action::HistoryCompactionPatchApplied {
                 reason,
@@ -495,7 +490,7 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
         )
         .await
     {
-        Ok(crate::chat::acked_session::Ack::Published(_)) => {}
+        Ok(crate::chat::acked_session::Ack::Published(acked)) => acked,
         Ok(crate::chat::acked_session::Ack::Rejected(rejection)) => {
             return ManualCompactOutcome::Refused {
                 reason: format!("Compaction refused: {rejection}. Nothing was changed."),
@@ -512,30 +507,27 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
                 reason: format!("Compaction failed: {error}. Nothing was changed."),
             };
         }
+    };
+    // The provider view is rebuilt from the acknowledged snapshot (which
+    // already carries the reducer's preserving trim), never trimmed on its
+    // own: a later acknowledged read then holds exactly these turns.
+    let mut view = provider_view_from_acked(&compacted, &acked);
+    if !append_after.is_empty() {
+        let insert_at = replacement_tail
+            .as_ref()
+            .and_then(|tail| {
+                view.iter()
+                    .rposition(|message| message.role == tail.role && message.content == tail.content)
+            })
+            .map(|index| index.saturating_add(1));
+        if let Some(insert_at) = insert_at {
+            view.splice(insert_at..insert_at, append_after);
+        }
     }
     if let Some(enriched) = enriched_request {
-        replace_final_request(&mut compacted, source_history.last(), enriched);
+        replace_final_request(&mut view, source_history.last(), enriched);
     }
-    *history = compacted;
-    let budget = crate::agent::context_budget::plan_context_budget(
-        history,
-        config,
-        crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
-    );
-    if budget.over_hard_limit {
-        let trimmed =
-            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                history,
-                config,
-                replacement_len,
-            );
-        tracing::warn!(
-            used_tokens = budget.used_tokens,
-            hard_limit = budget.available_input_tokens,
-            trimmed,
-            "chat summary compaction applied preserving trim"
-        );
-    }
+    *history = view;
     let (turns_after, tokens_after) = chat_history_turns_and_tokens(history);
     ManualCompactOutcome::Compacted {
         generation: crate::agent::compaction::context_handoff_generation(history),

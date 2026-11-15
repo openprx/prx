@@ -48,6 +48,7 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     let _ = reducer_state.reduce(Action::SessionLoaded {
         session: current_session,
         persist: false,
+        leading_system_prompt: None,
     });
     let (chat_dispatcher, action_rx) = dispatcher::ChatDispatcher::new_seeded(reducer_state.acked_session_seed());
     let mut chat_session = chat_dispatcher.session_reader();
@@ -160,7 +161,11 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     assert!(pending_chat_rewind.is_none());
     assert!(pending_diff_apply.is_none());
     assert!(!approval_router.has_pending());
-    assert_eq!(chat_session.session().id, "loaded-session");
+    assert_eq!(
+        chat_session.session().id,
+        "loaded-session",
+        "the reader adopted the loaded session"
+    );
     assert_eq!(chat_session_key, "chat:loaded-session");
     assert_eq!(fabric_turn_seq, 1);
     assert!(announced_started_sessions.is_empty());

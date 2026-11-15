@@ -130,7 +130,14 @@ fn is_durable_compaction_history_message(message: &ChatMessage) -> bool {
         && !crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
 }
 
-fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn> {
+/// The durable turns of a compacted history. `handoff_notes` are the exact
+/// contents of the context handoff notes the compaction code wrote (the
+/// current patch's and every earlier one the session kept); a turn equal to
+/// one of them keeps that provenance.
+fn durable_turns_from_compacted_history(
+    history: &[ChatMessage],
+    handoff_notes: &std::collections::HashSet<String>,
+) -> Vec<ChatTurn> {
     let timestamp = chrono::Utc::now();
     history
         .iter()
@@ -140,7 +147,19 @@ fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn
             content: message.content.clone(),
             timestamp,
             tool_calls: Vec::new(),
+            context_handoff: crate::agent::compaction::is_context_handoff_message(message)
+                && handoff_notes.contains(&message.content),
         })
+        .collect()
+}
+
+/// The contents of the handoff notes `turns` carry with compaction
+/// provenance.
+fn handoff_note_contents(turns: &[ChatTurn]) -> std::collections::HashSet<String> {
+    turns
+        .iter()
+        .filter(|turn| turn.context_handoff)
+        .map(|turn| turn.content.clone())
         .collect()
 }
 
@@ -1311,7 +1330,11 @@ impl ChatState {
             Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
             // ── Session ───────────────────────────────────────────
-            Action::SessionLoaded { session, persist } => self.reduce_session_loaded(session, persist),
+            Action::SessionLoaded {
+                session,
+                persist,
+                leading_system_prompt,
+            } => self.reduce_session_loaded(session, persist, leading_system_prompt),
             Action::TurnCommitRequested { task_id, draft_id } => self.reduce_turn_commit_requested(task_id, draft_id),
             Action::Awaited { action, .. } => self.reduce(*action),
             Action::SessionSaved { id } => self.reduce_session_saved(id),

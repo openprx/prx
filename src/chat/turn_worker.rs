@@ -620,8 +620,16 @@ mod tests {
         let decisions = commits.drain_ready();
         registry.apply_commit_decision(&decisions[0]).unwrap();
 
-        assert_eq!(registry.worker(id).unwrap().state, ProviderTurnWorkerState::Committed);
-        assert_eq!(registry.running_count(), 0);
+        assert_eq!(
+            registry.worker(id).unwrap().state,
+            ProviderTurnWorkerState::Committed,
+            "the inline completion commits the worker"
+        );
+        assert_eq!(
+            registry.running_count(),
+            0,
+            "the committed inline worker frees its slot"
+        );
     }
 
     #[test]
@@ -649,7 +657,10 @@ mod tests {
                 matches!(err, ProviderTurnWorkerError::InvalidWorkerState { .. }),
                 "{err:?}"
             );
-            assert!(!registry.worker(id).unwrap().completion_ready);
+            assert!(
+                !registry.worker(id).unwrap().completion_ready,
+                "a refused inline completion does not mark the worker ready"
+            );
         }
     }
 
@@ -1080,7 +1091,10 @@ mod tests {
         let (mut registry, id) = running_worker();
         registry.record_execution_started(id, 5).unwrap();
         registry.record_execution_failed(id, 5).unwrap();
-        assert!(registry.worker(id).unwrap().execution_failed);
+        assert!(
+            registry.worker(id).unwrap().execution_failed,
+            "the first failure while started is accepted"
+        );
         assert!(
             registry.record_execution_failed(id, 5).is_err(),
             "a second failure is refused"
@@ -1103,7 +1117,10 @@ mod tests {
             exited.record_execution_failed(exited_id, 7).is_err(),
             "refused after exit"
         );
-        assert!(!exited.worker(exited_id).unwrap().execution_failed);
+        assert!(
+            !exited.worker(exited_id).unwrap().execution_failed,
+            "a refused failure leaves the exited worker unfailed"
+        );
     }
 
     #[test]
@@ -1111,15 +1128,21 @@ mod tests {
         let (mut registry, id) = running_worker();
         registry.record_execution_started(id, 8).unwrap();
         let err = registry.record_execution_failed(id, 9).unwrap_err();
-        assert!(matches!(
-            err,
-            ProviderTurnWorkerError::ExecutionLeaseMismatch {
-                expected: 8,
-                actual: 9,
-                ..
-            }
-        ));
-        assert!(!registry.worker(id).unwrap().execution_failed);
+        assert!(
+            matches!(
+                err,
+                ProviderTurnWorkerError::ExecutionLeaseMismatch {
+                    expected: 8,
+                    actual: 9,
+                    ..
+                }
+            ),
+            "a failure for another lease is a lease mismatch"
+        );
+        assert!(
+            !registry.worker(id).unwrap().execution_failed,
+            "a refused foreign-lease failure leaves the worker unfailed"
+        );
     }
 
     #[tokio::test]
@@ -1129,16 +1152,31 @@ mod tests {
         registry.attach_execution_handle(id, 10, task.abort_handle()).unwrap();
         registry.record_execution_started(id, 10).unwrap();
 
-        assert!(registry.record_execution_exited(id, 11).is_err());
+        assert!(
+            registry.record_execution_exited(id, 11).is_err(),
+            "an exit for a foreign lease is refused"
+        );
         let worker = registry.worker(id).unwrap();
-        assert!(worker.execution_lease_active && !worker.execution_exited);
-        assert!(registry.execution_handle_attached(id));
+        assert!(
+            worker.execution_lease_active && !worker.execution_exited,
+            "a foreign-lease exit leaves the lease active"
+        );
+        assert!(
+            registry.execution_handle_attached(id),
+            "a foreign-lease exit leaves the handle attached"
+        );
 
         registry.record_execution_exited(id, 10).unwrap();
         registry.record_execution_exited(id, 10).unwrap();
         let worker = registry.worker(id).unwrap();
-        assert!(worker.execution_exited && !worker.execution_lease_active);
-        assert!(!registry.execution_handle_attached(id));
+        assert!(
+            worker.execution_exited && !worker.execution_lease_active,
+            "the matching exit retires the lease, idempotently"
+        );
+        assert!(
+            !registry.execution_handle_attached(id),
+            "the matching exit detaches the handle"
+        );
         task.abort();
     }
 }

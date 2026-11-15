@@ -2558,6 +2558,116 @@ impl Tool for SteadyTool {
     }
 }
 
+/// Payload-free logging: the reason a model gives with `stay_silent` is its
+/// own free text (it may quote the user) and reaches the log only as a length
+/// and digest.
+#[tokio::test]
+async fn a_stay_silent_reason_reaches_the_log_only_as_length_and_digest() {
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    // A second, never-dropped dispatcher keeps callsite interest computed
+    // from every dispatcher, so a sibling test cannot cache "never" here.
+    static PLURAL_DISPATCHERS: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    std::sync::LazyLock::force(&PLURAL_DISPATCHERS);
+    let sentinel = "SENTINEL-7f3a";
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        let temp = TempDir::new().expect("test: temporary workspace");
+        let response = format!(
+            "<tool_call>\n{{\"name\":\"stay_silent\",\"arguments\":{{\"reason\":\"the user said {sentinel}\"}}}}\n</tool_call>"
+        );
+        let provider = ScriptedProvider::from_text_responses(vec![response.as_str()]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::StaySilentTool::new())];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("banter")];
+        let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+        let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_tools(
+            temp.path(),
+            &history.last().expect("test: source input").content,
+            Arc::clone(&tools_registry),
+        )
+        .await;
+        run_turn(
+            &mut history,
+            crate::agent::turn_request::TurnRequest {
+                advice: None,
+                channel_name: "cli",
+                scope: None,
+                mode: ChatMode::default(),
+                silent: true,
+                expose_stay_silent: true,
+                multimodal: &crate::config::MultimodalConfig::default(),
+                schedule: crate::agent::turn_request::TurnSchedule {
+                    read_only_tool_concurrency_window: 2,
+                    priority_scheduling_enabled: false,
+                    low_priority_tool_names: Vec::new(),
+                },
+                compaction: None,
+                decision: admission.decision(),
+            },
+            crate::agent::turn_request::TurnServices {
+                provider: &provider,
+                provider_name: "ollama",
+                model: "prx-local-model",
+                temperature: 0.0,
+                tools_registry,
+                observer: &NoopObserver,
+                hooks: &crate::hooks::HookManager::new(temp.path().to_path_buf()),
+                approval: None,
+                approval_resolver: None,
+                runtime_adapter: Some(admission.adapter()),
+                memory: admission.memory_runtime(),
+            },
+            crate::agent::turn_request::TurnDelivery {
+                cancellation: None,
+                on_delta: None,
+                on_tool_call: None,
+            },
+        )
+        .await
+        .map(|(outcome, _trace)| outcome)
+    })
+    .await
+    .expect("test: the silent turn finishes within its deadline")
+    .expect("test: a silent decision is a normal terminal outcome");
+    let text = String::from_utf8_lossy(&captured.0.lock()).into_owned();
+
+    assert!(
+        matches!(outcome, ToolLoopOutcome::Silent { ref reason } if reason.contains(sentinel)),
+        "the premise is a silent turn carrying the sentinel reason: {outcome:?}"
+    );
+    assert!(
+        text.contains("model chose to stay silent") && text.contains("reason_len") && text.contains("reason_sha256"),
+        "the silence line is captured with the reason's length and digest:\n{text}"
+    );
+    assert!(
+        !text.contains(sentinel),
+        "the stay_silent reason reached a log line:\n{text}"
+    );
+}
+
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn shared_tool_loop_applies_wasm_middleware_to_delivered_text_and_history() {

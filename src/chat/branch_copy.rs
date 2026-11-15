@@ -71,9 +71,11 @@ pub(super) async fn copy_branch_transcript(
         match retained_turn_event_ids(mem, &source, branch, None).await {
             Ok(ids) => plan.final_batch.original_event_ids = ids,
             Err(error) => {
+                let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error.to_string());
                 tracing::warn!(
                     turns = branch.turns.len(),
-                    %error,
+                    error_len,
+                    error_sha256,
                     "branch keeps no handoff and its turns have no exact transcript rows; later compaction in the branch starts without provenance"
                 );
                 return Ok(());

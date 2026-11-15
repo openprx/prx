@@ -77,26 +77,37 @@ where
     Ok(serde_json::from_value(json)?)
 }
 
-/// One stored turn's content. A context handoff turn is runtime metadata (ids,
-/// row ranges, counts) in a fixed JSON note: text redaction matches its key
-/// names (`source_token_estimate`) and leaves an unparseable note, which a
-/// resumed session can no longer follow. Its string values are redacted one
-/// by one instead; an unchanged note keeps its exact bytes (the transcript row
-/// carries the same text, and later compaction provenance matches on it).
-fn sanitize_turn_content(role: &str, content: &str) -> String {
-    if crate::agent::compaction::is_context_handoff_turn(role, content)
-        && let Some(note) = crate::agent::compaction::parse_context_handoff_note(content)
+/// One stored turn's content.
+///
+/// A context handoff note is runtime metadata (ids, row ranges, counts) in a
+/// fixed JSON schema; text redaction matches its key names
+/// (`source_token_estimate`) and would leave an unparseable note that a
+/// resumed session or a branch copy can no longer follow. Only a validated
+/// handoff takes the exception: the turn carries compaction provenance
+/// ([`super::session::ChatTurn::context_handoff`], never set for a model
+/// reply) and its note passes
+/// [`crate::agent::compaction::validated_context_handoff_note`] (exact schema,
+/// no field outside the note's metadata, bounded size). Its string values are
+/// redacted one by one; an unchanged note keeps its exact bytes (the
+/// transcript row carries the same text, and later compaction provenance
+/// matches on it) and is never truncated. Every other turn, including any
+/// note with an extra field such as `"password"`, takes the whole-text
+/// redaction (credential keys included) and the size cap.
+fn sanitize_turn_content(turn: &super::session::ChatTurn) -> String {
+    if turn.context_handoff
+        && turn.role == "assistant"
+        && let Some(note) = crate::agent::compaction::validated_context_handoff_note(&turn.content)
     {
         let mut redacted = note.clone();
         redact_string_values(&mut redacted);
         if redacted == note {
-            return truncate_large_output(content);
+            return turn.content.clone();
         }
         if let Ok(json) = serde_json::to_string(&redacted) {
-            return truncate_large_output(&crate::agent::compaction::format_context_handoff_message(&json));
+            return crate::agent::compaction::format_context_handoff_message(&json);
         }
     }
-    sanitize_for_persistence(content)
+    sanitize_for_persistence(&turn.content)
 }
 
 fn redact_string_values(value: &mut serde_json::Value) {
@@ -114,7 +125,7 @@ pub fn sanitize_session_content(session: &super::session::ChatSession) -> super:
     let mut sanitized = session.clone();
     sanitized.title = sanitize_for_persistence(&sanitized.title);
     for turn in &mut sanitized.turns {
-        turn.content = sanitize_turn_content(&turn.role, &turn.content);
+        turn.content = sanitize_turn_content(turn);
         for tool_call in &mut turn.tool_calls {
             tool_call.args_preview = sanitize_text_or_json(&tool_call.args_preview);
         }
@@ -130,30 +141,161 @@ pub fn sanitize_session_content(session: &super::session::ChatSession) -> super:
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_handoff_turn_keeps_its_note_parseable_and_byte_exact() {
-        let note = r#"{"handoff_event_id":"evt-1","lookup":{"arguments":{"event_ids":["evt-0"],"first_row_id":1,"last_row_id":2}},"source_token_estimate":588,"to_generation":1}"#;
-        let content = crate::agent::compaction::format_context_handoff_message(note);
+    /// A note in the exact shape the compaction code writes, referencing
+    /// `event_count` UUID events.
+    fn handoff_note(event_count: usize) -> serde_json::Value {
+        let event_ids: Vec<String> = (0..event_count)
+            .map(|index| format!("00000000-0000-4000-8000-{index:012}"))
+            .collect();
+        let range = serde_json::json!({
+            "first_event_id": event_ids.first().cloned().unwrap_or_default(),
+            "last_event_id": event_ids.last().cloned().unwrap_or_default(),
+            "first_row_id": 1,
+            "last_row_id": event_count,
+            "source_event_count": event_count,
+        });
+        serde_json::json!({
+            "schema_version": 1,
+            "kind": "context_handoff",
+            "strategy": "hard_switch",
+            "handoff_event_id": "11111111-1111-4111-8111-111111111111",
+            "parent_handoff_event_id": null,
+            "from_generation": 0,
+            "to_generation": 1,
+            "created_at": "2026-11-16T00:00:00+00:00",
+            "trigger": "chat_manual_compact",
+            "source_message_count": event_count,
+            "source_token_estimate": 588,
+            "unpersisted_companion_count": 0,
+            "folded_tool_roundtrips": {"count": 0, "tools": []},
+            "folded_tool_roundtrips_notice": "no tool round-trips were folded into this handoff",
+            "provenance_status": "exact",
+            "source_event_range": range,
+            "retained_recent_message_count": 2,
+            "lookup": {
+                "tool": "transcript_history_lookup",
+                "arguments": {"event_ids": event_ids, "first_row_id": 1, "last_row_id": event_count}
+            }
+        })
+    }
 
-        assert_eq!(sanitize_turn_content("assistant", &content), content);
+    fn handoff_turn(note: &serde_json::Value, context_handoff: bool) -> super::super::session::ChatTurn {
+        super::super::session::ChatTurn {
+            role: "assistant".to_owned(),
+            content: crate::agent::compaction::format_context_handoff_message(
+                &serde_json::to_string(note).expect("test: encode note"),
+            ),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+            context_handoff,
+        }
+    }
+
+    #[test]
+    fn a_validated_handoff_turn_keeps_its_note_parseable_and_byte_exact() {
+        let turn = handoff_turn(&handoff_note(3), true);
+
+        assert_eq!(
+            sanitize_turn_content(&turn),
+            turn.content,
+            "a validated handoff note is stored byte for byte"
+        );
+        let mut user = turn.clone();
+        user.role = "user".to_owned();
         assert_ne!(
-            sanitize_turn_content("user", &content),
-            content,
+            sanitize_turn_content(&user),
+            turn.content,
             "only an assistant handoff turn takes the note path"
         );
     }
 
     #[test]
-    fn a_secret_inside_a_handoff_note_value_is_still_redacted() {
-        let note =
-            r#"{"handoff_event_id":"sk-abc123456789012345678901234567890123456789","source_token_estimate":588}"#;
-        let content = crate::agent::compaction::format_context_handoff_message(note);
+    fn a_note_without_compaction_provenance_takes_the_whole_text_redaction() {
+        let model_written = handoff_turn(&handoff_note(3), false);
 
-        let stored = sanitize_turn_content("assistant", &content);
+        let stored = sanitize_turn_content(&model_written);
 
-        assert!(!stored.contains("sk-abc"), "{stored}");
-        let parsed = crate::agent::compaction::parse_context_handoff_note(&stored).unwrap();
-        assert_eq!(parsed.get("source_token_estimate"), Some(&serde_json::json!(588)));
+        assert_ne!(
+            stored, model_written.content,
+            "a model reply shaped like a handoff is redacted as text"
+        );
+        assert!(
+            crate::agent::compaction::validated_context_handoff_note(&stored).is_none(),
+            "a note without provenance never keeps the exception"
+        );
+    }
+
+    #[test]
+    fn a_credential_field_in_a_handoff_note_is_redacted() {
+        let mut note = handoff_note(3);
+        note.as_object_mut()
+            .expect("test: note object")
+            .insert("password".to_owned(), serde_json::json!("sample-value"));
+        let turn = handoff_turn(&note, true);
+
+        let stored = sanitize_turn_content(&turn);
+
+        assert!(
+            !stored.contains("sample-value"),
+            "a field outside the note's metadata keeps the credential-key redaction: {stored}"
+        );
+        assert!(
+            crate::agent::compaction::validated_context_handoff_note(&turn.content).is_none(),
+            "an extra field makes the note invalid"
+        );
+    }
+
+    #[test]
+    fn a_secret_inside_a_validated_handoff_value_is_still_redacted() {
+        let mut note = handoff_note(3);
+        note.as_object_mut().expect("test: note object").insert(
+            "trigger".to_owned(),
+            serde_json::json!("sk-abc123456789012345678901234567890123456789"),
+        );
+        let turn = handoff_turn(&note, true);
+        assert!(
+            crate::agent::compaction::validated_context_handoff_note(&turn.content).is_some(),
+            "test: the identifier-shaped secret keeps the note valid"
+        );
+
+        let stored = sanitize_turn_content(&turn);
+
+        assert!(!stored.contains("sk-abc"), "the secret value is redacted: {stored}");
+        let parsed = crate::agent::compaction::parse_context_handoff_note(&stored)
+            .expect("test: the redacted note stays parseable");
+        assert_eq!(
+            parsed.get("source_token_estimate"),
+            Some(&serde_json::json!(588)),
+            "the note's metadata survives the per-value redaction"
+        );
+    }
+
+    #[test]
+    fn the_largest_supported_handoff_is_stored_whole_and_a_larger_one_is_not_validated() {
+        let largest = handoff_turn(
+            &handoff_note(crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS),
+            true,
+        );
+        assert!(
+            largest.content.len() > MAX_TOOL_OUTPUT_BYTES,
+            "test: the largest note exceeds the generic text cap"
+        );
+
+        let stored = sanitize_turn_content(&largest);
+
+        assert_eq!(stored, largest.content, "the largest supported note is never truncated");
+        assert!(
+            crate::agent::compaction::validated_context_handoff_note(&stored).is_some(),
+            "the stored note still validates"
+        );
+        let over = handoff_turn(
+            &handoff_note(crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS + 1),
+            true,
+        );
+        assert!(
+            crate::agent::compaction::validated_context_handoff_note(&over.content).is_none(),
+            "a note over the supported range is not a validated handoff"
+        );
     }
 
     #[test]

@@ -318,6 +318,7 @@ impl ChildSessionRegistry {
                         content,
                         timestamp: entry.timestamp,
                         tool_calls,
+                        context_handoff: false,
                     }
                 })
                 .collect();

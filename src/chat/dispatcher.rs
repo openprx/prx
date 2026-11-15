@@ -408,7 +408,39 @@ impl ChatDispatcher {
         .await
         .unwrap_or(Err(AckError::Timeout));
         if let Err(error) = &result {
-            tracing::error!(action_kind, error = %error, "awaited session acknowledgement failed");
+            tracing::error!(
+                action_kind,
+                error_kind = error.kind(),
+                "awaited session acknowledgement failed"
+            );
+            commits.fail_history_commit(error.to_string());
+        }
+        result
+    }
+
+    /// Send `action` in order, waiting for channel capacity for at most
+    /// [`crate::chat::acked_session::ACK_TIMEOUT`]. For actions a later commit
+    /// depends on (the turn's final usage): a closed channel or a timeout
+    /// latches `commits` as an unconfirmed history commit and is returned, so
+    /// the caller never commits without them.
+    pub async fn dispatch_bounded(
+        &self,
+        action: Action,
+        commits: &TurnCompletionSignal,
+    ) -> Result<(), crate::chat::acked_session::AckError> {
+        use crate::chat::acked_session::{ACK_TIMEOUT, AckError};
+        let action_kind = action.kind();
+        let result = match tokio::time::timeout(ACK_TIMEOUT, self.action_tx.send(action)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(AckError::ChannelClosed),
+            Err(_) => Err(AckError::Timeout),
+        };
+        if let Err(error) = &result {
+            tracing::error!(
+                action_kind,
+                error_kind = error.kind(),
+                "ordered session action was not accepted"
+            );
             commits.fail_history_commit(error.to_string());
         }
         result
@@ -1271,8 +1303,10 @@ impl EffectExecutor {
         let json = match session.to_json() {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!(error = %e, "SaveSession effect: serialize failed");
-                *self.persistence_error.lock() = Some(e.to_string());
+                let error = e.to_string();
+                let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error);
+                tracing::warn!(error_len, error_sha256, "SaveSession effect: serialize failed");
+                *self.persistence_error.lock() = Some(error);
                 return;
             }
         };
@@ -1317,8 +1351,12 @@ impl EffectExecutor {
                 let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
             }
             Err(e) => {
-                tracing::warn!(error = %e, "SaveSession effect: store failed");
-                *self.persistence_error.lock() = Some(e.to_string());
+                // A store error can quote stored content (a safety rejection's
+                // detail): the log carries its length and digest only.
+                let error = e.to_string();
+                let (error_len, error_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&error);
+                tracing::warn!(error_len, error_sha256, "SaveSession effect: store failed");
+                *self.persistence_error.lock() = Some(error);
             }
         }
     }
@@ -3134,6 +3172,9 @@ struct ReducedAction {
     usage: Option<TokenUsage>,
     draft_id: Option<String>,
     approval_response: Option<(String, bool, bool)>,
+    /// A failed save of this action's effects. Every one, awaited or not,
+    /// reaches the single history-commit latch.
+    persistence_failure: Option<String>,
     #[cfg(feature = "terminal-tui")]
     ui_dirty: bool,
 }
@@ -3186,6 +3227,7 @@ async fn reduce_and_execute(
         };
         ticket.answer(reply);
     }
+    let persistence_failure = persistence_error.clone();
     let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested, persistence_error);
     ReducedAction {
         outcome,
@@ -3193,6 +3235,7 @@ async fn reduce_and_execute(
         usage,
         draft_id,
         approval_response,
+        persistence_failure,
         #[cfg(feature = "terminal-tui")]
         ui_dirty,
     }
@@ -3206,6 +3249,19 @@ fn finish_reduced_action(
 ) {
     if let (Some((tool_id, approved, always)), Some(router)) = (reduced.approval_response, approval_router) {
         router.resolve_decision(&tool_id, approved, always);
+    }
+    if let Some(failure) = reduced.persistence_failure {
+        // The reducer has moved past the last acknowledged revision; no
+        // reader may go on from the older snapshot. The latch keeps the first
+        // failure, so the chat stops with exactly one terminal failure.
+        tracing::error!(
+            failure_len = failure.len(),
+            "session save failed; chat stops after an unconfirmed history commit"
+        );
+        match turn_signal {
+            Some(sig) => sig.fail_history_commit(format!("session persistence failed: {failure}")),
+            None => tracing::error!("session save failed with no turn signal to latch"),
+        }
     }
     if let Some(sig) = turn_signal {
         let draft_id = reduced.draft_id.as_deref();

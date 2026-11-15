@@ -23,7 +23,7 @@ fn brand_new_chat_seeds_redux_with_durable_session_id() {
     let session = session::ChatSession::new("mock", "mock-model");
     assert_eq!(session.turn_count(), 0);
 
-    let state = initial_chat_dispatcher_state("mock", "mock-model", CancellationToken::new(), &session);
+    let state = initial_chat_dispatcher_state("mock", "mock-model", CancellationToken::new(), &session, None);
 
     assert_eq!(state.session.id, session.id);
     assert_eq!(state.session.provider.as_ref(), session.provider);

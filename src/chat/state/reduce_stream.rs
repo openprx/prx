@@ -464,11 +464,14 @@ impl ChatState {
                 status: crate::chat::tui::ToolStatus::Error,
                 content: format!("Error: {err}"),
             });
+        // The error text may echo user or tool content: the log carries its
+        // length and digest only.
+        let (err_len, err_sha256) = crate::agent::diagnostics::tool_parse_log_digest(&err);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::WARN,
                 msg: format!(
-                    "stream_failed draft_id={draft_id} retryable={retryable} orphan_user_removed={orphan_user_removed} err={err}"
+                    "stream_failed draft_id={draft_id} retryable={retryable} orphan_user_removed={orphan_user_removed} err_len={err_len} err_sha256={err_sha256}"
                 ),
             },
             Effect::NotifyHook {
@@ -554,10 +557,11 @@ impl ChatState {
     /// Does not mutate state (the driver keeps its own attempt count); the UI can show a "retrying" hint.
     pub(super) fn reduce_stream_retry_attempt(&self, attempt: u8, reason: &str) -> Vec<Effect> {
         let _ = &self.ui;
+        let (reason_len, reason_sha256) = crate::agent::diagnostics::tool_parse_log_digest(reason);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("stream_retry_attempt #{attempt} reason={reason}"),
+                msg: format!("stream_retry_attempt #{attempt} reason_len={reason_len} reason_sha256={reason_sha256}"),
             },
             Effect::RequestRedraw,
         ]

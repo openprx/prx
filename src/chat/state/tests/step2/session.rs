@@ -120,6 +120,7 @@ fn test_redux_session_loaded_replaces_session_state() {
     let effects = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
 
     assert_eq!(state.session.id, "sess-abc");
@@ -232,6 +233,7 @@ fn test_redux_background_session_recorded_emits_savesession_with_summary() {
     let _ = reloaded.reduce(Action::SessionLoaded {
         session: snapshot.session,
         persist: false,
+        leading_system_prompt: None,
     });
     assert_eq!(reloaded.session.background_sessions.len(), 1);
     assert_eq!(
@@ -263,6 +265,7 @@ fn test_redux_background_sessions_survive_snapshot_and_reload() {
     let _ = fresh.reduce(Action::SessionLoaded {
         session: snapshot,
         persist: false,
+        leading_system_prompt: None,
     });
     assert_eq!(fresh.session.background_sessions.len(), 2);
     // None of the restored entries is a live status — reload never
@@ -293,11 +296,13 @@ fn test_redux_session_loaded_only_user_assistant_in_history() {
         content: "You are helpful".to_string(),
         timestamp: chrono::Utc::now(),
         tool_calls: vec![],
+        context_handoff: false,
     });
     loaded.add_user_turn("q");
     let _ = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
     // history holds only user, no system (SessionLoaded does not add system to history)
     assert_eq!(
@@ -334,6 +339,7 @@ fn test_redux_session_loaded_strips_fabricated_tool_markers_from_assistant_histo
     let _ = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
 
     let history: Vec<&str> = state.session.history.iter().map(|m| m.content.as_str()).collect();
@@ -388,6 +394,7 @@ fn late_save_acknowledgement_cannot_replace_a_loaded_session() {
     let _ = state.reduce(Action::SessionLoaded {
         session: loaded,
         persist: false,
+        leading_system_prompt: None,
     });
     let effects = state.reduce(Action::SessionSaved {
         id: "prx-old-session".into(),
@@ -902,6 +909,7 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
     let _ = reloaded.reduce(Action::SessionLoaded {
         session: snapshot,
         persist: false,
+        leading_system_prompt: None,
     });
     assert_eq!(
         messages_as_pairs(&reloaded.session.history),

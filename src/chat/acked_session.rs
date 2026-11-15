@@ -107,6 +107,19 @@ pub enum AckError {
     PersistenceFailed(String),
 }
 
+impl AckError {
+    /// The failure class for the log. `PersistenceFailed` carries the store's
+    /// error text, which is shown to the user but never logged.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::ChannelClosed => "channel_closed",
+            Self::Timeout => "timeout",
+            Self::PersistenceFailed(_) => "persistence_failed",
+        }
+    }
+}
+
 type AckReply = Result<Ack, AckError>;
 
 /// One-use reply slot travelling with an awaited action. Cloning an action
@@ -225,6 +238,9 @@ pub(crate) struct TestSessionDispatcher {
 
 #[cfg(test)]
 impl TestSessionDispatcher {
+    /// Upper bound for joining the dispatcher task after shutdown.
+    const STOP_DEADLINE: Duration = Duration::from_secs(10);
+
     pub(crate) fn spawn(memory: Arc<dyn crate::memory::Memory>, state: crate::chat::state::ChatState) -> Self {
         use crate::chat::dispatcher::{
             ChatDispatcher, EffectExecutor, PersistenceDeps, RuntimeDualWriteGuard, TurnCompletionSignal,
@@ -263,16 +279,25 @@ impl TestSessionDispatcher {
         let _ = state.reduce(crate::chat::action::Action::SessionLoaded {
             session: ChatSession::new("provider", "model"),
             persist: false,
+            leading_system_prompt: None,
         });
         state.session.history = history;
         state
     }
 
+    /// Stop the dispatcher task and join it within [`Self::STOP_DEADLINE`];
+    /// a task that does not stop in time is aborted and fails the test.
     pub(crate) async fn stop(self) {
         self.shutdown.cancel();
         drop(self.dispatcher);
-        if let Err(error) = self.handle.await {
-            tracing::warn!(error = %error, "test dispatcher join failed");
+        let mut handle = self.handle;
+        match tokio::time::timeout(Self::STOP_DEADLINE, &mut handle).await {
+            Ok(Ok(_stats)) => {}
+            Ok(Err(error)) => tracing::warn!(error = %error, "test dispatcher join failed"),
+            Err(_) => {
+                handle.abort();
+                panic!("the test dispatcher did not stop within STOP_DEADLINE");
+            }
         }
     }
 }
@@ -280,6 +305,9 @@ impl TestSessionDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upper bound for one dispatcher test and its cleanup.
+    const TEST_DEADLINE: Duration = Duration::from_secs(20);
 
     fn acked(id: &str, load_epoch: u64, revision: u64, turns: usize) -> AckedSession {
         let mut session = ChatSession::new("p", "m");
@@ -299,20 +327,37 @@ mod tests {
     fn reader_ignores_a_publication_of_another_load() {
         let publisher = SessionPublisher::new(acked("a", 1, 0, 0));
         let mut reader = publisher.reader();
-        assert!(publisher.publish(acked("b", 2, 0, 3)));
-        assert_eq!(reader.session().id, "a");
+        assert!(publisher.publish(acked("b", 2, 0, 3)), "a newer load is published");
+        assert_eq!(
+            reader.session().id,
+            "a",
+            "a reader of load `a` ignores the publication of load `b`"
+        );
         reader.adopt(acked("b", 2, 0, 3));
-        assert_eq!(reader.session().turns.len(), 3);
+        assert_eq!(reader.session().turns.len(), 3, "an adopted load is read from then on");
     }
 
     #[test]
     fn publisher_refuses_an_older_load_or_revision() {
         let publisher = SessionPublisher::new(acked("a", 2, 5, 0));
-        assert!(!publisher.publish(acked("old", 1, 9, 1)));
-        assert!(!publisher.publish(acked("a", 2, 4, 1)));
-        assert!(publisher.publish(acked("a", 2, 6, 2)));
-        assert_eq!(publisher.current().revision, 6);
-        assert_eq!(publisher.reader().session().turns.len(), 2);
+        assert!(
+            !publisher.publish(acked("old", 1, 9, 1)),
+            "an older load is refused whatever its revision"
+        );
+        assert!(
+            !publisher.publish(acked("a", 2, 4, 1)),
+            "an older revision of the same load is refused"
+        );
+        assert!(
+            publisher.publish(acked("a", 2, 6, 2)),
+            "a newer revision of the same load is published"
+        );
+        assert_eq!(publisher.current().revision, 6, "the newest revision is current");
+        assert_eq!(
+            publisher.reader().session().turns.len(),
+            2,
+            "a new reader reads the newest revision"
+        );
     }
 
     fn sqlite_memory() -> (tempfile::TempDir, Arc<dyn crate::memory::Memory>) {
@@ -324,115 +369,142 @@ mod tests {
 
     #[tokio::test]
     async fn an_acknowledged_save_publishes_the_unsanitized_runtime_form_and_stores_a_sanitized_row() {
-        let (_dir, memory) = sqlite_memory();
-        let secret = "AKIAABCDEFGHIJKLMNOP";
-        let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-        let _ = state.reduce(crate::chat::action::Action::RecordUserTurn(format!(
-            "deploy key {secret}"
-        )));
-        let session_id = state.session.id.clone();
-        let harness = TestSessionDispatcher::spawn(Arc::clone(&memory), state);
-        let mut reader = harness.dispatcher.session_reader();
+        tokio::time::timeout(TEST_DEADLINE, async {
+            let (_dir, memory) = sqlite_memory();
+            let secret = "AKIAABCDEFGHIJKLMNOP";
+            let mut state = TestSessionDispatcher::state_with_history(Vec::new());
+            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn(format!(
+                "deploy key {secret}"
+            )));
+            let session_id = state.session.id.clone();
+            let harness = TestSessionDispatcher::spawn(Arc::clone(&memory), state);
+            let mut reader = harness.dispatcher.session_reader();
 
-        let ack = harness
-            .dispatcher
-            .dispatch_awaited(
-                crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
-                &harness.commits,
-            )
-            .await
-            .expect("test: mode change acknowledged");
-        let Ack::Published(acked) = ack else {
-            panic!("a changed mode must publish a saved revision: {ack:?}");
-        };
-        reader.adopt(acked.clone());
-        let unchanged = harness
-            .dispatcher
-            .dispatch_awaited(
-                crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
-                &harness.commits,
-            )
-            .await
-            .expect("test: repeated mode acknowledged");
-        harness.stop().await;
+            let ack = harness
+                .dispatcher
+                .dispatch_awaited(
+                    crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
+                    &harness.commits,
+                )
+                .await
+                .expect("test: mode change acknowledged");
+            let Ack::Published(acked) = ack else {
+                panic!("a changed mode must publish a saved revision: {ack:?}");
+            };
+            reader.adopt(acked.clone());
+            let unchanged = harness
+                .dispatcher
+                .dispatch_awaited(
+                    crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
+                    &harness.commits,
+                )
+                .await
+                .expect("test: repeated mode acknowledged");
+            harness.stop().await;
 
-        assert_eq!(acked.load_epoch, 1);
-        assert_eq!(acked.revision, 1);
-        assert!(matches!(unchanged, Ack::Unchanged(ref same) if same.revision == 1));
-        let published = reader.session();
-        assert_eq!(published.mode, crate::agent::turn_contracts::ChatMode::Plan);
-        assert!(
-            published.turns.iter().any(|turn| turn.content.contains(secret)),
-            "the acknowledged runtime form is the reducer's unsanitized snapshot"
-        );
-        let key = format!("{}:{session_id}", crate::chat::session::SESSION_MEMORY_PREFIX);
-        let stored = memory
-            .get(&key)
-            .await
-            .expect("test: read stored row")
-            .expect("test: row stored");
-        assert!(!stored.content.contains(secret), "only the persisted copy is sanitized");
+            assert_eq!(acked.load_epoch, 1, "the save belongs to the seeded load");
+            assert_eq!(acked.revision, 1, "the mode change is the first saved revision");
+            assert!(
+                matches!(unchanged, Ack::Unchanged(ref same) if same.revision == 1),
+                "repeating the same mode saves nothing and answers the current revision: {unchanged:?}"
+            );
+            let published = reader.session();
+            assert_eq!(
+                published.mode,
+                crate::agent::turn_contracts::ChatMode::Plan,
+                "the reader sees the acknowledged mode"
+            );
+            assert!(
+                published.turns.iter().any(|turn| turn.content.contains(secret)),
+                "the acknowledged runtime form is the reducer's unsanitized snapshot"
+            );
+            let key = format!("{}:{session_id}", crate::chat::session::SESSION_MEMORY_PREFIX);
+            let stored = memory
+                .get(&key)
+                .await
+                .expect("test: read stored row")
+                .expect("test: row stored");
+            assert!(!stored.content.contains(secret), "only the persisted copy is sanitized");
+        })
+        .await
+        .expect("an_acknowledged_save_publishes_the_unsanitized_runtime_form_and_stores_a_sanitized_row exceeded TEST_DEADLINE");
     }
 
     #[tokio::test]
     async fn a_load_while_generating_is_rejected_and_nothing_is_published() {
-        let (_dir, memory) = sqlite_memory();
-        let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-        state.control.generating = true;
-        let harness = TestSessionDispatcher::spawn(memory, state);
-        let before = harness.dispatcher.session_publisher().current();
-        let mut other = ChatSession::new("provider", "model");
-        other.id = "other-session".to_owned();
+        tokio::time::timeout(TEST_DEADLINE, async {
+            let (_dir, memory) = sqlite_memory();
+            let mut state = TestSessionDispatcher::state_with_history(Vec::new());
+            state.control.generating = true;
+            let harness = TestSessionDispatcher::spawn(memory, state);
+            let before = harness.dispatcher.session_publisher().current();
+            let mut other = ChatSession::new("provider", "model");
+            other.id = "other-session".to_owned();
 
-        let ack = harness
-            .dispatcher
-            .dispatch_awaited(
-                crate::chat::action::Action::SessionLoaded {
-                    session: other,
-                    persist: true,
-                },
-                &harness.commits,
-            )
-            .await
-            .expect("test: load answered");
-        let after = harness.dispatcher.session_publisher().current();
-        harness.stop().await;
+            let ack = harness
+                .dispatcher
+                .dispatch_awaited(
+                    crate::chat::action::Action::SessionLoaded {
+                        session: other,
+                        persist: true,
+                        leading_system_prompt: None,
+                    },
+                    &harness.commits,
+                )
+                .await
+                .expect("test: load answered");
+            let after = harness.dispatcher.session_publisher().current();
+            harness.stop().await;
 
-        assert!(matches!(ack, Ack::Rejected(_)), "{ack:?}");
-        assert_eq!(after.session_id, before.session_id);
-        assert_eq!((after.load_epoch, after.revision), (before.load_epoch, before.revision));
+            assert!(matches!(ack, Ack::Rejected(_)), "{ack:?}");
+            assert_eq!(
+                after.session_id, before.session_id,
+                "a rejected load leaves the published session"
+            );
+            assert_eq!(
+                (after.load_epoch, after.revision),
+                (before.load_epoch, before.revision),
+                "a rejected load publishes no new epoch or revision"
+            );
+        })
+        .await
+        .expect("a_load_while_generating_is_rejected_and_nothing_is_published exceeded TEST_DEADLINE");
     }
 
     #[tokio::test]
     async fn a_turn_commit_is_saved_once_per_task() {
-        let (_dir, memory) = sqlite_memory();
-        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
-        let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
-        let mut state = TestSessionDispatcher::state_with_history(Vec::new());
-        let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned()));
-        let harness = TestSessionDispatcher::spawn(memory, state);
-        let commit = crate::chat::action::Action::TurnCommitRequested {
-            task_id,
-            draft_id: None,
-        };
+        tokio::time::timeout(TEST_DEADLINE, async {
+            let (_dir, memory) = sqlite_memory();
+            let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+            let mut state = TestSessionDispatcher::state_with_history(Vec::new());
+            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned()));
+            let harness = TestSessionDispatcher::spawn(memory, state);
+            let commit = crate::chat::action::Action::TurnCommitRequested {
+                task_id,
+                draft_id: None,
+            };
 
-        let first = harness
-            .dispatcher
-            .dispatch_awaited(commit.clone(), &harness.commits)
-            .await
-            .expect("test: first commit answered");
-        let second = harness
-            .dispatcher
-            .dispatch_awaited(commit, &harness.commits)
-            .await
-            .expect("test: second commit answered");
-        harness.stop().await;
+            let first = harness
+                .dispatcher
+                .dispatch_awaited(commit.clone(), &harness.commits)
+                .await
+                .expect("test: first commit answered");
+            let second = harness
+                .dispatcher
+                .dispatch_awaited(commit, &harness.commits)
+                .await
+                .expect("test: second commit answered");
+            harness.stop().await;
 
-        assert!(
-            matches!(first, Ack::Published(ref acked) if acked.session.turns.len() == 1),
-            "{first:?}"
-        );
-        assert!(matches!(second, Ack::Rejected(_)), "{second:?}");
+            assert!(
+                matches!(first, Ack::Published(ref acked) if acked.session.turns.len() == 1),
+                "{first:?}"
+            );
+            assert!(matches!(second, Ack::Rejected(_)), "{second:?}");
+        })
+        .await
+        .expect("a_turn_commit_is_saved_once_per_task exceeded TEST_DEADLINE");
     }
 
     #[tokio::test]
@@ -462,10 +534,14 @@ mod tests {
             harness.stop().await;
 
             assert!(!acknowledged_before, "nothing is acknowledged before the commit");
-            assert_eq!(committed, Ok(()));
+            assert_eq!(committed, Ok(()), "the ordered commit is acknowledged");
             assert!(acknowledged_after, "the acknowledged commit is the one-shot's success");
             let turns: Vec<&str> = published.session.turns.iter().map(|t| t.content.as_str()).collect();
-            assert_eq!(turns, vec!["q", "pong"]);
+            assert_eq!(
+                turns,
+                vec!["q", "pong"],
+                "the published session holds the committed turn"
+            );
         })
         .await
         .expect("the_ordered_commit_marks_its_task_acknowledged_for_the_one_shot exceeded its deadline");

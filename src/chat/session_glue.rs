@@ -496,7 +496,7 @@ pub(super) async fn shutdown_child_sessions_for_exit(
             )
             .await
         {
-            tracing::warn!(error = %error, "exit summary was not acknowledged");
+            tracing::warn!(error_kind = error.kind(), "exit summary was not acknowledged");
             break;
         }
     }

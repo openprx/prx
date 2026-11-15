@@ -270,7 +270,8 @@ async fn a_panicking_stream_fails_its_turn_once_and_the_chat_keeps_working() {
                     run_loop
                         .workers
                         .worker(panicked)
-                        .is_some_and(|worker| worker.execution_failed)
+                        .is_some_and(|worker| worker.execution_failed),
+                    "the accepted panic marks the execution failed"
                 );
                 assert!(
                     signal.consume_turn_outcome(panicked).is_none(),
@@ -289,7 +290,9 @@ async fn a_panicking_stream_fails_its_turn_once_and_the_chat_keeps_working() {
                     ))
                     .await?;
                 match run_loop.await_outcome(next, notified).await {
-                    Some(TurnOutcomeKind::Completed { final_text, .. }) => assert_eq!(final_text, ANSWER),
+                    Some(TurnOutcomeKind::Completed { final_text, .. }) => {
+                        assert_eq!(final_text, ANSWER, "the next turn after the panic answers in full")
+                    }
                     other => panic!("the next turn must complete, got {other:?}"),
                 }
                 // Phase 2: the ordered commit retires the ready draft.
@@ -494,7 +497,10 @@ impl SupervisedTurn {
             .dispatch_awaited(Action::RedrawRequested, &self.run_loop.signal)
             .await
             .expect("barrier acknowledged");
-        assert!(matches!(ack, crate::chat::acked_session::Ack::Unchanged(_)));
+        assert!(
+            matches!(ack, crate::chat::acked_session::Ack::Unchanged(_)),
+            "the barrier action changes nothing durable"
+        );
     }
 
     fn assert_no_failure_accepted(&self) {
@@ -505,7 +511,8 @@ impl SupervisedTurn {
         assert_eq!(rows.len(), 1, "one worker row");
         assert!(
             rows.iter()
-                .all(|row| row.execution_exited && !row.execution_handle_attached)
+                .all(|row| row.execution_exited && !row.execution_handle_attached),
+            "the lease and handle are retired exactly once"
         );
     }
 }
@@ -517,7 +524,9 @@ async fn a_panic_after_phase_one_keeps_the_completed_outcome_and_retires_the_lea
     let worker = turn.ready_then_panic_worker(released);
     turn.supervise(worker).await;
     match turn.phase_one().await {
-        Some(TurnOutcomeKind::Completed { final_text, .. }) => assert_eq!(final_text, ANSWER),
+        Some(TurnOutcomeKind::Completed { final_text, .. }) => {
+            assert_eq!(final_text, ANSWER, "phase 1 carries the full answer")
+        }
         other => panic!("phase 1 completes, got {other:?}"),
     }
     release.send(()).expect("worker waiting");
@@ -541,10 +550,10 @@ async fn a_panic_after_phase_two_keeps_the_committed_outcome_and_retires_the_lea
     let (release, released) = tokio::sync::oneshot::channel();
     let worker = turn.ready_then_panic_worker(released);
     turn.supervise(worker).await;
-    assert!(matches!(
-        turn.phase_one().await,
-        Some(TurnOutcomeKind::Completed { .. })
-    ));
+    assert!(
+        matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
+        "phase 1 completes before the late panic"
+    );
     dispatch_ordered_provider_turn_commit_and_wait(
         &turn.dispatcher,
         &turn.run_loop.signal,
@@ -619,10 +628,10 @@ async fn metered_usage_is_recorded_while_a_duplicate_terminal_is_refused() {
     let (release, released) = tokio::sync::oneshot::channel();
     let worker = turn.ready_then_panic_worker(released);
     turn.supervise(worker).await;
-    assert!(matches!(
-        turn.phase_one().await,
-        Some(TurnOutcomeKind::Completed { .. })
-    ));
+    assert!(
+        matches!(turn.phase_one().await, Some(TurnOutcomeKind::Completed { .. })),
+        "phase 1 completes before the late panic"
+    );
     // Usage reaches the task slot even though it was registered after phase 1.
     turn.run_loop.signal.register_turn(turn.task, DRAFT);
     let actions = turn.dispatcher.sender();

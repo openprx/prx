@@ -322,6 +322,157 @@ pub(crate) fn format_context_handoff_message(note_json: &str) -> String {
     format!("{CONTEXT_HANDOFF_START}\n{note_json}\n{CONTEXT_HANDOFF_END}")
 }
 
+/// Upper bound of a handoff message (note plus markers). The largest
+/// supported note references [`MAX_REFERENCED_EVENTS`] event ids of at most
+/// [`HANDOFF_NOTE_MAX_ID_BYTES`] bytes each and [`FOLDED_TOOL_NAME_LIMIT`]
+/// tool names of at most [`HANDOFF_NOTE_MAX_TOOL_NAME_BYTES`] bytes (listed
+/// and repeated in the notice): about 37 KiB. A handoff over this bound is
+/// refused before it is applied; a validated note is never truncated, so a
+/// persisted handoff always stays parseable.
+///
+/// [`MAX_REFERENCED_EVENTS`]: crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS
+pub(crate) const MAX_HANDOFF_MESSAGE_BYTES: usize = 48 * 1024;
+
+/// Longest event id, handoff id or trigger a validated note may carry.
+pub(crate) const HANDOFF_NOTE_MAX_ID_BYTES: usize = 64;
+
+/// Longest folded tool name a validated note may carry.
+pub(crate) const HANDOFF_NOTE_MAX_TOOL_NAME_BYTES: usize = 128;
+
+/// The exact schema of a note the compaction code writes; any other field,
+/// at any level, makes the note invalid.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffNoteSchema {
+    schema_version: u64,
+    kind: String,
+    strategy: String,
+    handoff_event_id: String,
+    parent_handoff_event_id: Option<String>,
+    from_generation: u64,
+    to_generation: u64,
+    created_at: String,
+    trigger: String,
+    #[serde(rename = "source_message_count")]
+    _source_message_count: u64,
+    #[serde(rename = "source_token_estimate")]
+    _source_token_estimate: u64,
+    #[serde(rename = "unpersisted_companion_count")]
+    _unpersisted_companion_count: u64,
+    folded_tool_roundtrips: HandoffNoteFolded,
+    folded_tool_roundtrips_notice: String,
+    provenance_status: String,
+    source_event_range: HandoffNoteRange,
+    #[serde(rename = "retained_recent_message_count")]
+    _retained_recent_message_count: u64,
+    lookup: HandoffNoteLookup,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffNoteFolded {
+    count: usize,
+    tools: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffNoteRange {
+    first_event_id: String,
+    last_event_id: String,
+    first_row_id: i64,
+    last_row_id: i64,
+    #[serde(rename = "source_event_count")]
+    _source_event_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffNoteLookup {
+    tool: String,
+    arguments: HandoffNoteLookupArguments,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffNoteLookupArguments {
+    event_ids: Vec<String>,
+    first_row_id: i64,
+    last_row_id: i64,
+}
+
+/// An id, handoff id or trigger of a validated note: ASCII letters, digits,
+/// `-`, `_`, `.` or `:`, at most [`HANDOFF_NOTE_MAX_ID_BYTES`] bytes.
+fn is_handoff_note_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= HANDOFF_NOTE_MAX_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn is_handoff_note_tool_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= HANDOFF_NOTE_MAX_TOOL_NAME_BYTES && !value.chars().any(char::is_control)
+}
+
+/// The note of `content` when it is a handoff the compaction code could have
+/// written: the exact framing, at most [`MAX_HANDOFF_MESSAGE_BYTES`], the
+/// exact schema ([`HandoffNoteSchema`], no other field) and every value in its
+/// shape (constant kind, strategy and tool; consecutive generations; known
+/// provenance status; RFC 3339 time; bounded identifiers and lookup range; the
+/// notice the folded count and tools produce). `None` for anything else, in
+/// particular for model output that merely looks like a handoff.
+#[must_use]
+pub(crate) fn validated_context_handoff_note(content: &str) -> Option<serde_json::Value> {
+    if content.len() > MAX_HANDOFF_MESSAGE_BYTES {
+        return None;
+    }
+    let json = content
+        .strip_prefix(CONTEXT_HANDOFF_START)?
+        .strip_prefix('\n')?
+        .strip_suffix(CONTEXT_HANDOFF_END)?
+        .strip_suffix('\n')?;
+    let note: HandoffNoteSchema = serde_json::from_str(json).ok()?;
+    let lookup = &note.lookup.arguments;
+    let range = &note.source_event_range;
+    let folded = FoldedToolRoundtrips {
+        count: note.folded_tool_roundtrips.count,
+        tools: note.folded_tool_roundtrips.tools,
+    };
+    let valid = note.schema_version == 1
+        && note.kind == "context_handoff"
+        && note.strategy == "hard_switch"
+        && note.lookup.tool == crate::tools::TRANSCRIPT_HISTORY_LOOKUP_TOOL_NAME
+        && note.from_generation.checked_add(1) == Some(note.to_generation)
+        && matches!(
+            note.provenance_status.as_str(),
+            "exact" | COMPACTION_PROVENANCE_EXACT_WITH_TOOL_ROUNDTRIPS
+        )
+        && chrono::DateTime::parse_from_rfc3339(&note.created_at).is_ok()
+        && is_handoff_note_identifier(&note.trigger)
+        && is_handoff_note_identifier(&note.handoff_event_id)
+        && note
+            .parent_handoff_event_id
+            .as_deref()
+            .is_none_or(is_handoff_note_identifier)
+        && is_handoff_note_identifier(&range.first_event_id)
+        && is_handoff_note_identifier(&range.last_event_id)
+        && !lookup.event_ids.is_empty()
+        && lookup.event_ids.len() <= crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS
+        && lookup.event_ids.iter().all(|id| is_handoff_note_identifier(id))
+        && lookup.first_row_id <= lookup.last_row_id
+        && lookup.last_row_id.saturating_sub(lookup.first_row_id)
+            <= crate::tools::transcript_history_lookup::MAX_ROW_SPAN
+        && (range.first_row_id, range.last_row_id) == (lookup.first_row_id, lookup.last_row_id)
+        && folded.tools.len() <= FOLDED_TOOL_NAME_LIMIT
+        && folded.tools.iter().all(|tool| is_handoff_note_tool_name(tool))
+        && note.folded_tool_roundtrips_notice == format_folded_tool_roundtrips_notice(&folded);
+    if !valid {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(json).ok()
+}
+
 /// True when `message` exists only inside a live tool round-trip and therefore
 /// never became its own durable `message.created` event.
 ///
@@ -1129,6 +1280,18 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         });
         let note_json = serde_json::to_string(&note)?;
         let handoff_message = format_context_handoff_message(&note_json);
+        // Every applied handoff is one a later load can validate, within its
+        // size bound; anything else is refused before it is written.
+        if validated_context_handoff_note(&handoff_message).is_none() {
+            tracing::warn!(
+                trigger,
+                handoff_bytes = handoff_message.len(),
+                limit = MAX_HANDOFF_MESSAGE_BYTES,
+                referenced_events = source.source_event_ids.len(),
+                "context switch skipped because the handoff note is oversized or does not validate"
+            );
+            return Ok(None);
+        }
         persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
         return Ok(Some(CompactionPatch {
             replacement: vec![ChatMessage::assistant(handoff_message)],
