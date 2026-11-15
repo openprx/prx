@@ -2889,7 +2889,13 @@ impl ToolExecutionService {
                 &approval_channel,
             ));
             let resolved = approval_resolution.await;
-            if !matches!(resolved, Some(crate::agent::turn_contracts::ApprovalDecision::Grant)) {
+            if !matches!(
+                resolved,
+                Some(
+                    crate::agent::turn_contracts::ApprovalDecision::Grant
+                        | crate::agent::turn_contracts::ApprovalDecision::GrantForSession
+                )
+            ) {
                 let reason = "approval denied".to_string();
                 return self.finish(
                     &command,

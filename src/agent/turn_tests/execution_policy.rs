@@ -335,3 +335,97 @@ fn file_edit_grant_authorizes_once() {
         "replay refusal names the approval: {replay}"
     );
 }
+
+struct WriteProbeTool(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Tool for WriteProbeTool {
+    fn name(&self) -> &str {
+        "prx_probe_write"
+    }
+
+    fn description(&self) -> &str {
+        "PRX approval probe"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{}})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "written".to_string(),
+            error: None,
+        })
+    }
+}
+
+/// Answers every approval with one scripted decision and counts the asks.
+struct ScriptedResolver {
+    decision: ApprovalDecision,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ApprovalResolver for ScriptedResolver {
+    async fn resolve(&self, _request: &ApprovalRequest, _channel: &str) -> ApprovalDecision {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.decision.clone()
+    }
+}
+
+/// CR-2 `a`: a session grant approves this call and later calls of the same
+/// tool without asking again; a single grant asks every time.
+#[tokio::test]
+async fn session_grant_approves_later_calls_without_asking() {
+    for (decision, expected_asks) in [(ApprovalDecision::GrantForSession, 1), (ApprovalDecision::Grant, 2)] {
+        let workspace = tempfile::tempdir().expect("test workspace");
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(WriteProbeTool(Arc::clone(&executions)))]);
+        let mut policy = SecurityPolicy::default();
+        policy.workspace_dir = workspace.path().to_path_buf();
+        policy.autonomy = crate::security::AutonomyLevel::Supervised;
+        let manager = Arc::new(ApprovalManager::new());
+        let resolver = Arc::new(ScriptedResolver {
+            decision: decision.clone(),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let adapter = build_agent_tool_runtime_adapter(AgentToolRuntimeInputs {
+            scope: None,
+            channel_name: "terminal",
+            tools_registry: Arc::clone(&registry),
+            approval: Some(Arc::clone(&manager)),
+            approval_resolver: Some(Arc::clone(&resolver) as Arc<dyn ApprovalResolver>),
+            cancellation: None,
+            ledger: None,
+            unscoped_policy: Some(Arc::new(policy)),
+        });
+        let service = adapter.tool_execution_service.expect("tool service");
+        for _ in 0..2 {
+            let outcome = service
+                .execute(
+                    crate::tools::ToolExecutionCommand::new("prx_probe_write", serde_json::json!({})),
+                    adapter.tool_execution_context.clone(),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                outcome.status,
+                crate::tools::ToolExecutionStatus::Succeeded,
+                "{decision:?}"
+            );
+        }
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2, "{decision:?}");
+        assert_eq!(
+            resolver.asked.load(std::sync::atomic::Ordering::SeqCst),
+            expected_asks,
+            "{decision:?}"
+        );
+        assert_eq!(
+            manager.is_session_allowlisted("prx_probe_write"),
+            matches!(decision, ApprovalDecision::GrantForSession)
+        );
+    }
+}

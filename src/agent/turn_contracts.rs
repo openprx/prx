@@ -493,6 +493,10 @@ pub enum ApprovalDecision {
     /// Allow the call and inject a runtime approval grant, mirroring the
     /// interactive `Yes`/`Always` track that mints an `ApprovalGrantV2`.
     Grant,
+    /// [`Self::Grant`], and later calls of the same tool in this session are
+    /// approved without asking (the operator answered "always"). Calls that
+    /// need an explicit grant are still asked.
+    GrantForSession,
 }
 
 /// Out-of-band approval decision point for the tool-call loop.

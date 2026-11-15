@@ -36,7 +36,7 @@ use super::provider_turns::{
     provider_turn_visible_admission, provider_worker_status, publish_provider_worker_status,
     record_provider_turn_completion_context, record_provider_turn_lifecycle_event, record_provider_turn_usage,
     register_provider_history_commit_task, register_provider_turn_worker, route_provider_completion_event_and_publish,
-    start_provider_turn_task, take_provider_turn_completion_history_len,
+    start_provider_turn_task,
 };
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
@@ -45,7 +45,7 @@ use super::provider_turns::{
     drain_provider_turn_finalizer_events_and_publish, enqueue_provider_turn_finalizer_event,
     finalize_all_per_turn_contexts_as_cancelled, finalize_ready_per_turn_contexts,
     provider_turn_terminal_plan_from_completion, resolve_provider_turn_completion,
-    spawn_provider_turn_completion_waiter,
+    spawn_provider_turn_completion_waiter, take_provider_turn_completion_history_len,
 };
 #[cfg(feature = "terminal-tui")]
 use super::pty_attach::{handle_pty_command, reattach_pty};
@@ -4150,10 +4150,15 @@ Retry with a compatible model: /provider {shown} <model>",
                                 hooks: &hooks,
                                 approval: Some(Arc::clone(&approval_manager)),
                                 approval_resolver: None,
+                                // Supervised calls ask on the terminal (CR-2), as on the reducer path.
                                 runtime_adapter: chat_turn_binding.as_ref().map(|binding| crate::agent::turn_contracts::ToolLoopRuntimeAdapter {
                                     guarded_delivery: true,
                                     provider_trace: binding.retained_provider_trace(),
-                                    events: None, stream_provider: false, tool_execution_service: None,
+                                    events: None, stream_provider: false,
+                                    tool_execution_service: Some(Arc::new(super::line_approval::line_tool_execution_service(
+                                        Arc::clone(&tools_registry), &mem, &security,
+                                        Arc::clone(&approval_manager), cancellation.clone(),
+                                    ))),
                                     tool_execution_context: super::approval_context::line_mode(binding.envelope().clone())
                                         .with_approval_ledger(binding.h2_approval_ledger()),
                                     allowed_tool_names: None,
@@ -4189,6 +4194,11 @@ Retry with a compatible model: /provider {shown} <model>",
                 Err(e) => {
                     if let Some(ref d_id) = draft_id {
                         let _ = terminal.cancel_draft("user", d_id).await;
+                    }
+                    // The one-shot reads this note: a send-admission refusal
+                    // exits 2 with its reply, any other failure exits 1.
+                    if let Some(binding) = chat_turn_binding.as_ref() {
+                        binding.note_failure(binding::TurnFailureNote::from_error(&e));
                     }
                     let err_text = e.to_string();
                     super::output::print_turn_failure(plain_mode, &err_text);

@@ -85,6 +85,7 @@ mod copy_select;
 mod external_editor;
 mod file_mention;
 mod input_queue;
+mod line_approval;
 mod model_commands;
 mod output;
 mod provider_turns;

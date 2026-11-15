@@ -222,6 +222,7 @@ impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
             };
             match resolved {
                 Some(ApprovalDecision::Grant) => (ApprovalResponse::Yes, true),
+                Some(ApprovalDecision::GrantForSession) => (ApprovalResponse::Always, true),
                 Some(ApprovalDecision::Deny) | None => (ApprovalResponse::No, false),
             }
         } else if self.channel == "cli" {
