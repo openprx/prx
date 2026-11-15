@@ -338,10 +338,16 @@ pub(super) fn user_text_enters_histories_only_neutralized() {
                     continue;
                 }
                 let before = production[..start].trim_end();
+                // A borrowed return type (`-> &ChatMessage {`) names the
+                // type; it constructs nothing.
+                let returns_borrow = before
+                    .strip_suffix('&')
+                    .is_some_and(|rest| rest.trim_end().ends_with("->"));
                 if before.ends_with("struct")
                     || before.ends_with("impl")
                     || before.ends_with("for")
                     || before.ends_with("->")
+                    || returns_borrow
                 {
                     continue;
                 }

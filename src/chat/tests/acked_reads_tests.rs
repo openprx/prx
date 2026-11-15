@@ -9,6 +9,7 @@
 //!   value with no turn in between;
 //! - a patch or save of an earlier load that arrives after a resume, branch or
 //!   rewind is never read by the new load.
+#![cfg(test)]
 
 use super::*;
 use crate::chat::acked_session::{Ack, AckedSession, TestSessionDispatcher};

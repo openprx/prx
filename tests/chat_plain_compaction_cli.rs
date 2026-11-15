@@ -163,8 +163,10 @@ fn current_session_id(stderr: &str) -> String {
     stderr
         .lines()
         .find_map(|line| line.strip_prefix("current chat session: "))
-        .map(|id| id.trim().to_owned())
-        .unwrap_or_else(|| panic!("no session id line in stderr: {stderr}"))
+        .map_or_else(
+            || panic!("no session id line in stderr: {stderr}"),
+            |id| id.trim().to_owned(),
+        )
 }
 
 /// The id from the `Created branch <id> from the first …` line.
@@ -173,8 +175,7 @@ fn created_branch_id(stdout: &str) -> String {
         .lines()
         .find_map(|line| line.trim().strip_prefix("Created branch "))
         .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_owned)
-        .unwrap_or_else(|| panic!("no branch line in stdout: {stdout}"))
+        .map_or_else(|| panic!("no branch line in stdout: {stdout}"), str::to_owned)
 }
 
 fn assert_clean(output: &Output, label: &str) {

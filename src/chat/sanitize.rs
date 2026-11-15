@@ -153,7 +153,7 @@ mod tests {
 
         assert!(!stored.contains("sk-abc"), "{stored}");
         let parsed = crate::agent::compaction::parse_context_handoff_note(&stored).unwrap();
-        assert_eq!(parsed["source_token_estimate"], 588);
+        assert_eq!(parsed.get("source_token_estimate"), Some(&serde_json::json!(588)));
     }
 
     #[test]

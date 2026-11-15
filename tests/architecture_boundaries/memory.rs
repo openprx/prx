@@ -153,6 +153,8 @@ const SQLITE_BACKEND_FILES: &[&str] = &[
 /// Older child modules that were never part of the exemption for the
 /// repository root and stay scanned like any other file.
 const SQLITE_SEPARATE_MODULES: &[&str] = &[
+    // R3d transactional branch copy; runs on the backend's pool, opens nothing.
+    "branch_copy.rs",
     "event_batch.rs",
     // Test-only golden-vector access that delegates to the production encoders.
     "golden_vectors.rs",

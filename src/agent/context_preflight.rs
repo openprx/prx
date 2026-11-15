@@ -171,7 +171,7 @@ pub(crate) struct CapturedTurnRequest {
 
 impl CapturedTurnRequest {
     /// The request exactly as it stood in the history it was captured from.
-    pub(crate) fn message(&self) -> &ChatMessage {
+    pub(crate) const fn message(&self) -> &ChatMessage {
         &self.message
     }
 

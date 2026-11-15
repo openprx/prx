@@ -1,5 +1,6 @@
 //! R3d: a branch copies its handoff chain and retained turns in one
 //! transaction, and lookups from the branch read only the copies.
+#![cfg(test)]
 
 use std::sync::Arc;
 

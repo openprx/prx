@@ -1107,10 +1107,10 @@ impl ChatState {
                 self.stream.has_visible_draft(draft_id)
                     || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id)
             }
-            Action::StreamFailed { draft_id, .. } => match self.stream.visible_draft_ready(draft_id) {
-                Some(ready) => !ready,
-                None => self.control.cancelled_drafts_awaiting_terminal.contains(draft_id),
-            },
+            Action::StreamFailed { draft_id, .. } => self.stream.visible_draft_ready(draft_id).map_or_else(
+                || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id),
+                |ready| !ready,
+            ),
             _ => false,
         }
     }

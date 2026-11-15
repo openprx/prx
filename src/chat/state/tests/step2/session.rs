@@ -951,7 +951,7 @@ fn redux_compaction_patch_guard_mismatch_leaves_history_unchanged() {
     let effects = state.reduce(Action::HistoryCompactionPatchApplied {
         reason: CompactReason::ContextOverflow,
         patch,
-        compaction_config: config.clone(),
+        compaction_config: config,
     });
 
     assert!(

@@ -132,12 +132,12 @@ impl CompactionPatch {
     /// The replaced range is always the guard's range; the patch does not
     /// carry a second copy that could disagree with it.
     #[must_use]
-    pub fn range_start(&self) -> usize {
+    pub const fn range_start(&self) -> usize {
         self.guard.range_start
     }
 
     #[must_use]
-    pub fn range_end(&self) -> usize {
+    pub const fn range_end(&self) -> usize {
         self.guard.range_end
     }
 }

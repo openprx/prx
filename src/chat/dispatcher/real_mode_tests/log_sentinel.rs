@@ -63,7 +63,7 @@ fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
         .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .finish();
-    (logs.clone(), tracing::subscriber::set_default(subscriber))
+    (logs, tracing::subscriber::set_default(subscriber))
 }
 
 fn sqlite_memory() -> (TempDir, Arc<dyn Memory>) {

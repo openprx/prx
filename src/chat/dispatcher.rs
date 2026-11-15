@@ -398,7 +398,7 @@ impl ChatDispatcher {
             action: Box::new(action),
             ticket,
         };
-        let result = match tokio::time::timeout(ACK_TIMEOUT, async {
+        let result = tokio::time::timeout(ACK_TIMEOUT, async {
             self.action_tx
                 .send(awaited)
                 .await
@@ -406,10 +406,7 @@ impl ChatDispatcher {
             reply.await.map_err(|_| AckError::ChannelClosed)?
         })
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AckError::Timeout),
-        };
+        .unwrap_or(Err(AckError::Timeout));
         if let Err(error) = &result {
             tracing::error!(action_kind, error = %error, "awaited session acknowledgement failed");
             commits.fail_history_commit(error.to_string());

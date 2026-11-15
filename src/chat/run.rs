@@ -4524,8 +4524,8 @@ Retry with a compatible model: /provider {shown} <model>",
             if let Some(tx) = redraw_tx_for_main.as_ref() {
                 let _ = tx.try_send(());
             }
+            observer.record_event(&ObserverEvent::TurnComplete);
             if !dual_write_guard.is_active() {
-                observer.record_event(&ObserverEvent::TurnComplete);
                 hooks
                     .emit(
                         HookEvent::TurnComplete,
@@ -4535,8 +4535,6 @@ Retry with a compatible model: /provider {shown} <model>",
                         }),
                     )
                     .await;
-            } else {
-                observer.record_event(&ObserverEvent::TurnComplete);
             }
             finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, Some(inline_payload));
             mark_provider_turn_completed(

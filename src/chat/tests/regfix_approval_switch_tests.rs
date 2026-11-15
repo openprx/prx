@@ -26,10 +26,10 @@ fn spawn_recording_reducer(
                 | crate::chat::state::Effect::PublishSession(commit) => Some(commit.acked()),
                 _ => None,
             });
-            ticket.answer(Ok(match acked {
-                Some(acked) => crate::chat::acked_session::Ack::Published(acked),
-                None => crate::chat::acked_session::Ack::Unchanged(state.acked_session_seed()),
-            }));
+            ticket.answer(Ok(acked.map_or_else(
+                || crate::chat::acked_session::Ack::Unchanged(state.acked_session_seed()),
+                crate::chat::acked_session::Ack::Published,
+            )));
         }
     });
     (recorded, handle)

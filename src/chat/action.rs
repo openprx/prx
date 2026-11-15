@@ -474,7 +474,7 @@ pub enum Action {
     /// Wrapper for [`crate::chat::dispatcher::ChatDispatcher::dispatch_awaited`]:
     /// the dispatcher reduces `action`, runs its effects, then answers `ticket`.
     Awaited {
-        action: Box<Action>,
+        action: Box<Self>,
         ticket: crate::chat::acked_session::AckTicket,
     },
     /// The session has been persisted
