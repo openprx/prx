@@ -226,7 +226,7 @@ pub(crate) const WEBHOOK_OWNER: &str = "owner:cron-origin:webhook:bearer:0f0f:cl
 pub(crate) enum Surface {
     /// A `/webhook` turn: a network surface.
     Webhook,
-    /// A `prx agent` CLI turn: the local-process operator.
+    /// The local-operator CLI tuple: the local-process operator.
     AgentCli,
     /// A terminal UI turn: the local operator.
     Terminal,

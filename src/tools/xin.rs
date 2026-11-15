@@ -609,7 +609,7 @@ impl Tool for XinTool {
                 });
             }
         };
-        // The local-process operator (terminal UI, `prx agent`) sees and manages
+        // The local-process operator (terminal UI, local-operator CLI tuple) sees and manages
         // every task and goal, as it does every cron job (R-CRON F-7). Its
         // own creations still record its lineage and origin below; managing
         // another principal's task never changes that task's origin.
@@ -1672,7 +1672,7 @@ mod tests {
     }
 
     /// R-CRON F-7: xin's owner rule compared owners only, so the terminal UI
-    /// and `prx agent` (two different owners) could not manage each other's
+    /// and the local-operator CLI tuple (two different owners) could not manage each other's
     /// tasks, nor any network-created task. The local-process operator now
     /// sees and manages every task and goal, as with cron; every other caller
     /// stays confined to its own owner, and the operator changing a task does

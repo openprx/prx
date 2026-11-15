@@ -158,8 +158,8 @@ pub(crate) fn principal_from_args(args: &Value, workspace_id: &str) -> MemoryPri
 /// the owner that started it, and the local-process operator sees them all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunOwnerScope {
-    /// Every run: the local-process operator (terminal UI and `prx agent`
-    /// CLI), and in-process calls that bypass the execution service and so
+    /// Every run: the local-process operator (terminal UI and the
+    /// local-operator CLI tuple), and in-process calls that bypass the execution service and so
     /// carry no trusted scope at all.
     Unrestricted,
     /// Only runs registered under exactly this owner. `None` means the caller
@@ -948,7 +948,7 @@ mod tests {
         }
     }
 
-    /// D-019 Q-5: the terminal UI and the `prx agent` CLI keep the
+    /// D-019 Q-5: the terminal UI and the local-operator CLI tuple keep the
     /// workspace-wide view.
     #[tokio::test]
     async fn the_local_process_operator_recovers_every_run() {

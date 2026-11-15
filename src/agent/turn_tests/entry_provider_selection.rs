@@ -180,7 +180,7 @@ fn declare_decision_only(config: &mut Config, provider: &str) {
     );
 }
 
-/// PMM-C-L: `prx agent` (and cron and xin agent jobs, which enter here)
+/// PMM-C-L: the internal agent engine (cron and xin agent jobs enter here)
 /// resolve the selection through the provider/model resolver: a model the
 /// evidence says cannot chat is refused before any provider exists, and
 /// nothing is sent.

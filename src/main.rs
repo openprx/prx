@@ -1764,8 +1764,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     // Initialize logging. RUST_LOG always wins when set. Otherwise foreground
-    // commands (agent, chat, go, ...) default to warn on stderr so a scripted
-    // `prx agent 'What is 2+2?'` prints only the reply on stdout. Long-running
+    // commands (chat, go, ...) default to warn on stderr so a scripted
+    // `prx chat --message 'What is 2+2?'` prints only the reply on stdout. Long-running
     // services (daemon, gateway, channel start) keep info on the process
     // default writer. Chat still uses a reloadable stderr subscriber so
     // tracing can move to chat.log before configuration is loaded.

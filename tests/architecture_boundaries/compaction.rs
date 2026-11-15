@@ -378,7 +378,9 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
     let ordinary = compact_rust_tokens(&function_body(&entry, "run"));
     assert_eq!(
         braced_block(&ordinary, ordinary.find('{').expect("chat entry body")),
-        Some("{super::run_internal(config,provider,model,temperature,plain,session,list,shutdown,None,None,).await.map(|_|())}"),
+        Some(
+            "{super::run_internal(config,provider,model,temperature,plain,session,list,shutdown,None,None,).await.map(|_|())}"
+        ),
         "ordinary chat must forward every input to the budgeted private owner"
     );
     let controlled = compact_rust_tokens(&function_body(&entry, "run_controlled"));

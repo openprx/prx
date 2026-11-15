@@ -53,7 +53,7 @@ curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | 
 export PATH="$HOME/.local/bin:$PATH"
 prx init --interactive
 prx daemon
-prx agent 'What is 2+2?'
+prx chat --message 'What is 2+2?'
 ```
 
 Windows PowerShell:
@@ -64,10 +64,10 @@ prx init --interactive
 prx daemon
 ```
 
-Foreground commands (`prx agent`, `prx chat`, `prx go`, `prx doctor`,
-`prx status`, and other commands whose stdout is the product) default to
-`warn`-level tracing on stderr, so a scripted `prx agent 'What is 2+2?'`
-prints only the reply. Those commands previously wrote tracing to stdout.
+Foreground commands (`prx chat`, `prx go`, `prx doctor`, `prx status`, and
+other commands whose stdout is the product) default to `warn`-level tracing
+on stderr, so a scripted `prx chat --message 'What is 2+2?'` prints only the
+reply. Those commands previously wrote tracing to stdout.
 `RUST_LOG` can raise or lower the level (`RUST_LOG=info`, `RUST_LOG=error`).
 Interactive `prx chat` writes the same filter to `chat.log` (WARN+ by
 default). `prx daemon`, `prx gateway`, and `prx channel start` keep `info`
@@ -92,9 +92,8 @@ cargo build --release --locked --bin prx
 
 | Command | What it does |
 |---------|----------------|
-| `prx agent [message]` | One-shot agent loop: print the reply on stdout, or omit the message for a line-mode prompt. No TUI. |
-| `prx chat` | Fullscreen interactive session: streaming, tool cards, and saved sessions. `--plain` or `PRX_TUI=0` uses the reedline fallback. |
-| `prx go` | Zero-config start in a temporary workspace. Writes no config files. `--message` uses the agent loop; otherwise it opens chat. |
+| `prx chat` | Fullscreen interactive session: streaming, tool cards, and saved sessions. `--plain` or `PRX_TUI=0` uses the reedline fallback. `--message <text>` (`-q`) runs one turn, prints only the reply on stdout and exits 0, 2 on a policy refusal or 1 on failure; it is not saved unless `--save` or `--session` is given. |
+| `prx go` | Zero-config start in a temporary workspace. Writes no config files. `--message` runs one chat turn like `prx chat --message`; otherwise it opens chat. |
 | `prx tasks` | List or kill live subagent runs on a running gateway (`list`, `kill`, `send`, `pools`). |
 | `prx cost` | Read the workspace cost ledger without initializing configuration. `--json` for machine-readable output. |
 | `prx config` | Inspect and change configuration through a transaction (`show`, `plan`, `apply`, `history`, `rollback`, `status`, `schema`). |

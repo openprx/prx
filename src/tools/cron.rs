@@ -96,7 +96,7 @@ impl CronTool {
     /// not be rewritable by anyone else: a webhook caller that could `update`
     /// the prompt of an operator-created agent job would be running its own
     /// text with the operator's authority. The local-process operator (the
-    /// terminal UI and `prx agent`, [`scope_is_local_process_operator`]) may
+    /// terminal UI and the local-operator CLI tuple, [`scope_is_local_process_operator`]) may
     /// manage every job and never adopts one by doing so — the origin is not
     /// changed by any update. Any other trusted caller may manage only jobs
     /// whose stored owner is its own owner (the same owner
@@ -398,7 +398,7 @@ struct RunView {
 
 /// Which jobs a caller may see, change or run (CRON-ORIGIN, R-CRON F-3).
 ///
-/// The local-process operator (the terminal UI and `prx agent`,
+/// The local-process operator (the terminal UI and the local-operator CLI tuple,
 /// [`scope_is_local_process_operator`]) reaches every job. Any other trusted
 /// caller reaches only jobs whose stored owner is its own owner (the owner
 /// [`cron::lineage_from_trusted_scope`] records at creation); a caller with no
@@ -1972,7 +1972,7 @@ mod tests {
     /// Rewriting `delivery` re-anchors the principal onto the caller doing the
     /// rewrite; a patch that leaves `delivery` alone leaves the identity alone.
     /// Since CRON-ORIGIN only the creator or the local operator may rewrite a
-    /// job, so the rewriting caller here is the operator (`prx agent`) and an
+    /// job, so the rewriting caller here is the local operator and an
     /// unrelated principal is refused outright.
     #[tokio::test]
     async fn patching_delivery_re_anchors_the_principal_onto_the_updating_caller() {
@@ -2579,7 +2579,7 @@ mod tests {
             "job_id": job.id,
             RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(&wire_grant).unwrap(),
             "_zc_scope_trusted": true,
-            // The local operator (`prx agent`): the job has no creator of its
+            // The local operator (local-operator CLI tuple): the job has no creator of its
             // own, so only the operator may run it (CRON-ORIGIN).
             "_zc_scope": {
                 "principal_id": "test:cron-user",
@@ -2744,7 +2744,7 @@ mod tests {
 
     /// CRON-ORIGIN: every creating action records who created the job, from
     /// the service-authored scope only. A network surface is recorded as
-    /// itself with its owner, the `prx agent` CLI and terminal UI as the local
+    /// itself with its owner, the local-operator CLI tuple and terminal UI as the local
     /// operator, and a scope the runtime did not author as nobody. An update
     /// never changes the origin.
     ///

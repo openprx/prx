@@ -332,7 +332,7 @@ fn cli_agent_probe_saw_a_chat_request(probe: &crate::providers::credential_probe
         .any(|request| request.path.contains("chat/completions"))
 }
 
-/// A plain single-shot `prx agent` turn must enter through the production
+/// A plain single-shot internal agent-engine turn must enter through the production
 /// bootstrap and reach its serving model with the default built-in decision
 /// plane. This is the CLI entrypoint acceptance proof for ordinary text.
 #[tokio::test]
@@ -821,7 +821,7 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
     assert!(!config.workspace_dir.join("scheduled-denied.txt").exists());
 }
 
-/// D-053 / REDACT-TURN probe: a single-shot `prx agent` turn whose provider
+/// D-053 / REDACT-TURN probe: a single-shot internal agent-engine turn whose provider
 /// replies with a secret runs `run_with_runtime_envelope` to the `Completed`
 /// `finalize_turn` commit; nothing under the workspace may keep the secret, so
 /// this fails before the REDACT-TURN commits.
@@ -870,7 +870,7 @@ async fn cli_agent_persists_no_secret_from_a_reply() {
     assert_nothing_under_persists_the_probe_secret(tmp.path());
 }
 
-/// D-053 / REDACT-TURN probe: a single-shot `prx agent` turn whose provider
+/// D-053 / REDACT-TURN probe: a single-shot internal agent-engine turn whose provider
 /// fails with an error echoing a secret runs `run_with_runtime_envelope` to the
 /// `Failed` `finalize_turn` commit; nothing under the workspace may keep the
 /// secret, so this fails before the REDACT-TURN commits.
@@ -983,7 +983,7 @@ fn workspace_tree(root: &std::path::Path) -> std::collections::BTreeMap<std::pat
 }
 
 /// D-065 M-1: a selection the resolver refuses is refused before the runtime
-/// bootstrap, so a refused `prx agent` run (and a cron or xin agent job,
+/// bootstrap, so a refused internal agent-engine run (a cron or xin agent job,
 /// which enter here) leaves the workspace exactly as it was: no memory
 /// database, snapshot, hygiene state, plugin directory or audit file, and
 /// nothing sent.

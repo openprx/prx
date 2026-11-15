@@ -1385,8 +1385,8 @@ mod agent_turn_origin_tests {
 
 /// The provider and model an agent entry runs on, resolved and owned.
 ///
-/// `prx agent` (with or without `--provider`), `prx go --message`, and cron
-/// and xin agent jobs all resolve their selection with
+/// The internal agent engine (cron and xin agent jobs, skill evaluation)
+/// resolves their selection with
 /// [`resolve_agent_model_choice`] before anything is constructed: before the
 /// runtime bootstrap (memory hygiene, snapshots, the database, plugins,
 /// tools), so a refused selection leaves no trace (D-065 M-1).
@@ -1595,7 +1595,7 @@ impl AgentProviderSelection<'_> {
     }
 }
 
-/// P0-B: `prx agent --provider <other>` must give the override only its own
+/// P0-B: a provider override on the agent entry must give the override only its own
 /// credential. Driven through the production seam, the real factory and a
 /// loopback endpoint; every credential is a sentinel and the config directory
 /// is a fresh temporary one with no auth profiles.
@@ -1608,7 +1608,7 @@ mod agent_provider_selection_tests;
 ///
 /// `scheduled_tool_scope` is the tool context and policy a cron job or xin
 /// task runs under when its `JobOrigin` is not the local operator
-/// (CRON-ORIGIN); `None` keeps the `prx agent` CLI context and policy. It
+/// (CRON-ORIGIN); `None` keeps the local-operator CLI context and policy. It
 /// governs a single-shot turn only.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_with_runtime_envelope(

@@ -475,8 +475,8 @@ fn resolver_imports(production: &str) -> Vec<String> {
     imports
 }
 
-/// PMM-C-L / D-065: the agent loop's entries (`prx agent`, cron and xin agent
-/// jobs, `prx go --message`) resolve their provider and model exactly once,
+/// PMM-C-L / D-065: the internal agent engine's entries (cron and xin agent
+/// jobs, skill evaluation) resolve their provider and model exactly once,
 /// in `agent::entry::resolve_agent_model_choice`, and before the runtime
 /// bootstrap. The only later re-resolution is the explicit credential-source
 /// attestation immediately before construction. Each configured route is then

@@ -2841,7 +2841,7 @@ mod tests {
     }
 
     /// R-MCPB F-3 / R-MCPBh M-1: an agent cron job ran every tool call with the
-    /// `prx agent` CLI tuple whoever scheduled it, so a webhook caller could
+    /// local-operator CLI tuple whoever scheduled it, so a webhook caller could
     /// schedule a job whose `memory_store` text was mirrored into `MEMORY.md`
     /// and so into every surface's system prompt (D-026). The run now acts as
     /// the webhook caller: the store still happens, owner-scoped, but never
@@ -2882,7 +2882,7 @@ mod tests {
     }
 
     /// The other half of D-019 Q-5 / D-026: a job the local operator scheduled
-    /// (`prx agent`, or the terminal UI) keeps the operator's authority, so its
+    /// (the `prx cron` CLI, or the terminal UI) keeps the operator's authority, so its
     /// `memory_store` still reaches the shared prompt exactly as a direct
     /// operator turn's does.
     #[tokio::test]

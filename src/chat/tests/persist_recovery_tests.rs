@@ -47,7 +47,7 @@ async fn record_agent_note(memory: &Arc<dyn Memory>, workspace: &Path) {
             lease_epoch: None,
             config_generation_id: None,
             config_source_revision: None,
-            content: "prx agent note".to_owned(),
+            content: "agent engine note".to_owned(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Session,
         })

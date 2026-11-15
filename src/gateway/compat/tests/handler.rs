@@ -918,7 +918,7 @@ fn webhook_turn_context(workspace: &Path, sender: &str) -> crate::tools::ToolExe
     .with_chat_id(session_key)
 }
 
-/// The terminal UI tuple (`tui = true`) or the `prx agent` CLI tuple.
+/// The terminal UI tuple (`tui = true`) or the local-operator CLI tuple.
 fn local_operator_turn_context(workspace: &Path, tui: bool) -> crate::tools::ToolExecutionContext {
     let (channel, sender, chat_id) = if tui {
         ("terminal", "user", "terminal:user")

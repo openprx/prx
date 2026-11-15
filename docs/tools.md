@@ -102,7 +102,7 @@ and ReadOnly shells refuse git before spawning; approval does not change that
 policy. `git_operations` keeps its hardened launch at every level. Skill scripts
 and cron/Xin shell jobs keep their existing git policy.
 
-`runtime.workdir` or `prx agent --workdir /absolute/task` selects the working root
+`runtime.workdir` or `prx chat --workdir /absolute/task` selects the working root
 for shell, native file tools and `git_operations`; otherwise they use the workspace.
 Restricted native file and shell path checks resolve relative requests against
 that root before evaluating forbidden paths and workspace confinement. ReadOnly
@@ -180,7 +180,7 @@ Recorded Console, gateway, verified h2 ingress and explicit operator `/bg` calls
 (in both task and process mode) carrying a persisted approval context use durable
 approval. Ordinary child calls do not opt in.
 A side-effecting call under Supervised autonomy waits for review before
-execution. Foreground TUI, line-mode chat, and `prx agent` retain their
+execution. Foreground TUI, line-mode chat, and `prx chat --message` retain their
 interactive prompts, resolver and session allowlist. Each surface builder
 chooses its approval routing.
 Approval binds the source, capability and complete arguments; changing arguments
@@ -253,7 +253,6 @@ every model-running entrypoint:
 | Entrypoint | Skills | MCP | Hooks | WASM |
 |---|---:|---:|---:|---:|
 | `prx chat` (TUI or plain) | yes | yes | yes | yes |
-| `prx agent` (interactive or one-shot) | yes | yes | yes | yes |
 | standalone IM channel supervisor | use only¹ | call only¹ | run only¹ | call only¹ |
 | gateway/webhook turns | yes | yes | yes | yes |
 | delegated/session-worker turns | yes | yes | yes | yes |
@@ -802,11 +801,11 @@ owner in its manifest). Events without an owner, and a reader without an owner
 id, contribute nothing to it.
 
 The local-process operator keeps the workspace-wide view: turns driven from the
-terminal UI and from the `prx agent` CLI (single-shot or REPL) see and manage
-every run. The runtime recognises both from the scope it authors itself — the
-terminal UI's `terminal`/`user`/`terminal:user` tuple and the CLI's
+terminal UI and from runs that carry the local-operator CLI tuple see and
+manage every run. The runtime recognises both from the scope it authors itself —
+the terminal UI's `terminal`/`user`/`terminal:user` tuple and the local-operator
 `cli`/`agent`/`agent:local` tuple — so no network surface can claim either.
-Cron agent jobs and xin tasks run through the same CLI entry point, but carry
+Cron agent jobs and xin tasks run through the internal agent engine, and carry
 the CLI tuple — and so keep the operator's view — only when the local operator
 created them; every other job runs as its creator (see
 [Scheduled job origin](#scheduled-job-origin)). Runs recorded before this
@@ -907,13 +906,13 @@ untrusted input.
 
 Only the local operator's writes are mirrored into the workspace Markdown files.
 `MEMORY.md` is one of the workspace files inlined into the system prompt of every
-surface — the terminal UI, `prx agent`, webhook turns, the Web Console, IM
+surface — the terminal UI, cron and xin agent runs, webhook turns, the Web Console, IM
 channels, sub-agents — so text placed there reads as the operator's own
 instructions on every user's next turn. With `memory.acl_enabled = false`,
 `memory_store` therefore mirrors a write into `MEMORY.md` (`core`) or the daily
 log (`memory/<date>.md`, other categories) only when it comes from the terminal
-UI or the `prx agent` CLI, or from a cron agent job or xin task the local
-operator created. A `memory_store` from a webhook, channel, gateway, Web
+UI, or from a cron agent job or xin task the local operator created (the
+local-operator CLI tuple). A `memory_store` from a webhook, channel, gateway, Web
 Console, MCP or sub-agent turn, or from a job one of those created, stays in the
 owner-scoped memory table, where
 its owner can recall it. Other internal writers (autosaves, router and
@@ -931,7 +930,8 @@ change are not rewritten; review the file once after upgrading.
 
 The workspace-root `MEMORY_SNAPSHOT.md` export (run whenever a SQLite or
 `lucid` memory backend starts) follows the same rule: it carries only `core`
-rows the local operator wrote through the terminal UI or `prx agent`, and rows
+rows the local operator wrote through the terminal UI or an operator-created
+cron or xin agent run, and rows
 the operator's own process wrote with no caller context. Rows of MCP callers
 and of every network surface are not exported, nor are rows a WASM plugin
 writes through `memory.store`, which carry the channel `plugin:<name>`.
@@ -1503,13 +1503,13 @@ created it — when it is created, and every agent run of it acts as that origin
 
 | Created from | Origin | A run of it |
 |---|---|---|
-| terminal UI, `prx agent`, `prx cron` / `prx xin` CLI, built-in and `HEARTBEAT.md` system tasks | local operator | `prx agent` CLI context: workspace-wide run view, `MEMORY.md` mirror |
+| terminal UI, `prx cron` / `prx xin` CLI, built-in and `HEARTBEAT.md` system tasks | local operator | local-operator CLI context: workspace-wide run view, `MEMORY.md` mirror |
 | any other trusted surface (webhook, IM channel, gateway, Web Console, sub-agent, a job created by such a job) | that principal: channel, sender, chat type, owner, owner isolation | acts as that principal's owner: its own runs only, no mirror; owner-isolated if the creator was |
 | no runtime-authored scope, or a row stored before this change | unattributed | acts as the job's stored owner, or — when it has none — as an owner of its own derived from the job id; never the operator |
 
 A non-operator run keeps its `cron` / `xin` runtime source and a `cron:{id}` /
 `xin:{id}` chat id, so it can never be mistaken for the terminal UI or the
-`prx agent` CLI, whatever channel and sender its creator had. The origin is
+local-operator CLI tuple, whatever channel and sender its creator had. The origin is
 fixed at creation. Only the job's creator (the same owner) or the local
 operator can `update`, `remove`, `pause`, `resume` or `run` a cron job; the
 operator doing so does not adopt it. Reads follow the same rule: `list` and
@@ -1530,7 +1530,7 @@ unrestricted behaviour it always had.
 
 **Upgrade.** Jobs stored before this change have no recorded origin and are
 treated as unattributed — they no longer run with operator authority, even if
-the operator created them through `prx agent` or the terminal UI. The only
+the operator created them through the `prx cron` / `prx xin` CLI or the terminal UI. The only
 exception is xin `system` tasks and goals, which only the built-in definitions
 and `HEARTBEAT.md` write. Re-create an operator job that relied on writing
 `MEMORY.md` or on the workspace-wide run view. No origin is backfilled, so a
@@ -1552,7 +1552,7 @@ A non-operator run's tool calls are decided by the configured
 `supervised` a call that would ask for approval is refused rather than approved.
 Jobs the local operator created keep the operator's policy. Creating a job from a
 network surface therefore needs no separate capability. Two limits remain: a
-scheduled run uses the `prx agent` tool registry, which can register tools the
+scheduled run uses the internal agent-engine tool registry, which can register tools the
 creating surface does not; and a **shell** job (`job_type = "shell"`, or a xin
 `shell` task) runs its command directly as the daemon's OS user with no tool
 policy at all, whoever created it — deny the `cron` and `xin` tools to a scope
@@ -1803,8 +1803,14 @@ routing. Their durable review records are bound to the source and exact call;
 changing a command, URL, method, body, artifact hash or target changes that call.
 HTTP private-host and allowlist checks still apply after approval.
 
-The plain `prx agent` CLI has no interactive approval-review adapter. A
-Supervised call that needs an unavailable resolver fails closed. Ordinary chat
+`prx chat --plain` and `prx chat --message` ask on the terminal: stderr shows
+`Approve <tool> <summary>? [y/N/a]`; `y` approves this call, `a` approves it and
+later calls of the same tool for the session (calls that need an explicit grant
+are still asked), anything else or end of input denies. Ctrl-C at the prompt
+cancels the turn (`--message` then exits 1). Without a readable terminal the
+call is denied unless `OPENPRX_APPROVAL_OVERRIDE=allow` is set. Unattended cron and xin
+agent runs have no review adapter: a Supervised call that needs an unavailable
+resolver fails closed. Ordinary chat
 approval does not require a separate durable approval step.
 
 Lifecycle reads have separate capabilities: `lifecycle_status`, `lifecycle_list`

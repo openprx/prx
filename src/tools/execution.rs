@@ -758,7 +758,7 @@ const LOCAL_OPERATOR_SENDER: &str = "user";
 const LOCAL_OPERATOR_CHAT_ID: &str = "terminal:user";
 const LOCAL_OPERATOR_CHAT_TYPE: &str = "private";
 
-/// The exact scope tuple a `prx agent` CLI turn (single-shot or REPL) stamps
+/// The exact scope tuple an operator-created cron or xin run of the internal agent engine stamps
 /// on every tool call: `agent_tool_execution_context(None, "cli")` in
 /// `src/agent/execution_policy.rs`. Cron agent jobs and xin tasks enter through the same
 /// `run_with_runtime_envelope`, but carry this tuple only when their
@@ -769,7 +769,7 @@ const LOCAL_CLI_SENDER: &str = "agent";
 const LOCAL_CLI_CHAT_ID: &str = "agent:local";
 
 /// Whether the service-authored scope in `args` comes from a **local-process
-/// operator surface**: the terminal UI or the `prx agent` CLI (D-019 Q-5).
+/// operator surface**: the terminal UI or the local-operator CLI tuple (D-019 Q-5).
 ///
 /// This is wider than [`ToolExecutionContext::is_local_operator`] on purpose
 /// and must never replace it: that predicate (`_prx_scope_trusted`) guards
@@ -818,7 +818,7 @@ pub fn scope_is_local_process_operator(args: &serde_json::Value) -> bool {
 ///
 /// A scheduled agent run has no live caller: the turn that created the job
 /// ended long before. Without a recorded origin every run used to execute with
-/// the `prx agent` CLI tuple, so a job scheduled from a channel, webhook or the
+/// the local-operator CLI tuple, so a job scheduled from a channel, webhook or the
 /// Web Console ran with the local operator's authority: the workspace-wide run
 /// view and the `MEMORY.md` mirror. The origin is captured from the creating
 /// turn's service-authored scope, persisted with the job, and never changed by
@@ -834,7 +834,7 @@ pub fn scope_is_local_process_operator(args: &serde_json::Value) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobOrigin {
-    /// Created by the local operator. Runs keep the `prx agent` CLI tuple and
+    /// Created by the local operator. Runs keep the local-operator CLI tuple and
     /// with it the workspace-wide run view and the `MEMORY.md` mirror.
     LocalOperator,
     /// Created from a trusted, non-operator scope. Runs act as this principal.

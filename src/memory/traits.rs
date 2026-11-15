@@ -1754,7 +1754,7 @@ pub trait Memory: Send + Sync {
     /// `MEMORY.md` is inlined into the system prompt of every surface, so text
     /// placed there steers every user's turns. The caller — `memory_store` —
     /// invokes this only for a write that came from the terminal UI or the
-    /// `prx agent` CLI; every other origin (webhook, channel, gateway,
+    /// local-operator CLI tuple; every other origin (webhook, channel, gateway,
     /// Console, MCP, sub-agent) stays in the owner-scoped store. Backends with
     /// no separate mirror do nothing.
     async fn mirror_operator_write(&self, key: &str, content: &str, category: &MemoryCategory) -> anyhow::Result<()> {

@@ -910,7 +910,7 @@ async fn run_agent(
     // runner drives this synchronously. See never_cancelled_shutdown docs.
     let runtime_envelope = xin_task_runtime_envelope(config, task, authority);
     // CRON-ORIGIN: the run's tool calls act as whoever created the task (or
-    // goal). Only a task the local operator created keeps the `prx agent` CLI
+    // goal). Only a task the local operator created keeps the local-operator CLI
     // context.
     let scheduled_tool_scope = task.origin.scheduled_tool_scope(runtime_envelope.clone(), config);
     match crate::agent::scheduled_source::ScheduledAgentOrigin::from_xin(task)
@@ -2127,7 +2127,7 @@ mod tests {
     }
 
     /// R-MCPBh M-1 for xin: an agent-session task ran every tool call with the
-    /// `prx agent` CLI tuple whoever created it, so a webhook caller's task could
+    /// local-operator CLI tuple whoever created it, so a webhook caller's task could
     /// write into `MEMORY.md` and so into every surface's system prompt. The run
     /// now acts as its creator.
     ///

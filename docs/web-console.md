@@ -29,8 +29,8 @@ PostgreSQL support the operation; other backends must implement the explicit
 creation contract or return an error.
 
 Use the returned ID with `POST /api/sessions/{id}/message`. Accepted messaging
-channel turns also create records in this list. Webhook requests, `prx agent`
-and terminal `prx chat` have separate histories and do not implicitly create
+channel turns also create records in this list. Webhook requests, cron and xin
+agent runs and terminal `prx chat` have separate histories and do not implicitly create
 Console sessions. The existing Console list continues to show these persisted
 records; the API is available to clients without manually inserting database rows.
 
@@ -385,8 +385,8 @@ Supervised exact-call collection includes named Shell and HTTP operations in
 addition to file, fixed-operation MCP and lifecycle mutations. Approval binds
 all normalized arguments; an approved call executes once and
 retains tool-specific policy. A Console owner's existing isolation restrictions
-still apply, so this does not grant Console access to host Shell. The plain
-agent CLI has no review adapter. Ordinary Chat uses its interactive execution
+still apply, so this does not grant Console access to host Shell. Unattended cron
+and xin agent runs have no review adapter. Ordinary Chat uses its interactive execution
 approval prompt and does not use this Console review panel.
 
 An operator can call the authenticated plugin reload route through

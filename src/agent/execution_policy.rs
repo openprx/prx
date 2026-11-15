@@ -248,7 +248,7 @@ pub(super) fn agent_tool_execution_context(
     unscoped_policy: Option<Arc<SecurityPolicy>>,
 ) -> (Arc<SecurityPolicy>, crate::tools::ToolExecutionContext) {
     // CRON-ORIGIN: a scheduled run whose job was not created by the local
-    // operator acts as its creator, not as the `prx agent` CLI below.
+    // operator acts as its creator, not as the local-operator CLI tuple below.
     // Its calls are decided by the configured policy for that creator.
     if scope.is_none()
         && let Some(scheduled) = crate::tools::execution::scheduled_job_tool_scope()

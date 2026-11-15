@@ -421,7 +421,7 @@ pub fn warn_if_hint_unroutable(surface: &str, model: &str) -> Option<String> {
     }
     let warning = format!(
         "model '{model}' is a routing hint, and {surface} does not route hints: requests on this surface will be \
-         refused. Hints route in `prx chat`, `prx agent` (and `prx go --message`), cron and xin; select the \
+         refused. Hints route in `prx chat` (and `prx go --message`), cron and xin; select the \
          route's model directly here."
     );
     tracing::warn!(target: "providers::selection", "{warning}");
@@ -1236,11 +1236,11 @@ model = "k3.1-pro"
     }
 
     /// D-065 L-2: the warning names every surface that routes hints,
-    /// `prx agent` included.
+    /// `prx go --message` included.
     #[test]
     fn the_unroutable_hint_warning_names_every_routing_surface() {
         let warning = warn_if_hint_unroutable("the gateway", "hint:fast").expect("test: a hint warns");
-        for surface in ["`prx chat`", "`prx agent`", "`prx go --message`", "cron", "xin"] {
+        for surface in ["`prx chat`", "`prx go --message`", "cron", "xin"] {
             assert!(warning.contains(surface), "{surface} missing: {warning}");
         }
         assert!(warn_if_hint_unroutable("the gateway", "vendor/model").is_none());

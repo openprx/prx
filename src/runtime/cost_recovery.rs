@@ -196,8 +196,8 @@ impl CostOutboxProjector {
         finished
     }
 
-    /// One pass with the 15 s deadline, for the one-shot `prx agent` entry
-    /// before its turn.
+    /// One pass with the 15 s deadline, for a one-shot entry (`prx chat --message`,
+    /// the internal agent engine) before its turn.
     pub(crate) async fn run_once(memory: Arc<dyn Memory>, workspace_dir: PathBuf, cost_config: CostConfig) {
         pass_off_runtime(memory, workspace_dir, cost_config, CancellationToken::new()).await;
     }

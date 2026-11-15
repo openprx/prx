@@ -114,7 +114,7 @@ fn remote_ingress_is_never_trusted() {
         ("telegram", "1234567", "gateway", "gateway:telegram:1234567"),
         // src/gateway/api/sessions.rs:316 — console web UI.
         ("console", "console-user", "private", "console-session-1"),
-        // src/agent/execution_policy.rs — `prx agent` CLI with no scope.
+        // src/agent/execution_policy.rs — local-operator CLI tuple with no scope.
         ("cli", "agent", "private", "agent:local"),
     ];
     for (channel, sender, chat_type, chat_id) in remote {

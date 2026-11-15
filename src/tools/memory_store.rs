@@ -195,7 +195,7 @@ impl Tool for MemoryStoreTool {
         // D-026: the workspace Markdown files (`MEMORY.md`, daily logs) are
         // shared prompt material — `MEMORY.md` is inlined into every surface's
         // system prompt — so only a write from the local operator (terminal UI,
-        // `prx agent` CLI) is mirrored there. Every other origin stays in the
+        // local-operator CLI tuple) is mirrored there. Every other origin stays in the
         // owner-scoped store, and a backend whose store *is* those files is
         // refused to them.
         let local_operator = crate::tools::execution::scope_is_local_process_operator(&args);
@@ -680,7 +680,7 @@ mod tests {
     /// D-026 (R-MCPBfg N-2): an IM channel, gateway or sub-agent turn's
     /// `memory_store` text used to be mirrored into `MEMORY.md`, which every
     /// surface's system prompt inlines. Only the terminal UI and the
-    /// `prx agent` CLI mirror now.
+    /// local-operator CLI tuple mirror now.
     ///
     /// MUTATION GUARD: mirror every successful store again and the channel,
     /// console and sub-agent rows go red; stop mirroring the operator's writes

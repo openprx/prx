@@ -74,8 +74,8 @@ fn can_hydrate_entry(key: &str, origin: Option<&SnapshotOrigin>) -> bool {
 ///
 /// `MEMORY_SNAPSHOT.md` is a workspace-root, Git-visible copy of memory, so it
 /// holds only what the operator's own process wrote: `memory_store` rows from
-/// the terminal UI (`terminal`/`user`/`terminal:user`) or the `prx agent` CLI
-/// (`cli`/`agent`/`agent:local`) — the tuples
+/// the terminal UI (`terminal`/`user`/`terminal:user`) or the local-operator CLI
+/// tuple (`cli`/`agent`/`agent:local`) — the tuples
 /// `tools::execution::scope_is_local_process_operator` admits — and rows
 /// written with no caller context at all (no channel, no owner). Rows of
 /// owner-isolated MCP callers and of every network surface (webhook, IM

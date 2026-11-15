@@ -217,7 +217,7 @@ route whose model is itself a hint, and an empty hint or one containing
 whitespace are refused. A configuration fails to load when two routes share a
 hint or a route's `hint` contains whitespace (the router compares hints
 exactly while the checks trim, so such a hint is selected unreliably). Hints
-route in `prx chat`, `prx agent` (and `prx go --message`), cron and xin agent
+route in `prx chat` (including `--message` and `prx go --message`), cron and xin agent
 jobs, gateway and channel turns, `delegate`, and `sessions_spawn` in task or
 process mode. Each turn builds the selected route's provider, model and
 credential together. A process worker checks the sealed route against its
@@ -252,13 +252,12 @@ redacted), the evidence and the fix:
 
 | Surface | What is resolved | Policy |
 | --- | --- | --- |
-| `prx chat` startup, `/model`, `/provider`; each `[[model_routes]]` destination is retained as either a ready route or a named refusal | chat | invocation |
+| `prx chat` startup (every mode, including `--message` and `prx go`), `/model`, `/provider`; each `[[model_routes]]` destination is retained as either a ready route or a named refusal | chat | invocation |
 | channel runtime start-up, channel `/model` (the route is left unchanged on a refusal); under the daemon, every hot reload that changes the default provider or model, the provider tables or the routes restarts the channel runtime, which resolves again, so a reload to a model that cannot chat is refused and the previous configuration stays active. A standalone `prx channels start` applies such changes only on restart | chat | invocation |
 | gateway start-up and each configuration generation (a refused default rejects the generation; the previous one stays active) | chat | invocation |
 | `delegate`, `sessions_spawn` (task and process workers) | chat | invocation |
-| `prx agent` (`--provider`, `--model`), `prx go --message`, and cron and xin agent jobs, which run through it: the selection and every configured `[[model_routes]]` destination, retained as ready or refused once per run | chat | invocation |
+| the internal agent engine (cron and xin agent jobs, skill evaluation): the selection and every configured `[[model_routes]]` destination, retained as ready or refused once per run | chat | invocation |
 | the evolution judge: judges with the resolved default model (the route destination for a `hint:`). A default that cannot be resolved or built leaves only the deterministic mock scorer, which sends nothing: its verdict is a deferral in every mode — a proposed Auto-mode change is not written — and the `evolution_judge` health component and a warning say so. A model judge whose call fails, whose reply is not a score, or that does not answer within `[self_system] evolution_judge_timeout_secs` (default 180) is deferred the same way (`judge_failed`). Evolution changes are written only after an accepted verdict; a deferred cycle is logged as `deferred` (see [evolution](evolution.md#judge-verdicts)). | chat | invocation |
-| `prx go` (resolved by the agent entry with `--message`, by chat start-up otherwise) | chat | invocation |
 | memory embedders and `[[embedding_routes]]` (a refused embedder falls back to keyword recall) | embeddings | invocation |
 | `prx init` quick setup and the interactive wizard; `POST /api/config` (and the Console) when the default changes | chat | operator |
 | the agent `gateway` tool's `config.patch` (default, routes, agent bindings, embedding routes it changes) | chat / embeddings | model-made durable |
@@ -654,7 +653,7 @@ other): a declaration for one model of an endpoint no longer changes what
 another model's turn is held to, and `raw`, the published document, is the
 strict answer whenever no single rewrite is exact.
 
-The agent loop (`prx agent`, cron and xin agent jobs) asks the provider
+The internal agent engine (cron and xin agent jobs, skill evaluation) asks the provider
 object, as `prx chat` does: each turn is validated against the dialect for the
 model it requests, and after the call against the dialect of the chain member
 that actually served it (a fallback across provider families is held to the
