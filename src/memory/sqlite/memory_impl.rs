@@ -785,6 +785,13 @@ impl Memory for SqliteMemory {
         self.append_event_batch(inputs).await
     }
 
+    async fn copy_events_for_branch(
+        &self,
+        plan: crate::memory::branch_copy::BranchCopyPlan,
+    ) -> anyhow::Result<crate::memory::branch_copy::BranchCopyResult> {
+        self.copy_branch_events(plan).await
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

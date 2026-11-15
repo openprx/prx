@@ -2003,6 +2003,19 @@ pub trait Memory: Send + Sync {
         results
     }
 
+    /// Copy a session's transcript rows into a new branch in one transaction,
+    /// rewriting every copied handoff note to reference the copies. Backends
+    /// without a transactional event log return [`BranchCopyError::Unsupported`].
+    ///
+    /// [`BranchCopyError::Unsupported`]: crate::memory::branch_copy::BranchCopyError::Unsupported
+    async fn copy_events_for_branch(
+        &self,
+        plan: crate::memory::branch_copy::BranchCopyPlan,
+    ) -> anyhow::Result<crate::memory::branch_copy::BranchCopyResult> {
+        let _ = plan;
+        Err(crate::memory::branch_copy::BranchCopyError::Unsupported.into())
+    }
+
     /// Create a backend lifetime owner. Unsupported backends fail explicitly.
     async fn acquire_ingress_lifetime(
         &self,

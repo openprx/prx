@@ -295,8 +295,31 @@ fn source_message_matches_event(message: &ChatMessage, event: &MessageEvent) -> 
             || crate::chat::sanitize::sanitize_for_persistence(&message.content) == event.content)
 }
 
-pub(super) fn is_context_handoff_message(message: &ChatMessage) -> bool {
-    message.role == "assistant" && message.content.starts_with(CONTEXT_HANDOFF_START)
+pub(crate) fn is_context_handoff_message(message: &ChatMessage) -> bool {
+    is_context_handoff_turn(&message.role, &message.content)
+}
+
+/// Whether a stored turn (`role`, `content`) is a context handoff.
+pub(crate) fn is_context_handoff_turn(role: &str, content: &str) -> bool {
+    role == "assistant" && content.starts_with(CONTEXT_HANDOFF_START)
+}
+
+/// The JSON note inside a context handoff message, if `content` is one.
+#[must_use]
+pub(crate) fn parse_context_handoff_note(content: &str) -> Option<serde_json::Value> {
+    let json = content
+        .strip_prefix(CONTEXT_HANDOFF_START)?
+        .strip_suffix(CONTEXT_HANDOFF_END)?
+        .trim();
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .filter(serde_json::Value::is_object)
+}
+
+/// The handoff message carrying `note_json`, as persisted and replayed.
+#[must_use]
+pub(crate) fn format_context_handoff_message(note_json: &str) -> String {
+    format!("{CONTEXT_HANDOFF_START}\n{note_json}\n{CONTEXT_HANDOFF_END}")
 }
 
 /// True when `message` exists only inside a live tool round-trip and therefore
@@ -472,14 +495,7 @@ fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
         .iter()
         .rev()
         .find(|message| is_context_handoff_message(message))
-        .and_then(|message| {
-            let json = message
-                .content
-                .strip_prefix(CONTEXT_HANDOFF_START)?
-                .strip_suffix(CONTEXT_HANDOFF_END)?
-                .trim();
-            serde_json::from_str::<serde_json::Value>(json).ok()
-        })
+        .and_then(|message| parse_context_handoff_note(&message.content))
         .map_or((0, None), |note| {
             (
                 note.get("to_generation")
@@ -1112,7 +1128,7 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
             }
         });
         let note_json = serde_json::to_string(&note)?;
-        let handoff_message = format!("{CONTEXT_HANDOFF_START}\n{note_json}\n{CONTEXT_HANDOFF_END}");
+        let handoff_message = format_context_handoff_message(&note_json);
         persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
         return Ok(Some(CompactionPatch {
             replacement: vec![ChatMessage::assistant(handoff_message)],

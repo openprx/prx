@@ -78,6 +78,9 @@ mod chat_message_event_projection_tests;
 mod legacy_chat_compaction_audit_tests;
 
 #[cfg(test)]
+mod branch_copy_tests;
+
+#[cfg(test)]
 mod file_mention_tests;
 
 #[cfg(test)]

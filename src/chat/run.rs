@@ -2130,9 +2130,23 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                             // The branch boundary reads the acknowledged state.
                             let current = chat_session.session();
-                            let branch = branched_chat_session_from(&current, keep_turns, provider_name, model_name);
+                            let mut branch = branched_chat_session_from(&current, keep_turns, provider_name, model_name);
                             let branch_id = branch.id.clone();
                             let branch_turns = branch.turn_count();
+                            // The branch's own transcript rows (handoff chain and
+                            // retained turns) commit in one transaction before the
+                            // branch session exists; any failure aborts the branch.
+                            if let Err(e) = super::branch_copy::copy_branch_transcript(
+                                mem.as_ref(),
+                                memory_fabric.workspace_id(),
+                                &current.id,
+                                &mut branch,
+                            )
+                            .await
+                            {
+                                emit_chat_output(&format!("Branch aborted: failed to copy the transcript: {e}"));
+                                continue;
+                            }
                             if let Err(e) = save_session(mem.as_ref(), &branch).await {
                                 emit_chat_output(&format!("Branch aborted: failed to save new branch session: {e}"));
                                 continue;
