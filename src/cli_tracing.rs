@@ -12,6 +12,8 @@ pub enum CliCommand {
     Go,
     Agent,
     Chat,
+    /// `prx chat --message`: warn on stderr, never chat.log.
+    ChatMessage,
     Gateway,
     Daemon,
     Service,
@@ -85,12 +87,13 @@ impl CliCommand {
 mod tests {
     use super::{CliCommand, CliTracingDefaults};
 
-    fn all_commands() -> [CliCommand; 33] {
+    fn all_commands() -> [CliCommand; 34] {
         [
             CliCommand::Init,
             CliCommand::Go,
             CliCommand::Agent,
             CliCommand::Chat,
+            CliCommand::ChatMessage,
             CliCommand::Gateway,
             CliCommand::Daemon,
             CliCommand::Service,
@@ -132,6 +135,7 @@ mod tests {
             | CliCommand::Go
             | CliCommand::Agent
             | CliCommand::Chat
+            | CliCommand::ChatMessage
             | CliCommand::Service
             | CliCommand::Doctor
             | CliCommand::Status
@@ -170,6 +174,8 @@ mod tests {
         }
         assert_eq!(CliCommand::Agent.defaults().filter, "warn");
         assert!(CliCommand::Agent.defaults().write_stderr);
+        assert_eq!(CliCommand::ChatMessage.defaults().filter, "warn");
+        assert!(CliCommand::ChatMessage.defaults().write_stderr);
         assert_eq!(CliCommand::Chat.defaults().filter, "warn");
         assert_eq!(CliCommand::Go.defaults().filter, "warn");
         assert_eq!(CliCommand::Daemon.defaults().filter, "info");

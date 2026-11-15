@@ -208,15 +208,7 @@ pub(super) fn print_summary(config: &Config) {
     }
 
     println!("    {} Send a quick message:", style(format!("{step}.")).cyan().bold());
-    println!("       {}", style("prx agent -m \"Hello, OpenPRX!\"").yellow());
-    println!();
-    step += 1;
-
-    println!(
-        "    {} Start interactive CLI mode:",
-        style(format!("{step}.")).cyan().bold()
-    );
-    println!("       {}", style("prx agent").yellow());
+    println!("       {}", style("prx chat --message \"Hello, OpenPRX!\"").yellow());
     println!();
     step += 1;
 

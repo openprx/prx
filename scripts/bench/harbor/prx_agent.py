@@ -211,7 +211,7 @@ class PrxAgent(BaseInstalledAgent):
             host = shlex.quote(CONTAINER_HOST if proxy is not None else endpoint(container_provider))
             no_proxy = f"NO_PROXY={host} no_proxy={host} "
             command = (f"env -u PRX_BENCH_API_KEY {no_proxy}prx --config-dir {CONFIG_DIR} "
-                       f"agent -t {self.temperature:g} -m {shlex.quote(instruction)} "
+                       f"chat -t {self.temperature:g} --message {shlex.quote(instruction)} "
                        f">{LOG_DIR}/prx-stdout.txt 2>{LOG_DIR}/prx-stderr.txt; "
                        f"code=$?; printf '%s\\n' \"$code\" >{LOG_DIR}/prx-exit-code")
             try:

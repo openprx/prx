@@ -80,12 +80,31 @@ pub struct ChatRunner {
     pub session: Option<String>,
     pub continue_last: bool,
     pub list_sessions: bool,
+    /// `--message`: run one turn, print only the reply and exit.
+    pub message: Option<String>,
+    /// `--save`: keep the one-shot turn as a resumable session.
+    pub save: bool,
 }
 
 #[async_trait::async_trait]
 impl ModeRunner for ChatRunner {
     async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
         let me = *self;
+        if let Some(message) = me.message {
+            return chat::run_message(
+                me.config,
+                me.provider,
+                me.model,
+                me.temperature,
+                chat::ChatMessageRequest {
+                    message,
+                    save: me.save,
+                    session: me.session.or_else(|| me.continue_last.then(|| "last".to_string())),
+                },
+                shutdown,
+            )
+            .await;
+        }
         match (me.h2_limits, me.h2_authority_seconds) {
             (Some(limits), Some(seconds)) => {
                 anyhow::ensure!(
@@ -238,7 +257,7 @@ pub const fn should_bind_signal(command: &Commands) -> bool {
 pub const fn starts_agent_runtime(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Chat { .. }
+        Commands::Chat { message: None, .. }
             | Commands::Gateway { .. }
             | Commands::Daemon { .. }
             | Commands::Channel {
@@ -370,6 +389,9 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             session,
             continue_last,
             list_sessions,
+            message,
+            save,
+            workdir: _,
         } => {
             // D5/D9 (A6): drive via ModeRunner with the dispatch root token. chat
             // is *not* whitelisted for a dispatch signal task — its internal
@@ -387,6 +409,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 session,
                 continue_last,
                 list_sessions,
+                message,
+                save,
             })
             .run(root_shutdown.clone())
             .await
@@ -819,6 +843,9 @@ mod tests {
             session: None,
             continue_last: false,
             list_sessions: false,
+            message: None,
+            save: false,
+            workdir: None,
         }
     }
 
@@ -836,6 +863,9 @@ mod tests {
             session: None,
             continue_last: false,
             list_sessions: false,
+            message: None,
+            save: false,
+            workdir: None,
         }));
     }
 

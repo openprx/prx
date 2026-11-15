@@ -12,12 +12,31 @@ use async_trait::async_trait;
 use crossterm::{execute, style, terminal};
 use std::io::{self, IsTerminal as _, Write as _};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub(crate) mod prompt_line;
+
+// ── Reply-only stdout ───────────────────────────────────────────────────────
+
+/// Set once by `prx chat --message`: stdout carries only the final reply,
+/// which that entry writes itself. Process-wide because the mode is: the
+/// process runs exactly one turn and exits.
+static STDOUT_RESERVED_FOR_REPLY: AtomicBool = AtomicBool::new(false);
+
+/// Reserve stdout for the one-shot reply: the terminal renderer and the plain
+/// notice/failure printers write nothing from now on.
+pub fn reserve_stdout_for_reply() {
+    STDOUT_RESERVED_FOR_REPLY.store(true, Ordering::Release);
+}
+
+/// Whether stdout is reserved for the one-shot reply.
+#[must_use]
+pub fn stdout_reserved_for_reply() -> bool {
+    STDOUT_RESERVED_FOR_REPLY.load(Ordering::Acquire)
+}
 
 // ── Terminal output sanitization ────────────────────────────────────────────
 
@@ -361,6 +380,9 @@ impl UiActor {
         #[cfg(feature = "terminal-tui")]
         if self.mirror.is_some() {
             self.handle_event_tui(event);
+            return;
+        }
+        if stdout_reserved_for_reply() {
             return;
         }
 

@@ -13,18 +13,11 @@ use wire::{MODEL, PARENT_MODEL, WireProbe};
 #[derive(Clone, Copy, Debug)]
 enum Root {
     Single,
-    Repl,
     PlainChat,
     TaskChild,
     ProcessWorker,
 }
-const ROOTS: &[Root] = &[
-    Root::Single,
-    Root::Repl,
-    Root::PlainChat,
-    Root::TaskChild,
-    Root::ProcessWorker,
-];
+const ROOTS: &[Root] = &[Root::Single, Root::PlainChat, Root::TaskChild, Root::ProcessWorker];
 
 fn config(
     workspace: &Path,
@@ -204,15 +197,8 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
     std::fs::write(config_dir.join("config.toml"), toml::to_string_pretty(&config)?)?;
     let mut command = command(&config_dir, &workspace, &home);
     let result = async {
-        if matches!(
-            root,
-            Root::Repl | Root::PlainChat | Root::TaskChild | Root::ProcessWorker
-        ) {
-            if matches!(root, Root::Repl) {
-                command.arg("agent");
-            } else {
-                command.args(["chat", "--plain"]);
-            }
+        if matches!(root, Root::PlainChat | Root::TaskChild | Root::ProcessWorker) {
+            command.args(["chat", "--plain"]);
             let source = if mode.is_some() {
                 "PRX_PARENT sessions_spawn: use memory_get capability_search skill_read prx_probe in a child"
             } else {
@@ -225,7 +211,7 @@ async fn drive(root: Root, input: &str, advice: bool, skill: bool, native: bool)
             };
             interactive(command, source, marker).await
         } else {
-            command.args(["agent", "-m", input]);
+            command.args(["chat", "--message", input]);
             let output = tokio::time::timeout(Duration::from_secs(120), command.output()).await??;
             ensure!(
                 output.status.success(),

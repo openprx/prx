@@ -209,8 +209,11 @@ pub(super) fn session_tools(
     ))
 }
 
+/// `strict` (a one-shot naming a session, D2/D3): a missing session is an
+/// error instead of a fresh session, so the turn never runs elsewhere.
 pub(super) async fn resume_session(
     session_id: Option<&str>,
+    strict: bool,
     mem: &Arc<dyn Memory>,
     memory_fabric: &super::MemoryFabric,
     config: &Config,
@@ -232,6 +235,7 @@ pub(super) async fn resume_session(
                     info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
                     s
                 }
+                Ok(None) if strict => anyhow::bail!("no saved chat session to continue"),
                 Ok(None) => {
                     info!("No previous session found, starting new");
                     session::ChatSession::new(provider_name, model_name)
@@ -251,6 +255,7 @@ pub(super) async fn resume_session(
                     info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
                     s
                 }
+                Ok(None) if strict => anyhow::bail!("session '{id}' not found"),
                 Ok(None) => {
                     eprintln!("Session '{id}' not found, starting new session.");
                     session::ChatSession::new(provider_name, model_name)
@@ -712,6 +717,7 @@ pub(super) async fn finish_chat_session(
     mem: &Arc<dyn Memory>,
     chat_session: &session::ChatSession,
     plain_mode_turn_failed: bool,
+    #[cfg(not(feature = "terminal-tui"))] persist_sessions: bool,
 ) -> Result<()> {
     // Step 5b: dispatcher task graceful shutdown.
     //
@@ -754,7 +760,7 @@ pub(super) async fn finish_chat_session(
     #[cfg(feature = "terminal-tui")]
     let legacy_exit_save_enabled = false; // S4-B: Pure single source
     #[cfg(not(feature = "terminal-tui"))]
-    let legacy_exit_save_enabled = true;
+    let legacy_exit_save_enabled = persist_sessions;
     if legacy_exit_save_enabled {
         // Final session save before exit
         if let Err(e) = save_session(mem.as_ref(), chat_session).await {

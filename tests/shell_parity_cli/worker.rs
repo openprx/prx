@@ -198,11 +198,11 @@ async fn root_pwd(worker: bool, override_root: bool) {
     } else if override_root {
         run(
             &config_dir,
-            &["--workdir", workdir_str, "Run shell pwd for PRX-PWD-CLI"],
+            &["--workdir", workdir_str, "--message", "Run shell pwd for PRX-PWD-CLI"],
         )
         .await
     } else {
-        run(&config_dir, &["Run shell pwd for PRX-PWD-CLI"]).await
+        run(&config_dir, &["--message", "Run shell pwd for PRX-PWD-CLI"]).await
     };
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(5), server)

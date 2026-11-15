@@ -1161,6 +1161,24 @@ pub(super) async fn apply_ready_ordered_provider_turn_commits(
     applied
 }
 
+/// The failed provider attempt a decided turn's terminal records, as every
+/// other entry records it; a policy refusal sent nothing, so it records none.
+#[cfg(feature = "terminal-tui")]
+fn failed_provider_outcome(pending: &PerTurnContext, err: &str) -> Option<ProviderExecutionOutcome> {
+    let binding = pending.turn_binding.as_ref()?;
+    let refused = matches!(
+        binding.failure_note(),
+        Some(crate::chat::binding::TurnFailureNote::Refused { .. })
+    );
+    (binding.is_decided() && !refused).then(|| {
+        ProviderExecutionOutcome::failed_for_decision(
+            &pending.route_decision,
+            pending.provider_started_at,
+            &anyhow::anyhow!("{err}"),
+        )
+    })
+}
+
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 async fn finalize_per_turn_context(
@@ -1256,13 +1274,14 @@ async fn finalize_per_turn_context(
             if let Some(guard) = pending.assignment.as_mut() {
                 guard.failed(&format!("The turn this chat ran for the assignment failed: {err}"));
             }
+            let provider_outcome = failed_provider_outcome(&pending, &err);
             if let Err(error) = finalize_chat_non_success_turn(
                 pending.turn_binding.as_deref(),
                 memory_fabric,
                 &pending.turn_run_id,
                 pending.route_scope.clone(),
                 crate::agent::terminal::TurnTerminalStatus::Failed,
-                None,
+                provider_outcome,
                 pending.provider_started_at,
                 &format!("redux driver failed: {err}"),
                 &config.cost,

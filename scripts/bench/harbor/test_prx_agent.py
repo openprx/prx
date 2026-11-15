@@ -48,7 +48,7 @@ class FakeEnvironment:
     async def exec(self, **kwargs):
         self.calls.append(kwargs)
         command = kwargs['command']
-        if 'agent -t' in command:
+        if 'chat -t' in command:
             if self.mode == 'timeout':
                 raise asyncio.TimeoutError()
             if self.mode == 'runtime_timeout':
@@ -101,11 +101,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 commands = [call['command'] for call in environment.calls]
                 self.assertIn(adapter.KILL_PRX, commands)
                 self.assertEqual(agent._metadata['per_attempt_models']['status'], 'unavailable')
-                invocation = next(c for c in commands if 'agent -t' in c)
+                invocation = next(c for c in commands if 'chat -t' in c)
                 self.assertIn('NO_PROXY=host.containers.internal', invocation)
                 self.assertNotIn('timeout -k', invocation)
                 self.assertNotIn('command -v timeout', commands)
-                execution = next(c for c in environment.calls if 'agent -t' in c['command'])
+                execution = next(c for c in environment.calls if 'chat -t' in c['command'])
                 self.assertEqual(execution['timeout_sec'], 70)
                 self.assertEqual(agent._metadata['agent_exec_timeout_sec'], 70)
                 self.assertTrue(all(c['timeout_sec'] == 10 for c in environment.calls if c['command'] == adapter.KILL_PRX))
@@ -149,7 +149,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 plain_exec = environment.exec
 
                 async def exec_and_probe(plain_exec=plain_exec, environment=environment, reachable=reachable, **kwargs):
-                    if 'agent -t' in kwargs['command']:
+                    if 'chat -t' in kwargs['command']:
                         port = int(environment.uploads[0]['content'].split('host.containers.internal:')[1].split('/')[0])
                         socket.create_connection(('127.0.0.1', port), timeout=2).close()
                         reachable.append(port)
@@ -246,7 +246,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent._metadata['provider'], 'kimi-code')
                 self.assertEqual(agent._metadata['settlement_provider'], 'kimi-code')
                 self.assertNotIn('api_url', agent._metadata['profile_values'])
-                invocation = next(c['command'] for c in environment.calls if 'agent -t' in c['command'])
+                invocation = next(c['command'] for c in environment.calls if 'chat -t' in c['command'])
                 self.assertIn('NO_PROXY=host.containers.internal', invocation)
                 self.assertEqual(environment.calls[-1]['command'], 'rm -rf /opt/prx-bench')
 

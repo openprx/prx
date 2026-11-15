@@ -62,7 +62,7 @@ ALLOWED = (
     #   providers serve chat completions, and that API can start background work
     #   that outlives the trial.
     # - GET /models (prx models refresh, prx providers test --live): never called
-    #   by `prx agent` during a trial.
+    #   by `prx chat --message` during a trial.
 )
 # Allowlists: nothing else crosses the proxy in either direction.
 REQUEST_HEADERS = ("content-type", "accept", "user-agent")

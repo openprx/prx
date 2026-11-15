@@ -1035,6 +1035,10 @@ pub struct EffectExecutor {
     /// terminal notification cannot claim success when durable persistence
     /// failed.
     persistence_error: Arc<ParkingMutex<Option<String>>>,
+    /// `false` for an unsaved `prx chat --message` turn: `SaveSession` writes
+    /// no chat session row (the turn's memory events, terminal and cost
+    /// records are written as for any turn).
+    persist_sessions: bool,
 }
 
 impl EffectExecutor {
@@ -1048,6 +1052,7 @@ impl EffectExecutor {
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot: None,
             persistence_error: Arc::new(ParkingMutex::new(None)),
+            persist_sessions: true,
         }
     }
 
@@ -1062,7 +1067,17 @@ impl EffectExecutor {
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot,
             persistence_error: Arc::new(ParkingMutex::new(None)),
+            persist_sessions: true,
         }
+    }
+
+    /// Run without chat session rows (an unsaved one-shot turn). `SaveSession`
+    /// then succeeds without storing, so the turn completes normally but is
+    /// neither listed nor resumable.
+    #[must_use]
+    pub(crate) const fn without_session_rows(mut self) -> Self {
+        self.persist_sessions = false;
+        self
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -1440,6 +1455,10 @@ impl EffectExecutor {
             }
             Effect::SaveSession(session) => {
                 *self.persistence_error.lock() = None;
+                if !self.persist_sessions {
+                    tracing::debug!(session_id = %session.id, "SaveSession effect: unsaved one-shot session, no row");
+                    return;
+                }
                 let session = crate::chat::sanitize::sanitize_session_content(&session);
                 // T3-3-fixB D1: inline await instead of tokio::spawn, so the serialization of the main loop's
                 // executor.execute(effect).await carries all the way through, closing the inconsistency window
@@ -2774,6 +2793,7 @@ async fn drive_start_turn_stream(
             return;
         }
         Err(error) => {
+            binding.note_failure(super::binding::TurnFailureNote::from_error(&error));
             let (message, retryable) = error
                 .downcast_ref::<crate::agent::turn_contracts::ContextCapacityError>()
                 .map_or_else(

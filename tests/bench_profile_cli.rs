@@ -158,7 +158,26 @@ impl Server {
                         }
                         .to_string();
                         let code = if chat { status } else { 404 };
-                        write!(stream, "HTTP/1.1 {code} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                        // The chat turn path streams: answer a streamed request with
+                        // real SSE frames carrying the same reply and usage.
+                        let streamed =
+                            chat && status == 200 && request.1.get("stream").and_then(Value::as_bool) == Some(true);
+                        let (content_type, body) = if streamed {
+                            let delta = serde_json::json!({"id":"prx-fixture", "object":"chat.completion.chunk",
+                                "model":MODEL,"choices":[{"index":0,"finish_reason":null,
+                                "delta":{"role":"assistant","content":"4"}}]});
+                            let done = serde_json::json!({"id":"prx-fixture", "object":"chat.completion.chunk",
+                                "model":MODEL,"choices":[{"index":0,"finish_reason":"stop","delta":{}}],
+                                "usage":{"prompt_tokens":20,"completion_tokens":1,"total_tokens":21,
+                                "prompt_tokens_details":{"cached_tokens":0}}});
+                            (
+                                "text/event-stream",
+                                format!("data: {delta}\n\ndata: {done}\n\ndata: [DONE]\n\n"),
+                            )
+                        } else {
+                            ("application/json", body)
+                        };
+                        write!(stream, "HTTP/1.1 {code} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
                             .expect("test: write HTTP response");
                         seen.push(request);
                     }
@@ -274,7 +293,7 @@ fn exercise(status: u16, refusal: bool) {
     command
         .args(["--config-dir"])
         .arg(&config_dir)
-        .args(["agent", "-t", "0.25", "-m", "What is 2 + 2?"])
+        .args(["chat", "-t", "0.25", "--message", "What is 2 + 2?"])
         .env("HOME", root.path())
         .env("RUST_LOG", "error")
         .env_remove("OPENPRX_CONFIG_DIR")

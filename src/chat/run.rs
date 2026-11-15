@@ -134,8 +134,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 mod entry;
+mod one_shot;
 mod startup;
 pub use entry::{run, run_controlled};
+pub use one_shot::{ChatMessageRequest, ONE_SHOT_REFUSAL_EXIT_CODE, OneShotRefused, one_shot_exit_code, run_message};
 
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
@@ -149,8 +151,16 @@ async fn run_internal(
     list_sessions: bool,
     shutdown: CancellationToken,
     terminal_producer: Option<crate::runtime::h2_entry::TerminalInputProducer>,
-) -> Result<()> {
-    let _tracing_guard = startup::chat_tracing_guard();
+    one_shot: Option<one_shot::OneShotTurn>,
+) -> Result<Option<one_shot::OneShotReply>> {
+    // A one-shot keeps tracing on stderr (`CliCommand::ChatMessage`), not chat.log.
+    let _tracing_guard = if one_shot.is_none() {
+        startup::chat_tracing_guard()
+    } else {
+        None
+    };
+    // An unsaved one-shot writes no chat session row (AR-R2).
+    let persist_sessions = one_shot.as_ref().is_none_or(one_shot::OneShotTurn::persists);
 
     // ── Panic hook: restore terminal state on crash ─────────────────────
     // Strengthened in P3-2: restoration runs before the chained hook so
@@ -185,7 +195,7 @@ async fn run_internal(
     // Early-exit before tools/provider/TUI are needed (MemoryOnly profile never
     // built them), preserving the original `--list-sessions` semantics.
     if list_sessions {
-        return list_saved_sessions(mem.as_ref()).await;
+        return list_saved_sessions(mem.as_ref()).await.map(|()| None);
     }
 
     // ── Tools ────────────────────────────────────────────────────
@@ -281,6 +291,16 @@ async fn run_internal(
     )?;
     // The process cost outbox projector (P2-R5), cancelled with `shutdown`.
     crate::runtime::cost_recovery::warn_legacy_files_once(&config.workspace_dir);
+    if one_shot.is_some() {
+        // The process may exit before the background projector's first pass
+        // finishes, so a one-shot awaits one pass before its turn (AR-R2).
+        crate::runtime::cost_recovery::CostOutboxProjector::run_once(
+            Arc::clone(&mem),
+            config.workspace_dir.clone(),
+            config.cost.clone(),
+        )
+        .await;
+    }
     let cost_projector = crate::runtime::cost_recovery::CostOutboxProjector::start(
         Arc::clone(&mem),
         config.workspace_dir.clone(),
@@ -314,7 +334,7 @@ async fn run_internal(
     let pty_handoff = Arc::new(crate::chat::sessions::pty::HandoffControl::new());
 
     let mut chat_session = startup::resume_session(
-        session_id.as_deref(), &mem, &memory_fabric, &config, provider_name, model_name,
+        session_id.as_deref(), one_shot.is_some(), &mem, &memory_fabric, &config, provider_name, model_name,
     ).await?;
     bind_session_to_runtime_provider_model(&mut chat_session, provider_name, model_name);
     let (mut chat_session_key, mut fabric_turn_seq, banner, mut history) = startup::initial_conversation(
@@ -420,7 +440,8 @@ async fn run_internal(
             tool_surface_reserve: tool_surface_reserve.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
-        dispatcher::EffectExecutor::new_with_deps(deps).with_cleanup_owner(Arc::clone(&child_cleanup))
+        let executor = dispatcher::EffectExecutor::new_with_deps(deps).with_cleanup_owner(Arc::clone(&child_cleanup));
+        if persist_sessions { executor } else { executor.without_session_rows() }
     };
     #[cfg(not(feature = "terminal-tui"))]
     let effect_executor = dispatcher::EffectExecutor::new_shadow();
@@ -489,16 +510,24 @@ async fn run_internal(
     // Non-TUI fallback still needs a shared cancellation slot for SIGINT.
     #[cfg(not(feature = "terminal-tui"))]
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
+    // A one-shot reads no terminal input: its one message is queued below.
     #[cfg(feature = "terminal-tui")]
-    let (terminal_guard, redraw_tx_for_main) = startup::terminal_input(
-        plain_mode, entry::take_producer(&ctx), &ui_startup, &terminal, input_tx, &control_tx, &chat_mirror, &shutdown,
-        &last_ctrlc_ms, &chat_dispatcher, &executor_redraw_slot, &snapshot_rx_for_tui,
-        &pty_handoff, &config, &security,
-    ).await;
+    let (terminal_guard, redraw_tx_for_main) = if one_shot.is_some() {
+        drop(input_tx);
+        (None, None)
+    } else {
+        startup::terminal_input(
+            plain_mode, entry::take_producer(&ctx), &ui_startup, &terminal, input_tx, &control_tx, &chat_mirror, &shutdown,
+            &last_ctrlc_ms, &chat_dispatcher, &executor_redraw_slot, &snapshot_rx_for_tui,
+            &pty_handoff, &config, &security,
+        ).await
+    };
     #[cfg(not(feature = "terminal-tui"))]
     let redraw_tx_for_main: Option<mpsc::Sender<()>> = None;
     #[cfg(not(feature = "terminal-tui"))]
-    {
+    if one_shot.is_some() {
+        drop(input_tx);
+    } else {
         println!("{banner}");
         eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.id));
         let terminal_for_listen = TerminalChannel::new(plain_mode);
@@ -619,9 +648,17 @@ async fn run_internal(
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
     let mut pending_diff_apply: Option<PendingDiffApply> = None;
     #[cfg(feature = "terminal-tui")]
-    let mut input_events_open = true;
+    let mut input_events_open = one_shot.is_none();
     #[cfg(not(feature = "terminal-tui"))]
-    let input_events_open = true;
+    let input_events_open = one_shot.is_none();
+    // The one-shot message, queued literally (D4): no priority prefix or
+    // command is interpreted. The input channel stays closed, so the loop
+    // ends once this turn resolves.
+    let one_shot_turns_before = chat_session.turns.len();
+    let mut one_shot_binding: Option<Arc<binding::ChatTurnBinding>> = None;
+    if let Some(turn) = one_shot.as_ref() {
+        turn.enqueue(&mut input_backlog, &mut turn_scheduler, chat_session.turns.len());
+    }
 
     // ── Reload notice: historical child sessions (v4) ────────
     // If this chat session was resumed and carried persisted background-session
@@ -652,13 +689,18 @@ async fn run_internal(
     // listens and no new transport exists. Enrolment happens off this path — a
     // daemon that is down, slow or refusing credentials costs this chat the
     // ability to be assigned work and nothing else.
-    let assignment_enrolment = start_assignment_enrolment(
-        &config,
-        &chat_sessions,
-        &assignment_input_tx,
-        &chat_dispatcher,
-        sessions_redraw_handle.as_ref(),
-    );
+    // An unsaved one-shot session cannot be assigned work.
+    let assignment_enrolment = if one_shot.is_none() {
+        start_assignment_enrolment(
+            &config,
+            &chat_sessions,
+            &assignment_input_tx,
+            &chat_dispatcher,
+            sessions_redraw_handle.as_ref(),
+        )
+    } else {
+        None
+    };
 
     // ── Main message loop ────────────────────────────────────────
     //
@@ -667,7 +709,7 @@ async fn run_internal(
     // outer loop: it only `break`s with a real input message (or `None` on
     // shutdown). On a tick we poll the registry and surface results via the
     // dispatcher (single source, reaches both render paths), then keep waiting.
-    while let Some(input) = loop {
+    'chat: while let Some(input) = loop {
         turn_signal.ensure_history_commits_healthy()?;
         #[cfg(feature = "terminal-tui")]
         macro_rules! handle_resume_saved_session_control {
@@ -1419,11 +1461,6 @@ async fn run_internal(
             }
         }
 
-        // Handle /quit and /exit immediately
-        if is_chat_quit_command(user_input.as_str()) {
-            break;
-        }
-
         // Route any user-visible slash-command output into the right sink:
         // (defined before the bang handler so `!cmd` can emit its output).
         // ratatui mirror on the TUI path (so it survives raw-mode `\n`
@@ -1447,6 +1484,14 @@ async fn run_internal(
         let emit_chat_output = |text: &str| {
             print_fallback_chat_output(text);
         };
+
+        // A one-shot message is literal model input (D4): it skips every
+        // quit, copy, queue, slash and bang command below.
+        if one_shot.is_none() {
+        // Handle /quit and /exit immediately
+        if is_chat_quit_command(user_input.as_str()) {
+            break 'chat;
+        }
 
         if is_copy_command(&user_input) {
             match select_copy_content(&chat_session, &user_input) {
@@ -1837,7 +1882,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     emit_chat_output(&text);
                     continue;
                 }
-                commands::CommandResult::Quit => break,
+                commands::CommandResult::Quit => break 'chat,
                 commands::CommandResult::SetMode(mode) => {
                     // Pure skips the legacy chat_session.set_mode; in legacy mode
                     // run_turn still reads it.
@@ -2912,6 +2957,8 @@ Retry with a compatible model: /provider {shown} <model>",
             }
         }
 
+        }
+
         // This is the concrete TerminalChannel: send_draft always returns
         // Some(id), including when its UI receiver has closed. Capacity can
         // therefore be selected before creating the durable source. The local
@@ -3014,6 +3061,9 @@ Retry with a compatible model: /provider {shown} <model>",
         }
         admission_guard.handoff_terminal()?;
         let chat_turn_binding = Some(Arc::clone(&admitted_binding));
+        if one_shot.is_some() {
+            one_shot_binding = Some(Arc::clone(&admitted_binding));
+        }
 
         let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await;
         if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
@@ -4644,7 +4694,7 @@ Retry with a compatible model: /provider {shown} <model>",
         // SaveSession or NotifyHook during a turn, the guard is active and every later write of the
         // old path is suppressed.
         if !dual_write_guard.is_active() {
-            if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+            if persist_sessions && let Err(e) = save_session(mem.as_ref(), &chat_session).await {
                 tracing::warn!("Failed to persist session: {e}");
             }
 
@@ -4701,11 +4751,23 @@ Retry with a compatible model: /provider {shown} <model>",
     )
     .await;
 
+    // The one-shot outcome is read before teardown; its failure is reported
+    // as that outcome, not as the interactive "turns failed" summary.
+    let one_shot_reply = one_shot.as_ref().map(|_| {
+        one_shot::outcome(
+            one_shot_binding.as_deref(),
+            plain_mode_turn_failed,
+            chat_session.turns.len() > one_shot_turns_before,
+            &history,
+        )
+    });
     startup::finish_chat_session(
         &shutdown, chat_dispatcher, dispatcher_handle,
         #[cfg(feature = "terminal-tui")] &terminal_guard,
-        &mem, &chat_session, plain_mode_turn_failed,
-    ).await
+        &mem, &chat_session, plain_mode_turn_failed && one_shot.is_none(),
+        #[cfg(not(feature = "terminal-tui"))] persist_sessions,
+    ).await?;
+    one_shot_reply.transpose()
     }).await;
     turn_service
         .shutdown(std::time::Instant::now() + Duration::from_secs(2))

@@ -1066,6 +1066,6 @@ cat <<'DONE'
 
 Next steps:
   prx status
-  prx agent -m "Hello, PRX!"
+  prx chat --message "Hello, PRX!"
   prx gateway
 DONE

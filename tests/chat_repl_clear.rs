@@ -1,4 +1,4 @@
-//! Exercise /clear and /new through a real REPL process and its SQLite store.
+//! Exercise /clear and /new through a real `chat --plain` process and its SQLite store.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -157,7 +157,7 @@ fn serve_loopback(listener: TcpListener) {
     });
 }
 
-fn start_repl(root: &std::path::Path, provider: &str, chat: bool) -> (Repl, std::path::PathBuf) {
+fn start_repl(root: &std::path::Path, provider: &str) -> (Repl, std::path::PathBuf) {
     let home = root.join("home");
     let config_dir = root.join("config");
     let workspace = config_dir.join("workspace");
@@ -192,12 +192,7 @@ fn start_repl(root: &std::path::Path, provider: &str, chat: bool) -> (Repl, std:
     .expect("write config");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_prx"));
-    command.arg("--config-dir").arg(&config_dir);
-    if chat {
-        command.args(["chat", "--plain"]);
-    } else {
-        command.arg("agent");
-    }
+    command.arg("--config-dir").arg(&config_dir).args(["chat", "--plain"]);
     let mut child = command
         .env("HOME", &home)
         .env("XDG_DATA_HOME", home.join("data"))
@@ -231,21 +226,12 @@ fn start_repl(root: &std::path::Path, provider: &str, chat: bool) -> (Repl, std:
 }
 
 #[test]
-fn clear_and_new_preserve_all_memories_and_rotate_repl_session() {
-    check_session_reset(false);
-}
-
-#[test]
 fn chat_clear_and_new_preserve_all_memories_and_start_new_sessions() {
-    check_session_reset(true);
-}
-
-fn check_session_reset(chat: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
     let provider = format!("custom:http://{}/v1", listener.local_addr().expect("loopback address"));
     serve_loopback(listener);
     let root = tempfile::tempdir().expect("isolated root");
-    let (mut repl, workspace) = start_repl(root.path(), &provider, chat);
+    let (mut repl, workspace) = start_repl(root.path(), &provider);
     repl.send("The PRX fixture records its initial conversation observation.");
     repl.until(&format!("{REPLY}: initial."));
     let db = rusqlite::Connection::open(workspace.join("memory/brain.db")).expect("independent SQLite connection");
@@ -258,13 +244,7 @@ fn check_session_reset(chat: bool) {
     assert_ne!(first.1, second.1, "run IDs remain per-turn");
 
     let rows = [
-        (
-            "current",
-            "conversation",
-            first.0.as_str(),
-            if chat { "chat" } else { "agent" },
-            if chat { "terminal" } else { "cli" },
-        ),
+        ("current", "conversation", first.0.as_str(), "chat", "terminal"),
         ("other", "daily", "agent:other-session", "agent", "cli"),
         (
             "channel",
@@ -295,11 +275,7 @@ fn check_session_reset(chat: bool) {
         ),
     ] {
         repl.send(command);
-        repl.until(if chat {
-            "Started new chat session "
-        } else {
-            "New session started. Stored memories are preserved."
-        });
+        repl.until("Started new chat session ");
         repl.send(text);
         repl.until(&format!(
             "{REPLY}: {}.",

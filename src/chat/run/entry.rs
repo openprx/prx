@@ -30,8 +30,10 @@ pub async fn run(
         list,
         shutdown,
         None,
+        None,
     )
     .await
+    .map(|_| ())
 }
 
 /// Only the direct OS command supplies these bounded bootstrap intentions.
@@ -86,8 +88,10 @@ pub async fn run_controlled(
         false,
         shutdown,
         Some(producer),
+        None,
     )
-    .await;
+    .await
+    .map(|_| ());
     let cleanup = profile.close_reader().await;
     cleanup?;
     result

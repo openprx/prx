@@ -10,7 +10,7 @@ use tokio::io::AsyncReadExt;
 const CLI_OUTPUT_LIMIT: u64 = 64 * 1024;
 
 async fn run(config: &std::path::Path, args: &[&str]) -> (std::process::ExitStatus, String) {
-    let mut arguments = vec!["agent"];
+    let mut arguments = vec!["chat"];
     arguments.extend_from_slice(args);
     run_program(config, &arguments, None).await
 }
@@ -87,7 +87,7 @@ async fn invalid_workdir_exits_before_provider_request() {
     let (status, help) = run(&config, &["--help"]).await;
     assert!(
         status.success() && help.contains("--workdir"),
-        "test: actual agent help exposes workdir: {help}"
+        "test: actual chat help exposes workdir: {help}"
     );
     let count = Arc::new(AtomicUsize::new(0));
     let requests = count.clone();
@@ -113,7 +113,7 @@ async fn invalid_workdir_exits_before_provider_request() {
     );
     std::fs::write(config.join("config.toml"), &config_text).expect("test: config");
     for path in ["relative", root.path().join("missing").to_str().expect("test: path")] {
-        let (status, output) = run(&config, &["--workdir", path, "hello"]).await;
+        let (status, output) = run(&config, &["--workdir", path, "--message", "hello"]).await;
         assert_eq!(status.code(), Some(2), "test: clap rejection: {output}");
     }
     let invalid = config_text.replace(
@@ -121,7 +121,7 @@ async fn invalid_workdir_exits_before_provider_request() {
         "workdir = \"relative\"",
     );
     std::fs::write(config.join("config.toml"), invalid).expect("test: invalid runtime.workdir");
-    let (status, output) = run(&config, &["hello"]).await;
+    let (status, output) = run(&config, &["--message", "hello"]).await;
     assert_eq!(status.code(), Some(1), "test: lifecycle rejection: {output}");
     assert!(output.contains("workdir"), "test: lifecycle diagnostic: {output}");
     stop.cancel();

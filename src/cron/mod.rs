@@ -39,7 +39,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             if jobs.is_empty() {
                 println!("No scheduled tasks yet.");
                 println!("\nUsage:");
-                println!("  prx cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
+                println!("  prx cron add '0 9 * * *' 'prx chat --message \"Good morning!\"'");
                 return Ok(());
             }
 

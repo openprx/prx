@@ -6,6 +6,10 @@ use std::io::IsTerminal as _;
 use std::io::Write as _;
 
 pub(crate) fn print_fallback_chat_output(text: &str) {
+    // `prx chat --message`: stdout is the reply alone; notices are dropped.
+    if crate::channels::terminal::stdout_reserved_for_reply() {
+        return;
+    }
     let out = format_fallback_chat_output_for(text, std::io::stdout().is_terminal());
     print!("{out}");
     let _ = std::io::stdout().flush();
@@ -15,6 +19,10 @@ pub(crate) fn print_fallback_chat_output(text: &str) {
 /// replies on stdout, so the failure goes there too; a stderr-only line is lost
 /// whenever stderr is not the terminal. Other non-TUI modes keep stderr.
 pub(super) fn print_turn_failure(plain_mode: bool, err: &str) {
+    // `prx chat --message` reports a failure once, as its `Error:` exit line.
+    if crate::channels::terminal::stdout_reserved_for_reply() {
+        return;
+    }
     if plain_mode {
         print_fallback_chat_output(&format!("Error: {err}"));
     } else {

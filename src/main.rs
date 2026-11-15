@@ -100,7 +100,7 @@ use std::{fs, io::Write, path::PathBuf};
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt};
 
-fn parse_agent_workdir(value: &str) -> Result<std::path::PathBuf, String> {
+fn parse_workdir(value: &str) -> Result<std::path::PathBuf, String> {
     openprx::config::RuntimeConfig::validate_workdir(std::path::Path::new(value)).map_err(|error| error.to_string())
 }
 
@@ -117,6 +117,7 @@ const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
         Commands::Init { .. } => cli_tracing::CliCommand::Init,
         Commands::Go { .. } => cli_tracing::CliCommand::Go,
         Commands::Agent { .. } => cli_tracing::CliCommand::Agent,
+        Commands::Chat { message: Some(_), .. } => cli_tracing::CliCommand::ChatMessage,
         Commands::Chat { .. } => cli_tracing::CliCommand::Chat,
         Commands::Gateway { .. } => cli_tracing::CliCommand::Gateway,
         Commands::Daemon { .. } => cli_tracing::CliCommand::Daemon,
@@ -517,7 +518,7 @@ Examples:
   prx agent -p anthropic 'summarize x'  # pick a provider")]
     Agent {
         /// Absolute existing working directory for shell, file tools and git.
-        #[arg(long, value_parser = parse_agent_workdir)]
+        #[arg(long, value_parser = parse_workdir)]
         workdir: Option<std::path::PathBuf>,
         /// Single message as a positional argument (UNIX-style, equivalent to -m).
         ///
@@ -564,7 +565,19 @@ Examples:
   prx chat --continue                   # resume last session
   prx chat --session last               # resume last session
   prx chat --session abc123             # resume specific session
-  prx chat --list-sessions              # list saved sessions")]
+  prx chat --list-sessions              # list saved sessions
+  prx chat --message 'What is 2+2?'     # one turn: the reply on stdout, then exit
+  prx chat -q 'Summarize x' --save      # one turn, saved as a resumable session
+  prx chat --session abc123 -q 'More?'  # one turn in a saved session
+
+With --message (-q) chat runs exactly one turn and prints only the reply on \
+stdout. The message is literal model input; slash text is not a command. \
+Exit status: 0 answered, 2 refused by policy (the refusal reply is still \
+printed), 1 any other failure (`Error: ...` on stderr). The turn is not saved \
+as a session unless --save, --session or --continue is given; --session or \
+--continue naming no saved session is an error. In Supervised mode tool \
+approvals are asked on the terminal ([y/N/a]); without a terminal only \
+OPENPRX_APPROVAL_OVERRIDE can allow.")]
     Chat {
         /// Controlled H2 root ceilings JSON (aggregate resources, per-root time/concurrency).
         #[arg(long = "h2-controlled-limits", requires = "h2_authority_seconds",
@@ -602,6 +615,18 @@ Examples:
         /// List all saved sessions and exit
         #[arg(long)]
         list_sessions: bool,
+
+        /// Run one turn with this message, print only the reply and exit
+        #[arg(short = 'q', long, conflicts_with_all = ["list_sessions", "h2_limits", "h2_authority_seconds"])]
+        message: Option<String>,
+
+        /// Save the --message turn as a resumable chat session
+        #[arg(long, requires = "message")]
+        save: bool,
+
+        /// Absolute existing working directory for shell, file tools and git.
+        #[arg(long, value_parser = parse_workdir)]
+        workdir: Option<std::path::PathBuf>,
     },
 
     /// Start the gateway server (webhooks, websockets)
@@ -1709,6 +1734,11 @@ fn main() -> std::process::ExitCode {
             if code == openprx::agent::AGENT_REFUSAL_EXIT_CODE {
                 return std::process::ExitCode::from(code);
             }
+            // A refused `prx chat --message` turn already printed its reply.
+            let code = openprx::chat::one_shot_exit_code(Some(&err));
+            if code == openprx::chat::ONE_SHOT_REFUSAL_EXIT_CODE {
+                return std::process::ExitCode::from(code);
+            }
             eprintln!("Error: {err:?}");
             std::process::ExitCode::FAILURE
         }
@@ -1818,7 +1848,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     // Acquire this before Config::load_* and hold it through command dispatch.
     // Fatal startup errors are still returned through anyhow and printed by
     // main after this guard restores stderr; routine tracing stays in chat.log.
-    let _chat_tracing_guard = if matches!(&cli.command, Commands::Chat { .. }) {
+    // `prx chat --message` keeps warn-level tracing on stderr instead.
+    let _chat_tracing_guard = if matches!(&cli.command, Commands::Chat { message: None, .. }) {
         match chat::setup_chat_tracing_to_file() {
             Ok(guard) => Some(guard),
             Err(error) => {
@@ -1867,21 +1898,24 @@ async fn async_main(cli: Cli) -> Result<()> {
         // provider exists.
 
         if let Some(msg) = message {
-            // Non-dispatch direct call (`prx go --message`): no dispatch-level
-            // signal task is wired here, so use the explicitly-named
-            // never-cancelled token. Termination is via the process default.
-            let result = agent::run(
+            // `prx go --message` is the chat one-shot (`prx chat --message`):
+            // chat owns ctrl_c internally, so the token is never cancelled.
+            let result = chat::run_message(
                 config,
-                Some(msg.clone()),
                 None, // provider already set in config
                 None, // model already set in config
                 0.7,
+                chat::ChatMessageRequest {
+                    message: msg.clone(),
+                    save: false,
+                    session: None,
+                },
                 crate::runtime::shutdown::never_cancelled_shutdown(),
             )
             .await;
-            // Keep tmpdir alive until agent finishes, then drop
+            // Keep tmpdir alive until the turn finishes, then drop
             drop(tmpdir);
-            return result.map(|_| ());
+            return result;
         }
 
         // Non-dispatch direct call (`prx go` interactive chat): chat owns ctrl_c
@@ -1950,6 +1984,9 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     if let Commands::Agent {
         workdir: Some(root), ..
+    }
+    | Commands::Chat {
+        workdir: Some(root), ..
     } = &cli.command
     {
         config.runtime.workdir = Some(root.clone());
@@ -1968,7 +2005,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     // chat.log by this point, so for the one interactive entry point the
     // warning went somewhere nobody looks. The process stderr is untouched by
     // that redirect and the TUI has not taken the screen yet.
-    if matches!(&cli.command, Commands::Chat { .. }) {
+    if matches!(&cli.command, Commands::Chat { message: None, .. }) {
         chat::print_embedding_upgrade_notice_to_stderr(&config);
     }
 
@@ -3711,6 +3748,7 @@ mod tests {
             Commands::Init { .. } => "Init",
             Commands::Go { .. } => "Go",
             Commands::Agent { .. } => "Agent",
+            Commands::Chat { message: Some(_), .. } => "ChatMessage",
             Commands::Chat { .. } => "Chat",
             Commands::Gateway { .. } => "Gateway",
             Commands::Daemon { .. } => "Daemon",
@@ -3756,6 +3794,10 @@ mod tests {
             (&["prx", "go"], cli_tracing::CliCommand::Go),
             (&["prx", "agent"], cli_tracing::CliCommand::Agent),
             (&["prx", "chat"], cli_tracing::CliCommand::Chat),
+            (
+                &["prx", "chat", "--message", "hi"],
+                cli_tracing::CliCommand::ChatMessage,
+            ),
             (&["prx", "gateway"], cli_tracing::CliCommand::Gateway),
             (&["prx", "daemon"], cli_tracing::CliCommand::Daemon),
             (&["prx", "service", "status"], cli_tracing::CliCommand::Service),
@@ -3819,6 +3861,7 @@ mod tests {
             "Go",
             "Agent",
             "Chat",
+            "ChatMessage",
             "Gateway",
             "Daemon",
             "Service",
@@ -4083,6 +4126,47 @@ mod tests {
                 assert_eq!(session.as_deref(), Some("abc"));
             }
             other => panic!("expected chat command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_message_parses_short_flag_save_and_workdir() {
+        let root = tempfile::tempdir().expect("test: root");
+        let workdir = root.path().to_str().expect("test: root path");
+        let cli = Cli::try_parse_from([
+            "prx",
+            "chat",
+            "-q",
+            "/compact",
+            "--save",
+            "--workdir",
+            workdir,
+            "-m",
+            "m1",
+        ])
+        .expect("test: chat one-shot flags");
+        match cli.command {
+            Commands::Chat {
+                message,
+                save,
+                workdir: Some(parsed),
+                model,
+                ..
+            } => {
+                assert_eq!(message.as_deref(), Some("/compact"));
+                assert!(save);
+                assert_eq!(model.as_deref(), Some("m1"));
+                assert_eq!(parsed, root.path().canonicalize().expect("test: canonical root"));
+            }
+            other => panic!("expected chat command, got {other:?}"),
+        }
+        for argv in [
+            &["prx", "chat", "--save"][..],
+            &["prx", "chat", "--message", "x", "--list-sessions"],
+            &["prx", "chat", "--workdir", "relative"],
+        ] {
+            let error = Cli::try_parse_from(argv).expect_err("test: invalid one-shot usage");
+            assert_eq!(error.exit_code(), 2, "test: clap usage exit for {argv:?}");
         }
     }
 

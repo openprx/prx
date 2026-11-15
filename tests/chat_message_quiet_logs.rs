@@ -1,16 +1,17 @@
-//! Single-shot `prx agent` keeps stdout as the reply line.
+//! `prx chat --message` keeps stdout as the reply line and tracing on stderr.
 //!
 //! Requires `--features test-mock` so the in-process mock provider can answer
 //! without a network. With `RUST_LOG` unset, the default warn filter must hide
 //! INFO tracing (and INFO tool-audit lines) from both stdout and stderr. With
-//! `RUST_LOG=info`, INFO must appear on stderr and still not on stdout.
+//! `RUST_LOG=info`, INFO must appear on stderr and still not on stdout. The
+//! one-shot never redirects tracing into `chat.log`.
 #![cfg(feature = "test-mock")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const REPLY: &str = "QUIET_AGENT_REPLY_SENTINEL";
+const REPLY: &str = "QUIET_CHAT_MESSAGE_REPLY_SENTINEL";
 
 fn write_mode(path: &std::path::Path, contents: &str) {
     let mut options = std::fs::OpenOptions::new();
@@ -47,7 +48,8 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-fn run_single_shot_agent(rust_log: Option<&str>) -> std::process::Output {
+/// The one-shot's output and whether it left a `chat.log` in its config dir.
+fn run_chat_message(rust_log: Option<&str>) -> (std::process::Output, bool) {
     let home = tempfile::tempdir().expect("home");
     let config_dir = home.path().join("config");
     std::fs::create_dir_all(config_dir.join("workspace")).expect("dirs");
@@ -85,11 +87,12 @@ cache_read = 0.0
     command
         .arg("--config-dir")
         .arg(&config_dir)
-        .arg("agent")
+        .arg("chat")
         .arg("-p")
         .arg("mock")
         .arg("--model")
         .arg("mock")
+        .arg("--message")
         .arg(REPLY)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -105,17 +108,18 @@ cache_read = 0.0
     if let Some(filter) = rust_log {
         command.env("RUST_LOG", filter);
     }
-    command.output().expect("run prx agent")
+    let output = command.output().expect("run prx chat --message");
+    (output, config_dir.join("chat.log").exists())
 }
 
 #[test]
-fn single_shot_agent_stdout_is_exactly_the_reply_and_stderr_has_no_info() {
-    let output = run_single_shot_agent(None);
+fn chat_message_stdout_is_exactly_the_reply_and_stderr_has_no_info() {
+    let (output, chat_log) = run_chat_message(None);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "prx agent failed: stdout={stdout:?} stderr={stderr:?}"
+        "prx chat --message failed: stdout={stdout:?} stderr={stderr:?}"
     );
     assert_eq!(
         stdout.as_ref(),
@@ -131,16 +135,17 @@ fn single_shot_agent_stdout_is_exactly_the_reply_and_stderr_has_no_info() {
         !stderr_plain.to_ascii_lowercase().contains("tool execution audited"),
         "INFO tool-audit lines must not appear at the default level: {stderr_plain:?}"
     );
+    assert!(!chat_log, "the one-shot must not write chat.log");
 }
 
 #[test]
-fn single_shot_agent_rust_log_info_writes_info_to_stderr_not_stdout() {
-    let output = run_single_shot_agent(Some("info"));
+fn chat_message_rust_log_info_writes_info_to_stderr_not_stdout() {
+    let (output, chat_log) = run_chat_message(Some("info"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "prx agent failed: stdout={stdout:?} stderr={stderr:?}"
+        "prx chat --message failed: stdout={stdout:?} stderr={stderr:?}"
     );
     assert_eq!(
         stdout.as_ref(),
@@ -152,4 +157,5 @@ fn single_shot_agent_rust_log_info_writes_info_to_stderr_not_stdout() {
         stderr_plain.contains("INFO"),
         "RUST_LOG=info must write INFO tracing to stderr: {stderr_plain:?}"
     );
+    assert!(!chat_log, "the one-shot must not write chat.log");
 }

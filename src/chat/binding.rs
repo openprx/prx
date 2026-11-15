@@ -516,6 +516,36 @@ pub struct ChatTurnBinding {
     envelope: RuntimeEnvelope,
     routing_input: Arc<str>,
     has_conversation_history: bool,
+    /// Why the turn's driver ended without an answer; the first note wins.
+    failure: std::sync::OnceLock<TurnFailureNote>,
+}
+
+/// How a chat turn ended without an answer, as its driver saw it. The
+/// one-shot entry reads it to pick its exit status and error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnFailureNote {
+    /// A policy refusal at send admission; `reply` is the user-facing text.
+    Refused { reply: String },
+    /// Any other failure; `message` is the error chain's top-level text.
+    Failed { message: String },
+}
+
+impl TurnFailureNote {
+    /// Classify a failed turn: a `ProviderSendRefused` anywhere in the chain
+    /// is a refusal, everything else a failure.
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<crate::agent::send_admission::ProviderSendRefused>())
+            .map_or_else(
+                || Self::Failed {
+                    message: error.to_string(),
+                },
+                |refused| Self::Refused {
+                    reply: refused.reply().into_owned(),
+                },
+            )
+    }
 }
 
 #[cfg(not(feature = "terminal-tui"))]
@@ -540,6 +570,19 @@ impl std::fmt::Debug for ChatTurnBinding {
 }
 
 impl ChatTurnBinding {
+    /// Record why the turn ended without an answer. Only the first note is
+    /// kept: the driver's own classification is the authoritative one.
+    pub(crate) fn note_failure(&self, note: TurnFailureNote) {
+        if self.failure.set(note).is_err() {
+            tracing::debug!("chat turn failure already noted; keeping the first note");
+        }
+    }
+
+    /// The driver's note, when the turn ended without an answer.
+    pub(crate) fn failure_note(&self) -> Option<&TurnFailureNote> {
+        self.failure.get()
+    }
+
     fn install_terminal(
         &self,
         ticket: crate::runtime::turn_cleanup::CleanupTicket,
@@ -897,6 +940,7 @@ impl ChatSourceReceipt {
             envelope: self.envelope.clone(),
             routing_input: Arc::clone(&self.routing_input),
             has_conversation_history,
+            failure: std::sync::OnceLock::new(),
         }))
     }
     /// Disabled mode can bind local input without claiming it was persisted.

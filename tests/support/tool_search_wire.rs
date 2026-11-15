@@ -209,9 +209,10 @@ async fn next_message(state: &ProbeState, request: &Value) -> Result<Value> {
                 names(request).contains(&"capability_search"),
                 "parent has no discovery control"
             );
+            // CF-R6: chat publishes sessions_spawn directly on its first request.
             ensure!(
-                !names(request).contains(&"sessions_spawn"),
-                "chat spawn must initially be deferred"
+                names(request).contains(&"sessions_spawn"),
+                "chat spawn must be published directly"
             );
             return Ok(tool_call(
                 "capability_search",
