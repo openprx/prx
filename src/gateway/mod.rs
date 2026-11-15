@@ -2706,8 +2706,10 @@ async fn run_gateway_chat_with_multimodal(
             return Err(error);
         }
     };
-    let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
+    // Bind before the handoff: a refusal here still has the admission guard
+    // to record the failed input and answer the job monitor.
     let terminal_binding = service.terminal_binding(&context)?;
+    let (cleanup_ticket, admission_acknowledgement) = admission_guard.into_terminal_parts()?;
     let terminal_guard = turn_source::publication_slot::GatewayTerminalGuard::new(
         cleanup_ticket,
         Arc::clone(service),

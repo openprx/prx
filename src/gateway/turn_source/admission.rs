@@ -21,7 +21,7 @@ pub(in crate::gateway) struct GatewayPendingInput {
 
 impl GatewayPendingInput {
     pub(in crate::gateway) async fn record(
-        mut self,
+        self,
         input: String,
         idempotency_key: Option<String>,
     ) -> anyhow::Result<(
@@ -29,31 +29,39 @@ impl GatewayPendingInput {
         Option<crate::memory::MessageEvent>,
         GatewayAdmissionGuard,
     )> {
-        self.fabric = self
-            .fabric
-            .with_ingress_recovery(&self.generation.effective, &self.ticket)
-            .await?;
-        let run_id = self
-            .envelope
-            .run_id
-            .as_deref()
-            .context("gateway input run is missing")?;
+        let Self {
+            generation,
+            fabric,
+            envelope,
+            ticket,
+            acknowledgement,
+        } = self;
+        // The job monitor already holds this owner's acknowledgement. A
+        // refusal before the input write must answer it, never drop it.
+        let fabric = match fabric.with_ingress_recovery(&generation.effective, &ticket).await {
+            Ok(fabric) => fabric,
+            Err(error) => return Err(refuse_before_input(ticket, acknowledgement, error)),
+        };
+        let Some(run_id) = envelope.run_id.as_deref() else {
+            let error = anyhow::anyhow!("gateway input run is missing");
+            return Err(refuse_before_input(ticket, acknowledgement, error));
+        };
         let idempotency_key = idempotency_key.unwrap_or_else(|| format!("gateway:{run_id}:input"));
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut guard = GatewayAdmissionGuard {
                 receipt: None,
-                generation: self.generation,
-                fabric: self.fabric,
-                ticket: Some(self.ticket),
-                acknowledgement: self.acknowledgement,
+                generation,
+                fabric,
+                ticket: Some(ticket),
+                acknowledgement,
                 pending: None,
             };
             let operation = async {
                 let recorded = guard
                     .fabric
                     .record_inbound_user_message_best_effort(
-                        self.envelope.message_scope(),
+                        envelope.message_scope(),
                         input.clone(),
                         Some(idempotency_key.clone()),
                         "gateway",
@@ -68,7 +76,7 @@ impl GatewayPendingInput {
                 let receipt = GatewaySourceReceipt::issue_for_turn(
                     guard.fabric.memory().as_ref(),
                     &guard.generation,
-                    &self.envelope,
+                    &envelope,
                     &input,
                     recorded.as_ref(),
                 )
@@ -105,8 +113,8 @@ impl GatewayPendingInput {
                         let memory = guard.fabric.memory();
                         let event = memory
                             .find_owned_message_event_by_idempotency_key(
-                                &self.envelope.workspace_id,
-                                &self.envelope.resolved_owner_id(),
+                                &envelope.workspace_id,
+                                &envelope.resolved_owner_id(),
                                 &idempotency_key,
                             )
                             .await?
@@ -118,7 +126,7 @@ impl GatewayPendingInput {
                         GatewaySourceReceipt::issue_for_turn(
                             memory.as_ref(),
                             &guard.generation,
-                            &self.envelope,
+                            &envelope,
                             &input,
                             Some(&event),
                         )
@@ -147,6 +155,23 @@ impl GatewayPendingInput {
         });
         receiver.await.context("gateway input owner ended without a receipt")?
     }
+}
+
+/// Settle an owner refused before its input write was started. Ingress
+/// preparation confirms its own store operations through separate tickets, so
+/// this owner has no unconfirmed write: its ticket and acknowledgement both
+/// report a confirmed (empty) cleanup and the caller surfaces `error` itself.
+fn refuse_before_input(
+    ticket: CleanupTicket,
+    acknowledgement: Option<Acknowledgement>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    ticket.finish(true);
+    if let Some(acknowledgement) = acknowledgement {
+        // A closed receiver means the job monitor already ended; nothing waits.
+        let _ = acknowledgement.send(Ok(()));
+    }
+    error
 }
 
 pub(in crate::gateway) struct GatewayAdmissionGuard {
@@ -243,6 +268,14 @@ impl GatewayAdmissionGuard {
 impl Drop for GatewayAdmissionGuard {
     fn drop(&mut self) {
         let Some(receipt) = self.receipt.take() else {
+            // Only an owner unwound before its receipt was issued still holds
+            // an acknowledgement here; its input write may have committed.
+            if let Some(acknowledgement) = self.acknowledgement.take() {
+                let _ = acknowledgement.send(Err("gateway input owner ended before its receipt".to_owned()));
+            }
+            if let Some(ticket) = self.ticket.take() {
+                ticket.finish(false);
+            }
             return;
         };
         let ticket = self.ticket.take();

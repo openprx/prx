@@ -328,7 +328,18 @@ impl TurnTerminalGuard {
         envelope: crate::runtime::envelope::RuntimeEnvelope,
         cleanup_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> anyhow::Result<Self> {
-        let binding = service.terminal_binding(&context)?;
+        let binding = match service.terminal_binding(&context) {
+            Ok(binding) => binding,
+            Err(error) => {
+                // The handed-over ticket ends unconfirmed; its acknowledgement
+                // must say so rather than vanish with this refused guard.
+                cleanup_ticket.finish(false);
+                if let Some(ack) = cleanup_ack {
+                    let _ = ack.send(Err("terminal owner could not bind its decision".to_owned()));
+                }
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             child_cleanup: None,
             cleanup_ticket: Some(cleanup_ticket),

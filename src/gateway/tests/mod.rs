@@ -47,6 +47,7 @@ mod selection_adoption;
 mod tool_surface;
 mod webhook_auth;
 mod webhook_budget;
+mod webhook_cleanup_ack;
 mod webhook_turns;
 mod whatsapp_signature;
 

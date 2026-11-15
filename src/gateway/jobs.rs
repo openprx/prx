@@ -78,6 +78,24 @@ async fn wait_terminal_cleanups(
         .map_err(|_| "terminal cleanup remains unconfirmed after the drain deadline".to_owned())?
 }
 
+/// An unconfirmed cleanup fails the job, but a work failure that preceded it
+/// stays in the message: the cleanup state never replaces the cause.
+fn unconfirmed_terminal_message(terminal: &Terminal, cleanup: &str) -> String {
+    let cause = match terminal {
+        Terminal::Failed(message) => Some(message.as_str()),
+        Terminal::Succeeded(output) if !output.status.is_success() => output
+            .body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .or(Some("the work returned a failure status")),
+        Terminal::Succeeded(_) | Terminal::Cancelled => None,
+    };
+    cause.map_or_else(
+        || format!("Gateway terminal persistence is unconfirmed: {cleanup}"),
+        |cause| format!("{cause}; Gateway terminal persistence is unconfirmed: {cleanup}"),
+    )
+}
+
 use uuid::Uuid;
 
 /// How long a finished job's result stays queryable. A client that submits in
@@ -431,7 +449,7 @@ where
         };
         let terminal = match wait_terminal_cleanups(&terminal_cleanups).await {
             Ok(()) => terminal,
-            Err(error) => Terminal::Failed(format!("Gateway terminal persistence is unconfirmed: {error}")),
+            Err(error) => Terminal::Failed(unconfirmed_terminal_message(&terminal, &error)),
         };
         JOBS.finish(id, terminal);
     });
