@@ -19,15 +19,13 @@ mod plain_chat;
 use std::time::{Duration, Instant};
 
 use compaction_script::{
-    PLANT, READ_DONE, RECALL, RECALLED, assistant_reply_count, carries_handoff_and_lookup, read_line,
-    switch_event_counts, write_filler_files,
+    PLANT, READ_DONE, RECALL, RECALLED, SMALL_WINDOW_TOKENS, assistant_reply_count, carries_handoff_and_lookup,
+    read_line, switch_event_counts, write_filler_files,
 };
 use loopback_openai::{LoopbackOpenAi, write_config};
 use plain_chat::{Output, Running, Sandbox};
 
 const MODEL: &str = "prx-loop-model";
-/// The small window of the automatic case.
-const SMALL_WINDOW_TOKENS: usize = 4_000;
 /// A window the manual case never crosses.
 const LARGE_WINDOW_TOKENS: usize = 200_000;
 /// Response reserve in both cases.

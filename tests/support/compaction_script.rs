@@ -32,6 +32,18 @@ pub const LOOKUP_TOOL: &str = "transcript_history_lookup";
 /// Markers around the handoff note.
 pub const HANDOFF_START: &str = "[context_handoff]";
 pub const HANDOFF_END: &str = "[/context_handoff]";
+/// The small window of the automatic switch case, in tokens.
+///
+/// Sized from the measured `llm.request.context.compiled` estimates
+/// (cl100k proxy) so the history has the room it had before the chat surface
+/// published the four direct sessions tools (CF-R6): without them the tool
+/// reserve is 540 native + 116 section + 4 framing = 660 tokens, with them
+/// 2,212 + 132 + 4 = 2,348 (+1,688). A 4,000 window then left
+/// 4,000 - 256 - 2,348 = 1,396 tokens, 531 of them the system prompt, too
+/// little for the handoff plus one tool-heavy turn, so every switch ended in a
+/// lossy trim. 5,700 restores the old history room:
+/// 5,700 - 256 - 2,348 = 3,096 (was 4,000 - 256 - 660 = 3,084).
+pub const SMALL_WINDOW_TOKENS: usize = 5_700;
 /// Bytes of each tool-heavy fixture file (about 500 tokens of prose).
 pub const FILLER_BYTES: usize = 2_000;
 

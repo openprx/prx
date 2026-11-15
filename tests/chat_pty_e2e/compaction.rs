@@ -16,14 +16,12 @@ use super::{
     spawn_chat_command, wait_for_exit,
 };
 use crate::compaction_script::{
-    PLANT, RECALL, RECALLED, assistant_reply_count, carries_handoff_and_lookup, chat_session_id, read_done, read_line,
-    switch_event_counts, write_filler_files,
+    PLANT, RECALL, RECALLED, SMALL_WINDOW_TOKENS, assistant_reply_count, carries_handoff_and_lookup, chat_session_id,
+    read_done, read_line, switch_event_counts, write_filler_files,
 };
 use crate::loopback_openai::LoopbackOpenAi;
 
 const MODEL: &str = "prx-loop-model";
-/// The small window of the automatic case.
-const SMALL_WINDOW_TOKENS: usize = 4_000;
 /// A window the manual case never crosses.
 const LARGE_WINDOW_TOKENS: usize = 200_000;
 /// Response reserve in both cases.
