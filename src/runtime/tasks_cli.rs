@@ -312,23 +312,29 @@ async fn decode<T: serde::de::DeserializeOwned>(
         .await
         .with_context(|| format!("failed to read {what} response body"))?;
     if !status.is_success() {
-        let (code, detail) = refusal_fields(&body);
-        let detail = detail.unwrap_or(body);
-        let message = if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            auth_hint(endpoint, status, what, &detail)
-        } else {
-            format!("{what} failed with HTTP {status}: {detail}")
-        };
-        return Err(anyhow::Error::new(ControlApiRefusal {
-            status: status.as_u16(),
-            code,
-            message,
-        }));
+        return Err(refusal(endpoint, status, what, &body));
     }
     serde_json::from_str::<T>(&body).with_context(|| format!("failed to parse {what} response"))
+}
+
+/// The typed error a non-2xx answer becomes; 401/403 carry the operator
+/// auth hint.
+fn refusal(endpoint: &TasksEndpoint, status: reqwest::StatusCode, what: &str, body: &str) -> anyhow::Error {
+    let (code, detail) = refusal_fields(body);
+    let detail = detail.unwrap_or_else(|| body.to_string());
+    let message = if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        auth_hint(endpoint, status, what, &detail)
+    } else {
+        format!("{what} failed with HTTP {status}: {detail}")
+    };
+    anyhow::Error::new(ControlApiRefusal {
+        status: status.as_u16(),
+        code,
+        message,
+    })
 }
 
 /// Turn a rejected credential into something the operator can act on.
@@ -373,6 +379,70 @@ fn unreachable_hint(endpoint: &TasksEndpoint, error: &reqwest::Error) -> anyhow:
          inspect.",
         endpoint.shown_url()
     )
+}
+
+/// Bounds of a short daemon read that falls back when the daemon is absent
+/// (`prx decision-engine status`, CF-R11).
+const SHORT_READ_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const SHORT_READ_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+const SHORT_READ_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// The result of a short daemon read.
+#[derive(Debug)]
+pub enum DaemonRead<T> {
+    /// The daemon answered 2xx with this body.
+    Answered(T),
+    /// No daemon answered (connection refused or timed out); the reason
+    /// with any URL userinfo redacted.
+    Unreachable(String),
+}
+
+/// `GET path` on the daemon with connect 2 s, total 5 s and a 64 KiB body
+/// cap. An unreachable daemon is [`DaemonRead::Unreachable`], not an error.
+///
+/// # Errors
+///
+/// A 401/403 (with the operator auth hint), any other non-2xx, an oversize
+/// body, or a body that is not `T`.
+pub async fn fetch_short<T: serde::de::DeserializeOwned>(
+    endpoint: &TasksEndpoint,
+    path: &str,
+    what: &str,
+) -> Result<DaemonRead<T>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(SHORT_READ_CONNECT_TIMEOUT)
+        .timeout(SHORT_READ_TOTAL_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client for the runtime control API")?;
+    let unreachable = |error: &reqwest::Error| {
+        DaemonRead::Unreachable(crate::providers::redact_endpoint_userinfo(&error.to_string()).into_owned())
+    };
+    let mut response = match endpoint.request(&client, reqwest::Method::GET, path).send().await {
+        Ok(response) => response,
+        Err(error) if error.is_connect() || error.is_timeout() => return Ok(unreachable(&error)),
+        Err(error) => return Err(unreachable_hint(endpoint, &error)),
+    };
+    let status = response.status();
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > SHORT_READ_MAX_BODY_BYTES {
+                    anyhow::bail!("{what} response exceeds {SHORT_READ_MAX_BODY_BYTES} bytes");
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) if error.is_timeout() => return Ok(unreachable(&error)),
+            Err(error) => return Err(error).with_context(|| format!("failed to read {what} response body")),
+        }
+    }
+    let body = String::from_utf8_lossy(&body);
+    if !status.is_success() {
+        return Err(refusal(endpoint, status, what, &body));
+    }
+    let value = serde_json::from_str::<T>(&body).with_context(|| format!("failed to parse {what} response"))?;
+    Ok(DaemonRead::Answered(value))
 }
 
 /// Fetch the current work listing.

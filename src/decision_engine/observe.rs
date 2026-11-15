@@ -16,6 +16,19 @@ pub trait TelemetryWriter: Send + 'static {
 pub struct ObserveCounters {
     pub dropped: AtomicU64,
     pub store_errors: AtomicU64,
+    /// Analysis records this worker durably stored (CF-R11); never persisted.
+    pub analyses: AtomicU64,
+}
+
+/// Persist one accepted record and count the result.
+fn persist(writer: &mut dyn TelemetryWriter, record: TelemetryRecord, cap: usize, counters: &ObserveCounters) {
+    let analysis = matches!(record, TelemetryRecord::Analysis(_));
+    if writer.append_fifo(record, cap).is_err() {
+        counters.store_errors.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("decision engine telemetry write failed");
+    } else if analysis {
+        counters.analyses.fetch_add(1, Ordering::Relaxed);
+    }
 }
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveStartError {
@@ -80,16 +93,10 @@ impl ObserveQueue {
                     let Some(record) = record else {
                         break;
                     };
-                    if writer.append_fifo(record, cap).is_err() {
-                        worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("decision engine telemetry write failed");
-                    }
+                    persist(writer.as_mut(), record, cap, &worker_counters);
                 }
                 while let Some(record) = receiver.blocking_recv() {
-                    if writer.append_fifo(record, cap).is_err() {
-                        worker_counters.store_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("decision engine telemetry write failed");
-                    }
+                    persist(writer.as_mut(), record, cap, &worker_counters);
                 }
                 let _ = finished.send(());
             })?;

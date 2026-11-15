@@ -138,12 +138,20 @@ fn stdout_json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("test: json output")
 }
 
-/// P2-R8: `prx decision-engine status` reports the default-off engine.
+/// P2-R8: `prx decision-engine status` reports the default-off engine; with
+/// no daemon on the configured gateway port it shows the process-local
+/// snapshot (CF-R11).
 #[test]
 fn decision_engine_status_reports_disabled_by_default() {
     let temp = TempDir::new().expect("test: temp");
-    let dir = config_dir(&temp, &[]);
+    // A port nothing listens on: bind, read the port, release it.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| i64::from(address.port()))
+        .expect("test: free loopback port");
+    let dir = config_dir(&temp, &[(&["gateway", "port"], toml::Value::Integer(port))]);
     let status = stdout_json(&prx_in(&dir, &["decision-engine", "status", "--json"]));
+    assert_eq!(status["source"], "process-local", "{status}");
     assert_eq!(status["enabled"], false, "{status}");
     assert_eq!(status["mode"], "off", "{status}");
     assert_eq!(status["telemetry_cap"], 0, "{status}");

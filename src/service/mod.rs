@@ -321,22 +321,13 @@ async fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 pub async fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
     if cfg!(target_os = "macos") {
         let unit = macos_service_file()?;
-        let output = run_capture_status(Command::new("launchctl").arg("list")).await?;
-        if !output.success {
-            bail!("launchctl list failed: {}", output.detail());
-        }
-        let running = output.stdout.lines().any(|line| line.contains(SERVICE_LABEL));
+        let output = run_capture_status(Command::new("launchctl").arg("list").arg(SERVICE_LABEL)).await?;
+        let (state, detail) = classify_launchd_status(&output, unit.is_file());
         return Ok(ServiceStatus {
-            state: if running {
-                ServiceState::Running
-            } else if unit.is_file() {
-                ServiceState::Stopped
-            } else {
-                ServiceState::NotInstalled
-            },
+            state,
             manager: "launchd",
             unit,
-            detail: output.detail(),
+            detail,
         });
     }
 
@@ -365,6 +356,67 @@ pub async fn query_status(config: &Config, init_system: InitSystem) -> Result<Se
     }
 
     anyhow::bail!("Service management is supported on macOS and Linux only")
+}
+
+/// Fields of `launchctl list <label>` that `prx service status` reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LaunchdJob {
+    pid: Option<u32>,
+    last_exit_status: Option<i64>,
+}
+
+/// Parse the property-list style output of `launchctl list <label>`
+/// (`"PID" = 123;`, `"LastExitStatus" = 0;`). Unknown keys are ignored.
+fn parse_launchctl_job(stdout: &str) -> LaunchdJob {
+    let mut job = LaunchdJob::default();
+    for line in stdout.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        let value = value.trim().trim_end_matches(';').trim();
+        match key {
+            "PID" => job.pid = value.parse().ok(),
+            "LastExitStatus" => job.last_exit_status = value.parse().ok(),
+            _ => {}
+        }
+    }
+    job
+}
+
+/// Map `launchctl list <label>` to a service state and a short detail naming
+/// only the PRX job's state, PID and last exit status.
+fn classify_launchd_status(output: &CapturedCommand, unit_exists: bool) -> (ServiceState, String) {
+    if !output.success {
+        let not_found = output.stderr.contains("Could not find service") || output.exit_code == Some(113);
+        if not_found {
+            let state = if unit_exists {
+                ServiceState::Stopped
+            } else {
+                ServiceState::NotInstalled
+            };
+            return (state, format!("{SERVICE_LABEL} is not loaded"));
+        }
+        let reason = output.stderr.lines().next().unwrap_or_default().trim();
+        let code = output
+            .exit_code
+            .map_or_else(|| "signal".to_string(), |code| code.to_string());
+        return (ServiceState::Unknown, format!("launchctl exit={code}: {reason}"));
+    }
+    let job = parse_launchctl_job(&output.stdout);
+    let last_exit = job
+        .last_exit_status
+        .map_or_else(|| "none".to_string(), |status| status.to_string());
+    match job.pid {
+        Some(pid) => (
+            ServiceState::Running,
+            format!("pid={pid}; last exit status={last_exit}"),
+        ),
+        None => (
+            ServiceState::Stopped,
+            format!("not running; last exit status={last_exit}"),
+        ),
+    }
 }
 
 async fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
@@ -1405,6 +1457,46 @@ mod tests {
             ..stopped
         };
         assert!(running.ensure_running().is_ok());
+    }
+
+    fn captured(success: bool, exit_code: i32, stdout: &str, stderr: &str) -> CapturedCommand {
+        CapturedCommand {
+            success,
+            exit_code: Some(exit_code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    const LAUNCHCTL_RUNNING: &str = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \"com.prx.daemon\";\n\t\"OnDemand\" = false;\n\t\"LastExitStatus\" = 0;\n\t\"PID\" = 4242;\n\t\"Program\" = \"/usr/local/bin/prx\";\n};\n";
+    const LAUNCHCTL_EXITED: &str = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \"com.prx.daemon\";\n\t\"OnDemand\" = false;\n\t\"LastExitStatus\" = 19968;\n\t\"Program\" = \"/usr/local/bin/prx\";\n};\n";
+    const LAUNCHCTL_NOT_FOUND: &str = "Could not find service \"com.prx.daemon\" in domain for port\n";
+
+    #[test]
+    fn launchd_running_job_reports_pid_and_last_exit() {
+        let (state, detail) = classify_launchd_status(&captured(true, 0, LAUNCHCTL_RUNNING, ""), true);
+        assert_eq!(state, ServiceState::Running);
+        assert_eq!(detail, "pid=4242; last exit status=0");
+    }
+
+    #[test]
+    fn launchd_exited_job_is_stopped_with_last_exit() {
+        let (state, detail) = classify_launchd_status(&captured(true, 0, LAUNCHCTL_EXITED, ""), true);
+        assert_eq!(state, ServiceState::Stopped);
+        assert_eq!(detail, "not running; last exit status=19968");
+    }
+
+    #[test]
+    fn launchd_missing_job_maps_to_stopped_or_not_installed() {
+        let missing = captured(false, 113, "", LAUNCHCTL_NOT_FOUND);
+        assert_eq!(
+            classify_launchd_status(&missing, true),
+            (ServiceState::Stopped, "com.prx.daemon is not loaded".to_string())
+        );
+        assert_eq!(
+            classify_launchd_status(&missing, false),
+            (ServiceState::NotInstalled, "com.prx.daemon is not loaded".to_string())
+        );
     }
 
     #[test]

@@ -210,6 +210,49 @@ fn analysis(id: &str) -> IntentAnalysis {
     }
 }
 
+/// CF-R11: the worker counts each analysis it durably stored; outcomes and
+/// failed writes do not count.
+#[tokio::test]
+async fn observe_counts_stored_analyses_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(observe::TELEMETRY_FILE);
+    let (queue, worker) = ObserveQueue::start(4, 10, CancellationToken::new(), || {
+        Ok(Box::new(SqliteTelemetryWriter::open(&path)?))
+    })
+    .unwrap();
+    let counters = std::sync::Arc::clone(&queue.counters);
+    for id in ["a1", "a2"] {
+        let record = AnalysisRecord::new(&analysis(id), format!("brief {id}"), 7, 5).unwrap();
+        assert_eq!(
+            queue.record(TelemetryRecord::Analysis(record)),
+            ObserveAdmission::Accepted
+        );
+    }
+    assert_eq!(queue.observe(outcome("o1")), ObserveAdmission::Accepted);
+    drop(queue);
+    worker.unwrap().await.unwrap();
+    assert_eq!(counters.analyses.load(Ordering::Relaxed), 2);
+    assert_eq!(counters.store_errors.load(Ordering::Relaxed), 0);
+
+    struct FailingWriter;
+    impl TelemetryWriter for FailingWriter {
+        fn append_fifo(&mut self, _: TelemetryRecord, _: usize) -> anyhow::Result<()> {
+            anyhow::bail!("test store failure")
+        }
+    }
+    let (queue, worker) = ObserveQueue::start(1, 1, CancellationToken::new(), || Ok(Box::new(FailingWriter))).unwrap();
+    let counters = std::sync::Arc::clone(&queue.counters);
+    let record = AnalysisRecord::new(&analysis("f"), "brief f".into(), 7, 5).unwrap();
+    assert_eq!(
+        queue.record(TelemetryRecord::Analysis(record)),
+        ObserveAdmission::Accepted
+    );
+    drop(queue);
+    worker.unwrap().await.unwrap();
+    assert_eq!(counters.analyses.load(Ordering::Relaxed), 0);
+    assert_eq!(counters.store_errors.load(Ordering::Relaxed), 1);
+}
+
 /// P2-R10: the fresh store holds exactly `engine_analyses` and
 /// `engine_outcomes`, each FIFO-capped; a zero cap opens no file; an old
 /// `user_version` is recreated; CHECK refuses oversize values; no user text.

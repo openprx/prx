@@ -35,6 +35,8 @@ pub(crate) struct DecisionEngineStatus {
     pub queue_depth: usize,
     pub dropped: u64,
     pub store_errors: u64,
+    /// Analysis records the observe worker durably stored since it started.
+    pub analyses: u64,
 }
 
 /// The telemetry cap the engine actually applies: `pre` mode records no
@@ -66,6 +68,7 @@ pub(crate) fn snapshot(config: &Config) -> DecisionEngineStatus {
         queue_depth: 0,
         dropped: 0,
         store_errors: 0,
+        analyses: 0,
     };
     let mut queues = QUEUES.lock();
     queues.retain(|entry| entry.counters.strong_count() > 0);
@@ -75,6 +78,7 @@ pub(crate) fn snapshot(config: &Config) -> DecisionEngineStatus {
             row.store_errors = row
                 .store_errors
                 .saturating_add(counters.store_errors.load(Ordering::Relaxed));
+            row.analyses = row.analyses.saturating_add(counters.analyses.load(Ordering::Relaxed));
         }
         if let Some(sender) = entry.sender.upgrade() {
             row.queue_depth = row

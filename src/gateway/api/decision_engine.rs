@@ -97,17 +97,6 @@ pub(super) async fn get_backends(State(state): State<AppState>) -> Response {
     Json(crate::decision_engine_cli::backend_rows(&config)).into_response()
 }
 
-/// One analysis as the API shows it.
-#[derive(Debug, Serialize)]
-struct AnalysisView {
-    decision_id: String,
-    created_at_ms: i64,
-    brief_redacted: String,
-    brief_sha256: String,
-    global: Value,
-    candidates: Value,
-}
-
 /// One outcome as the API shows it.
 #[derive(Debug, Serialize)]
 struct OutcomeView {
@@ -154,23 +143,7 @@ pub(super) async fn get_analyses(State(state): State<AppState>, RawQuery(query):
         Ok(rows) => rows,
         Err(response) => return *response,
     };
-    let views: Vec<AnalysisView> = rows
-        .into_iter()
-        .map(|row| {
-            // The store wrote `values_json` itself under its CHECK bound; a
-            // row that does not parse shows empty values rather than failing
-            // the whole read.
-            let values: Value = serde_json::from_str(row.values_json()).unwrap_or(Value::Null);
-            AnalysisView {
-                decision_id: row.decision_id().to_string(),
-                created_at_ms: row.created_at_ms(),
-                brief_redacted: row.brief_redacted().to_string(),
-                brief_sha256: row.brief_sha256().to_string(),
-                global: values.get("global").cloned().unwrap_or_else(|| json!({})),
-                candidates: values.get("candidates").cloned().unwrap_or_else(|| json!([])),
-            }
-        })
-        .collect();
+    let views: Vec<crate::decision_engine_cli::AnalysisView> = rows.into_iter().map(Into::into).collect();
     Json(views).into_response()
 }
 
@@ -367,7 +340,7 @@ pub(super) async fn put_credential(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::super::test_support::{json, serve_config};
+    use super::super::test_support::{json, serve_config, serve_config_with_console};
     use super::*;
     use crate::decision_engine::observe::TelemetryWriter as _;
     use crate::decision_engine::{AnalysisRecord, IntentAnalysis, IntentValue, TelemetryRecord};
@@ -401,6 +374,27 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// CF-R10: with the console merged as in production, an unmatched
+    /// `/api/*` path answers 404 JSON while other paths still get the
+    /// console; the retired causal routes keep their 410.
+    #[tokio::test]
+    async fn unmatched_api_path_is_json_not_found() {
+        let served = serve_config_with_console(|_| {}).await;
+        let (status, body) = served.call(Method::GET, "/api/causal/tree", None).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(json(&body), json!({"error": "not_found"}));
+
+        let (status, body) = served.call_anonymous(Method::GET, "/some/page", None).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("<html") || body.contains("<!doctype html") || body.contains("<!DOCTYPE html"),
+            "{body}"
+        );
+
+        let (status, _) = served.call(Method::GET, "/api/causal/status", None).await;
+        assert_eq!(status, 410);
     }
 
     /// Analyses are bounded by `limit` and hold only the redacted brief and

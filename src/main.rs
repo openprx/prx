@@ -1922,6 +1922,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             | Commands::Causal { .. }
             | Commands::DecisionEngine {
                 command: openprx::decision_engine_cli::DecisionEngineCommands::Status
+                    | openprx::decision_engine_cli::DecisionEngineCommands::Analyses { .. }
                     | openprx::decision_engine_cli::DecisionEngineCommands::Backends,
                 ..
             }

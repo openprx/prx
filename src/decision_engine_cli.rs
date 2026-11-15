@@ -1,5 +1,7 @@
 //! `prx decision-engine`: the advisory engine's commands (P2-R8; strip
-//! R43). `status` prints [`DecisionEngineStatus`], `backends` the effective
+//! R43). `status` prints [`DecisionEngineStatus`] as the running daemon reports
+//! it (process-local when no daemon answers), `analyses` the stored analyses,
+//! `backends` the effective
 //! engine backend plus the builtin, and `config set <key> <value>` changes one
 //! allowlisted `[decision_engine]` key through the management service
 //! (`config::manage::mutation::decision_engine`). No command takes or prints
@@ -13,7 +15,7 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::config::manage::mutation::decision_engine::CausalMutation;
@@ -27,8 +29,14 @@ pub const CAUSAL_DEPRECATION: &str =
 #[derive(Debug, Clone, Subcommand)]
 pub enum DecisionEngineCommands {
     /// Show whether the engine is enabled, its mode, backend and telemetry
-    /// counters
+    /// counters, as the running daemon reports them
     Status,
+    /// List the newest analyses in the telemetry store
+    Analyses {
+        /// How many analyses to show (1 to 100)
+        #[arg(long, default_value_t = DEFAULT_ANALYSES_LIMIT, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Show the effective engine backend and the builtin
     Backends,
     /// Change one allowlisted `[decision_engine]` key; the plan is shown and
@@ -127,8 +135,167 @@ pub fn backend_rows(config: &Config) -> Vec<BackendRow> {
     vec![configured, builtin]
 }
 
-/// Run a read-only `prx decision-engine` command over `config`, writing to
-/// `out`.
+/// The default `prx decision-engine analyses --limit` (as the API).
+pub const DEFAULT_ANALYSES_LIMIT: u16 = 20;
+
+/// Where a `prx decision-engine status` row came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatusSource {
+    /// `GET /api/decision-engine/status` of the running daemon.
+    Daemon,
+    /// This process's own (empty) counters: no daemon answered.
+    #[default]
+    ProcessLocal,
+}
+
+/// `prx decision-engine status` as printed: the engine status fields plus
+/// their source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusView {
+    pub enabled: bool,
+    pub mode: String,
+    pub backend_kind: String,
+    pub telemetry_cap: u32,
+    pub queue_depth: usize,
+    pub dropped: u64,
+    pub store_errors: u64,
+    pub analyses: u64,
+    /// Never sent by the daemon; set by the reader.
+    #[serde(skip_deserializing)]
+    pub source: StatusSource,
+}
+
+impl From<crate::decision_engine::status::DecisionEngineStatus> for StatusView {
+    fn from(status: crate::decision_engine::status::DecisionEngineStatus) -> Self {
+        Self {
+            enabled: status.enabled,
+            mode: status.mode.to_string(),
+            backend_kind: status.backend_kind.to_string(),
+            telemetry_cap: status.telemetry_cap,
+            queue_depth: status.queue_depth,
+            dropped: status.dropped,
+            store_errors: status.store_errors,
+            analyses: status.analyses,
+            source: StatusSource::ProcessLocal,
+        }
+    }
+}
+
+/// The engine status from the running daemon (endpoint and operator token as
+/// `prx tasks` and chat resolve them); when no daemon answers, this process's
+/// snapshot plus the stderr note saying so.
+///
+/// # Errors
+///
+/// The daemon refused the credential (401/403), answered another non-2xx, or
+/// sent a body that is not a status.
+pub async fn status_report(config: &Config) -> Result<(StatusView, Option<String>)> {
+    use crate::runtime::tasks_cli::{DaemonRead, fetch_short};
+    let endpoint = crate::chat::sessions::daemon::endpoint(config);
+    match fetch_short::<StatusView>(&endpoint, "/api/decision-engine/status", "decision engine status").await? {
+        DaemonRead::Answered(mut view) => {
+            view.source = StatusSource::Daemon;
+            Ok((view, None))
+        }
+        DaemonRead::Unreachable(reason) => {
+            let note = format!(
+                "daemon unreachable at {}: {reason}; showing process-local counters",
+                endpoint.shown_url()
+            );
+            Ok((crate::decision_engine::status::snapshot(config).into(), Some(note)))
+        }
+    }
+}
+
+/// Print `prx decision-engine status`: the row on `out`, the fallback note
+/// (if any) on `err`.
+///
+/// # Errors
+///
+/// As [`status_report`], or when the output cannot be written.
+pub async fn run_status(config: &Config, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+    let (status, note) = status_report(config).await?;
+    if let Some(note) = note {
+        writeln!(err, "{note}")?;
+    }
+    if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
+    } else {
+        writeln!(
+            out,
+            "enabled: {}\nmode: {}\nbackend: {}\ntelemetry cap: {}\nqueue depth: {}\ndropped: {}\nstore errors: {}\nanalyses: {}\nsource: {}",
+            status.enabled,
+            status.mode,
+            status.backend_kind,
+            status.telemetry_cap,
+            status.queue_depth,
+            status.dropped,
+            status.store_errors,
+            status.analyses,
+            match status.source {
+                StatusSource::Daemon => "daemon",
+                StatusSource::ProcessLocal => "process-local",
+            }
+        )?;
+    }
+    Ok(())
+}
+
+/// One stored analysis as `prx decision-engine analyses` and
+/// `GET /api/decision-engine/analyses` show it: the redacted brief and the
+/// typed values only.
+#[derive(Debug, Serialize)]
+pub struct AnalysisView {
+    pub decision_id: String,
+    pub created_at_ms: i64,
+    pub brief_redacted: String,
+    pub brief_sha256: String,
+    pub global: serde_json::Value,
+    pub candidates: serde_json::Value,
+}
+
+impl From<crate::decision_engine::AnalysisRecord> for AnalysisView {
+    fn from(row: crate::decision_engine::AnalysisRecord) -> Self {
+        // The store wrote `values_json` itself under its CHECK bound; a row
+        // that does not parse shows empty values rather than failing the
+        // whole read.
+        let values: serde_json::Value = serde_json::from_str(row.values_json()).unwrap_or(serde_json::Value::Null);
+        Self {
+            decision_id: row.decision_id().to_string(),
+            created_at_ms: row.created_at_ms(),
+            brief_redacted: row.brief_redacted().to_string(),
+            brief_sha256: row.brief_sha256().to_string(),
+            global: values.get("global").cloned().unwrap_or_else(|| serde_json::json!({})),
+            candidates: values
+                .get("candidates")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        }
+    }
+}
+
+/// The newest `limit` analyses of the workspace telemetry store, newest
+/// first. A missing store reads as empty and nothing is created.
+///
+/// # Errors
+///
+/// When the store cannot be read.
+pub fn read_analyses(config: &Config, limit: u16) -> Result<Vec<AnalysisView>> {
+    use crate::decision_engine::observe::{SqliteTelemetryWriter, TELEMETRY_FILE};
+    let path = config.workspace_dir.join(TELEMETRY_FILE);
+    let Some(store) = SqliteTelemetryWriter::open_existing(&path)? else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .analyses(usize::from(limit))?
+        .into_iter()
+        .map(AnalysisView::from)
+        .collect())
+}
+
+/// Run a read-only local `prx decision-engine` command (`analyses`,
+/// `backends`) over `config`, writing to `out`.
 ///
 /// # Errors
 ///
@@ -136,21 +303,18 @@ pub fn backend_rows(config: &Config) -> Vec<BackendRow> {
 pub fn run_read(config: &Config, json: bool, command: &DecisionEngineCommands, out: &mut dyn Write) -> Result<()> {
     match command {
         DecisionEngineCommands::Status => {
-            let status = crate::decision_engine::status::snapshot(config);
+            anyhow::bail!("`prx decision-engine status` asks the daemon first: use `run_status`")
+        }
+        DecisionEngineCommands::Analyses { limit } => {
+            let rows = read_analyses(config, *limit)?;
             if json {
-                writeln!(out, "{}", serde_json::to_string_pretty(&status)?)?;
+                writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
+            } else if rows.is_empty() {
+                writeln!(out, "no analyses recorded")?;
             } else {
-                writeln!(
-                    out,
-                    "enabled: {}\nmode: {}\nbackend: {}\ntelemetry cap: {}\nqueue depth: {}\ndropped: {}\nstore errors: {}",
-                    status.enabled,
-                    status.mode,
-                    status.backend_kind,
-                    status.telemetry_cap,
-                    status.queue_depth,
-                    status.dropped,
-                    status.store_errors
-                )?;
+                for row in rows {
+                    writeln!(out, "{} {} global={}", row.created_at_ms, row.decision_id, row.global)?;
+                }
             }
         }
         DecisionEngineCommands::Backends => {

@@ -179,9 +179,8 @@ impl Served {
     }
 }
 
-/// Save `edit`ed defaults (default provider `openai`, model `gpt-4o`) to a
-/// temp dir, load them back, and serve them.
-pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
+/// Save `edit`ed defaults to a temp dir and load them back.
+async fn saved_defaults(edit: impl FnOnce(&mut Config)) -> (tempfile::TempDir, Config) {
     let dir = tempfile::TempDir::new().expect("test: temp config dir");
     let mut config = Config {
         config_path: dir.path().join("config.toml"),
@@ -194,6 +193,13 @@ pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
     config.save().await.expect("test: save initial config");
     let loaded =
         Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
+    (dir, loaded)
+}
+
+/// Save `edit`ed defaults (default provider `openai`, model `gpt-4o`) to a
+/// temp dir, load them back, and serve them.
+pub(super) async fn serve_config(edit: impl FnOnce(&mut Config)) -> Served {
+    let (dir, loaded) = saved_defaults(edit).await;
     serve_state(dir, app_state(loaded)).await
 }
 
@@ -202,35 +208,37 @@ pub(super) async fn serve_with_memory(
     edit: impl FnOnce(&mut Config),
     memory: Arc<dyn crate::memory::Memory>,
 ) -> Served {
-    let dir = tempfile::TempDir::new().expect("test: temp config dir");
-    let mut config = Config {
-        config_path: dir.path().join("config.toml"),
-        workspace_dir: dir.path().join("workspace"),
-        default_provider: Some("openai".into()),
-        default_model: Some("gpt-4o".into()),
-        ..Config::default()
-    };
-    edit(&mut config);
-    config.save().await.expect("test: save initial config");
-    let loaded =
-        Config::load_from_path(&config.config_path, config.workspace_dir.clone()).expect("test: load initial config");
+    let (dir, loaded) = saved_defaults(edit).await;
     serve_state(dir, app_state_with_memory(loaded, memory)).await
 }
 
 /// Serve an already-built state. Callers that need a plugin runtime set it
 /// before this, because the router copies `plugin_runtime` at bind time.
 pub(super) async fn serve_state(dir: tempfile::TempDir, state: AppState) -> Served {
+    let app = axum::Router::new().nest("/api", super::router(state.clone()));
+    serve_router(dir, state, app).await
+}
+
+/// Serve `edit`ed defaults with the management API nested under `/api` and the
+/// embedded console merged after it, in the gateway's production order.
+pub(super) async fn serve_config_with_console(edit: impl FnOnce(&mut Config)) -> Served {
+    let (dir, loaded) = saved_defaults(edit).await;
+    let state = app_state(loaded);
+    let app = axum::Router::new()
+        .nest("/api", super::router(state.clone()))
+        .merge(crate::gateway::ui::router());
+    serve_router(dir, state, app).await
+}
+
+async fn serve_router(dir: tempfile::TempDir, state: AppState, app: axum::Router<AppState>) -> Served {
     // Axum serves connections on independent tasks. Bind the test dispatcher
     // on every request poll rather than relying on a thread-local default.
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let app = axum::Router::new()
-        .nest("/api", super::router(state.clone()))
-        .with_state(state.clone())
-        .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                next.run(request).with_subscriber(dispatch.clone())
-            },
-        ));
+    let app = app.with_state(state.clone()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            next.run(request).with_subscriber(dispatch.clone())
+        },
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test: bind ephemeral port");

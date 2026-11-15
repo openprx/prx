@@ -553,6 +553,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             openprx::decision_engine_cli::DecisionEngineCommands::Config { command } => {
                 manage_cli::run_process(ManageCommand::DecisionEngine(command), config).await
             }
+            openprx::decision_engine_cli::DecisionEngineCommands::Status => {
+                openprx::decision_engine_cli::run_status(&config, json, &mut std::io::stdout(), &mut std::io::stderr())
+                    .await
+            }
             read => {
                 let mut stdout = std::io::stdout().lock();
                 openprx::decision_engine_cli::run_read(&config, json, &read, &mut stdout)

@@ -48,6 +48,9 @@ pub async fn app_asset_handler(Path(path): Path<String>) -> Response {
 }
 
 pub async fn spa_fallback_handler(uri: axum::http::Uri) -> Response {
+    if is_api_path(uri.path()) {
+        return api_not_found();
+    }
     // Try serving the exact path as an embedded file first (e.g. /config → config.html)
     let path = uri.path().trim_start_matches('/');
     if !path.is_empty() && !path.contains('.') {
@@ -74,6 +77,20 @@ fn serve_embedded(path: &str, cache_control: &'static str) -> Response {
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
+/// `/api` and everything below it belong to the management API; the console
+/// fallback never answers them with HTML.
+fn is_api_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/")
+}
+
+fn api_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({"error": "not_found"})),
+    )
+        .into_response()
 }
 
 /// Check if a path is safe for embedded asset serving.
@@ -159,6 +176,14 @@ mod tests {
         assert!(is_safe_asset_path("app.min.js"));
         assert!(is_safe_asset_path("data.v2.json"));
         assert!(is_safe_asset_path(".hidden")); // single-dot is fine (not "..")
+    }
+
+    #[test]
+    fn api_paths_are_recognised() {
+        assert!(is_api_path("/api"));
+        assert!(is_api_path("/api/causal/tree"));
+        assert!(!is_api_path("/apis"));
+        assert!(!is_api_path("/some/page"));
     }
 
     // ── content_type ────────────────────────────────────────────
