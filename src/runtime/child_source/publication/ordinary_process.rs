@@ -84,6 +84,7 @@ impl OrdinaryProcessLaunch {
             worker.parent_capability.is_none()
                 && worker.ordinary_source.is_none()
                 && worker.operator_source.is_none()
+                && worker.direct_tools.is_none()
                 && worker.task == proof.routing_input()
                 && worker.config_generation == self.config_generation,
             "ordinary worker manifest differs from captured launch"
@@ -235,6 +236,7 @@ impl OrdinaryProcessLaunch {
         worker.route_uses_root_connection = route.is_some() && root;
         worker.route_source_provider = route.map(|_| selection.provider.clone());
         worker.route_credential = route.map(|_| resolved.credential().reference().clone());
+        worker.direct_tools = publication.chat_lineage_direct_tools();
         worker.ordinary_source = Some(source);
         Ok(())
     }

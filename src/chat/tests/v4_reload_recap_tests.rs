@@ -30,6 +30,7 @@ fn usage_record() -> MeteredTokenUsageRecord {
         cache_read_input_tokens: 0,
         source: TokenUsageSource::Reported,
         cost_usd: Some(0.0004),
+        settlement_class: None,
     }
 }
 

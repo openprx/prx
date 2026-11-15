@@ -178,6 +178,39 @@ pub struct MeteredTokenUsageRecord {
     /// Display cost computed from `[cost].prices`. `None` means the model is
     /// intentionally unknown-priced for this UI pass, not zero cost.
     pub cost_usd: Option<f64>,
+    /// How the turn settled, carried by chat session records only (CF-R8).
+    /// Terminal and outbox usage never set it, so their bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_class: Option<UsageSettlementClass>,
+}
+
+/// The settlement class of one recorded turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSettlementClass {
+    /// Priced from `[cost].prices` or the catalog.
+    Metered,
+    /// Billed by subscription: no per-token cost.
+    Subscription,
+    /// No price is known.
+    Unknown,
+}
+
+impl UsageSettlementClass {
+    /// The class of a terminal's cost settlement; `None` when the settlement
+    /// does not classify the usage (disabled or failed).
+    #[must_use]
+    pub const fn of(settlement: &crate::cost::types::CostSettlement) -> Option<Self> {
+        use crate::cost::types::CostSettlement;
+        match settlement {
+            CostSettlement::Subscription { .. } => Some(Self::Subscription),
+            CostSettlement::UnknownPricing => Some(Self::Unknown),
+            CostSettlement::Recorded { .. } | CostSettlement::Replayed | CostSettlement::ProjectionPending => {
+                Some(Self::Metered)
+            }
+            CostSettlement::Disabled | CostSettlement::Failed { .. } => None,
+        }
+    }
 }
 
 impl MeteredTokenUsageRecord {
@@ -237,6 +270,7 @@ impl MeteredTokenUsageRecord {
             cache_read_input_tokens,
             source: usage.source,
             cost_usd,
+            settlement_class: None,
         })
     }
 }

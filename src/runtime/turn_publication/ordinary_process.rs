@@ -16,6 +16,7 @@ pub(super) fn ordinary_process_publication(
     authority: Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>,
     build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
+    chat_lineage: bool,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
@@ -83,6 +84,7 @@ pub(super) fn ordinary_process_publication(
         memory_loader: None,
         loop_runtime: Some(runtime),
         publication_policy: build.surface_policy,
+        chat_lineage,
         ordinary_parent: None,
         operator_task: None,
         operator_process: None,

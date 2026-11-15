@@ -61,6 +61,7 @@ impl OwnedReceipt {
                 cache_read_input_tokens: cache_read,
                 source: TokenUsageSource::Reported,
                 cost_usd,
+                settlement_class: None,
             };
 
             Ok((record, total, actual_micro_usd))

@@ -143,6 +143,7 @@ pub(super) fn build_session_worker_manifest(
         memory_event_recording: event_recording,
         allowed_tools: allowed_tools.to_vec(),
         channel_excluded_tools: channel_excluded_tools.to_vec(),
+        direct_tools: None,
         system_prompt: agent_system_prompt.map(str::to_string),
         identity_dir,
         scope_sender: scope.map(|ctx| ctx.sender.clone()),

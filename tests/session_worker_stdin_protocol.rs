@@ -721,6 +721,7 @@ fn manifest_for(config_dir: &Path, workspace_dir: &Path) -> WorkerManifest {
         memory_event_recording: MemoryEventRecording::default(),
         allowed_tools: vec!["file_read".to_string()],
         channel_excluded_tools: Vec::new(),
+        direct_tools: None,
         system_prompt: None,
         identity_dir: None,
         scope_sender: None,

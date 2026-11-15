@@ -804,6 +804,19 @@ fn recovery_restart_from_killed_process() {
     auth_02_3_tests::recovery_restart_from_killed_process();
 }
 
+#[path = "subscription_recovery_tests.rs"]
+mod subscription_recovery_tests;
+
+#[tokio::test]
+async fn recovery_subscription_commit_survives_restart() {
+    subscription_recovery_tests::recovery_subscription_commit_survives_restart().await;
+}
+
+#[test]
+fn recovery_subscription_restart_from_killed_process() {
+    subscription_recovery_tests::recovery_subscription_restart_from_killed_process();
+}
+
 #[ignore = "child mode is invoked only by the owned recovery restart test"]
 #[tokio::test]
 async fn fresh_process_recovery_child() {

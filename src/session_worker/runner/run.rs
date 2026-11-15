@@ -113,6 +113,19 @@ struct PreparedWorkerResult {
     ordinary_completion: Option<Arc<crate::runtime::child_source::ordinary_process::OrdinaryProcessAuthority>>,
 }
 
+/// The worker's direct names: the sealed chat-lineage set when the parent
+/// filled one (D5), else `always_include`. A name is still published only
+/// where this worker's registry serves it and no exclusion hides it.
+fn worker_direct_names(
+    manifest: &WorkerManifest,
+    tiering: &crate::config::ToolTieringConfig,
+) -> std::collections::BTreeSet<String> {
+    manifest.direct_tools.as_ref().map_or_else(
+        || tiering.always_include.iter().cloned().collect(),
+        |names| names.iter().cloned().collect(),
+    )
+}
+
 fn worker_source_workspace(manifest: &WorkerManifest) -> Result<&str> {
     match (&manifest.ordinary_source, &manifest.operator_source) {
         (Some(source), None) => Ok(source.parent_constraints.workspace.as_str()),
@@ -671,6 +684,7 @@ async fn run_owned_manifest(
                     hooks: Arc::clone(&hooks),
                     observer: Arc::new(NoopObserver),
                 },
+                chat_lineage: manifest.direct_tools.is_some(),
                 surface_policy: crate::tools::capability::catalog::SurfacePolicy {
                     allowed_tools: if manifest.allowed_tools.is_empty()
                         || manifest.allowed_tools.iter().any(|name| name == "*")
@@ -680,7 +694,7 @@ async fn run_owned_manifest(
                         Some(manifest.allowed_tools.iter().cloned().collect())
                     },
                     excluded_names,
-                    direct_names: config.tool_tiering.always_include.iter().cloned().collect(),
+                    direct_names: worker_direct_names(&manifest, &config.tool_tiering),
                     channel_allowed: false,
                 },
             }
@@ -700,6 +714,7 @@ async fn run_owned_manifest(
                     hooks: Arc::clone(&hooks),
                     observer: Arc::new(NoopObserver),
                 },
+                chat_lineage: manifest.direct_tools.is_some(),
                 surface_policy: crate::tools::capability::catalog::SurfacePolicy {
                     allowed_tools: if manifest.allowed_tools.is_empty()
                         || manifest.allowed_tools.iter().any(|name| name == "*")
@@ -709,7 +724,7 @@ async fn run_owned_manifest(
                         Some(manifest.allowed_tools.iter().cloned().collect())
                     },
                     excluded_names,
-                    direct_names: config.tool_tiering.always_include.iter().cloned().collect(),
+                    direct_names: worker_direct_names(&manifest, &config.tool_tiering),
                     channel_allowed: false,
                 },
             }

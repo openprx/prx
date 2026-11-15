@@ -709,6 +709,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 source: TokenUsageSource::Reported,
                 cost_usd: Some(0.0042),
+                settlement_class: None,
             });
         let runs = Arc::new(RwLock::new(vec![run]));
         let tool = SessionsListTool::new(runs);

@@ -46,6 +46,7 @@ pub(crate) fn base_manifest(workspace: &Path, capability: &str) -> WorkerManifes
         memory_event_recording: crate::memory::MemoryEventRecording::default(),
         allowed_tools: vec!["file_read".to_string()],
         channel_excluded_tools: Vec::new(),
+        direct_tools: None,
         system_prompt: None,
         identity_dir: Some("identity/worker".to_string()),
         scope_sender: None,

@@ -381,6 +381,7 @@ async fn restore_operator_process(
         memory_event_recording: config.memory.event_recording_config(),
         allowed_tools: Vec::new(),
         channel_excluded_tools: Vec::new(),
+        direct_tools: None,
         system_prompt: None,
         identity_dir: None,
         scope_sender: scope.sender.clone(),
@@ -447,6 +448,7 @@ async fn process_segment(
         registry,
         security: runtime_security.1,
         runtime: runtime_security.0,
+        chat_lineage: false,
         surface_policy: crate::tools::capability::catalog::SurfacePolicy::default(),
     }
     .publish()

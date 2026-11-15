@@ -421,6 +421,31 @@ async fn restart_rejoin_verifies_every_terminal_status() {
     assert_not_replayable(rejoin_restart_cell(&cell).await, "one-sided replay_unavailable");
 }
 
+/// CF-R8: restart verification requires the authenticated outbox row of a
+/// subscription terminal, as it does for a metered one.
+#[tokio::test]
+async fn subscription_terminal_rejoins_and_requires_its_outbox_row() {
+    fn subscription(draft: &mut TurnTerminalDraft) {
+        draft.provider_outcome = Some(
+            crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+                &crate::llm::route_decision::RouteDecision::single_candidate("kimi-code", "kimi-for-coding"),
+                draft.telemetry.started_at,
+                crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+            ),
+        );
+    }
+    let cell = commit_restart_cell("restart-subscription", subscription, false).await;
+    rejoin_restart_cell(&cell)
+        .await
+        .unwrap_or_else(|error| panic!("test: a subscription terminal must rejoin after restart: {error:#}"));
+    let cell = commit_restart_cell("restart-subscription-no-outbox", subscription, false).await;
+    crate::memory::sqlite::remove_cost_for_test(&cell.workspace, &cell.terminal_id).expect("test: remove outbox");
+    assert_not_replayable(
+        rejoin_restart_cell(&cell).await,
+        "subscription facts without outbox row",
+    );
+}
+
 fn walk_keys(workspace: &Path) -> Vec<std::path::PathBuf> {
     let mut keys = Vec::new();
     let mut pending = vec![workspace.to_path_buf()];

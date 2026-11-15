@@ -60,6 +60,9 @@ pub struct MainSessionTokenUsageSummary {
     pub request_count: u64,
     pub known_cost_usd: f64,
     pub unknown_cost_requests: u64,
+    /// Unpriced records settled by subscription (CF-R8): not unknown cost.
+    #[serde(default)]
+    pub subscription_requests: u64,
 }
 
 /// Backward-compatible neutral name for shared token usage display.
@@ -105,6 +108,8 @@ impl MainSessionTokenUsageSummary {
             }
             if let Some(cost) = record.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
                 summary.known_cost_usd += cost;
+            } else if record.settlement_class == Some(crate::llm::route_decision::UsageSettlementClass::Subscription) {
+                summary.subscription_requests = summary.subscription_requests.saturating_add(1);
             } else {
                 summary.unknown_cost_requests = summary.unknown_cost_requests.saturating_add(1);
             }
@@ -149,13 +154,30 @@ pub fn format_session_token_usage_inline(summary: SessionTokenUsageSummary) -> O
     }
     let prefix = if summary.has_estimates() { "~" } else { "" };
     let mut out = format!("{prefix}{} tok", format_token_count_compact(summary.total_tokens));
-    if summary.cost_is_unknown() {
+    if summary.cost_is_unknown() && summary.subscription_requests == 0 {
         out.push_str(" | cost unknown");
     } else {
         out.push_str(" | ");
-        out.push_str(&format_cost_usd(summary.known_cost_usd));
+        out.push_str(&format_session_cost(summary));
     }
     Some(out)
+}
+
+/// The cost label of a session summary (CF-R8): `subscription` when every
+/// unpriced record is subscription-settled (after the known cost, if any),
+/// `cost unknown (known $x; N subscription)` when subscription and unknown
+/// records mix, `cost unknown (known $x)` / `cost unknown` otherwise.
+#[must_use]
+pub fn format_session_cost(summary: SessionTokenUsageSummary) -> String {
+    let known = format_cost_usd(summary.known_cost_usd);
+    match (summary.cost_is_unknown(), summary.subscription_requests) {
+        (true, 0) if summary.known_cost_usd > 0.0 => format!("cost unknown (known {known})"),
+        (true, 0) => "cost unknown".to_owned(),
+        (true, subscription) => format!("cost unknown (known {known}; {subscription} subscription)"),
+        (false, 0) => known,
+        (false, _) if summary.known_cost_usd > 0.0 => format!("{known} + subscription"),
+        (false, _) => "subscription".to_owned(),
+    }
 }
 
 #[must_use]
@@ -666,5 +688,59 @@ mod tests {
         assert!(session.record_usage_settlement(record).is_none());
         assert_eq!(session.token_usage_records.len(), 1);
         assert_eq!(session.token_usage_summary().request_count, 1);
+    }
+
+    fn classed(
+        class: Option<crate::llm::route_decision::UsageSettlementClass>,
+        cost: Option<f64>,
+    ) -> MainSessionTokenUsageRecord {
+        MainSessionTokenUsageRecord {
+            settlement_id: None,
+            provider: "kimi-code".to_owned(),
+            model: "kimi-for-coding".to_owned(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            source: crate::llm::route_decision::TokenUsageSource::Reported,
+            cost_usd: cost,
+            settlement_class: class,
+        }
+    }
+
+    #[test]
+    fn subscription_mixed_and_unknown_records_are_summarized_by_class() {
+        use crate::llm::route_decision::UsageSettlementClass::{Metered, Subscription, Unknown};
+        let subscription = MainSessionTokenUsageSummary::from_records(&[
+            classed(Some(Subscription), None),
+            classed(Some(Subscription), None),
+        ]);
+        assert_eq!(subscription.subscription_requests, 2);
+        assert!(!subscription.cost_is_unknown());
+        assert_eq!(format_session_cost(subscription), "subscription");
+        assert_eq!(
+            format_session_token_usage_inline(subscription).as_deref(),
+            Some("30 tok | subscription")
+        );
+
+        let mixed = MainSessionTokenUsageSummary::from_records(&[
+            classed(Some(Metered), Some(0.5)),
+            classed(Some(Subscription), None),
+            classed(Some(Unknown), None),
+        ]);
+        assert_eq!((mixed.subscription_requests, mixed.unknown_cost_requests), (1, 1));
+        assert_eq!(
+            format_session_cost(mixed),
+            "cost unknown (known $0.5000; 1 subscription)"
+        );
+
+        let unknown = MainSessionTokenUsageSummary::from_records(&[classed(Some(Unknown), None), classed(None, None)]);
+        assert_eq!(unknown.unknown_cost_requests, 2);
+        assert_eq!(format_session_cost(unknown), "cost unknown");
+        assert_eq!(
+            format_session_token_usage_inline(unknown).as_deref(),
+            Some("30 tok | cost unknown")
+        );
     }
 }

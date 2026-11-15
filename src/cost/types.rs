@@ -64,6 +64,9 @@ pub enum UsagePeriod {
     Month,
 }
 
+/// The `billing` value of a `$0` subscription settlement row.
+pub const SUBSCRIPTION_BILLING: &str = "subscription";
+
 /// A single cost record for persistent storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostRecord {
@@ -89,6 +92,11 @@ pub struct CostRecord {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u64>,
+    /// The billing class of a settlement row outside the fingerprint:
+    /// `Some("subscription")` on a `$0` subscription row (D9), absent on a
+    /// metered row, so metered rows stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
 }
 
 impl CostRecord {
@@ -104,6 +112,7 @@ impl CostRecord {
             settlement_source: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            billing: None,
         }
     }
 
@@ -119,6 +128,7 @@ impl CostRecord {
             settlement_source: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            billing: None,
         }
     }
 }

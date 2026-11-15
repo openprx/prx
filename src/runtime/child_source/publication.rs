@@ -149,6 +149,12 @@ impl OrdinaryChildPublication {
         })
     }
 
+    /// The direct names a process child issued from this publication is
+    /// sealed with (D5): `Some` only in a chat lineage.
+    pub(crate) fn chat_lineage_direct_tools(&self) -> Option<Vec<String>> {
+        self.inner.service.chat_lineage_direct_tools()
+    }
+
     /// Both publications were captured from the same authenticated parent.
     pub(crate) fn same_parent(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -419,6 +425,7 @@ impl OrdinaryChildPublication {
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
+            chat_lineage: parent.chat_lineage,
             ordinary_parent: task.is_none().then(|| self.clone()),
             operator_task: None,
             operator_process: None,

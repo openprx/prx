@@ -216,6 +216,7 @@ fn process_mode_task_arg_is_not_json_encoded() {
         memory_event_recording: MemoryEventRecording::default(),
         allowed_tools: vec!["shell".to_string()],
         channel_excluded_tools: Vec::new(),
+        direct_tools: None,
         system_prompt: None,
         identity_dir: None,
         scope_sender: None,

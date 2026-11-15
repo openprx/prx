@@ -36,6 +36,9 @@ pub(crate) struct TurnRuntimeService {
     pub(in crate::runtime) memory_loader: Option<Arc<dyn crate::agent::memory_loader::MemoryLoader>>,
     pub(in crate::runtime) loop_runtime: Option<PublicationLoopRuntime>,
     pub(in crate::runtime) publication_policy: SurfacePolicy,
+    /// The publication is a chat root or one of its descendants (D5): its
+    /// process children are sealed with this publication's direct names.
+    pub(in crate::runtime) chat_lineage: bool,
     pub(in crate::runtime) ordinary_parent: Option<OrdinaryChildPublication>,
     pub(in crate::runtime) operator_task: Option<Arc<crate::runtime::operator_spawn::task::OperatorTaskAuthority>>,
     pub(in crate::runtime) operator_process:
@@ -61,6 +64,14 @@ pub(crate) struct TurnRuntimeService {
 }
 
 impl TurnRuntimeService {
+    /// The direct names a process child of this publication is sealed with
+    /// (D5): this publication's own direct set in a chat lineage, `None`
+    /// elsewhere (the worker then keeps `always_include`).
+    pub(crate) fn chat_lineage_direct_tools(&self) -> Option<Vec<String>> {
+        self.chat_lineage
+            .then(|| self.publication_policy.direct_names.iter().cloned().collect())
+    }
+
     /// The turn's advisory decision driver.
     #[must_use]
     pub(crate) const fn advisory(&self) -> &crate::runtime::decision_advisory::DecisionAdvisory {

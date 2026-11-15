@@ -114,6 +114,22 @@ pub struct TurnTerminalReceipt {
     pub delivery_intent: TurnDeliveryIntent,
 }
 
+impl TurnTerminalReceipt {
+    /// The turn's usage as a chat session records it, tagged with the class
+    /// its cost settled as (CF-R8).
+    #[must_use]
+    pub fn into_session_usage(self) -> Option<MeteredTokenUsageRecord> {
+        let class = self
+            .cost_settlement
+            .as_ref()
+            .and_then(crate::llm::route_decision::UsageSettlementClass::of);
+        self.usage_settlement.map(|mut usage| {
+            usage.settlement_class = class;
+            usage
+        })
+    }
+}
+
 /// Redaction for reply, error or summary text persisted from a turn (D-053,
 /// D-054).
 ///

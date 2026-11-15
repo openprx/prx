@@ -880,6 +880,7 @@ async fn history_action_returns_tail_usage_and_truncation_controls() {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.0042),
+                settlement_class: None,
             }],
         });
     }

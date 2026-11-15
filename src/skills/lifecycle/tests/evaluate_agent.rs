@@ -653,6 +653,7 @@ fn usage_is_read_from_the_run_ledger_and_the_environment_binds_the_models_that_s
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(cost),
+                settlement_class: None,
             })
             .expect("test: settle");
     };
@@ -885,6 +886,7 @@ fn rows_with_cache_tokens_verify_and_count_and_a_tampered_row_voids_the_ledger()
                 cache_read_input_tokens: 13,
                 source,
                 cost_usd: Some(0.000_5),
+                settlement_class: None,
             })
             .expect("test: settle");
     }

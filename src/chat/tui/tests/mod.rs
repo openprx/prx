@@ -123,6 +123,7 @@ fn usage_record(
         cache_read_input_tokens: 0,
         source,
         cost_usd: Some(0.0042),
+        settlement_class: None,
     }
 }
 

@@ -29,6 +29,11 @@ pub(crate) struct OperatorChildPublication {
 }
 
 impl OperatorChildPublication {
+    /// The direct names an operator process child is sealed with (D5).
+    pub(crate) fn chat_lineage_direct_tools(&self) -> Option<Vec<String>> {
+        self.service.chat_lineage_direct_tools()
+    }
+
     pub(crate) fn capture(
         service: Arc<TurnRuntimeService>,
         runtime: Arc<crate::runtime::turn_context::TurnRuntimeHolder>,
@@ -247,6 +252,7 @@ impl OperatorChildPublication {
             memory_loader: None,
             loop_runtime: Some(runtime),
             publication_policy: policy,
+            chat_lineage: parent.chat_lineage,
             operator_task: Some(Arc::clone(&task)),
             operator_process: None,
             ordinary_parent: None,

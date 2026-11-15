@@ -163,7 +163,7 @@ pub(crate) fn verify_semantics(
 }
 
 /// Step 5 (E2 over the persisted semantic) and step 7 (usage event and the
-/// authenticated outbox row of a metered terminal).
+/// authenticated outbox row of a metered or subscription terminal).
 pub(crate) fn verify_claim_and_cost(
     repository: &dyn RecoveryRepository,
     chain: &crate::memory::recovery_authority::RecoveryChain,
@@ -186,11 +186,11 @@ pub(crate) fn verify_claim_and_cost(
             .recovery_event_evidence(chain, id)
             .map_err(|_| refuse("usage event missing from the chain"))?;
     }
-    if facts.pricing == RecoveryPricing::Metered.as_str() {
+    if facts.pricing == RecoveryPricing::Metered.as_str() || facts.pricing == RecoveryPricing::Subscription.as_str() {
         let row = repository
             .recovery_cost_row(&chain.workspace_id, &facts.terminal_id)
             .map_err(|_| refuse("cost outbox row does not authenticate"))?
-            .ok_or_else(|| refuse("metered terminal has no cost outbox row"))?;
+            .ok_or_else(|| refuse("settled terminal has no cost outbox row"))?;
         let outbox_final = serde_json::from_slice::<Value>(&row.facts)
             .ok()
             .and_then(|value| value.get("final_event_id").and_then(Value::as_str).map(str::to_owned));

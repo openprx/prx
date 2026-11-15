@@ -949,10 +949,9 @@ async fn discovery_cannot_append_an_excluded_tool() {
 }
 
 #[tokio::test]
-async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Result<()> {
-    use crate::tools::capability::search_tool::{CapabilitySearchTool, with_search_authority};
+async fn chat_sessions_spawn_is_direct_and_binds_its_child_publication() -> anyhow::Result<()> {
     use anyhow::Context as _;
-    for (input, excluded) in [("hi", false), ("sessions_spawn", false), ("sessions_spawn", true)] {
+    for excluded in [false, true] {
         let workspace = tempfile::tempdir()?;
         let _access = crate::decision_engine::access_spy::AccessSpy::new(workspace.path());
         let mut config = crate::config::Config::default();
@@ -968,7 +967,7 @@ async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Res
             Some(spawn_probe_registry()),
             config,
             ("ollama", "tiering-model", None),
-            ("prx_deferred_spawn", input),
+            ("prx_direct_spawn", "hi"),
             actions,
             CancellationToken::new(),
         )
@@ -978,61 +977,19 @@ async fn chat_sessions_spawn_is_deferred_until_search_admission() -> anyhow::Res
             .decision_routing()
             .context("source-bound chat routing")?;
         let initial = routing.service.agent_execution_specs(routing.proof, routing.context)?;
-        assert!(!initial.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL));
-        assert!(
-            routing
-                .service
-                .agent_capability_search_spec(routing.proof, routing.context)?
-                .is_some()
-        );
-        let port = routing.service.capability_search_port(routing.proof, routing.context)?;
-        let found = with_search_authority(
-            Some(port),
-            CapabilitySearchTool.execute(serde_json::json!({"query": SESSIONS_SPAWN_TOOL, "limit": 1})),
-        )
-        .await?;
-        assert!(found.success);
-        let output: serde_json::Value = serde_json::from_str(&found.output)?;
-        let hits = output
-            .get("hits")
-            .and_then(serde_json::Value::as_array)
-            .context("search hits")?;
+        let published = initial.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL);
         if excluded {
-            assert!(hits.is_empty(), "an exact mention cannot discover an excluded spawn");
-            assert_eq!(
-                routing
-                    .service
-                    .admit_offered_discoveries(routing.proof, routing.context, |_, _| false),
-                0
-            );
-            assert!(
-                routing
-                    .service
-                    .agent_appended_execution_specs(routing.proof, routing.context)?
-                    .specs
-                    .is_empty()
-            );
+            assert!(!published, "an excluded spawn is never published directly");
             continue;
         }
-        assert_eq!(hits.len(), 1);
-        assert!(found.output.contains(SESSIONS_SPAWN_TOOL));
-        assert_eq!(
-            routing
-                .service
-                .admit_offered_discoveries(routing.proof, routing.context, |_, _| false),
-            1
-        );
-        let appended = routing
-            .service
-            .agent_appended_execution_specs(routing.proof, routing.context)?;
-        assert!(appended.specs.iter().any(|spec| spec.name == SESSIONS_SPAWN_TOOL));
+        assert!(published, "chat publishes sessions_spawn directly (CF-R6)");
         let (_, execution) =
             routing
                 .service
-                .bind_agent_execution(routing.proof, routing.context, &admitted.context, &appended.specs)?;
+                .bind_agent_execution(routing.proof, routing.context, &admitted.context, &initial.specs)?;
         assert!(
             execution.ordinary_child_publication.is_some(),
-            "deferred publication retains the ordinary child publication"
+            "a direct spawn retains the ordinary child publication"
         );
     }
     Ok(())

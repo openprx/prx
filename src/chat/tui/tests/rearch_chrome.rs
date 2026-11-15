@@ -382,6 +382,7 @@ fn status_bar_renders_reported_tokens_and_cost() {
         request_count: 1,
         known_cost_usd: 0.0105,
         unknown_cost_requests: 0,
+        subscription_requests: 0,
     };
 
     let line = render_status_bar_text(&state, 120);
@@ -634,6 +635,7 @@ fn status_bar_marks_estimated_usage_with_tilde() {
         request_count: 1,
         known_cost_usd: 0.002,
         unknown_cost_requests: 0,
+        subscription_requests: 0,
     };
 
     let line = render_status_bar_text(&state, 120);

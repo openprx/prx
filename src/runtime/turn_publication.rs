@@ -23,9 +23,16 @@ use std::sync::Arc;
 /// approval gates before any one of them can execute.
 const DEFAULT_DIRECT_TOOLS: [&str; 4] = ["file_edit", "file_read", "file_write", "shell"];
 
-fn direct_tool_names(configured: &crate::config::ToolTieringConfig) -> std::collections::BTreeSet<String> {
+/// The sessions tools a chat turn and its whole lineage publish directly
+/// (CF-R6). They are still published only where the registry serves them and
+/// no exclusion hides them.
+const CHAT_SESSIONS_TOOLS: [&str; 4] = ["sessions_spawn", "sessions_send", "sessions_list", "session_status"];
+
+fn direct_tool_names(configured: &crate::config::ToolTieringConfig, chat: bool) -> std::collections::BTreeSet<String> {
+    let chat_tools: &[&str] = if chat { &CHAT_SESSIONS_TOOLS } else { &[] };
     DEFAULT_DIRECT_TOOLS
         .into_iter()
+        .chain(chat_tools.iter().copied())
         .map(str::to_owned)
         .chain(configured.always_include.iter().cloned())
         .filter(|name| !configured.always_exclude.contains(name))
@@ -43,7 +50,10 @@ pub(crate) fn surface_policy(
         std::borrow::Cow::Borrowed(configured)
     };
     let excluded_names = tiering.always_exclude.iter().cloned().collect();
-    let direct_names = direct_tool_names(&tiering);
+    let direct_names = direct_tool_names(
+        &tiering,
+        surface == crate::tools::capability::turn_state::TurnSurfaceKind::Interactive,
+    );
     crate::tools::capability::catalog::SurfacePolicy {
         allowed_tools: None,
         excluded_names,
@@ -214,6 +224,9 @@ impl TurnPublication {
 /// Publish an ordinary process against its restored catalog and the actual
 /// local executor. The driver separately owns its authority lifetime guard.
 pub(crate) struct OrdinaryProcessPublication {
+    /// The worker descends from a chat root (its manifest carries
+    /// `direct_tools`, D5); its own process children inherit that set.
+    pub(crate) chat_lineage: bool,
     pub(crate) authority: Arc<super::child_source::ordinary_process::OrdinaryProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -259,6 +272,7 @@ impl OrdinaryProcessPublication {
                 security: self.security,
             },
             self.runtime,
+            self.chat_lineage,
         )?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
             service
@@ -273,6 +287,9 @@ impl OrdinaryProcessPublication {
 
 /// Publish a worker from authenticated explicit operator authority.
 pub(crate) struct OperatorProcessPublication {
+    /// The worker descends from a chat root (its manifest carries
+    /// `direct_tools`, D5); its own process children inherit that set.
+    pub(crate) chat_lineage: bool,
     pub(crate) authority: Arc<super::child_source::operator_process::OperatorProcessAuthority>,
     pub(crate) registry: Arc<Vec<Box<dyn tools::Tool>>>,
     pub(crate) security: Arc<crate::security::SecurityPolicy>,
@@ -318,6 +335,7 @@ impl OperatorProcessPublication {
                 security: self.security,
             },
             self.runtime,
+            self.chat_lineage,
         )
         .await?;
         if let Err(error) = owner.retain_child_service(Arc::clone(&service)) {
@@ -414,5 +432,45 @@ mod static_publication_tests {
                 .await;
             assert!(matches!(result, Err(error) if error.to_string().contains("registry MCP instance")));
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_sessions_surface_tests {
+    use super::{CHAT_SESSIONS_TOOLS, surface_policy};
+    use crate::tools::capability::turn_state::TurnSurfaceKind;
+
+    #[test]
+    fn interactive_surface_publishes_sessions_tools_directly() {
+        let policy = surface_policy(
+            TurnSurfaceKind::Interactive,
+            &crate::config::ToolTieringConfig::default(),
+        );
+        for name in CHAT_SESSIONS_TOOLS {
+            assert!(policy.direct_names.contains(name), "{name} is direct on chat");
+        }
+    }
+
+    #[test]
+    fn cron_and_xin_surfaces_have_no_sessions_tools() {
+        for surface in [TurnSurfaceKind::Cron, TurnSurfaceKind::Xin] {
+            let policy = surface_policy(surface, &crate::config::ToolTieringConfig::default());
+            for name in CHAT_SESSIONS_TOOLS {
+                assert!(
+                    !policy.direct_names.contains(name),
+                    "{name} is absent on {}",
+                    surface.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn excluded_sessions_tool_is_not_direct_on_chat() {
+        let mut tiering = crate::config::ToolTieringConfig::default();
+        tiering.always_exclude.push("sessions_spawn".to_owned());
+        let policy = surface_policy(TurnSurfaceKind::Interactive, &tiering);
+        assert!(!policy.direct_names.contains("sessions_spawn"));
+        assert!(policy.excluded_names.contains("sessions_spawn"));
     }
 }

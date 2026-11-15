@@ -115,6 +115,7 @@ pub(crate) async fn build_publication(
         memory_loader: None,
         loop_runtime: None,
         publication_policy: build.surface_policy,
+        chat_lineage: surface == TurnSurfaceKind::Interactive,
         ordinary_parent: None,
         operator_task: None,
         operator_process: None,

@@ -1,9 +1,10 @@
 //! Metered cost and estimated-liability reconciliation under one ledger lock.
 use super::{
-    CostRecord, CostSettlement, CostStorage, CostTracker, TokenUsage, acquire_cost_ledger_lock, budget_check,
-    ceil_micro_usd, settlement_fingerprint,
+    CostRecord, CostSettlement, CostStorage, CostTracker, LedgerBlocked, TokenUsage, acquire_cost_ledger_lock,
+    budget_check, ceil_micro_usd, settlement_fingerprint,
 };
 use crate::cost::reservation::{ReservationReceipt, Reservations, SubscriptionCall, cost_row_sha256};
+use crate::cost::types::SUBSCRIPTION_BILLING;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -70,17 +71,41 @@ impl Drop for RecoveryProjectionFaultGuard {
     }
 }
 
+/// What one subscription append did.
+enum SubscriptionAppend {
+    /// The `$0` row was written now.
+    Appended(Box<CostRecord>),
+    /// The settlement already had its verified subscription row.
+    Replayed,
+}
+
 impl CostTracker {
-    /// Project authenticated recovery usage into the cost ledger. No budget check.
-    pub(crate) fn project_recovery_usage(&self, record: &MeteredTokenUsageRecord) -> Result<()> {
+    /// Project authenticated recovery usage into the cost ledger, by the
+    /// outbox row's signed pricing (D8). No budget check.
+    pub(crate) fn project_recovery_usage(
+        &self,
+        record: &MeteredTokenUsageRecord,
+        pricing: crate::memory::recovery_authority::RecoveryPricing,
+    ) -> Result<()> {
+        use crate::memory::recovery_authority::RecoveryPricing;
         let settlement_id = record
             .settlement_id
             .as_deref()
             .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
         anyhow::ensure!(!settlement_id.trim().is_empty(), "Metered usage settlement_id is empty");
-        let cost_usd = record
-            .cost_usd
-            .ok_or_else(|| anyhow!("recovery cost projection requires a priced usage record"))?;
+        let cost_usd = match pricing {
+            RecoveryPricing::Metered => record
+                .cost_usd
+                .ok_or_else(|| anyhow!("recovery cost projection requires a priced usage record"))?,
+            RecoveryPricing::Subscription => {
+                anyhow::ensure!(
+                    record.cost_usd.is_none_or(|cost| cost.to_bits() == 0.0_f64.to_bits()),
+                    LedgerBlocked::Conflict
+                );
+                0.0
+            }
+            RecoveryPricing::Unknown => return Err(UnknownRecoveryPricing.into()),
+        };
         anyhow::ensure!(
             cost_usd.is_finite() && cost_usd >= 0.0,
             "Metered usage cost must be a finite, non-negative value"
@@ -93,17 +118,15 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
-        if storage.has_settlement(settlement_id) {
-            storage.verify_replayed_settlement(record, cost_usd)?;
-            if let Some((file, _)) = super::open_cost_file(&storage.path, super::CostFileAccess::Read)? {
-                file.sync_all()
-                    .with_context(|| format!("Failed to sync cost storage at {}", storage.path.display()))?;
-            }
-            #[cfg(unix)]
-            if let Some(parent) = storage.path.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
+        if pricing == RecoveryPricing::Subscription {
+            if let SubscriptionAppend::Replayed = self.append_subscription(&mut storage, settlement_id, record)? {
+                sync_replayed(&storage)?;
             }
             return Ok(());
+        }
+        if storage.has_settlement(settlement_id) {
+            storage.verify_replayed_settlement(record, cost_usd)?;
+            return sync_replayed(&storage);
         }
         let usage = TokenUsage {
             model: format!("{}/{}", record.provider, record.model),
@@ -131,6 +154,56 @@ impl CostTracker {
             return Err(TestCrash.into());
         }
         Ok(())
+    }
+
+    /// The one subscription append every path uses (D9). The caller holds
+    /// the ledger lock on a refreshed snapshot. A stored row for the
+    /// settlement must be the same `$0` subscription row (else
+    /// [`LedgerBlocked::Conflict`]); otherwise one `$0` row with the
+    /// unchanged settlement fingerprint and `billing = "subscription"` is
+    /// appended. No budget check runs.
+    fn append_subscription(
+        &self,
+        storage: &mut CostStorage,
+        settlement_id: &str,
+        record: &MeteredTokenUsageRecord,
+    ) -> Result<SubscriptionAppend> {
+        if storage.has_settlement(settlement_id) {
+            storage.verify_replayed_settlement(record, 0.0)?;
+            anyhow::ensure!(
+                storage.settlement_billing(settlement_id)?.as_deref() == Some(SUBSCRIPTION_BILLING),
+                LedgerBlocked::Conflict
+            );
+            return Ok(SubscriptionAppend::Replayed);
+        }
+        subscription_settlement(record)?;
+        let usage = TokenUsage {
+            model: format!("{}/{}", record.provider, record.model),
+            input_tokens: record.prompt_tokens,
+            output_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+            cost_usd: 0.0,
+            timestamp: Utc::now(),
+        };
+        let mut cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        cost_record.settlement_sha256 = Some(settlement_fingerprint(record, 0.0)?);
+        cost_record.settlement_provider = Some(record.provider.clone());
+        cost_record.settlement_source = Some(record.source);
+        cost_record.cache_creation_input_tokens = Some(record.cache_creation_input_tokens);
+        cost_record.cache_read_input_tokens = Some(record.cache_read_input_tokens);
+        cost_record.billing = Some(SUBSCRIPTION_BILLING.to_owned());
+        #[cfg(test)]
+        if FORCE_IO_ERROR.with(std::cell::Cell::get) {
+            FORCE_IO_ERROR.with(|cell| cell.set(false));
+            anyhow::bail!("test: subscription cost append I/O error");
+        }
+        storage.add_record(cost_record.clone())?;
+        #[cfg(test)]
+        if CRASH_AFTER_APPEND.with(std::cell::Cell::get) {
+            CRASH_AFTER_APPEND.with(|cell| cell.set(false));
+            return Err(TestCrash.into());
+        }
+        Ok(SubscriptionAppend::Appended(Box::new(cost_record)))
     }
 
     /// The canonical cost append remains durable before the journal changes.
@@ -173,13 +246,20 @@ impl CostTracker {
                 crate::llm::route_decision::UsagePrice::Subscription
             ) {
                 let settlement = subscription_settlement(record)?;
+                let mut storage = self.lock_storage();
+                let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+                storage.refresh_from_disk()?;
+                let appended = self.append_subscription(&mut storage, settlement_id, record)?;
+                if let SubscriptionAppend::Appended(row) = &appended {
+                    self.lock_session_costs().push(row.as_ref().clone());
+                }
                 if let Some(receipt) = receipt {
-                    let mut storage = self.lock_storage();
-                    let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
-                    storage.refresh_from_disk()?;
                     reconcile_subscription_hold(&storage, receipt, record)?;
                 }
-                return Ok(settlement);
+                return Ok(match appended {
+                    SubscriptionAppend::Appended(_) => settlement,
+                    SubscriptionAppend::Replayed => CostSettlement::Replayed,
+                });
             }
             anyhow::ensure!(receipt.is_none(), "reserved settlement price is unknown");
             return Ok(CostSettlement::UnknownPricing);
@@ -234,6 +314,25 @@ impl CostTracker {
         }
         Ok(CostSettlement::Recorded { budget })
     }
+}
+
+/// A recovery projection was asked to project an unknown-priced row, which
+/// has no ledger row.
+#[derive(Debug, thiserror::Error)]
+#[error("recovery cost projection refuses an unknown-priced row")]
+pub(crate) struct UnknownRecoveryPricing;
+
+/// Make a verified replay durable before its outbox row is acknowledged.
+fn sync_replayed(storage: &CostStorage) -> Result<()> {
+    if let Some((file, _)) = super::open_cost_file(&storage.path, super::CostFileAccess::Read)? {
+        file.sync_all()
+            .with_context(|| format!("Failed to sync cost storage at {}", storage.path.display()))?;
+    }
+    #[cfg(unix)]
+    if let Some(parent) = storage.path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(super) fn reconcile_durable_projection(
@@ -317,5 +416,7 @@ fn reconcile_subscription_hold(
     )
 }
 
+#[cfg(test)]
+mod subscription_tests;
 #[cfg(test)]
 mod tests;

@@ -579,6 +579,7 @@ mod tests {
             cache_read_input_tokens: 20,
             source: crate::llm::route_decision::TokenUsageSource::Reported,
             cost_usd: Some(0.001_234),
+            settlement_class: None,
         };
 
         scheduler.record_usage(id, &record).unwrap();

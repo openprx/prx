@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 mod report;
 mod settlement;
-pub use report::{CostTotals, WorkspaceCostReport, workspace_cost_report};
+pub use report::{CostTotals, ModelCostTotals, WorkspaceCostReport, workspace_cost_report};
 #[cfg(test)]
 pub(crate) use settlement::{crash_after_append, crash_before_append, force_io_error, take_recovery_projection_faults};
 
@@ -1069,6 +1069,7 @@ pub(crate) fn settlement_row_is_authentic(row: &CostRecord) -> bool {
             cache_read_input_tokens: row.cache_read_input_tokens.unwrap_or(0),
             source,
             cost_usd: Some(usage.cost_usd),
+            settlement_class: None,
         };
         settlement_fingerprint(&record, usage.cost_usd).is_ok_and(|expected| expected == digest)
     };
@@ -1155,6 +1156,18 @@ impl CostStorage {
 
     fn has_settlement(&self, settlement_id: &str) -> bool {
         self.settlement_ids.contains(settlement_id)
+    }
+
+    /// The `billing` class of the stored row for `settlement_id`. The caller
+    /// holds the cross-process ledger lock and has verified the replay.
+    fn settlement_billing(&self, settlement_id: &str) -> Result<Option<String>> {
+        let mut billing = None;
+        self.for_each_record(|stored| {
+            if stored.settlement_id.as_deref() == Some(settlement_id) {
+                billing = stored.billing;
+            }
+        })?;
+        Ok(billing)
     }
 
     /// The caller holds the cross-process ledger lock. Legacy rows prove
@@ -2275,6 +2288,7 @@ mod tests {
             cache_read_input_tokens: 0,
             source: crate::llm::route_decision::TokenUsageSource::Reported,
             cost_usd,
+            settlement_class: None,
         }
     }
 
@@ -2473,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_usage_is_not_recorded_as_unknown_pricing_or_zero() {
+    fn subscription_usage_is_recorded_as_one_zero_cost_subscription_row() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::for_workspace(enabled_config(), tmp.path()).unwrap();
         let mut record = metered_record("turn-subscription", None);
@@ -2496,12 +2510,12 @@ mod tests {
             Some("subscription")
         );
         assert!(encoded.get("cost_usd").is_none(), "{encoded}");
-        assert_eq!(tracker.get_summary().unwrap().request_count, 0);
-        let ledger = tmp.path().join("state").join("costs.jsonl");
-        if ledger.exists() {
-            let persisted = std::fs::read_to_string(ledger).unwrap();
-            assert!(persisted.trim().is_empty(), "{persisted}");
-        }
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.session_cost_usd.to_bits(), 0.0_f64.to_bits());
+        let persisted = std::fs::read_to_string(tmp.path().join("state").join("costs.jsonl")).unwrap();
+        assert_eq!(persisted.lines().count(), 1, "{persisted}");
+        assert!(persisted.contains(r#""billing":"subscription""#), "{persisted}");
     }
 }
 

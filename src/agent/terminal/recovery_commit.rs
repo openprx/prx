@@ -384,7 +384,7 @@ pub(super) async fn finalize_recovery_terminal(
         RecoveryTerminalOutcome::Conflict => anyhow::bail!("recovery terminal commit conflict"),
     };
 
-    if pricing == RecoveryPricing::Metered {
+    if matches!(pricing, RecoveryPricing::Metered | RecoveryPricing::Subscription) {
         let skip_inline = {
             #[cfg(test)]
             {
@@ -778,7 +778,7 @@ fn project_committed_usage(
             return Ok(InlineProjection::of(state));
         }
     };
-    let projected = tracker.project_recovery_usage(&usage);
+    let projected = tracker.project_recovery_usage(&usage, row.pricing);
     let crash_before_ack = {
         #[cfg(test)]
         {

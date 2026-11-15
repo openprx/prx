@@ -347,7 +347,7 @@ fn binding_a_stricter_scope_can_only_reduce_the_original_money_owner() {
 }
 
 #[tokio::test]
-async fn a_subscription_decision_settles_without_a_priced_row() -> anyhow::Result<()> {
+async fn a_subscription_decision_settles_with_one_zero_cost_row() -> anyhow::Result<()> {
     let workspace = tempfile::tempdir()?;
     let mut config = Config::default();
     config.workspace_dir = workspace.path().to_owned();
@@ -417,11 +417,13 @@ async fn a_subscription_decision_settles_without_a_priced_row() -> anyhow::Resul
     assert!(settled.get("cost_usd").is_none());
     assert!(settled.get("settlement_sha256").is_none());
     assert!(settled.get("cost_row_sha256").is_none());
-    let ledger = workspace.path().join("state/costs.jsonl");
-    if ledger.exists() {
-        let persisted = std::fs::read_to_string(&ledger)?;
-        assert!(persisted.trim().is_empty(), "{persisted}");
-    }
+    // CF-R8: one `$0` subscription row (D9), outside every micro-USD total.
+    let persisted = std::fs::read_to_string(workspace.path().join("state/costs.jsonl"))?;
+    assert_eq!(persisted.lines().count(), 1, "{persisted}");
+    let row: crate::cost::types::CostRecord = serde_json::from_str(persisted.lines().next().unwrap_or_default())?;
+    assert_eq!(row.billing.as_deref(), Some("subscription"));
+    assert_eq!(row.usage.cost_usd.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(row.usage.total_tokens, 18);
     assert_eq!(scope.remaining_budgets().tokens, budgets.tokens - 18);
     assert_eq!(scope.remaining_budgets().micro_usd, budgets.micro_usd);
     let tracker = crate::cost::tracker::CostTracker::for_workspace(config.cost.clone(), workspace.path())?;

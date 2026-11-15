@@ -1,7 +1,7 @@
 //! Process-level projection of the recovery cost outbox (Part-2 D§5.2, OV-11)
 //! and the one-time legacy decision file warning (D§1, OV-1).
 //!
-//! Every committed metered terminal has one outbox row. The inline path in
+//! Every committed metered or subscription terminal has one outbox row. The inline path in
 //! `agent::terminal::recovery_commit` projects it right after the commit; this
 //! projector owns every row the inline path did not finish. It needs only a
 //! recovery repository whose outbox table exists: it never activates the
@@ -94,7 +94,8 @@ pub(crate) struct PassReport {
     pub(crate) retryable_seen: usize,
     /// Rows whose state the pass changed.
     pub(crate) progressed: usize,
-    /// Metered rows the pass left retryable (`pending` or `error`).
+    /// Metered or subscription rows the pass left retryable (`pending` or
+    /// `error`).
     pub(crate) retryable_left: usize,
     /// The scan reached the end of the retryable set. A failed, cancelled or
     /// deadline-cut pass is never exhausted.
@@ -267,7 +268,7 @@ pub(crate) fn run_pass(
             if stopped() {
                 return Ok(report);
             }
-            if row.pricing != RecoveryPricing::Metered {
+            if row.pricing == RecoveryPricing::Unknown {
                 continue;
             }
             let opened = tracker.get_or_insert_with(|| open_tracker(cost_config, workspace_dir));
@@ -312,7 +313,8 @@ struct RowProjection {
     progressed: bool,
 }
 
-/// Project one metered row and record its state.
+/// Project one metered or subscription row, by its signed pricing (D8), and
+/// record its state.
 fn project_row(
     repository: &dyn RecoveryRepository,
     tracker: &Result<Arc<crate::cost::tracker::CostTracker>, RecoveryCostState>,
@@ -334,7 +336,7 @@ fn project_row(
                     return unchanged;
                 }
             };
-            let projected = tracker.project_recovery_usage(&usage);
+            let projected = tracker.project_recovery_usage(&usage, row.pricing);
             #[cfg(test)]
             if projected
                 .as_ref()
@@ -371,7 +373,7 @@ pub(crate) fn is_blocked(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<crate::cost::tracker::LedgerBlocked>())
 }
 
-/// The metered usage carried by outbox facts, if any.
+/// The usage carried by outbox facts, if any.
 pub(crate) fn usage_from_facts(facts: &[u8]) -> anyhow::Result<Option<MeteredTokenUsageRecord>> {
     let value: serde_json::Value = serde_json::from_slice(facts)?;
     match value.get("usage") {

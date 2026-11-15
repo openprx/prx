@@ -452,8 +452,16 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                     ("Month", &report.month),
                     ("All time", &report.all_time),
                 ] {
+                    let subscription = if totals.subscription_requests > 0 {
+                        format!(
+                            " ({} subscription-billed; no per-token cost)",
+                            totals.subscription_requests
+                        )
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{label}: ${:.6}; {} tokens; {} requests ({} with reported usage)",
+                        "{label}: ${:.6}; {} tokens; {} requests ({} with reported usage){subscription}",
                         totals.cost_usd, totals.total_tokens, totals.requests, totals.reported_requests
                     );
                 }

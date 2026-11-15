@@ -3762,7 +3762,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         )
                         .await
                         {
-                            Ok(receipt) => receipt.usage_settlement,
+                            Ok(receipt) => receipt.into_session_usage(),
                             Err(error) => {
                                 return Err(error);
                             }
@@ -3840,7 +3840,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     )
                     .await
                     {
-                        Ok(receipt) => receipt.usage_settlement,
+                        Ok(receipt) => receipt.into_session_usage(),
                         Err(error) => {
                             return Err(error);
                         }
@@ -4411,7 +4411,7 @@ Retry with a compatible model: /provider {shown} <model>",
             )
             .await
             {
-                Ok(receipt) => receipt.usage_settlement,
+                Ok(receipt) => receipt.into_session_usage(),
                 Err(error) => {
                     return Err(error);
                 }
@@ -4502,7 +4502,7 @@ Retry with a compatible model: /provider {shown} <model>",
         )
         .await
         {
-            Ok(receipt) => receipt.usage_settlement,
+            Ok(receipt) => receipt.into_session_usage(),
             Err(error) => {
                 return Err(error);
             }

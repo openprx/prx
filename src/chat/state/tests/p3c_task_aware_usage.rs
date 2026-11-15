@@ -29,6 +29,7 @@ fn record(total_tokens: u64) -> MainSessionTokenUsageRecord {
         cache_read_input_tokens: 0,
         source: TokenUsageSource::Reported,
         cost_usd: None,
+        settlement_class: None,
     }
 }
 

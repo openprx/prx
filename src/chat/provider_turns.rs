@@ -955,7 +955,7 @@ async fn commit_completed_provider_turn(
         )
         .await
         {
-            Ok(receipt) => receipt.usage_settlement,
+            Ok(receipt) => receipt.into_session_usage(),
             Err(error) => {
                 tracing::error!(error = %error, "Chat terminal persistence is unconfirmed");
                 return false;

@@ -620,6 +620,7 @@ mod tests {
                         cache_read_input_tokens: 0,
                         source: crate::llm::route_decision::TokenUsageSource::Reported,
                         cost_usd: Some(0.25),
+                        settlement_class: None,
                     });
                 record
                     .background_sessions

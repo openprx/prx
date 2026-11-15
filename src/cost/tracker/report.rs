@@ -13,6 +13,9 @@ pub struct CostTotals {
     pub total_tokens: u64,
     pub requests: u64,
     pub reported_requests: u64,
+    /// Settled turns billed by subscription: counted in `requests` and the
+    /// token sums, with no per-token cost (D10).
+    pub subscription_requests: u64,
 }
 impl CostTotals {
     fn add(&mut self, row: &super::CostRecord) -> Result<()> {
@@ -34,6 +37,32 @@ impl CostTotals {
         if row.settlement_source == Some(crate::llm::route_decision::TokenUsageSource::Reported) {
             self.reported_requests += 1;
         }
+        if is_subscription(row) {
+            self.subscription_requests += 1;
+        }
+        Ok(())
+    }
+}
+
+fn is_subscription(row: &super::CostRecord) -> bool {
+    row.billing.as_deref() == Some(crate::cost::types::SUBSCRIPTION_BILLING)
+}
+
+/// One model's all-time totals and its billing class: `subscription` when
+/// every row of the model is subscription-billed, absent otherwise.
+#[derive(Debug, Default, Serialize)]
+pub struct ModelCostTotals {
+    #[serde(flatten)]
+    pub totals: CostTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<&'static str>,
+}
+
+impl ModelCostTotals {
+    fn add(&mut self, row: &super::CostRecord) -> Result<()> {
+        self.totals.add(row)?;
+        self.billing = (self.totals.subscription_requests == self.totals.requests)
+            .then_some(crate::cost::types::SUBSCRIPTION_BILLING);
         Ok(())
     }
 }
@@ -45,7 +74,7 @@ pub struct WorkspaceCostReport {
     pub month: CostTotals,
     pub all_time: CostTotals,
     /// All-time totals, grouped by redacted model label.
-    pub by_model: BTreeMap<String, CostTotals>,
+    pub by_model: BTreeMap<String, ModelCostTotals>,
     pub reserved_requests: usize,
     pub unsettled_dispatched_requests: usize,
     /// Includes estimates. This is not an additional settled charge or a vendor billing cap.
@@ -243,6 +272,28 @@ mod tests {
         assert_eq!(report.all_time.requests, 0);
         assert_eq!(report.outstanding_reservation_micro_usd, 0);
         assert_eq!(report.unsettled_dispatched_requests, 1);
+    }
+
+    #[test]
+    fn subscription_rows_are_counted_and_their_model_carries_billing() {
+        let now = Utc::now();
+        let mut subscription =
+            CostRecord::from_settlement("scope", "sub", TokenUsage::new("kimi-code/k", 10, 5, 0.0, 0.0));
+        subscription.billing = Some("subscription".to_owned());
+        let metered = CostRecord::from_settlement("scope", "metered", TokenUsage::new("alpha/model", 4, 2, 1.0, 1.0));
+        let ledger = [&subscription, &metered]
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = summarize(&ledger, now, 0, 0, 0).unwrap();
+        assert_eq!(report.all_time.requests, 2);
+        assert_eq!(report.all_time.subscription_requests, 1);
+        assert_eq!(report.all_time.total_tokens, 21);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["by_model"]["kimi-code/k"]["billing"], "subscription");
+        assert_eq!(json["by_model"]["kimi-code/k"]["subscription_requests"], 1);
+        assert!(json["by_model"]["alpha/model"].get("billing").is_none());
     }
 
     #[test]

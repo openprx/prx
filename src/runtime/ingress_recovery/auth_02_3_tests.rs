@@ -29,7 +29,7 @@ const OUTBOX_FACT_KEYS: [&str; 7] = [
     "final_event_id",
 ];
 
-fn home_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+pub(super) fn home_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tombstone_fixture::home_dir();
     let workspace = dir.path().canonicalize().expect("test: workspace");
     (dir, workspace)
@@ -46,6 +46,33 @@ fn ledger_lines(workspace: &Path, terminal_id: &str) -> usize {
     .count()
 }
 
+/// The ledger rows of `terminal_id`, parsed.
+pub(super) fn ledger_rows(workspace: &Path, terminal_id: &str) -> Vec<crate::cost::types::CostRecord> {
+    match std::fs::read_to_string(workspace.join("state").join("costs.jsonl")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("test: read cost ledger: {error}"),
+    }
+    .lines()
+    .map(|line| serde_json::from_str::<crate::cost::types::CostRecord>(line).expect("test: ledger row"))
+    .filter(|row| row.settlement_id.as_deref() == Some(terminal_id))
+    .collect()
+}
+
+/// CF-R8: exactly one authentic `$0` subscription row for the terminal.
+pub(super) fn assert_subscription_row(workspace: &Path, terminal_id: &str) {
+    let rows = ledger_rows(workspace, terminal_id);
+    assert_eq!(rows.len(), 1, "test: one subscription row per settled terminal");
+    let row = rows.first().expect("test: subscription row");
+    assert_eq!(row.usage.cost_usd.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(row.billing.as_deref(), Some("subscription"));
+    assert_eq!(
+        (row.usage.input_tokens, row.usage.output_tokens, row.usage.total_tokens),
+        (10, 5, 15)
+    );
+    assert!(crate::cost::tracker::settlement_row_is_authentic(row));
+}
+
 fn assert_closed_outbox_facts(facts: &[u8]) {
     let value: serde_json::Value = serde_json::from_slice(facts).expect("test: outbox facts");
     let object = value.as_object().expect("test: outbox object");
@@ -60,7 +87,21 @@ fn assert_closed_outbox_facts(facts: &[u8]) {
     );
 }
 
-fn first_outbox(workspace: &Path) -> fixture_readback::OutboxRow {
+/// A completed terminal draft whose usage (10/5/15 tokens) was served by the
+/// `kimi-code` subscription provider.
+pub(super) fn subscription_commit(terminal_id: &str) -> crate::agent::terminal::TurnTerminalDraft {
+    let mut commit = completed_commit(terminal_id);
+    commit.provider_outcome = Some(
+        crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &RouteDecision::single_candidate("kimi-code", "kimi-for-coding"),
+            commit.telemetry.started_at,
+            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+        ),
+    );
+    commit
+}
+
+pub(super) fn first_outbox(workspace: &Path) -> fixture_readback::OutboxRow {
     fixture_readback::outbox_rows(workspace)
         .into_iter()
         .next()
@@ -74,7 +115,7 @@ fn first_claim_payload(workspace: &Path) -> String {
         .expect("test: claim payload")
 }
 
-struct SkipInline;
+pub(super) struct SkipInline;
 impl Drop for SkipInline {
     fn drop(&mut self) {
         crate::agent::terminal::recovery_commit::skip_inline_projection(false);
@@ -223,14 +264,7 @@ pub(super) async fn recovery_nonmonetary_pricing_commits_disposition() {
     unknown_service.shutdown(Instant::now() + Duration::from_secs(5)).await;
 
     let sub_id = "prx-subscription";
-    let mut subscription = completed_commit(sub_id);
-    subscription.provider_outcome = Some(
-        crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
-            &RouteDecision::single_candidate("kimi-code", "kimi-for-coding"),
-            subscription.telemetry.started_at,
-            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
-        ),
-    );
+    let mut subscription = subscription_commit(sub_id);
     let sub_service = bind_terminal_fixture(
         &workspace,
         Arc::clone(&memory),
@@ -245,16 +279,12 @@ pub(super) async fn recovery_nonmonetary_pricing_commits_disposition() {
         matches!(sub_receipt.cost_settlement, Some(CostSettlement::Subscription { .. })),
         "test: subscription usage must retain its nonmonetary disposition"
     );
-    assert_eq!(
-        ledger_lines(&workspace, sub_id),
-        0,
-        "test: subscription usage must not create a monetary ledger entry"
-    );
+    assert_subscription_row(&workspace, sub_id);
 
     let rows = fixture_readback::outbox_rows(&workspace);
     assert!(
         rows.iter().all(|row| row.state == "acknowledged"),
-        "test: nonmonetary dispositions must finish without leaving retryable work"
+        "test: unknown and projected subscription rows leave no retryable work"
     );
     assert!(
         rows.iter().any(|row| row.pricing == "unknown"),
@@ -1507,7 +1537,7 @@ pub(super) fn recovery_restart_from_killed_process() {
     drop(dir);
 }
 
-struct RecoveryChild(std::process::Child);
+pub(super) struct RecoveryChild(std::process::Child);
 impl std::ops::Deref for RecoveryChild {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
@@ -1536,7 +1566,10 @@ impl Drop for RecoveryChild {
     }
 }
 
-fn spawn_recovery_child(workspace: &Path, phase: &str) -> (RecoveryChild, std::sync::mpsc::Receiver<String>) {
+pub(super) fn spawn_recovery_child(
+    workspace: &Path,
+    phase: &str,
+) -> (RecoveryChild, std::sync::mpsc::Receiver<String>) {
     let child = std::process::Command::new(std::env::current_exe().expect("test: recovery child executable"))
         .args([
             "runtime::ingress_recovery::tests::fresh_process_recovery_child",
@@ -1601,7 +1634,11 @@ pub(super) async fn fresh_process_recovery_child() {
 
     let fabric = MemoryFabric::new(Arc::clone(&memory), workspace.to_string_lossy());
     let cost = priced_cost_config();
-    let mut commit = completed_commit("prx-killed");
+    let mut commit = if std::env::var("PRX_RECOVERY_TEST_PHASE").as_deref() == Ok("commit-subscription") {
+        subscription_commit("prx-killed-subscription")
+    } else {
+        completed_commit("prx-killed")
+    };
     let service = bind_terminal_fixture(&workspace, Arc::clone(&memory), &mut commit, &cost).await;
     crate::agent::terminal::recovery_commit::skip_inline_projection(true);
     finalize_turn(&fabric, commit, &cost, &workspace)

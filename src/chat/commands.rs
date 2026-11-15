@@ -635,18 +635,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
 pub(crate) fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
     let summary = chat_session.token_usage_summary();
     let total_prefix = if summary.has_estimates() { "~" } else { "" };
-    let cost = if summary.cost_is_unknown() {
-        if summary.known_cost_usd > 0.0 {
-            format!(
-                "cost unknown (known {})",
-                session::format_cost_usd(summary.known_cost_usd)
-            )
-        } else {
-            "cost unknown".to_string()
-        }
-    } else {
-        session::format_cost_usd(summary.known_cost_usd)
-    };
+    let cost = session::format_session_cost(summary);
 
     let cache_detail = if summary.cache_creation_input_tokens > 0 || summary.cache_read_input_tokens > 0 {
         format!(
@@ -848,18 +837,7 @@ fn format_export_usage_line(session: &session::ChatSession) -> Option<String> {
         return None;
     }
     let prefix = if summary.has_estimates() { "~" } else { "" };
-    let cost = if summary.cost_is_unknown() {
-        if summary.known_cost_usd > 0.0 {
-            format!(
-                "cost unknown (known {})",
-                session::format_cost_usd(summary.known_cost_usd)
-            )
-        } else {
-            "cost unknown".to_string()
-        }
-    } else {
-        session::format_cost_usd(summary.known_cost_usd)
-    };
+    let cost = session::format_session_cost(summary);
     Some(format!(
         "**Usage**: {prefix}{} tok (real {}, est ~{}) | **Cost**: {cost}",
         session::format_token_count_compact(summary.total_tokens),
@@ -1258,6 +1236,7 @@ mod mode_tests {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.0105),
+                settlement_class: None,
             });
 
         let body = export_session_body_in_unique_tempdir(&session, "json");
@@ -1322,6 +1301,7 @@ mod mode_tests {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Estimated,
                 cost_usd: None,
+                settlement_class: None,
             });
 
         let body = export_session_body_in_unique_tempdir(&session, "md");
@@ -1358,6 +1338,7 @@ mod mode_tests {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.0105),
+                settlement_class: None,
             });
         let ctx = CommandContext {
             model_name: "kimi2.6",
@@ -1412,6 +1393,7 @@ mod mode_tests {
                 cache_read_input_tokens: 700,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.005_835),
+                settlement_class: None,
             });
         let ctx = CommandContext {
             model_name: "claude-sonnet-4-20250514",
@@ -1451,6 +1433,7 @@ mod mode_tests {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Estimated,
                 cost_usd: Some(0.0001),
+                settlement_class: None,
             });
         let ctx = CommandContext {
             model_name: "kimi2.6",
@@ -1492,6 +1475,7 @@ mod mode_tests {
                 cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: None,
+                settlement_class: None,
             });
         let ctx = CommandContext {
             model_name: "llama3",

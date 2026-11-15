@@ -14,6 +14,7 @@ pub(super) async fn operator_process_publication(
     authority: Arc<crate::runtime::child_source::operator_process::OperatorProcessAuthority>,
     mut build: PublicationInputs<'_>,
     runtime: PublicationLoopRuntime,
+    chat_lineage: bool,
 ) -> anyhow::Result<Arc<TurnRuntimeService>> {
     authority.verify()?;
     let snapshots = authority.snapshots();
@@ -116,6 +117,7 @@ pub(super) async fn operator_process_publication(
         memory_loader: None,
         loop_runtime: Some(runtime),
         publication_policy: build.surface_policy,
+        chat_lineage,
         operator_process: Some(Arc::clone(&authority)),
         operator_task: None,
         ordinary_parent: None,

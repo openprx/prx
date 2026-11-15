@@ -220,6 +220,7 @@ impl OperatorProcessLaunch {
             worker.parent_capability.is_none()
                 && worker.ordinary_source.is_none()
                 && worker.operator_source.is_none()
+                && worker.direct_tools.is_none()
                 && worker.task == source.task.trim()
                 && Some(worker.run_id.as_str()) == self.scope.run_id.as_deref()
                 && worker.config_generation == self.config_generation
@@ -292,6 +293,7 @@ impl OperatorProcessLaunch {
             .route
             .as_ref()
             .map(|_| source.resolved.credential().reference().clone());
+        worker.direct_tools = source.publication.chat_lineage_direct_tools();
         worker.operator_source = Some(snapshots);
         Ok(())
     }

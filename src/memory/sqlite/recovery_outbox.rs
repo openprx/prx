@@ -61,6 +61,15 @@ pub(super) fn schema(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The state a new outbox row starts in: a metered or subscription row waits
+/// for its ledger projection (CF-R8); an unknown-priced row has none.
+const fn initial_state(pricing: RecoveryPricing) -> RecoveryCostState {
+    match pricing {
+        RecoveryPricing::Metered | RecoveryPricing::Subscription => RecoveryCostState::Pending,
+        RecoveryPricing::Unknown => RecoveryCostState::Acknowledged,
+    }
+}
+
 pub(super) fn insert_in(
     tx: &rusqlite::Transaction<'_>,
     directory: &KeyDirectory,
@@ -83,11 +92,7 @@ pub(super) fn insert_in(
         "recovery cost outbox facts are invalid"
     );
     validate_facts(facts, pricing)?;
-    let state = if pricing == RecoveryPricing::Metered {
-        RecoveryCostState::Pending
-    } else {
-        RecoveryCostState::Acknowledged
-    };
+    let state = initial_state(pricing);
     let key = directory.load(key_id)?;
     let usage_digest = usage_digest_mac(&key, facts)?;
     let mac = sign_outbox(
@@ -597,11 +602,7 @@ pub(crate) fn sign_outbox_for_test(
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let directory = KeyDirectory::open(memory.db_path.parent().context("missing memory directory")?, false)?;
     let key = directory.load(key_id)?;
-    let state = if pricing == RecoveryPricing::Metered {
-        RecoveryCostState::Pending
-    } else {
-        RecoveryCostState::Acknowledged
-    };
+    let state = initial_state(pricing);
     Ok((
         sign_outbox(
             &key,

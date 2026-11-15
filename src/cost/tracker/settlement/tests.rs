@@ -45,6 +45,7 @@ fn usage() -> MeteredTokenUsageRecord {
         cache_read_input_tokens: 0,
         source: TokenUsageSource::Reported,
         cost_usd: Some(0.125),
+        settlement_class: None,
     }
 }
 fn rows(path: &Path) -> Result<Vec<Value>> {
@@ -310,7 +311,7 @@ fn experiment_case_usage_excludes_prior_unknown_attempts_without_freeing_parent_
 }
 
 #[test]
-fn subscription_settlement_reopens_without_a_cost_projection_and_rejects_conflicts() -> Result<()> {
+fn subscription_settlement_reopens_with_one_subscription_row_and_rejects_conflicts() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let tracker = CostTracker::new(config(), workspace.path())?;
     let mut reserved = request();
@@ -328,7 +329,7 @@ fn subscription_settlement_reopens_without_a_cost_projection_and_rejects_conflic
         total_tokens: record.total_tokens,
     };
     assert_eq!(tracker.settle_and_reconcile_estimated(&receipt, &record)?, expected);
-    assert_eq!(tracker.get_summary()?.request_count, 0);
+    assert_eq!(tracker.get_summary()?.request_count, 1);
     let journal_path = workspace.path().join("state").join(JOURNAL);
     let journal = rows(&journal_path)?;
     assert_eq!(journal.len(), 3);
@@ -356,7 +357,10 @@ fn subscription_settlement_reopens_without_a_cost_projection_and_rejects_conflic
     );
     assert!(event.get("actual_micro_usd").is_none());
     let reopened = CostTracker::new(config(), workspace.path())?;
-    assert_eq!(reopened.settle_and_reconcile_estimated(&receipt, &record)?, expected);
+    assert_eq!(
+        reopened.settle_and_reconcile_estimated(&receipt, &record)?,
+        CostSettlement::Replayed
+    );
     assert_eq!(rows(&journal_path)?, journal);
     let usage = reopened.physical_scope_usage("prx_settlement_turn")?;
     assert_eq!(usage.calls, 1);
@@ -369,9 +373,8 @@ fn subscription_settlement_reopens_without_a_cost_projection_and_rejects_conflic
     assert!(reopened.settle_and_reconcile_estimated(&receipt, &record).is_err());
     assert_eq!(rows(&journal_path)?, journal);
     assert_eq!(remaining_micro_usd_read_only(&config(), workspace.path())?, 1_000_000);
-    let cost_path = workspace.path().join("state/costs.jsonl");
-    if cost_path.exists() {
-        assert_eq!(fs::read_to_string(cost_path)?.trim(), "");
-    }
+    let ledger = fs::read_to_string(workspace.path().join("state/costs.jsonl"))?;
+    assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    assert!(ledger.contains(r#""billing":"subscription""#), "{ledger}");
     Ok(())
 }

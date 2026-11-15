@@ -200,6 +200,12 @@ pub struct WorkerManifest {
     /// capability seal, so a worker cannot be started with it stripped.
     #[serde(default)]
     pub channel_excluded_tools: Vec<String>,
+    /// The direct names of a chat-lineage child (D5), filled by the parent
+    /// only when it descends from a chat root and covered by the manifest
+    /// seal. The worker publishes them instead of `always_include`; `None`
+    /// keeps that rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_tools: Option<Vec<String>>,
     pub system_prompt: Option<String>,
     pub identity_dir: Option<String>,
     pub scope_sender: Option<String>,
@@ -424,6 +430,7 @@ mod tests {
             },
             allowed_tools: vec!["shell".into(), "file_read".into()],
             channel_excluded_tools: Vec::new(),
+            direct_tools: None,
             system_prompt: None,
             identity_dir: Some("identity/worker".into()),
             scope_sender: Some("openprx_user".into()),
@@ -605,6 +612,7 @@ mod tests {
             memory_event_recording: crate::memory::MemoryEventRecording::default(),
             allowed_tools: Vec::new(),
             channel_excluded_tools: Vec::new(),
+            direct_tools: None,
             system_prompt: None,
             identity_dir: None,
             scope_sender: None,

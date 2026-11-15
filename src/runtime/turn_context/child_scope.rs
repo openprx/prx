@@ -134,14 +134,6 @@ impl TurnRuntimeService {
                 .entry_for_public_name(name)
                 .is_some_and(|entry| matches!(entry.exposure, Exposure::Direct) && permitted(entry))
         });
-        // Chat keeps sessions_spawn deferred. Prepare its bounded child
-        // manifest now, so a later admitted search hit can use the same
-        // durable parent authority without exposing an eager model schema.
-        let deferred_chat_delegator = trusted.surface == TurnSurfaceKind::Interactive
-            && self
-                .catalog
-                .entry_for_public_name("sessions_spawn")
-                .is_some_and(|entry| entry.supports_metadata_discovery() && permitted(entry));
         let input = routing_input.as_str();
         // This proposal comes from the pinned configuration of a sealed
         // embedded source, not from synthetic text or operator identity.
@@ -162,7 +154,7 @@ impl TurnRuntimeService {
                         .is_some_and(|entry| crate::tools::surface_owner::publication::is_delegator(&entry.public_name))
                 })
         });
-        if !names_delegator && !direct_delegator && !deferred_chat_delegator && !inherited_delegator {
+        if !names_delegator && !direct_delegator && !inherited_delegator {
             return None;
         }
         let direct = if names_delegator {
