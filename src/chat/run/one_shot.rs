@@ -122,12 +122,13 @@ pub(super) fn note_turn_failure(binding: Option<&ChatTurnBinding>, error: &anyho
 }
 
 /// Read the turn's end: the driver's refusal note first, then a failure, then
-/// a committed answer; a turn that committed nothing and did not fail was
-/// cancelled (Ctrl-C), which is a failure for the process.
+/// the answer of a turn whose ordered commit was acknowledged (`committed`);
+/// a turn without an acknowledged commit that did not fail was cancelled
+/// (Ctrl-C), which is a failure for the process.
 pub(super) fn outcome(
     binding: Option<&ChatTurnBinding>,
     turn_failed: bool,
-    answered: bool,
+    committed: bool,
     history: &[ChatMessage],
 ) -> anyhow::Result<OneShotReply> {
     match binding.and_then(ChatTurnBinding::failure_note) {
@@ -136,7 +137,7 @@ pub(super) fn outcome(
         _ => {}
     }
     anyhow::ensure!(!turn_failed, "the chat turn failed");
-    anyhow::ensure!(answered, "the chat turn was cancelled");
+    anyhow::ensure!(committed, "the chat turn was cancelled");
     let reply = history
         .last()
         .filter(|message| message.role == "assistant")

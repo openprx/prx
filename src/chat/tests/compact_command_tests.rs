@@ -458,3 +458,127 @@ async fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one
         "the provider view is the compacted source with the enriched request replacing the plain one"
     );
 }
+
+/// Upper bound for one awaited-acknowledgement test.
+const ACK_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn sqlite_test_memory() -> (tempfile::TempDir, std::sync::Arc<dyn crate::memory::Memory>) {
+    let dir = tempfile::TempDir::new().expect("test: temp dir");
+    let memory: std::sync::Arc<dyn crate::memory::Memory> =
+        std::sync::Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+    (dir, memory)
+}
+
+#[tokio::test]
+async fn deterministic_trim_publishes_a_saved_revision_that_later_reads_keep() {
+    tokio::time::timeout(ACK_TEST_DEADLINE, async {
+        let (_dir, memory) = sqlite_test_memory();
+        let mut history = vec![ChatMessage::system("sys")];
+        history.extend((0..20).map(long_user));
+        let state = crate::chat::acked_session::TestSessionDispatcher::state_with_history(history.clone());
+        let session_id = state.session.id.clone();
+        let harness = crate::chat::acked_session::TestSessionDispatcher::spawn(std::sync::Arc::clone(&memory), state);
+        let before = harness.dispatcher.session_publisher().current();
+        let mut provider_view = history.clone();
+
+        let outcome = crate::chat::compaction::apply_deterministic_trim_and_sync(
+            &mut provider_view,
+            crate::chat::action::CompactReason::Manual,
+            &harness.dispatcher,
+            &harness.commits,
+        )
+        .await;
+        let after_trim = harness.dispatcher.session_publisher().current();
+        let later = harness
+            .dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::ModeChanged(crate::agent::turn_contracts::ChatMode::Plan),
+                &harness.commits,
+            )
+            .await
+            .expect("test: later save acknowledged");
+        harness.stop().await;
+
+        let crate::chat::compaction::ManualCompactOutcome::Degraded { dropped_messages } = outcome else {
+            panic!("a deterministic trim reports the loss: {outcome:?}");
+        };
+        assert_eq!(dropped_messages, history.len() - provider_view.len());
+        assert!(dropped_messages > 0, "twenty oversized turns must lose some");
+        assert_eq!(
+            after_trim.revision,
+            before.revision + 1,
+            "the trim is one saved revision"
+        );
+        let trimmed: Vec<&str> = provider_view.iter().skip(1).map(|m| m.content.as_str()).collect();
+        let published: Vec<&str> = after_trim.session.turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(published, trimmed, "the acknowledged turns are the trimmed history");
+        let crate::chat::acked_session::Ack::Published(later) = later else {
+            panic!("a changed mode publishes a saved revision: {later:?}");
+        };
+        let kept: Vec<&str> = later.session.turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(kept, trimmed, "a later revision keeps the trimmed turns");
+        let key = format!("{}:{session_id}", crate::chat::session::SESSION_MEMORY_PREFIX);
+        let stored = memory
+            .get(&key)
+            .await
+            .expect("test: read stored row")
+            .expect("test: row stored");
+        assert!(
+            !stored.content.contains("turn-0-"),
+            "the stored row omits the dropped turns"
+        );
+        assert!(
+            stored.content.contains("turn-19-"),
+            "the stored row keeps the newest turn"
+        );
+    })
+    .await
+    .expect("deterministic_trim_publishes_a_saved_revision_that_later_reads_keep exceeded ACK_TEST_DEADLINE");
+}
+
+#[tokio::test]
+async fn a_guard_mismatched_reducer_patch_is_rejected_and_leaves_state_and_revision_unchanged() {
+    tokio::time::timeout(ACK_TEST_DEADLINE, async {
+        let (_dir, memory) = sqlite_test_memory();
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("q2"),
+        ];
+        let mut other = history.clone();
+        other.insert(1, ChatMessage::user("inserted"));
+        let patch = crate::agent::turn_contracts::CompactionPatch {
+            replacement: vec![ChatMessage::assistant("summary")],
+            append_after: Vec::new(),
+            guard: crate::agent::compaction::compaction_patch_guard_for(&other, 1, 3)
+                .expect("test: guard over another history"),
+        };
+        let harness = crate::chat::acked_session::TestSessionDispatcher::spawn(
+            memory,
+            crate::chat::acked_session::TestSessionDispatcher::state_with_history(history),
+        );
+        let before = harness.dispatcher.session_publisher().current();
+
+        let ack = harness
+            .dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::HistoryCompactionPatchApplied {
+                    reason: crate::chat::action::CompactReason::ContextOverflow,
+                    patch,
+                    compaction_config: crate::config::AgentCompactionConfig::default(),
+                },
+                &harness.commits,
+            )
+            .await
+            .expect("test: patch answered");
+        let after = harness.dispatcher.session_publisher().current();
+        harness.stop().await;
+
+        assert!(matches!(ack, crate::chat::acked_session::Ack::Rejected(_)), "{ack:?}");
+        assert_eq!((after.load_epoch, after.revision), (before.load_epoch, before.revision));
+        assert_eq!(after.session.turns.len(), before.session.turns.len());
+    })
+    .await
+    .expect("a_guard_mismatched_reducer_patch_is_rejected_and_leaves_state_and_revision_unchanged exceeded ACK_TEST_DEADLINE");
+}

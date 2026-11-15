@@ -434,4 +434,40 @@ mod tests {
         );
         assert!(matches!(second, Ack::Rejected(_)), "{second:?}");
     }
+
+    #[tokio::test]
+    async fn the_ordered_commit_marks_its_task_acknowledged_for_the_one_shot() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (_dir, memory) = sqlite_memory();
+            let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+            let mut state = TestSessionDispatcher::state_with_history(Vec::new());
+            let _ = state.reduce(crate::chat::action::Action::RecordUserTurn("q".to_owned()));
+            let harness = TestSessionDispatcher::spawn(memory, state);
+            let acknowledged_before = harness.commits.history_commit_acknowledged(task_id);
+
+            let committed = crate::chat::provider_turns::dispatch_ordered_provider_turn_commit_and_wait(
+                &harness.dispatcher,
+                &harness.commits,
+                task_id,
+                crate::chat::provider_turns::OrderedCommitTerminal::TurnCommitRequested { draft_id: None },
+                "q",
+                "pong",
+                false,
+                false,
+            )
+            .await;
+            let acknowledged_after = harness.commits.history_commit_acknowledged(task_id);
+            let published = harness.dispatcher.session_publisher().current();
+            harness.stop().await;
+
+            assert!(!acknowledged_before, "nothing is acknowledged before the commit");
+            assert_eq!(committed, Ok(()));
+            assert!(acknowledged_after, "the acknowledged commit is the one-shot's success");
+            let turns: Vec<&str> = published.session.turns.iter().map(|t| t.content.as_str()).collect();
+            assert_eq!(turns, vec!["q", "pong"]);
+        })
+        .await
+        .expect("the_ordered_commit_marks_its_task_acknowledged_for_the_one_shot exceeded its deadline");
+    }
 }

@@ -675,6 +675,20 @@ fn test_redux_history_compacted_basic_algorithm() {
     );
     // LogTrace must be emitted
     assert!(has_log_trace(&effects), "HistoryCompacted must emit LogTrace");
+    // The trimmed history is the durable state: turns are rebuilt from it and saved.
+    let trimmed_non_system: Vec<&str> = state
+        .session
+        .history
+        .iter()
+        .skip(1)
+        .map(|m| m.content.as_str())
+        .collect();
+    let turns: Vec<&str> = state.session.turns.iter().map(|t| t.content.as_str()).collect();
+    assert_eq!(turns, trimmed_non_system, "turns must equal the trimmed history");
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
+        "a deterministic trim must save the trimmed session"
+    );
 }
 
 /// S2-B Step 1: HistoryCompacted is a no-op when len<=1
@@ -692,6 +706,10 @@ fn test_redux_history_compacted_noop_when_short() {
     });
     assert_eq!(state.session.history.len(), 1, "unchanged when len<=1");
     assert!(has_log_trace(&effects), "a no-op still emits LogTrace(DEBUG)");
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::SaveSession(_))),
+        "a no-op saves nothing"
+    );
 }
 
 #[test]

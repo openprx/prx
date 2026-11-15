@@ -311,16 +311,46 @@ pub(super) async fn run_manual_compact(
         )
         .await;
     }
-    let messages_before = history.len();
-    compact_chat_history(history);
-    let _ = chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::HistoryCompacted {
-            reason: crate::chat::action::CompactReason::Manual,
+    apply_deterministic_trim_and_sync(
+        history,
+        crate::chat::action::CompactReason::Manual,
+        chat_dispatcher,
+        commits,
+    )
+    .await
+}
+
+/// The lossy fallback when no handoff or summary can be built: the reducer
+/// trims, rebuilds and saves its session first; only after that saved
+/// revision is acknowledged is the provider view trimmed the same way. A
+/// rejection, an acknowledgement without a saved revision or a failed
+/// acknowledgement leaves the provider view unchanged.
+pub(super) async fn apply_deterministic_trim_and_sync(
+    history: &mut Vec<ChatMessage>,
+    reason: crate::chat::action::CompactReason,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
+) -> ManualCompactOutcome {
+    match chat_dispatcher
+        .dispatch_awaited(crate::chat::action::Action::HistoryCompacted { reason }, commits)
+        .await
+    {
+        Ok(crate::chat::acked_session::Ack::Published(_)) => {
+            let messages_before = history.len();
+            compact_chat_history(history);
+            ManualCompactOutcome::Degraded {
+                dropped_messages: messages_before.saturating_sub(history.len()),
+            }
+        }
+        Ok(crate::chat::acked_session::Ack::Unchanged(_)) => ManualCompactOutcome::Refused {
+            reason: "Nothing to compact: the session history is already minimal.".to_owned(),
         },
-        "chat.history_compacted_manual",
-    );
-    ManualCompactOutcome::Degraded {
-        dropped_messages: messages_before.saturating_sub(history.len()),
+        Ok(crate::chat::acked_session::Ack::Rejected(rejection)) => ManualCompactOutcome::Refused {
+            reason: format!("Compaction refused: {rejection}. Nothing was changed."),
+        },
+        Err(error) => ManualCompactOutcome::Refused {
+            reason: format!("Compaction failed: {error}. Nothing was changed."),
+        },
     }
 }
 

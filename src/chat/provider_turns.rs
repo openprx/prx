@@ -855,7 +855,7 @@ pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
     empty_response: bool,
     record_user: bool,
 ) -> std::result::Result<(), String> {
-    match terminal {
+    let result = match terminal {
         #[cfg(feature = "terminal-tui")]
         OrderedCommitTerminal::StreamCompleted { draft_id, reasoning } => {
             dispatch_stream_completed_commit_and_wait(
@@ -884,7 +884,11 @@ pub(super) async fn dispatch_ordered_provider_turn_commit_and_wait(
             )
             .await
         }
+    };
+    if result.is_ok() {
+        turn_signal.record_history_commit(task_id);
     }
+    result
 }
 
 /// TUI ordered commit: the records, then `StreamCompleted`, acknowledged by

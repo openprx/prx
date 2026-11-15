@@ -18,8 +18,8 @@ use super::chat_events::{
 use super::compaction::refresh_context_budget_for_tui;
 use super::compaction::{
     apply_chat_compaction_patch_and_sync, bounded_legacy_chat_compaction_audit_source, build_chat_compaction_patch,
-    chat_embedding_upgrade_notice, compact_chat_history, legacy_compaction_token_metadata,
-    original_legacy_chat_compaction_audit_source, persist_legacy_chat_compaction_audit,
+    chat_embedding_upgrade_notice, legacy_compaction_token_metadata, original_legacy_chat_compaction_audit_source,
+    persist_legacy_chat_compaction_audit,
 };
 use super::copy_select::{copy_success_message, is_copy_command, select_copy_content};
 use super::file_mention::enrich_file_mentions_for_prompt;
@@ -673,7 +673,8 @@ async fn run_internal(
     // The one-shot message, queued literally (D4): no priority prefix or
     // command is interpreted. The input channel stays closed, so the loop
     // ends once this turn resolves.
-    let one_shot_turns_before = chat_session.session().turns.len();
+    // The one-shot succeeds when its turn's ordered commit is acknowledged.
+    let mut one_shot_task_id: Option<crate::chat::turn_scheduler::TurnTaskId> = None;
     let mut one_shot_binding: Option<Arc<binding::ChatTurnBinding>> = None;
     if let Some(turn) = one_shot.as_ref() {
         turn.enqueue(&mut input_backlog, &mut turn_scheduler, chat_session.session().turns.len());
@@ -3472,6 +3473,9 @@ Retry with a compatible model: /provider {shown} <model>",
             !chat_turn_binding.as_ref().is_some_and(|binding| binding.is_decided()) || provider_turn_task_id.is_some(),
             "decision-owned Chat turn could not acquire a scheduler task"
         );
+        if one_shot.is_some() {
+            one_shot_task_id = provider_turn_task_id;
+        }
         register_provider_history_commit_task(&mut history_commit_coordinator, &turn_scheduler, provider_turn_task_id);
         record_provider_turn_completion_context(
             &mut provider_turn_completion_contexts,
@@ -4046,17 +4050,13 @@ Retry with a compatible model: /provider {shown} <model>",
                 )
                 .await
             } else {
-                let messages_before = history.len();
-                compact_chat_history(&mut history);
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                    },
-                    "chat.history_compacted_preflight",
-                );
-                super::compaction::ManualCompactOutcome::Degraded {
-                    dropped_messages: messages_before.saturating_sub(history.len()),
-                }
+                super::compaction::apply_deterministic_trim_and_sync(
+                    &mut history,
+                    crate::chat::action::CompactReason::ContextOverflow,
+                    &chat_dispatcher,
+                    &turn_signal,
+                )
+                .await
             };
             persist_legacy_chat_compaction_audit(
                 mem.as_ref(),
@@ -4715,7 +4715,7 @@ Retry with a compatible model: /provider {shown} <model>",
         one_shot::outcome(
             one_shot_binding.as_deref(),
             plain_mode_turn_failed,
-            chat_session.session().turns.len() > one_shot_turns_before,
+            one_shot_task_id.is_some_and(|task_id| turn_signal.history_commit_acknowledged(task_id)),
             &history,
         )
     });

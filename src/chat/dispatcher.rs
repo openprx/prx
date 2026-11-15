@@ -524,6 +524,9 @@ pub enum TurnOutcomeKind {
 pub struct TurnCompletionSignal {
     turn_cancellation: CancellationToken,
     commit_failure: Arc<ParkingMutex<Option<String>>>,
+    /// The task whose ordered history commit was acknowledged last; the
+    /// one-shot reads its single turn's success from it.
+    last_acknowledged_commit: Arc<ParkingMutex<Option<crate::chat::turn_scheduler::TurnTaskId>>>,
     inner: Arc<tokio::sync::Notify>,
     outcome: Arc<ParkingMutex<Option<TurnOutcomeKind>>>,
     usage: Arc<ParkingMutex<ProviderUsageAccumulator>>,
@@ -554,6 +557,7 @@ impl TurnCompletionSignal {
         Self {
             turn_cancellation,
             commit_failure: Arc::new(ParkingMutex::new(None)),
+            last_acknowledged_commit: Arc::new(ParkingMutex::new(None)),
             inner: Arc::new(tokio::sync::Notify::new()),
             outcome: Arc::new(parking_lot::Mutex::new(None)),
             usage: Arc::new(ParkingMutex::new(ProviderUsageAccumulator::new())),
@@ -578,6 +582,16 @@ impl TurnCompletionSignal {
         }
         drop(failure);
         self.turn_cancellation.cancel();
+    }
+
+    /// Record that `task_id`'s ordered history commit was acknowledged.
+    pub(super) fn record_history_commit(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) {
+        *self.last_acknowledged_commit.lock() = Some(task_id);
+    }
+
+    /// Whether `task_id`'s ordered history commit is the last one acknowledged.
+    pub(super) fn history_commit_acknowledged(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> bool {
+        *self.last_acknowledged_commit.lock() == Some(task_id)
     }
 
     pub(super) fn ensure_history_commits_healthy(&self) -> anyhow::Result<()> {

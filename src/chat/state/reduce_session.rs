@@ -432,6 +432,10 @@ impl ChatState {
     /// 3. keep only the last [`COMPACT_KEEP_MESSAGES`] non-system messages (drain the older ones).
     /// 4. truncate a single message with an ellipsis when it exceeds [`COMPACT_CONTENT_CHARS`] chars.
     /// 5. drop oldest turns FIFO when the total budget exceeds [`COMPACT_TOTAL_CHARS`].
+    ///
+    /// The trimmed history is the session's durable state: its turns are
+    /// rebuilt from it and the result is saved, so every later reader sees
+    /// the trimmed revision.
     pub(super) fn reduce_history_compacted(&mut self, reason: CompactReason) -> Vec<Effect> {
         let history = &mut self.session.history;
         if history.len() <= 1 {
@@ -443,13 +447,19 @@ impl ChatState {
         compact_history_in_place(history);
 
         let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
-        vec![Effect::LogTrace {
-            level: tracing::Level::INFO,
-            msg: format!(
-                "HistoryCompacted reason={reason:?} len={} chars={final_chars}",
-                history.len()
-            ),
-        }]
+        let final_len = history.len();
+        self.session.turns = durable_turns_from_compacted_history(history);
+        self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+        self.ui.turn_count = self.session.turns.len();
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!("HistoryCompacted reason={reason:?} len={final_len} chars={final_chars}"),
+            },
+            Effect::SaveSession(self.session_commit()),
+            Effect::RequestRedraw,
+        ]
     }
 
     pub(super) fn reduce_history_compaction_patch_applied(
