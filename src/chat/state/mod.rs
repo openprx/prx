@@ -548,12 +548,27 @@ pub struct StreamingTurnDraft {
     /// turns report their own elapsed time instead of sharing a global timer.
     pub started_at_ms: i64,
     pub draft: StreamingDraft,
+    /// Phase 1 (`ProviderTurnReadyForCommit`) was accepted: the provider
+    /// produced its terminal payload and the draft waits for the ordered
+    /// commit. A late failure no longer applies to it.
+    pub ready_for_commit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleStreamingDraftView {
     pub sequence: u64,
     pub draft: StreamingDraft,
+}
+
+/// The result of [`ChatState::reduce_tracked`].
+#[derive(Debug)]
+pub struct TrackedReduction {
+    pub effects: Vec<Effect>,
+    /// The UI snapshot must be rebuilt (always `false` without the TUI).
+    pub ui_dirty: bool,
+    /// The action is a turn terminal this state accepted (R4); only an
+    /// accepted terminal notifies the turn's outcome.
+    pub terminal_accepted: bool,
 }
 
 /// Intermediate streaming-inference state (reset every turn).
@@ -627,6 +642,14 @@ impl StreamState {
 
     fn has_visible_draft(&self, draft_id: &str) -> bool {
         self.visible_drafts.iter().any(|turn| turn.draft.draft_id == draft_id)
+    }
+
+    /// `Some(ready_for_commit)` for a visible draft, `None` otherwise.
+    fn visible_draft_ready(&self, draft_id: &str) -> Option<bool> {
+        self.visible_drafts
+            .iter()
+            .find(|turn| turn.draft.draft_id == draft_id)
+            .map(|turn| turn.ready_for_commit)
     }
 
     fn clear_visible_drafts(&mut self) {
@@ -726,6 +749,11 @@ pub struct ControlState {
     pub final_usage_tasks_recorded: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
     /// Tasks whose non-TUI `TurnCommitRequested` was accepted (once per task).
     pub committed_turn_tasks: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
+    /// Drafts removed by a cancel or shutdown before their worker reported a
+    /// terminal. The worker's `StreamCancelled`/`StreamFailed` for such a
+    /// draft is still the turn's one accepted terminal; the entry is dropped
+    /// on acceptance and on every load.
+    pub cancelled_drafts_awaiting_terminal: std::collections::HashSet<String>,
     /// Whether this turn has already surfaced the lossy-compaction notice.
     ///
     /// The pre-provider budget check runs once per tool iteration, so a session
@@ -933,6 +961,7 @@ impl ChatState {
                 turn_cancels: std::collections::HashMap::new(),
                 final_usage_tasks_recorded: std::collections::HashSet::new(),
                 committed_turn_tasks: std::collections::HashSet::new(),
+                cancelled_drafts_awaiting_terminal: std::collections::HashSet::new(),
                 context_degrade_notified: false,
             },
             #[cfg(feature = "terminal-tui")]
@@ -1037,8 +1066,9 @@ impl ChatState {
     /// The dispatcher only calls `reduce_tracked` (wired up in Commit 3); tests are still free to
     /// use `reduce`/`reduce_with_now`.
     #[cfg(feature = "terminal-tui")]
-    pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
+    pub fn reduce_tracked(&mut self, action: Action) -> TrackedReduction {
         let dirty = ui_dirty_for(&action);
+        let terminal_accepted = self.terminal_accepted(&action);
         let snap_before = self.snapshot_dirty_fields();
         let effects = self.reduce(action);
         let snap_after = self.snapshot_dirty_fields();
@@ -1047,7 +1077,42 @@ impl ChatState {
             // ui changed: clear the cache so the next build_ui_snapshot rebuilds the Arc<Vec<_>>
             self.cached_lines_arc = None;
         }
-        (effects, dirty_final)
+        TrackedReduction {
+            effects,
+            ui_dirty: dirty_final,
+            terminal_accepted,
+        }
+    }
+
+    /// R4: whether `action` is a turn terminal this state accepts. Decided
+    /// before the reducer runs; the reducer applies exactly these rules.
+    ///
+    /// - `ProviderTurnReadyForCommit` (phase 1): the draft is visible and not
+    ///   yet ready.
+    /// - `StreamCompleted` (phase 2): the draft is visible.
+    /// - `TurnCommitRequested` (non-TUI): once per task.
+    /// - `StreamCancelled`: the draft is visible, or was removed by a cancel
+    ///   before its worker reported a terminal.
+    /// - `StreamFailed`: the draft is visible and not ready, or was removed by
+    ///   such a cancel.
+    #[must_use]
+    pub fn terminal_accepted(&self, action: &Action) -> bool {
+        match action {
+            Action::ProviderTurnReadyForCommit { draft_id, .. } => {
+                self.stream.visible_draft_ready(draft_id) == Some(false)
+            }
+            Action::StreamCompleted { draft_id, .. } => self.stream.has_visible_draft(draft_id),
+            Action::TurnCommitRequested { task_id, .. } => !self.control.committed_turn_tasks.contains(task_id),
+            Action::StreamCancelled { draft_id } => {
+                self.stream.has_visible_draft(draft_id)
+                    || self.control.cancelled_drafts_awaiting_terminal.contains(draft_id)
+            }
+            Action::StreamFailed { draft_id, .. } => match self.stream.visible_draft_ready(draft_id) {
+                Some(ready) => !ready,
+                None => self.control.cancelled_drafts_awaiting_terminal.contains(draft_id),
+            },
+            _ => false,
+        }
     }
 
     /// Runtime fallback for the dirty decision in `reduce_tracked`: returns a coarse fingerprint
@@ -1078,9 +1143,14 @@ impl ChatState {
 
     /// Without the terminal-tui feature ui_dirty is always false (there is no UI to render).
     #[cfg(not(feature = "terminal-tui"))]
-    pub fn reduce_tracked(&mut self, action: Action) -> (Vec<Effect>, bool) {
+    pub fn reduce_tracked(&mut self, action: Action) -> TrackedReduction {
+        let terminal_accepted = self.terminal_accepted(&action);
         let effects = self.reduce(action);
-        (effects, false)
+        TrackedReduction {
+            effects,
+            ui_dirty: false,
+            terminal_accepted,
+        }
     }
 
     /// Pure sync state machine — mutates self per [`Action`], returns the [`Effect`] list to run.
@@ -1200,7 +1270,9 @@ impl ChatState {
                 final_text,
                 reasoning,
             } => self.reduce_stream_completed(&draft_id, final_text, reasoning),
-            Action::ProviderTurnReadyForCommit { .. } => vec![],
+            Action::ProviderTurnReadyForCommit { draft_id, .. } => {
+                self.reduce_provider_turn_ready_for_commit(&draft_id)
+            }
             Action::StreamFailed {
                 draft_id,
                 err,

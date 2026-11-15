@@ -53,6 +53,7 @@ impl ChatState {
             prompt_preview,
             started_at_ms: chrono::Utc::now().timestamp_millis(),
             draft: StreamingDraft::new(draft_id),
+            ready_for_commit: false,
         });
     }
 
@@ -419,6 +420,17 @@ impl ChatState {
     /// layer (backoff / `Retry-After` / failover), and by this point the turn's tool side effects may have landed.
     /// It feeds the trace log and the `HookEvent::Error` payload so audits can tell transient from hard failures.
     pub(super) fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
+        match self.stream.visible_draft_ready(draft_id) {
+            // R4: a failure after phase 1 does not apply; the draft waits for
+            // its ordered commit.
+            Some(true) => return vec![],
+            Some(false) => {}
+            None => {
+                // The draft was removed by a cancel; this is its one terminal.
+                self.control.cancelled_drafts_awaiting_terminal.remove(draft_id);
+                return vec![];
+            }
+        }
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
         };
@@ -472,9 +484,21 @@ impl ChatState {
         ]
     }
 
+    /// `Action::ProviderTurnReadyForCommit` — phase 1: mark the visible draft
+    /// ready for its ordered commit (accepted once). No other state changes;
+    /// the commit itself is phase 2.
+    pub(super) fn reduce_provider_turn_ready_for_commit(&mut self, draft_id: &str) -> Vec<Effect> {
+        if let Some(turn) = self.stream.visible_draft_mut(draft_id) {
+            turn.ready_for_commit = true;
+        }
+        vec![]
+    }
+
     /// `Action::StreamCancelled` — the user cancelled explicitly; only clear the draft.
     pub(super) fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
         let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
+            // A cancel already removed the draft; this is its one terminal.
+            self.control.cancelled_drafts_awaiting_terminal.remove(draft_id);
             return vec![];
         };
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);

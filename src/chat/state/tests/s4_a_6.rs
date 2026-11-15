@@ -217,7 +217,11 @@ fn s4_b_reducer_sole_source_for_conversation_lines() {
 #[test]
 fn s4_a_post_p2_terminal_resized_not_dirty() {
     let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
-    let (effects, dirty) = state.reduce_tracked(Action::TerminalResized { w: 120, h: 40 });
+    let crate::chat::state::TrackedReduction {
+        effects,
+        ui_dirty: dirty,
+        ..
+    } = state.reduce_tracked(Action::TerminalResized { w: 120, h: 40 });
     assert!(
         effects.iter().any(|e| matches!(e, Effect::RequestRedraw)),
         "TerminalResized must still emit RequestRedraw (the redraw goes through redraw_tx)"

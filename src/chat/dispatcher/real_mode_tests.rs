@@ -341,3 +341,5 @@ mod replay;
 mod start_turn;
 mod step5a4;
 mod tool_protocol;
+#[cfg(feature = "terminal-tui")]
+mod worker_supervisor;

@@ -330,6 +330,7 @@ pub(super) fn record_provider_turn_lifecycle_event(
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
     event: dispatcher::ProviderTurnLifecycleEvent,
 ) {
+    use crate::chat::turn_worker::ProviderTurnWorkerError;
     let (task_id, lease_id, kind, result) = match event {
         dispatcher::ProviderTurnLifecycleEvent::HandleAttached {
             task_id,
@@ -343,8 +344,41 @@ pub(super) fn record_provider_turn_lifecycle_event(
             let result = workers.record_execution_started(task_id, lease_id);
             (task_id, lease_id, "started", result)
         }
+        dispatcher::ProviderTurnLifecycleEvent::FailureRequested {
+            task_id,
+            lease_id,
+            accepted,
+        } => {
+            let result = workers.record_execution_failed(task_id, lease_id);
+            if accepted.send(result.is_ok()).is_err() {
+                tracing::debug!(
+                    task_id = task_id.get(),
+                    lease_id,
+                    "provider worker supervisor left before the failure answer"
+                );
+            }
+            if let Err(error) = result {
+                // Expected when the turn already produced its terminal: the
+                // failure gate refuses and the turn keeps its outcome.
+                tracing::debug!(
+                    task_id = task_id.get(),
+                    lease_id,
+                    error = ?error,
+                    "provider worker failure refused"
+                );
+            }
+            return;
+        }
         dispatcher::ProviderTurnLifecycleEvent::Exited { task_id, lease_id } => {
             let result = workers.record_execution_exited(task_id, lease_id);
+            if let Err(ProviderTurnWorkerError::UnknownWorker(_)) = result {
+                tracing::debug!(
+                    task_id = task_id.get(),
+                    lease_id,
+                    "provider worker exit for a retired task"
+                );
+                return;
+            }
             (task_id, lease_id, "exited", result)
         }
     };

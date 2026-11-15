@@ -423,7 +423,11 @@ impl ChatState {
 
     pub(super) fn cancel_task(&mut self, tool_key: ToolTaskKey, draft_id: String, reason: &'static str) -> Vec<Effect> {
         let cancel_opt = self.control.take_turn_cancel(tool_key);
-        let _ = self.stream.remove_visible_draft(&draft_id);
+        if let Some(removed) = self.stream.remove_visible_draft(&draft_id)
+            && !removed.ready_for_commit
+        {
+            self.control.cancelled_drafts_awaiting_terminal.insert(draft_id.clone());
+        }
         self.finalize_pending_tool_cards(tool_key, true, Some(reason));
         self.control.clear_tool_buffer(tool_key);
         let target_pending_approval = self.clear_target_pending_approval(tool_key);
@@ -475,6 +479,13 @@ impl ChatState {
         let (draft_id_opt, cancel_tokens) = if self.control.generating {
             let id = Self::take_draft_id(&self.stream);
             let tokens = self.control.drain_turn_cancels();
+            for turn in &self.stream.visible_drafts {
+                if !turn.ready_for_commit {
+                    self.control
+                        .cancelled_drafts_awaiting_terminal
+                        .insert(turn.draft.draft_id.clone());
+                }
+            }
             self.stream.clear_visible_drafts();
             self.control.generating = false;
             (id, tokens)

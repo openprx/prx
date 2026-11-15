@@ -61,6 +61,8 @@ pub struct ProviderTurnWorker {
     pub started_at_ms: i64,
     pub execution_started: bool,
     pub execution_exited: bool,
+    /// The worker task panicked and its failure was accepted (at most once).
+    pub execution_failed: bool,
     pub execution_lease_id: Option<u64>,
     pub execution_lease_active: bool,
     pub completion_ready: bool,
@@ -161,6 +163,7 @@ impl ProviderTurnWorkerRegistry {
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
                 execution_started: false,
                 execution_exited: false,
+                execution_failed: false,
                 execution_lease_id: None,
                 execution_lease_active: false,
                 completion_ready: false,
@@ -214,11 +217,23 @@ impl ProviderTurnWorkerRegistry {
         Ok(())
     }
 
+    /// Retire the execution lease after the worker task joined (normal,
+    /// panicked or aborted). Idempotent for the matching lease; a different
+    /// lease is refused and leaves the worker untouched.
     pub fn record_execution_exited(
         &mut self,
         task_id: TurnTaskId,
         lease_id: u64,
     ) -> Result<(), ProviderTurnWorkerError> {
+        if let Some(handle) = self.execution_handles.get(&task_id)
+            && handle.lease_id != lease_id
+        {
+            return Err(ProviderTurnWorkerError::ExecutionLeaseMismatch {
+                task_id,
+                expected: handle.lease_id,
+                actual: lease_id,
+            });
+        }
         let worker = self.worker_mut(task_id)?;
         if let Some(existing) = worker.execution_lease_id
             && existing != lease_id
@@ -232,16 +247,50 @@ impl ProviderTurnWorkerRegistry {
         worker.execution_lease_id = Some(lease_id);
         worker.execution_lease_active = false;
         worker.execution_exited = true;
-        if let Some(handle) = self.execution_handles.get(&task_id)
-            && handle.lease_id != lease_id
-        {
-            return Err(ProviderTurnWorkerError::ExecutionLeaseMismatch {
+        self.execution_handles.remove(&task_id);
+        Ok(())
+    }
+
+    /// The worker task of `lease_id` panicked. Accepted only while the
+    /// execution is attached or started and has produced no terminal: refused
+    /// after completion-ready, a terminal state, exit, or an earlier failure.
+    pub fn record_execution_failed(
+        &mut self,
+        task_id: TurnTaskId,
+        lease_id: u64,
+    ) -> Result<(), ProviderTurnWorkerError> {
+        let handle_lease = self.execution_handles.get(&task_id).map(|handle| handle.lease_id);
+        let worker = self.worker_mut(task_id)?;
+        let attached_lease = worker.execution_lease_id.or(handle_lease);
+        match attached_lease {
+            Some(existing) if existing == lease_id => {}
+            Some(existing) => {
+                return Err(ProviderTurnWorkerError::ExecutionLeaseMismatch {
+                    task_id,
+                    expected: existing,
+                    actual: lease_id,
+                });
+            }
+            None => {
+                return Err(ProviderTurnWorkerError::InvalidWorkerState {
+                    task_id,
+                    expected: "execution attached or started",
+                    actual: worker.state,
+                });
+            }
+        }
+        let live = matches!(
+            worker.state,
+            ProviderTurnWorkerState::Running | ProviderTurnWorkerState::Cancelling
+        );
+        if !live || worker.completion_ready || worker.execution_exited || worker.execution_failed {
+            return Err(ProviderTurnWorkerError::InvalidWorkerState {
                 task_id,
-                expected: handle.lease_id,
-                actual: lease_id,
+                expected: "attached or started execution without a terminal",
+                actual: worker.state,
             });
         }
-        self.execution_handles.remove(&task_id);
+        worker.execution_failed = true;
         Ok(())
     }
 
@@ -925,5 +974,83 @@ mod tests {
                 actual: ProviderTurnWorkerState::Committed,
             } if task_id == id
         ));
+    }
+
+    fn running_worker() -> (ProviderTurnWorkerRegistry, TurnTaskId) {
+        let mut scheduler = TurnScheduler::new();
+        let id = scheduler.enqueue("turn", TurnPriority::Normal, 0);
+        scheduler.start_task(id).unwrap();
+        let mut registry = ProviderTurnWorkerRegistry::new();
+        registry
+            .start_from_task(scheduler.task(id).unwrap(), ProviderTurnWorkerKind::Detached)
+            .unwrap();
+        (registry, id)
+    }
+
+    #[test]
+    fn execution_failure_is_accepted_once_while_started() {
+        let (mut registry, id) = running_worker();
+        registry.record_execution_started(id, 5).unwrap();
+        registry.record_execution_failed(id, 5).unwrap();
+        assert!(registry.worker(id).unwrap().execution_failed);
+        assert!(
+            registry.record_execution_failed(id, 5).is_err(),
+            "a second failure is refused"
+        );
+    }
+
+    #[test]
+    fn execution_failure_is_refused_after_completion_ready_and_after_exit() {
+        let (mut registry, id) = running_worker();
+        mark_completion_ready(&mut registry, id, 6);
+        assert!(
+            registry.record_execution_failed(id, 6).is_err(),
+            "refused after ready-for-commit"
+        );
+
+        let (mut exited, exited_id) = running_worker();
+        exited.record_execution_started(exited_id, 7).unwrap();
+        exited.record_execution_exited(exited_id, 7).unwrap();
+        assert!(
+            exited.record_execution_failed(exited_id, 7).is_err(),
+            "refused after exit"
+        );
+        assert!(!exited.worker(exited_id).unwrap().execution_failed);
+    }
+
+    #[test]
+    fn execution_failure_for_another_lease_is_refused() {
+        let (mut registry, id) = running_worker();
+        registry.record_execution_started(id, 8).unwrap();
+        let err = registry.record_execution_failed(id, 9).unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderTurnWorkerError::ExecutionLeaseMismatch {
+                expected: 8,
+                actual: 9,
+                ..
+            }
+        ));
+        assert!(!registry.worker(id).unwrap().execution_failed);
+    }
+
+    #[tokio::test]
+    async fn execution_exit_is_idempotent_and_a_foreign_lease_leaves_the_worker_untouched() {
+        let (mut registry, id) = running_worker();
+        let task = tokio::spawn(std::future::pending::<()>());
+        registry.attach_execution_handle(id, 10, task.abort_handle()).unwrap();
+        registry.record_execution_started(id, 10).unwrap();
+
+        assert!(registry.record_execution_exited(id, 11).is_err());
+        let worker = registry.worker(id).unwrap();
+        assert!(worker.execution_lease_active && !worker.execution_exited);
+        assert!(registry.execution_handle_attached(id));
+
+        registry.record_execution_exited(id, 10).unwrap();
+        registry.record_execution_exited(id, 10).unwrap();
+        let worker = registry.worker(id).unwrap();
+        assert!(worker.execution_exited && !worker.execution_lease_active);
+        assert!(!registry.execution_handle_attached(id));
+        task.abort();
     }
 }

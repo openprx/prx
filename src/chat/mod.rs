@@ -69,6 +69,7 @@ pub mod slash_types;
 pub mod state;
 pub mod terminal_proto;
 pub mod turn_scheduler;
+pub mod turn_supervisor;
 pub mod turn_worker;
 
 #[cfg(feature = "terminal-tui")]

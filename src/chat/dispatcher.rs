@@ -791,23 +791,21 @@ pub fn extract_turn_draft_id(action: &Action) -> Option<&str> {
     }
 }
 
-fn record_turn_signal_action(
-    sig: &TurnCompletionSignal,
-    draft_id: Option<&str>,
-    usage: Option<TokenUsage>,
-    outcome: Option<TurnOutcomeKind>,
-) {
-    if let Some(usage) = usage {
-        sig.record_usage(usage.clone());
-        if let Some(draft_id) = draft_id {
-            let _ = sig.record_usage_for_draft(draft_id, usage);
-        }
+/// Metered usage (`StreamUsageMetered`) is always recorded: the provider
+/// charged it whether or not the turn's terminal is later accepted. The
+/// task-scoped copy lands only when the draft maps to a registered task.
+fn record_turn_signal_usage(sig: &TurnCompletionSignal, draft_id: Option<&str>, usage: TokenUsage) {
+    sig.record_usage(usage.clone());
+    if let Some(draft_id) = draft_id {
+        let _ = sig.record_usage_for_draft(draft_id, usage);
     }
-    if let Some(outcome) = outcome {
-        sig.record_and_notify(outcome.clone());
-        if let Some(draft_id) = draft_id {
-            let _ = sig.record_and_notify_for_draft(draft_id, outcome);
-        }
+}
+
+/// Notify a turn outcome; called only for a terminal the reducer accepted.
+fn notify_turn_signal_outcome(sig: &TurnCompletionSignal, draft_id: Option<&str>, outcome: TurnOutcomeKind) {
+    sig.record_and_notify(outcome.clone());
+    if let Some(draft_id) = draft_id {
+        let _ = sig.record_and_notify_for_draft(draft_id, outcome);
     }
 }
 
@@ -990,6 +988,15 @@ pub enum ProviderTurnLifecycleEvent {
         task_id: crate::chat::turn_scheduler::TurnTaskId,
         lease_id: u64,
     },
+    /// The worker supervisor saw the worker task panic and asks the registry
+    /// owner to accept the failure; `accepted` carries the answer back.
+    FailureRequested {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        lease_id: u64,
+        accepted: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Sent by the worker supervisor after every join result; the single
+    /// exit path of a provider-turn worker.
     Exited {
         task_id: crate::chat::turn_scheduler::TurnTaskId,
         lease_id: u64,
@@ -1558,6 +1565,8 @@ impl EffectExecutor {
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 // Task locals do not cross spawn; carry the chat owner's tracker.
                 let cleanup_owner = self.cleanup_owner.clone();
+                let supervised_draft_id = draft_id.clone();
+                let supervisor_action_tx = action_tx.clone();
                 let provider_task_handle = tokio::spawn(async move {
                     // Task-local wrappers otherwise carry copies of the large
                     // driver future through nested debug poll frames. Keep both
@@ -1586,13 +1595,6 @@ impl EffectExecutor {
                             // already cancelled before start: send StreamCancelled directly, do not issue an LLM request.
                             if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
                                 tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
-                            }
-                            if let (Some(task_id), Some(lease_id), Some(tx)) = (
-                                provider_turn_task_id,
-                                provider_turn_execution_lease_id,
-                                provider_turn_lifecycle_tx.as_ref(),
-                            ) {
-                                let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
                             }
                             return;
                         }
@@ -1661,13 +1663,6 @@ impl EffectExecutor {
                             provider_turn_execution_lease_id,
                             "provider turn worker task exited"
                         );
-                        if let (Some(task_id), Some(lease_id), Some(tx)) = (
-                            provider_turn_task_id,
-                            provider_turn_execution_lease_id,
-                            provider_turn_lifecycle_tx.as_ref(),
-                        ) {
-                            let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id }).await;
-                        }
                     });
                     if let Some(owner) = cleanup_owner {
                         owner.scope(work).await;
@@ -1675,19 +1670,37 @@ impl EffectExecutor {
                         work.await;
                     }
                 });
-                if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                let lease = match (
                     provider_turn_task_id,
                     provider_turn_execution_lease_id,
-                    provider_turn_handle_tx.as_ref(),
+                    provider_turn_handle_tx,
                 ) {
-                    let _ = tx
-                        .send(ProviderTurnLifecycleEvent::HandleAttached {
+                    (Some(task_id), Some(lease_id), Some(lifecycle_tx)) => {
+                        let _ = lifecycle_tx
+                            .send(ProviderTurnLifecycleEvent::HandleAttached {
+                                task_id,
+                                lease_id,
+                                abort_handle: provider_task_handle.abort_handle(),
+                            })
+                            .await;
+                        Some(crate::chat::turn_supervisor::WorkerLease {
                             task_id,
                             lease_id,
-                            abort_handle: provider_task_handle.abort_handle(),
+                            lifecycle_tx,
                         })
-                        .await;
-                }
+                    }
+                    _ => None,
+                };
+                // R4: the supervisor owns the worker's exit; it is spawned after
+                // `HandleAttached` so the registry sees attach before exit.
+                tokio::spawn(crate::chat::turn_supervisor::supervise_provider_turn_worker(
+                    provider_task_handle,
+                    crate::chat::turn_supervisor::WorkerSupervision {
+                        lease,
+                        draft_id: supervised_draft_id,
+                        action_tx: supervisor_action_tx,
+                    },
+                ));
             }
             Effect::SaveSession(_) | Effect::PublishSession(_) | Effect::ActionRejected { .. } => {
                 // Persistence effects run in `execute` through `PersistenceDeps`.
@@ -3119,6 +3132,8 @@ async fn drive_start_turn_stream(
 /// effects ran.
 struct ReducedAction {
     outcome: Option<TurnOutcomeKind>,
+    /// R4: only an accepted terminal notifies its outcome.
+    terminal_accepted: bool,
     usage: Option<TokenUsage>,
     draft_id: Option<String>,
     approval_response: Option<(String, bool, bool)>,
@@ -3148,10 +3163,13 @@ async fn reduce_and_execute(
         &action,
         Action::StreamCompleted { .. } | Action::TurnCommitRequested { .. }
     );
-    #[cfg(feature = "terminal-tui")]
-    let (effects, ui_dirty) = state.reduce_tracked(action);
+    let crate::chat::state::TrackedReduction {
+        effects,
+        ui_dirty,
+        terminal_accepted,
+    } = state.reduce_tracked(action);
     #[cfg(not(feature = "terminal-tui"))]
-    let effects = state.reduce(action);
+    let _ = ui_dirty;
     let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
     let rejection = effects.iter().find_map(|effect| match effect {
         Effect::ActionRejected { reason } => Some(reason.clone()),
@@ -3174,6 +3192,7 @@ async fn reduce_and_execute(
     let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested, persistence_error);
     ReducedAction {
         outcome,
+        terminal_accepted,
         usage,
         draft_id,
         approval_response,
@@ -3192,7 +3211,20 @@ fn finish_reduced_action(
         router.resolve_decision(&tool_id, approved, always);
     }
     if let Some(sig) = turn_signal {
-        record_turn_signal_action(sig, reduced.draft_id.as_deref(), reduced.usage, reduced.outcome);
+        let draft_id = reduced.draft_id.as_deref();
+        if let Some(usage) = reduced.usage {
+            record_turn_signal_usage(sig, draft_id, usage);
+        }
+        if let Some(outcome) = reduced.outcome {
+            if reduced.terminal_accepted {
+                notify_turn_signal_outcome(sig, draft_id, outcome);
+            } else {
+                tracing::debug!(
+                    has_draft = draft_id.is_some(),
+                    "turn terminal refused by the reducer; outcome not notified"
+                );
+            }
+        }
     }
 }
 

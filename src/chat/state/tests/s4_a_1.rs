@@ -63,16 +63,28 @@ fn s4_a_1_ui_dirty_true_on_record_user_turn_via_runtime_fallback() {
     // the runtime snapshot_dirty_fields is unchanged too → false overall.
     // This case verifies that writing session does not incidentally set dirty.
     let mut state = make_state();
-    let (_effects, dirty) = state.reduce_tracked(Action::RecordUserTurn("q".into()));
+    let crate::chat::state::TrackedReduction {
+        effects: _effects,
+        ui_dirty: dirty,
+        ..
+    } = state.reduce_tracked(Action::RecordUserTurn("q".into()));
     assert!(!dirty, "RecordUserTurn must not set ui_dirty");
 }
 
 #[test]
 fn s4_a_1_tool_progress_dirty_but_retry_trace_only_is_clean() {
     let mut state = make_state();
-    let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1 });
+    let crate::chat::state::TrackedReduction {
+        effects: _e,
+        ui_dirty: d,
+        ..
+    } = state.reduce_tracked(Action::ToolProgress { iteration: 1 });
     assert!(d, "ToolProgress must dirty Pure snapshots so progress is visible");
-    let (_e, d2) = state.reduce_tracked(Action::StreamRetryAttempt {
+    let crate::chat::state::TrackedReduction {
+        effects: _e,
+        ui_dirty: d2,
+        ..
+    } = state.reduce_tracked(Action::StreamRetryAttempt {
         attempt: 1,
         reason: "x".into(),
     });
@@ -84,12 +96,20 @@ fn s4_a_1_ui_dirty_true_on_stream_completed() {
     // full flow: TurnStarted registers the draft first, then StreamCompleted finalizes it.
     let mut state = make_state();
     let token = CancellationToken::new();
-    let (_e, d_start) = state.reduce_tracked(Action::TurnStarted {
+    let crate::chat::state::TrackedReduction {
+        effects: _e,
+        ui_dirty: d_start,
+        ..
+    } = state.reduce_tracked(Action::TurnStarted {
         draft_id: "d1".into(),
         cancel: token,
     });
     assert!(d_start, "TurnStarted must be dirty (stream.draft changed)");
-    let (_e, d_done) = state.reduce_tracked(Action::StreamCompleted {
+    let crate::chat::state::TrackedReduction {
+        effects: _e,
+        ui_dirty: d_done,
+        ..
+    } = state.reduce_tracked(Action::StreamCompleted {
         draft_id: "d1".into(),
         final_text: "hi".into(),
         reasoning: String::new(),
@@ -103,7 +123,11 @@ fn s4_a_1_ui_dirty_true_on_stream_completed() {
 #[test]
 fn s4_a_1_ui_dirty_true_on_system_message_added() {
     let mut state = make_state();
-    let (_e, d) = state.reduce_tracked(Action::SystemMessageAdded { text: "banner".into() });
+    let crate::chat::state::TrackedReduction {
+        effects: _e,
+        ui_dirty: d,
+        ..
+    } = state.reduce_tracked(Action::SystemMessageAdded { text: "banner".into() });
     assert!(d, "SystemMessageAdded must be dirty (pushed to conversation_lines)");
 }
 

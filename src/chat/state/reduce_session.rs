@@ -84,6 +84,7 @@ impl ChatState {
         self.control.turn_cancels.clear();
         self.control.final_usage_tasks_recorded.clear();
         self.control.committed_turn_tasks.clear();
+        self.control.cancelled_drafts_awaiting_terminal.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
         // The load itself is revision 0 of its epoch.

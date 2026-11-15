@@ -349,7 +349,11 @@ fn test_fold_toggle_marks_snapshot_dirty_and_rebuilds() {
     // Prime the snapshot cache.
     let _ = state.build_ui_snapshot(1);
     // Toggle via tracked reduce — must report dirty and clear the cache.
-    let (_effects, dirty) = state.reduce_tracked(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    let crate::chat::state::TrackedReduction {
+        effects: _effects,
+        ui_dirty: dirty,
+        ..
+    } = state.reduce_tracked(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
     assert!(dirty, "fold toggle must mark snapshot dirty");
     let snap = state.build_ui_snapshot(2);
     match snap.conversation_lines.last() {
