@@ -555,6 +555,54 @@ pub(super) fn gate_completed_provider_turn_finalization(
     mark_provider_turn_completed(scheduler, coordinator, workers, id, history_commit_len, summary)
 }
 
+/// Finalized payload of a turn the non-TUI tool loop completed inline.
+pub(super) fn inline_provider_turn_payload(
+    history_commit_len: usize,
+    response_chars: usize,
+    usage: Option<&crate::chat::session::MainSessionTokenUsageRecord>,
+) -> crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+    crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+        history_commit_len,
+        final_text_chars: response_chars,
+        recorded_response_chars: response_chars,
+        total_tokens: usage.map_or(0, |usage| usage.total_tokens),
+        prompt_tokens: usage.map_or(0, |usage| usage.prompt_tokens),
+        completion_tokens: usage.map_or(0, |usage| usage.completion_tokens),
+    }
+}
+
+/// The non-TUI tool loop awaited provider turn `id` inline and reached its
+/// terminal. Records the inline execution as complete and, for a completed
+/// turn, its finalized payload, so the terminal mark that follows commits the
+/// worker and frees the visible-turn slot (without it the worker stays
+/// `Running` and every later input, `/exit` included, waits for a slot).
+pub(super) fn finish_inline_provider_turn(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    payload: Option<crate::chat::turn_worker::ProviderTurnFinalizedPayload>,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    if let Err(error) = workers.record_inline_completion_ready(id) {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry inline provider completion failed"
+        );
+        return;
+    }
+    if let Some(payload) = payload
+        && let Err(error) = workers.record_finalized_payload(id, payload)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry inline provider finalized payload record failed"
+        );
+    }
+}
+
 pub(super) fn gate_failed_provider_turn_finalization(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,

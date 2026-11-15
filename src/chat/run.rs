@@ -32,11 +32,11 @@ use super::output::{print_fallback_chat_output, render_response, should_resend_o
 use super::provider_turns::{
     OrderedCommitTerminal, PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext,
     ProviderTurnCompletionEvent, dispatch_final_usage, dispatch_ordered_provider_turn_commit_and_wait,
-    gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization, mark_provider_turn_completed,
-    provider_turn_visible_admission, provider_worker_status, publish_provider_worker_status,
-    record_provider_turn_completion_context, record_provider_turn_lifecycle_event,
-    register_provider_history_commit_task, register_provider_turn_worker, route_provider_completion_event_and_publish,
-    start_provider_turn_task,
+    finish_inline_provider_turn, gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization,
+    inline_provider_turn_payload, mark_provider_turn_completed, provider_turn_visible_admission,
+    provider_worker_status, publish_provider_worker_status, record_provider_turn_completion_context,
+    record_provider_turn_lifecycle_event, register_provider_history_commit_task, register_provider_turn_worker,
+    route_provider_completion_event_and_publish, start_provider_turn_task,
 };
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
@@ -4337,6 +4337,7 @@ Retry with a compatible model: /provider {shown} <model>",
             TurnOutcome::Success(resp) => (resp, successful_trace.context("successful Chat outcome has no serving trace")?),
             TurnOutcome::Cancelled => {
                 rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_cancelled_provider_turn_finalization(
                     &mut turn_scheduler,
                     &mut history_commit_coordinator,
@@ -4349,6 +4350,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 continue;
             }
             TurnOutcome::FailedWithError { err, .. } => {
+                finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
                 gate_failed_provider_turn_finalization(
                     &mut turn_scheduler,
                     &mut history_commit_coordinator,
@@ -4481,6 +4483,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     return Err(error);
                 }
             };
+            let inline_payload = inline_provider_turn_payload(history.len(), 0, terminal_usage.as_ref());
             // Usage first (inside the commit's acknowledged revision), then
             // the awaited commit (the user turn was recorded at admission).
             dispatch_final_usage(
@@ -4535,6 +4538,7 @@ Retry with a compatible model: /provider {shown} <model>",
             } else {
                 observer.record_event(&ObserverEvent::TurnComplete);
             }
+            finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, Some(inline_payload));
             mark_provider_turn_completed(
                 &mut turn_scheduler,
                 &mut history_commit_coordinator,
@@ -4585,6 +4589,8 @@ Retry with a compatible model: /provider {shown} <model>",
         // carries it; the ordered commit then sends RecordAssistantTurn and
         // the awaited TurnCommitRequested (the user turn was recorded at
         // admission).
+        let inline_payload =
+            inline_provider_turn_payload(history.len(), response.chars().count(), terminal_usage.as_ref());
         dispatch_final_usage(
             &chat_dispatcher,
             &mut turn_scheduler,
@@ -4693,6 +4699,7 @@ Retry with a compatible model: /provider {shown} <model>",
             // external side effects).
             observer.record_event(&ObserverEvent::TurnComplete);
         }
+        finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, Some(inline_payload));
         mark_provider_turn_completed(
             &mut turn_scheduler,
             &mut history_commit_coordinator,

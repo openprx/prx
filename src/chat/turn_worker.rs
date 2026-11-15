@@ -344,6 +344,39 @@ impl ProviderTurnWorkerRegistry {
         }
     }
 
+    /// A foreground turn the run loop awaits inline (the non-TUI tool loop)
+    /// has no spawned execution, lease or handle: the loop reaching the
+    /// turn's terminal is the execution's start, completion and exit at once.
+    /// Marks it completion-ready so its terminal outcome can be recorded and
+    /// committed, which frees its visible-turn slot.
+    pub fn record_inline_completion_ready(&mut self, task_id: TurnTaskId) -> Result<(), ProviderTurnWorkerError> {
+        let handle_attached = self.execution_handles.contains_key(&task_id);
+        let worker = self.worker_mut(task_id)?;
+        if worker.kind != ProviderTurnWorkerKind::ForegroundAwaited
+            || worker.execution_lease_id.is_some()
+            || handle_attached
+        {
+            return Err(ProviderTurnWorkerError::InvalidWorkerState {
+                task_id,
+                expected: "inline foreground provider worker without an execution",
+                actual: worker.state,
+            });
+        }
+        match worker.state {
+            ProviderTurnWorkerState::Running | ProviderTurnWorkerState::Cancelling => {
+                worker.execution_started = true;
+                worker.execution_exited = true;
+                worker.completion_ready = true;
+                Ok(())
+            }
+            state => Err(ProviderTurnWorkerError::InvalidWorkerState {
+                task_id,
+                expected: "running or cancelling",
+                actual: state,
+            }),
+        }
+    }
+
     pub fn record_finalized_payload(
         &mut self,
         task_id: TurnTaskId,
@@ -563,6 +596,61 @@ mod tests {
         registry
             .record_finalized_payload(id, sample_payload(history_commit_len))
             .unwrap();
+    }
+
+    #[test]
+    fn an_inline_foreground_turn_commits_and_frees_its_slot() {
+        let mut scheduler = TurnScheduler::new();
+        let id = scheduler.enqueue("turn", TurnPriority::Normal, 3);
+        scheduler.start_task(id).unwrap();
+        let mut registry = ProviderTurnWorkerRegistry::new();
+        registry
+            .start_from_task(scheduler.task(id).unwrap(), ProviderTurnWorkerKind::ForegroundAwaited)
+            .unwrap();
+
+        registry.record_inline_completion_ready(id).unwrap();
+        mark_completed_payload_ready(&mut registry, id, 5);
+        registry.record_completed(id).unwrap();
+        scheduler.mark_completed(id, 5, "done").unwrap();
+        let mut commits = HistoryCommitCoordinator::new();
+        commits.register_task(scheduler.task(id).unwrap()).unwrap();
+        commits
+            .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(id).unwrap()).unwrap())
+            .unwrap();
+        let decisions = commits.drain_ready();
+        registry.apply_commit_decision(&decisions[0]).unwrap();
+
+        assert_eq!(registry.worker(id).unwrap().state, ProviderTurnWorkerState::Committed);
+        assert_eq!(registry.running_count(), 0);
+    }
+
+    #[test]
+    fn inline_completion_is_refused_for_a_spawned_or_detached_execution() {
+        let mut scheduler = TurnScheduler::new();
+        let leased = scheduler.enqueue("leased", TurnPriority::Normal, 3);
+        scheduler.start_task(leased).unwrap();
+        let detached = scheduler.enqueue("detached", TurnPriority::Normal, 3);
+        scheduler.start_task(detached).unwrap();
+        let mut registry = ProviderTurnWorkerRegistry::new();
+        registry
+            .start_from_task(
+                scheduler.task(leased).unwrap(),
+                ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .unwrap();
+        registry
+            .start_from_task(scheduler.task(detached).unwrap(), ProviderTurnWorkerKind::Detached)
+            .unwrap();
+        registry.record_execution_started(leased, 9).unwrap();
+
+        for id in [leased, detached] {
+            let err = registry.record_inline_completion_ready(id).unwrap_err();
+            assert!(
+                matches!(err, ProviderTurnWorkerError::InvalidWorkerState { .. }),
+                "{err:?}"
+            );
+            assert!(!registry.worker(id).unwrap().completion_ready);
+        }
     }
 
     #[test]

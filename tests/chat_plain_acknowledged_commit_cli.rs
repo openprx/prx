@@ -137,14 +137,22 @@ fn a_reply_is_committed_into_the_saved_session_row() {
     );
 }
 
-/// Non-TUI only: the shared agent loop completes an empty reply as a turn
-/// (`run.rs` empty completion). The reducer driver of the TUI build retries an
-/// empty reply once and then fails the turn instead (unchanged behaviour).
+/// Two isolated tool-call JSON lines: not one JSON value, so the agent loop
+/// reads them as reply text rather than a call, and the channel sanitizer then
+/// strips both lines, leaving an empty reply.
+#[cfg(not(feature = "terminal-tui"))]
+const EMPTY_AFTER_SANITIZE: &str =
+    "{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}\n{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}";
+
+/// Non-TUI only: a reply that is empty after sanitization completes as a turn
+/// (`run.rs` empty completion). A reply that is empty on the wire never gets
+/// there: the agent loop retries it once and then fails the turn (unchanged
+/// behaviour, in both builds).
 #[cfg(not(feature = "terminal-tui"))]
 #[test]
 fn an_empty_reply_is_committed_into_the_saved_session_row() {
     let sandbox = Sandbox::new();
-    let _server = serve(&sandbox, Box::new(|_, _| Scripted::Text(Vec::new())));
+    let _server = serve(&sandbox, Box::new(|_, _| Scripted::text(EMPTY_AFTER_SANITIZE)));
     let mut chat = spawn_plain(&sandbox);
     chat.send("say nothing");
     wait_for_saved_turns(&sandbox, 1);
