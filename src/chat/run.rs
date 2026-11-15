@@ -947,8 +947,14 @@ async fn run_internal(
             },
             // EOF on the line front end's stdin. Lines read before it are
             // still queued; the arm waits until the input arm has taken them,
-            // then closes the input like a closed channel would.
+            // then closes the input like a closed channel would. The guard is
+            // evaluated before the select polls: the reader may send its last
+            // lines and fire EOF while the loop waits, making both arms ready
+            // at once. Re-check here so lines sent before EOF are never dropped.
             () = stdin_closed.cancelled(), if input_events_open && input_rx.is_empty() => {
+                if !input_rx.is_empty() {
+                    continue;
+                }
                 input_events_open = false;
                 continue;
             },
