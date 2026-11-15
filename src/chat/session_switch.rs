@@ -2,7 +2,6 @@
 
 use super::session_store::{
     bind_session_to_runtime_provider_model, history_for_session_with_system, load_session_by_id_with_message_events,
-    save_session,
 };
 #[cfg(feature = "terminal-tui")]
 use super::tui;
@@ -15,7 +14,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(super) struct ChatSwitchCtx<'a> {
-    pub(super) chat_session: &'a mut session::ChatSession,
+    /// Reader of the acknowledged session; a switch adopts the new load's ack.
+    pub(super) chat_session: &'a mut crate::chat::acked_session::SessionReader,
+    /// Commit-failure latch for the awaited load acknowledgement.
+    pub(super) commits: &'a dispatcher::TurnCompletionSignal,
     pub(super) chat_session_key: &'a mut String,
     pub(super) fabric_turn_seq: &'a mut u64,
     pub(super) history: &'a mut Vec<ChatMessage>,
@@ -184,33 +186,61 @@ pub(super) enum ChatControlEvent {
     ResumeSavedSession { id: String },
 }
 
-pub(super) async fn resume_saved_session_by_id(
-    mem: &dyn Memory,
-    target_id: &str,
-    ctx: ChatSwitchCtx<'_>,
-) -> Result<String> {
-    let current_child_summaries = ctx
-        .chat_sessions
+/// Dispatch a metadata change (`ModeChanged`, `ModelChanged`,
+/// `ProviderChanged`) and wait for its acknowledgement; the caller reports
+/// success only on `Ok`.
+pub(super) async fn await_metadata_change(
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
+    chat_session: &mut crate::chat::acked_session::SessionReader,
+    action: crate::chat::action::Action,
+) -> std::result::Result<(), String> {
+    match chat_dispatcher.dispatch_awaited(action, commits).await {
+        Ok(crate::chat::acked_session::Ack::Published(acked)) => {
+            chat_session.adopt(acked);
+            Ok(())
+        }
+        Ok(crate::chat::acked_session::Ack::Unchanged(_)) => Ok(()),
+        Ok(crate::chat::acked_session::Ack::Rejected(reason)) => Err(reason),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Record the current child-session summaries through the reducer and wait
+/// for each acknowledged save before the current session is left.
+pub(super) async fn record_child_summaries_awaited(
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
+) -> Result<()> {
+    let summaries = chat_sessions
         .snapshot()
         .await
         .iter()
         .map(|view| crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new()))
         .collect::<Vec<_>>();
-    let mut current_to_save = ctx.chat_session.clone();
-    for summary in &current_child_summaries {
-        current_to_save.record_background_session(summary.clone());
+    for summary in summaries {
+        match chat_dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::BackgroundSessionRecorded { summary },
+                commits,
+            )
+            .await?
+        {
+            crate::chat::acked_session::Ack::Published(_) | crate::chat::acked_session::Ack::Unchanged(_) => {}
+            crate::chat::acked_session::Ack::Rejected(reason) => anyhow::bail!("{reason}"),
+        }
     }
+    Ok(())
+}
 
-    if let Err(e) = save_session(mem, &current_to_save).await {
+pub(super) async fn resume_saved_session_by_id(
+    mem: &dyn Memory,
+    target_id: &str,
+    ctx: ChatSwitchCtx<'_>,
+) -> Result<String> {
+    if let Err(e) = record_child_summaries_awaited(ctx.chat_sessions, ctx.chat_dispatcher, ctx.commits).await {
         anyhow::bail!("Resume aborted: failed to save current session before switching: {e}");
-    }
-    for summary in &current_child_summaries {
-        let _ = ctx.chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::BackgroundSessionRecorded {
-                summary: summary.clone(),
-            },
-            "chat.resume_record_child_summary_before_switch",
-        );
     }
 
     let workspace_id = ctx.config.workspace_dir.to_string_lossy();
@@ -230,50 +260,27 @@ pub(super) async fn resume_saved_session_by_id(
         loaded_session.title.clone()
     };
 
-    apply_chat_session_switch(ctx, loaded_session).await;
+    if let Err(e) = apply_chat_session_switch(ctx, loaded_session, false).await {
+        anyhow::bail!("Resume aborted: {e}");
+    }
     Ok(format!(
         "Resumed saved chat session {loaded_id} ({loaded_title}, {loaded_turns} turns)."
     ))
 }
 
-pub(super) async fn start_new_chat_session(mem: &dyn Memory, ctx: ChatSwitchCtx<'_>) -> Result<String> {
-    let current_child_summaries = ctx
-        .chat_sessions
-        .snapshot()
-        .await
-        .iter()
-        .map(|view| crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new()))
-        .collect::<Vec<_>>();
-    let mut current_to_save = ctx.chat_session.clone();
-    for summary in &current_child_summaries {
-        current_to_save.record_background_session(summary.clone());
-    }
-
-    if let Err(e) = save_session(mem, &current_to_save).await {
+pub(super) async fn start_new_chat_session(ctx: ChatSwitchCtx<'_>) -> Result<String> {
+    if let Err(e) = record_child_summaries_awaited(ctx.chat_sessions, ctx.chat_dispatcher, ctx.commits).await {
         anyhow::bail!("New session aborted: failed to save current session: {e}");
     }
-    for summary in &current_child_summaries {
-        let _ = ctx.chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::BackgroundSessionRecorded {
-                summary: summary.clone(),
-            },
-            "chat.new_record_child_summary_before_switch",
-        );
-    }
 
-    #[cfg(feature = "terminal-tui")]
-    let current_mode = ctx.chat_mirror.lock().chat_mode;
-    #[cfg(not(feature = "terminal-tui"))]
-    let current_mode = ctx.chat_session.mode;
-
-    let previous_id = current_to_save.id.clone();
-    let new_session = fresh_chat_session(ctx.provider_name, ctx.model_name, current_mode);
+    let current = ctx.chat_session.session();
+    let previous_id = current.id.clone();
+    let new_session = fresh_chat_session(ctx.provider_name, ctx.model_name, current.mode);
     let new_id = new_session.id.clone();
-    if let Err(e) = save_session(mem, &new_session).await {
+    // The new session is persisted by its load (`persist: true`).
+    if let Err(e) = apply_chat_session_switch(ctx, new_session, true).await {
         anyhow::bail!("New session aborted: failed to persist new session: {e}");
     }
-
-    apply_chat_session_switch(ctx, new_session).await;
     Ok(format!(
         "Started new chat session {new_id}. Previous session {previous_id} was saved."
     ))
@@ -289,7 +296,35 @@ pub(super) fn fresh_chat_session(
     session
 }
 
-pub(super) async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
+/// Load `loaded_session` through the reducer (`persist`: new, branch, rewind;
+/// otherwise a resume that only publishes) and wait for its acknowledgement
+/// before touching any run-loop state. A rejection (a turn is generating) or
+/// a failed save aborts the switch with everything unchanged.
+pub(super) async fn apply_chat_session_switch(
+    mut ctx: ChatSwitchCtx<'_>,
+    mut loaded_session: session::ChatSession,
+    persist: bool,
+) -> Result<()> {
+    bind_session_to_runtime_provider_model(&mut loaded_session, ctx.provider_name, ctx.model_name);
+    let acked = match ctx
+        .chat_dispatcher
+        .dispatch_awaited(
+            crate::chat::action::Action::SessionLoaded {
+                session: loaded_session,
+                persist,
+            },
+            ctx.commits,
+        )
+        .await?
+    {
+        crate::chat::acked_session::Ack::Published(acked) => acked,
+        crate::chat::acked_session::Ack::Unchanged(_) => {
+            anyhow::bail!("the session load was not acknowledged")
+        }
+        crate::chat::acked_session::Ack::Rejected(reason) => anyhow::bail!("{reason}"),
+    };
+    ctx.chat_session.adopt(acked);
+    let loaded = ctx.chat_session.session();
     let cleared_approvals = clear_pending_approvals_for_session_switch(&mut ctx);
     if cleared_approvals > 0 {
         tracing::warn!(
@@ -307,27 +342,14 @@ pub(super) async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut lo
     *ctx.attached_follow = None;
     *ctx.attached_follow_seq = None;
 
-    bind_session_to_runtime_provider_model(&mut loaded_session, ctx.provider_name, ctx.model_name);
-    *ctx.chat_session = loaded_session;
-    *ctx.chat_session_key = format!("chat:{}", ctx.chat_session.id);
-    *ctx.fabric_turn_seq = ctx
-        .chat_session
+    *ctx.chat_session_key = format!("chat:{}", loaded.id);
+    *ctx.fabric_turn_seq = loaded
         .turns
         .iter()
         .filter(|turn| turn.role == "user")
         .fold(0_u64, |acc, _| acc.saturating_add(1));
-    *ctx.history = history_for_session_with_system(
-        ctx.chat_session,
-        ctx.config,
-        ctx.model_name,
-        ctx.skills,
-        ctx.native_tools,
-    );
+    *ctx.history = history_for_session_with_system(&loaded, ctx.config, ctx.model_name, ctx.skills, ctx.native_tools);
 
-    let _ = ctx.chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::SessionLoaded(ctx.chat_session.clone()),
-        "chat.session_switch_loaded",
-    );
     let _ = ctx.chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::SessionFocusChanged {
             focus: crate::chat::sessions::FocusTarget::Main,
@@ -358,11 +380,11 @@ pub(super) async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut lo
     #[cfg(feature = "terminal-tui")]
     {
         let mut mirror = ctx.chat_mirror.lock();
-        mirror.session_title = ctx.chat_session.title.clone();
-        mirror.turn_count = ctx.chat_session.turn_count();
-        mirror.chat_mode = ctx.chat_session.mode;
+        mirror.session_title = loaded.title.clone();
+        mirror.turn_count = loaded.turn_count();
+        mirror.chat_mode = loaded.mode;
         mirror.autonomy_level = ctx.config.autonomy.level;
-        mirror.conversation_lines = conversation_lines_for_resumed_session(ctx.chat_session);
+        mirror.conversation_lines = conversation_lines_for_resumed_session(&loaded);
         mirror.streaming = None;
         mirror.sessions_status.clear();
         mirror.sessions_cache.clear();
@@ -370,7 +392,7 @@ pub(super) async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut lo
         mirror.pending_tool_approval = None;
         mirror.context_used_tokens = None;
         mirror.context_window_tokens = None;
-        mirror.token_usage_summary = ctx.chat_session.token_usage_summary();
+        mirror.token_usage_summary = loaded.token_usage_summary();
         mirror.external_editor_prefix_armed = false;
         mirror.input.clear_navigation_state();
         mirror.focus = crate::chat::sessions::FocusTarget::Main;
@@ -380,6 +402,7 @@ pub(super) async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut lo
     if let Some(tx) = ctx.redraw_handle {
         let _ = tx.try_send(());
     }
+    Ok(())
 }
 
 pub(super) fn should_ignore_session_event_after_chat_resume(

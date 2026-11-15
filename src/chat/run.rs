@@ -30,10 +30,11 @@ use super::input_queue::{
 };
 use super::output::{print_fallback_chat_output, render_response, should_resend_on_finalize_failure};
 use super::provider_turns::{
-    PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext, ProviderTurnCompletionEvent,
+    OrderedCommitTerminal, PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY, ProviderTurnCompletionContext,
+    ProviderTurnCompletionEvent, dispatch_final_usage, dispatch_ordered_provider_turn_commit_and_wait,
     gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization, mark_provider_turn_completed,
     provider_turn_visible_admission, provider_worker_status, publish_provider_worker_status,
-    record_provider_turn_completion_context, record_provider_turn_lifecycle_event, record_provider_turn_usage,
+    record_provider_turn_completion_context, record_provider_turn_lifecycle_event,
     register_provider_history_commit_task, register_provider_turn_worker, route_provider_completion_event_and_publish,
     start_provider_turn_task,
 };
@@ -73,8 +74,9 @@ use super::session_store::{
 use super::session_switch::request_diff_apply_approval;
 use super::session_switch::{
     ChatControlEvent, ChatSwitchCtx, PendingChatRewind, PendingDiffApply, RewindApprovalOutcome,
-    apply_chat_session_switch, approval_already_pending_message, approval_in_progress, resolve_rewind_approval,
-    resume_saved_session_by_id, should_ignore_session_event_after_chat_resume, start_new_chat_session,
+    apply_chat_session_switch, approval_already_pending_message, approval_in_progress, await_metadata_change,
+    record_child_summaries_awaited, resolve_rewind_approval, resume_saved_session_by_id,
+    should_ignore_session_event_after_chat_resume, start_new_chat_session,
 };
 #[cfg(feature = "terminal-tui")]
 use super::terminal::TerminalGuard;
@@ -332,24 +334,26 @@ async fn run_internal(
     #[cfg(feature = "terminal-tui")]
     let pty_handoff = Arc::new(crate::chat::sessions::pty::HandoffControl::new());
 
-    let mut chat_session = startup::resume_session(
+    // Pre-load construction: the only mutable session copy, consumed by the
+    // reducer seed below. Afterwards the run loop reads the acknowledged session.
+    let mut initial_session = startup::resume_session(
         session_id.as_deref(), one_shot.is_some(), &mem, &memory_fabric, &config, provider_name, model_name,
     ).await?;
-    bind_session_to_runtime_provider_model(&mut chat_session, provider_name, model_name);
+    bind_session_to_runtime_provider_model(&mut initial_session, provider_name, model_name);
     let (mut chat_session_key, mut fabric_turn_seq, banner, mut history) = startup::initial_conversation(
-        &chat_session, &config, provider_name, model_name, &skills, native_tools,
+        &initial_session, &config, provider_name, model_name, &skills, native_tools,
     );
 
     #[cfg(feature = "terminal-tui")]
     let (initial_saved_session_entries, chat_mirror) = startup::initial_tui_mirror(
-        &mem, &chat_session, &config, provider_name, model_name,
+        &mem, &initial_session, &config, provider_name, model_name,
     ).await;
 
 
     #[cfg(feature = "terminal-tui")]
     let ui_startup = startup::ChatStartupUi {
         banner: &banner,
-        session_id: &chat_session.id,
+        session_id: &initial_session.id,
         initial_saved_session_entries: &initial_saved_session_entries,
     };
 
@@ -374,7 +378,7 @@ async fn run_internal(
     // owner of ctrl_c semantics while the caller can also request shutdown.
 
     let (chat_dispatcher, chat_action_rx, dispatcher_shadow_state) = startup::initial_dispatcher(
-        provider_name, model_name, &shutdown, &chat_session,
+        provider_name, model_name, &shutdown, &initial_session,
         #[cfg(feature = "terminal-tui")] &config,
         #[cfg(feature = "terminal-tui")] &ui_startup,
     );
@@ -385,6 +389,8 @@ async fn run_internal(
     // P0-1 fix: dropped allow(unused_variables) — the guard is read at the end of an old-path turn,
     // so it is genuinely used under both feature configurations.)
     let dual_write_guard = dispatcher::RuntimeDualWriteGuard::new();
+    // The run loop's only view of the session: the reducer's acknowledged state.
+    let mut chat_session = chat_dispatcher.session_reader();
 
     // PRX_CHAT_REDUX is read once at the entry point and reused inside the function body, so the env
     // var is not parsed in several places.
@@ -419,14 +425,16 @@ async fn run_internal(
         let mode = top_redux_mode;
         let deps = dispatcher::EffectDeps {
             provider: Arc::clone(&provider),
-            memory: Arc::clone(&mem),
             memory_event_recording: config.memory.event_recording_config(),
             channel: Arc::clone(&terminal) as Arc<dyn crate::channels::Channel>,
             hooks: Arc::clone(&hooks),
             observer: Arc::clone(&observer),
-            action_tx: chat_dispatcher.sender(),
+            persistence: dispatcher::PersistenceDeps {
+                memory: Arc::clone(&mem),
+                action_tx: chat_dispatcher.sender(),
+                dual_write_guard: dual_write_guard.clone(),
+            },
             provider_turn_lifecycle_tx: Some(provider_turn_lifecycle_tx.clone()),
-            dual_write_guard: dual_write_guard.clone(),
             redraw_tx: None,
             tui_mirror: Some(Arc::clone(&chat_mirror)),
             shutdown: shutdown.clone(),
@@ -439,11 +447,23 @@ async fn run_internal(
             tool_surface_reserve: tool_surface_reserve.clone(),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
-        let executor = dispatcher::EffectExecutor::new_with_deps(deps).with_cleanup_owner(Arc::clone(&child_cleanup));
+        let executor = dispatcher::EffectExecutor::new_with_deps(deps)
+            .with_cleanup_owner(Arc::clone(&child_cleanup))
+            .with_session_publisher(chat_dispatcher.session_publisher());
         if persist_sessions { executor } else { executor.without_session_rows() }
     };
+    // Non-TUI: the persistence effects run for real (save, publish, ack); the
+    // tool loop performs provider turns, hooks and output itself.
     #[cfg(not(feature = "terminal-tui"))]
-    let effect_executor = dispatcher::EffectExecutor::new_shadow();
+    let effect_executor = {
+        let executor = dispatcher::EffectExecutor::new_persistence_only(dispatcher::PersistenceDeps {
+            memory: Arc::clone(&mem),
+            action_tx: chat_dispatcher.sender(),
+            dual_write_guard: dual_write_guard.clone(),
+        })
+        .with_session_publisher(chat_dispatcher.session_publisher());
+        if persist_sessions { executor } else { executor.without_session_rows() }
+    };
 
     // P0-2 fix: take the redraw_slot Arc up front so redraw_tx can be injected after TUI
     // initialization completes. The EffectExecutor is consumed by the dispatcher
@@ -480,7 +500,7 @@ async fn run_internal(
 
     #[cfg(feature = "terminal-tui")]
     let (snapshot_tx_for_dispatcher, snapshot_rx_for_tui) = startup::initial_snapshot_channel(
-        provider_name, model_name, &chat_session, &config, top_redux_mode,
+        provider_name, model_name, &initial_session, &config, top_redux_mode,
     );
 
     #[cfg(feature = "terminal-tui")]
@@ -528,7 +548,7 @@ async fn run_internal(
         drop(input_tx);
     } else {
         println!("{banner}");
-        eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.id));
+        eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.session().id));
         let terminal_for_listen = TerminalChannel::new(plain_mode);
         tokio::spawn(async move {
             if let Err(e) = terminal_for_listen.listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx)).await {
@@ -653,10 +673,10 @@ async fn run_internal(
     // The one-shot message, queued literally (D4): no priority prefix or
     // command is interpreted. The input channel stays closed, so the loop
     // ends once this turn resolves.
-    let one_shot_turns_before = chat_session.turns.len();
+    let one_shot_turns_before = chat_session.session().turns.len();
     let mut one_shot_binding: Option<Arc<binding::ChatTurnBinding>> = None;
     if let Some(turn) = one_shot.as_ref() {
-        turn.enqueue(&mut input_backlog, &mut turn_scheduler, chat_session.turns.len());
+        turn.enqueue(&mut input_backlog, &mut turn_scheduler, chat_session.session().turns.len());
     }
 
     // ── Reload notice: historical child sessions (v4) ────────
@@ -675,8 +695,9 @@ async fn run_internal(
         surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &embedding_notice);
     }
 
-    if !chat_session.background_sessions.is_empty() {
-        let recap = format_reloaded_background_sessions(&chat_session.background_sessions);
+    let loaded_background_sessions = chat_session.session();
+    if !loaded_background_sessions.background_sessions.is_empty() {
+        let recap = format_reloaded_background_sessions(&loaded_background_sessions.background_sessions);
         surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &recap);
     }
 
@@ -720,6 +741,7 @@ async fn run_internal(
                     &$id,
                     ChatSwitchCtx {
                         chat_session: &mut chat_session,
+                        commits: &turn_signal,
                         chat_session_key: &mut chat_session_key,
                         fabric_turn_seq: &mut fabric_turn_seq,
                         history: &mut history,
@@ -768,12 +790,10 @@ async fn run_internal(
             &mut turn_scheduler,
             &mut history_commit_coordinator,
             &mut provider_turn_workers,
-            &chat_mirror,
             &chat_dispatcher,
             &terminal,
             &memory_fabric,
             &chat_session_key,
-            &mut chat_session,
             &config,
             sessions_redraw_handle.as_ref(),
             redraw_tx_for_main.as_ref(),
@@ -812,12 +832,10 @@ async fn run_internal(
                 &mut history,
                 &mut turn_scheduler,
                 &provider_turn_workers,
-                &chat_mirror,
                 &chat_dispatcher,
                 &terminal,
                 &memory_fabric,
                 &chat_session_key,
-                &mut chat_session,
                 &config,
                 sessions_redraw_handle.as_ref(),
                 redraw_tx_for_main.as_ref(),
@@ -889,7 +907,7 @@ async fn run_internal(
                         &mut provider_turn_workers,
                         Some(active_task_id),
                         &chat_dispatcher,
-                        &chat_session,
+                        &chat_session.session(),
                         &mut chat_sessions,
                         &session_rings,
                         &mut reaped_log_archive,
@@ -905,13 +923,13 @@ async fn run_internal(
                     &mut input_backlog,
                     &mut turn_scheduler,
                     msg,
-                    chat_session.turns.len(),
+                    chat_session.session().turns.len(),
                 );
                 drain_available_input_messages(
                     &mut input_rx,
                     &mut input_backlog,
                     Some(&mut turn_scheduler),
-                    chat_session.turns.len(),
+                    chat_session.session().turns.len(),
                 );
                 publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                 if let Some(next) = pop_next_visible_input_task_with_scheduler(
@@ -969,12 +987,10 @@ async fn run_internal(
                         &mut turn_scheduler,
                         &mut history_commit_coordinator,
                         &mut provider_turn_workers,
-                        &chat_mirror,
                         &chat_dispatcher,
                         &terminal,
                         &memory_fabric,
                         &chat_session_key,
-                        &mut chat_session,
                         &config,
                         sessions_redraw_handle.as_ref(),
                         redraw_tx_for_main.as_ref(),
@@ -1000,12 +1016,10 @@ async fn run_internal(
                             &mut turn_scheduler,
                             &mut history_commit_coordinator,
                             &mut provider_turn_workers,
-                            &chat_mirror,
                             &chat_dispatcher,
                             &terminal,
                             &memory_fabric,
                             &chat_session_key,
-                            &mut chat_session,
                             &config,
                             sessions_redraw_handle.as_ref(),
                             redraw_tx_for_main.as_ref(),
@@ -1057,18 +1071,11 @@ async fn run_internal(
                     RewindApprovalOutcome::Apply => {
                         let target_id = pending.target_session.id.clone();
                         let target_turns = pending.target_session.turn_count();
-                        if let Err(e) = save_session(mem.as_ref(), &pending.target_session).await {
-                            surface_session_message(
-                                &chat_dispatcher,
-                                sessions_redraw_handle.as_ref(),
-                                &format!("Rewind aborted: failed to save trimmed session: {e}"),
-                            );
-                            continue;
-                        }
                         let provider_name = current_provider_owned.as_str();
                         let model_name = current_model_owned.as_str();
-                        apply_chat_session_switch(ChatSwitchCtx {
+                        match apply_chat_session_switch(ChatSwitchCtx {
                             chat_session: &mut chat_session,
+                            commits: &turn_signal,
                             chat_session_key: &mut chat_session_key,
                             fabric_turn_seq: &mut fabric_turn_seq,
                             history: &mut history,
@@ -1093,12 +1100,18 @@ async fn run_internal(
                             native_tools,
                             #[cfg(feature = "terminal-tui")]
                             chat_mirror: &chat_mirror,
-                        }, pending.target_session).await;
-                        surface_session_message(
-                            &chat_dispatcher,
-                            sessions_redraw_handle.as_ref(),
-                            &format!("Rewound chat session {target_id} to {target_turns} turns."),
-                        );
+                        }, pending.target_session, true).await {
+                            Ok(()) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &format!("Rewound chat session {target_id} to {target_turns} turns."),
+                            ),
+                            Err(e) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &format!("Rewind aborted: failed to save trimmed session: {e}"),
+                            ),
+                        }
                     }
                     RewindApprovalOutcome::Cancelled(message) => {
                         surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &message);
@@ -1196,11 +1209,7 @@ async fn run_internal(
                                 )
                             },
                         );
-                    // Legacy (non-TUI) persistence path serializes `chat_session`
-                    // directly, so mirror the record there too. The Redux/TUI
-                    // path persists from SessionState, fed by the dispatched
-                    // action below. Both write the same backward-compatible field.
-                    chat_session.record_background_session(persisted.clone());
+                    // The reducer records and saves the summary (both builds).
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
                         "chat.bg_session_recorded",
@@ -1216,13 +1225,13 @@ async fn run_internal(
                         .collect::<std::collections::HashSet<_>>();
                     for session in &reaped.reaped {
                         if chat_session
+                            .session()
                             .background_sessions
                             .iter()
                             .any(|summary| summary.id == session.summary.id)
                         {
                             continue;
                         }
-                        chat_session.record_background_session(session.summary.clone());
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::BackgroundSessionRecorded {
                                 summary: session.summary.clone(),
@@ -1493,7 +1502,7 @@ async fn run_internal(
         }
 
         if is_copy_command(&user_input) {
-            match select_copy_content(&chat_session, &user_input) {
+            match select_copy_content(&chat_session.session(), &user_input) {
                 Ok(selection) if plain_mode => {
                     println!("{}", selection.content);
                     let _ = std::io::stdout().flush();
@@ -1598,12 +1607,19 @@ async fn run_internal(
                     {
                         chat_mirror.lock().model = new_model.to_string();
                     }
-                    let _ = chat_dispatcher.dispatch_or_log(
+                    if let Err(error) = await_metadata_change(
+                        &chat_dispatcher,
+                        &turn_signal,
+                        &mut chat_session,
                         crate::chat::action::Action::ModelChanged {
                             model: new_model.to_string(),
                         },
-                        "chat.model_changed",
-                    );
+                    )
+                    .await
+                    {
+                        emit_chat_output(&format!("Model switch was not saved: {error}"));
+                        continue;
+                    }
                     // emit_chat_output already nudges the renderer (try_send on
                     // the TUI redraw channel) so the status bar repaints.
                     emit_chat_output(&format!(
@@ -1709,13 +1725,20 @@ Retry with a compatible model: /provider {shown} <model>",
                     // provider handle, the Redux provider_slot and the session ledger) stay
                     // consistent this way. When switching providers also changes the model, both go
                     // into the same action (no separate ModelChanged needed).
-                    let _ = chat_dispatcher.dispatch_or_log(
+                    if let Err(error) = await_metadata_change(
+                        &chat_dispatcher,
+                        &turn_signal,
+                        &mut chat_session,
                         crate::chat::action::Action::ProviderChanged {
                             provider: new_provider.clone(),
                             model: model_changed.then(|| candidate_model.clone()),
                         },
-                        "chat.provider_changed",
-                    );
+                    )
+                    .await
+                    {
+                        emit_chat_output(&format!("Provider switch was not saved: {error}"));
+                        continue;
+                    }
                     let model_note = if model_changed {
                         format!(" (model set to {candidate_model})")
                     } else {
@@ -1793,9 +1816,9 @@ Retry with a compatible model: /provider {shown} <model>",
         // remain intact, including those owned by other sessions or channels.
         if matches!(user_input.as_str(), "/new" | "/clear") {
             match start_new_chat_session(
-                mem.as_ref(),
                 ChatSwitchCtx {
                     chat_session: &mut chat_session,
+                    commits: &turn_signal,
                     chat_session_key: &mut chat_session_key,
                     fabric_turn_seq: &mut fabric_turn_seq,
                     history: &mut history,
@@ -1845,13 +1868,14 @@ Retry with a compatible model: /provider {shown} <model>",
             let compact_outcome = super::compaction::run_manual_compact(
                 super::compaction::ManualCompact {
                     history: &mut history,
-                    chat_session: &chat_session,
+                    chat_session: &chat_session.session(),
                     provider: provider.as_ref(),
                     model: model_name,
                     config: &compact_config,
                     memory: Arc::clone(&mem),
                     envelope: &compact_envelope,
                     chat_dispatcher: &chat_dispatcher,
+                    commits: &turn_signal,
                 },
                 &mut |text: &str| emit_chat_output(text),
             )
@@ -1874,7 +1898,7 @@ Retry with a compatible model: /provider {shown} <model>",
             let cmd_ctx = commands::CommandContext {
                 model_name,
                 provider_name,
-                chat_session: &chat_session,
+                chat_session: &chat_session.session(),
                 tools_registry: &tools_registry,
                 mem: mem.as_ref(),
             };
@@ -1886,20 +1910,22 @@ Retry with a compatible model: /provider {shown} <model>",
                 }
                 commands::CommandResult::Quit => break 'chat,
                 commands::CommandResult::SetMode(mode) => {
-                    // Pure skips the legacy chat_session.set_mode; in legacy mode
-                    // run_turn still reads it.
-                    let _ = chat_dispatcher
-                        .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
+                    // The reducer saves a changed mode; success is reported
+                    // only after its acknowledgement.
+                    if let Err(error) = await_metadata_change(
+                        &chat_dispatcher,
+                        &turn_signal,
+                        &mut chat_session,
+                        crate::chat::action::Action::ModeChanged(mode),
+                    )
+                    .await
+                    {
+                        emit_chat_output(&format!("Mode unchanged: {error}"));
+                        continue;
+                    }
                     #[cfg(feature = "terminal-tui")]
                     {
                         chat_mirror.lock().chat_mode = mode;
-                    }
-                    #[cfg(feature = "terminal-tui")]
-                    let legacy_session_mode_writes_enabled = false; // S4-B: Pure single source
-                    #[cfg(not(feature = "terminal-tui"))]
-                    let legacy_session_mode_writes_enabled = true;
-                    if legacy_session_mode_writes_enabled {
-                        chat_session.set_mode(mode);
                     }
                     let msg = match mode {
                         commands::ChatMode::Plan => {
@@ -1922,7 +1948,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                         .map(|session| {
                                             crate::chat::session::SavedSessionPickerEntry::from_session(
                                                 session,
-                                                &chat_session.id,
+                                                &chat_session.session().id,
                                             )
                                         })
                                         .collect::<Vec<_>>();
@@ -1961,6 +1987,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 &id,
                                 ChatSwitchCtx {
                                     chat_session: &mut chat_session,
+                                    commits: &turn_signal,
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
@@ -1994,32 +2021,13 @@ Retry with a compatible model: /provider {shown} <model>",
                             }
                         }
                         commands::ResumeCommand::Last => {
-                            let current_child_summaries = chat_sessions
-                                .snapshot()
-                                .await
-                                .iter()
-                                .map(|view| {
-                                    crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new())
-                                })
-                                .collect::<Vec<_>>();
-                            let mut current_to_save = chat_session.clone();
-                            for summary in &current_child_summaries {
-                                current_to_save.record_background_session(summary.clone());
-                            }
-
-                            if let Err(e) = save_session(mem.as_ref(), &current_to_save).await {
+                            if let Err(e) =
+                                record_child_summaries_awaited(&mut chat_sessions, &chat_dispatcher, &turn_signal).await
+                            {
                                 emit_chat_output(&format!(
                                     "Resume aborted: failed to save current session before switching: {e}"
                                 ));
                                 continue;
-                            }
-                            for summary in &current_child_summaries {
-                                let _ = chat_dispatcher.dispatch_or_log(
-                                    crate::chat::action::Action::BackgroundSessionRecorded {
-                                        summary: summary.clone(),
-                                    },
-                                    "chat.resume_record_child_summary_before_switch",
-                                );
                             }
 
                             let loaded = match load_latest_session_with_message_events(
@@ -2045,9 +2053,10 @@ Retry with a compatible model: /provider {shown} <model>",
                                 continue;
                             };
 
-                            apply_chat_session_switch(
+                            if let Err(e) = apply_chat_session_switch(
                                 ChatSwitchCtx {
                                     chat_session: &mut chat_session,
+                                    commits: &turn_signal,
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
@@ -2074,18 +2083,24 @@ Retry with a compatible model: /provider {shown} <model>",
                                     chat_mirror: &chat_mirror,
                                 },
                                 loaded_session,
+                                false,
                             )
-                            .await;
+                            .await
+                            {
+                                emit_chat_output(&format!("Resume aborted: {e}"));
+                                continue;
+                            }
 
-                            let title = if chat_session.title.is_empty() {
+                            let resumed = chat_session.session();
+                            let title = if resumed.title.is_empty() {
                                 "(untitled)"
                             } else {
-                                chat_session.title.as_str()
+                                resumed.title.as_str()
                             };
                             emit_chat_output(&format!(
                                 "Resumed saved chat session {} ({title}, {} turns).",
-                                chat_session.id,
-                                chat_session.turn_count()
+                                resumed.id,
+                                resumed.turn_count()
                             ));
                         }
                     }
@@ -2094,45 +2109,37 @@ Retry with a compatible model: /provider {shown} <model>",
                 commands::CommandResult::HistoryAction(action) => {
                     match action {
                         commands::HistoryCommand::BranchList => {
-                            emit_chat_output(&format_turn_boundaries(&chat_session));
+                            emit_chat_output(&format_turn_boundaries(&chat_session.session()));
                         }
                         commands::HistoryCommand::Branch(raw) => {
-                            let keep_turns = match parse_turn_boundary(&raw, chat_session.turn_count(), "branch") {
+                            let keep_turns = match parse_turn_boundary(&raw, chat_session.session().turn_count(), "branch") {
                                 Ok(value) => value,
                                 Err(msg) => {
                                     emit_chat_output(&msg);
                                     continue;
                                 }
                             };
-                            let current_child_summaries = chat_sessions
-                                .snapshot()
-                                .await
-                                .iter()
-                                .map(|view| {
-                                    crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new())
-                                })
-                                .collect::<Vec<_>>();
-                            let mut current_to_save = chat_session.clone();
-                            for summary in current_child_summaries {
-                                current_to_save.record_background_session(summary);
-                            }
-                            if let Err(e) = save_session(mem.as_ref(), &current_to_save).await {
+                            if let Err(e) =
+                                record_child_summaries_awaited(&mut chat_sessions, &chat_dispatcher, &turn_signal).await
+                            {
                                 emit_chat_output(&format!(
                                     "Branch aborted: failed to save current session before forking: {e}"
                                 ));
                                 continue;
                             }
-                            let branch =
-                                branched_chat_session_from(&current_to_save, keep_turns, provider_name, model_name);
+                            // The branch boundary reads the acknowledged state.
+                            let current = chat_session.session();
+                            let branch = branched_chat_session_from(&current, keep_turns, provider_name, model_name);
                             let branch_id = branch.id.clone();
                             let branch_turns = branch.turn_count();
                             if let Err(e) = save_session(mem.as_ref(), &branch).await {
                                 emit_chat_output(&format!("Branch aborted: failed to save new branch session: {e}"));
                                 continue;
                             }
-                            apply_chat_session_switch(
+                            if let Err(e) = apply_chat_session_switch(
                                 ChatSwitchCtx {
                                     chat_session: &mut chat_session,
+                                    commits: &turn_signal,
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
@@ -2159,21 +2166,26 @@ Retry with a compatible model: /provider {shown} <model>",
                                     chat_mirror: &chat_mirror,
                                 },
                                 branch,
+                                true,
                             )
-                            .await;
+                            .await
+                            {
+                                emit_chat_output(&format!("Branch aborted: {e}"));
+                                continue;
+                            }
                             emit_chat_output(&format!(
                                 "Created branch {branch_id} from the first {branch_turns} turns and switched to it."
                             ));
                         }
                         commands::HistoryCommand::Rewind(raw) => {
-                            let keep_turns = match parse_turn_boundary(&raw, chat_session.turn_count(), "rewind") {
+                            let keep_turns = match parse_turn_boundary(&raw, chat_session.session().turn_count(), "rewind") {
                                 Ok(value) => value,
                                 Err(msg) => {
                                     emit_chat_output(&msg);
                                     continue;
                                 }
                             };
-                            if keep_turns == chat_session.turn_count() {
+                            if keep_turns == chat_session.session().turn_count() {
                                 emit_chat_output(&format!(
                                     "Rewind skipped: session already has exactly {keep_turns} turns."
                                 ));
@@ -2205,7 +2217,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                     );
                                     continue;
                                 };
-                                let target_session = rewound_chat_session_from(&chat_session, keep_turns);
+                                let target_session = rewound_chat_session_from(&chat_session.session(), keep_turns);
                                 let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<bool>();
                                 let tool_id = format!("chat_rewind:{}", uuid::Uuid::new_v4());
                                 if !router.register(tool_id.clone(), approval_tx) {
@@ -2213,10 +2225,10 @@ Retry with a compatible model: /provider {shown} <model>",
                                     continue;
                                 }
                                 let args = serde_json::json!({
-                                    "session_id": chat_session.id,
-                                    "from_turns": chat_session.turn_count(),
+                                    "session_id": chat_session.session().id,
+                                    "from_turns": chat_session.session().turn_count(),
                                     "to_turns": keep_turns,
-                                    "drops_child_summaries": keep_turns < chat_session.turn_count(),
+                                    "drops_child_summaries": keep_turns < chat_session.session().turn_count(),
                                 })
                                 .to_string();
                                 let dispatch_result = chat_dispatcher.dispatch_or_log(
@@ -2255,7 +2267,7 @@ Retry with a compatible model: /provider {shown} <model>",
                         emit_chat_output(approval_already_pending_message());
                         continue;
                     }
-                    let Some(diff) = diff_apply::latest_fenced_diff(&chat_session.turns, latest_index) else {
+                    let Some(diff) = diff_apply::latest_fenced_diff(&chat_session.session().turns, latest_index) else {
                         emit_chat_output("No applicable fenced diff block found in this conversation.");
                         continue;
                     };
@@ -2391,7 +2403,7 @@ Retry with a compatible model: /provider {shown} <model>",
                             .await
                             {
                                 emit_chat_output(&super::session_glue::sessions_listing_with_current(
-                                    &chat_session.id,
+                                    &chat_session.session().id,
                                     &output,
                                 ));
                             }
@@ -3043,11 +3055,11 @@ Retry with a compatible model: /provider {shown} <model>",
         #[cfg(feature = "terminal-tui")]
         let admitted_chat_mode = chat_mirror.lock().chat_mode;
         #[cfg(not(feature = "terminal-tui"))]
-        let admitted_chat_mode = chat_session.mode;
+        let admitted_chat_mode = chat_session.session().mode;
         let has_conversation_history = history.iter().any(|message| message.role != "system");
         let (chat_user_event, admitted_binding, mut admission_guard) = current_provider_binding.record_guarded_with_origin(
             memory_fabric.clone(), (input_scope, &chat_session_key, binding::ChatAdmissionMode::Model(admitted_chat_mode), has_conversation_history), &user_input,
-            format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.id),
+            format!("chat:{}:{turn_run_id}:{fabric_turn_seq}:user", chat_session.session().id),
             child_cleanup.register(cancellation.clone())?, entry::prepare_origin(terminal_origin,&msg,&user_input)?,
         ).await?;
         let admission = admitted_binding
@@ -3113,7 +3125,7 @@ Retry with a compatible model: /provider {shown} <model>",
         // Publish only this turn's selected metadata. Previous turns do not
         // grant continued Skill exposure; the prompt builder orders entries.
         let system_prompt = build_runtime_system_prompt(&config, model_name, &selected_skills, native_tools);
-        let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
+        let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input);
         upsert_leading_system_prompt(&mut history, system_prompt.clone());
         // S2-C Step 4: dual-write SetLeadingSystemPrompt to the reducer — byte-for-byte aligned with
         // the legacy `if empty { push } else { first_mut = ... }` (the reducer takes the same
@@ -3706,7 +3718,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                 &mut provider_turn_workers,
                                 provider_turn_task_id,
                                 &chat_dispatcher,
-                                &chat_session,
+                                &chat_session.session(),
                                 &mut chat_sessions,
                                 &session_rings,
                                 &mut reaped_log_archive,
@@ -3819,27 +3831,16 @@ Retry with a compatible model: /provider {shown} <model>",
                                 return Err(error);
                             }
                         };
-                        chat_session.add_user_turn(&user_input);
-                        if let Some(record) =
-                            terminal_usage.and_then(|record| chat_session.record_usage_settlement(record))
-                        {
-                            record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
-                            #[cfg(feature = "terminal-tui")]
-                            {
-                                chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
-                            }
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::ProviderUsageRecorded {
-                                    task_id: provider_turn_task_id,
-                                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
-                                    record,
-                                },
-                                "chat.provider_usage_recorded_empty_response",
-                            );
-                            #[cfg(feature = "terminal-tui")]
-                            if let Some(tx) = redraw_tx_for_main.as_ref() {
-                                let _ = tx.try_send(());
-                            }
+                        dispatch_final_usage(
+                            &chat_dispatcher,
+                            &mut turn_scheduler,
+                            provider_turn_task_id,
+                            terminal_usage,
+                            "chat.provider_usage_recorded_empty_response",
+                        );
+                        #[cfg(feature = "terminal-tui")]
+                        if let Some(tx) = redraw_tx_for_main.as_ref() {
+                            let _ = tx.try_send(());
                         }
                         surface_turn_elapsed_message(
                             &chat_dispatcher,
@@ -3906,39 +3907,20 @@ Retry with a compatible model: /provider {shown} <model>",
                         attempts_count,
                         "success",
                     );
-                    // On the driver path RecordAssistantTurn is already sent by dispatcher.rs
-                    // (fixB B5).
-                    // BUG-06 / BUG-08 round-2 fix: the real TUI drives turns through
-                    // this ReduxDriver branch, which `continue`s at the end of the
-                    // block and therefore NEVER reaches the legacy tool-loop
-                    // `chat_session.add_*_turn` at the bottom of the loop body. The
-                    // round-1 fix populated only that legacy path, so interactive
-                    // `/export` / `/cost` (which read `ctx.chat_session.turns`) still
-                    // saw an empty session. Mirror the live turn into the in-memory
-                    // `chat_session` here as well. The reducer remains the single *persistence*
-                    // source (it dispatched RecordAssistantTurn + Effect::SaveSession),
-                    // so this only backs the slash commands and never double-writes.
-                    chat_session.add_user_turn(&user_input);
-                    chat_session.add_assistant_turn(&recorded_response, Vec::new());
-                    if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record))
-                    {
-                        record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
-                        #[cfg(feature = "terminal-tui")]
-                        {
-                            chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
-                        }
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::ProviderUsageRecorded {
-                                task_id: provider_turn_task_id,
-                                usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
-                                record,
-                            },
-                            "chat.provider_usage_recorded",
-                        );
-                        #[cfg(feature = "terminal-tui")]
-                        if let Some(tx) = redraw_tx_for_main.as_ref() {
-                            let _ = tx.try_send(());
-                        }
+                    // On this driver path the worker's sink already sent
+                    // RecordAssistantTurn + StreamCompleted (fixB B5); the
+                    // reducer owns the turn, and the slash commands read its
+                    // acknowledged snapshot.
+                    dispatch_final_usage(
+                        &chat_dispatcher,
+                        &mut turn_scheduler,
+                        provider_turn_task_id,
+                        terminal_usage,
+                        "chat.provider_usage_recorded",
+                    );
+                    #[cfg(feature = "terminal-tui")]
+                    if let Some(tx) = redraw_tx_for_main.as_ref() {
+                        let _ = tx.try_send(());
                     }
                     surface_turn_elapsed_message(
                         &chat_dispatcher,
@@ -4060,7 +4042,9 @@ Retry with a compatible model: /provider {shown} <model>",
                     &legacy_budget_config,
                     crate::chat::action::CompactReason::ContextOverflow,
                     &chat_dispatcher,
+                    &turn_signal,
                 )
+                .await
             } else {
                 let messages_before = history.len();
                 compact_chat_history(&mut history);
@@ -4480,49 +4464,47 @@ Retry with a compatible model: /provider {shown} <model>",
                     return Err(error);
                 }
             };
-            if let Some(ref d_id) = draft_id {
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::StreamCompleted {
-                        draft_id: d_id.clone(),
-                        final_text: String::new(),
-                        reasoning: String::new(),
-                    },
-                    "chat.stream_completed_empty_response",
-                );
-                if let Err(e) = terminal.cancel_draft("user", d_id).await {
-                    tracing::debug!(error = %e, "cancel empty-response draft failed");
-                }
+            // Usage first (inside the commit's acknowledged revision), then
+            // the awaited commit (the user turn was recorded at admission).
+            dispatch_final_usage(
+                &chat_dispatcher,
+                &mut turn_scheduler,
+                provider_turn_task_id,
+                terminal_usage,
+                "chat.provider_usage_recorded_empty_response",
+            );
+            let Some(commit_task_id) = provider_turn_task_id else {
+                anyhow::bail!("chat turn has no provider task; its history cannot be committed");
+            };
+            if let Err(error) = dispatch_ordered_provider_turn_commit_and_wait(
+                &chat_dispatcher,
+                &turn_signal,
+                commit_task_id,
+                OrderedCommitTerminal::TurnCommitRequested { draft_id: draft_id.as_deref() },
+                &user_input,
+                "",
+                true,
+                false,
+            )
+            .await
+            {
+                anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+            }
+            if let Some(ref d_id) = draft_id
+                && let Err(e) = terminal.cancel_draft("user", d_id).await
+            {
+                tracing::debug!(error = %e, "cancel empty-response draft failed");
             }
             surface_session_message(
                 &chat_dispatcher,
                 sessions_redraw_handle.as_ref(),
                 crate::agent::response_guard::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
             );
-
-            chat_session.add_user_turn(&user_input);
-            if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
-                record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
-                #[cfg(feature = "terminal-tui")]
-                {
-                    chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
-                }
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::ProviderUsageRecorded {
-                        task_id: provider_turn_task_id,
-                        usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
-                        record,
-                    },
-                    "chat.provider_usage_recorded_empty_response",
-                );
-                #[cfg(feature = "terminal-tui")]
-                if let Some(tx) = redraw_tx_for_main.as_ref() {
-                    let _ = tx.try_send(());
-                }
+            #[cfg(feature = "terminal-tui")]
+            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                let _ = tx.try_send(());
             }
             if !dual_write_guard.is_active() {
-                if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
-                    tracing::warn!("Failed to persist session after empty assistant response: {e}");
-                }
                 observer.record_event(&ObserverEvent::TurnComplete);
                 hooks
                     .emit(
@@ -4582,28 +4564,37 @@ Retry with a compatible model: /provider {shown} <model>",
         // byte-for-byte aligned with the legacy history. The old dispatch at line 2055 below used
         // sanitized_response, whose content differs from history.push — from S2-B Step 4 on it is
         // dispatched here with response instead, and the old dispatch below is deleted.
-        let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordAssistantTurn {
-                task_id: provider_turn_task_id,
-                content: response.clone(),
-            },
-            "chat.record_assistant_turn",
+        // The final usage goes first so the commit's acknowledged revision
+        // carries it; the ordered commit then sends RecordAssistantTurn and
+        // the awaited TurnCommitRequested (the user turn was recorded at
+        // admission).
+        dispatch_final_usage(
+            &chat_dispatcher,
+            &mut turn_scheduler,
+            provider_turn_task_id,
+            terminal_usage,
+            "chat.provider_usage_recorded",
         );
-
-        // T3-3-fixA P0-1: StreamCompleted must be dispatched after RecordAssistantTurn, because the
-        // reducer's reduce_stream_completed emits Effect::SaveSession(snapshot) and session.turns must
-        // already contain this turn's assistant message by then — otherwise SaveSession persists a
-        // stale snapshot. final_text matches the response persisted above, keeping the reducer's
-        // conversation_lines, history records and the UI aligned.
-        if let Some(ref d_id) = draft_id {
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::StreamCompleted {
-                    draft_id: d_id.clone(),
-                    final_text: response.clone(),
-                    reasoning: String::new(),
-                },
-                "chat.stream_completed",
-            );
+        let Some(commit_task_id) = provider_turn_task_id else {
+            anyhow::bail!("chat turn has no provider task; its history cannot be committed");
+        };
+        if let Err(error) = dispatch_ordered_provider_turn_commit_and_wait(
+            &chat_dispatcher,
+            &turn_signal,
+            commit_task_id,
+            OrderedCommitTerminal::TurnCommitRequested { draft_id: draft_id.as_deref() },
+            &user_input,
+            &response,
+            false,
+            false,
+        )
+        .await
+        {
+            anyhow::bail!("Chat stopped after an unconfirmed history commit: {error}");
+        }
+        #[cfg(feature = "terminal-tui")]
+        if let Some(tx) = redraw_tx_for_main.as_ref() {
+            let _ = tx.try_send(());
         }
 
         // ── Extract and display media markers (images, documents, etc.) ──
@@ -4658,46 +4649,6 @@ Retry with a compatible model: /provider {shown} <model>",
             let _ = terminal.send(&SendMessage::new(rendered, "user")).await;
         }
 
-        // ── Record turn in session + persist ───────────────────
-        // S2-B Step 4: RecordUserTurn / RecordAssistantTurn were already dispatched above (at the
-        // same points as enriched / response); the legacy `chat_session.add_*_turn` here is kept in
-        // `Off` / `Both` / `Redux` mode, because `chat_session` is still the real persistence source
-        // for `save_session(mem, &chat_session)`.
-        //
-        // T3-3-c wrap-up: **Pure mode skips the legacy add_*_turn** — the reducer's
-        // `RecordUserTurn` / `RecordAssistantTurn` + `Effect::SaveSession` take over single-source
-        // persistence, and the `save_session(...)` below is also suppressed by `dual_write_guard`.
-        // That closes the last dual-write remnant kept from the S2-D/E stage.
-        // BUG-06 / BUG-08 fix: always keep the in-memory `chat_session.turns`
-        // populated so interactive `/cost` and `/export` (which read
-        // `ctx.chat_session.turns`) reflect the live conversation. In Pure mode
-        // the reducer owns *persistence* (its `build_session_snapshot` +
-        // `Effect::SaveSession`), and the legacy `save_session(&chat_session)`
-        // below is independently suppressed by `dual_write_guard`. Populating the
-        // in-memory turns therefore does NOT cause double-persistence — it only
-        // backs the slash commands that read from `chat_session`.
-        chat_session.add_user_turn(&user_input);
-        chat_session.add_assistant_turn(&response, Vec::new());
-        if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
-            record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
-            #[cfg(feature = "terminal-tui")]
-            {
-                chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
-            }
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::ProviderUsageRecorded {
-                    task_id: provider_turn_task_id,
-                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
-                    record,
-                },
-                "chat.provider_usage_recorded",
-            );
-            #[cfg(feature = "terminal-tui")]
-            if let Some(tx) = redraw_tx_for_main.as_ref() {
-                let _ = tx.try_send(());
-            }
-        }
-
         // P0-1 fix: in Both/Redux mode the old path is gated by dual_write_guard.
         // The Redux reducer's SaveSession effect already raised the guard inside execute_real, and
         // when the guard is active the old path skips save_session + hooks.emit(TurnComplete), which
@@ -4708,10 +4659,6 @@ Retry with a compatible model: /provider {shown} <model>",
         // SaveSession or NotifyHook during a turn, the guard is active and every later write of the
         // old path is suppressed.
         if !dual_write_guard.is_active() {
-            if persist_sessions && let Err(e) = save_session(mem.as_ref(), &chat_session).await {
-                tracing::warn!("Failed to persist session: {e}");
-            }
-
             observer.record_event(&ObserverEvent::TurnComplete);
             hooks
                 .emit(
@@ -4723,11 +4670,8 @@ Retry with a compatible model: /provider {shown} <model>",
                 )
                 .await;
         } else {
-            // Guard active: Redux path already handled save_session + hooks.emit.
-            // The old path skips this, to avoid duplicate writes/notifications.
-            tracing::debug!(
-                "P0-1: dual_write_guard active — legacy path skipping save_session + hooks.emit(TurnComplete)"
-            );
+            // Guard active: the Redux path already handled hooks.emit.
+            tracing::debug!("P0-1: dual_write_guard active — legacy path skipping hooks.emit(TurnComplete)");
             // observer.record_event is still called (the observer is only a local counter, with no
             // external side effects).
             observer.record_event(&ObserverEvent::TurnComplete);
@@ -4756,7 +4700,7 @@ Retry with a compatible model: /provider {shown} <model>",
     // registry through the single session owner. This covers running agents,
     // NeedsInput agents, background shells, and interactive PTYs uniformly.
     let _shutdown_report =
-        shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &chat_dispatcher).await;
+        shutdown_child_sessions_for_exit(&mut chat_sessions, &chat_dispatcher, &turn_signal).await;
     session_rings.clear();
     withdraw_assignment_enrolment(
         assignment_enrolment.as_ref(),
@@ -4771,15 +4715,14 @@ Retry with a compatible model: /provider {shown} <model>",
         one_shot::outcome(
             one_shot_binding.as_deref(),
             plain_mode_turn_failed,
-            chat_session.turns.len() > one_shot_turns_before,
+            chat_session.session().turns.len() > one_shot_turns_before,
             &history,
         )
     });
     startup::finish_chat_session(
         &shutdown, chat_dispatcher, dispatcher_handle,
         #[cfg(feature = "terminal-tui")] &terminal_guard,
-        &mem, &chat_session, plain_mode_turn_failed && one_shot.is_none(),
-        #[cfg(not(feature = "terminal-tui"))] persist_sessions,
+        plain_mode_turn_failed && one_shot.is_none(),
     ).await?;
     one_shot_reply.transpose()
     }).await;

@@ -360,7 +360,7 @@ impl ChatState {
                     "response_chars": chars,
                 }),
             },
-            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
         ];
         // Fallback for drivers that miss RecordAssistantTurn: only the completed
@@ -402,7 +402,7 @@ impl ChatState {
                     "response_chars": chars,
                 }),
             },
-            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
         ];
         self.control.clear_tool_buffer(tool_key);

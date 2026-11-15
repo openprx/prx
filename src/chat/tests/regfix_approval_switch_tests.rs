@@ -5,9 +5,54 @@ use crate::chat::action::Action;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Records every action the switch sends and answers awaited ones through a
+/// real reducer: the commit the reducer emits is the published value.
+fn spawn_recording_reducer(
+    mut state: crate::chat::state::ChatState,
+    mut action_rx: tokio::sync::mpsc::Receiver<Action>,
+) -> (Arc<parking_lot::Mutex<Vec<Action>>>, tokio::task::JoinHandle<()>) {
+    let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    let handle = tokio::spawn(async move {
+        while let Some(action) = action_rx.recv().await {
+            let Action::Awaited { action, ticket } = action else {
+                sink.lock().push(action);
+                continue;
+            };
+            let effects = state.reduce((*action).clone());
+            sink.lock().push(*action);
+            let acked = effects.iter().find_map(|effect| match effect {
+                crate::chat::state::Effect::SaveSession(commit)
+                | crate::chat::state::Effect::PublishSession(commit) => Some(commit.acked()),
+                _ => None,
+            });
+            ticket.answer(Ok(match acked {
+                Some(acked) => crate::chat::acked_session::Ack::Published(acked),
+                None => crate::chat::acked_session::Ack::Unchanged(state.acked_session_seed()),
+            }));
+        }
+    });
+    (recorded, handle)
+}
+
 #[tokio::test]
 async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
-    let (chat_dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+    let mut current_session = session::ChatSession::new("p", "m");
+    current_session.id = "current-session".to_string();
+    current_session.add_user_turn("current");
+    let mut reducer_state = crate::chat::state::ChatState::new(
+        Arc::from("p"),
+        Arc::from("m"),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let _ = reducer_state.reduce(Action::SessionLoaded {
+        session: current_session,
+        persist: false,
+    });
+    let (chat_dispatcher, action_rx) = dispatcher::ChatDispatcher::new_seeded(reducer_state.acked_session_seed());
+    let mut chat_session = chat_dispatcher.session_reader();
+    let (recorded, recorder) = spawn_recording_reducer(reducer_state, action_rx);
+    let commits = dispatcher::TurnCompletionSignal::new();
     let approval_router = Arc::new(dispatcher::ApprovalRouter::new());
     let (router_tx, mut router_rx) = tokio::sync::oneshot::channel::<bool>();
     assert!(approval_router.register("tool-live".to_string(), router_tx));
@@ -29,9 +74,6 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
         approval_rx: apply_rx,
     });
 
-    let mut chat_session = session::ChatSession::new("p", "m");
-    chat_session.id = "current-session".to_string();
-    chat_session.add_user_turn("current");
     let mut loaded_session = session::ChatSession::new("p", "m");
     loaded_session.id = "loaded-session".to_string();
     loaded_session.title = "Loaded".to_string();
@@ -83,6 +125,7 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
     apply_chat_session_switch(
         ChatSwitchCtx {
             chat_session: &mut chat_session,
+            commits: &commits,
             chat_session_key: &mut chat_session_key,
             fabric_turn_seq: &mut fabric_turn_seq,
             history: &mut history,
@@ -108,14 +151,16 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
             chat_mirror: &chat_mirror,
         },
         loaded_session,
+        false,
     )
-    .await;
+    .await
+    .expect("the load is acknowledged");
 
     assert_eq!(router_rx.try_recv(), Ok(false), "router approval must be denied");
     assert!(pending_chat_rewind.is_none());
     assert!(pending_diff_apply.is_none());
     assert!(!approval_router.has_pending());
-    assert_eq!(chat_session.id, "loaded-session");
+    assert_eq!(chat_session.session().id, "loaded-session");
     assert_eq!(chat_session_key, "chat:loaded-session");
     assert_eq!(fabric_turn_seq, 1);
     assert!(announced_started_sessions.is_empty());
@@ -134,9 +179,11 @@ async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
         assert_eq!(mirror.turn_count, 2);
     }
 
+    drop(chat_dispatcher);
+    recorder.await.expect("recorder joins");
     let mut received = Vec::new();
     let mut saw_clear = false;
-    while let Ok(action) = action_rx.try_recv() {
+    for action in recorded.lock().drain(..) {
         match action {
             Action::ToolApprovalReceived { tool_id, approved, .. } => received.push((tool_id, approved)),
             Action::ToolApprovalCleared => saw_clear = true,

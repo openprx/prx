@@ -301,11 +301,25 @@ pub(super) fn dispatch_child_bottom_switch(
 ///
 /// Pure on its own, no I/O — kept here so unit tests can exercise the binding
 /// table without touching crossterm / ratatui terminals.
+/// The loggable class of a key: `char` keys never log which character was
+/// typed, `modifier` keys only their class; named keys (Enter, Esc, arrows,
+/// F-keys) are not content and are returned for the log.
+#[must_use]
+pub(crate) const fn key_log_class(code: &KeyCode) -> (&'static str, Option<&KeyCode>) {
+    match code {
+        KeyCode::Char(_) => ("char", None),
+        KeyCode::Modifier(_) => ("modifier", None),
+        named => ("named", Some(named)),
+    }
+}
+
 pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // [DIAG] trace every key that enters the dispatch function so we can
     // correlate raw events (tui_input_event) with what the handler sees.
+    let (key_class, named_key) = key_log_class(&key.code);
     tracing::debug!(
-        code = ?key.code,
+        key_class,
+        named_key = ?named_key,
         modifiers = ?key.modifiers,
         kind = ?key.kind,
         input_lines_before = state.input.lines.len(),

@@ -18,8 +18,8 @@ async fn s2_5_t2_5_3_save_session_dispatch_idempotent() {
     let executor = EffectExecutor::new_with_deps(deps);
 
     let session = ChatSession::new("prov", "model");
-    executor.execute(Effect::SaveSession(session.clone())).await;
-    executor.execute(Effect::SaveSession(session)).await;
+    executor.execute(Effect::SaveSession(session.clone().into())).await;
+    executor.execute(Effect::SaveSession(session.into())).await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
@@ -68,14 +68,16 @@ async fn s2_5_t2_5_3_notify_hook_repeat_no_double_fire() {
     let shutdown = CancellationToken::new();
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks: Arc::clone(&hooks),
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard: RuntimeDualWriteGuard::new(),
         redraw_tx: Some(redraw_tx),
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,
@@ -161,12 +163,12 @@ async fn s2_5_t2_5_3_save_session_concurrent_dispatch_no_race() {
     let exec1 = Arc::clone(&executor);
     let sess1 = session.clone();
     let h1 = tokio::spawn(async move {
-        exec1.execute(Effect::SaveSession(sess1)).await;
+        exec1.execute(Effect::SaveSession(sess1.into())).await;
     });
     let exec2 = Arc::clone(&executor);
     let sess2 = session;
     let h2 = tokio::spawn(async move {
-        exec2.execute(Effect::SaveSession(sess2)).await;
+        exec2.execute(Effect::SaveSession(sess2.into())).await;
     });
 
     tokio::time::timeout(Duration::from_secs(5), async {

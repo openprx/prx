@@ -29,7 +29,12 @@ async fn s2_5_p1_a_dispatch_or_log_normal_sent() {
 async fn s2_5_p1_a_dispatch_or_log_full_warns_and_counts() {
     use crate::observability::chat_metrics;
     let (tx, _rx) = mpsc::channel::<Action>(1);
-    let dispatcher = ChatDispatcher { action_tx: tx };
+    let dispatcher = ChatDispatcher {
+        action_tx: tx,
+        publisher: crate::chat::acked_session::SessionPublisher::new(
+            crate::chat::acked_session::AckedSession::unseeded(),
+        ),
+    };
     // fill the capacity of 1.
     let _ = dispatcher.try_dispatch(Action::CancelRequested);
 

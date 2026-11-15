@@ -7,7 +7,7 @@ use super::output::print_fallback_chat_output;
 use super::provider_turns::provider_turn_visible_admission;
 #[cfg(feature = "terminal-tui")]
 use super::tui;
-use super::{SESSION_LOGS_MAX_LINES, dispatcher, session};
+use super::{SESSION_LOGS_MAX_LINES, dispatcher};
 use crate::config::Config;
 use crate::tools::Tool;
 use tokio::sync::mpsc;
@@ -477,21 +477,28 @@ pub(super) fn is_chat_quit_command(input: &str) -> bool {
 
 pub(super) async fn shutdown_child_sessions_for_exit(
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
-    chat_session: &mut session::ChatSession,
     chat_dispatcher: &dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
 ) -> crate::chat::sessions::runtime::ShutdownReport {
     let report = chat_sessions.shutdown_all("chat-exit").await;
+    // Each interrupted summary is recorded and saved by the reducer; the
+    // acknowledgement is awaited before teardown stops the dispatcher.
     for persisted in report
         .summaries
         .iter()
         .filter(|summary| summary.status == crate::chat::sessions::model::STATUS_INTERRUPTED)
         .cloned()
     {
-        chat_session.record_background_session(persisted.clone());
-        let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
-            "chat.bg_session_recorded_exit",
-        );
+        if let Err(error) = chat_dispatcher
+            .dispatch_awaited(
+                crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+                commits,
+            )
+            .await
+        {
+            tracing::warn!(error = %error, "exit summary was not acknowledged");
+            break;
+        }
     }
     report
 }

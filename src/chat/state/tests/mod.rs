@@ -1,6 +1,8 @@
 #![cfg(test)]
 
 use super::*;
+#[cfg(feature = "terminal-tui")]
+use crate::chat::session::ChatSession;
 
 fn make_state() -> ChatState {
     let shutdown = CancellationToken::new();
@@ -960,7 +962,10 @@ fn session_loaded_resets_transient_holder_set() {
     loaded.id = "sess-new".to_string();
     loaded.add_user_turn("hello");
     loaded.add_assistant_turn("hi", vec![]);
-    let effects = state.reduce(Action::SessionLoaded(loaded));
+    let effects = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
 
     assert!(state.ui.pending_tool_approval.is_none());
     assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
@@ -998,7 +1003,10 @@ fn loading_fresh_session_clears_visible_title_turns_and_token_usage() {
 
     let mut fresh = ChatSession::new("prov-new", "model-new");
     fresh.id = "sess-fresh".to_string();
-    let _ = state.reduce(Action::SessionLoaded(fresh));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: fresh,
+        persist: false,
+    });
 
     assert_eq!(state.session.id, "sess-fresh");
     assert!(state.session.title.is_empty(), "expected an empty value");
@@ -1026,7 +1034,10 @@ fn session_loaded_is_rejected_while_generating_without_clearing_active_turn() {
     let mut loaded = ChatSession::new("prov-new", "model-new");
     loaded.id = "sess-new".to_string();
     loaded.add_user_turn("should-not-load");
-    let effects = state.reduce(Action::SessionLoaded(loaded));
+    let effects = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
 
     assert_eq!(state.session.id, "sess-old");
     assert!(state.control.generating);

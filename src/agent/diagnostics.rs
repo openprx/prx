@@ -26,63 +26,18 @@ pub(super) fn scrub_credentials(input: &str) -> String {
     })
 }
 
-/// How much of a tool-call parse failure's text is redacted for its preview.
-/// The preview keeps [`TOOL_PARSE_LOG_PREVIEW_CHARS`] characters; a secret
-/// that starts within them and is detected by its start (a token prefix, a
-/// credential name, an `Authorization` value) is found in this prefix even
-/// when cut at its end, so redacting more would only cost time on a large
-/// model response (R-C2BUk K-5). The one format detected by its end, a PEM
-/// private-key block, is handled apart (see
-/// [`unterminated_private_key_start`]).
-const TOOL_PARSE_LOG_SCRUBBED_BYTES: usize = 16 * 1024;
-
-/// The start of a PEM private-key header (`-----BEGIN … PRIVATE KEY-----`)
-/// in `text`. The redactor replaces a whole block, BEGIN to END, so a header
-/// still present after redaction is one whose END lies beyond the redacted
-/// prefix (D-069 L-4).
-fn unterminated_private_key_start(text: &str) -> Option<usize> {
-    const BEGIN: &str = "-----BEGIN ";
-    const DASHES: &str = "-----";
-    let mut from = 0usize;
-    while let Some(offset) = text.get(from..).and_then(|rest| rest.find(BEGIN)) {
-        let at = from + offset;
-        let label_start = at + BEGIN.len();
-        let label = text
-            .get(label_start..)
-            .and_then(|rest| rest.find(DASHES).and_then(|end| rest.get(..end)));
-        if label.is_some_and(|label| {
-            label.ends_with("PRIVATE KEY")
-                && label
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == ' ')
-        }) {
-            return Some(at);
-        }
-        from = label_start;
-    }
-    None
-}
-
-/// Redact and bound a tool-call parse failure's preview for the log.
-///
-/// Only a bounded prefix is redacted, then the preview is cut from it: the
-/// prefix is far longer than the preview, so a secret that starts inside the
-/// preview is still detected whole. A PEM private-key block whose END lies
-/// beyond the prefix is redacted from its BEGIN to the cut.
-pub(super) fn sanitize_tool_parse_log_preview(input: &str) -> String {
-    let mut prefix_end = input.len().min(TOOL_PARSE_LOG_SCRUBBED_BYTES);
-    while !input.is_char_boundary(prefix_end) {
-        prefix_end -= 1;
-    }
-    let mut redacted = crate::security::redaction::redact_secrets(input.get(..prefix_end).unwrap_or_default());
-    if let Some(at) = unterminated_private_key_start(&redacted) {
-        redacted.truncate(at);
-        redacted.push_str(crate::security::redaction::REDACTED);
-    }
-    if redacted.chars().count() <= TOOL_PARSE_LOG_PREVIEW_CHARS {
-        return redacted;
-    }
-    redacted.chars().take(TOOL_PARSE_LOG_PREVIEW_CHARS).collect()
+/// Payload-free identity of a malformed tool-call body for the log: its byte
+/// length and the first 16 hex digits of its SHA-256. The body itself (model
+/// output that may carry user or tool content) is never logged.
+pub(super) fn tool_parse_log_digest(input: &str) -> (usize, String) {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(input.as_bytes());
+    let hex = digest.iter().take(8).fold(String::with_capacity(16), |mut out, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+        out
+    });
+    (input.len(), hex)
 }
 
 /// Tool arguments for the log: every credential-named value replaced and

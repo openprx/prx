@@ -10,7 +10,7 @@ async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_
     let executor = EffectExecutor::new_with_deps(deps);
     let mut old = ChatSession::new("prx-provider", "prx-model");
     old.id = "prx-old-session".into();
-    executor.execute(Effect::SaveSession(old)).await;
+    executor.execute(Effect::SaveSession(old.into())).await;
     let acknowledgement = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
         .await
         .unwrap()
@@ -26,7 +26,10 @@ async fn queued_save_acknowledgement_preserves_loaded_session_and_next_snapshot_
     );
     let mut loaded = ChatSession::new("prx-provider", "prx-model");
     loaded.id = "prx-new-session".into();
-    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
     let _ = state.reduce(acknowledgement);
     assert_eq!(state.session.id, "prx-new-session");
     let _ = state.reduce(Action::RecordUserTurn("new request".into()));
@@ -100,7 +103,7 @@ async fn real_mode_save_session_triggers_memory_store() {
     let memory_key = format!("{}:{}", crate::chat::session::SESSION_MEMORY_PREFIX, state.session.id);
     executor.execute(save_effect).await;
 
-    let stored = deps.memory.get(&memory_key).await.unwrap().unwrap();
+    let stored = deps.persistence.memory.get(&memory_key).await.unwrap().unwrap();
     assert!(!stored.content.contains(secret));
     assert!(stored.content.contains('\u{20ac}'));
     let stored_session = ChatSession::from_json(&stored.content).unwrap();
@@ -114,18 +117,18 @@ async fn real_mode_save_session_triggers_memory_store() {
         stored_content,
         "dispatcher-stored projection must be idempotent"
     );
-    let recalled = deps.memory.recall(secret, 10, None).await.unwrap();
+    let recalled = deps.persistence.memory.recall(secret, 10, None).await.unwrap();
     assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
     let mut raw_session = ChatSession::new("prov", "model");
     raw_session.id = "dispatcher-raw-session".to_string();
     raw_session.add_assistant_turn(&format!("manual raw effect {secret}"), Vec::new());
     let raw_key = raw_session.memory_key();
-    executor.execute(Effect::SaveSession(raw_session)).await;
-    let raw_stored = deps.memory.get(&raw_key).await.unwrap().unwrap();
+    executor.execute(Effect::SaveSession(raw_session.into())).await;
+    let raw_stored = deps.persistence.memory.get(&raw_key).await.unwrap().unwrap();
     assert!(!raw_stored.content.contains(secret));
     // RAII scope: the guard must reset automatically once the subtask finishes (it must not stick).
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard should auto-clear after SaveSession completes (RAII scope)"
     );
 }
@@ -407,7 +410,7 @@ async fn t3_3_fix_b_driver_path_save_session_includes_assistant() {
                 });
                 for e in effects {
                     if let Effect::SaveSession(session) = e {
-                        save_snapshot = Some(session);
+                        save_snapshot = Some(session.session);
                         break;
                     }
                 }
@@ -505,14 +508,16 @@ async fn t3_3_fix_b_effect_save_then_redraw_strict_order() {
 
         let deps = EffectDeps {
             provider,
-            memory,
+            persistence: PersistenceDeps {
+                memory,
+                action_tx,
+                dual_write_guard: RuntimeDualWriteGuard::new(),
+            },
             memory_event_recording: MemoryEventRecording::default(),
             channel,
             hooks,
             observer,
-            action_tx,
             provider_turn_lifecycle_tx: None,
-            dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
@@ -529,7 +534,7 @@ async fn t3_3_fix_b_effect_save_then_redraw_strict_order() {
 
         let session = ChatSession::new("prov", "model");
         // serial main loop: SaveSession → RequestRedraw (the reducer's actual order).
-        executor.execute(Effect::SaveSession(session)).await;
+        executor.execute(Effect::SaveSession(session.into())).await;
         executor.execute(Effect::RequestRedraw).await;
 
         // wait for redraw_listener to finish (it exits after receiving redraw).
@@ -576,14 +581,16 @@ async fn real_mode_request_redraw_pings_renderer() {
     let (redraw_tx, mut redraw_rx) = mpsc::channel::<()>(4);
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks,
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard: RuntimeDualWriteGuard::new(),
         redraw_tx: Some(redraw_tx),
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,
@@ -750,7 +757,7 @@ async fn real_mode_emit_channel_message_triggers_channel_send() {
     );
     // RAII scope: the guard must reset automatically once the subtask finishes (it must not stick).
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard should auto-clear after EmitChannelMessage completes (RAII scope)"
     );
 }
@@ -782,7 +789,7 @@ async fn real_mode_persist_to_memory_triggers_memory_store() {
     );
     // RAII scope: the guard must reset automatically once the subtask finishes (it must not stick).
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard should auto-clear after PersistToMemory completes (RAII scope)"
     );
 }
@@ -800,7 +807,10 @@ async fn real_mode_notify_hook_guard_does_not_stick() {
     let (deps, _rx, _hooks, _temp) = build_deps(memory, shutdown);
     let executor = EffectExecutor::new_with_deps(deps.clone());
 
-    assert!(!deps.dual_write_guard.is_active(), "guard should start inactive");
+    assert!(
+        !deps.persistence.dual_write_guard.is_active(),
+        "guard should start inactive"
+    );
 
     executor
         .execute(Effect::NotifyHook {
@@ -814,7 +824,7 @@ async fn real_mode_notify_hook_guard_does_not_stick() {
 
     // RAII scope: the guard must reset automatically once the subtask finishes (it must not stick).
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard must auto-clear after NotifyHook completes (RAII scope prevents sticking)"
     );
 }
@@ -859,14 +869,16 @@ async fn real_mode_notify_hook_triggers_emit() {
     let shutdown = CancellationToken::new();
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks: Arc::clone(&hooks),
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard: RuntimeDualWriteGuard::new(),
         redraw_tx: Some(redraw_tx),
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,
@@ -937,7 +949,7 @@ async fn real_mode_send_draft_finalize_triggers_channel_finalize() {
     );
     // RAII scope: the guard resets automatically after the subtask finishes (no sticking)
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard must auto-clear after SendDraftFinalize completes (RAII scope)"
     );
 }
@@ -1017,14 +1029,16 @@ async fn redraw_handle_injection_enables_request_redraw() {
     let (action_tx, _action_rx) = mpsc::channel::<Action>(64);
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks,
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard: RuntimeDualWriteGuard::new(),
         redraw_tx: None, // simulate redraw_tx not existing yet at construction
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,

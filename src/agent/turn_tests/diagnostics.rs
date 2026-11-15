@@ -32,22 +32,6 @@ fn test_scrub_credentials_json() {
 }
 
 #[test]
-fn sanitize_tool_parse_log_preview_redacts_and_truncates() {
-    let input = format!(
-        "Bearer abcdefghijklmnopqrstuvwxyz sk-1234567890abcdef key=ABCDEF0123456789 {}",
-        "x".repeat(260)
-    );
-
-    let preview = sanitize_tool_parse_log_preview(&input);
-    assert!(preview.chars().count() <= TOOL_PARSE_LOG_PREVIEW_CHARS);
-    assert!(!preview.contains("abcdefghijklmnopqrstuvwxyz"));
-    assert!(!preview.contains("1234567890abcdef"));
-    assert!(!preview.contains("ABCDEF0123456789"));
-    assert!(preview.contains("Bearer [REDACTED]"));
-    assert!(preview.contains("key=[REDACTED]"));
-}
-
-#[test]
 fn scrub_credentials_empty_input() {
     let result = scrub_credentials("");
     assert_eq!(result, "");
@@ -70,13 +54,6 @@ fn scrub_credentials_short_keyed_values_are_redacted_without_a_prefix() {
 
 /// R-C2BUg G-1: the model-output parse preview scrubs every credentialed
 /// URL, including text that starts with one.
-#[test]
-fn the_tool_parse_preview_redacts_every_url_in_url_first_text() {
-    crate::providers::label_redaction_tests::assert_every_url_redacted("tool parse preview", &|text| {
-        sanitize_tool_parse_log_preview(text)
-    });
-}
-
 /// REDACT-2 (D-054 amendment): tool-output previews detect secrets with the one
 /// redactor and only choose how to show them (a short prefix), so an AWS key id
 /// or a token with no `key=` in front is scrubbed too. Fails before REDACT-2.
@@ -128,41 +105,17 @@ fn logged_tool_arguments_are_redacted_by_key_and_by_content() {
 /// redacted. The redactor's work does not grow with the model's response
 /// (it redacted the whole text, then cut 200 characters), and a secret that
 /// starts inside the preview is still redacted whole.
-#[test]
-fn a_tool_parse_preview_redacts_a_bounded_prefix() {
-    let one = "sk-a ".repeat(1024 * 1024 / 5);
-    let two = "sk-a ".repeat(2 * 1024 * 1024 / 5);
-    let work_one = crate::security::redaction::redaction_work(|| sanitize_tool_parse_log_preview(&one));
-    let work_two = crate::security::redaction::redaction_work(|| sanitize_tool_parse_log_preview(&two));
-    assert_eq!(
-        work_one,
-        work_two,
-        "the preview's redaction must not grow with the input ({} vs {} bytes)",
-        one.len(),
-        two.len()
-    );
-    assert!(work_one < one.len(), "{work_one} bytes examined for a 1 MB input");
-
-    let secret = "A1b2".repeat(20);
-    let text = format!("{} sk-{secret} {}", "x".repeat(150), "y".repeat(40_000));
-    let preview = sanitize_tool_parse_log_preview(&text);
-    assert!(!preview.contains("A1b2A1b2"), "{preview}");
-    assert!(preview.chars().count() <= TOOL_PARSE_LOG_PREVIEW_CHARS);
-}
-
 /// D-069 L-4: a PEM private-key block whose END lies beyond the redacted
 /// prefix is redacted from its BEGIN to the cut. The redactor needs the END,
 /// so the key body used to reach the preview. A public key is not cut.
-#[test]
-fn a_private_key_without_its_end_in_the_preview_prefix_is_redacted() {
-    let body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC".repeat(1_000);
-    let text = format!("tool output: -----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----");
-    assert!(text.len() > 16 * 1024, "test: the END lies beyond the redacted prefix");
-    let preview = sanitize_tool_parse_log_preview(&text);
-    assert!(!preview.contains("MIIEvQIBADAN"), "{preview}");
-    assert!(preview.starts_with("tool output: "), "{preview}");
-    assert!(preview.ends_with(crate::security::redaction::REDACTED), "{preview}");
 
-    let public = format!("-----BEGIN PUBLIC KEY-----\n{}", "QUJD".repeat(100));
-    assert!(sanitize_tool_parse_log_preview(&public).contains("QUJD"));
+#[test]
+fn a_tool_parse_log_digest_carries_length_and_hash_but_no_content() {
+    let body = "{\"name\": \"shell\", \"arguments\": \"SENTINEL-7f3a\"";
+    let (len, hash) = tool_parse_log_digest(body);
+    assert_eq!(len, body.len());
+    assert_eq!(hash.len(), 16);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!hash.contains("SENTINEL"));
+    assert_eq!(tool_parse_log_digest(body), (len, hash), "the digest is stable");
 }

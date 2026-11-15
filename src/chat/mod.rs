@@ -51,6 +51,7 @@
 // Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod acked_session;
 pub mod action;
 pub(crate) mod binding;
 pub mod commands;

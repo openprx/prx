@@ -10,18 +10,26 @@ use crate::providers::ChatMessage;
 use std::sync::Arc;
 
 impl ChatState {
-    /// `Action::SessionLoaded(ChatSession)` — restore a persisted session into SessionState.
+    /// `Action::SessionLoaded { session, persist }` — restore a session into SessionState.
     ///
-    /// Every field is replaced (id/title/provider/model/mode/turns); history is rebuilt from turns by
-    /// the main loop when SessionLoaded arrives (wired up in Step 5).
-    pub(super) fn reduce_session_loaded(&mut self, loaded: ChatSession) -> Vec<Effect> {
+    /// Every field is replaced (id/title/provider/model/mode/turns) and history is rebuilt from
+    /// turns. The load starts a new `load_epoch`; `persist` (new, branch, rewind) saves it, a
+    /// resume only publishes it. A load while generating is rejected unchanged.
+    pub(super) fn reduce_session_loaded(&mut self, loaded: ChatSession, persist: bool) -> Vec<Effect> {
         let id = loaded.id.clone();
         if self.control.generating {
-            return vec![Effect::LogTrace {
-                level: tracing::Level::WARN,
-                msg: format!("SessionLoaded rejected while generating: {id}"),
-            }];
+            return vec![
+                Effect::LogTrace {
+                    level: tracing::Level::WARN,
+                    msg: format!("SessionLoaded rejected while generating: {id}"),
+                },
+                Effect::ActionRejected {
+                    reason: "a session cannot be loaded while a turn is generating".to_owned(),
+                },
+            ];
         }
+        self.session.load_epoch = self.session.load_epoch.saturating_add(1);
+        self.session.revision = 0;
         self.session.id = loaded.id;
         self.session.title = loaded.title;
         self.session.provider = Arc::from(loaded.provider.as_str());
@@ -75,15 +83,84 @@ impl ChatState {
         self.control.clear_all_tool_buffers();
         self.control.turn_cancels.clear();
         self.control.final_usage_tasks_recorded.clear();
+        self.control.committed_turn_tasks.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
+        // The load itself is revision 0 of its epoch.
+        let commit = crate::chat::acked_session::SessionCommit {
+            session: self.build_session_snapshot(),
+            load_epoch: self.session.load_epoch,
+            revision: self.session.revision,
+        };
         vec![
+            if persist {
+                Effect::SaveSession(commit)
+            } else {
+                Effect::PublishSession(commit)
+            },
             Effect::RequestRedraw,
             Effect::LogTrace {
                 level: tracing::Level::INFO,
-                msg: format!("Session loaded: {id}"),
+                msg: format!("Session loaded: {id} load_epoch={}", self.session.load_epoch),
             },
         ]
+    }
+
+    /// `Action::TurnCommitRequested` — the non-TUI completion commit. The
+    /// turn's visible draft (if any) is removed as by `StreamCompleted`; the
+    /// session is always saved; a second request for the same task is refused.
+    pub(super) fn reduce_turn_commit_requested(
+        &mut self,
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        draft_id: Option<String>,
+    ) -> Vec<Effect> {
+        if !self.control.committed_turn_tasks.insert(task_id) {
+            return vec![Effect::ActionRejected {
+                reason: format!("turn {} was already committed", task_id.get()),
+            }];
+        }
+        let mut effects = match draft_id {
+            Some(draft_id) if self.stream.has_visible_draft(&draft_id) => {
+                self.reduce_stream_completed(&draft_id, String::new(), String::new())
+            }
+            _ => Vec::new(),
+        };
+        if !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))) {
+            effects.push(Effect::SaveSession(self.session_commit()));
+        }
+        effects
+    }
+
+    /// The current acknowledged-session seed (no revision bump): used once at
+    /// dispatcher construction, before any effect runs.
+    #[must_use]
+    pub fn acked_session_seed(&self) -> crate::chat::acked_session::AckedSession {
+        crate::chat::acked_session::AckedSession {
+            session_id: self.session.id.clone(),
+            load_epoch: self.session.load_epoch,
+            revision: self.session.revision,
+            session: Arc::new(self.build_session_snapshot()),
+        }
+    }
+
+    /// The next revision of the current load, as a commit for the executor.
+    pub(super) fn session_commit(&mut self) -> crate::chat::acked_session::SessionCommit {
+        self.session.revision = self.session.revision.saturating_add(1);
+        crate::chat::acked_session::SessionCommit {
+            session: self.build_session_snapshot(),
+            load_epoch: self.session.load_epoch,
+            revision: self.session.revision,
+        }
+    }
+
+    /// `ModeChanged` / `ModelChanged` / `ProviderChanged`: a changed value is
+    /// saved; an unchanged one only redraws (its awaited ack is `Unchanged`).
+    pub(super) fn metadata_changed_effects(&mut self, changed: bool) -> Vec<Effect> {
+        if changed {
+            vec![Effect::SaveSession(self.session_commit()), Effect::RequestRedraw]
+        } else {
+            vec![Effect::RequestRedraw]
+        }
     }
 
     /// A save acknowledgement may initialize an empty identity, but cannot
@@ -112,9 +189,9 @@ impl ChatState {
     ///   [0] SaveSession(current_snapshot)
     ///   [1] LogTrace
     ///   [2] RequestRedraw
-    pub(super) fn reduce_session_switched(&self, id: String) -> Vec<Effect> {
+    pub(super) fn reduce_session_switched(&mut self, id: String) -> Vec<Effect> {
         vec![
-            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::SaveSession(self.session_commit()),
             Effect::LogTrace {
                 level: tracing::Level::INFO,
                 msg: format!("Session switching to: {id}"),
@@ -132,9 +209,13 @@ impl ChatState {
     ///
     /// It lives in its own fn so `reduce_session_switched` / `reduce_stream_completed` and others share a
     /// single construction path and cannot miss a field.
-    pub(super) fn build_session_snapshot(&self) -> ChatSession {
+    ///
+    /// The snapshot is the canonical, unsanitized runtime form: publication, guards and the reducer
+    /// history all derive from it. Only persistence copies are sanitized (by the executor before the
+    /// store).
+    pub(crate) fn build_session_snapshot(&self) -> ChatSession {
         let now = chrono::Utc::now();
-        let snapshot = ChatSession {
+        ChatSession {
             id: self.session.id.clone(),
             schema_version: crate::chat::session::SCHEMA_VERSION,
             title: self.session.title.clone(),
@@ -149,8 +230,7 @@ impl ChatState {
             background_sessions: self.session.background_sessions.clone(),
             token_usage_records: self.session.token_usage_records.clone(),
             mode: self.session.mode,
-        };
-        crate::chat::sanitize::sanitize_session_content(&snapshot)
+        }
     }
 
     /// `Action::RecordUserTurn(text)` — persist a user turn into the session record and LLM history.
@@ -299,10 +379,7 @@ impl ChatState {
         }
         self.session.token_usage_records.push(record);
         self.ui.token_usage_summary = MainSessionTokenUsageSummary::from_records(&self.session.token_usage_records);
-        vec![
-            Effect::SaveSession(self.build_session_snapshot()),
-            Effect::RequestRedraw,
-        ]
+        vec![Effect::SaveSession(self.session_commit()), Effect::RequestRedraw]
     }
 
     /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
@@ -343,7 +420,7 @@ impl ChatState {
             self.session.background_sessions.push(summary);
         }
         // Persist the updated snapshot now (state already mutated above).
-        vec![Effect::SaveSession(self.build_session_snapshot())]
+        vec![Effect::SaveSession(self.session_commit())]
     }
 
     /// `Action::HistoryCompacted` — compact the LLM context history.
@@ -385,13 +462,18 @@ impl ChatState {
         if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(history, &patch) {
             // The patch does not describe the reducer's history: nothing is
             // changed and nothing is saved.
-            return vec![Effect::LogTrace {
-                level: tracing::Level::WARN,
-                msg: format!(
-                    "HistoryCompactionPatch rejected reason={reason:?}; {error}; history unchanged len={}",
-                    history.len()
-                ),
-            }];
+            return vec![
+                Effect::LogTrace {
+                    level: tracing::Level::WARN,
+                    msg: format!(
+                        "HistoryCompactionPatch rejected reason={reason:?}; {error}; history unchanged len={}",
+                        history.len()
+                    ),
+                },
+                Effect::ActionRejected {
+                    reason: format!("the compaction does not describe the session history ({error})"),
+                },
+            ];
         }
         let budget = crate::agent::context_budget::plan_context_budget(
             history,
@@ -425,7 +507,7 @@ impl ChatState {
                     history.len()
                 ),
             },
-            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::SaveSession(self.session_commit()),
             Effect::RequestRedraw,
         ]
     }

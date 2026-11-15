@@ -16,6 +16,7 @@
 mod draft_buffer;
 mod input;
 mod keys;
+pub(crate) use keys::key_log_class;
 mod layout;
 mod render_chrome;
 mod render_conversation;

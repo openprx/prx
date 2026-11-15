@@ -19,7 +19,10 @@ pub(super) fn initial_chat_dispatcher_state(
     chat_session: &session::ChatSession,
 ) -> state::ChatState {
     let mut state = state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown);
-    let _ = state.reduce(crate::chat::action::Action::SessionLoaded(chat_session.clone()));
+    let _ = state.reduce(crate::chat::action::Action::SessionLoaded {
+        session: chat_session.clone(),
+        persist: false,
+    });
     state
 }
 

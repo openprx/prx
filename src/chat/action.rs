@@ -461,8 +461,22 @@ pub enum Action {
     StreamRetryAttempt { attempt: u8, reason: String },
 
     // ── Session ─────────────────────────────────────────────────
-    /// The session finished loading
-    SessionLoaded(ChatSession),
+    /// The session finished loading. The reducer starts a new load epoch and
+    /// emits `SaveSession` when `persist` (new, branch, rewind) or
+    /// `PublishSession` (resume); a load while generating is rejected.
+    SessionLoaded { session: ChatSession, persist: bool },
+    /// Non-TUI completion commit for a provider turn: removes the turn's draft
+    /// if visible, always saves, and is accepted once per task.
+    TurnCommitRequested {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        draft_id: Option<String>,
+    },
+    /// Wrapper for [`crate::chat::dispatcher::ChatDispatcher::dispatch_awaited`]:
+    /// the dispatcher reduces `action`, runs its effects, then answers `ticket`.
+    Awaited {
+        action: Box<Action>,
+        ticket: crate::chat::acked_session::AckTicket,
+    },
     /// The session has been persisted
     SessionSaved { id: String },
     /// Switch to the given session
@@ -669,7 +683,9 @@ impl Action {
             Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
             Self::ToolApprovalCleared => "ToolApprovalCleared",
             Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
-            Self::SessionLoaded(_) => "SessionLoaded",
+            Self::SessionLoaded { .. } => "SessionLoaded",
+            Self::TurnCommitRequested { .. } => "TurnCommitRequested",
+            Self::Awaited { action, .. } => action.kind(),
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",
             Self::RecordUserTurn(_) => "RecordUserTurn",

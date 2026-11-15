@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::chat::session::ChatSession;
 
 /// Every loop-written note is kept out of the durable transcript, not
 /// only the refresh aside: a `[Tool results]` block or a recalled page
@@ -32,7 +33,10 @@ fn a_reloaded_user_turn_opening_with_a_reserved_marker_enters_history_defused() 
     loaded.add_user_turn(question);
     loaded.add_assistant_turn("an answer", vec![]);
     let mut state = s();
-    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
     let user = state
         .session
         .history

@@ -105,7 +105,7 @@ fn s5_invariant_cancel_no_partial_save() {
 }
 
 #[test]
-fn save_session_effect_redacts_all_authoritative_content_fields() {
+fn save_session_persistence_copy_redacts_all_authoritative_content_fields() {
     let secret = "AKIAABCDEFGHIJKLMNOP";
     let mut state = fresh_state();
     state.session.title = format!("deploy {secret} \u{2705}");
@@ -141,11 +141,18 @@ fn save_session_effect_redacts_all_authoritative_content_fields() {
             _ => None,
         })
         .expect("background record must save");
-    let blob = snapshot.to_json().unwrap();
-    assert!(!blob.contains(secret), "authoritative SaveSession blob leaked AWS key");
+    // The commit is the canonical unsanitized runtime form; only the copy the
+    // executor persists is sanitized.
+    assert!(
+        snapshot.to_json().unwrap().contains(secret),
+        "the runtime form is not sanitized"
+    );
+    let persisted = crate::chat::sanitize::sanitize_session_content(&snapshot.session);
+    let blob = persisted.to_json().unwrap();
+    assert!(!blob.contains(secret), "persisted SaveSession blob leaked AWS key");
     assert!(blob.contains("Unicode"));
     assert!(blob.contains("\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}"));
-    let tool_call = snapshot
+    let tool_call = persisted
         .turns
         .first()
         .and_then(|turn| turn.tool_calls.first())

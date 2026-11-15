@@ -340,6 +340,8 @@ mod approval_router_regression_tests;
 #[derive(Clone)]
 pub struct ChatDispatcher {
     action_tx: mpsc::Sender<Action>,
+    /// The acknowledged session (single authority), published by the executor.
+    publisher: crate::chat::acked_session::SessionPublisher,
 }
 
 /// Result of the `try_send` policy (lets the caller decide whether coalescing / a fallback is needed).
@@ -357,8 +359,62 @@ impl ChatDispatcher {
     /// Construct the dispatcher plus its receiver. The receiver is consumed by the dispatcher task
     /// ([`spawn_dispatcher_task_with_signal`]).
     pub fn new() -> (Self, mpsc::Receiver<Action>) {
+        Self::new_seeded(crate::chat::acked_session::AckedSession::unseeded())
+    }
+
+    /// Construct the dispatcher with its acknowledged session seeded from the
+    /// reducer state built at startup.
+    pub fn new_seeded(seed: crate::chat::acked_session::AckedSession) -> (Self, mpsc::Receiver<Action>) {
         let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
-        (Self { action_tx }, action_rx)
+        let publisher = crate::chat::acked_session::SessionPublisher::new(seed);
+        (Self { action_tx, publisher }, action_rx)
+    }
+
+    /// The publishing side, handed to the effect executor.
+    #[must_use]
+    pub fn session_publisher(&self) -> crate::chat::acked_session::SessionPublisher {
+        self.publisher.clone()
+    }
+
+    /// A reader of the acknowledged session for the current load.
+    #[must_use]
+    pub fn session_reader(&self) -> crate::chat::acked_session::SessionReader {
+        self.publisher.reader()
+    }
+
+    /// Dispatch `action` and wait until the dispatcher has reduced it and run
+    /// every effect it produced. Bounded by
+    /// [`crate::chat::acked_session::ACK_TIMEOUT`]. A closed channel, a timeout
+    /// or a failed save latches `commits` as an unconfirmed history commit.
+    pub async fn dispatch_awaited(
+        &self,
+        action: Action,
+        commits: &TurnCompletionSignal,
+    ) -> Result<crate::chat::acked_session::Ack, crate::chat::acked_session::AckError> {
+        use crate::chat::acked_session::{ACK_TIMEOUT, AckError, AckTicket};
+        let action_kind = action.kind();
+        let (ticket, reply) = AckTicket::new();
+        let awaited = Action::Awaited {
+            action: Box::new(action),
+            ticket,
+        };
+        let result = match tokio::time::timeout(ACK_TIMEOUT, async {
+            self.action_tx
+                .send(awaited)
+                .await
+                .map_err(|_| AckError::ChannelClosed)?;
+            reply.await.map_err(|_| AckError::ChannelClosed)?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(AckError::Timeout),
+        };
+        if let Err(error) = &result {
+            tracing::error!(action_kind, error = %error, "awaited session acknowledgement failed");
+            commits.fail_history_commit(error.to_string());
+        }
+        result
     }
 
     /// Non-blocking send. Returns `Backpressured` when full; the caller decides to coalesce or drop.
@@ -942,8 +998,9 @@ fn next_provider_turn_execution_lease_id() -> u64 {
 pub struct EffectDeps {
     /// Current provider (LLM calls) — in Step 5a-1 only StartTurn uses it, later effects reuse it
     pub provider: Arc<dyn Provider>,
-    /// memory backend (SaveSession / PersistToMemory)
-    pub memory: Arc<dyn Memory>,
+    /// Session persistence: memory backend, action feedback sender and the
+    /// dual-write guard (SaveSession / PublishSession / PersistToMemory).
+    pub persistence: PersistenceDeps,
     /// Message-event policy shared with the chat ingress. Request-context
     /// provenance must obey the same persistence switch as the transcript.
     pub memory_event_recording: MemoryEventRecording,
@@ -953,16 +1010,12 @@ pub struct EffectDeps {
     pub hooks: Arc<HookManager>,
     /// observability observer (structured events)
     pub observer: Arc<dyn Observer>,
-    /// Action feedback channel sender (streaming callbacks of the StartTurn subtask)
-    pub action_tx: mpsc::Sender<Action>,
     /// Provider task lifecycle event bridge back to chat::run. This is separate
     /// from action_tx because it is orchestration metadata, not reducer state.
     ///
     /// Bounded at [`crate::chat::provider_turns::PROVIDER_TURN_LIFECYCLE_CHANNEL_CAPACITY`]; a
     /// full queue parks the emitting turn rather than growing without bound.
     pub provider_turn_lifecycle_tx: Option<mpsc::Sender<ProviderTurnLifecycleEvent>>,
-    /// dual-write suppression guard (set before persistence effects in Both/Redux mode)
-    pub dual_write_guard: RuntimeDualWriteGuard,
     /// render redraw channel (RequestRedraw wakes the main loop)
     /// mpsc::Sender<()> rather than broadcast, because we only need to nudge the main loop
     pub redraw_tx: Option<mpsc::Sender<()>>,
@@ -1005,6 +1058,19 @@ pub struct EffectDeps {
     pub tool_surface_reserve: crate::agent::context_budget::ToolSurfaceReserve,
 }
 
+/// The dependencies of the persistence effects (`SaveSession`,
+/// `PublishSession`) and of awaited acknowledgements. Both builds run them for
+/// real: the TUI executor embeds them in [`EffectDeps`]; the non-TUI build uses
+/// a persistence-only executor.
+#[derive(Clone)]
+pub struct PersistenceDeps {
+    pub memory: Arc<dyn Memory>,
+    /// Action feedback channel sender (also the StartTurn subtask's callbacks)
+    pub action_tx: mpsc::Sender<Action>,
+    /// dual-write suppression guard (set before persistence effects)
+    pub dual_write_guard: RuntimeDualWriteGuard,
+}
+
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
 
 /// `Effect` executor. Two construction shapes:
@@ -1018,10 +1084,15 @@ pub struct EffectDeps {
 /// dispatcher task injects `redraw_tx` through the Arc returned by `redraw_handle()`, solving the ordering problem.
 pub struct EffectExecutor {
     cleanup_owner: Option<Arc<crate::runtime::turn_cleanup::CleanupTracker>>,
-    /// shadow mode flag. When `true` every business Effect skips execution.
-    shadow_mode: bool,
-    /// Real business dependencies. Some means deps mode, None means shadow mode.
+    /// Persistence dependencies. `None` only for the test shadow executor.
+    persistence: Option<PersistenceDeps>,
+    /// Real business dependencies. `None` for the persistence-only (non-TUI)
+    /// and the test shadow executor: every non-persistence effect is a no-op.
     deps: Option<EffectDeps>,
+    /// Acknowledged-session watch the persistence effects publish to.
+    publisher: Option<crate::chat::acked_session::SessionPublisher>,
+    /// The commit published while executing the current action's effects.
+    publication: Arc<ParkingMutex<Option<crate::chat::acked_session::AckedSession>>>,
     /// P0-2: late-injectable redraw_tx handle. Filled in with the real sender by chat::run after spawn.
     /// In real mode both sides share the same Arc, allowing injection while the dispatcher task runs.
     redraw_slot: Arc<ParkingMutex<Option<mpsc::Sender<()>>>>,
@@ -1042,13 +1113,36 @@ pub struct EffectExecutor {
 }
 
 impl EffectExecutor {
-    /// Construct a shadow-mode executor (Step 5b compatibility, unit tests, Off mode).
+    /// Construct a shadow executor for isolated reducer tests: every
+    /// business and persistence Effect except `LogTrace` is a no-op.
+    #[cfg(test)]
     #[must_use]
     pub fn new_shadow() -> Self {
         Self {
             cleanup_owner: None,
-            shadow_mode: true,
+            persistence: None,
             deps: None,
+            publisher: None,
+            publication: Arc::new(ParkingMutex::new(None)),
+            redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
+            provider_slot: None,
+            persistence_error: Arc::new(ParkingMutex::new(None)),
+            persist_sessions: true,
+        }
+    }
+
+    /// Construct the non-TUI executor: the persistence effects run for real
+    /// (save, publish, acknowledge); every other effect is a no-op, because
+    /// the non-TUI tool loop itself performs provider turns, hooks and channel
+    /// output.
+    #[must_use]
+    pub fn new_persistence_only(persistence: PersistenceDeps) -> Self {
+        Self {
+            cleanup_owner: None,
+            persistence: Some(persistence),
+            deps: None,
+            publisher: None,
+            publication: Arc::new(ParkingMutex::new(None)),
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot: None,
             persistence_error: Arc::new(ParkingMutex::new(None)),
@@ -1062,13 +1156,22 @@ impl EffectExecutor {
         let provider_slot = Some(ProviderSlot::new(Arc::clone(&deps.provider)));
         Self {
             cleanup_owner: None,
-            shadow_mode: false,
+            persistence: Some(deps.persistence.clone()),
             deps: Some(deps),
+            publisher: None,
+            publication: Arc::new(ParkingMutex::new(None)),
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot,
             persistence_error: Arc::new(ParkingMutex::new(None)),
             persist_sessions: true,
         }
+    }
+
+    /// Publish acknowledged commits to `publisher` (the dispatcher's watch).
+    #[must_use]
+    pub fn with_session_publisher(mut self, publisher: crate::chat::acked_session::SessionPublisher) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 
     /// Run without chat session rows (an unsaved one-shot turn). `SaveSession`
@@ -1086,14 +1189,29 @@ impl EffectExecutor {
         self
     }
 
+    /// The value currently published (for an `Unchanged` acknowledgement).
+    fn acknowledged(&self) -> crate::chat::acked_session::AckedSession {
+        self.publisher
+            .as_ref()
+            .map_or_else(crate::chat::acked_session::AckedSession::unseeded, |publisher| {
+                publisher.current()
+            })
+    }
+
+    /// Take the persistence error and the publication of the action whose
+    /// effects just ran.
+    fn take_action_results(&self) -> (Option<String>, Option<crate::chat::acked_session::AckedSession>) {
+        (self.persistence_error.lock().take(), self.publication.lock().take())
+    }
+
     fn outcome_after_effects(
         &self,
         outcome: Option<TurnOutcomeKind>,
         requires_persistence: bool,
         save_requested: bool,
+        persistence_error: Option<String>,
     ) -> Option<TurnOutcomeKind> {
-        let persistence_error = self.persistence_error.lock().take();
-        if requires_persistence && (!save_requested || self.shadow_mode || self.deps.is_none()) {
+        if requires_persistence && (!save_requested || self.persistence.is_none()) {
             return Some(TurnOutcomeKind::Failed {
                 err: "session completion did not execute persistence".to_owned(),
                 retryable: false,
@@ -1106,6 +1224,102 @@ impl EffectExecutor {
             }),
             (outcome, _) => outcome,
         }
+    }
+
+    /// `Effect::SaveSession`: store the sanitized persistence copy, then
+    /// publish the unsanitized commit as the acknowledged session.
+    async fn execute_save_session(
+        &self,
+        commit: crate::chat::acked_session::SessionCommit,
+        persistence: &PersistenceDeps,
+    ) {
+        if !self.persist_sessions {
+            tracing::debug!(session_id = %commit.session.id, "SaveSession effect: unsaved one-shot session, no row");
+            self.publish(&commit);
+            return;
+        }
+        // Only the persisted copy is sanitized; the acknowledged
+        // runtime form stays the reducer's unsanitized snapshot.
+        let session = crate::chat::sanitize::sanitize_session_content(&commit.session);
+        // T3-3-fixB D1: inline await instead of tokio::spawn, so the serialization of the main loop's
+        // executor.execute(effect).await carries all the way through, closing the inconsistency window
+        // where RequestRedraw had already refreshed the screen while SaveSession was still writing to disk.
+        // The RAII scope shares the lifetime of the inline await: once the await completes, _scope drops
+        // and releases the guard, so the legacy path can single-write again (serial effects never overlap).
+        let _scope = persistence.dual_write_guard.enter_scope();
+        let memory = Arc::clone(&persistence.memory);
+        let action_tx = persistence.action_tx.clone();
+        let session_id = session.id.clone();
+        let json = match session.to_json() {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "SaveSession effect: serialize failed");
+                *self.persistence_error.lock() = Some(e.to_string());
+                return;
+            }
+        };
+        let mut store_result = memory
+            .store(
+                &session.memory_key(),
+                &json,
+                crate::memory::MemoryCategory::Conversation,
+                Some(&session.id),
+            )
+            .await;
+        // The SQLite memory backend may briefly report BUSY/LOCKED
+        // while the same completed turn is committing its message
+        // events. Yield and retry a small bounded number of times;
+        // this is contention recovery, not a timing delay. Every
+        // other error remains fail-fast and is propagated through the
+        // terminal acknowledgement below.
+        for _ in 0..3 {
+            let retryable = store_result.as_ref().is_err_and(|error| {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("database is locked")
+                    || message.contains("database is busy")
+                    || message.contains("sqlite_busy")
+                    || message.contains("sqlite_locked")
+            });
+            if !retryable {
+                break;
+            }
+            tokio::task::yield_now().await;
+            store_result = memory
+                .store(
+                    &session.memory_key(),
+                    &json,
+                    crate::memory::MemoryCategory::Conversation,
+                    Some(&session.id),
+                )
+                .await;
+        }
+        match store_result {
+            Ok(()) => {
+                self.publish(&commit);
+                let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SaveSession effect: store failed");
+                *self.persistence_error.lock() = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Publish an acknowledged commit and remember it for the awaited reply.
+    fn publish(&self, commit: &crate::chat::acked_session::SessionCommit) {
+        let acked = commit.acked();
+        if let Some(publisher) = self.publisher.as_ref()
+            && !publisher.publish(acked.clone())
+        {
+            tracing::debug!(
+                session_id = %acked.session_id,
+                load_epoch = acked.load_epoch,
+                revision = acked.revision,
+                "acknowledged session not published: an equal or newer load is already published"
+            );
+            return;
+        }
+        *self.publication.lock() = Some(acked);
     }
 
     /// P0-2 fix: return the shared redraw_tx slot Arc for chat::run to inject into after TUI init.
@@ -1150,7 +1364,7 @@ impl EffectExecutor {
     #[cfg(test)]
     #[must_use]
     pub const fn is_shadow(&self) -> bool {
-        self.shadow_mode
+        self.persistence.is_none() && self.deps.is_none()
     }
 
     /// Execute a single Effect.
@@ -1171,20 +1385,28 @@ impl EffectExecutor {
             Self::emit_trace(*level, msg);
             return;
         }
-        match (self.shadow_mode, &self.deps) {
-            (true, _) | (_, None) => self.execute_shadow(effect),
-            (false, Some(deps)) => self.execute_real(effect, deps).await,
+        match (effect, self.persistence.as_ref(), self.deps.as_ref()) {
+            (Effect::SaveSession(commit), Some(persistence), _) => self.execute_save_session(commit, persistence).await,
+            (Effect::PublishSession(commit), Some(_), _) => {
+                // An accepted non-persistent load (resume): publish, no row.
+                self.publish(&commit);
+            }
+            (Effect::ActionRejected { .. }, _, _) => {
+                // Answered by the dispatcher loop through the awaited ticket.
+            }
+            (effect, _, Some(deps)) => self.execute_real(effect, deps).await,
+            (effect, _, None) => self.execute_shadow(&effect),
         }
     }
 
     /// shadow mode branch: every business Effect is a no-op plus a debug log.
-    fn execute_shadow(&self, effect: Effect) {
-        match &effect {
+    fn execute_shadow(&self, effect: &Effect) {
+        match effect {
             Effect::RequestRedraw => {
                 tracing::trace!("effect: RequestRedraw (shadow no-op)");
             }
             other => {
-                tracing::debug!(effect = ?other, "effect skipped (shadow mode)");
+                tracing::debug!(effect_kind = other.kind(), "effect skipped (no business executor)");
             }
         }
     }
@@ -1234,7 +1456,7 @@ impl EffectExecutor {
                 turn_binding,
             } => {
                 // Step 5a-2 — long-running: spawn a subtask that really calls provider.stream_chat_with_history
-                // and feeds chunk / completed / failed / cancelled events back to the reducer via deps.action_tx,
+                // and feeds chunk / completed / failed / cancelled events back to the reducer via deps.persistence.action_tx,
                 // replacing the old `delta_tx → draft_updater → coalescer` chain.
                 //
                 // Design notes (consistent with plan Step 5a-2):
@@ -1260,8 +1482,8 @@ impl EffectExecutor {
                     },
                     |binding| binding.provider(),
                 );
-                let action_tx = deps.action_tx.clone();
-                let guard_scope = deps.dual_write_guard.enter_scope();
+                let action_tx = deps.persistence.action_tx.clone();
+                let guard_scope = deps.persistence.dual_write_guard.enter_scope();
                 // Codex P1 fix: take the real model + temperature from deps and pass them to the stream API.
                 // BUG-07: read the current ModelSlot value at the start of every turn, so after /model <name>
                 // later turns automatically use the new model (same provider, different model).
@@ -1293,18 +1515,18 @@ impl EffectExecutor {
                     )
                     .with_schema_dialect(provider.tool_schema_dialect_for(&model));
                 let request_event_fabric = MemoryFabric::new(
-                    Arc::clone(&deps.memory),
+                    Arc::clone(&deps.persistence.memory),
                     tool_execution_context.envelope.workspace_id.clone(),
                 )
                 .with_event_recording(deps.memory_event_recording);
                 let compaction_audit = Some(crate::agent::document_ingest::DocumentIngestRuntime::from_envelope(
-                    Arc::clone(&deps.memory),
+                    Arc::clone(&deps.persistence.memory),
                     &tool_execution_context.envelope,
                 ));
                 let tool_execution_service = tools_registry.as_ref().map(|registry| {
                     Arc::new(chat_tool_execution_service(
                         Arc::clone(registry),
-                        Some(Arc::clone(&deps.memory)),
+                        Some(Arc::clone(&deps.persistence.memory)),
                         Arc::clone(&tool_security_policy),
                         Arc::clone(&deps.approval_router),
                         action_tx.clone(),
@@ -1453,78 +1675,16 @@ impl EffectExecutor {
                         .await;
                 }
             }
-            Effect::SaveSession(session) => {
-                *self.persistence_error.lock() = None;
-                if !self.persist_sessions {
-                    tracing::debug!(session_id = %session.id, "SaveSession effect: unsaved one-shot session, no row");
-                    return;
-                }
-                let session = crate::chat::sanitize::sanitize_session_content(&session);
-                // T3-3-fixB D1: inline await instead of tokio::spawn, so the serialization of the main loop's
-                // executor.execute(effect).await carries all the way through, closing the inconsistency window
-                // where RequestRedraw had already refreshed the screen while SaveSession was still writing to disk.
-                // The RAII scope shares the lifetime of the inline await: once the await completes, _scope drops
-                // and releases the guard, so the legacy path can single-write again (serial effects never overlap).
-                let _scope = deps.dual_write_guard.enter_scope();
-                let memory = Arc::clone(&deps.memory);
-                let action_tx = deps.action_tx.clone();
-                let session_id = session.id.clone();
-                let json = match session.to_json() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SaveSession effect: serialize failed");
-                        *self.persistence_error.lock() = Some(e.to_string());
-                        return;
-                    }
-                };
-                let mut store_result = memory
-                    .store(
-                        &session.memory_key(),
-                        &json,
-                        crate::memory::MemoryCategory::Conversation,
-                        Some(&session.id),
-                    )
-                    .await;
-                // The SQLite memory backend may briefly report BUSY/LOCKED
-                // while the same completed turn is committing its message
-                // events. Yield and retry a small bounded number of times;
-                // this is contention recovery, not a timing delay. Every
-                // other error remains fail-fast and is propagated through the
-                // terminal acknowledgement below.
-                for _ in 0..3 {
-                    let retryable = store_result.as_ref().is_err_and(|error| {
-                        let message = error.to_string().to_ascii_lowercase();
-                        message.contains("database is locked")
-                            || message.contains("database is busy")
-                            || message.contains("sqlite_busy")
-                            || message.contains("sqlite_locked")
-                    });
-                    if !retryable {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                    store_result = memory
-                        .store(
-                            &session.memory_key(),
-                            &json,
-                            crate::memory::MemoryCategory::Conversation,
-                            Some(&session.id),
-                        )
-                        .await;
-                }
-                match store_result {
-                    Ok(()) => {
-                        let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SaveSession effect: store failed");
-                        *self.persistence_error.lock() = Some(e.to_string());
-                    }
-                }
+            Effect::SaveSession(_) | Effect::PublishSession(_) | Effect::ActionRejected { .. } => {
+                // Persistence effects run in `execute` through `PersistenceDeps`.
+                tracing::debug!(
+                    effect_kind = effect.kind(),
+                    "persistence effect reached the business executor"
+                );
             }
             Effect::SendDraftFinalize { draft_id, text } => {
                 // dual-write suppression RAII scope: automatically reset when the subtask exits.
-                let guard_scope = deps.dual_write_guard.enter_scope();
+                let guard_scope = deps.persistence.dual_write_guard.enter_scope();
                 let channel = Arc::clone(&deps.channel);
                 tokio::spawn(async move {
                     let _scope = guard_scope;
@@ -1560,7 +1720,7 @@ impl EffectExecutor {
                 token.cancel();
             }
             Effect::EmitChannelMessage(send_msg) => {
-                let guard_scope = deps.dual_write_guard.enter_scope();
+                let guard_scope = deps.persistence.dual_write_guard.enter_scope();
                 let channel = Arc::clone(&deps.channel);
                 tokio::spawn(async move {
                     let _scope = guard_scope;
@@ -1570,8 +1730,8 @@ impl EffectExecutor {
                 });
             }
             Effect::PersistToMemory { key, value, category } => {
-                let guard_scope = deps.dual_write_guard.enter_scope();
-                let memory = Arc::clone(&deps.memory);
+                let guard_scope = deps.persistence.dual_write_guard.enter_scope();
+                let memory = Arc::clone(&deps.persistence.memory);
                 tokio::spawn(async move {
                     let _scope = guard_scope;
                     if let Err(e) = memory.store(&key, &value, category, None).await {
@@ -1580,7 +1740,7 @@ impl EffectExecutor {
                 });
             }
             Effect::NotifyHook { event, payload } => {
-                let guard_scope = deps.dual_write_guard.enter_scope();
+                let guard_scope = deps.persistence.dual_write_guard.enter_scope();
                 let hooks = Arc::clone(&deps.hooks);
                 tokio::spawn(async move {
                     let _scope = guard_scope;
@@ -1594,7 +1754,7 @@ impl EffectExecutor {
                 let _ = deps.observer.name(); // placeholder so the deps.observer field is not warned about
             }
             Effect::AutoTitleSession(title) => {
-                tracing::debug!(title = %title, "AutoTitleSession effect");
+                tracing::debug!(title_len = title.chars().count(), "AutoTitleSession effect");
             }
             Effect::RequestApproval {
                 task_id,
@@ -1637,7 +1797,7 @@ impl EffectExecutor {
                             args_len = args.len(),
                             "RequestApproval effect: TUI active but no approval surface, failing closed"
                         );
-                        let action_tx = deps.action_tx.clone();
+                        let action_tx = deps.persistence.action_tx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = action_tx
                                 .send(Action::ToolApprovalReceived {
@@ -1656,7 +1816,7 @@ impl EffectExecutor {
                 // Line mode (`--plain`): ask on the controlling terminal; without
                 // one only OPENPRX_APPROVAL_OVERRIDE can allow (CR-2).
                 let router = Arc::clone(&deps.approval_router);
-                let action_tx = deps.action_tx.clone();
+                let action_tx = deps.persistence.action_tx.clone();
                 tokio::spawn(async move {
                     let decision =
                         crate::chat::terminal_approval::prompt(&name, &args, || router.is_pending(&tool_id)).await;
@@ -2941,6 +3101,87 @@ async fn drive_start_turn_stream(
     let _ = action_tx.send(terminal).await;
 }
 
+/// Per-action bookkeeping the dispatcher loop needs after the reducer and the
+/// effects ran.
+struct ReducedAction {
+    outcome: Option<TurnOutcomeKind>,
+    usage: Option<TokenUsage>,
+    draft_id: Option<String>,
+    approval_response: Option<(String, bool, bool)>,
+    #[cfg(feature = "terminal-tui")]
+    ui_dirty: bool,
+}
+
+/// Reduce one action, run its effects in order, and answer an awaited
+/// action's ticket with the outcome.
+async fn reduce_and_execute(
+    state: &mut ChatState,
+    executor: &EffectExecutor,
+    action: Action,
+    stats: &mut DispatcherStats,
+) -> ReducedAction {
+    use crate::chat::acked_session::{Ack, AckError};
+    stats.actions_seen = stats.actions_seen.saturating_add(1);
+    let (action, ticket) = match action {
+        Action::Awaited { action, ticket } => (*action, Some(ticket)),
+        other => (other, None),
+    };
+    let outcome = extract_turn_outcome(&action);
+    let usage = extract_stream_usage(&action);
+    let draft_id = extract_turn_draft_id(&action).map(str::to_string);
+    let approval_response = extract_approval_response(&action);
+    let requires_persistence = matches!(
+        &action,
+        Action::StreamCompleted { .. } | Action::TurnCommitRequested { .. }
+    );
+    #[cfg(feature = "terminal-tui")]
+    let (effects, ui_dirty) = state.reduce_tracked(action);
+    #[cfg(not(feature = "terminal-tui"))]
+    let effects = state.reduce(action);
+    let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
+    let rejection = effects.iter().find_map(|effect| match effect {
+        Effect::ActionRejected { reason } => Some(reason.clone()),
+        _ => None,
+    });
+    stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
+    for effect in effects {
+        executor.execute(effect).await;
+    }
+    let (persistence_error, publication) = executor.take_action_results();
+    if let Some(ticket) = ticket {
+        let reply = match (rejection, persistence_error.as_ref(), publication) {
+            (Some(reason), _, _) => Ok(Ack::Rejected(reason)),
+            (None, Some(error), _) => Err(AckError::PersistenceFailed(error.clone())),
+            (None, None, Some(acked)) => Ok(Ack::Published(acked)),
+            (None, None, None) => Ok(Ack::Unchanged(executor.acknowledged())),
+        };
+        ticket.answer(reply);
+    }
+    let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested, persistence_error);
+    ReducedAction {
+        outcome,
+        usage,
+        draft_id,
+        approval_response,
+        #[cfg(feature = "terminal-tui")]
+        ui_dirty,
+    }
+}
+
+/// Resolve a forwarded approval and record the turn signal of one reduced action.
+fn finish_reduced_action(
+    reduced: ReducedAction,
+    approval_router: Option<&Arc<ApprovalRouter>>,
+    turn_signal: Option<&TurnCompletionSignal>,
+) {
+    if let (Some((tool_id, approved, always)), Some(router)) = (reduced.approval_response, approval_router) {
+        router.resolve_decision(&tool_id, approved, always);
+    }
+    if let Some(sig) = turn_signal {
+        record_turn_signal_action(sig, reduced.draft_id.as_deref(), reduced.usage, reduced.outcome);
+    }
+}
+
 // ─── Dispatcher task ───────────────────────────────────────────────────────────
 
 /// Step 5a-4: Spawn dispatcher task with optional [`TurnCompletionSignal`].
@@ -3027,32 +3268,13 @@ pub fn spawn_dispatcher_task_full(
                     // observability. Bounded by remaining queue depth, not by
                     // network/disk I/O.
                     while let Ok(action) = action_rx.try_recv() {
-                        stats.actions_seen = stats.actions_seen.saturating_add(1);
-                        let outcome = extract_turn_outcome(&action);
-                        let usage = extract_stream_usage(&action);
-                        let draft_id = extract_turn_draft_id(&action).map(str::to_string);
-                        let approval_response = extract_approval_response(&action);
-                        let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
-                        let (effects, ui_dirty) = state.reduce_tracked(action);
-                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
-                        stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
-                        for effect in effects {
-                            executor.execute(effect).await;
-                        }
-                        let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                        push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
-                        if let (Some((tool_id, approved, always)), Some(router)) =
-                            (approval_response, approval_router.as_ref())
-                        {
-                            router.resolve_decision(&tool_id, approved, always);
-                        }
+                        let reduced = reduce_and_execute(&mut state, &executor, action, &mut stats).await;
+                        push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, reduced.ui_dirty);
                         // turn_signal must fire during shutdown too, otherwise the last turn before shutdown
                         // preempts the chat::run await and hangs forever (causing the round 2 hang
                         // regression). The terminal action carries the outcome — main.rs:888
                         // shutdown_timeout is the backstop that guarantees the main process finally exits.
-                        if let Some(ref sig) = turn_signal {
-                            record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
-                        }
+                        finish_reduced_action(reduced, approval_router.as_ref(), turn_signal.as_ref());
                     }
                     // Fallback: during shutdown chat::run may still be awaiting turn_signal.notified(),
                     // so notify once to let it detect shutdown.cancelled() and leave the select (no outcome
@@ -3070,30 +3292,11 @@ pub fn spawn_dispatcher_task_full(
                 maybe_action = action_rx.recv() => {
                     match maybe_action {
                         Some(action) => {
-                            stats.actions_seen = stats.actions_seen.saturating_add(1);
-                            let outcome = extract_turn_outcome(&action);
-                            let usage = extract_stream_usage(&action);
-                            let draft_id = extract_turn_draft_id(&action).map(str::to_string);
-                            let approval_response = extract_approval_response(&action);
-                            let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
-                        let (effects, ui_dirty) = state.reduce_tracked(action);
-                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
-                            stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
-                            for effect in effects {
-                                executor.execute(effect).await;
-                            }
-                            let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                            push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
+                            let reduced = reduce_and_execute(&mut state, &executor, action, &mut stats).await;
+                            push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, reduced.ui_dirty);
                             // S3 T3-1: once the reducer has handled ToolApprovalReceived, hand the decision
                             // to the driver's pending oneshot through approval_router.
-                            if let (Some((tool_id, approved, always)), Some(router)) =
-                                (approval_response, approval_router.as_ref())
-                            {
-                                router.resolve_decision(&tool_id, approved, always);
-                            }
-                            if let Some(ref sig) = turn_signal {
-                                record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
-                            }
+                            finish_reduced_action(reduced, approval_router.as_ref(), turn_signal.as_ref());
                         }
                         None => {
                             // Channel closed: every dispatcher sender has been dropped.
@@ -3136,27 +3339,8 @@ pub fn spawn_dispatcher_task_full(
                 biased;
                 () = shutdown.cancelled() => {
                     while let Ok(action) = action_rx.try_recv() {
-                        stats.actions_seen = stats.actions_seen.saturating_add(1);
-                        let outcome = extract_turn_outcome(&action);
-                        let usage = extract_stream_usage(&action);
-                        let draft_id = extract_turn_draft_id(&action).map(str::to_string);
-                        let approval_response = extract_approval_response(&action);
-                        let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
-                        let effects = state.reduce(action);
-                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
-                        stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
-                        for effect in effects {
-                            executor.execute(effect).await;
-                        }
-                        let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                        if let (Some((tool_id, approved, always)), Some(router)) =
-                            (approval_response, approval_router.as_ref())
-                        {
-                            router.resolve_decision(&tool_id, approved, always);
-                        }
-                        if let Some(ref sig) = turn_signal {
-                            record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
-                        }
+                        let reduced = reduce_and_execute(&mut state, &executor, action, &mut stats).await;
+                        finish_reduced_action(reduced, approval_router.as_ref(), turn_signal.as_ref());
                     }
                     if let Some(ref sig) = turn_signal {
                         sig.notify();
@@ -3166,27 +3350,8 @@ pub fn spawn_dispatcher_task_full(
                 maybe_action = action_rx.recv() => {
                     match maybe_action {
                         Some(action) => {
-                            stats.actions_seen = stats.actions_seen.saturating_add(1);
-                            let outcome = extract_turn_outcome(&action);
-                            let usage = extract_stream_usage(&action);
-                            let draft_id = extract_turn_draft_id(&action).map(str::to_string);
-                            let approval_response = extract_approval_response(&action);
-                            let requires_persistence = matches!(&action, Action::StreamCompleted { .. });
-                        let effects = state.reduce(action);
-                        let save_requested = effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_)));
-                            stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
-                            for effect in effects {
-                                executor.execute(effect).await;
-                            }
-                            let outcome = executor.outcome_after_effects(outcome, requires_persistence, save_requested);
-                            if let (Some((tool_id, approved, always)), Some(router)) =
-                                (approval_response, approval_router.as_ref())
-                            {
-                                router.resolve_decision(&tool_id, approved, always);
-                            }
-                            if let Some(ref sig) = turn_signal {
-                                record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
-                            }
+                            let reduced = reduce_and_execute(&mut state, &executor, action, &mut stats).await;
+                            finish_reduced_action(reduced, approval_router.as_ref(), turn_signal.as_ref());
                         }
                         None => {
                             if let Some(ref sig) = turn_signal {

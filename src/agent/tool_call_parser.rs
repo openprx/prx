@@ -1,4 +1,4 @@
-use crate::agent::diagnostics::sanitize_tool_parse_log_preview;
+use crate::agent::diagnostics::tool_parse_log_digest;
 use crate::providers::ToolCall;
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
@@ -633,10 +633,12 @@ fn parse_tool_calls_with_patterns(
             }
 
             if !parsed_any {
-                let sanitized_preview = sanitize_tool_parse_log_preview(inner);
+                let (body_len, body_sha256) = tool_parse_log_digest(inner);
                 tracing::error!(
-                    raw_tool_call_body = sanitized_preview.as_str(),
-                    "Malformed <tool_call> JSON: expected tool-call object in tag body"
+                    body_len,
+                    body_sha256 = body_sha256.as_str(),
+                    parse_error = "expected tool-call object in tag body",
+                    "Malformed <tool_call> JSON"
                 );
             }
 

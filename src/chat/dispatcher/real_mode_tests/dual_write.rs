@@ -198,7 +198,7 @@ async fn real_mode_save_session_clears_guard_after_completion() {
     let executor = EffectExecutor::new_with_deps(deps.clone());
 
     let session = crate::chat::session::ChatSession::new("prov", "model");
-    executor.execute(Effect::SaveSession(session)).await;
+    executor.execute(Effect::SaveSession(session.into())).await;
 
     // poll until the subtask finishes (at most 500ms)
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -215,7 +215,7 @@ async fn real_mode_save_session_clears_guard_after_completion() {
 
     // the guard must reset automatically once the subtask finishes
     assert!(
-        !deps.dual_write_guard.is_active(),
+        !deps.persistence.dual_write_guard.is_active(),
         "dual_write_guard must be false after SaveSession subtask completes (RAII scope auto-cleared)"
     );
 }

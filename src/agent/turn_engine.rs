@@ -39,7 +39,7 @@ use crate::agent::context_preflight::{
     RestoredRequestPosition, capture_current_turn_request, preflight_context_budget_before_provider_call,
     restore_current_turn_request,
 };
-use crate::agent::diagnostics::{redact_sensitive_json_keys, sanitize_tool_parse_log_preview, scrub_credentials};
+use crate::agent::diagnostics::{redact_sensitive_json_keys, scrub_credentials, tool_parse_log_digest};
 #[cfg(test)]
 use crate::agent::document_ingest::drop_untrusted_external_results;
 use crate::agent::document_ingest::{persist_tool_output_document, persist_untrusted_external_copy};
@@ -1361,9 +1361,11 @@ async fn run_turn_unguarded(
                     }
                     calls = fallback_calls;
                     if calls.is_empty() && looks_like_unparsed_tool_call_syntax(&response_text)? {
-                        let sanitized_preview = sanitize_tool_parse_log_preview(&response_text);
+                        let (response_len, response_sha256) = tool_parse_log_digest(&response_text);
                         tracing::error!(
-                            raw_response = sanitized_preview.as_str(),
+                            response_len,
+                            response_sha256 = response_sha256.as_str(),
+                            parse_error = "unparsed tool-call syntax",
                             "Failed to parse model tool-call syntax; suppressing raw tool-call text"
                         );
                         parsed_text = "tool execution failed".to_string();

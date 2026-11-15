@@ -17,7 +17,7 @@ mod reduce_ui;
 use crate::agent::turn_contracts::ChatMode;
 use crate::channels::traits::SendMessage;
 use crate::chat::action::{Action, MainQueueStatus, ProviderUsageRecordKind, ProviderWorkerStatus};
-use crate::chat::session::{ChatSession, ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
+use crate::chat::session::{ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
 use crate::chat::slash_types::AtPathCandidate;
 use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
@@ -199,8 +199,15 @@ pub enum Effect {
         routing_input: Option<String>,
         turn_binding: Option<Arc<super::binding::ChatTurnBinding>>,
     },
-    /// Persist a snapshot of the current session
-    SaveSession(ChatSession),
+    /// Persist a snapshot of the current session, then publish it as the
+    /// acknowledged session.
+    SaveSession(crate::chat::acked_session::SessionCommit),
+    /// Publish an accepted non-persistent load (resume) as the acknowledged
+    /// session without writing a row.
+    PublishSession(crate::chat::acked_session::SessionCommit),
+    /// The reducer refused the action; an awaited acknowledgement answers
+    /// `Ack::Rejected` with this payload-free reason.
+    ActionRejected { reason: String },
     /// Tell the render layer the draft is finished and push it into conversation_lines
     SendDraftFinalize { draft_id: String, text: String },
     /// Cancel streaming for the given draft
@@ -281,6 +288,8 @@ impl Effect {
         match self {
             Self::StartTurn { .. } => "StartTurn",
             Self::SaveSession(_) => "SaveSession",
+            Self::PublishSession(_) => "PublishSession",
+            Self::ActionRejected { .. } => "ActionRejected",
             Self::SendDraftFinalize { .. } => "SendDraftFinalize",
             Self::CancelDraft(_) => "CancelDraft",
             Self::CancelToken(_) => "CancelToken",
@@ -326,6 +335,11 @@ pub struct SessionState {
     pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
     /// Main-session token records, success-only. Child-session usage is Phase 4.
     pub token_usage_records: Vec<MainSessionTokenUsageRecord>,
+    /// Incremented by every accepted `SessionLoaded`; acknowledged snapshots
+    /// of an earlier load are never read by the current one.
+    pub load_epoch: u64,
+    /// Incremented by every snapshot handed to the executor within a load.
+    pub revision: u64,
 }
 
 /// Transient TUI state (discarded on exit, never persisted).
@@ -611,6 +625,10 @@ impl StreamState {
         Some(self.visible_drafts.remove(idx))
     }
 
+    fn has_visible_draft(&self, draft_id: &str) -> bool {
+        self.visible_drafts.iter().any(|turn| turn.draft.draft_id == draft_id)
+    }
+
     fn clear_visible_drafts(&mut self) {
         self.visible_drafts.clear();
     }
@@ -706,6 +724,8 @@ pub struct ControlState {
     /// P3c: final aggregate usage records are idempotent per provider task.
     /// Incremental usage records are intentionally never tracked here.
     pub final_usage_tasks_recorded: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
+    /// Tasks whose non-TUI `TurnCommitRequested` was accepted (once per task).
+    pub committed_turn_tasks: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
     /// Whether this turn has already surfaced the lossy-compaction notice.
     ///
     /// The pre-provider budget check runs once per tool iteration, so a session
@@ -870,6 +890,8 @@ impl ChatState {
                 created_at: None,
                 background_sessions: Vec::new(),
                 token_usage_records: Vec::new(),
+                load_epoch: 0,
+                revision: 0,
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
@@ -910,6 +932,7 @@ impl ChatState {
                 tool_buffers: std::collections::HashMap::new(),
                 turn_cancels: std::collections::HashMap::new(),
                 final_usage_tasks_recorded: std::collections::HashSet::new(),
+                committed_turn_tasks: std::collections::HashSet::new(),
                 context_degrade_notified: false,
             },
             #[cfg(feature = "terminal-tui")]
@@ -1095,18 +1118,24 @@ impl ChatState {
                 vec![]
             }
             Action::ModeChanged(mode) => {
+                let changed = self.session.mode != mode;
                 self.session.mode = mode;
                 self.ui.chat_mode = mode;
-                vec![Effect::RequestRedraw]
+                self.metadata_changed_effects(changed)
             }
             Action::ModelChanged { model } => {
+                let changed = self.session.model.as_ref() != model.as_str();
                 // BUG-07: /model <name> switches online. Update session.model so the status bar
                 // shows the new model immediately; the real model switch for later LLM turns is done
                 // by the main loop hot-swapping the EffectDeps slot (reducer keeps only the ledger).
                 self.session.model = Arc::from(model.as_str());
-                vec![Effect::RequestRedraw]
+                self.metadata_changed_effects(changed)
             }
             Action::ProviderChanged { provider, model } => {
+                let changed = self.session.provider.as_ref() != provider.as_str()
+                    || model
+                        .as_deref()
+                        .is_some_and(|model| self.session.model.as_ref() != model);
                 // Bug #3: /provider <name> [model] switches online. Update session.provider so the
                 // status bar / snapshot reflects the new provider immediately; if a model was given,
                 // write session.model too. The real provider instance for later LLM turns is swapped
@@ -1115,7 +1144,7 @@ impl ChatState {
                 if let Some(model) = model {
                     self.session.model = Arc::from(model.as_str());
                 }
-                vec![Effect::RequestRedraw]
+                self.metadata_changed_effects(changed)
             }
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
             Action::HistoryCompactionPatchApplied {
@@ -1210,7 +1239,9 @@ impl ChatState {
             Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
             // ── Session ───────────────────────────────────────────
-            Action::SessionLoaded(session) => self.reduce_session_loaded(session),
+            Action::SessionLoaded { session, persist } => self.reduce_session_loaded(session, persist),
+            Action::TurnCommitRequested { task_id, draft_id } => self.reduce_turn_commit_requested(task_id, draft_id),
+            Action::Awaited { action, .. } => self.reduce(*action),
             Action::SessionSaved { id } => self.reduce_session_saved(id),
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
             Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
@@ -1386,7 +1417,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         }
 
         // Session: SessionLoaded rebuilds history and may force a UI reset; SessionSaved/Switched do not
-        Action::SessionLoaded(_) => true,
+        Action::SessionLoaded { .. } | Action::TurnCommitRequested { .. } => true,
+        Action::Awaited { action, .. } => ui_dirty_for(action),
         Action::SessionSaved { .. } | Action::SessionSwitched { .. } => false,
         // Record*/compaction writes session.turns/history only. User-visible
         // compaction feedback is `SystemMessageAdded`; budget UI refresh is

@@ -176,6 +176,8 @@ pub(super) struct ManualCompact<'a> {
     /// The current chat session's envelope; the audit runtime binds to it.
     pub(super) envelope: &'a RuntimeEnvelope,
     pub(super) chat_dispatcher: &'a dispatcher::ChatDispatcher,
+    /// Commit-failure latch for the awaited reducer acknowledgement.
+    pub(super) commits: &'a dispatcher::TurnCompletionSignal,
 }
 
 /// What an explicit `/compact` or a chat preflight compaction did. Callers
@@ -255,6 +257,7 @@ pub(super) async fn run_manual_compact(
         memory,
         envelope,
         chat_dispatcher,
+        commits,
     } = request;
     let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
     let mut source_history = Vec::with_capacity(chat_session.turns.len().saturating_add(system_count));
@@ -304,7 +307,9 @@ pub(super) async fn run_manual_compact(
             config,
             crate::chat::action::CompactReason::Manual,
             chat_dispatcher,
-        );
+            commits,
+        )
+        .await;
     }
     let messages_before = history.len();
     compact_chat_history(history);
@@ -416,14 +421,16 @@ pub(super) async fn build_chat_compaction_patch(
     }
 }
 
-/// Apply `patch` to its `source_history`, make the compacted source the
-/// provider view and hand the same patch to the reducer.
+/// Validate `patch` against its `source_history`, hand the same patch to the
+/// reducer and wait for its acknowledgement; only then is the compacted source
+/// the provider view.
 ///
 /// `enriched_request` is the current turn's enriched request (preflight): it
 /// replaces the compacted source's final message, the plain request, so the
-/// request occurs exactly once. A patch that does not describe its source is
-/// refused before anything changes.
-pub(super) fn apply_chat_compaction_patch_and_sync(
+/// request occurs exactly once. A patch that does not describe its source, or
+/// that the reducer rejects, is refused with nothing changed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn apply_chat_compaction_patch_and_sync(
     history: &mut Vec<ChatMessage>,
     source_history: &[ChatMessage],
     enriched_request: Option<ChatMessage>,
@@ -431,6 +438,7 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
     config: &crate::config::AgentCompactionConfig,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
+    commits: &dispatcher::TurnCompletionSignal,
 ) -> ManualCompactOutcome {
     let replacement_len = patch.replacement.len();
     let mut compacted = source_history.to_vec();
@@ -445,6 +453,35 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
         return ManualCompactOutcome::Refused {
             reason: format!("Compaction refused: {error}. Nothing was changed."),
         };
+    }
+    match chat_dispatcher
+        .dispatch_awaited(
+            crate::chat::action::Action::HistoryCompactionPatchApplied {
+                reason,
+                patch,
+                compaction_config: config.clone(),
+            },
+            commits,
+        )
+        .await
+    {
+        Ok(crate::chat::acked_session::Ack::Published(_)) => {}
+        Ok(crate::chat::acked_session::Ack::Rejected(rejection)) => {
+            return ManualCompactOutcome::Refused {
+                reason: format!("Compaction refused: {rejection}. Nothing was changed."),
+            };
+        }
+        Ok(crate::chat::acked_session::Ack::Unchanged(_)) => {
+            return ManualCompactOutcome::Refused {
+                reason: "Compaction refused: the session did not acknowledge the compaction. Nothing was changed."
+                    .to_owned(),
+            };
+        }
+        Err(error) => {
+            return ManualCompactOutcome::Refused {
+                reason: format!("Compaction failed: {error}. Nothing was changed."),
+            };
+        }
     }
     if let Some(enriched) = enriched_request {
         replace_final_request(&mut compacted, source_history.last(), enriched);
@@ -469,14 +506,6 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
             "chat summary compaction applied preserving trim"
         );
     }
-    let _ = chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::HistoryCompactionPatchApplied {
-            reason,
-            patch,
-            compaction_config: config.clone(),
-        },
-        "chat.history_compaction_patch_applied",
-    );
     let (turns_after, tokens_after) = chat_history_turns_and_tokens(history);
     ManualCompactOutcome::Compacted {
         generation: crate::agent::compaction::context_handoff_generation(history),

@@ -610,7 +610,10 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
         Arc::from("test-model"),
         CancellationToken::new(),
     );
-    let _ = resumed.reduce(Action::SessionLoaded(snapshot));
+    let _ = resumed.reduce(Action::SessionLoaded {
+        session: snapshot.session,
+        persist: false,
+    });
     let resumed_pairs = resumed
         .session
         .history

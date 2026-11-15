@@ -228,14 +228,16 @@ fn build_deps(
     let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard,
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks: Arc::clone(&hooks),
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard,
         redraw_tx: Some(redraw_tx),
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,
@@ -303,14 +305,16 @@ fn build_counting_channel_deps(
     let (redraw_tx, _redraw_rx) = mpsc::channel::<()>(1);
     let deps = EffectDeps {
         provider,
-        memory,
+        persistence: PersistenceDeps {
+            memory,
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        },
         memory_event_recording: MemoryEventRecording::default(),
         channel,
         hooks,
         observer,
-        action_tx,
         provider_turn_lifecycle_tx: None,
-        dual_write_guard: RuntimeDualWriteGuard::new(),
         redraw_tx: Some(redraw_tx),
         #[cfg(feature = "terminal-tui")]
         tui_mirror: None,

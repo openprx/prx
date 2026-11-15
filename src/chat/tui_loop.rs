@@ -612,9 +612,11 @@ pub(super) fn run_tui_unified_loop(
         // behavior without turning large plain-text input into a log flood.
         match &ev {
             crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
+                let (key_class, named_key) = crate::chat::tui::key_log_class(&k.code);
                 tracing::info!(
                     event_type = "Key",
-                    code = ?k.code,
+                    key_class,
+                    named_key = ?named_key,
                     modifiers = ?k.modifiers,
                     kind = ?k.kind,
                     "tui_input_event"
@@ -626,7 +628,6 @@ pub(super) fn run_tui_unified_loop(
                     event_type = "Paste",
                     chars_count = s.chars().count(),
                     bytes_count = s.len(),
-                    first_8_chars = %s.chars().take(8).collect::<String>(),
                     "tui_input_event"
                 );
             }

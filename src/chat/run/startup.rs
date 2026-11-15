@@ -3,7 +3,7 @@ use super::{
     Arc, AtomicU64, Channel, Config, DOUBLE_CTRLC_WINDOW_MS, Memory, Ordering, Result, TerminalChannel, Tool,
     TracingChatGuard, dispatcher, ensure_chat_tracing_to_file, history_for_session_with_system,
     initial_chat_dispatcher_state, load_latest_session_with_message_events, load_session_by_id_with_message_events,
-    mpsc, now_ms, providers, save_session, session, startup_banner,
+    mpsc, now_ms, providers, session, startup_banner,
 };
 #[cfg(feature = "terminal-tui")]
 use super::{
@@ -232,7 +232,7 @@ pub(super) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                    info!(id = %s.id, title_len = s.title.chars().count(), turns = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("no saved chat session to continue"),
@@ -252,7 +252,7 @@ pub(super) async fn resume_session(
                 .await
             {
                 Ok(Some(s)) => {
-                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                    info!(id = %s.id, title_len = s.title.chars().count(), turns = s.turn_count(), "Resumed session");
                     s
                 }
                 Ok(None) if strict => anyhow::bail!("session '{id}' not found"),
@@ -384,9 +384,12 @@ pub(super) fn initial_dispatcher(
     // bounded(2048): covers the Action stream of a typical chat session (user input + streaming
     // chunks + tool events + signals) while merging deltas through [`StreamChunkCoalescer`] under
     // backpressure, so it cannot grow without bound and OOM.
-    let (chat_dispatcher, chat_action_rx) = dispatcher::ChatDispatcher::new();
     let dispatcher_shadow_state =
         initial_chat_dispatcher_state(provider_name, model_name, shutdown.clone(), chat_session);
+    // The acknowledged session is seeded from the reducer state (load epoch 1,
+    // revision 0), so a read right after startup sees the loaded session.
+    let (chat_dispatcher, chat_action_rx) =
+        dispatcher::ChatDispatcher::new_seeded(dispatcher_shadow_state.acked_session_seed());
     // The TUI fields exist only with `terminal-tui`; without it the state is
     // used as built (no `mut` binding, so feature-less builds do not warn).
     #[cfg(feature = "terminal-tui")]
@@ -714,10 +717,7 @@ pub(super) async fn finish_chat_session(
     chat_dispatcher: dispatcher::ChatDispatcher,
     dispatcher_handle: tokio::task::JoinHandle<dispatcher::DispatcherStats>,
     #[cfg(feature = "terminal-tui")] terminal_guard: &Option<TerminalGuard>,
-    mem: &Arc<dyn Memory>,
-    chat_session: &session::ChatSession,
     plain_mode_turn_failed: bool,
-    #[cfg(not(feature = "terminal-tui"))] persist_sessions: bool,
 ) -> Result<()> {
     // Step 5b: dispatcher task graceful shutdown.
     //
@@ -749,25 +749,6 @@ pub(super) async fn finish_chat_session(
         let mut stdout = std::io::stdout();
         let _ = stdout.write_all(b"\r\n");
         let _ = stdout.flush();
-    }
-
-    // T3-3-fixA P0-2: Pure guard for the exit-time save_session.
-    //
-    // In Pure mode chat_session.add_*_turn is skipped by the guard at line 2185, so chat_session.turns
-    // lags behind the SessionState maintained by the reducer. Saving unconditionally on exit would
-    // overwrite the latest snapshot the reducer already persisted with a stale one. The guard
-    // expression is kept structurally identical to the one at line 2185.
-    #[cfg(feature = "terminal-tui")]
-    let legacy_exit_save_enabled = false; // S4-B: Pure single source
-    #[cfg(not(feature = "terminal-tui"))]
-    let legacy_exit_save_enabled = persist_sessions;
-    if legacy_exit_save_enabled {
-        // Final session save before exit
-        if let Err(e) = save_session(mem.as_ref(), chat_session).await {
-            tracing::warn!("Failed to persist session on exit: {e}");
-        }
-    } else {
-        tracing::debug!("Pure mode: skip legacy exit save_session (reducer owns persistence)");
     }
 
     info!("Chat session ended");

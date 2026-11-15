@@ -117,7 +117,10 @@ fn test_redux_session_loaded_replaces_session_state() {
     loaded.add_user_turn("hello");
     loaded.add_assistant_turn("hi", vec![]);
 
-    let effects = state.reduce(Action::SessionLoaded(loaded));
+    let effects = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
 
     assert_eq!(state.session.id, "sess-abc");
     assert_eq!(state.session.title, "My Session");
@@ -226,7 +229,10 @@ fn test_redux_background_session_recorded_emits_savesession_with_summary() {
     // Round-trip: reloading that snapshot into a fresh state restores it,
     // confirming the persisted blob is sufficient for reload recap.
     let mut reloaded = s();
-    let _ = reloaded.reduce(Action::SessionLoaded(snapshot));
+    let _ = reloaded.reduce(Action::SessionLoaded {
+        session: snapshot.session,
+        persist: false,
+    });
     assert_eq!(reloaded.session.background_sessions.len(), 1);
     assert_eq!(
         reloaded.session.background_sessions.first().map(|s| s.id.as_str()),
@@ -254,7 +260,10 @@ fn test_redux_background_sessions_survive_snapshot_and_reload() {
 
     // Reloading that snapshot into a fresh state restores the summaries.
     let mut fresh = s();
-    let _ = fresh.reduce(Action::SessionLoaded(snapshot));
+    let _ = fresh.reduce(Action::SessionLoaded {
+        session: snapshot,
+        persist: false,
+    });
     assert_eq!(fresh.session.background_sessions.len(), 2);
     // None of the restored entries is a live status — reload never
     // resurrects a running process.
@@ -286,7 +295,10 @@ fn test_redux_session_loaded_only_user_assistant_in_history() {
         tool_calls: vec![],
     });
     loaded.add_user_turn("q");
-    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
     // history holds only user, no system (SessionLoaded does not add system to history)
     assert_eq!(
         state.session.history.len(),
@@ -319,7 +331,10 @@ fn test_redux_session_loaded_strips_fabricated_tool_markers_from_assistant_histo
     loaded.add_user_turn("and now?");
     loaded.add_assistant_turn("Nothing new.\n[Used tools: shell]", vec![]);
 
-    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
 
     let history: Vec<&str> = state.session.history.iter().map(|m| m.content.as_str()).collect();
     assert_eq!(
@@ -370,7 +385,10 @@ fn late_save_acknowledgement_cannot_replace_a_loaded_session() {
     let mut loaded = crate::chat::session::ChatSession::new("prx-provider", "prx-model");
     loaded.id = "prx-new-session".into();
     loaded.add_user_turn("new request");
-    let _ = state.reduce(Action::SessionLoaded(loaded));
+    let _ = state.reduce(Action::SessionLoaded {
+        session: loaded,
+        persist: false,
+    });
     let effects = state.reduce(Action::SessionSaved {
         id: "prx-old-session".into(),
     });
@@ -863,7 +881,10 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
 
     let snapshot = state.build_session_snapshot();
     let mut reloaded = s();
-    let _ = reloaded.reduce(Action::SessionLoaded(snapshot));
+    let _ = reloaded.reduce(Action::SessionLoaded {
+        session: snapshot,
+        persist: false,
+    });
     assert_eq!(
         messages_as_pairs(&reloaded.session.history),
         vec![

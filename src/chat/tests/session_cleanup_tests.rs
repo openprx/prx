@@ -100,11 +100,22 @@ async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary
         };
         let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));
         let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::clone(&runs));
-        let mut chat_session = session::ChatSession::new("provider", "model");
-        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        let session_dispatcher = crate::chat::acked_session::TestSessionDispatcher::spawn(
+            std::sync::Arc::new(crate::memory::NoneMemory::new()),
+            crate::chat::acked_session::TestSessionDispatcher::state_with_history(Vec::new()),
+        );
+        let reader = session_dispatcher.dispatcher.session_reader();
 
-        let report = shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &dispatcher).await;
+        let report = shutdown_child_sessions_for_exit(
+            &mut chat_sessions,
+            &session_dispatcher.dispatcher,
+            &session_dispatcher.commits,
+        )
+        .await;
 
+        // The acknowledged session holds the summary as soon as the helper returns.
+        let chat_session = reader.session();
+        session_dispatcher.stop().await;
         assert_eq!(report.summaries.len(), 1);
         assert!(
             runs.read().await.is_empty(),

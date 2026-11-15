@@ -309,31 +309,33 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
     );
 
     let mut legacy_history = enriched_history;
-    let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+    let session_dispatcher = crate::chat::acked_session::TestSessionDispatcher::spawn(
+        std::sync::Arc::new(crate::memory::NoneMemory::new()),
+        crate::chat::acked_session::TestSessionDispatcher::state_with_history(persisted_history.clone()),
+    );
     let outcome = apply_chat_compaction_patch_and_sync(
         &mut legacy_history,
         &persisted_history,
         None,
-        patch,
+        patch.clone(),
         &config,
         crate::chat::action::CompactReason::ContextOverflow,
-        &dispatcher,
-    );
+        &session_dispatcher.dispatcher,
+        &session_dispatcher.commits,
+    )
+    .await;
+    session_dispatcher.stop().await;
     assert!(
         matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
-        "the persisted-source patch must apply to its own source: {outcome:?}"
+        "the persisted-source patch must apply to its own source and be acknowledged: {outcome:?}"
     );
-    let action = action_rx
-        .try_recv()
-        .expect("compaction helper should dispatch reducer patch");
 
-    let mut reducer_state = crate::chat::state::ChatState::new(
-        std::sync::Arc::from("provider"),
-        std::sync::Arc::from("model"),
-        tokio_util::sync::CancellationToken::new(),
-    );
-    reducer_state.session.history = persisted_history;
-    let _ = reducer_state.reduce(action);
+    let mut reducer_state = crate::chat::acked_session::TestSessionDispatcher::state_with_history(persisted_history);
+    let _ = reducer_state.reduce(crate::chat::action::Action::HistoryCompactionPatchApplied {
+        reason: crate::chat::action::CompactReason::ContextOverflow,
+        patch,
+        compaction_config: config.clone(),
+    });
 
     let legacy_pairs: Vec<_> = legacy_history
         .iter()
@@ -363,8 +365,8 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
     );
 }
 
-#[test]
-fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change() {
+#[tokio::test]
+async fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change() {
     let config = crate::config::AgentCompactionConfig::default();
     let source = vec![
         ChatMessage::system("sys"),
@@ -383,6 +385,7 @@ fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change(
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 enriched")];
     let history_before = history.clone();
     let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+    let commits = dispatcher::TurnCompletionSignal::new();
 
     let outcome = apply_chat_compaction_patch_and_sync(
         &mut history,
@@ -392,7 +395,9 @@ fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change(
         &config,
         crate::chat::action::CompactReason::Manual,
         &dispatcher,
-    );
+        &commits,
+    )
+    .await;
 
     assert!(
         matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Refused { .. }),
@@ -409,8 +414,8 @@ fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change(
     );
 }
 
-#[test]
-fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
+#[tokio::test]
+async fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
     let config = crate::config::AgentCompactionConfig::default();
     let source = vec![
         ChatMessage::system("sys"),
@@ -424,7 +429,10 @@ fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
         guard: crate::agent::compaction::compaction_patch_guard_for(&source, 1, 3).expect("test: guard over source"),
     };
     let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 ENRICHED")];
-    let (dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+    let session_dispatcher = crate::chat::acked_session::TestSessionDispatcher::spawn(
+        std::sync::Arc::new(crate::memory::NoneMemory::new()),
+        crate::chat::acked_session::TestSessionDispatcher::state_with_history(source.clone()),
+    );
 
     let outcome = apply_chat_compaction_patch_and_sync(
         &mut history,
@@ -433,8 +441,11 @@ fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
         patch,
         &config,
         crate::chat::action::CompactReason::ContextOverflow,
-        &dispatcher,
-    );
+        &session_dispatcher.dispatcher,
+        &session_dispatcher.commits,
+    )
+    .await;
+    session_dispatcher.stop().await;
 
     assert!(
         matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
