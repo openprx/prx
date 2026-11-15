@@ -22,6 +22,15 @@ impl ProviderSendRefused {
     pub(crate) fn reply(&self) -> std::borrow::Cow<'static, str> {
         crate::agent::refusal::render_refusal_reply("budget", self.reason.user_hint().as_deref())
     }
+
+    /// A budget refusal with `diagnostic`, for tests that classify one.
+    #[cfg(test)]
+    pub(crate) fn budget_for_test(diagnostic: &str) -> Self {
+        Self {
+            reason: crate::agent::refusal::RefusalReason::Budget,
+            diagnostic: diagnostic.to_owned(),
+        }
+    }
 }
 
 #[cfg(test)]

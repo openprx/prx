@@ -4158,6 +4158,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                     tool_execution_service: Some(Arc::new(super::line_approval::line_tool_execution_service(
                                         Arc::clone(&tools_registry), &mem, &security,
                                         Arc::clone(&approval_manager), cancellation.clone(),
+                                        Arc::new(super::terminal_approval::ControllingTerminal),
                                     ))),
                                     tool_execution_context: super::approval_context::line_mode(binding.envelope().clone())
                                         .with_approval_ledger(binding.h2_approval_ledger()),
@@ -4197,9 +4198,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     }
                     // The one-shot reads this note: a send-admission refusal
                     // exits 2 with its reply, any other failure exits 1.
-                    if let Some(binding) = chat_turn_binding.as_ref() {
-                        binding.note_failure(binding::TurnFailureNote::from_error(&e));
-                    }
+                    one_shot::note_turn_failure(chat_turn_binding.as_deref(), &e);
                     let err_text = e.to_string();
                     super::output::print_turn_failure(plain_mode, &err_text);
                     if plain_mode {

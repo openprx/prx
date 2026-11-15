@@ -53,49 +53,108 @@ impl TerminalApproval {
     }
 }
 
+/// What one approval prompt read from its answer line source.
+#[derive(Debug)]
+pub(crate) enum AnswerRead {
+    /// There is no controlling terminal; only `OPENPRX_APPROVAL_OVERRIDE` can
+    /// allow.
+    NoTerminal(std::io::Error),
+    /// A terminal exists but no line can be read from it (another prompt
+    /// holds it, or its reader could not start).
+    Unavailable,
+    /// The source finished: the answer line, or `None` on EOF.
+    Line(Option<String>),
+    /// The approval stopped waiting before an answer arrived.
+    Abandoned,
+}
+
+/// Where an approval prompt reads its one answer line. Production reads the
+/// controlling terminal ([`ControllingTerminal`]); the line-mode tests inject
+/// the lines an operator would type.
+#[async_trait::async_trait]
+pub(crate) trait AnswerLineSource: Send + Sync {
+    /// Show the prompt for `tool` and read one answer line while
+    /// `still_waiting` holds.
+    async fn read_answer(&self, tool: &str, args: &str, still_waiting: &(dyn Fn() -> bool + Send + Sync))
+    -> AnswerRead;
+}
+
+/// The controlling terminal (`/dev/tty`), or the chat input thread's next
+/// line while that thread owns the terminal stdin.
+pub(crate) struct ControllingTerminal;
+
+#[async_trait::async_trait]
+impl AnswerLineSource for ControllingTerminal {
+    async fn read_answer(
+        &self,
+        tool: &str,
+        args: &str,
+        still_waiting: &(dyn Fn() -> bool + Send + Sync),
+    ) -> AnswerRead {
+        let tty = match open_tty() {
+            Ok(tty) => tty,
+            Err(error) => return AnswerRead::NoTerminal(error),
+        };
+        eprint!("Approve {tool} {}? [y/N/a] ", summary(args));
+        let _ = std::io::stderr().flush();
+
+        let answer = if crate::channels::terminal::prompt_line::tty_input_loop_active() {
+            // The chat input thread owns the terminal stdin; take its next line.
+            drop(tty);
+            let Some(mut claimed) = crate::channels::terminal::prompt_line::claim_next_line() else {
+                tracing::warn!(tool, "terminal approval prompt already active; denying");
+                return AnswerRead::Unavailable;
+            };
+            wait_for_answer(claimed.line(), still_waiting).await
+        } else {
+            match TtyReader::spawn(tty) {
+                Ok(mut reader) => {
+                    let answer = wait_for_answer(reader.line(), still_waiting).await;
+                    reader.stop();
+                    answer
+                }
+                Err(error) => {
+                    tracing::warn!(tool, %error, "terminal approval reader unavailable; denying");
+                    return AnswerRead::Unavailable;
+                }
+            }
+        };
+        match answer {
+            Some(Some(line)) => AnswerRead::Line(Some(line)),
+            Some(None) => {
+                eprintln!();
+                AnswerRead::Line(None)
+            }
+            None => {
+                eprintln!("\napproval cancelled");
+                AnswerRead::Abandoned
+            }
+        }
+    }
+}
+
 /// Ask the operator on the terminal. `still_waiting` reports whether the
 /// approval is still pending; once it is not (the turn was cancelled, for
 /// example by Ctrl-C), the prompt stops reading and returns `Deny`.
 pub(crate) async fn prompt<F>(tool: &str, args: &str, still_waiting: F) -> TerminalApproval
 where
-    F: Fn() -> bool + Send,
+    F: Fn() -> bool + Send + Sync,
 {
-    let tty = match open_tty() {
-        Ok(tty) => tty,
-        Err(error) => return override_decision(tool, &error),
-    };
-    eprint!("Approve {tool} {}? [y/N/a] ", summary(args));
-    let _ = std::io::stderr().flush();
+    prompt_from(&ControllingTerminal, tool, args, &still_waiting).await
+}
 
-    let answer = if crate::channels::terminal::prompt_line::tty_input_loop_active() {
-        // The chat input thread owns the terminal stdin; take its next line.
-        drop(tty);
-        let Some(mut claimed) = crate::channels::terminal::prompt_line::claim_next_line() else {
-            tracing::warn!(tool, "terminal approval prompt already active; denying");
-            return TerminalApproval::Deny;
-        };
-        wait_for_answer(claimed.line(), &still_waiting).await
-    } else {
-        match TtyReader::spawn(tty) {
-            Ok(mut reader) => {
-                let answer = wait_for_answer(reader.line(), &still_waiting).await;
-                reader.stop();
-                answer
-            }
-            Err(error) => {
-                tracing::warn!(tool, %error, "terminal approval reader unavailable; denying");
-                return TerminalApproval::Deny;
-            }
-        }
-    };
-    match answer {
-        Some(Some(line)) => TerminalApproval::parse(&line),
-        Some(None) => {
-            eprintln!();
-            TerminalApproval::Deny
-        }
-        None => {
-            eprintln!("\napproval cancelled");
+/// [`prompt`] reading its answer from `source`.
+pub(crate) async fn prompt_from(
+    source: &dyn AnswerLineSource,
+    tool: &str,
+    args: &str,
+    still_waiting: &(dyn Fn() -> bool + Send + Sync),
+) -> TerminalApproval {
+    match source.read_answer(tool, args, still_waiting).await {
+        AnswerRead::NoTerminal(error) => override_decision(tool, &error),
+        AnswerRead::Unavailable | AnswerRead::Line(None) => TerminalApproval::Deny,
+        AnswerRead::Line(Some(line)) => TerminalApproval::parse(&line),
+        AnswerRead::Abandoned => {
             tracing::info!(tool, "terminal approval abandoned: the approval is no longer pending");
             TerminalApproval::Deny
         }
@@ -104,10 +163,9 @@ where
 
 /// `Some(answer)` when the line source finished (`None` inside is EOF);
 /// `None` when the approval stopped waiting first.
-async fn wait_for_answer<L, F>(line: L, still_waiting: &F) -> Option<Option<String>>
+async fn wait_for_answer<L>(line: L, still_waiting: &(dyn Fn() -> bool + Send + Sync)) -> Option<Option<String>>
 where
     L: std::future::Future<Output = Option<String>>,
-    F: Fn() -> bool,
 {
     tokio::pin!(line);
     let mut check = tokio::time::interval(PENDING_CHECK_INTERVAL);

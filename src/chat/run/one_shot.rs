@@ -112,6 +112,15 @@ pub(super) enum OneShotReply {
     Refused(String),
 }
 
+/// Record why the line-mode turn failed on its binding: a send-admission
+/// refusal anywhere in the error chain is noted as a refusal (the one-shot
+/// exits 2 with its reply), any other error as a failure (exit 1).
+pub(super) fn note_turn_failure(binding: Option<&ChatTurnBinding>, error: &anyhow::Error) {
+    if let Some(binding) = binding {
+        binding.note_failure(TurnFailureNote::from_error(error));
+    }
+}
+
 /// Read the turn's end: the driver's refusal note first, then a failure, then
 /// a committed answer; a turn that committed nothing and did not fail was
 /// cancelled (Ctrl-C), which is a failure for the process.
@@ -207,6 +216,58 @@ mod tests {
         assert_eq!(one_shot_exit_code(None), 0);
         assert_eq!(one_shot_exit_code(Some(&refused)), ONE_SHOT_REFUSAL_EXIT_CODE);
         assert_eq!(one_shot_exit_code(Some(&anyhow::anyhow!("boom"))), 1);
+    }
+
+    /// The line-mode loop's failure note decides the one-shot status: a
+    /// send-admission refusal (even wrapped in context) is read back as the
+    /// refusal reply and exit 2, any other failure as its message and exit 1.
+    #[tokio::test]
+    async fn line_mode_failure_note_classifies_refusal_and_failure() {
+        let refused = crate::agent::send_admission::ProviderSendRefused::budget_for_test("prx test refusal");
+        let expected_reply = refused.reply().into_owned();
+        let refusal = anyhow::Error::new(refused).context("provider round failed");
+        let (_dir, _fabric, binding) =
+            crate::chat::binding::tests::fixture_with_advisory(false, Default::default()).await;
+        note_turn_failure(Some(&binding), &refusal);
+        assert_eq!(
+            binding.failure_note(),
+            Some(&TurnFailureNote::Refused {
+                reply: expected_reply.clone()
+            }),
+            "a wrapped send-admission refusal must be noted as a refusal with its reply"
+        );
+        let reply = outcome(Some(&binding), true, false, &[]);
+        assert_eq!(
+            reply.as_ref().ok(),
+            Some(&OneShotReply::Refused(expected_reply.clone())),
+            "the one-shot must read the noted refusal back as its reply: {reply:?}"
+        );
+        let refused_exit = anyhow::Error::new(OneShotRefused { reply: expected_reply });
+        assert_eq!(
+            one_shot_exit_code(Some(&refused_exit)),
+            ONE_SHOT_REFUSAL_EXIT_CODE,
+            "a refused one-shot exits 2"
+        );
+
+        let (_dir, _fabric, binding) =
+            crate::chat::binding::tests::fixture_with_advisory(false, Default::default()).await;
+        note_turn_failure(Some(&binding), &anyhow::anyhow!("prx provider transport broke"));
+        assert_eq!(
+            binding.failure_note(),
+            Some(&TurnFailureNote::Failed {
+                message: "prx provider transport broke".to_owned()
+            }),
+            "any other error must be noted as a failure with its message"
+        );
+        let failed = outcome(Some(&binding), true, false, &[]);
+        let message = failed.as_ref().err().map(ToString::to_string);
+        assert_eq!(
+            message.as_deref(),
+            Some("prx provider transport broke"),
+            "the one-shot must fail with the noted message, not the generic text: {failed:?}"
+        );
+        let failed_exit = failed.err();
+        assert_eq!(one_shot_exit_code(failed_exit.as_ref()), 1, "a failed one-shot exits 1");
     }
 
     #[test]
