@@ -144,6 +144,21 @@ deleted. A later rollover can reference the prior handoff event exactly, so
 repeated switches form an auditable generation chain within the same durable
 session.
 
+Each handoff references only the rows it replaced, its parent handoff row
+among them, so a fact older than the newest handoff is reached by following
+the chain: one lookup per generation. Once a handoff exists, the
+`[Current session context]` preamble quotes only the session's rows stored
+after the newest handoff, never a row it replaced and never a row `/branch`
+copied; older facts stay reachable through `transcript_history_lookup` alone.
+In chat, `/compact` and the preflight report their outcome: compacted (new
+generation, turns and tokens after), degraded (a deterministic trim that
+dropped messages), or refused with the reason and "Nothing was changed."
+`/branch` of a compacted session copies the handoff chain and the kept turns
+into the branch in one transaction, with every note rewritten to point at the
+copies, so the branch's lookups read its own rows; the original session's rows
+stay refused there. If the copy fails, the branch is aborted and nothing is
+saved.
+
 When a legacy mode does recall an evicted OS-paging page, the injected message
 is framed as history, not as an observation: the `[Recalled context from earlier
 in this session]` marker line is followed by a notice stating that the excerpts
