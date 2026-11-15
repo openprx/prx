@@ -25,6 +25,9 @@ pub const CHILD_DEADLINE: Duration = Duration::from_secs(180);
 const POLL: Duration = Duration::from_millis(20);
 /// Bound on the kill-and-reap during cleanup.
 const REAP_BOUND: Duration = Duration::from_secs(5);
+/// Longest an output drain may outlive its child. A grandchild that inherited
+/// the pipe keeps it open after the child exits, so the join must be bounded.
+const DRAIN_BOUND: Duration = Duration::from_secs(10);
 
 /// A private tree: `config/` (holding `workspace/`) and `home/`.
 pub struct Sandbox {
@@ -149,12 +152,21 @@ impl Running {
     }
 }
 
+/// Join a drain without waiting forever: poll `is_finished` until `DRAIN_BOUND`.
+fn join_bounded(drain: Drain) -> Vec<u8> {
+    let deadline = Instant::now() + DRAIN_BOUND;
+    while !drain.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "output pipe still open {DRAIN_BOUND:?} after the child exited (inherited by a grandchild?)"
+        );
+        std::thread::sleep(POLL);
+    }
+    drain.join().expect("test: drain thread").expect("test: read output")
+}
+
 fn collect(drain: Option<Drain>) -> String {
-    let bytes = drain
-        .expect("test: drain")
-        .join()
-        .expect("test: drain thread")
-        .expect("test: read output");
+    let bytes = join_bounded(drain.expect("test: drain"));
     assert!(
         u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_OUTPUT_BYTES,
         "output exceeded MAX_OUTPUT_BYTES"

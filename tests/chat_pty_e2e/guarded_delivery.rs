@@ -231,8 +231,11 @@ fn install_middleware(guard: &HarnessGuard) {
         std::fs::copy(fixture.join(file), plugin_dir.join(file)).expect("test: copy plugin fixture");
     }
     let source = plugin_dir.to_str().expect("test: UTF-8 plugin path");
+    // `Running` bounds the child: piped output with a byte cap, a deadline,
+    // and kill-and-reap on timeout or drop.
     let run = |args: &[&str]| {
-        let output = std::process::Command::new(super::prx_binary())
+        let mut command = std::process::Command::new(super::prx_binary());
+        command
             .arg("--config-dir")
             .arg(&guard.config_dir)
             .args(args)
@@ -240,16 +243,10 @@ fn install_middleware(guard: &HarnessGuard) {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &guard.home_dir)
             .env("OPENPRX_WORKSPACE", workspace(guard))
-            .env("RUST_LOG", "off")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("test: run prx plugin");
-        assert!(
-            output.status.success(),
-            "prx {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).into_owned()
+            .env("RUST_LOG", "off");
+        let output = crate::plain_chat::Running::spawn(command).wait();
+        assert!(output.status.success(), "prx {args:?}: {}", output.stderr);
+        output.stdout
     };
     let inspected = run(&["plugin", "inspect", source]);
     let start = inspected.find('{').expect("test: inspect JSON");

@@ -74,6 +74,8 @@ mod compaction_script;
 mod guarded_delivery;
 #[path = "support/loopback_openai.rs"]
 mod loopback_openai;
+#[path = "support/plain_chat.rs"]
+mod plain_chat;
 #[path = "chat_pty_e2e/search_reachability.rs"]
 mod search_reachability;
 #[path = "chat_pty_e2e/supervised_file_edit.rs"]

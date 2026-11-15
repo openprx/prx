@@ -8,14 +8,50 @@ use crate::session_worker::protocol::WorkerResult;
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 
+/// Bound on the launches remembered as already warned about in this sweep.
+const MAX_WARNED_LAUNCHES: usize = 4096;
+/// Set once the process has reported that the suppression set is saturated.
+static SUPPRESSION_SATURATION_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the sweep does about one unconfirmed launch.
+#[derive(Debug, PartialEq, Eq)]
+enum UnconfirmedWarning {
+    /// First report of this launch: emit its warning.
+    Warn,
+    /// Already reported and remembered: stay silent.
+    Suppressed,
+    /// The set is full, so this launch cannot be remembered and gets no
+    /// per-launch warning. `aggregate` is true only for the first such launch
+    /// in the process, which emits the saturation warning.
+    Unremembered { aggregate: bool },
+}
+
+/// Decide the warning for `launch_event_id`. Remembered launches are never
+/// forgotten: a full set stays full rather than being cleared.
+fn admit_unconfirmed_warning(
+    warned: &mut std::collections::HashSet<i64>,
+    launch_event_id: i64,
+    saturation_reported: &std::sync::atomic::AtomicBool,
+) -> UnconfirmedWarning {
+    if warned.contains(&launch_event_id) {
+        return UnconfirmedWarning::Suppressed;
+    }
+    if warned.len() < MAX_WARNED_LAUNCHES {
+        warned.insert(launch_event_id);
+        return UnconfirmedWarning::Warn;
+    }
+    UnconfirmedWarning::Unremembered {
+        aggregate: !saturation_reported.swap(true, std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
 pub(super) async fn run_restart_recovery(
     fabric: MemoryFabric,
     workspace: std::path::PathBuf,
     runs: std::sync::Arc<tokio::sync::RwLock<Vec<super::SubAgentRun>>>,
 ) {
     // An unconfirmed reconciliation is reported once per launch per process,
-    // not again on every sweep; the set is bounded and restarts when full.
-    const MAX_WARNED_LAUNCHES: usize = 4096;
+    // not again on every sweep; the set is bounded and never cleared.
     let mut warned = std::collections::HashSet::new();
     let mut cursor = 0;
     loop {
@@ -26,16 +62,22 @@ pub(super) async fn run_restart_recovery(
                     match outcome.result {
                         Ok(Some(recovered)) => {
                             if recovered.restore(&runs).await.is_err() {
-                                if warned.len() >= MAX_WARNED_LAUNCHES {
-                                    warned.clear();
+                                match admit_unconfirmed_warning(
+                                    &mut warned,
+                                    outcome.launch_event_id,
+                                    &SUPPRESSION_SATURATION_REPORTED,
+                                ) {
+                                    UnconfirmedWarning::Warn => tracing::warn!(
+                                        launch_event_id = outcome.launch_event_id,
+                                        "worker restart registry reconciliation remains unconfirmed"
+                                    ),
+                                    UnconfirmedWarning::Suppressed
+                                    | UnconfirmedWarning::Unremembered { aggregate: false } => {}
+                                    UnconfirmedWarning::Unremembered { aggregate: true } => tracing::warn!(
+                                        limit = MAX_WARNED_LAUNCHES,
+                                        "worker restart warning suppression set is saturated; further unconfirmed launches are not reported individually"
+                                    ),
                                 }
-                                if !warned.insert(outcome.launch_event_id) {
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    launch_event_id = outcome.launch_event_id,
-                                    "worker restart registry reconciliation remains unconfirmed"
-                                );
                             }
                         }
                         Ok(None) => {}
@@ -380,5 +422,48 @@ impl ConfirmedProcessRepair {
                 .is_some_and(|original| *error == super::sub_agent_reported_failure(original)),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_WARNED_LAUNCHES, UnconfirmedWarning, admit_unconfirmed_warning};
+    use std::collections::HashSet;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn saturated_suppression_set_keeps_known_launches_and_reports_overflow_once() {
+        let saturation_reported = AtomicBool::new(false);
+        let mut warned = HashSet::new();
+        let limit = i64::try_from(MAX_WARNED_LAUNCHES).expect("test: limit fits i64");
+        for id in 1..=limit {
+            assert_eq!(
+                admit_unconfirmed_warning(&mut warned, id, &saturation_reported),
+                UnconfirmedWarning::Warn
+            );
+        }
+        // A remembered launch stays silent after saturation, and the set is not cleared.
+        assert_eq!(
+            admit_unconfirmed_warning(&mut warned, 1, &saturation_reported),
+            UnconfirmedWarning::Suppressed
+        );
+        assert_eq!(warned.len(), MAX_WARNED_LAUNCHES);
+
+        // The first launch that cannot be remembered raises the aggregate warning; later ones do not.
+        let overflow = limit + 1;
+        assert_eq!(
+            admit_unconfirmed_warning(&mut warned, overflow, &saturation_reported),
+            UnconfirmedWarning::Unremembered { aggregate: true }
+        );
+        assert_eq!(
+            admit_unconfirmed_warning(&mut warned, overflow + 1, &saturation_reported),
+            UnconfirmedWarning::Unremembered { aggregate: false }
+        );
+        assert_eq!(
+            admit_unconfirmed_warning(&mut warned, 1, &saturation_reported),
+            UnconfirmedWarning::Suppressed
+        );
+        assert_eq!(warned.len(), MAX_WARNED_LAUNCHES);
+        assert!(!warned.contains(&overflow));
     }
 }
