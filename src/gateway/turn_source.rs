@@ -9,7 +9,7 @@ mod admission;
 pub(super) mod publication_slot;
 /// Gateway ownership uses the shared runtime cleanup protocol.
 pub(super) use crate::runtime::turn_cleanup::CleanupTracker;
-pub(super) use admission::{GatewayAdmissionGuard, GatewayPendingInput};
+pub(super) use admission::{GatewayAdmissionGuard, GatewayPendingInput, PreInputOwner};
 
 #[derive(Clone)]
 pub(super) struct GatewaySourceReceipt {

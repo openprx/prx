@@ -2607,8 +2607,12 @@ async fn run_gateway_chat_with_multimodal(
         generation: Arc::clone(&config_generation),
         fabric: fabric.clone(),
         envelope: runtime_envelope,
-        ticket: turn_runtime.publication_slot.cleanup.register(cancellation.clone())?,
-        acknowledgement: jobs::register_terminal_cleanup(),
+        // Arguments evaluate in order: a refused registration returns before
+        // any acknowledgement exists, and the owner holds both from here on.
+        owner: turn_source::PreInputOwner::new(
+            turn_runtime.publication_slot.cleanup.register(cancellation.clone())?,
+            jobs::register_terminal_cleanup(),
+        ),
     };
     let (source_receipt, gateway_user_event, mut admission_guard) = pending_input
         .record(message.to_owned(), fabric_ctx.idempotency_key.clone())

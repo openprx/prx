@@ -15,8 +15,50 @@ pub(in crate::gateway) struct GatewayPendingInput {
     pub(in crate::gateway) generation: Arc<ConfigGeneration>,
     pub(in crate::gateway) fabric: MemoryFabric,
     pub(in crate::gateway) envelope: crate::runtime::envelope::RuntimeEnvelope,
-    pub(in crate::gateway) ticket: CleanupTicket,
-    pub(in crate::gateway) acknowledgement: Option<Acknowledgement>,
+    pub(in crate::gateway) owner: PreInputOwner,
+}
+
+/// Owns the cleanup ticket and the job-monitor acknowledgement from the moment
+/// they are registered until the input write starts. Every exit before that
+/// write (refusal, error, cancellation or abort of the awaiting task) settles
+/// both as a confirmed empty cleanup: ingress preparation confirms its own
+/// store work through separate tickets and runs to completion in its own task,
+/// so this owner has nothing unconfirmed and must not latch its tracker failed.
+pub(in crate::gateway) struct PreInputOwner {
+    ticket: Option<CleanupTicket>,
+    acknowledgement: Option<Acknowledgement>,
+}
+
+impl PreInputOwner {
+    pub(in crate::gateway) const fn new(ticket: CleanupTicket, acknowledgement: Option<Acknowledgement>) -> Self {
+        Self {
+            ticket: Some(ticket),
+            acknowledgement,
+        }
+    }
+
+    fn ticket(&self) -> anyhow::Result<&CleanupTicket> {
+        self.ticket.as_ref().context("gateway input cleanup ticket missing")
+    }
+
+    /// Synchronous transfer to the write owner: no await point between this
+    /// call and the admission guard that takes over both parts.
+    fn hand_off(mut self) -> anyhow::Result<(CleanupTicket, Option<Acknowledgement>)> {
+        let ticket = self.ticket.take().context("gateway input cleanup ticket missing")?;
+        Ok((ticket, self.acknowledgement.take()))
+    }
+}
+
+impl Drop for PreInputOwner {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            ticket.finish(true);
+        }
+        if let Some(acknowledgement) = self.acknowledgement.take() {
+            // A closed receiver means the job monitor already ended; nothing waits.
+            let _ = acknowledgement.send(Ok(()));
+        }
+    }
 }
 
 impl GatewayPendingInput {
@@ -33,30 +75,27 @@ impl GatewayPendingInput {
             generation,
             fabric,
             envelope,
-            ticket,
-            acknowledgement,
+            owner,
         } = self;
-        // The job monitor already holds this owner's acknowledgement. A
-        // refusal before the input write must answer it, never drop it.
-        let fabric = match fabric.with_ingress_recovery(&generation.effective, &ticket).await {
-            Ok(fabric) => fabric,
-            Err(error) => return Err(refuse_before_input(ticket, acknowledgement, error)),
-        };
-        let Some(run_id) = envelope.run_id.as_deref() else {
-            let error = anyhow::anyhow!("gateway input run is missing");
-            return Err(refuse_before_input(ticket, acknowledgement, error));
-        };
+        // The job monitor already holds this owner's acknowledgement. `owner`
+        // answers it on refusal and when this future is dropped mid-await.
+        let fabric = fabric
+            .with_ingress_recovery(&generation.effective, owner.ticket()?)
+            .await?;
+        let run_id = envelope.run_id.as_deref().context("gateway input run is missing")?;
         let idempotency_key = idempotency_key.unwrap_or_else(|| format!("gateway:{run_id}:input"));
+        let (ticket, acknowledgement) = owner.hand_off()?;
+        let guard = GatewayAdmissionGuard {
+            receipt: None,
+            generation,
+            fabric,
+            ticket: Some(ticket),
+            acknowledgement,
+            pending: None,
+        };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut guard = GatewayAdmissionGuard {
-                receipt: None,
-                generation,
-                fabric,
-                ticket: Some(ticket),
-                acknowledgement,
-                pending: None,
-            };
+            let mut guard = guard;
             let operation = async {
                 let recorded = guard
                     .fabric
@@ -155,23 +194,6 @@ impl GatewayPendingInput {
         });
         receiver.await.context("gateway input owner ended without a receipt")?
     }
-}
-
-/// Settle an owner refused before its input write was started. Ingress
-/// preparation confirms its own store operations through separate tickets, so
-/// this owner has no unconfirmed write: its ticket and acknowledgement both
-/// report a confirmed (empty) cleanup and the caller surfaces `error` itself.
-fn refuse_before_input(
-    ticket: CleanupTicket,
-    acknowledgement: Option<Acknowledgement>,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    ticket.finish(true);
-    if let Some(acknowledgement) = acknowledgement {
-        // A closed receiver means the job monitor already ended; nothing waits.
-        let _ = acknowledgement.send(Ok(()));
-    }
-    error
 }
 
 pub(in crate::gateway) struct GatewayAdmissionGuard {
@@ -418,8 +440,10 @@ mod tests {
                 generation: Arc::clone(&generation),
                 fabric: fabric.clone(),
                 envelope: envelope.clone(),
-                ticket: tracker.register(tokio_util::sync::CancellationToken::new()).unwrap(),
-                acknowledgement: None,
+                owner: PreInputOwner::new(
+                    tracker.register(tokio_util::sync::CancellationToken::new()).unwrap(),
+                    None,
+                ),
             }
             .record("prx input".to_string(), Some("prx-gateway-stable-key".to_string()))
         };
@@ -483,11 +507,12 @@ mod tests {
                 generation: Arc::clone(&self.generation),
                 fabric: self.fabric.clone(),
                 envelope: self.envelope.clone(),
-                ticket: self
-                    .tracker
-                    .register(tokio_util::sync::CancellationToken::new())
-                    .expect("test: cleanup owner"),
-                acknowledgement: None,
+                owner: PreInputOwner::new(
+                    self.tracker
+                        .register(tokio_util::sync::CancellationToken::new())
+                        .expect("test: cleanup owner"),
+                    None,
+                ),
             }
             .record(content.to_string(), Some(ERASED_KEY.to_string()))
             .await

@@ -305,6 +305,8 @@ impl MemoryFabric {
         let config = Arc::clone(config);
         let (sent, received) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
+            #[cfg(test)]
+            preparation_pause::wait(&config.workspace_dir.to_string_lossy()).await;
             let result = crate::runtime::ingress_recovery::IngressRecorder::prepare(memory, &config, &ownership).await;
             ownership.finish(result.is_ok());
             let _ = sent.send(result);
@@ -923,6 +925,36 @@ impl MemoryEventWatcher {
             self.cursor = last.id;
         }
         Ok(events)
+    }
+}
+
+/// Test seam: hold the next ingress preparation of one workspace inside its
+/// owned task, before it touches the store, so a test can end the awaiting
+/// caller while preparation is still pending.
+#[cfg(test)]
+pub(crate) mod preparation_pause {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+    use tokio::sync::oneshot;
+
+    type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    static GATES: LazyLock<parking_lot::Mutex<HashMap<String, Gate>>> = LazyLock::new(Default::default);
+
+    /// Pause the next preparation for `workspace`. The first receiver resolves
+    /// once preparation is held; dropping or sending on the sender releases it.
+    pub(crate) fn install(workspace: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        GATES.lock().insert(workspace.to_owned(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    pub(super) async fn wait(workspace: &str) {
+        let gate = GATES.lock().remove(workspace);
+        if let Some((reached, release)) = gate {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
     }
 }
 
