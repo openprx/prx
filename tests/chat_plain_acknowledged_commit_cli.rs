@@ -141,8 +141,7 @@ fn a_reply_is_committed_into_the_saved_session_row() {
 /// reads them as reply text rather than a call, and the channel sanitizer then
 /// strips both lines, leaving an empty reply.
 #[cfg(not(feature = "terminal-tui"))]
-const EMPTY_AFTER_SANITIZE: &str =
-    "{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}\n{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}";
+const EMPTY_AFTER_SANITIZE: &str = "{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}\n{\"name\":\"shell\",\"arguments\":{\"command\":\"true\"}}";
 
 /// Non-TUI only: a reply that is empty after sanitization completes as a turn
 /// (`run.rs` empty completion). A reply that is empty on the wire never gets

@@ -50,16 +50,18 @@ pub const HANDOFF_END: &str = "[/context_handoff]";
 /// lossy trim. 5,700 restores the old history room:
 /// 5,700 - 256 - 2,348 = 3,096 (was 4,000 - 256 - 660 = 3,084).
 pub const SMALL_WINDOW_TOKENS: usize = 5_700;
-/// The window of the long switch, branch and restart cases, in tokens.
+/// The window of the cases that recall a fact through a chain of handoffs,
+/// in tokens.
 ///
-/// Every turn's request also quotes the session's own stored events in a
-/// `[Current session context]` preamble (capped at 12,288 bytes, about 3,500
-/// tokens). A session with many stored events (a long history, handoffs, a
-/// branch's copied rows) therefore needs that much more room than
-/// [`SMALL_WINDOW_TOKENS`], or every request ends in a lossy trim:
-/// 256 reserve + 2,348 tools + ~830 system + ~3,500 preamble leaves
-/// 9,500 - 6,934 = ~2,566 tokens of history, so a few tool-heavy turns still
-/// force a switch and the handoff plus the kept tail fit afterwards.
+/// Each handoff points at its own rows only, its parent among them, so a fact
+/// older than the newest handoff is reached by one lookup per generation, all
+/// in the same turn. Every lookup result must stay inline to be followed (a
+/// result is cut to an inline preview sized by the window's remaining room,
+/// at least 478 characters), and one result carrying a parent note is about
+/// 1,800 bytes (~500 tokens). [`SMALL_WINDOW_TOKENS`] leaves room for a single
+/// preview of that note, cut before its lookup pointer; this window keeps
+/// three to four nested results inline while tool-heavy turns still force a
+/// switch.
 pub const RECALL_WINDOW_TOKENS: usize = 9_500;
 /// Bytes of each tool-heavy fixture file (about 500 tokens of prose).
 pub const FILLER_BYTES: usize = 2_000;
@@ -125,22 +127,28 @@ pub fn handoff_lookup_arguments(request: &serde_json::Value) -> Option<serde_jso
 }
 
 /// The lookup arguments of the newest handoff note among the events of a
-/// lookup result (`text` is the tool output JSON).
+/// lookup result (`text` is the tool output as the model sees it). The output
+/// may be an inline preview cut short of its closing brackets, so each note is
+/// read between its own markers: inside the output JSON it is one escaped
+/// string value, decoded before it is parsed.
 fn nested_handoff_lookup(text: &str) -> Option<serde_json::Value> {
-    let start = text.find('{')?;
-    let output: serde_json::Value = serde_json::Deserializer::from_str(&text[start..])
-        .into_iter::<serde_json::Value>()
-        .next()?
-        .ok()?;
-    output["events"]
-        .as_array()?
-        .iter()
-        .filter_map(|event| {
-            let content = event["content"].as_str()?;
-            let start = content.find(HANDOFF_START)? + HANDOFF_START.len();
-            let end = content[start..].find(HANDOFF_END)? + start;
-            serde_json::from_str::<serde_json::Value>(content[start..end].trim()).ok()
-        })
+    let mut notes = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(HANDOFF_START) {
+        let after = &rest[at + HANDOFF_START.len()..];
+        let Some(end) = after.find(HANDOFF_END) else {
+            break;
+        };
+        let escaped = &after[..end];
+        if let Ok(decoded) = serde_json::from_str::<String>(&format!("\"{escaped}\""))
+            && let Ok(note) = serde_json::from_str::<serde_json::Value>(decoded.trim())
+        {
+            notes.push(note);
+        }
+        rest = &after[end + HANDOFF_END.len()..];
+    }
+    notes
+        .into_iter()
         .max_by_key(|note| note["to_generation"].as_u64().unwrap_or(0))
         .map(|note| note["lookup"]["arguments"].clone())
 }

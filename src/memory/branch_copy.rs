@@ -18,6 +18,19 @@ pub(crate) const BRANCH_COPY_MAX_ROWS: usize = 4096;
 /// Event type of a persisted context handoff row.
 pub(crate) const CONTEXT_SWITCH_EVENT_TYPE: &str = "context.switch.created";
 
+/// Idempotency-key prefix of every row a branch copy inserted.
+pub(crate) const BRANCH_COPY_IDEMPOTENCY_PREFIX: &str = "branch-copy:";
+
+/// Whether `event` is a row a branch copy inserted (a copy of a row of the
+/// session the branch was made from).
+#[must_use]
+pub(crate) fn is_branch_copy(event: &MessageEvent) -> bool {
+    event
+        .idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with(BRANCH_COPY_IDEMPOTENCY_PREFIX))
+}
+
 /// The canonical and legacy session keys of one chat session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchCopySessionKeys {
@@ -99,7 +112,7 @@ impl BranchCopyPlan {
     /// The idempotency key of the copy of `original_event_id`.
     #[must_use]
     pub fn idempotency_key(&self, original_event_id: &str) -> String {
-        format!("branch-copy:{}:{original_event_id}", self.branch_id)
+        format!("{BRANCH_COPY_IDEMPOTENCY_PREFIX}{}:{original_event_id}", self.branch_id)
     }
 }
 

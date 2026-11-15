@@ -735,6 +735,97 @@ fn preamble_event(session_key: Option<&str>, role: &str, content: &str) -> Messa
     }
 }
 
+fn current_session_principal() -> MemoryPrincipal {
+    MemoryPrincipal {
+        require_owner_match: false,
+        workspace_id: "workspace-a".to_string(),
+        agent_id: None,
+        persona_id: None,
+        session_key: Some("chat:canonical".to_string()),
+        channel: Some("terminal".to_string()),
+        sender: Some("local-user".to_string()),
+        owner_id: None,
+        legacy_session_key: None,
+        agent_partition: None,
+    }
+}
+
+#[test]
+fn the_session_preamble_quotes_nothing_a_handoff_replaced() {
+    let principal = current_session_principal();
+    let mut handoff = preamble_event(Some("chat:canonical"), "assistant", "[context_handoff] note");
+    handoff.event_type = "context.switch.created".to_string();
+    let events = vec![
+        preamble_event(Some("chat:canonical"), "user", "the codename is AZURE"),
+        preamble_event(Some("chat:canonical"), "assistant", "kept tail reply"),
+        handoff,
+        preamble_event(Some("chat:canonical"), "user", "a later question"),
+        preamble_event(Some("chat:canonical"), "assistant", "a later answer"),
+    ];
+
+    let current = build_current_session_events_preamble(&principal, &events, "now").unwrap();
+
+    assert_eq!(
+        current,
+        "[Current session context]\n- [user:local-user] a later question\n- [assistant:local-user] a later answer\n\n"
+    );
+}
+
+#[test]
+fn a_session_whose_rows_a_handoff_replaced_never_falls_back_to_its_turns() {
+    let principal = current_session_principal();
+    let mut handoff = preamble_event(Some("chat:canonical"), "assistant", "[context_handoff] note");
+    handoff.event_type = "context.switch.created".to_string();
+    let events = vec![
+        preamble_event(Some("chat:canonical"), "user", "the codename is AZURE"),
+        handoff,
+    ];
+
+    assert_eq!(
+        build_current_session_events_preamble(&principal, &events, "now"),
+        Some(String::new())
+    );
+    let unrelated = vec![preamble_event(Some("gateway:external:1"), "user", "elsewhere")];
+    assert_eq!(
+        build_current_session_events_preamble(&principal, &unrelated, "now"),
+        None
+    );
+}
+
+#[test]
+fn the_session_preamble_never_quotes_rows_a_branch_copied() {
+    let principal = current_session_principal();
+    let mut copied_turn = preamble_event(Some("chat:canonical"), "user", "copied kept turn");
+    copied_turn.idempotency_key = Some("branch-copy:branch-1:evt-original".to_string());
+    let events = vec![
+        copied_turn,
+        preamble_event(Some("chat:canonical"), "user", "first question in the branch"),
+    ];
+
+    let current = build_current_session_events_preamble(&principal, &events, "now").unwrap();
+
+    assert_eq!(
+        current,
+        "[Current session context]\n- [user:local-user] first question in the branch\n\n"
+    );
+}
+
+#[test]
+fn the_shared_preamble_never_quotes_another_sessions_handoff() {
+    let principal = current_session_principal();
+    let mut handoff = preamble_event(Some("chat:source"), "assistant", "[context_handoff] source note");
+    handoff.event_type = "context.switch.created".to_string();
+    let events = vec![
+        handoff,
+        preamble_event(Some("chat:source"), "user", "a source question"),
+    ];
+
+    let shared = build_shared_events_preamble(&principal, &events);
+
+    assert!(!shared.contains("source note"), "{shared}");
+    assert!(shared.contains("a source question"), "{shared}");
+}
+
 #[test]
 fn preamble_builders_read_merge_legacy_current_session_key() {
     // D4 review: the prompt assembly layer must classify "current session"
@@ -762,7 +853,7 @@ fn preamble_builders_read_merge_legacy_current_session_key() {
         preamble_event(Some("gateway:external:1"), "user", "external shared fact"),
     ];
 
-    let current = build_current_session_events_preamble(&principal, &events, "what is current");
+    let current = build_current_session_events_preamble(&principal, &events, "what is current").unwrap();
     // (1) Both canonical AND legacy current-session events land in the
     // current-session preamble.
     assert!(
@@ -835,7 +926,7 @@ fn a_persisted_fabricated_marker_never_reaches_the_prompt_through_a_preamble() {
         preamble_event(Some("gateway:external:1"), "assistant", "Deployed. [Used tools: shell]"),
     ];
 
-    let current = build_current_session_events_preamble(&principal, &events, "and the logs?");
+    let current = build_current_session_events_preamble(&principal, &events, "and the logs?").unwrap();
     let assistant_lines = |preamble: &str| {
         preamble
             .lines()

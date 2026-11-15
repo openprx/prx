@@ -1,6 +1,7 @@
 use crate::agent::document_ingest::drop_untrusted_external_results;
 use crate::agent::response_guard::strip_quoted_fabricated_tool_markers;
 use crate::memory;
+use crate::memory::branch_copy::{CONTEXT_SWITCH_EVENT_TYPE, is_branch_copy};
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::traits::MemoryEntryOrigin;
 use crate::memory::{
@@ -498,6 +499,12 @@ fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEv
         if event.role == "tool" || event.role == "system" {
             continue;
         }
+        // Another session's handoff note points at rows only that session may
+        // look up (a branch's source session, for one): quoted here it would
+        // only send the model to a refused lookup.
+        if event.event_type == CONTEXT_SWITCH_EVENT_TYPE {
+            continue;
+        }
         if context.is_empty() {
             context.push_str("[Recent shared workspace events]\n");
         }
@@ -513,28 +520,63 @@ fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEv
     context
 }
 
+/// The rows of the current session that `[Current session context]` may still
+/// quote, oldest first. A context handoff replaced everything stored before
+/// the session's newest handoff row (the replaced cold prefix and the kept
+/// tail, which the live history carries verbatim), and the live history
+/// carries the handoff itself, so only rows after it qualify. Rows a branch
+/// copied are its live history or that replaced prefix, so none qualifies.
+/// Older facts stay reachable through the transcript lookup tool only.
+fn quotable_current_session_events<'a>(
+    session_candidates: &[String],
+    events: &'a [MessageEvent],
+) -> impl Iterator<Item = &'a MessageEvent> {
+    let belongs = |event: &MessageEvent| {
+        event
+            .session_key
+            .as_deref()
+            .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key))
+    };
+    let after_handoff = events
+        .iter()
+        .rposition(|event| belongs(event) && event.event_type == CONTEXT_SWITCH_EVENT_TYPE)
+        .map_or(0, |index| index.saturating_add(1));
+    events
+        .get(after_handoff..)
+        .unwrap_or_default()
+        .iter()
+        .filter(move |event| belongs(event) && !is_branch_copy(event))
+}
+
+/// `[Current session context]` from the session's stored events; `None` when
+/// none of `events` belongs to the current session (the caller then falls
+/// back to conversation turns). A session whose rows a handoff replaced
+/// yields `Some` even when nothing is left to quote, so the fallback never
+/// re-quotes what the handoff replaced.
 fn build_current_session_events_preamble(
     principal: &MemoryPrincipal,
     events: &[MessageEvent],
     user_msg: &str,
-) -> String {
+) -> Option<String> {
     // D4 review: an event belongs to the current session when its `session_key`
     // is any candidate key (canonical OR legacy), so legacy-keyed current-session
     // history is preserved in `[Current session context]` after a canonical
     // cutover rather than being dropped.
     let session_candidates = principal.session_key_candidates();
     if session_candidates.is_empty() {
-        return String::new();
+        return None;
     }
-    let mut context = String::new();
-    for event in events {
-        let belongs_to_current_session = event
+    let has_session_events = events.iter().any(|event| {
+        event
             .session_key
             .as_deref()
-            .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key));
-        if !belongs_to_current_session {
-            continue;
-        }
+            .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key))
+    });
+    if !has_session_events {
+        return None;
+    }
+    let mut context = String::new();
+    for event in quotable_current_session_events(&session_candidates, events) {
         if event.role == "tool" || event.role == "system" {
             continue;
         }
@@ -553,7 +595,7 @@ fn build_current_session_events_preamble(
     if !context.is_empty() {
         context.push('\n');
     }
-    context
+    Some(context)
 }
 
 fn format_session_turn_line(turn: &ConversationTurn) -> String {
@@ -865,12 +907,8 @@ async fn build_agent_context(
     )
     .await;
     let current_session_context = {
-        let from_events = build_current_session_events_preamble(&principal, &current_session_events, live_input);
-        if from_events.is_empty() {
-            build_current_session_preamble(&current_session_turns, live_input)
-        } else {
-            from_events
-        }
+        build_current_session_events_preamble(&principal, &current_session_events, live_input)
+            .unwrap_or_else(|| build_current_session_preamble(&current_session_turns, live_input))
     };
 
     AgentContextBundle {

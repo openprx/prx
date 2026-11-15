@@ -412,3 +412,69 @@ fn kimi_code_subscription_usage_is_reported() {
     assert_eq!(all_time["subscription_requests"], 1, "{report}");
     assert_eq!(all_time["cost_usd"].as_f64(), Some(0.0), "{report}");
 }
+
+/// R3b: a saved one-shot on a session whose history forces a context switch
+/// during the one-shot exits 0 with the reply; success is the turn's
+/// acknowledged commit, not a turn count.
+#[test]
+fn saved_one_shot_that_switches_exits_0_with_the_reply() {
+    /// Saved turns before the one-shot. Tool output is not part of a saved
+    /// turn, so the history is grown by long notes: eight of them (~2,400
+    /// tokens) overflow the small window's history room on the one-shot's
+    /// first call, and the handoff and the kept tail fit afterwards.
+    const PRIOR_NOTES: usize = 8;
+    /// Filler words of each note.
+    const NOTE_WORDS: usize = 200;
+    let sandbox = Sandbox::new();
+    compaction_script::write_filler_files(&sandbox.workspace, 1);
+    let server = LoopbackOpenAi::start(MODEL, Some((5, 3)), compaction_script::script());
+    let configure = |window: usize| {
+        write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+            config.workspace_dir.clone_from(&sandbox.workspace);
+            config.autonomy.level = openprx::security::AutonomyLevel::Full;
+            config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+            config.agent.compaction.max_context_tokens = window;
+            config.agent.compaction.reserve_tokens = 256;
+            config.agent.compaction.keep_recent_messages = 2;
+            config.memory.auto_save = false;
+        });
+    };
+    // Build the history under a window it never crosses.
+    configure(200_000);
+    let mut chat = Running::spawn(sandbox.command(&["chat", "--plain"]));
+    let mut lines = vec![compaction_script::PLANT.to_owned()];
+    lines.extend((0..PRIOR_NOTES).map(|index| format!("note {index}: {}", "lorem ".repeat(NOTE_WORDS))));
+    for (index, line) in lines.iter().enumerate() {
+        chat.send(line);
+        let started = std::time::Instant::now();
+        while compaction_script::assistant_reply_count(&sandbox.workspace) < index + 1 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "turn {index} timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    chat.send("/exit");
+    let built = chat.wait();
+    assert!(built.status.success(), "stderr: {}", built.stderr);
+    assert!(
+        compaction_script::stored_handoffs(&sandbox.workspace).is_empty(),
+        "no switch while the history was built"
+    );
+    let session = current_session_id(&built.stderr);
+
+    // A window the built history overflows on the one-shot's first call.
+    configure(compaction_script::SMALL_WINDOW_TOKENS);
+    let line = compaction_script::read_line(0);
+    let output = run(&sandbox, &["chat", "--message", &line, "--session", &session, "--save"]);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        format!("{}\n", compaction_script::read_done(0)),
+        "stdout is the reply alone"
+    );
+    let handoffs = compaction_script::session_handoffs(&sandbox.workspace, &session);
+    assert!(!handoffs.is_empty(), "the one-shot switched; stderr: {}", output.stderr);
+}

@@ -257,9 +257,15 @@ fn pii_phone_regex() -> std::result::Result<&'static Regex, &'static regex::Erro
     pattern
 }
 
+/// A canonical UUID, or a UUID cut short by a preview ellipsis (`…` or
+/// `...`): a stored tool-call preview truncates its arguments mid-identifier,
+/// and the digits of the remaining groups would read as a phone number.
 fn canonical_uuid_regex() -> std::result::Result<&'static Regex, &'static regex::Error> {
-    static UUID: LazyLock<std::result::Result<Regex, regex::Error>> =
-        LazyLock::new(|| Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"));
+    static UUID: LazyLock<std::result::Result<Regex, regex::Error>> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[0-9a-f]{8}-[0-9a-f-]{0,27}(?:…|\.\.\.)",
+        )
+    });
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let pattern = UUID.as_ref();
     if pattern.is_err() && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -410,6 +416,22 @@ mod tests {
         let result = filter.check(&with_phone, &source).await;
         assert!(!result.passed);
         assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
+    }
+
+    #[tokio::test]
+    async fn a_uuid_cut_by_a_preview_ellipsis_is_not_phone_pii() {
+        let filter = MemorySafetyFilter::default();
+        let source = SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        };
+        let preview = r#"{"args_preview":"{\"event_ids\":[\"dd098779-5841-4428-bce2-1…"}"#;
+        assert!(filter.check(preview, &source).await.passed);
+        let ascii = r#"{"args_preview":"{\"event_ids\":[\"dd098779-5841-4428-b..."}"#;
+        assert!(filter.check(ascii, &source).await.passed);
+
+        let with_phone = format!("{preview} call 212-555-0199");
+        assert!(!filter.check(&with_phone, &source).await.passed);
     }
 
     #[tokio::test]

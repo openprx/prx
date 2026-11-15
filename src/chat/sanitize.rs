@@ -77,13 +77,44 @@ where
     Ok(serde_json::from_value(json)?)
 }
 
+/// One stored turn's content. A context handoff turn is runtime metadata (ids,
+/// row ranges, counts) in a fixed JSON note: text redaction matches its key
+/// names (`source_token_estimate`) and leaves an unparseable note, which a
+/// resumed session can no longer follow. Its string values are redacted one
+/// by one instead; an unchanged note keeps its exact bytes (the transcript row
+/// carries the same text, and later compaction provenance matches on it).
+fn sanitize_turn_content(role: &str, content: &str) -> String {
+    if crate::agent::compaction::is_context_handoff_turn(role, content)
+        && let Some(note) = crate::agent::compaction::parse_context_handoff_note(content)
+    {
+        let mut redacted = note.clone();
+        redact_string_values(&mut redacted);
+        if redacted == note {
+            return truncate_large_output(content);
+        }
+        if let Ok(json) = serde_json::to_string(&redacted) {
+            return truncate_large_output(&crate::agent::compaction::format_context_handoff_message(&json));
+        }
+    }
+    sanitize_for_persistence(content)
+}
+
+fn redact_string_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => object.values_mut().for_each(redact_string_values),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_string_values),
+        serde_json::Value::String(text) => *text = redact_secrets(text),
+        _ => {}
+    }
+}
+
 /// Apply the authoritative persistence/export content policy to a session
 /// clone while preserving its schema and non-content metadata.
 pub fn sanitize_session_content(session: &super::session::ChatSession) -> super::session::ChatSession {
     let mut sanitized = session.clone();
     sanitized.title = sanitize_for_persistence(&sanitized.title);
     for turn in &mut sanitized.turns {
-        turn.content = sanitize_for_persistence(&turn.content);
+        turn.content = sanitize_turn_content(&turn.role, &turn.content);
         for tool_call in &mut turn.tool_calls {
             tool_call.args_preview = sanitize_text_or_json(&tool_call.args_preview);
         }
@@ -98,6 +129,32 @@ pub fn sanitize_session_content(session: &super::session::ChatSession) -> super:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_handoff_turn_keeps_its_note_parseable_and_byte_exact() {
+        let note = r#"{"handoff_event_id":"evt-1","lookup":{"arguments":{"event_ids":["evt-0"],"first_row_id":1,"last_row_id":2}},"source_token_estimate":588,"to_generation":1}"#;
+        let content = crate::agent::compaction::format_context_handoff_message(note);
+
+        assert_eq!(sanitize_turn_content("assistant", &content), content);
+        assert_ne!(
+            sanitize_turn_content("user", &content),
+            content,
+            "only an assistant handoff turn takes the note path"
+        );
+    }
+
+    #[test]
+    fn a_secret_inside_a_handoff_note_value_is_still_redacted() {
+        let note =
+            r#"{"handoff_event_id":"sk-abc123456789012345678901234567890123456789","source_token_estimate":588}"#;
+        let content = crate::agent::compaction::format_context_handoff_message(note);
+
+        let stored = sanitize_turn_content("assistant", &content);
+
+        assert!(!stored.contains("sk-abc"), "{stored}");
+        let parsed = crate::agent::compaction::parse_context_handoff_note(&stored).unwrap();
+        assert_eq!(parsed["source_token_estimate"], 588);
+    }
 
     #[test]
     fn redacts_api_keys() {

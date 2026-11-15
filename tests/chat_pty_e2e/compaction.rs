@@ -16,8 +16,9 @@ use super::{
     spawn_chat_command, wait_for_exit,
 };
 use crate::compaction_script::{
-    PLANT, RECALL, RECALLED, SMALL_WINDOW_TOKENS, assistant_reply_count, carries_handoff_and_lookup, chat_session_id,
-    read_done, read_line, switch_event_counts, write_filler_files,
+    PLANT, RECALL, RECALL_WINDOW_TOKENS, RECALLED, assert_handoff_chain, assistant_reply_count,
+    carries_handoff_and_lookup, chat_session_id, lookup_results, over_hard_limit_after_handoff, planted_row_content,
+    read_done, read_line, session_handoffs, stored_handoffs, switch_event_counts, write_filler_files,
 };
 use crate::loopback_openai::LoopbackOpenAi;
 
@@ -28,13 +29,18 @@ const LARGE_WINDOW_TOKENS: usize = 200_000;
 const RESERVE_TOKENS: usize = 256;
 /// Messages kept verbatim after compaction.
 const KEEP_RECENT: usize = 2;
+/// Scripted usage of every completion (`prompt`, `completion`).
+const USAGE: (u64, u64) = (11, 7);
+/// Filler files of the switch case; the automatic switch comes well before
+/// the last one.
+const SWITCH_FILLERS: usize = 10;
 
 fn workspace(guard: &HarnessGuard) -> std::path::PathBuf {
     guard.config_dir.join("workspace")
 }
 
 fn start(guard: &HarnessGuard, window: usize, filler_files: usize) -> (LoopbackOpenAi, SessionGuard) {
-    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), crate::compaction_script::script());
+    let server = LoopbackOpenAi::start(MODEL, Some(USAGE), crate::compaction_script::script());
     let provider = server.provider();
     crate::loopback_openai::write_config(&guard.config_dir, &provider, MODEL, |config| {
         config.workspace_dir = workspace(guard);
@@ -43,12 +49,21 @@ fn start(guard: &HarnessGuard, window: usize, filler_files: usize) -> (LoopbackO
         config.agent.compaction.max_context_tokens = window;
         config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
         config.agent.compaction.keep_recent_messages = KEEP_RECENT;
+        // Context comes from the session and its handoff alone: a saved
+        // long-term memory of the planted line is recalled by its own,
+        // separate path and would put the fact back outside the handoff.
+        config.memory.auto_save = false;
     });
     prepare_owned_chat_fixture(guard, &provider, MODEL);
     std::fs::create_dir_all(workspace(guard)).expect("test: workspace");
     write_filler_files(&workspace(guard), filler_files);
-    let command = build_provider_chat_command_in(guard, &provider, MODEL, &[], &[("PRX_TUI", "1")]);
-    (server, SessionGuard::new(spawn_chat_command(command)))
+    (server, respawn(guard, &provider, &[]))
+}
+
+/// Start the fullscreen chat against an already configured fixture.
+fn respawn(guard: &HarnessGuard, provider: &str, args: &[&str]) -> SessionGuard {
+    let command = build_provider_chat_command_in(guard, provider, MODEL, args, &[("PRX_TUI", "1")]);
+    SessionGuard::new(spawn_chat_command(command))
 }
 
 /// Drain interval while a turn runs.
@@ -98,22 +113,71 @@ fn assert_handoff_and_recall(guard: &HarnessGuard, server: &LoopbackOpenAi) {
 #[serial_test::serial(prx_chat_pty)]
 fn switch_compaction_and_recall() {
     let guard = new_harness_guard().expect("isolated chat paths");
-    let (server, mut session) = start(&guard, SMALL_WINDOW_TOKENS, 6);
+    let (server, mut session) = start(&guard, RECALL_WINDOW_TOKENS, SWITCH_FILLERS);
     let banner = read_until_all_with_dsr(session.session(), &[MODEL, "session"], STARTUP_TIMEOUT);
     turn(&guard, &mut session, PLANT, 1);
-    for index in 0..6 {
-        turn(&guard, &mut session, &read_line(index), index + 2);
-        assert_eq!(last_reply(&guard), read_done(index), "tool turn {index} completed");
+    turn(&guard, &mut session, &read_line(0), 2);
+    assert_eq!(last_reply(&guard), read_done(0), "tool turn 0 completed");
+    session.session().send("/compact\r").expect("send /compact");
+    let compacted = screen_text(&read_until_with_dsr(session.session(), "Compacted", TURN_TIMEOUT));
+    assert!(!compacted.contains("lossy"), "manual compaction compacted: {compacted}");
+    let mut replies = 2;
+    let mut next_file = 1;
+    while stored_handoffs(&workspace(&guard)).len() < 2 && next_file < SWITCH_FILLERS {
+        replies += 1;
+        turn(&guard, &mut session, &read_line(next_file), replies);
+        assert_eq!(
+            last_reply(&guard),
+            read_done(next_file),
+            "tool turn {next_file} completed"
+        );
+        next_file += 1;
     }
-    turn(&guard, &mut session, RECALL, 8);
-    assert_eq!(last_reply(&guard), RECALLED, "the lookup returned the planted fact");
     let id = chat_session_id(&workspace(&guard));
+    // Right after the automatic switch: both read the compacted state.
+    session.session().send("/compact\r").expect("send /compact");
+    session.session().send("/branch 1\r").expect("send /branch");
+    let branched = screen_text(&read_until_with_dsr(session.session(), "Created branch", TURN_TIMEOUT));
+    replies += 1;
+    turn(&guard, &mut session, RECALL, replies);
+    assert_eq!(last_reply(&guard), RECALLED, "the branch recalls the planted fact");
     session.session().send("/sessions\r").expect("send /sessions");
-    let sessions = read_until_with_dsr(session.session(), &id, TURN_TIMEOUT);
+    let sessions = read_until_with_dsr(session.session(), "current chat session", TURN_TIMEOUT);
     exit(&mut session);
     drop(session);
 
+    let mut resumed = respawn(&guard, &server.provider(), &["--session", &id]);
+    read_until_with_dsr(resumed.session(), MODEL, STARTUP_TIMEOUT);
+    replies += 1;
+    turn(&guard, &mut resumed, RECALL, replies);
+    assert_eq!(
+        last_reply(&guard),
+        RECALLED,
+        "the restarted session recalls the planted fact"
+    );
+    exit(&mut resumed);
+    drop(resumed);
+
     assert_handoff_and_recall(&guard, &server);
+    assert_handoff_chain(&session_handoffs(&workspace(&guard), &id), 2);
+    assert!(!branched.contains("Branch aborted"), "/branch succeeded: {branched}");
+    let has_branch_handoff = stored_handoffs(&workspace(&guard))
+        .iter()
+        .any(|handoff| !handoff.session_key.ends_with(&id));
+    assert!(
+        has_branch_handoff,
+        "/branch 1 kept the handoff turn of the compacted state"
+    );
+    let row = planted_row_content(&workspace(&guard));
+    let results = lookup_results(&server.requests());
+    assert!(
+        !results.is_empty() && results.iter().all(|result| result.contains(&row)),
+        "every lookup result carries the stored row `{row}`: {results:?}"
+    );
+    assert!(
+        !over_hard_limit_after_handoff(&workspace(&guard)),
+        "the window fits handoff, tail and tool schemas"
+    );
     assert!(
         screen_text(&banner).contains(&format!("session {id}")),
         "the start banner shows the session id `{id}`"
@@ -122,6 +186,35 @@ fn switch_compaction_and_recall() {
         screen_text(&sessions).contains("current chat session"),
         "/sessions names the current chat session first"
     );
+}
+
+/// `/cost` right after a reply reports that turn's exact scripted usage
+/// (the final usage lands in the turn's acknowledged commit).
+#[test]
+#[serial_test::serial(prx_chat_pty)]
+fn cost_right_after_a_reply_reports_that_turns_exact_usage() {
+    let guard = new_harness_guard().expect("isolated chat paths");
+    let (_server, mut session) = start(&guard, LARGE_WINDOW_TOKENS, 0);
+    read_until_with_dsr(session.session(), MODEL, STARTUP_TIMEOUT);
+    turn(&guard, &mut session, PLANT, 1);
+    session.session().send("/cost\r").expect("send /cost");
+    let report = screen_text(&read_until_all_with_dsr(
+        session.session(),
+        &["Session cost", "Completion tokens", "Total tokens"],
+        TURN_TIMEOUT,
+    ));
+    exit(&mut session);
+    drop(session);
+
+    let report = report.split_whitespace().collect::<Vec<_>>().join(" ");
+    for line in [
+        "Metered requests: 1".to_owned(),
+        format!("Prompt tokens: {} (incl. cache)", USAGE.0),
+        format!("Completion tokens: {}", USAGE.1),
+        format!("Total tokens: {}", USAGE.0 + USAGE.1),
+    ] {
+        assert!(report.contains(&line), "/cost reports `{line}`: {report}");
+    }
 }
 
 #[test]
