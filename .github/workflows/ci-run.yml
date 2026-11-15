@@ -308,6 +308,32 @@ jobs:
                   fi
                   version="$(cargo nextest --version)"
                   grep -q "^cargo-nextest 0.9.151 " <<<"$version"
+            # The all-features lib test crate is one rustc whose peak RSS is ~17 GiB (16.9 GiB measured at
+            # 3d38836b2 and 614280a44, CARGO_BUILD_JOBS=1 still 15.9 GiB). A hosted runner has 16 GiB RAM and
+            # only gets the image's 4 GiB /mnt swap when it has an Azure resource disk; without it the runner
+            # is lost mid-build (exit 143 or no log). Guarantee RAM + swap >= 24 GiB (peak + 40%) before compiling.
+            - name: Ensure swap for the lib test crate (hosted runner)
+              if: matrix.name == 'lib' && needs.changes.outputs.heavy_timeout == '45'
+              run: |
+                  set -euo pipefail
+                  free -m; swapon --show; df -h / /mnt 2>/dev/null || df -h /
+                  ram_mib=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+                  swap_mib=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo)
+                  need_mib=$(( 24576 - ram_mib - swap_mib ))
+                  if [ "$need_mib" -le 0 ]; then echo "RAM ${ram_mib} MiB + swap ${swap_mib} MiB already >= 24 GiB"; exit 0; fi
+                  dir=/
+                  if mountpoint -q /mnt && [ "$(df -Pm /mnt | awk 'NR==2{print $4}')" -gt "$(df -Pm / | awk 'NR==2{print $4}')" ]; then dir=/mnt; fi
+                  # Keep 6 GiB free for the target dir growth (~4.1 GiB measured in total) and the 153 MiB archive.
+                  avail_mib=$(df -Pm "$dir" | awk 'NR==2{print $4}')
+                  if [ $(( avail_mib - need_mib )) -lt 6144 ]; then
+                      echo "::error::cannot add ${need_mib} MiB swap on ${dir}: only ${avail_mib} MiB free"; exit 1
+                  fi
+                  swapfile="${dir%/}/prx-ci-swapfile"
+                  sudo fallocate -l "${need_mib}M" "$swapfile"
+                  sudo chmod 600 "$swapfile"
+                  sudo mkswap "$swapfile" >/dev/null
+                  sudo swapon "$swapfile"
+                  free -m; swapon --show
             # The signed-carry library test runs the real prx binary. Build it on its own so it never compiles
             # beside the all-features lib test crate (hosted runner OOM, exit 143); archive.include ships it.
             - name: Build the binaries before the lib test archive
