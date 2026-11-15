@@ -94,8 +94,11 @@ fn plain_turns_record_one_subscription_row_each() {
     let text = cost_command(&sandbox, &["cost"]);
     assert!(text.contains("(2 subscription-billed; no per-token cost)"), "{text}");
 
-    // A second start runs the startup projector pass: still one row per terminal.
-    let mut restarted = Running::spawn(sandbox.command(&["chat", "--plain"]));
+    // A second start resumes the saved session (the MessageEvent replay path)
+    // and runs the startup projector pass: the resumed session still reports
+    // subscription, and the ledger keeps one row per terminal.
+    let mut restarted = Running::spawn(sandbox.command(&["chat", "--plain", "--continue"]));
+    restarted.send("/cost");
     restarted.send("/quit");
     let output = restarted.wait();
     assert!(
@@ -103,6 +106,12 @@ fn plain_turns_record_one_subscription_row_each() {
         "restarted chat failed; stderr: {}",
         output.stderr
     );
+    assert!(
+        output.stdout.contains("Cost:              subscription"),
+        "resumed /cost lost the subscription class; stdout: {}",
+        output.stdout
+    );
+    assert!(!output.stdout.contains("cost unknown"), "{}", output.stdout);
     let settlements = ledger_settlements(&sandbox);
     assert_eq!(settlements.len(), 2, "{settlements:?}");
     assert_ne!(settlements.first(), settlements.get(1), "one row per terminal id");

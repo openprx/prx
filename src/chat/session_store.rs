@@ -177,6 +177,9 @@ fn apply_chat_message_event_projection(
     if usage_from_events {
         for (projected, persisted) in projected_usage.iter_mut().zip(&snapshot.token_usage_records) {
             projected.settlement_id.clone_from(&persisted.settlement_id);
+            // The class came from the verified terminal settlement when the
+            // turn was recorded; provider outcomes do not carry it (CF-R8).
+            projected.settlement_class = persisted.settlement_class;
         }
         snapshot.token_usage_records = projected_usage;
     }
