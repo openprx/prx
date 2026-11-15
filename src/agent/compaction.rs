@@ -461,6 +461,12 @@ fn compaction_boundary_without_orphan_tool_results(
     start
 }
 
+/// The newest context-handoff generation in `history`, 0 when none.
+#[must_use]
+pub(crate) fn context_handoff_generation(history: &[ChatMessage]) -> u64 {
+    context_handoff_lineage(history).0
+}
+
 fn context_handoff_lineage(history: &[ChatMessage]) -> (u64, Option<String>) {
     history
         .iter()

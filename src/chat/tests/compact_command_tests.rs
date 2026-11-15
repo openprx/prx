@@ -172,11 +172,13 @@ fn legacy_preflight_compaction_feedback_emits_system_message() {
     for i in 0..(COMPACT_KEEP_MESSAGES + 4) {
         history.push(long_user(i));
     }
-    let system_count = usize::from(history.first().is_some_and(|message| message.role == "system"));
-    let turns_before = history.len().saturating_sub(system_count);
-    let tokens_before = estimate_chat_history_tokens(&history);
+    let (turns_before, tokens_before) = crate::chat::compaction::chat_history_turns_and_tokens(&history);
+    let messages_before = history.len();
     compact_chat_history(&mut history);
-    let text = format_compact_feedback_after_history(turns_before, tokens_before, &history, &config);
+    let outcome = crate::chat::compaction::ManualCompactOutcome::Degraded {
+        dropped_messages: messages_before.saturating_sub(history.len()),
+    };
+    let text = outcome.feedback(turns_before, tokens_before, &config);
     let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
 
     surface_session_message(&dispatcher, None, &text);
@@ -308,15 +310,19 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
 
     let mut legacy_history = enriched_history;
     let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
-    apply_chat_compaction_patch_and_sync(
+    let outcome = apply_chat_compaction_patch_and_sync(
         &mut legacy_history,
-        Some(&persisted_history),
+        &persisted_history,
+        None,
         patch,
         &config,
         crate::chat::action::CompactReason::ContextOverflow,
         &dispatcher,
-    )
-    .expect("test: the persisted-source patch applies to its own source");
+    );
+    assert!(
+        matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
+        "the persisted-source patch must apply to its own source: {outcome:?}"
+    );
     let action = action_rx
         .try_recv()
         .expect("compaction helper should dispatch reducer patch");
@@ -354,5 +360,90 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
             .iter()
             .all(|message| !message.content.contains("[tool:shell]")),
         "persisted-source compaction must not keep enriched-only tool/internal messages"
+    );
+}
+
+#[test]
+fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_change() {
+    let config = crate::config::AgentCompactionConfig::default();
+    let source = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("a1"),
+        ChatMessage::user("q2"),
+    ];
+    let mut other_source = source.clone();
+    other_source.insert(1, ChatMessage::user("inserted"));
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement: vec![ChatMessage::assistant("summary")],
+        append_after: Vec::new(),
+        guard: crate::agent::compaction::compaction_patch_guard_for(&other_source, 1, 3)
+            .expect("test: guard over the other source"),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 enriched")];
+    let history_before = history.clone();
+    let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+
+    let outcome = apply_chat_compaction_patch_and_sync(
+        &mut history,
+        &source,
+        Some(ChatMessage::user("q2 enriched")),
+        patch,
+        &config,
+        crate::chat::action::CompactReason::Manual,
+        &dispatcher,
+    );
+
+    assert!(
+        matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Refused { .. }),
+        "a patch whose guard describes another source must be refused: {outcome:?}"
+    );
+    assert_eq!(
+        history.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
+        history_before.iter().map(|m| (&m.role, &m.content)).collect::<Vec<_>>(),
+        "a refused patch must leave the provider view unchanged"
+    );
+    assert!(
+        action_rx.try_recv().is_err(),
+        "a refused patch must not reach the reducer"
+    );
+}
+
+#[test]
+fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one() {
+    let config = crate::config::AgentCompactionConfig::default();
+    let source = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q1"),
+        ChatMessage::assistant("a1"),
+        ChatMessage::user("q2"),
+    ];
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement: vec![ChatMessage::assistant("summary")],
+        append_after: Vec::new(),
+        guard: crate::agent::compaction::compaction_patch_guard_for(&source, 1, 3).expect("test: guard over source"),
+    };
+    let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("q2 ENRICHED")];
+    let (dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+
+    let outcome = apply_chat_compaction_patch_and_sync(
+        &mut history,
+        &source,
+        Some(ChatMessage::user("q2 ENRICHED")),
+        patch,
+        &config,
+        crate::chat::action::CompactReason::ContextOverflow,
+        &dispatcher,
+    );
+
+    assert!(
+        matches!(outcome, crate::chat::compaction::ManualCompactOutcome::Compacted { .. }),
+        "the source patch must apply: {outcome:?}"
+    );
+    let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(
+        contents,
+        vec!["sys", "summary", "q2 ENRICHED"],
+        "the provider view is the compacted source with the enriched request replacing the plain one"
     );
 }

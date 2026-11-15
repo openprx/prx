@@ -18,8 +18,7 @@ use super::chat_events::{
 use super::compaction::refresh_context_budget_for_tui;
 use super::compaction::{
     apply_chat_compaction_patch_and_sync, bounded_legacy_chat_compaction_audit_source, build_chat_compaction_patch,
-    chat_embedding_upgrade_notice, compact_chat_history, estimate_chat_history_tokens,
-    format_compact_feedback_after_history, legacy_compaction_token_metadata,
+    chat_embedding_upgrade_notice, compact_chat_history, legacy_compaction_token_metadata,
     original_legacy_chat_compaction_audit_source, persist_legacy_chat_compaction_audit,
 };
 use super::copy_select::{copy_success_message, is_copy_command, select_copy_content};
@@ -1841,7 +1840,9 @@ Retry with a compatible model: /provider {shown} <model>",
             let compact_config = tool_surface_reserve.reserved_config(&compact_context.config);
             let compact_envelope =
                 super::chat_runtime_envelope(&config.workspace_dir.to_string_lossy(), &chat_session_key);
-            super::compaction::run_manual_compact(
+            let (compact_turns_before, compact_tokens_before) =
+                super::compaction::chat_history_turns_and_tokens(&history);
+            let compact_outcome = super::compaction::run_manual_compact(
                 super::compaction::ManualCompact {
                     history: &mut history,
                     chat_session: &chat_session,
@@ -1855,6 +1856,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 &mut |text: &str| emit_chat_output(text),
             )
             .await;
+            emit_chat_output(&compact_outcome.feedback(compact_turns_before, compact_tokens_before, &compact_config));
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
@@ -4033,10 +4035,13 @@ Retry with a compatible model: /provider {shown} <model>",
             let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
             let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
-            let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
-            let turns_before = history.len().saturating_sub(system_count);
-            let tokens_before = estimate_chat_history_tokens(&history);
-            if let Some(patch) = build_chat_compaction_patch(
+            let (turns_before, tokens_before) = super::compaction::chat_history_turns_and_tokens(&history);
+            // The request is already recorded (`RecordUserTurn` above), so the
+            // source is the persisted history including it and the reducer gets
+            // the same patch. The enriched request replaces the source's plain
+            // final message in the provider view.
+            let enriched_request = history.last().filter(|message| message.role == "user").cloned();
+            let preflight_outcome = if let Some(patch) = build_chat_compaction_patch(
                 &history,
                 &persisted_history_for_turn,
                 provider.as_ref(),
@@ -4047,17 +4052,17 @@ Retry with a compatible model: /provider {shown} <model>",
             )
             .await
             {
-                if let Err(error) = apply_chat_compaction_patch_and_sync(
+                apply_chat_compaction_patch_and_sync(
                     &mut history,
-                    Some(&persisted_history_for_turn),
+                    &persisted_history_for_turn,
+                    enriched_request,
                     patch,
                     &legacy_budget_config,
                     crate::chat::action::CompactReason::ContextOverflow,
                     &chat_dispatcher,
-                ) {
-                    tracing::warn!(%error, "preflight compaction refused; history unchanged");
-                }
+                )
             } else {
+                let messages_before = history.len();
                 compact_chat_history(&mut history);
                 let _ = chat_dispatcher.dispatch_or_log(
                     crate::chat::action::Action::HistoryCompacted {
@@ -4065,7 +4070,10 @@ Retry with a compatible model: /provider {shown} <model>",
                     },
                     "chat.history_compacted_preflight",
                 );
-            }
+                super::compaction::ManualCompactOutcome::Degraded {
+                    dropped_messages: messages_before.saturating_sub(history.len()),
+                }
+            };
             persist_legacy_chat_compaction_audit(
                 mem.as_ref(),
                 &runtime_envelope,
@@ -4084,12 +4092,7 @@ Retry with a compatible model: /provider {shown} <model>",
                 &chat_mirror,
                 &chat_dispatcher,
             );
-            let compact_msg = format_compact_feedback_after_history(
-                turns_before,
-                tokens_before,
-                &history,
-                &legacy_budget_config,
-            );
+            let compact_msg = preflight_outcome.feedback(turns_before, tokens_before, &legacy_budget_config);
             surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
             tracing::warn!(
                 before_used_tokens = preflight_budget.used_tokens,

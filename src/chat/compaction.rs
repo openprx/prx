@@ -178,14 +178,74 @@ pub(super) struct ManualCompact<'a> {
     pub(super) chat_dispatcher: &'a dispatcher::ChatDispatcher,
 }
 
+/// What an explicit `/compact` or a chat preflight compaction did. Callers
+/// print from this and refresh the TUI budget; nothing else reports success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ManualCompactOutcome {
+    /// The patch was applied to its source and handed to the reducer.
+    /// `generation` is the newest handoff generation in the compacted view
+    /// (0 when the mode wrote a summary rather than a handoff).
+    Compacted {
+        generation: u64,
+        turns_after: usize,
+        tokens_after: usize,
+    },
+    /// No handoff or summary could be built; a deterministic trim dropped
+    /// `dropped_messages` messages.
+    Degraded { dropped_messages: usize },
+    /// Nothing was changed. `reason` is the user-facing explanation.
+    Refused { reason: String },
+}
+
+impl ManualCompactOutcome {
+    /// The line printed for this outcome. `turns_before` / `tokens_before`
+    /// describe the provider view before compaction.
+    pub(super) fn feedback(
+        &self,
+        turns_before: usize,
+        tokens_before: usize,
+        config: &crate::config::AgentCompactionConfig,
+    ) -> String {
+        match self {
+            Self::Compacted {
+                turns_after,
+                tokens_after,
+                ..
+            } => format_compact_feedback(
+                turns_before,
+                *turns_after,
+                tokens_before,
+                *tokens_after,
+                config.max_context_tokens,
+            ),
+            Self::Degraded { dropped_messages } => format_context_degraded_notice(*dropped_messages),
+            Self::Refused { reason } => reason.clone(),
+        }
+    }
+}
+
+/// Non-system message count and token estimate of a provider view.
+pub(super) fn chat_history_turns_and_tokens(history: &[ChatMessage]) -> (usize, usize) {
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    (
+        history.len().saturating_sub(system_count),
+        estimate_chat_history_tokens(history),
+    )
+}
+
 /// Run an explicit `/compact`.
 ///
 /// Forced: every message beyond `keep_recent_messages` is compacted whatever
-/// the budget says. The audit runtime binds to the session's newest persisted
-/// user-input event, so `switch` mode writes a durable context-switch handoff.
-/// The deterministic trim runs only when no handoff or summary can be built,
-/// and then reports the loss instead of "compacted".
-pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut impl FnMut(&str)) {
+/// the budget says. The source is the system prompt plus the acknowledged
+/// session turns; the reducer receives the same patch. The audit runtime binds
+/// to the session's newest persisted user-input event, so `switch` mode writes
+/// a durable context-switch handoff. The deterministic trim runs only when no
+/// handoff or summary can be built, and then reports the loss instead of
+/// "compacted".
+pub(super) async fn run_manual_compact(
+    request: ManualCompact<'_>,
+    emit: &mut impl FnMut(&str),
+) -> ManualCompactOutcome {
     let ManualCompact {
         history,
         chat_session,
@@ -203,8 +263,9 @@ pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut im
     }
     source_history.extend(super::session_store::session_turns_to_history(chat_session));
     if !manual_compact_has_compactable(&source_history, config) {
-        emit(&format_nothing_to_compact_feedback(history, config));
-        return;
+        return ManualCompactOutcome::Refused {
+            reason: format_nothing_to_compact_feedback(history, config),
+        };
     }
     let audit = match DocumentIngestRuntime::from_envelope(memory, envelope)
         .bound_to_newest_user_input()
@@ -212,20 +273,18 @@ pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut im
     {
         Ok(Some(audit)) => audit,
         Ok(None) => {
-            emit(NOTHING_TO_COMPACT_NO_TRANSCRIPT);
-            return;
+            return ManualCompactOutcome::Refused {
+                reason: NOTHING_TO_COMPACT_NO_TRANSCRIPT.to_owned(),
+            };
         }
         Err(error) => {
             tracing::warn!(%error, "manual compaction could not read the durable transcript");
-            emit(&format!(
-                "Compaction unavailable: the durable transcript could not be read ({error})."
-            ));
-            return;
+            return ManualCompactOutcome::Refused {
+                reason: format!("Compaction unavailable: the durable transcript could not be read ({error})."),
+            };
         }
     };
     emit("Compacting conversation...");
-    let turns_before = history.len().saturating_sub(system_count);
-    let tokens_before = estimate_chat_history_tokens(history);
     let patch = build_chat_compaction_patch(
         history,
         &source_history,
@@ -237,24 +296,15 @@ pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut im
     )
     .await;
     if let Some(patch) = patch {
-        if let Err(error) = apply_chat_compaction_patch_and_sync(
+        return apply_chat_compaction_patch_and_sync(
             history,
-            Some(&source_history),
+            &source_history,
+            None,
             patch,
             config,
             crate::chat::action::CompactReason::Manual,
             chat_dispatcher,
-        ) {
-            emit(&format!("Compaction refused: {error}. Nothing was changed."));
-            return;
-        }
-        emit(&format_compact_feedback_after_history(
-            turns_before,
-            tokens_before,
-            history,
-            config,
-        ));
-        return;
+        );
     }
     let messages_before = history.len();
     compact_chat_history(history);
@@ -264,9 +314,9 @@ pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut im
         },
         "chat.history_compacted_manual",
     );
-    emit(&format_context_degraded_notice(
-        messages_before.saturating_sub(history.len()),
-    ));
+    ManualCompactOutcome::Degraded {
+        dropped_messages: messages_before.saturating_sub(history.len()),
+    }
 }
 
 pub(super) fn format_nothing_to_compact_feedback(
@@ -278,22 +328,6 @@ pub(super) fn format_nothing_to_compact_feedback(
     let tokens = estimate_chat_history_tokens(history);
     let window = format_compact_token_count(compaction_config.max_context_tokens);
     format!("Nothing to compact: {turns} turns / ~{tokens} tokens / {window} window.")
-}
-
-pub(super) fn format_compact_feedback_after_history(
-    turns_before: usize,
-    tokens_before: usize,
-    history: &[ChatMessage],
-    compaction_config: &crate::config::AgentCompactionConfig,
-) -> String {
-    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
-    format_compact_feedback(
-        turns_before,
-        history.len().saturating_sub(system_count),
-        tokens_before,
-        estimate_chat_history_tokens(history),
-        compaction_config.max_context_tokens,
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,25 +416,38 @@ pub(super) async fn build_chat_compaction_patch(
     }
 }
 
+/// Apply `patch` to its `source_history`, make the compacted source the
+/// provider view and hand the same patch to the reducer.
+///
+/// `enriched_request` is the current turn's enriched request (preflight): it
+/// replaces the compacted source's final message, the plain request, so the
+/// request occurs exactly once. A patch that does not describe its source is
+/// refused before anything changes.
 pub(super) fn apply_chat_compaction_patch_and_sync(
     history: &mut Vec<ChatMessage>,
-    patch_source_history: Option<&[ChatMessage]>,
+    source_history: &[ChatMessage],
+    enriched_request: Option<ChatMessage>,
     patch: crate::agent::turn_contracts::CompactionPatch,
     config: &crate::config::AgentCompactionConfig,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
-) -> Result<(), crate::agent::turn_contracts::CompactionPatchError> {
+) -> ManualCompactOutcome {
     let replacement_len = patch.replacement.len();
-    let mut compacted = patch_source_history.map_or_else(|| history.clone(), <[ChatMessage]>::to_vec);
+    let mut compacted = source_history.to_vec();
     if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
         tracing::warn!(
             guard_history_len = patch.guard.history_len,
             range_start = patch.range_start(),
             range_end = patch.range_end(),
-            source_len = compacted.len(),
+            source_len = source_history.len(),
             "chat compaction patch does not describe its source; nothing was changed"
         );
-        return Err(error);
+        return ManualCompactOutcome::Refused {
+            reason: format!("Compaction refused: {error}. Nothing was changed."),
+        };
+    }
+    if let Some(enriched) = enriched_request {
+        replace_final_request(&mut compacted, source_history.last(), enriched);
     }
     *history = compacted;
     let budget = crate::agent::context_budget::plan_context_budget(
@@ -430,7 +477,32 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
         },
         "chat.history_compaction_patch_applied",
     );
-    Ok(())
+    let (turns_after, tokens_after) = chat_history_turns_and_tokens(history);
+    ManualCompactOutcome::Compacted {
+        generation: crate::agent::compaction::context_handoff_generation(history),
+        turns_after,
+        tokens_after,
+    }
+}
+
+/// Replace the view's final message, when it is the source's plain request,
+/// with the enriched request; append the enriched request when the plain one
+/// did not survive at the tail. Either way the request occurs exactly once.
+pub(super) fn replace_final_request(
+    view: &mut Vec<ChatMessage>,
+    source_request: Option<&ChatMessage>,
+    enriched: ChatMessage,
+) {
+    let tail_is_request = source_request.is_some_and(|request| {
+        request.role == "user"
+            && view
+                .last()
+                .is_some_and(|last| last.role == request.role && last.content == request.content)
+    });
+    if tail_is_request {
+        view.pop();
+    }
+    view.push(enriched);
 }
 
 pub(super) fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
