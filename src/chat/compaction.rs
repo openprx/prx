@@ -295,6 +295,29 @@ fn provider_view_from_acked(
     super::session_store::provider_view_for_session(&acked.session, system)
 }
 
+/// The provider view after a turn whose commit follows a worker (automatic)
+/// compaction: rebuilt from the committed acknowledged snapshot, so the next
+/// turn never resends the replaced cold prefix. Only the committed request
+/// keeps its enrichment (as in the manual and preflight helpers): the newest
+/// stored user turn, when it is that request, becomes `enriched_request`.
+/// Only the TUI finalizer commits a turn after a detached worker compaction.
+#[cfg(feature = "terminal-tui")]
+pub(super) fn provider_view_after_compacted_commit(
+    current_view: &[ChatMessage],
+    acked: &crate::chat::acked_session::AckedSession,
+    plain_request: &str,
+    enriched_request: &ChatMessage,
+) -> Vec<ChatMessage> {
+    let mut view = provider_view_from_acked(current_view, acked);
+    let plain = crate::agent::turn_contracts::inbound_user_message(plain_request);
+    if let Some(slot) = view.iter_mut().rev().find(|message| message.role == "user")
+        && slot.content == plain.content
+    {
+        *slot = enriched_request.clone();
+    }
+    view
+}
+
 /// Replace the view's final user message (the current request as the reducer
 /// stored it, possibly capped by a trim) with `enriched`, or append `enriched`
 /// when the view does not end with a user message.

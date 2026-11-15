@@ -2003,6 +2003,15 @@ pub trait Memory: Send + Sync {
         results
     }
 
+    /// Store a chat session snapshot (the session-snapshot persistence path
+    /// only; nothing else calls it). A backend that runs the memory safety
+    /// filter may apply its trusted session-snapshot check
+    /// ([`crate::memory::filter::MemorySafetyFilter::check_session_snapshot`]);
+    /// the default is an ordinary `Conversation` store with the full check.
+    async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+        self.store(key, content, MemoryCategory::Conversation, session_id).await
+    }
+
     /// Copy a session's transcript rows into a new branch in one transaction,
     /// rewriting every copied handoff note to reference the copies. Backends
     /// without a transactional event log return [`BranchCopyError::Unsupported`].

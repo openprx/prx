@@ -334,6 +334,73 @@ fn switch_compaction_and_recall() {
     assert_handoff_and_recall(&sandbox, &server, &first);
 }
 
+/// An ordinary line the script answers with plain text (no tool call).
+const ORDINARY: &str = "Just say noted, nothing else.";
+
+/// The lossy-trim notice the chat prints when a rollover drops context.
+const LOSSY_NOTICE: &str = "Context trimmed (lossy)";
+
+#[test]
+fn an_ordinary_turn_right_after_an_automatic_switch_sends_the_compacted_view() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = configure(&sandbox, RECALL_WINDOW_TOKENS);
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    let mut replies = 1;
+    chat.turn(PLANT, replies);
+    let mut next_file = 0;
+    while compaction_script::stored_handoffs(&sandbox.workspace).is_empty() && next_file < SWITCH_FILLERS {
+        replies += 1;
+        chat.turn(&read_line(next_file), replies);
+        next_file += 1;
+    }
+    let handoffs_after_switch = compaction_script::stored_handoffs(&sandbox.workspace).len();
+    // No `/compact`, no session switch: the very next line is ordinary.
+    replies += 1;
+    chat.turn(ORDINARY, replies);
+    let output = chat.exit();
+    assert_clean(&output, "automatic switch then an ordinary turn");
+
+    assert_eq!(
+        handoffs_after_switch, 1,
+        "the tool-heavy turns caused exactly one automatic switch; stdout: {}\nstderr: {}",
+        output.stdout, output.stderr
+    );
+    let ordinary: Vec<serde_json::Value> = server
+        .requests()
+        .into_iter()
+        .filter(|request| request.to_string().contains(ORDINARY))
+        .collect();
+    assert!(!ordinary.is_empty(), "the ordinary turn reached the provider");
+    for request in &ordinary {
+        assert!(
+            !request.to_string().contains(compaction_script::CODENAME),
+            "the ordinary turn's request resends the replaced cold prefix: {request}"
+        );
+        assert!(
+            compaction_script::handoff_note(request).is_some_and(|note| note["to_generation"] == 1),
+            "the ordinary turn's request carries the committed handoff: {request}"
+        );
+    }
+    assert_eq!(
+        compaction_script::stored_handoffs(&sandbox.workspace).len(),
+        handoffs_after_switch,
+        "the ordinary turn caused no second rollover"
+    );
+    let (_, unavailable) = switch_event_counts(&sandbox.workspace);
+    assert_eq!(unavailable, 0, "no handoff_unavailable degradation is stored");
+    assert!(
+        !compaction_script::over_hard_limit_after_handoff(&sandbox.workspace),
+        "no lossy over-limit fallback after the handoff"
+    );
+    assert!(
+        !output.stdout.contains(LOSSY_NOTICE) && !output.stderr.contains(LOSSY_NOTICE),
+        "no lossy trim notice; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+}
+
 #[test]
 fn manual_compact_below_threshold() {
     let sandbox = Sandbox::new();

@@ -104,6 +104,7 @@ impl ChatState {
             session: self.build_session_snapshot(),
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
+            compaction_epoch: self.session.compaction_epoch,
         };
         vec![
             if persist {
@@ -152,6 +153,7 @@ impl ChatState {
             session_id: self.session.id.clone(),
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
+            compaction_epoch: self.session.compaction_epoch,
             session: Arc::new(self.build_session_snapshot()),
         }
     }
@@ -163,6 +165,7 @@ impl ChatState {
             session: self.build_session_snapshot(),
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
+            compaction_epoch: self.session.compaction_epoch,
         }
     }
 
@@ -460,6 +463,7 @@ impl ChatState {
             }];
         }
         compact_history_in_place(history);
+        self.session.compaction_epoch = self.session.compaction_epoch.saturating_add(1);
 
         let final_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
         let final_len = history.len();
@@ -525,6 +529,7 @@ impl ChatState {
         } else {
             false
         };
+        self.session.compaction_epoch = self.session.compaction_epoch.saturating_add(1);
         self.session.turns = durable_turns_from_compacted_history(history, &handoff_notes);
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);

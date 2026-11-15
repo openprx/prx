@@ -1311,12 +1311,7 @@ impl EffectExecutor {
             }
         };
         let mut store_result = memory
-            .store(
-                &session.memory_key(),
-                &json,
-                crate::memory::MemoryCategory::Conversation,
-                Some(&session.id),
-            )
+            .store_session_snapshot(&session.memory_key(), &json, Some(&session.id))
             .await;
         // The SQLite memory backend may briefly report BUSY/LOCKED
         // while the same completed turn is committing its message
@@ -1337,12 +1332,7 @@ impl EffectExecutor {
             }
             tokio::task::yield_now().await;
             store_result = memory
-                .store(
-                    &session.memory_key(),
-                    &json,
-                    crate::memory::MemoryCategory::Conversation,
-                    Some(&session.id),
-                )
+                .store_session_snapshot(&session.memory_key(), &json, Some(&session.id))
                 .await;
         }
         match store_result {

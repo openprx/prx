@@ -182,9 +182,47 @@ impl SqliteMemory {
         // V02-R9: an owner-isolated write is confined to the caller's own keys.
         // `Some(owner)` only for an isolated context; a blank owner id refuses
         // here, before anything is written.
-        let isolated_owner = crate::memory::owner_predicate::isolated_store_owner(context)?;
+        crate::memory::owner_predicate::isolated_store_owner(context)?;
         self.check_memory_safety(content, context).await?;
+        self.write_checked(key, content, category, session_id, context, metadata)
+            .await
+    }
 
+    /// The trusted session-snapshot write (`Memory::store_session_snapshot`):
+    /// the same write as `store`, checked by
+    /// [`MemorySafetyFilter::check_session_snapshot`].
+    pub(super) async fn store_session_snapshot_impl(
+        &self,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        validate_memory_write_target(key, session_id)?;
+        let source = SourceMetadata {
+            actor: Self::safety_actor_for_context(None),
+            historical_accuracy: None,
+        };
+        let result = MemorySafetyFilter::default()
+            .check_session_snapshot(content, &source)
+            .await;
+        if !result.passed {
+            anyhow::bail!("{}", safety_rejection_message(&result.issues));
+        }
+        self.write_checked(key, content, MemoryCategory::Conversation, session_id, None, None)
+            .await
+    }
+
+    /// The write after the target and safety checks passed.
+    async fn write_checked(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        metadata: Option<MemoryStoreMetadata>,
+    ) -> anyhow::Result<()> {
+        let isolated_owner = crate::memory::owner_predicate::isolated_store_owner(context)?;
         let partition = context.and_then(|ctx| ctx.agent_partition.clone());
         let session_key = context.and_then(|ctx| ctx.session_key.clone());
         let needs_embedding = matches!(&category, MemoryCategory::Core | MemoryCategory::Custom(_));

@@ -96,6 +96,15 @@ impl BranchCopyPlan {
                 });
             }
         }
+        // The final batch has the same per-batch limit; unlike a handoff
+        // batch it may be empty (a branch that keeps no turn).
+        let final_rows = self.final_batch.original_event_ids.len();
+        if final_rows > MAX_REFERENCED_EVENTS {
+            return Err(BranchCopyError::BatchTooLarge {
+                rows: final_rows,
+                limit: MAX_REFERENCED_EVENTS,
+            });
+        }
         let mut seen = std::collections::HashSet::with_capacity(rows);
         let all_unique = self
             .handoff_batches

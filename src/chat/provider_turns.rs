@@ -88,6 +88,11 @@ pub(super) struct PerTurnContext {
     pub(super) model_name: String,
     pub(super) history_len_before_user_turn: usize,
     pub(super) history_user_message: ChatMessage,
+    /// The reducer's compaction epoch when the turn's provider view was
+    /// copied. A newer acknowledged epoch at commit means a worker compaction
+    /// ran during the turn, and the run loop's view is rebuilt from the
+    /// committed snapshot instead of being appended to.
+    pub(super) compaction_epoch_at_start: u64,
     /// Set when this turn was started by daemon-assigned work, and carried all
     /// the way to the commit because that is where the reply exists.
     ///
@@ -1234,7 +1239,7 @@ async fn commit_completed_provider_turn(
         if let Some(guard) = pending.assignment.as_mut() {
             guard.failed("The turn finished without reply text.");
         }
-        history.push(pending.history_user_message.clone());
+        adopt_committed_turn(history, chat_dispatcher, &pending, None);
         surface_turn_elapsed_message(
             chat_dispatcher,
             sessions_redraw_handle,
@@ -1289,8 +1294,7 @@ async fn commit_completed_provider_turn(
         );
         return false;
     }
-    history.push(pending.history_user_message.clone());
-    history.push(ChatMessage::assistant(final_text.clone()));
+    adopt_committed_turn(history, chat_dispatcher, &pending, Some(&final_text));
     if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
     }
@@ -1318,6 +1322,42 @@ async fn commit_completed_provider_turn(
     publish_main_queue_status(chat_dispatcher, turn_scheduler);
     publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
     true
+}
+
+/// Bring the run loop's provider view up to an acknowledged turn commit.
+/// Without a compaction since the turn copied its view, the committed request
+/// (enriched) and reply are appended. After a worker compaction the view is
+/// rebuilt from the committed snapshot instead: appending to the
+/// pre-compaction view would resend the replaced cold prefix and force
+/// another rollover or a lossy fallback on the next turn.
+#[cfg(feature = "terminal-tui")]
+fn adopt_committed_turn(
+    history: &mut Vec<ChatMessage>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    pending: &PerTurnContext,
+    reply: Option<&str>,
+) {
+    let acked = chat_dispatcher.session_reader().acked();
+    if acked.compaction_epoch != pending.compaction_epoch_at_start {
+        let view = super::compaction::provider_view_after_compacted_commit(
+            history,
+            &acked,
+            &pending.user_input,
+            &pending.history_user_message,
+        );
+        tracing::info!(
+            task_id = pending.task_id.get(),
+            messages_before = history.len(),
+            messages_after = view.len(),
+            "provider view rebuilt from the committed snapshot after a worker compaction"
+        );
+        *history = view;
+        return;
+    }
+    history.push(pending.history_user_message.clone());
+    if let Some(reply) = reply {
+        history.push(ChatMessage::assistant(reply.to_owned()));
+    }
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -1885,6 +1925,27 @@ pub(super) fn request_provider_turn_cancel(
             );
         }
     }
+}
+
+/// Record the user's request when the turn is admitted (the non-TUI path;
+/// its completion commits with `record_user: false`). The send is bounded and
+/// awaited on the ordered action channel
+/// ([`crate::chat::dispatcher::ChatDispatcher::dispatch_bounded`]): a full
+/// channel delays the turn instead of dropping the request, so the later
+/// commit always includes it. A send that is not accepted latches the
+/// unconfirmed-commit stop once and fails the turn before it runs.
+pub(super) async fn record_user_turn_at_admission(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    commits: &crate::chat::dispatcher::TurnCompletionSignal,
+    user_input: &str,
+) -> anyhow::Result<()> {
+    chat_dispatcher
+        .dispatch_bounded(
+            crate::chat::action::Action::RecordUserTurn(user_input.to_owned()),
+            commits,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("Chat stopped after an unconfirmed history commit: {error}"))
 }
 
 /// Dispatch a turn's final metered usage (`FinalAggregate`) unconditionally,

@@ -792,6 +792,10 @@ impl Memory for SqliteMemory {
         self.copy_branch_events(plan).await
     }
 
+    async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+        self.store_session_snapshot_impl(key, content, session_id).await
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

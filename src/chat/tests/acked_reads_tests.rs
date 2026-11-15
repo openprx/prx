@@ -463,6 +463,7 @@ async fn assert_delayed_writes_of_the_first_load_are_never_read(kind: NewLoad) {
         session: stale_session,
         load_epoch: first_acked.load_epoch,
         revision: first_acked.revision + 10,
+        compaction_epoch: first_acked.compaction_epoch,
     };
     let (loaded, persist) = new_load(kind, &first);
     let expected = turn_pairs(&loaded);
@@ -857,4 +858,144 @@ async fn final_usage_that_the_dispatcher_cannot_accept_fails_before_any_commit()
     })
     .await
     .expect("final_usage_that_the_dispatcher_cannot_accept_fails_before_any_commit exceeded DEADLINE");
+}
+
+/// Fill the parked dispatcher's real bounded action channel with unchanged
+/// metadata actions until a non-blocking send is refused; returns how many
+/// were queued.
+fn fill_action_channel(
+    parked: &crate::chat::acked_session::ParkedSessionDispatcher,
+    mode: crate::agent::turn_contracts::ChatMode,
+) -> usize {
+    let mut queued = 0;
+    while parked.dispatcher.try_dispatch(Action::ModeChanged(mode)) == crate::chat::dispatcher::DispatchResult::Sent {
+        queued += 1;
+        assert!(
+            queued <= crate::chat::dispatcher::ACTION_CHANNEL_CAPACITY,
+            "the action channel accepts no more than its capacity"
+        );
+    }
+    queued
+}
+
+#[tokio::test]
+async fn the_admission_record_waits_for_a_full_channel_and_the_commit_includes_the_request() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, memory) = sqlite_memory();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("q", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let state = TestSessionDispatcher::state_with_history(Vec::new());
+        let mode = state.session.mode;
+        let parked = TestSessionDispatcher::parked(memory, state);
+        let queued = fill_action_channel(&parked, mode);
+        let dispatcher = parked.dispatcher.clone();
+        let commits = parked.commits.clone();
+
+        let mut admission = std::pin::pin!(crate::chat::provider_turns::record_user_turn_at_admission(
+            &dispatcher,
+            &commits,
+            "the admitted request",
+        ));
+        let waits_while_full = futures::poll!(admission.as_mut()).is_pending();
+        let harness = parked.start();
+        let admitted = admission.await;
+        let committed = crate::chat::provider_turns::dispatch_ordered_provider_turn_commit_and_wait(
+            &harness.dispatcher,
+            &harness.commits,
+            task_id,
+            crate::chat::provider_turns::OrderedCommitTerminal::TurnCommitRequested { draft_id: None },
+            "the admitted request",
+            "the reply",
+            false,
+            false,
+        )
+        .await;
+        let published = harness.dispatcher.session_publisher().current();
+        let healthy = harness.commits.ensure_history_commits_healthy();
+        harness.stop().await;
+
+        assert_eq!(
+            queued,
+            crate::chat::dispatcher::ACTION_CHANNEL_CAPACITY,
+            "the channel was full before the admission record"
+        );
+        assert!(
+            waits_while_full,
+            "the admission record waits for capacity instead of being dropped"
+        );
+        assert!(
+            admitted.is_ok(),
+            "the record is accepted once the dispatcher drains: {admitted:?}"
+        );
+        assert_eq!(
+            committed,
+            Ok(()),
+            "the completion commit (record_user: false) is acknowledged"
+        );
+        assert!(healthy.is_ok(), "nothing is latched: {healthy:?}");
+        let turns: Vec<(&str, &str)> = published
+            .session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            vec![("user", "the admitted request"), ("assistant", "the reply")],
+            "the acknowledged commit holds the request recorded under backpressure"
+        );
+    })
+    .await
+    .expect("the_admission_record_waits_for_a_full_channel_and_the_commit_includes_the_request exceeded DEADLINE");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_admission_record_the_full_channel_never_accepts_fails_the_turn_once() {
+    tokio::time::timeout(DEADLINE + crate::chat::acked_session::ACK_TIMEOUT, async {
+        // The dispatcher task never runs here, so its executor never writes.
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::NoneMemory::new());
+        let state = TestSessionDispatcher::state_with_history(Vec::new());
+        let mode = state.session.mode;
+        let parked = TestSessionDispatcher::parked(memory, state);
+        let queued = fill_action_channel(&parked, mode);
+
+        let admitted = crate::chat::provider_turns::record_user_turn_at_admission(
+            &parked.dispatcher,
+            &parked.commits,
+            "the refused request",
+        )
+        .await;
+        let latched = parked.commits.ensure_history_commits_healthy();
+        let turns_cancelled = parked.commits.new_turn_cancellation().is_cancelled();
+        // The dispatcher task never started; dropping the parked dispatcher
+        // releases the queued actions.
+        drop(parked);
+
+        assert_eq!(
+            queued,
+            crate::chat::dispatcher::ACTION_CHANNEL_CAPACITY,
+            "the channel was full before the admission record"
+        );
+        let message = admitted
+            .expect_err("a record the channel never accepts fails the turn")
+            .to_string();
+        assert_eq!(
+            message
+                .matches("Chat stopped after an unconfirmed history commit")
+                .count(),
+            1,
+            "the turn fails once, as an unconfirmed history commit: {message}"
+        );
+        assert!(
+            message.contains("timed out"),
+            "the failure is the bounded send's timeout: {message}"
+        );
+        assert!(
+            latched.is_err(),
+            "the failed admission record latches the history commit"
+        );
+        assert!(turns_cancelled, "the latch cancels every running turn");
+    })
+    .await
+    .expect("an_admission_record_the_full_channel_never_accepts_fails_the_turn_once exceeded its deadline");
 }

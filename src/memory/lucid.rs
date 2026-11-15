@@ -680,6 +680,15 @@ impl Memory for LucidMemory {
         self.local.copy_events_for_branch(plan).await
     }
 
+    /// The local SQLite store applies its trusted snapshot check; the
+    /// mirror sync matches `store`.
+    async fn store_session_snapshot(&self, key: &str, content: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+        self.local.store_session_snapshot(key, content, session_id).await?;
+        self.sync_to_lucid_async(key, content, &MemoryCategory::Conversation)
+            .await;
+        Ok(())
+    }
+
     async fn find_message_event_by_idempotency_key(
         &self,
         workspace_id: &str,

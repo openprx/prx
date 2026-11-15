@@ -1229,3 +1229,66 @@ async fn sqlite_scoped_memory_acl_conformance() {
     let (_tmp, mem) = temp_sqlite();
     crate::memory::traits::conformance::assert_scoped_memory_acl_conformance(&mem, "sqlite-scoped-conformance").await;
 }
+
+/// A stored session snapshot whose tool-call preview cut an event id after
+/// digit-only groups (they read as a phone number), and whose user turn is
+/// `user_text`.
+fn session_snapshot_json(user_text: &str) -> String {
+    serde_json::json!({
+        "id": "snapshot-test",
+        "turns": [{
+            "role": "user",
+            "content": user_text,
+            "tool_calls": [{
+                "name": "transcript_history_lookup",
+                "args_preview": "{\"event_ids\":[\"20125550-1990-5550-1990-1…",
+                "success": true
+            }]
+        }]
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn only_the_session_snapshot_entry_point_masks_a_cut_preview_id() {
+    let (_tmp, mem) = temp_sqlite();
+    let snapshot = session_snapshot_json("look it up");
+
+    let generic = mem
+        .store("generic-copy", &snapshot, MemoryCategory::Conversation, None)
+        .await;
+    let trusted = mem.store_session_snapshot("snapshot-copy", &snapshot, None).await;
+    let spelled = mem
+        .store_session_snapshot(
+            "spelled-copy",
+            &session_snapshot_json(r#"{"args_preview":"20125550-1990-5550-1990-1…"}"#),
+            None,
+        )
+        .await;
+
+    let generic_error = generic
+        .expect_err("a generic write keeps the full PII check")
+        .to_string();
+    assert!(
+        generic_error.contains("Pii"),
+        "the generic write is refused as PII: {generic_error}"
+    );
+    assert!(
+        mem.get("generic-copy").await.expect("test: read generic").is_none(),
+        "the refused generic write stored nothing"
+    );
+    assert!(
+        trusted.is_ok(),
+        "the trusted snapshot path stores the preview: {trusted:?}"
+    );
+    let stored = mem
+        .get("snapshot-copy")
+        .await
+        .expect("test: read snapshot")
+        .expect("test: the snapshot row exists");
+    assert_eq!(stored.content, snapshot, "the snapshot is stored unchanged");
+    assert!(
+        spelled.is_err() && mem.get("spelled-copy").await.expect("test: read spelled").is_none(),
+        "user turn text spelling an `args_preview` key is refused and stores nothing: {spelled:?}"
+    );
+}

@@ -17,7 +17,7 @@ use anyhow::Result;
 pub(super) async fn save_session(mem: &dyn Memory, session: &session::ChatSession) -> Result<()> {
     let sanitized = sanitize::sanitize_session_content(session);
     let json = sanitized.to_json().map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-    mem.store(&session.memory_key(), &json, MemoryCategory::Conversation, None)
+    mem.store_session_snapshot(&session.memory_key(), &json, None)
         .await
         .map_err(|e| anyhow::anyhow!("store: {e}"))?;
     Ok(())

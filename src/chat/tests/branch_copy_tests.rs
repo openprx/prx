@@ -433,6 +433,51 @@ async fn a_copy_over_the_row_limit_is_refused_before_any_write() {
 }
 
 #[tokio::test]
+async fn a_final_batch_over_the_batch_limit_is_refused_before_any_write() {
+    tokio::time::timeout(TEST_DEADLINE, async {
+        let temp = TempDir::new().expect("test: tempdir");
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).expect("test: sqlite"));
+        let fabric = MemoryFabric::new(Arc::clone(&memory), WORKSPACE);
+        let source_session = "final-batch-source";
+        let source = chat_runtime_envelope(WORKSPACE, &format!("chat:{source_session}"));
+        let limit = crate::tools::transcript_history_lookup::MAX_REFERENCED_EVENTS;
+        // One more real row than one batch may hold (a handoff plus `limit`
+        // retained turns): every id resolves, so only the bound stops it.
+        let mut ids = Vec::with_capacity(limit + 1);
+        for index in 0..=limit {
+            let event = fabric
+                .record_inbound_user_message(
+                    source.message_scope(),
+                    format!("retained turn {index}"),
+                    Some(format!("final-batch-test-{index}")),
+                    None,
+                )
+                .await
+                .expect("test: record source row");
+            ids.push(event.event_id);
+        }
+
+        let error = memory
+            .copy_events_for_branch(plan_with(ids, source_session))
+            .await
+            .expect_err("a final batch over the batch limit is refused");
+
+        assert_eq!(
+            error.downcast_ref::<BranchCopyError>(),
+            Some(&BranchCopyError::BatchTooLarge { rows: limit + 1, limit }),
+            "the final batch is refused with its size and the per-batch limit"
+        );
+        assert_eq!(
+            branch_row_count(&memory).await,
+            0,
+            "the refused final batch wrote no branch row"
+        );
+    })
+    .await
+    .expect("a_final_batch_over_the_batch_limit_is_refused_before_any_write exceeded TEST_DEADLINE");
+}
+
+#[tokio::test]
 async fn a_backend_without_an_event_log_refuses_the_copy_with_a_typed_error() {
     tokio::time::timeout(TEST_DEADLINE, async {
         let memory = NoneMemory::new();

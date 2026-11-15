@@ -35,8 +35,8 @@ use super::provider_turns::{
     finish_inline_provider_turn, gate_cancelled_provider_turn_finalization, gate_failed_provider_turn_finalization,
     inline_provider_turn_payload, mark_provider_turn_completed, provider_turn_visible_admission,
     provider_worker_status, publish_provider_worker_status, record_provider_turn_completion_context,
-    record_provider_turn_lifecycle_event, register_provider_history_commit_task, register_provider_turn_worker,
-    route_provider_completion_event_and_publish, start_provider_turn_task,
+    record_provider_turn_lifecycle_event, record_user_turn_at_admission, register_provider_history_commit_task,
+    register_provider_turn_worker, route_provider_completion_event_and_publish, start_provider_turn_task,
 };
 #[cfg(feature = "terminal-tui")]
 use super::provider_turns::{
@@ -3167,6 +3167,10 @@ Retry with a compatible model: /provider {shown} <model>",
         let history_len_before_user_turn = history.len();
         let history_user_message = crate::agent::turn_contracts::inbound_user_message(&enriched);
         // The provider-side copy is read only by the TUI reducer driver.
+        // The compaction epoch the provider-side copy reflects; a worker
+        // compaction during the turn moves it on (see the finalizer).
+        #[cfg(feature = "terminal-tui")]
+        let compaction_epoch_at_start = chat_session.acked().compaction_epoch;
         #[cfg(feature = "terminal-tui")]
         let history_for_provider = {
             let mut history_for_provider = history.clone();
@@ -3471,22 +3475,16 @@ Retry with a compatible model: /provider {shown} <model>",
             if reducer_driver_turn_active {
                 provider_history_len_before_assistant = history_for_provider.len();
             } else {
+                record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?;
                 history.push(history_user_message.clone());
                 provider_history_len_before_assistant = history.len();
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::RecordUserTurn(user_input.clone()),
-                    "chat.record_user_turn",
-                );
             }
         }
         #[cfg(not(feature = "terminal-tui"))]
         {
+            record_user_turn_at_admission(&chat_dispatcher, &turn_signal, &user_input).await?;
             history.push(history_user_message.clone());
             provider_history_len_before_assistant = history.len();
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::RecordUserTurn(user_input.clone()),
-                "chat.record_user_turn",
-            );
         }
 
         let provider_turn_task_id = start_provider_turn_task(
@@ -3669,6 +3667,7 @@ Retry with a compatible model: /provider {shown} <model>",
                             model_name: model_name.to_string(),
                             history_len_before_user_turn,
                             history_user_message: history_user_message.clone(),
+                            compaction_epoch_at_start,
                             assignment: assignment_guard.take(),
                         },
                     )

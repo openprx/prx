@@ -22,6 +22,8 @@ pub struct AckedSession {
     pub session_id: String,
     pub load_epoch: u64,
     pub revision: u64,
+    /// The reducer's compaction epoch at this snapshot.
+    pub compaction_epoch: u64,
     /// The canonical (unsanitized) runtime form of the session.
     pub session: Arc<ChatSession>,
 }
@@ -34,6 +36,7 @@ impl AckedSession {
             session_id: String::new(),
             load_epoch: 0,
             revision: 0,
+            compaction_epoch: 0,
             session: Arc::new(ChatSession::new("", "")),
         }
     }
@@ -50,6 +53,7 @@ pub struct SessionCommit {
     pub session: ChatSession,
     pub load_epoch: u64,
     pub revision: u64,
+    pub compaction_epoch: u64,
 }
 
 impl SessionCommit {
@@ -59,6 +63,7 @@ impl SessionCommit {
             session_id: self.session.id.clone(),
             load_epoch: self.load_epoch,
             revision: self.revision,
+            compaction_epoch: self.compaction_epoch,
             session: Arc::new(self.session.clone()),
         }
     }
@@ -71,6 +76,7 @@ impl From<ChatSession> for SessionCommit {
             session,
             load_epoch: 1,
             revision: 1,
+            compaction_epoch: 0,
         }
     }
 }
@@ -226,6 +232,38 @@ impl SessionReader {
     }
 }
 
+/// Test support: a dispatcher and its real persistence-only executor whose
+/// dispatcher task has not started yet.
+#[cfg(test)]
+pub(crate) struct ParkedSessionDispatcher {
+    pub(crate) dispatcher: crate::chat::dispatcher::ChatDispatcher,
+    pub(crate) commits: crate::chat::dispatcher::TurnCompletionSignal,
+    state: crate::chat::state::ChatState,
+    action_rx: tokio::sync::mpsc::Receiver<crate::chat::action::Action>,
+    executor: crate::chat::dispatcher::EffectExecutor,
+}
+
+#[cfg(test)]
+impl ParkedSessionDispatcher {
+    /// Start the dispatcher task; it drains the queued actions in order.
+    pub(crate) fn start(self) -> TestSessionDispatcher {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = crate::chat::dispatcher::spawn_dispatcher_task_with_signal(
+            self.state,
+            self.action_rx,
+            shutdown.clone(),
+            self.executor,
+            Some(self.commits.clone()),
+        );
+        TestSessionDispatcher {
+            dispatcher: self.dispatcher,
+            commits: self.commits,
+            shutdown,
+            handle,
+        }
+    }
+}
+
 /// Test support: a running dispatcher task over a real persistence-only
 /// executor (real save, publish and acknowledgement) seeded from `state`.
 #[cfg(test)]
@@ -242,10 +280,19 @@ impl TestSessionDispatcher {
     const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
     pub(crate) fn spawn(memory: Arc<dyn crate::memory::Memory>, state: crate::chat::state::ChatState) -> Self {
+        Self::parked(memory, state).start()
+    }
+
+    /// The same dispatcher and executor, with the dispatcher task not yet
+    /// running: actions queue on the real bounded channel until
+    /// [`ParkedSessionDispatcher::start`].
+    pub(crate) fn parked(
+        memory: Arc<dyn crate::memory::Memory>,
+        state: crate::chat::state::ChatState,
+    ) -> ParkedSessionDispatcher {
         use crate::chat::dispatcher::{
             ChatDispatcher, EffectExecutor, PersistenceDeps, RuntimeDualWriteGuard, TurnCompletionSignal,
         };
-        let shutdown = tokio_util::sync::CancellationToken::new();
         let (dispatcher, action_rx) = ChatDispatcher::new_seeded(state.acked_session_seed());
         let executor = EffectExecutor::new_persistence_only(PersistenceDeps {
             memory,
@@ -253,19 +300,12 @@ impl TestSessionDispatcher {
             dual_write_guard: RuntimeDualWriteGuard::new(),
         })
         .with_session_publisher(dispatcher.session_publisher());
-        let commits = TurnCompletionSignal::new();
-        let handle = crate::chat::dispatcher::spawn_dispatcher_task_with_signal(
+        ParkedSessionDispatcher {
+            dispatcher,
+            commits: TurnCompletionSignal::new(),
             state,
             action_rx,
-            shutdown.clone(),
             executor,
-            Some(commits.clone()),
-        );
-        Self {
-            dispatcher,
-            commits,
-            shutdown,
-            handle,
         }
     }
 
@@ -319,6 +359,7 @@ mod tests {
             session_id: id.to_owned(),
             load_epoch,
             revision,
+            compaction_epoch: 0,
             session: Arc::new(session),
         }
     }

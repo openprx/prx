@@ -359,6 +359,10 @@ pub struct SessionState {
     pub load_epoch: u64,
     /// Incremented by every snapshot handed to the executor within a load.
     pub revision: u64,
+    /// Incremented by every compaction the reducer adopts (a patch or a
+    /// trim); never reset. A run-loop provider view built before a newer
+    /// value describes turns the session no longer holds.
+    pub compaction_epoch: u64,
 }
 
 /// Transient TUI state (discarded on exit, never persisted).
@@ -939,6 +943,7 @@ impl ChatState {
                 token_usage_records: Vec::new(),
                 load_epoch: 0,
                 revision: 0,
+                compaction_epoch: 0,
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
