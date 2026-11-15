@@ -1505,3 +1505,106 @@ fn compaction_aux_send_exemption_caps_input_and_output() {
     assert_eq!(COMPACTION_MAX_SUMMARY_CHARS, 8_000);
     assert_eq!(MEMORY_FLUSH_MAX_CHARS, 3_200);
 }
+
+fn numbered_history(len: usize) -> Vec<ChatMessage> {
+    let mut history = vec![ChatMessage::system("sys")];
+    history.extend((1..len).map(|index| {
+        if index % 2 == 1 {
+            ChatMessage::user(format!("question {index}"))
+        } else {
+            ChatMessage::assistant(format!("answer {index}"))
+        }
+    }));
+    history
+}
+
+fn patch_over(history: &[ChatMessage], start: usize, end: usize) -> CompactionPatch {
+    CompactionPatch {
+        replacement: vec![ChatMessage::assistant("handoff")],
+        append_after: Vec::new(),
+        guard: compaction_patch_guard_for(history, start, end).expect("test: guard over an in-range span"),
+    }
+}
+
+fn contents(history: &[ChatMessage]) -> Vec<(String, String)> {
+    history
+        .iter()
+        .map(|message| (message.role.clone(), message.content.clone()))
+        .collect()
+}
+
+#[test]
+fn apply_compaction_patch_exact_rejects_out_of_range_patch_without_mutation() {
+    // The guard describes a 50-message source; the history is the 17-message
+    // provider view of the regression.
+    let source = numbered_history(50);
+    let patch = patch_over(&source, 1, 40);
+    let mut provider_view = numbered_history(17);
+    let before = contents(&provider_view);
+
+    let result = apply_compaction_patch_exact(&mut provider_view, &patch);
+
+    assert_eq!(
+        result,
+        Err(crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds {
+            start: 1,
+            end: 40,
+            len: 17
+        }),
+        "a range past the history end must be a typed out-of-range error, not a splice panic"
+    );
+    assert_eq!(
+        contents(&provider_view),
+        before,
+        "a refused patch must leave the history unchanged"
+    );
+}
+
+#[test]
+fn apply_compaction_patch_exact_rejects_guard_mismatch_without_mutation() {
+    let source = numbered_history(20);
+    let patch = patch_over(&source, 1, 10);
+    let mut other = numbered_history(20);
+    if let Some(message) = other.get_mut(3) {
+        message.content = "edited after the guard was taken".to_owned();
+    }
+    let before = contents(&other);
+
+    let result = apply_compaction_patch_exact(&mut other, &patch);
+
+    assert_eq!(
+        result,
+        Err(crate::agent::turn_contracts::CompactionPatchError::GuardMismatch {
+            expected_len: 20,
+            actual_len: 20
+        }),
+        "an in-range history the guard does not describe must be a typed guard mismatch"
+    );
+    assert_eq!(
+        contents(&other),
+        before,
+        "a refused patch must leave the history unchanged"
+    );
+}
+
+#[test]
+fn apply_compaction_patch_exact_replaces_exactly_the_guarded_range() {
+    let source = numbered_history(12);
+    let mut patch = patch_over(&source, 1, 9);
+    patch.append_after = vec![ChatMessage::user("refresh")];
+    let mut history = source.clone();
+
+    apply_compaction_patch_exact(&mut history, &patch).expect("test: the guard describes its own source");
+
+    let mut expected = vec![
+        source[0].clone(),
+        ChatMessage::assistant("handoff"),
+        ChatMessage::user("refresh"),
+    ];
+    expected.extend(source[9..].iter().cloned());
+    assert_eq!(
+        contents(&history),
+        contents(&expected),
+        "the guarded range must be replaced and the tail kept verbatim"
+    );
+}

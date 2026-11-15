@@ -576,8 +576,6 @@ async fn resumed_compacted_session_does_not_call_summarizer_again() {
     let guard = crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3)
         .expect("test: compaction guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        range_start: 1,
-        range_end: 3,
         replacement: vec![PMsg::assistant(
             "[Context compacted at test. Summary: DURABLE_SUMMARY_MARKER]",
         )],

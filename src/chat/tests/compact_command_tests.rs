@@ -315,7 +315,8 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
         &config,
         crate::chat::action::CompactReason::ContextOverflow,
         &dispatcher,
-    );
+    )
+    .expect("test: the persisted-source patch applies to its own source");
     let action = action_rx
         .try_recv()
         .expect("compaction helper should dispatch reducer patch");

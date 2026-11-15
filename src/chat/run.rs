@@ -4047,14 +4047,16 @@ Retry with a compatible model: /provider {shown} <model>",
             )
             .await
             {
-                apply_chat_compaction_patch_and_sync(
+                if let Err(error) = apply_chat_compaction_patch_and_sync(
                     &mut history,
                     Some(&persisted_history_for_turn),
                     patch,
                     &legacy_budget_config,
                     crate::chat::action::CompactReason::ContextOverflow,
                     &chat_dispatcher,
-                );
+                ) {
+                    tracing::warn!(%error, "preflight compaction refused; history unchanged");
+                }
             } else {
                 compact_chat_history(&mut history);
                 let _ = chat_dispatcher.dispatch_or_log(

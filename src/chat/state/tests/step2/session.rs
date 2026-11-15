@@ -689,8 +689,6 @@ fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
     let mut driver_history = state.session.history.clone();
     let guard = crate::agent::compaction::compaction_patch_guard_for(&driver_history, 1, 3).expect("guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        range_start: 1,
-        range_end: 3,
         replacement: vec![crate::providers::ChatMessage::assistant(
             "[Context compacted at test. Summary: PROVIDER_SUMMARY_MARKER]",
         )],
@@ -706,7 +704,8 @@ fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
         ..crate::config::AgentCompactionConfig::default()
     };
 
-    crate::agent::compaction::apply_compaction_patch_exact(&mut driver_history, &patch);
+    crate::agent::compaction::apply_compaction_patch_exact(&mut driver_history, &patch)
+        .expect("test: driver patch applies to its own source");
     let effects = state.reduce(Action::HistoryCompactionPatchApplied {
         reason: CompactReason::ContextOverflow,
         patch,
@@ -743,8 +742,6 @@ fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
     let mut legacy_history = state.session.history.clone();
     let guard = crate::agent::compaction::compaction_patch_guard_for(&legacy_history, 1, 3).expect("guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        range_start: 1,
-        range_end: 3,
         replacement: vec![crate::providers::ChatMessage::assistant(
             "[Context compacted at test. Summary: ISS-037 parity summary]",
         )],
@@ -760,7 +757,8 @@ fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
         ..crate::config::AgentCompactionConfig::default()
     };
 
-    crate::agent::compaction::apply_compaction_patch_exact(&mut legacy_history, &patch);
+    crate::agent::compaction::apply_compaction_patch_exact(&mut legacy_history, &patch)
+        .expect("test: legacy patch applies to its own source");
     let _ = state.reduce(Action::HistoryCompactionPatchApplied {
         reason: CompactReason::ContextOverflow,
         patch,
@@ -815,8 +813,6 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
     let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
     let guard = crate::agent::compaction::compaction_patch_guard_for(&state.session.history, 1, 3).expect("guard");
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        range_start: 1,
-        range_end: 3,
         replacement: vec![crate::providers::ChatMessage::assistant(
             "[Context compacted at test. Summary: persisted-turn summary]",
         )],
@@ -883,7 +879,7 @@ fn post_compaction_refresh_not_persisted_as_session_turn() {
 }
 
 #[test]
-fn redux_compaction_patch_guard_mismatch_falls_back_without_stale_patch() {
+fn redux_compaction_patch_guard_mismatch_leaves_history_unchanged() {
     use crate::chat::action::CompactReason;
     let mut state = s();
     let original = vec![
@@ -898,9 +894,8 @@ fn redux_compaction_patch_guard_mismatch_falls_back_without_stale_patch() {
         .session
         .history
         .push(crate::providers::ChatMessage::user("mutation before reducer"));
+    let before_len = state.session.history.len();
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        range_start: 1,
-        range_end: 3,
         replacement: vec![crate::providers::ChatMessage::assistant(
             "[Context compacted at test. Summary: STALE_PROVIDER_SUMMARY]",
         )],
@@ -928,23 +923,25 @@ fn redux_compaction_patch_guard_mismatch_falls_back_without_stale_patch() {
             .all(|message| !message.content.contains("STALE_PROVIDER_SUMMARY")),
         "guard mismatch must not apply stale provider patch"
     );
-    assert!(
-        crate::agent::context_budget::plan_context_budget(
-            &state.session.history,
-            &config,
-            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD
-        )
-        .used_tokens
-            <= 80,
-        "fallback trim must bring history under literal hard limit 80"
+    assert_eq!(
+        state.session.history.len(),
+        before_len,
+        "a rejected patch must leave the reducer history unchanged (no fallback trim)"
     );
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        Effect::LogTrace {
-            level: tracing::Level::WARN,
-            msg
-        } if msg.contains("guard mismatch")
-    )));
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+        "a rejected patch must not save"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg
+            } if msg.contains("rejected")
+        )),
+        "a rejected patch logs a warning"
+    );
 }
 
 /// Step4-12: CancelRequested twice — the second one is a no-op (generating=false)

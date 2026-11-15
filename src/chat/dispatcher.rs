@@ -1765,12 +1765,35 @@ fn compaction_patch_for_reducer_without_pending_user(
     }
     reducer_target_with_pending.pop();
     crate::agent::turn_contracts::CompactionPatch {
-        range_start: 0,
-        range_end: reducer_source.len(),
         replacement: reducer_target_with_pending,
         append_after: Vec::new(),
         guard,
     }
+}
+
+/// Rebuild the provider view after a switch compacted the source: the
+/// compacted source with its final message (the plain request) replaced by the
+/// enriched request. When the request did not survive at the tail, the
+/// enriched request is appended, so it occurs exactly once either way.
+/// Older-turn enrichment is not carried over.
+fn provider_view_from_compacted_source(
+    compacted_source: &[crate::providers::traits::ChatMessage],
+    source_request: Option<crate::agent::context_preflight::CapturedTurnRequest>,
+    enriched_request: Option<crate::agent::context_preflight::CapturedTurnRequest>,
+) -> Vec<crate::providers::traits::ChatMessage> {
+    let mut view = compacted_source.to_vec();
+    let Some(enriched) = enriched_request else {
+        return view;
+    };
+    let tail_is_request = source_request.as_ref().is_some_and(|source| {
+        view.last()
+            .is_some_and(|last| last.role == source.message().role && last.content == source.message().content)
+    });
+    if tail_is_request {
+        view.pop();
+    }
+    view.push(enriched.into_message());
+    view
 }
 
 /// What a redux rollover attempt left behind for its caller.
@@ -1895,21 +1918,47 @@ async fn apply_redux_context_rollover(
     };
 
     let replacement_len = patch.replacement.len();
-    let reducer_source_history = compaction_guard_history.clone();
-    crate::agent::compaction::apply_compaction_patch_exact(history, &patch);
-    crate::agent::compaction::apply_compaction_patch_exact(compaction_guard_history, &patch);
-    crate::agent::context_preflight::restore_current_turn_request(
-        history,
-        current_request,
-        trigger,
-        crate::agent::context_preflight::RestoredRequestPosition::Tail,
-    );
+    // The patch's guard describes the source (`compaction_guard_history`), never
+    // the provider view. Validate against the source before any mutation or send.
+    let mut compacted_source = compaction_guard_history.clone();
+    if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_source, &patch) {
+        tracing::warn!(
+            %error,
+            trigger,
+            guard_history_len = patch.guard.history_len,
+            source_len = compaction_guard_history.len(),
+            provider_view_len = history.len(),
+            "context switch patch does not describe its source; nothing was changed"
+        );
+        let budget = crate::agent::context_budget::plan_context_budget(
+            history,
+            config,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        crate::agent::compaction::persist_context_switch_degradation(
+            audit,
+            trigger,
+            "handoff_failed",
+            budget.used_tokens,
+            budget.used_tokens,
+            budget.available_input_tokens,
+        )
+        .await;
+        return Ok(ContextRolloverOutcome {
+            replacement_len: None,
+            degraded: true,
+        });
+    }
+    let reducer_source_history = std::mem::replace(compaction_guard_history, compacted_source);
     crate::agent::context_preflight::restore_current_turn_request(
         compaction_guard_history,
-        guard_request,
+        guard_request.clone(),
         trigger,
         crate::agent::context_preflight::RestoredRequestPosition::Tail,
     );
+    // Provider view = compacted source whose final message (the request) is
+    // replaced by the enriched request, so the request occurs exactly once.
+    *history = provider_view_from_compacted_source(compaction_guard_history, guard_request, current_request);
     let budget = crate::agent::context_budget::plan_context_budget(
         history,
         config,
@@ -1957,20 +2006,16 @@ async fn apply_redux_context_rollover(
         }
     }
     let mut restored_patch = patch;
-    restored_patch.range_end = reducer_source_history.len();
+    let range_start = restored_patch.range_start();
     let Some(guard) = crate::agent::compaction::compaction_patch_guard_for(
         &reducer_source_history,
-        restored_patch.range_start,
-        restored_patch.range_end,
+        range_start,
+        reducer_source_history.len(),
     ) else {
         return Err(());
     };
     restored_patch.guard = guard;
-    restored_patch.replacement = compaction_guard_history
-        .iter()
-        .skip(restored_patch.range_start)
-        .cloned()
-        .collect();
+    restored_patch.replacement = compaction_guard_history.iter().skip(range_start).cloned().collect();
     restored_patch.append_after.clear();
     let reducer_patch = compaction_patch_for_reducer_without_pending_user(
         &restored_patch,
@@ -2374,20 +2419,26 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 tokens_after,
                 used_context_tokens,
             } => {
-                anyhow::ensure!(
-                    crate::agent::compaction::compaction_patch_guard_matches(&source_history, &patch.guard),
-                    "worker compaction patch does not match its source"
-                );
                 let mut compacted_history = source_history;
-                crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_history, &patch);
+                if let Err(error) =
+                    crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_history, &patch)
+                {
+                    // No mutation and no reducer patch: the reducer keeps its
+                    // acknowledged history and the worker's own view proceeds.
+                    tracing::warn!(
+                        %error,
+                        guard_history_len = patch.guard.history_len,
+                        source_len = compacted_history.len(),
+                        "worker compaction patch does not match its source; reducer patch not sent"
+                    );
+                    return Ok(());
+                }
                 let patch = {
                     let mut source = self.reducer_history.lock();
                     let target = reducer_history_from_compacted_worker(&compacted_history);
                     let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
                         .ok_or_else(|| anyhow::anyhow!("invalid reducer compaction source"))?;
                     let patch = crate::agent::turn_contracts::CompactionPatch {
-                        range_start: 0,
-                        range_end: source.len(),
                         replacement: target.clone(),
                         append_after: Vec::new(),
                         guard,

@@ -237,14 +237,17 @@ pub(super) async fn run_manual_compact(request: ManualCompact<'_>, emit: &mut im
     )
     .await;
     if let Some(patch) = patch {
-        apply_chat_compaction_patch_and_sync(
+        if let Err(error) = apply_chat_compaction_patch_and_sync(
             history,
             Some(&source_history),
             patch,
             config,
             crate::chat::action::CompactReason::Manual,
             chat_dispatcher,
-        );
+        ) {
+            emit(&format!("Compaction refused: {error}. Nothing was changed."));
+            return;
+        }
         emit(&format_compact_feedback_after_history(
             turns_before,
             tokens_before,
@@ -386,15 +389,20 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
     config: &crate::config::AgentCompactionConfig,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
-) {
+) -> Result<(), crate::agent::turn_contracts::CompactionPatchError> {
     let replacement_len = patch.replacement.len();
-    if let Some(source_history) = patch_source_history {
-        let mut source_history = source_history.to_vec();
-        apply_compaction_patch_exact(&mut source_history, &patch);
-        *history = source_history;
-    } else {
-        apply_compaction_patch_exact(history, &patch);
+    let mut compacted = patch_source_history.map_or_else(|| history.clone(), <[ChatMessage]>::to_vec);
+    if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+        tracing::warn!(
+            guard_history_len = patch.guard.history_len,
+            range_start = patch.range_start(),
+            range_end = patch.range_end(),
+            source_len = compacted.len(),
+            "chat compaction patch does not describe its source; nothing was changed"
+        );
+        return Err(error);
     }
+    *history = compacted;
     let budget = crate::agent::context_budget::plan_context_budget(
         history,
         config,
@@ -422,6 +430,7 @@ pub(super) fn apply_chat_compaction_patch_and_sync(
         },
         "chat.history_compaction_patch_applied",
     );
+    Ok(())
 }
 
 pub(super) fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {

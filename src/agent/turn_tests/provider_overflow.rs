@@ -273,7 +273,8 @@ async fn provider_overflow_retry_keeps_current_request() {
                         &patch.guard
                     ));
                     let mut replayed = before.clone();
-                    crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch);
+                    crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch)
+                        .expect("test: published patch replays on its source");
                     let pairs = |messages: &[ChatMessage]| {
                         messages
                             .iter()

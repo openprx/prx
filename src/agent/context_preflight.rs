@@ -162,10 +162,22 @@ pub(super) async fn preflight_context_budget_before_provider_call(
 
 /// The turn's own request, captured before a context-budget removal can take
 /// it, with the number of messages that followed it at capture time.
+#[derive(Debug, Clone)]
 pub(crate) struct CapturedTurnRequest {
     message: ChatMessage,
     messages_after: usize,
     restore_message: Option<ChatMessage>,
+}
+
+impl CapturedTurnRequest {
+    /// The request exactly as it stood in the history it was captured from.
+    pub(crate) fn message(&self) -> &ChatMessage {
+        &self.message
+    }
+
+    pub(crate) fn into_message(self) -> ChatMessage {
+        self.message
+    }
 }
 
 /// Where a restored request goes back into history.

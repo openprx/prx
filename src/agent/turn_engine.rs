@@ -1470,72 +1470,106 @@ async fn run_turn_unguarded(
                                     // the patch. Restoring Q only in the worker would leave the saved
                                     // reducer view without the request (or duplicate it on replay).
                                     let mut compacted = history.clone();
-                                    apply_compaction_patch_exact(&mut compacted, &patch);
-                                    let switch_mode = matches!(config.mode, crate::config::AgentCompactionMode::Switch);
-                                    let budget = plan_context_budget(&compacted, config, PRE_TURN_FLUSH_THRESHOLD);
-                                    before_trim = budget;
-                                    if !switch_mode || budget.over_hard_limit {
-                                        trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                                            &mut compacted,
+                                    if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+                                        warn_overflow_patch_refused(&error);
+                                        restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
+                                        trim_overflow_without_handoff(
+                                            history,
                                             config,
-                                            patch.replacement.len(),
+                                            runtime_adapter.stream_provider,
+                                            messages_before_compaction,
+                                            tokens_before_compaction,
                                         );
+                                        degraded_reason = Some("handoff_unavailable");
+                                    } else {
+                                        let switch_mode =
+                                            matches!(config.mode, crate::config::AgentCompactionMode::Switch);
+                                        let budget = plan_context_budget(&compacted, config, PRE_TURN_FLUSH_THRESHOLD);
+                                        before_trim = budget;
+                                        if !switch_mode || budget.over_hard_limit {
+                                            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                                                &mut compacted,
+                                                config,
+                                                patch.replacement.len(),
+                                            );
+                                        }
+                                        if switch_mode && budget.over_hard_limit {
+                                            degraded_reason = Some("over_hard_limit_after_handoff");
+                                        }
+                                        restore_current_turn_request(
+                                            &mut compacted,
+                                            current_request.take(),
+                                            "overflow_retry",
+                                            restore_position,
+                                        );
+                                        let range_start = patch.range_start();
+                                        patch.guard = crate::agent::compaction::compaction_patch_guard_for(
+                                            history,
+                                            range_start,
+                                            history.len(),
+                                        )
+                                        .ok_or_else(|| anyhow::anyhow!("invalid overflow compaction patch range"))?;
+                                        patch.replacement = compacted.into_iter().skip(range_start).collect();
+                                        patch.append_after.clear();
+                                        let source_history = history.clone();
+                                        if let Err(error) = apply_compaction_patch_exact(history, &patch) {
+                                            warn_overflow_patch_refused(&error);
+                                            restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
+                                            current_request = capture_current_turn_request(history);
+                                            trim_overflow_without_handoff(
+                                                history,
+                                                config,
+                                                runtime_adapter.stream_provider,
+                                                messages_before_compaction,
+                                                tokens_before_compaction,
+                                            );
+                                            degraded_reason = Some("handoff_unavailable");
+                                        } else {
+                                            let turns_after = history.len().saturating_sub(usize::from(
+                                                history.first().is_some_and(|message| message.role == "system"),
+                                            ));
+                                            let tokens_after = estimate_history_tokens(history);
+                                            let used_context_tokens =
+                                                plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD)
+                                                    .used_tokens;
+                                            emit_tool_loop_event(
+                                                &runtime_adapter,
+                                                ToolLoopEvent::ContextCompactionPatch {
+                                                    source_history,
+                                                    patch,
+                                                    config: config.clone(),
+                                                    turns_before,
+                                                    tokens_before: tokens_before_compaction,
+                                                    turns_after,
+                                                    tokens_after,
+                                                    used_context_tokens,
+                                                },
+                                            )
+                                            .await?;
+                                            emitted_exact_patch = true;
+                                        }
                                     }
-                                    if switch_mode && budget.over_hard_limit {
-                                        degraded_reason = Some("over_hard_limit_after_handoff");
-                                    }
-                                    restore_current_turn_request(
-                                        &mut compacted,
-                                        current_request.take(),
-                                        "overflow_retry",
-                                        restore_position,
-                                    );
-                                    patch.range_end = history.len();
-                                    patch.guard = crate::agent::compaction::compaction_patch_guard_for(
+                                } else if let Err(error) = apply_compaction_patch_exact(history, &patch) {
+                                    warn_overflow_patch_refused(&error);
+                                    restore_position = RestoredRequestPosition::AboveEverythingLeftStanding;
+                                    trim_overflow_without_handoff(
                                         history,
-                                        patch.range_start,
-                                        patch.range_end,
-                                    )
-                                    .ok_or_else(|| anyhow::anyhow!("invalid overflow compaction patch range"))?;
-                                    patch.replacement = compacted.into_iter().skip(patch.range_start).collect();
-                                    patch.append_after.clear();
-                                    let source_history = history.clone();
-                                    apply_compaction_patch_exact(history, &patch);
-                                    let turns_after = history.len().saturating_sub(usize::from(
-                                        history.first().is_some_and(|message| message.role == "system"),
-                                    ));
-                                    let tokens_after = estimate_history_tokens(history);
-                                    let used_context_tokens =
-                                        plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
-                                    emit_tool_loop_event(
-                                        &runtime_adapter,
-                                        ToolLoopEvent::ContextCompactionPatch {
-                                            source_history,
-                                            patch,
-                                            config: config.clone(),
-                                            turns_before,
-                                            tokens_before: tokens_before_compaction,
-                                            turns_after,
-                                            tokens_after,
-                                            used_context_tokens,
-                                        },
-                                    )
-                                    .await?;
-                                    emitted_exact_patch = true;
-                                } else {
-                                    apply_compaction_patch_exact(history, &patch);
+                                        config,
+                                        runtime_adapter.stream_provider,
+                                        messages_before_compaction,
+                                        tokens_before_compaction,
+                                    );
+                                    degraded_reason = Some("handoff_unavailable");
                                 }
                             }
                             Ok(None) => {
-                                if runtime_adapter.stream_provider {
-                                    trim_history_to_context_budget(history, config);
-                                }
-                                if !runtime_adapter.stream_provider
-                                    || history.len() == messages_before_compaction
-                                        && estimate_history_tokens(history) >= tokens_before_compaction
-                                {
-                                    apply_aggressive_trim(history, config.keep_recent_messages);
-                                }
+                                trim_overflow_without_handoff(
+                                    history,
+                                    config,
+                                    runtime_adapter.stream_provider,
+                                    messages_before_compaction,
+                                    tokens_before_compaction,
+                                );
                                 degraded_reason = Some("handoff_unavailable");
                             }
                             Err(error) => {
@@ -2102,6 +2136,45 @@ async fn run_turn_unguarded(
                 "stopped after a repeated unrecoverable tool failure ('{tool_name}' is blocked by policy/permissions); not retrying further"
             );
         }
+    }
+}
+
+/// Logs a refused overflow compaction patch with lengths and range only.
+fn warn_overflow_patch_refused(error: &crate::agent::turn_contracts::CompactionPatchError) {
+    match error {
+        crate::agent::turn_contracts::CompactionPatchError::RangeOutOfBounds { start, end, len } => tracing::warn!(
+            range_start = *start,
+            range_end = *end,
+            history_len = *len,
+            "overflow compaction patch range out of bounds; trimming without a handoff"
+        ),
+        crate::agent::turn_contracts::CompactionPatchError::GuardMismatch {
+            expected_len,
+            actual_len,
+        } => tracing::warn!(
+            guard_history_len = *expected_len,
+            history_len = *actual_len,
+            "overflow compaction patch guard mismatch; trimming without a handoff"
+        ),
+    }
+}
+
+/// The overflow retry's trim when no handoff can be applied: budget trim for
+/// streaming providers, aggressive trim when that made no progress.
+fn trim_overflow_without_handoff(
+    history: &mut Vec<ChatMessage>,
+    config: &crate::config::AgentCompactionConfig,
+    stream_provider: bool,
+    messages_before_compaction: usize,
+    tokens_before_compaction: usize,
+) {
+    if stream_provider {
+        trim_history_to_context_budget(history, config);
+    }
+    if !stream_provider
+        || history.len() == messages_before_compaction && estimate_history_tokens(history) >= tokens_before_compaction
+    {
+        apply_aggressive_trim(history, config.keep_recent_messages);
     }
 }
 

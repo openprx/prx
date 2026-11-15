@@ -1,7 +1,9 @@
 use crate::agent::context_budget::estimate_history_tokens;
 use crate::agent::document_ingest::DocumentIngestRuntime;
 use crate::agent::response_guard::strip_assistant_fabricated_tool_markers;
-use crate::agent::turn_contracts::{CompactionPatch, CompactionPatchGuard, POST_COMPACTION_REFRESH_MARKER};
+use crate::agent::turn_contracts::{
+    CompactionPatch, CompactionPatchError, CompactionPatchGuard, POST_COMPACTION_REFRESH_MARKER,
+};
 use crate::memory::{
     CompactionRunInput, CompactionSourceEventRange, Memory, MemoryCategory, MemoryPrincipal, MemoryStoreMetadata,
     MemoryWriteContext, MessageEvent, SessionContextQuery,
@@ -109,10 +111,29 @@ pub fn compaction_patch_guard_matches(history: &[ChatMessage], guard: &Compactio
     current == *guard
 }
 
-pub fn apply_compaction_patch_exact(history: &mut Vec<ChatMessage>, patch: &CompactionPatch) {
-    history.splice(patch.range_start..patch.range_end, patch.replacement.clone());
-    let append_index = patch.range_start + patch.replacement.len();
-    history.splice(append_index..append_index, patch.append_after.clone());
+/// Applies `patch` to `history` only when the patch's guard describes it.
+/// The replaced range is the guard's range. Both the bounds and the guard are
+/// checked before any mutation, so on error `history` is unchanged.
+pub fn apply_compaction_patch_exact(
+    history: &mut Vec<ChatMessage>,
+    patch: &CompactionPatch,
+) -> Result<(), CompactionPatchError> {
+    let start = patch.range_start();
+    let end = patch.range_end();
+    let len = history.len();
+    if start > end || end > len {
+        return Err(CompactionPatchError::RangeOutOfBounds { start, end, len });
+    }
+    if !compaction_patch_guard_matches(history, &patch.guard) {
+        return Err(CompactionPatchError::GuardMismatch {
+            expected_len: patch.guard.history_len,
+            actual_len: len,
+        });
+    }
+    let append_index = start.saturating_add(patch.replacement.len());
+    history.splice(start..end, patch.replacement.iter().cloned());
+    history.splice(append_index..append_index, patch.append_after.iter().cloned());
+    Ok(())
 }
 
 fn compaction_summary_fidelity_status(
@@ -1088,8 +1109,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         let handoff_message = format!("{CONTEXT_HANDOFF_START}\n{note_json}\n{CONTEXT_HANDOFF_END}");
         persist_context_switch(audit, trigger, source, &handoff_event_id, &handoff_message, &note_json).await?;
         return Ok(Some(CompactionPatch {
-            range_start: start,
-            range_end: compact_end,
             replacement: vec![ChatMessage::assistant(handoff_message)],
             append_after: Vec::new(),
             guard,
@@ -1242,8 +1261,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     let append_after = vec![post_compaction_refresh_aside()];
 
     Ok(Some(CompactionPatch {
-        range_start: start,
-        range_end: compact_end,
         replacement,
         append_after,
         guard,
@@ -1266,7 +1283,7 @@ pub(super) async fn apply_configurable_compaction_with_replacement_len(
     // as progress even though it produces no user-visible output.
     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
     let replacement_len = patch.replacement.len();
-    apply_compaction_patch_exact(history, &patch);
+    apply_compaction_patch_exact(history, &patch)?;
     Ok(Some(replacement_len))
 }
 

@@ -382,54 +382,52 @@ impl ChatState {
         compaction_config: &crate::config::AgentCompactionConfig,
     ) -> Vec<Effect> {
         let history = &mut self.session.history;
-        if crate::agent::compaction::compaction_patch_guard_matches(history, &patch.guard) {
-            crate::agent::compaction::apply_compaction_patch_exact(history, &patch);
-            let budget = crate::agent::context_budget::plan_context_budget(
+        if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(history, &patch) {
+            // The patch does not describe the reducer's history: nothing is
+            // changed and nothing is saved.
+            return vec![Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: format!(
+                    "HistoryCompactionPatch rejected reason={reason:?}; {error}; history unchanged len={}",
+                    history.len()
+                ),
+            }];
+        }
+        let budget = crate::agent::context_budget::plan_context_budget(
+            history,
+            compaction_config,
+            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        let trim_fallback = if budget.over_hard_limit {
+            crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                 history,
                 compaction_config,
-                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
-            );
-            let trim_fallback = if budget.over_hard_limit {
-                crate::agent::context_budget::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
-                    history,
-                    compaction_config,
+                patch.replacement.len(),
+            )
+        } else {
+            false
+        };
+        self.session.turns = durable_turns_from_compacted_history(history);
+        self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+        self.ui.turn_count = self.session.turns.len();
+
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!(
+                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
+                    patch.range_start(),
+                    patch.range_end(),
                     patch.replacement.len(),
-                )
-            } else {
-                false
-            };
-            self.session.turns = durable_turns_from_compacted_history(history);
-            self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
-            self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
-            self.ui.turn_count = self.session.turns.len();
-
-            return vec![
-                Effect::LogTrace {
-                    level: tracing::Level::INFO,
-                    msg: format!(
-                        "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
-                        patch.range_start,
-                        patch.range_end,
-                        patch.replacement.len(),
-                        patch.append_after.len(),
-                        trim_fallback,
-                        history.len()
-                    ),
-                },
-                Effect::SaveSession(self.build_session_snapshot()),
-                Effect::RequestRedraw,
-            ];
-        }
-
-        let before_len = history.len();
-        let trimmed = crate::agent::context_budget::trim_history_to_context_budget(history, compaction_config);
-        vec![Effect::LogTrace {
-            level: tracing::Level::WARN,
-            msg: format!(
-                "HistoryCompactionPatch guard mismatch reason={reason:?}; stale patch ignored; trim_fallback={trimmed} before_len={before_len} after_len={}",
-                history.len()
-            ),
-        }]
+                    patch.append_after.len(),
+                    trim_fallback,
+                    history.len()
+                ),
+            },
+            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::RequestRedraw,
+        ]
     }
 
     /// `Action::HistoryCompactionDegraded` — one user-visible line per turn when

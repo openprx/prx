@@ -123,11 +123,35 @@ pub struct CompactionPatchGuard {
 
 #[derive(Debug, Clone)]
 pub struct CompactionPatch {
-    pub range_start: usize,
-    pub range_end: usize,
     pub replacement: Vec<ChatMessage>,
     pub append_after: Vec<ChatMessage>,
     pub guard: CompactionPatchGuard,
+}
+
+impl CompactionPatch {
+    /// The replaced range is always the guard's range; the patch does not
+    /// carry a second copy that could disagree with it.
+    #[must_use]
+    pub fn range_start(&self) -> usize {
+        self.guard.range_start
+    }
+
+    #[must_use]
+    pub fn range_end(&self) -> usize {
+        self.guard.range_end
+    }
+}
+
+/// Typed reason a compaction patch was not applied. The history is unchanged
+/// whenever this is returned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompactionPatchError {
+    #[error("compaction patch range {start}..{end} is out of bounds for history length {len}")]
+    RangeOutOfBounds { start: usize, end: usize, len: usize },
+    #[error(
+        "compaction patch guard does not describe this history (guard length {expected_len}, history length {actual_len})"
+    )]
+    GuardMismatch { expected_len: usize, actual_len: usize },
 }
 
 /// Opens the loop-authored tool-result message in prompt-guided mode.
