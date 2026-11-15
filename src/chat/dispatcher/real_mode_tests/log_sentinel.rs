@@ -1,0 +1,297 @@
+//! Payload-free logging (R3): a TRACE capture over the TUI executor, the
+//! non-TUI persistence-only executor and the test shadow executor running
+//! `SaveSession`, `PublishSession`, `AutoTitleSession` and a compaction patch
+//! with its `LogTrace`, plus a resume of a titled session, a paste and a
+//! sentinel typed key by key. The sentinel in turn content, title, tool
+//! `args_preview` and input never reaches the captured output; the stored row
+//! is sanitized.
+
+use super::*;
+use crate::chat::acked_session::{SessionCommit, SessionPublisher};
+use crate::chat::session::{ChatTurn, ToolCallSummary};
+use crate::providers::ChatMessage;
+use std::sync::LazyLock;
+use tracing_subscriber::fmt::MakeWriter;
+
+const SENTINEL: &str = "SENTINEL-7f3a";
+/// A credential the persistence redactor replaces.
+const SECRET: &str = "AKIAABCDEFGHIJKLMNOP";
+/// Upper bound for one test.
+const DEADLINE: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Registered once and never dropped, interested in nothing: with two live
+/// dispatchers `tracing-core` computes callsite interest from all of them, so
+/// a sibling test reaching a line first cannot cache "never" for this capture.
+static PLURAL_DISPATCHERS: LazyLock<tracing::Dispatch> =
+    LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+/// A TRACE capture installed as this thread's default (the test runtime is
+/// current-thread, so the dispatcher task runs under it too).
+fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    LazyLock::force(&PLURAL_DISPATCHERS);
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    (logs.clone(), tracing::subscriber::set_default(subscriber))
+}
+
+fn sqlite_memory() -> (TempDir, Arc<dyn Memory>) {
+    let dir = TempDir::new().expect("test: temp dir");
+    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(dir.path()).expect("test: sqlite memory"));
+    (dir, memory)
+}
+
+fn sentinel_session() -> ChatSession {
+    let mut session = ChatSession::new("provider", "model");
+    session.title = format!("title {SENTINEL}");
+    session.turns = vec![
+        ChatTurn {
+            role: "user".to_owned(),
+            content: format!("turn {SENTINEL} key {SECRET}"),
+            timestamp: chrono::Utc::now(),
+            tool_calls: vec![ToolCallSummary {
+                name: "shell".to_owned(),
+                args_preview: format!("{{\"command\":\"echo {SENTINEL}\"}}"),
+                success: true,
+                task_id: None,
+                sequence: None,
+            }],
+        },
+        ChatTurn {
+            role: "assistant".to_owned(),
+            content: format!("reply {SENTINEL}"),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        },
+        ChatTurn {
+            role: "user".to_owned(),
+            content: format!("again {SENTINEL}"),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        },
+        ChatTurn {
+            role: "assistant".to_owned(),
+            content: format!("done {SENTINEL}"),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        },
+    ];
+    session
+}
+
+/// The reducer effects of a sentinel-bearing compaction patch (its
+/// `LogTrace`, `SaveSession` and redraw), then `PublishSession` and
+/// `AutoTitleSession`.
+fn sentinel_effects() -> Vec<crate::chat::state::Effect> {
+    let mut state = crate::chat::acked_session::TestSessionDispatcher::state_with_history(Vec::new());
+    let _ = state.reduce(Action::SessionLoaded {
+        session: sentinel_session(),
+        persist: false,
+    });
+    let history = state.session.history.clone();
+    let patch = crate::agent::turn_contracts::CompactionPatch {
+        replacement: vec![ChatMessage::assistant(format!("summary {SENTINEL}"))],
+        append_after: Vec::new(),
+        guard: crate::agent::compaction::compaction_patch_guard_for(&history, 0, 2)
+            .expect("test: guard over the reducer history"),
+    };
+    let mut effects = state.reduce(Action::HistoryCompactionPatchApplied {
+        reason: crate::chat::action::CompactReason::Manual,
+        patch,
+        compaction_config: crate::config::AgentCompactionConfig::default(),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, crate::chat::state::Effect::SaveSession(_))),
+        "test: the patch applies and saves"
+    );
+    let commit = SessionCommit {
+        session: state.build_session_snapshot(),
+        load_epoch: state.session.load_epoch,
+        revision: state.session.revision.saturating_add(1),
+    };
+    effects.push(crate::chat::state::Effect::PublishSession(commit));
+    effects.push(crate::chat::state::Effect::AutoTitleSession(format!("auto {SENTINEL}")));
+    effects
+}
+
+fn publisher() -> SessionPublisher {
+    SessionPublisher::new(crate::chat::acked_session::AckedSession::unseeded())
+}
+
+async fn run_effects(executor: &EffectExecutor) {
+    for effect in sentinel_effects() {
+        executor.execute(effect).await;
+    }
+}
+
+async fn stored_rows(memory: &dyn Memory) -> String {
+    memory
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .expect("test: list stored rows")
+        .into_iter()
+        .map(|entry| entry.content)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_no_sentinel(logs: &str, surface: &str) {
+    assert!(
+        !logs.contains(SENTINEL),
+        "{surface}: the sentinel reached a log line:\n{logs}"
+    );
+    assert!(!logs.contains(SECRET), "{surface}: the secret reached a log line");
+}
+
+#[tokio::test]
+async fn executors_never_log_session_content() {
+    tokio::time::timeout(DEADLINE, async {
+        let (logs, _guard) = capture_logs();
+        let (_tui_dir, tui_memory) = sqlite_memory();
+        let (deps, _action_rx, _hooks, _hook_dir) = build_deps(Arc::clone(&tui_memory), CancellationToken::new());
+        let tui = EffectExecutor::new_with_deps(deps).with_session_publisher(publisher());
+        run_effects(&tui).await;
+        let tui_logs = logs.text();
+
+        let (_plain_dir, plain_memory) = sqlite_memory();
+        let (action_tx, _plain_rx) = mpsc::channel::<Action>(64);
+        let persistence_only = EffectExecutor::new_persistence_only(PersistenceDeps {
+            memory: Arc::clone(&plain_memory),
+            action_tx,
+            dual_write_guard: RuntimeDualWriteGuard::new(),
+        })
+        .with_session_publisher(publisher());
+        run_effects(&persistence_only).await;
+
+        run_effects(&EffectExecutor::new_shadow()).await;
+        let all_logs = logs.text();
+
+        assert!(
+            tui_logs.contains("HistoryCompactionPatchApplied") && tui_logs.contains("AutoTitleSession effect"),
+            "the capture records the executor's lines:\n{tui_logs}"
+        );
+        assert_eq!(
+            all_logs.matches("HistoryCompactionPatchApplied").count(),
+            3,
+            "each executor logged the patch's LogTrace:\n{all_logs}"
+        );
+        assert_no_sentinel(&all_logs, "executors");
+        for (memory, executor) in [(&tui_memory, "TUI"), (&plain_memory, "persistence-only")] {
+            let rows = stored_rows(memory.as_ref()).await;
+            assert!(rows.contains(SENTINEL), "{executor}: the session row is stored");
+            assert!(!rows.contains(SECRET), "{executor}: the stored row is sanitized");
+        }
+    })
+    .await
+    .expect("executors_never_log_session_content exceeded DEADLINE");
+}
+
+#[tokio::test]
+async fn resuming_a_titled_session_logs_no_title() {
+    tokio::time::timeout(DEADLINE, async {
+        let (logs, _guard) = capture_logs();
+        let (dir, memory) = sqlite_memory();
+        let session = sentinel_session();
+        crate::chat::session_store::save_session(memory.as_ref(), &session)
+            .await
+            .expect("test: store the titled session");
+        let fabric = crate::memory::MemoryFabric::new(Arc::clone(&memory), dir.path().to_string_lossy());
+
+        let resumed = crate::chat::run::resume_session(
+            Some(&session.id),
+            true,
+            &memory,
+            &fabric,
+            &crate::config::Config::default(),
+            "provider",
+            "model",
+        )
+        .await
+        .expect("test: resume the titled session");
+        let text = logs.text();
+
+        assert_eq!(resumed.id, session.id);
+        assert!(text.contains("Resumed session"), "the resume line is captured:\n{text}");
+        assert!(
+            text.contains("title_len"),
+            "the resume line carries only the title length:\n{text}"
+        );
+        assert_no_sentinel(&text, "resume");
+    })
+    .await
+    .expect("resuming_a_titled_session_logs_no_title exceeded DEADLINE");
+}
+
+#[cfg(feature = "terminal-tui")]
+#[test]
+fn typed_and_pasted_input_logs_no_characters() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    let (logs, _guard) = capture_logs();
+    let mut state = crate::chat::tui::TuiState::new("provider", "model");
+    for ch in SENTINEL.chars() {
+        let modifiers = if ch.is_ascii_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        let key = KeyEvent::new(KeyCode::Char(ch), modifiers);
+        crate::chat::tui_loop::log_tui_input_event(&Event::Key(key));
+        let _ = crate::chat::tui::dispatch_global_key(key, &mut state);
+    }
+    crate::chat::tui_loop::log_tui_input_event(&Event::Paste(format!("pasted {SENTINEL}")));
+    let text = logs.text();
+
+    assert_eq!(
+        state.input.lines.first().map(String::as_str),
+        Some(SENTINEL),
+        "test: the keys reached the input"
+    );
+    assert!(
+        text.contains("dispatch_global_key_entry") && text.contains("event_type=\"Key\"") && text.contains("Paste"),
+        "the key and paste lines are captured:\n{text}"
+    );
+    assert_no_sentinel(&text, "input");
+    let chars: Vec<char> = SENTINEL.chars().collect();
+    for window in chars.windows(3) {
+        let sequence: String = window.iter().collect();
+        assert!(
+            !text.contains(&sequence),
+            "a typed character sequence `{sequence}` reached a log line:\n{text}"
+        );
+    }
+    assert!(!text.contains("Char("), "no key event logs its character:\n{text}");
+}

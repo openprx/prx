@@ -63,6 +63,9 @@ mod runtime_display_tests;
 mod compact_command_tests;
 
 #[cfg(test)]
+mod acked_reads_tests;
+
+#[cfg(test)]
 mod provider_connection_tests;
 
 #[cfg(test)]

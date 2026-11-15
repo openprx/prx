@@ -139,6 +139,8 @@ mod one_shot;
 mod startup;
 pub use entry::{run, run_controlled};
 pub use one_shot::{ChatMessageRequest, ONE_SHOT_REFUSAL_EXIT_CODE, OneShotRefused, one_shot_exit_code, run_message};
+#[cfg(test)]
+pub(in crate::chat) use startup::resume_session;
 
 /// Run the interactive chat session with rich terminal UI.
 #[allow(clippy::too_many_lines)]
@@ -529,6 +531,8 @@ async fn run_internal(
     // Non-TUI fallback still needs a shared cancellation slot for SIGINT.
     #[cfg(not(feature = "terminal-tui"))]
     let active_cancel: Arc<parking_lot::Mutex<Option<CancellationToken>>> = Arc::new(parking_lot::Mutex::new(None));
+    // Fires when the line front end's stdin reaches EOF.
+    let stdin_closed = CancellationToken::new();
     // A one-shot reads no terminal input: its one message is queued below.
     #[cfg(feature = "terminal-tui")]
     let (terminal_guard, redraw_tx_for_main) = if one_shot.is_some() {
@@ -538,7 +542,7 @@ async fn run_internal(
         startup::terminal_input(
             plain_mode, entry::take_producer(&ctx), &ui_startup, &terminal, input_tx, &control_tx, &chat_mirror, &shutdown,
             &last_ctrlc_ms, &chat_dispatcher, &executor_redraw_slot, &snapshot_rx_for_tui,
-            &pty_handoff, &config, &security,
+            &pty_handoff, &config, &security, &stdin_closed,
         ).await
     };
     #[cfg(not(feature = "terminal-tui"))]
@@ -549,12 +553,7 @@ async fn run_internal(
     } else {
         println!("{banner}");
         eprintln!("{}", super::session_glue::current_chat_session_line(&chat_session.session().id));
-        let terminal_for_listen = TerminalChannel::new(plain_mode);
-        tokio::spawn(async move {
-            if let Err(e) = terminal_for_listen.listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx)).await {
-                tracing::error!("Terminal input loop error: {e}");
-            }
-        });
+        startup::spawn_line_input_listener(plain_mode, input_tx, stdin_closed.clone());
     }
 
     let mut plain_mode_turn_failed = false;
@@ -666,10 +665,7 @@ async fn run_internal(
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
     let mut pending_diff_apply: Option<PendingDiffApply> = None;
-    #[cfg(feature = "terminal-tui")]
     let mut input_events_open = one_shot.is_none();
-    #[cfg(not(feature = "terminal-tui"))]
-    let input_events_open = one_shot.is_none();
     // The one-shot message, queued literally (D4): no priority prefix or
     // command is interpreted. The input channel stays closed, so the loop
     // ends once this turn resolves.
@@ -947,6 +943,13 @@ async fn run_internal(
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
                     break Some(next);
                 }
+                continue;
+            },
+            // EOF on the line front end's stdin. Lines read before it are
+            // still queued; the arm waits until the input arm has taken them,
+            // then closes the input like a closed channel would.
+            () = stdin_closed.cancelled(), if input_events_open && input_rx.is_empty() => {
+                input_events_open = false;
                 continue;
             },
             lifecycle = provider_turn_lifecycle_rx.recv(), if provider_turn_lifecycle_events_open => {

@@ -211,7 +211,7 @@ pub(super) fn session_tools(
 
 /// `strict` (a one-shot naming a session, D2/D3): a missing session is an
 /// error instead of a fresh session, so the turn never runs elsewhere.
-pub(super) async fn resume_session(
+pub(in crate::chat) async fn resume_session(
     session_id: Option<&str>,
     strict: bool,
     mem: &Arc<dyn Memory>,
@@ -453,6 +453,7 @@ pub(super) async fn terminal_input(
     pty_handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
     config: &Config,
     security: &Arc<crate::security::SecurityPolicy>,
+    stdin_closed: &CancellationToken,
 ) -> (Option<TerminalGuard>, Option<mpsc::Sender<()>>) {
     let banner = ui_startup.banner;
     let session_line = crate::chat::session_glue::current_chat_session_line(ui_startup.session_id);
@@ -563,15 +564,7 @@ pub(super) async fn terminal_input(
                 // print it the old way.
                 println!("{banner}");
                 eprintln!("{session_line}");
-                let terminal_for_listen = TerminalChannel::new(plain_mode);
-                tokio::spawn(async move {
-                    if let Err(e) = terminal_for_listen
-                        .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
-                        .await
-                    {
-                        tracing::error!("Terminal input loop error: {e}");
-                    }
-                });
+                spawn_line_input_listener(plain_mode, input_tx, stdin_closed.clone());
                 (None, None)
             }
         }
@@ -587,17 +580,30 @@ pub(super) async fn terminal_input(
         // behaviour.
         println!("{banner}");
         eprintln!("{session_line}");
-        let terminal_for_listen = TerminalChannel::new(plain_mode);
-        tokio::spawn(async move {
-            if let Err(e) = terminal_for_listen
-                .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
-                .await
-            {
-                tracing::error!("Terminal input loop error: {e}");
-            }
-        });
+        spawn_line_input_listener(plain_mode, input_tx, stdin_closed.clone());
         (None, None)
     }
+}
+
+/// Read terminal lines (the plain / non-TTY front end) into the chat input
+/// channel. When stdin reaches EOF (or the read fails) `stdin_closed` fires:
+/// the input channel has other senders (scheduled and daemon-assigned input),
+/// so its closing cannot signal the end of the terminal.
+pub(super) fn spawn_line_input_listener(
+    plain_mode: bool,
+    input_tx: crate::runtime::h2_entry::ChatInputSender,
+    stdin_closed: CancellationToken,
+) {
+    let terminal_for_listen = TerminalChannel::new(plain_mode);
+    tokio::spawn(async move {
+        if let Err(e) = terminal_for_listen
+            .listen_input_sink(crate::runtime::h2_entry::TerminalInputSink::ordinary(input_tx))
+            .await
+        {
+            tracing::error!("Terminal input loop error: {e}");
+        }
+        stdin_closed.cancel();
+    });
 }
 
 pub(super) fn ctrlc_handler(

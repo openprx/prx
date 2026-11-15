@@ -109,6 +109,41 @@ pub(super) fn should_log_tui_key_event(key: &crossterm::event::KeyEvent) -> bool
     !matches!(key.code, KeyCode::Char(_)) || key.modifiers != KeyModifiers::NONE
 }
 
+/// Log one terminal input event's structure (paste, resize, control keys)
+/// without its content: key events carry only their class, pastes only their
+/// size, so typed or pasted text never reaches a log.
+#[cfg(feature = "terminal-tui")]
+pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
+    match ev {
+        crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
+            let (key_class, named_key) = crate::chat::tui::key_log_class(&k.code);
+            tracing::info!(
+                event_type = "Key",
+                key_class,
+                named_key = ?named_key,
+                modifiers = ?k.modifiers,
+                kind = ?k.kind,
+                "tui_input_event"
+            );
+        }
+        crossterm::event::Event::Key(_) => {}
+        crossterm::event::Event::Paste(s) => {
+            tracing::info!(
+                event_type = "Paste",
+                chars_count = s.chars().count(),
+                bytes_count = s.len(),
+                "tui_input_event"
+            );
+        }
+        crossterm::event::Event::Resize(w, h) => {
+            tracing::info!(event_type = "Resize", w, h, "tui_input_event");
+        }
+        other => {
+            tracing::info!(event_type = "Other", debug = ?other, "tui_input_event");
+        }
+    }
+}
+
 #[cfg(feature = "terminal-tui")]
 pub(super) fn is_plain_character_key(key: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -608,36 +643,7 @@ pub(super) fn run_tui_unified_loop(
             }
             crossterm::event::read()?
         };
-        // [DIAG] log structural events so we can observe paste/resize/control
-        // behavior without turning large plain-text input into a log flood.
-        match &ev {
-            crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
-                let (key_class, named_key) = crate::chat::tui::key_log_class(&k.code);
-                tracing::info!(
-                    event_type = "Key",
-                    key_class,
-                    named_key = ?named_key,
-                    modifiers = ?k.modifiers,
-                    kind = ?k.kind,
-                    "tui_input_event"
-                );
-            }
-            crossterm::event::Event::Key(_) => {}
-            crossterm::event::Event::Paste(s) => {
-                tracing::info!(
-                    event_type = "Paste",
-                    chars_count = s.chars().count(),
-                    bytes_count = s.len(),
-                    "tui_input_event"
-                );
-            }
-            crossterm::event::Event::Resize(w, h) => {
-                tracing::info!(event_type = "Resize", w, h, "tui_input_event");
-            }
-            other => {
-                tracing::info!(event_type = "Other", debug = ?other, "tui_input_event");
-            }
-        }
+        log_tui_input_event(&ev);
         match ev {
             Event::Key(key) => {
                 // Skip key-release events: terminals with

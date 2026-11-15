@@ -335,6 +335,7 @@ mod compaction_overflow;
 mod compaction_trim;
 mod dual_write;
 mod effects;
+mod log_sentinel;
 #[cfg(feature = "terminal-tui")]
 mod overflow_reducer;
 mod replay;

@@ -860,3 +860,51 @@ fn unparsed_syntax_propagates_pattern_error() {
         "syntax decision must propagate pattern error instead of returning false"
     );
 }
+
+/// A malformed `<tool_call>` body is logged by length, hash and parse error
+/// only: the body's content never reaches a log line (R3 payload-free logging).
+#[test]
+fn a_malformed_tool_call_body_logs_no_content() {
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    // A second, never-dropped dispatcher keeps callsite interest computed
+    // from every dispatcher, so a sibling test cannot cache "never" here.
+    static PLURAL_DISPATCHERS: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    std::sync::LazyLock::force(&PLURAL_DISPATCHERS);
+    let sentinel = "SENTINEL-7f3a";
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+
+    let parsed = tracing::subscriber::with_default(subscriber, || {
+        parse_tool_calls(&format!("<tool_call>{{\"name\": broken {sentinel}</tool_call>"))
+    });
+    let text = String::from_utf8_lossy(&captured.0.lock()).into_owned();
+
+    let (_, calls) = parsed.expect("a malformed body is reported, not an error");
+    assert!(calls.is_empty());
+    assert!(
+        text.contains("Malformed <tool_call> JSON") && text.contains("body_len") && text.contains("body_sha256"),
+        "the diagnostic is captured with its length and hash:\n{text}"
+    );
+    assert!(!text.contains(sentinel), "the body reached a log line:\n{text}");
+}

@@ -27,6 +27,12 @@ pub const RECALLED: &str = "RECALLED-AZURE-HERON-77";
 pub const NOTED: &str = "NOTED-OK";
 /// Reply prefix after a `file_read` result; the file name follows.
 pub const READ_DONE: &str = "READ-DONE-";
+/// A user line prefix: look up exactly the JSON arguments that follow.
+pub const LOOKUP_EXACTLY: &str = "lookup exactly ";
+/// Reply to a lookup the tool refused (another session's rows).
+pub const LOOKUP_REFUSED: &str = "LOOKUP-REFUSED";
+/// The lookup tool's refusal of rows outside the current session.
+const LOOKUP_REFUSAL: &str = "outside the authenticated session";
 /// Name of the recovery tool the handoff points at.
 pub const LOOKUP_TOOL: &str = "transcript_history_lookup";
 /// Markers around the handoff note.
@@ -44,6 +50,17 @@ pub const HANDOFF_END: &str = "[/context_handoff]";
 /// lossy trim. 5,700 restores the old history room:
 /// 5,700 - 256 - 2,348 = 3,096 (was 4,000 - 256 - 660 = 3,084).
 pub const SMALL_WINDOW_TOKENS: usize = 5_700;
+/// The window of the long switch, branch and restart cases, in tokens.
+///
+/// Every turn's request also quotes the session's own stored events in a
+/// `[Current session context]` preamble (capped at 12,288 bytes, about 3,500
+/// tokens). A session with many stored events (a long history, handoffs, a
+/// branch's copied rows) therefore needs that much more room than
+/// [`SMALL_WINDOW_TOKENS`], or every request ends in a lossy trim:
+/// 256 reserve + 2,348 tools + ~830 system + ~3,500 preamble leaves
+/// 9,500 - 6,934 = ~2,566 tokens of history, so a few tool-heavy turns still
+/// force a switch and the handoff plus the kept tail fit afterwards.
+pub const RECALL_WINDOW_TOKENS: usize = 9_500;
 /// Bytes of each tool-heavy fixture file (about 500 tokens of prose).
 pub const FILLER_BYTES: usize = 2_000;
 
@@ -92,15 +109,40 @@ fn text_of(message: &serde_json::Value) -> String {
     }
 }
 
-/// The lookup arguments of the newest handoff note in `request`, if any.
-pub fn handoff_lookup_arguments(request: &serde_json::Value) -> Option<serde_json::Value> {
+/// The newest handoff note in `request`, if any.
+pub fn handoff_note(request: &serde_json::Value) -> Option<serde_json::Value> {
     request["messages"].as_array()?.iter().rev().find_map(|message| {
         let text = text_of(message);
         let start = text.find(HANDOFF_START)? + HANDOFF_START.len();
         let end = text[start..].find(HANDOFF_END)? + start;
-        let note: serde_json::Value = serde_json::from_str(text[start..end].trim()).ok()?;
-        Some(note["lookup"]["arguments"].clone())
+        serde_json::from_str(text[start..end].trim()).ok()
     })
+}
+
+/// The lookup arguments of the newest handoff note in `request`, if any.
+pub fn handoff_lookup_arguments(request: &serde_json::Value) -> Option<serde_json::Value> {
+    handoff_note(request).map(|note| note["lookup"]["arguments"].clone())
+}
+
+/// The lookup arguments of the newest handoff note among the events of a
+/// lookup result (`text` is the tool output JSON).
+fn nested_handoff_lookup(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let output: serde_json::Value = serde_json::Deserializer::from_str(&text[start..])
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    output["events"]
+        .as_array()?
+        .iter()
+        .filter_map(|event| {
+            let content = event["content"].as_str()?;
+            let start = content.find(HANDOFF_START)? + HANDOFF_START.len();
+            let end = content[start..].find(HANDOFF_END)? + start;
+            serde_json::from_str::<serde_json::Value>(content[start..end].trim()).ok()
+        })
+        .max_by_key(|note| note["to_generation"].as_u64().unwrap_or(0))
+        .map(|note| note["lookup"]["arguments"].clone())
 }
 
 /// Whether `request` publishes `name` as a tool.
@@ -123,11 +165,24 @@ pub fn script() -> Script {
         };
         let content = text_of(last);
         if last["role"] == "tool" {
-            return if content.contains(CODENAME) {
-                Scripted::text(RECALLED)
-            } else {
-                Scripted::text(&format!("{READ_DONE}{}", newest_read_path(&messages)))
-            };
+            if content.contains(CODENAME) {
+                return Scripted::text(RECALLED);
+            }
+            if content.contains(LOOKUP_REFUSAL) {
+                return Scripted::text(LOOKUP_REFUSED);
+            }
+            // A lookup that returned an older handoff: follow its pointer.
+            if let Some(arguments) = nested_handoff_lookup(&content) {
+                return Scripted::tool(&format!("call-lookup-{index}"), LOOKUP_TOOL, &arguments);
+            }
+            return Scripted::text(&format!("{READ_DONE}{}", newest_read_path(&messages)));
+        }
+        if let Some(raw) = content
+            .rfind(LOOKUP_EXACTLY)
+            .map(|at| &content[at + LOOKUP_EXACTLY.len()..])
+        {
+            let arguments: serde_json::Value = serde_json::from_str(raw.trim()).expect("test: lookup arguments JSON");
+            return Scripted::tool(&format!("call-lookup-{index}"), LOOKUP_TOOL, &arguments);
         }
         if content.contains(RECALL) {
             return match handoff_lookup_arguments(request) {
@@ -192,8 +247,9 @@ pub fn chat_session_id(workspace: &std::path::Path) -> String {
     key.rsplit(':').next().unwrap_or_default().to_owned()
 }
 
-/// Persisted assistant replies so far; 0 while the store or its schema does
-/// not exist yet (the chat process creates both on start).
+/// Persisted assistant replies so far (a `/branch` copy of an earlier reply is
+/// not a reply); 0 while the store or its schema does not exist yet (the chat
+/// process creates both on start).
 pub fn assistant_reply_count(workspace: &std::path::Path) -> usize {
     let Ok(database) = rusqlite::Connection::open_with_flags(
         workspace.join("memory/brain.db"),
@@ -203,9 +259,134 @@ pub fn assistant_reply_count(workspace: &std::path::Path) -> usize {
     };
     database
         .query_row(
-            "SELECT COUNT(*) FROM message_events WHERE role = 'assistant' AND event_type = 'message.created'",
+            "SELECT COUNT(*) FROM message_events WHERE role = 'assistant' AND event_type = 'message.created' \
+             AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'branch-copy:%')",
             [],
             |row| row.get::<_, i64>(0),
         )
         .map_or(0, |count| usize::try_from(count).unwrap_or(0))
+}
+
+/// One stored context-switch handoff row.
+pub struct StoredHandoff {
+    pub event_id: String,
+    pub session_key: String,
+    /// The handoff note (JSON between the handoff markers).
+    pub note: serde_json::Value,
+}
+
+fn open_store(workspace: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        workspace.join("memory/brain.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("test: open real store")
+}
+
+/// Every `context.switch.created` row of the real store, oldest first.
+pub fn stored_handoffs(workspace: &std::path::Path) -> Vec<StoredHandoff> {
+    let database = open_store(workspace);
+    let mut statement = database
+        .prepare(
+            "SELECT event_id, COALESCE(session_key, ''), content FROM message_events \
+             WHERE event_type = 'context.switch.created' ORDER BY id",
+        )
+        .expect("test: handoff query");
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("test: handoff rows")
+        .map(|row| {
+            let (event_id, session_key, content) = row.expect("test: handoff row");
+            let start = content.find(HANDOFF_START).expect("test: handoff start marker") + HANDOFF_START.len();
+            let end = content[start..].find(HANDOFF_END).expect("test: handoff end marker") + start;
+            let note = serde_json::from_str(content[start..end].trim()).expect("test: handoff note JSON");
+            StoredHandoff {
+                event_id,
+                session_key,
+                note,
+            }
+        })
+        .collect()
+}
+
+/// The handoffs of the session whose key ends with `session_id`.
+pub fn session_handoffs(workspace: &std::path::Path, session_id: &str) -> Vec<StoredHandoff> {
+    stored_handoffs(workspace)
+        .into_iter()
+        .filter(|handoff| handoff.session_key.ends_with(session_id))
+        .collect()
+}
+
+/// Assert `handoffs` form one chain: generation 1, 2, … with each parent the
+/// previous row's event id.
+pub fn assert_handoff_chain(handoffs: &[StoredHandoff], min_generation: u64) {
+    assert!(
+        handoffs.len() as u64 >= min_generation,
+        "at least {min_generation} handoffs; found {}",
+        handoffs.len()
+    );
+    let mut parent: Option<&str> = None;
+    for (index, handoff) in handoffs.iter().enumerate() {
+        let generation = index as u64 + 1;
+        assert_eq!(
+            handoff.note["to_generation"], generation,
+            "handoff {index}: {}",
+            handoff.note
+        );
+        assert_eq!(
+            handoff.note["handoff_event_id"],
+            handoff.event_id.as_str(),
+            "handoff {index}"
+        );
+        match parent {
+            None => assert!(
+                handoff.note["parent_handoff_event_id"].is_null(),
+                "generation 1 has no parent"
+            ),
+            Some(parent) => assert_eq!(
+                handoff.note["parent_handoff_event_id"], parent,
+                "generation {generation} points at its parent"
+            ),
+        }
+        parent = Some(handoff.event_id.as_str());
+    }
+}
+
+/// Content of the stored user message that planted the fact.
+pub fn planted_row_content(workspace: &std::path::Path) -> String {
+    open_store(workspace)
+        .query_row(
+            "SELECT content FROM message_events WHERE role = 'user' AND event_type = 'message.created' \
+             AND content LIKE ?1 ORDER BY id LIMIT 1",
+            [format!("%{CODENAME}%")],
+            |row| row.get(0),
+        )
+        .expect("test: planted user row")
+}
+
+/// Whether any stored event records the `over_hard_limit_after_handoff`
+/// degradation.
+pub fn over_hard_limit_after_handoff(workspace: &std::path::Path) -> bool {
+    crate::loopback_openai::message_events(workspace)
+        .iter()
+        .any(|event| event.content.contains("over_hard_limit_after_handoff"))
+}
+
+/// The content of every `role: tool` message of every request that carries
+/// the codename (the lookup results).
+pub fn lookup_results(requests: &[serde_json::Value]) -> Vec<String> {
+    requests
+        .iter()
+        .filter_map(|request| request["messages"].as_array())
+        .flatten()
+        .filter(|message| message["role"] == "tool")
+        .map(text_of)
+        .filter(|text| text.contains(CODENAME))
+        .collect()
 }
