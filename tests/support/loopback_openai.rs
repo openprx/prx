@@ -314,12 +314,14 @@ pub fn write_config(
     model: &str,
     edit: impl FnOnce(&mut openprx::config::Config),
 ) {
-    let mut config = openprx::config::Config::default();
-    config.default_provider = Some(provider.to_owned());
-    config.default_model = Some(model.to_owned());
-    config.api_key = Some("prx-test-credential".to_owned());
+    let mut config = openprx::config::Config {
+        default_provider: Some(provider.to_owned()),
+        default_model: Some(model.to_owned()),
+        api_key: Some("prx-test-credential".to_owned()),
+        ..openprx::config::Config::default()
+    };
     config.auth.codex_auth_json_auto_import = false;
-    config.memory.embedding_provider = "none".to_owned();
+    "none".clone_into(&mut config.memory.embedding_provider);
     config.reliability.provider_retries = 0;
     config.reliability.fallback_providers.clear();
     config.cost.prices.insert(

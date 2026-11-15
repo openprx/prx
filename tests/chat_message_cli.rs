@@ -24,7 +24,7 @@ const PLANTED: &str = "PRX-FALCON-7";
 fn serve(sandbox: &Sandbox, script: Script) -> LoopbackOpenAi {
     let server = LoopbackOpenAi::start(MODEL, Some((5, 3)), script);
     write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
-        config.workspace_dir = sandbox.workspace.clone();
+        config.workspace_dir.clone_from(&sandbox.workspace);
         config.autonomy.level = openprx::security::AutonomyLevel::Full;
         // Recall comes from the session history alone, never from autosaved memories.
         config.memory.auto_save = false;
@@ -103,8 +103,10 @@ fn current_session_id(stderr: &str) -> String {
     stderr
         .lines()
         .find_map(|line| line.strip_prefix("current chat session: "))
-        .map(|id| id.trim().to_owned())
-        .unwrap_or_else(|| panic!("no session id line in stderr: {stderr}"))
+        .map_or_else(
+            || panic!("no session id line in stderr: {stderr}"),
+            |id| id.trim().to_owned(),
+        )
 }
 
 /// CF-R6: a plain session resumed with `--session <id>` (real stdin) publishes

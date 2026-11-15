@@ -79,7 +79,7 @@ impl Pty {
     }
 
     /// Current capture length, a mark for [`Self::read_until`].
-    pub fn mark(&self) -> usize {
+    pub const fn mark(&self) -> usize {
         self.capture.len()
     }
 

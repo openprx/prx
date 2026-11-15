@@ -32,7 +32,7 @@ fn edit_call(id: &str, old: &str, new: &str) -> Scripted {
 fn start(sandbox: &Sandbox, script: Script) -> (LoopbackOpenAi, Pty) {
     let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script);
     loopback_openai::write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
-        config.workspace_dir = sandbox.workspace.clone();
+        config.workspace_dir.clone_from(&sandbox.workspace);
         config.autonomy.level = openprx::security::AutonomyLevel::Supervised;
     });
     std::fs::write(sandbox.workspace.join("notes.txt"), ORIGINAL).expect("test: notes.txt");

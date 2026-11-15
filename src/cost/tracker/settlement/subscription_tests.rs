@@ -151,7 +151,7 @@ fn conflicting_replay_is_refused_and_keeps_one_row() -> Result<()> {
     // A stored metered row with the same settlement id is not a subscription row.
     let metered_workspace = tempfile::tempdir()?;
     let metered_tracker = CostTracker::new(config(), metered_workspace.path())?;
-    let mut metered = record.clone();
+    let mut metered = record;
     metered.provider = "prx_provider".to_owned();
     metered.model = "prx_model".to_owned();
     metered.cost_usd = Some(0.0);
@@ -159,7 +159,7 @@ fn conflicting_replay_is_refused_and_keeps_one_row() -> Result<()> {
         metered_tracker.settle_metered(&metered)?,
         CostSettlement::Recorded { .. }
     ));
-    let mut same_projection = metered.clone();
+    let mut same_projection = metered;
     same_projection.cost_usd = None;
     let refused = metered_tracker
         .project_recovery_usage(

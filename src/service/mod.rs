@@ -407,16 +407,20 @@ fn classify_launchd_status(output: &CapturedCommand, unit_exists: bool) -> (Serv
     let last_exit = job
         .last_exit_status
         .map_or_else(|| "none".to_string(), |status| status.to_string());
-    match job.pid {
-        Some(pid) => (
-            ServiceState::Running,
-            format!("pid={pid}; last exit status={last_exit}"),
-        ),
-        None => (
-            ServiceState::Stopped,
-            format!("not running; last exit status={last_exit}"),
-        ),
-    }
+    job.pid.map_or_else(
+        || {
+            (
+                ServiceState::Stopped,
+                format!("not running; last exit status={last_exit}"),
+            )
+        },
+        |pid| {
+            (
+                ServiceState::Running,
+                format!("pid={pid}; last exit status={last_exit}"),
+            )
+        },
+    )
 }
 
 async fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {

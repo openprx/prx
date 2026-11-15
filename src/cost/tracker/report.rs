@@ -291,9 +291,17 @@ mod tests {
         assert_eq!(report.all_time.subscription_requests, 1);
         assert_eq!(report.all_time.total_tokens, 21);
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["by_model"]["kimi-code/k"]["billing"], "subscription");
-        assert_eq!(json["by_model"]["kimi-code/k"]["subscription_requests"], 1);
-        assert!(json["by_model"]["alpha/model"].get("billing").is_none());
+        let kimi = json.pointer("/by_model/kimi-code~1k");
+        assert_eq!(
+            kimi.and_then(|model| model.get("billing")),
+            Some(&serde_json::json!("subscription"))
+        );
+        assert_eq!(
+            kimi.and_then(|model| model.get("subscription_requests")),
+            Some(&serde_json::json!(1))
+        );
+        let alpha = json.pointer("/by_model/alpha~1model").expect("test: alpha row");
+        assert!(alpha.get("billing").is_none());
     }
 
     #[test]

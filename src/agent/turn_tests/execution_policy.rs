@@ -308,7 +308,7 @@ fn file_edit_grant_authorizes_once() {
     let issued = runtime_approval_grant_for_call("file_edit", &args, Some(&scope)).expect("file_edit grant");
     // The tool reads the grant from its runtime arguments with the trusted
     // scope the executor attaches, which binds the caller principal.
-    let mut runtime_args = args.clone();
+    let mut runtime_args = args;
     runtime_args[crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG] =
         serde_json::to_value(&issued).expect("serialize grant");
     runtime_args["_zc_scope_trusted"] = serde_json::Value::Bool(true);

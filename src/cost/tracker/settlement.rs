@@ -119,7 +119,10 @@ impl CostTracker {
         let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
         storage.refresh_from_disk()?;
         if pricing == RecoveryPricing::Subscription {
-            if let SubscriptionAppend::Replayed = self.append_subscription(&mut storage, settlement_id, record)? {
+            if matches!(
+                self.append_subscription(&mut storage, settlement_id, record)?,
+                SubscriptionAppend::Replayed
+            ) {
                 sync_replayed(&storage)?;
             }
             return Ok(());
