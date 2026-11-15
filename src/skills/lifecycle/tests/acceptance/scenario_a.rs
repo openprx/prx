@@ -3,8 +3,8 @@
 //! Scenario A: create a skill from observed repeated work, starting from NO
 //! skill (spec section 17 A, finding 108.1).
 //!
-//! Nothing exists at the start. Real tasks run through the agent entry
-//! (`crate::agent::run`) without any managed skill and complete (this fixture's
+//! Nothing exists at the start. Real tasks run through the internal
+//! single-shot engine (`run_quiet`) without any managed skill and complete (this fixture's
 //! replies fail the verifiable check; production has no such check); the
 //! production terminal leaves an attributable experience for each.
 //! Those experiences are consolidated into a pattern of uncovered work, a NEW

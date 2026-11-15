@@ -299,7 +299,7 @@ const ALLOWED_PROCESS_COMMANDS: &[&str] = &[
     "src/service/mod.rs::install_linux_systemd::run_checked(Command::new(\"systemctl\").args([\"--user\", \"enable\", \"prx.service\"])).await?;",
     "src/service/mod.rs::install_windows::run_checked(Command::new(\"schtasks\").args([",
     "src/service/mod.rs::preferred_user_config_dir::if let Ok(output) = Command::new(\"getent\")",
-    "src/service/mod.rs::query_status::let output = run_capture_status(Command::new(\"launchctl\").arg(\"list\")).await?;",
+    "src/service/mod.rs::query_status::let output = run_capture_status(Command::new(\"launchctl\").arg(\"list\").arg(SERVICE_LABEL)).await?;",
     "src/service/mod.rs::query_status::run_capture_status(Command::new(\"schtasks\").args([\"/Query\", \"/TN\", windows_task_name(), \"/FO\", \"LIST\"]))",
     "src/service/mod.rs::query_status_linux::let output = run_capture_status(Command::new(\"rc-service\").args([\"prx\", \"status\"])).await?;",
     "src/service/mod.rs::query_status_linux::run_capture_status(Command::new(\"systemctl\").args([\"--user\", \"is-active\", \"prx.service\"])).await?;",

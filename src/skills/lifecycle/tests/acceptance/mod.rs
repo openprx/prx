@@ -2,7 +2,7 @@
 
 //! SL10: local end-to-end acceptance of the skill lifecycle (spec section 17,
 //! scenarios A-E). The scenarios drive the production entry points: the
-//! single-shot agent entry (`crate::agent::run`) against a loopback model,
+//! internal single-shot engine (`run_quiet`) against a loopback model,
 //! `skill_read`, the task-terminal call-in, knowledge consolidation, the
 //! proposer, the frozen-suite evaluator, the gate, the lifecycle service and
 //! the `prx skills lifecycle` CLI handler.

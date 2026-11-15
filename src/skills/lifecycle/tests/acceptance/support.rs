@@ -440,15 +440,13 @@ impl World {
             .expect("test: lifecycle enabled")
     }
 
-    /// One task through the real single-shot agent entry (`prx agent -m`).
+    /// One task through the internal single-shot engine (`run_quiet`).
     pub async fn run_task(&self, config: &Config, prompt: &str) -> anyhow::Result<String> {
         let run = crate::runtime::logical_clock::scope(
             std::sync::Arc::clone(&self.clock),
-            Box::pin(crate::agent::run(
+            Box::pin(crate::agent::entry::run_quiet(
                 config.clone(),
-                Some(prompt.to_string()),
-                None,
-                None,
+                prompt.to_string(),
                 0.0,
                 tokio_util::sync::CancellationToken::new(),
             )),

@@ -45,5 +45,4 @@ mod prefix_stability_tests;
 mod tests;
 
 pub(crate) use entry::run_with_runtime_envelope;
-pub use entry::{AGENT_REFUSAL_EXIT_CODE, AgentTurnRefused, agent_cli_exit_code, run};
 pub use turn_contracts::{ApprovalDecision, ApprovalResolver};

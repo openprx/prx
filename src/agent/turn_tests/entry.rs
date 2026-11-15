@@ -26,14 +26,12 @@ use tempfile::TempDir;
 
 #[test]
 fn refused_single_shot_uses_distinct_nonzero_exit_code() {
-    use crate::agent::{AGENT_REFUSAL_EXIT_CODE, AgentTurnRefused, agent_cli_exit_code};
-    assert_eq!(AGENT_REFUSAL_EXIT_CODE, 2);
-    assert_ne!(AGENT_REFUSAL_EXIT_CODE, 0);
-    assert_ne!(AGENT_REFUSAL_EXIT_CODE, 1);
-    let refused = anyhow::Error::from(AgentTurnRefused { reply: String::new() });
-    assert_eq!(agent_cli_exit_code(Some(&refused)), AGENT_REFUSAL_EXIT_CODE);
-    assert_eq!(agent_cli_exit_code(None), 0);
-    assert_eq!(agent_cli_exit_code(Some(&anyhow::anyhow!("provider failed"))), 1);
+    use crate::chat::{ONE_SHOT_REFUSAL_EXIT_CODE, OneShotRefused, one_shot_exit_code};
+    assert_eq!(ONE_SHOT_REFUSAL_EXIT_CODE, 2);
+    let refused = anyhow::Error::from(OneShotRefused { reply: String::new() });
+    assert_eq!(one_shot_exit_code(Some(&refused)), ONE_SHOT_REFUSAL_EXIT_CODE);
+    assert_eq!(one_shot_exit_code(None), 0);
+    assert_eq!(one_shot_exit_code(Some(&anyhow::anyhow!("provider failed"))), 1);
     assert!(
         crate::agent::refusal::render_refusal_reply(
             "no_legal_path",
@@ -347,7 +345,7 @@ async fn cli_single_shot_plain_message_reaches_provider_with_default_causal_conf
 
     let reply = run_with_runtime_envelope(
         config,
-        Some("hello".to_string()),
+        "hello".to_string(),
         None,
         None,
         0.0,
@@ -383,7 +381,7 @@ async fn cli_full_autonomy_shell_request_with_empty_memory_reaches_model_and_run
 
     let reply = run_with_runtime_envelope(
         config.clone(),
-        Some("Run the shell command: echo hi".to_string()),
+        "Run the shell command: echo hi".to_string(),
         None,
         None,
         0.0,
@@ -425,7 +423,7 @@ async fn cli_agent_configured_scope_denies_wire_file_write() {
 
     let reply = run_with_runtime_envelope(
         config.clone(),
-        Some("write wire-denied.txt".to_string()),
+        "write wire-denied.txt".to_string(),
         None,
         None,
         0.0,
@@ -565,7 +563,7 @@ async fn scheduled_retry_of_accepted_input_key_is_refused_with_plane_off() {
     let run = |envelope: RuntimeEnvelope, scope: crate::tools::execution::ScheduledToolScope| {
         crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&job, None).scope(run_with_runtime_envelope(
             config.clone(),
-            Some("prx scheduled retry".to_string()),
+            "prx scheduled retry".to_string(),
             None,
             None,
             0.0,
@@ -659,7 +657,7 @@ impl ScheduledIssuer {
         crate::agent::scheduled_source::ScheduledAgentOrigin::from_cron(&self.job, None)
             .scope(run_with_runtime_envelope(
                 self.config.clone(),
-                Some(SCHEDULED_PROMPT.to_string()),
+                SCHEDULED_PROMPT.to_string(),
                 None,
                 None,
                 0.0,
@@ -791,7 +789,7 @@ async fn scheduled_agent_creator_read_only_denies_wire_file_write() {
     let reply = origin
         .scope(run_with_runtime_envelope(
             config.clone(),
-            Some("write scheduled-denied.txt".to_string()),
+            "write scheduled-denied.txt".to_string(),
             None,
             None,
             0.0,
@@ -849,7 +847,7 @@ async fn cli_agent_persists_no_secret_from_a_reply() {
     let reply = driver
         .run(run_with_runtime_envelope(
             config,
-            Some("Return a short PRX project greeting.".to_string()),
+            "Return a short PRX project greeting.".to_string(),
             None,
             None,
             0.0,
@@ -898,7 +896,7 @@ async fn cli_agent_persists_no_secret_from_a_provider_error() {
     let result = driver
         .run(run_with_runtime_envelope(
             config,
-            Some("Return a short PRX project greeting.".to_string()),
+            "Return a short PRX project greeting.".to_string(),
             None,
             None,
             0.0,
@@ -941,7 +939,7 @@ fn cli_entry_future_fits_default_stack_and_unpolled_drop_is_lazy() {
     let shutdown = CancellationToken::new();
     let future = run_with_runtime_envelope(
         config,
-        Some("prx stack layout input".to_owned()),
+        "prx stack layout input".to_owned(),
         None,
         None,
         0.0,
@@ -1008,7 +1006,7 @@ async fn a_refused_selection_leaves_no_bootstrap_side_effects() {
 
     let error = run_with_runtime_envelope(
         config,
-        Some("hi".to_string()),
+        "hi".to_string(),
         None,
         None,
         0.0,
@@ -1096,7 +1094,7 @@ async fn cli_production_autosave_excludes_live_input() {
     let input = "Remember the PRX flight code PRX123 tomorrow";
     run_with_runtime_envelope(
         config,
-        Some(input.into()),
+        input.into(),
         None,
         None,
         0.0,

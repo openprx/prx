@@ -2,8 +2,8 @@
 
 //! Scenario E: verify through real entrypoints, up to the boundary.
 //!
-//! What runs here is the single-shot agent entry (`prx agent -m`, i.e.
-//! `crate::agent::run`) and the `prx skills lifecycle` CLI handler, both against
+//! What runs here is the internal single-shot engine (`run_quiet`) and the
+//! `prx skills lifecycle` CLI handler, both against
 //! a loopback model on 127.0.0.1. The evidence the spec asks for is captured and
 //! checked: the selected revision, the actual hydration, the tool arguments and
 //! results, the terminal receipt and a harmless verifiable side effect.

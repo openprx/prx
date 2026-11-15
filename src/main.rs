@@ -116,7 +116,6 @@ const fn cli_tracing_command(command: &Commands) -> cli_tracing::CliCommand {
     match command {
         Commands::Init { .. } => cli_tracing::CliCommand::Init,
         Commands::Go { .. } => cli_tracing::CliCommand::Go,
-        Commands::Agent { .. } => cli_tracing::CliCommand::Agent,
         Commands::Chat { message: Some(_), .. } => cli_tracing::CliCommand::ChatMessage,
         Commands::Chat { .. } => cli_tracing::CliCommand::Chat,
         Commands::Gateway { .. } => cli_tracing::CliCommand::Gateway,
@@ -496,51 +495,6 @@ Examples:
         /// Single message mode (non-interactive)
         #[arg(long)]
         message: Option<String>,
-    },
-
-    /// Run the agent once with a single message, or interactively.
-    #[command(long_about = "\
-Run the agent on a single message and print the reply, or omit the message \
-to enter interactive mode.
-
-The message may be given either as a positional argument (UNIX-style) or with \
--m/--message; they are equivalent and mutually exclusive.
-
-A single-shot turn that the policy refuses still prints the reply on stdout \
-and exits 2 (distinct from 1, a command or runtime failure). Configuration \
-refusals append one `Reason:` line; security and policy-internal refusals \
-stay on the generic sentence.
-
-Examples:
-  prx agent 'What is 2+2?'              # positional message (UNIX-style)
-  prx agent -m 'What is 2+2?'           # same, via -m/--message
-  prx agent                             # interactive mode
-  prx agent -p anthropic 'summarize x'  # pick a provider")]
-    Agent {
-        /// Absolute existing working directory for shell, file tools and git.
-        #[arg(long, value_parser = parse_workdir)]
-        workdir: Option<std::path::PathBuf>,
-        /// Single message as a positional argument (UNIX-style, equivalent to -m).
-        ///
-        /// Mutually exclusive with `-m/--message`.
-        #[arg(value_name = "MESSAGE", conflicts_with = "message")]
-        message_pos: Option<String>,
-
-        /// Single message mode (don't enter interactive mode)
-        #[arg(short, long)]
-        message: Option<String>,
-
-        /// Provider to use (openrouter, anthropic, openai, openai-codex)
-        #[arg(short, long)]
-        provider: Option<String>,
-
-        /// Model to use
-        #[arg(long)]
-        model: Option<String>,
-
-        /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
     },
 
     /// Start an interactive chat session with streaming output
@@ -1730,10 +1684,6 @@ fn main() -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            let code = openprx::agent::agent_cli_exit_code(Some(&err));
-            if code == openprx::agent::AGENT_REFUSAL_EXIT_CODE {
-                return std::process::ExitCode::from(code);
-            }
             // A refused `prx chat --message` turn already printed its reply.
             let code = openprx::chat::one_shot_exit_code(Some(&err));
             if code == openprx::chat::ONE_SHOT_REFUSAL_EXIT_CODE {
@@ -1982,10 +1932,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?
     };
 
-    if let Commands::Agent {
-        workdir: Some(root), ..
-    }
-    | Commands::Chat {
+    if let Commands::Chat {
         workdir: Some(root), ..
     } = &cli.command
     {
@@ -3742,12 +3689,11 @@ mod tests {
     }
 
     /// Oracle is clap argv, not a copy of `cli_tracing_command`. Mapping
-    /// `Commands::Gateway` to `CliCommand::Agent` fails the gateway row.
+    /// `Commands::Gateway` to `CliCommand::Chat` fails the gateway row.
     fn commands_coverage_tag(command: &Commands) -> &'static str {
         match command {
             Commands::Init { .. } => "Init",
             Commands::Go { .. } => "Go",
-            Commands::Agent { .. } => "Agent",
             Commands::Chat { message: Some(_), .. } => "ChatMessage",
             Commands::Chat { .. } => "Chat",
             Commands::Gateway { .. } => "Gateway",
@@ -3792,7 +3738,6 @@ mod tests {
         let cases: &[(&[&str], cli_tracing::CliCommand)] = &[
             (&["prx", "init"], cli_tracing::CliCommand::Init),
             (&["prx", "go"], cli_tracing::CliCommand::Go),
-            (&["prx", "agent"], cli_tracing::CliCommand::Agent),
             (&["prx", "chat"], cli_tracing::CliCommand::Chat),
             (
                 &["prx", "chat", "--message", "hi"],
@@ -3859,7 +3804,6 @@ mod tests {
         let mut expected_tags = vec![
             "Init",
             "Go",
-            "Agent",
             "Chat",
             "ChatMessage",
             "Gateway",
@@ -4171,66 +4115,22 @@ mod tests {
     }
 
     #[test]
-    fn agent_workdir_is_canonical_and_requires_an_existing_absolute_directory() {
+    fn chat_workdir_is_canonical_and_requires_an_existing_absolute_directory() {
         let root = tempfile::tempdir().expect("test: root");
         let alias = root.path().join(".");
-        let cli = Cli::try_parse_from([
-            "prx",
-            "agent",
-            "--workdir",
-            alias.to_str().expect("test: root path"),
-            "hello",
-        ])
-        .expect("test: canonical workdir");
+        let cli = Cli::try_parse_from(["prx", "chat", "--workdir", alias.to_str().expect("test: root path")])
+            .expect("test: canonical workdir");
         assert!(
-            matches!(cli.command, Commands::Agent { workdir: Some(ref workdir), .. } if *workdir == root.path().canonicalize().expect("test: canonical root")),
+            matches!(cli.command, Commands::Chat { workdir: Some(ref workdir), .. } if *workdir == root.path().canonicalize().expect("test: canonical root")),
             "test: parsed root canonicalized"
         );
         for path in [
             "relative",
             root.path().join("missing").to_str().expect("test: missing path"),
         ] {
-            let error = Cli::try_parse_from(["prx", "agent", "--workdir", path]).expect_err("test: invalid root");
+            let error = Cli::try_parse_from(["prx", "chat", "--workdir", path]).expect_err("test: invalid root");
             assert_eq!(error.exit_code(), 2, "test: clap usage exit");
         }
-    }
-
-    #[test]
-    fn agent_accepts_positional_message() {
-        // Bug #4: `prx agent 'msg'` (UNIX-style positional) must parse, equivalent
-        // to `-m 'msg'`.
-        let cli = Cli::try_parse_from(["prx", "agent", "What is 2+2?"]).expect("positional agent message should parse");
-        match cli.command {
-            Commands::Agent {
-                message_pos, message, ..
-            } => {
-                assert_eq!(message_pos.as_deref(), Some("What is 2+2?"));
-                assert_eq!(message, None);
-            }
-            other => panic!("expected agent command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_accepts_dash_m_message() {
-        // The existing `-m` form must keep working.
-        let cli = Cli::try_parse_from(["prx", "agent", "-m", "hello there"]).expect("-m agent message should parse");
-        match cli.command {
-            Commands::Agent {
-                message_pos, message, ..
-            } => {
-                assert_eq!(message.as_deref(), Some("hello there"));
-                assert_eq!(message_pos, None);
-            }
-            other => panic!("expected agent command, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_rejects_both_positional_and_dash_m() {
-        // Providing both forms is a usage error (conflicts_with).
-        let result = Cli::try_parse_from(["prx", "agent", "positional", "-m", "flag"]);
-        assert!(result.is_err(), "positional message and -m must be mutually exclusive");
     }
 
     #[test]

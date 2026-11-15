@@ -4,8 +4,8 @@
 //! case's fixtures, and (for an arm with a skill) the arm's revision installed
 //! through the same store, import and publication path production uses, so
 //! `skill_read` serves it from the pinned immutable revision and records the
-//! hydration and terminal receipts. The task itself is `crate::agent::run`, the
-//! single-shot CLI entry: the provider, model, price and autonomy come from the
+//! hydration and terminal receipts. The task itself is `run_quiet`, the
+//! internal single-shot engine: the provider, model, price and autonomy come from the
 //! caller's `Config` through the existing managed provider path. This module
 //! builds no provider, reads no credential and has no registry of its own.
 
@@ -62,7 +62,7 @@ impl AccountingOwner {
     }
 }
 
-/// Runs cases through `crate::agent::run` with a template configuration.
+/// Runs cases through `run_quiet` with a template configuration.
 #[derive(Clone)]
 pub struct AgentCaseExecutor {
     template: Config,
@@ -109,7 +109,7 @@ impl AgentCaseExecutor {
     }
 
     /// Acceptance cases share the world's logical decision clock. The clock is
-    /// entered inside the spawned case task, where `agent::run` polls.
+    /// entered inside the spawned case task, where `run_quiet` polls.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_logical_clock(mut self, clock: Arc<crate::runtime::logical_clock::ManualClock>) -> Self {

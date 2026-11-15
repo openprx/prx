@@ -243,7 +243,7 @@ pub(super) const REVIEWED_DECISION_HANDOFFS: &[(&str, usize, &str)] = &[
     ),
     (
         "src/agent/entry.rs",
-        2,
+        1,
         "crate::agent::turn_request::TurnDecision{service:decision_service,context:decision_context,runtime:decision_context.runtime(),proof:decision_proof,}",
     ),
     ("src/channels/turn.rs", 1, "decision_turn.routing()"),

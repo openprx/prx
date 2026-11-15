@@ -98,7 +98,6 @@ const FORWARDED_COMPACTION_SITES: &[&str] = &[
     // Source-bound decision snapshots reserve the actual served model's window.
     "src/agent/embedded_turn.rs::run_work",
     "src/agent/entry.rs::run_with_runtime_envelope",
-    "src/agent/entry.rs::run_with_runtime_envelope",
     "src/channels/turn.rs::run_channel_turn",
     // The reducer action carries its explicitly resolved compaction config.
     "src/chat/dispatcher.rs::drive_start_turn_stream",
@@ -379,12 +378,12 @@ pub(super) fn forwarded_compaction_values_are_produced_from_the_effective_window
     let ordinary = compact_rust_tokens(&function_body(&entry, "run"));
     assert_eq!(
         braced_block(&ordinary, ordinary.find('{').expect("chat entry body")),
-        Some("{super::run_internal(config,provider,model,temperature,plain,session,list,shutdown,None,).await}"),
+        Some("{super::run_internal(config,provider,model,temperature,plain,session,list,shutdown,None,None,).await.map(|_|())}"),
         "ordinary chat must forward every input to the budgeted private owner"
     );
     let controlled = compact_rust_tokens(&function_body(&entry, "run_controlled"));
     assert_eq!(controlled.matches("super::run_internal(").count(), 1);
-    assert!(controlled.ends_with("letresult=super::run_internal(config,provider,model,temperature,plain,session,false,shutdown,Some(producer),).await;letcleanup=profile.close_reader().await;cleanup?;result}"),
+    assert!(controlled.ends_with("letresult=super::run_internal(config,provider,model,temperature,plain,session,false,shutdown,Some(producer),None,).await.map(|_|());letcleanup=profile.close_reader().await;cleanup?;result}"),
         "controlled chat must forward its verified producer and retain reader cleanup");
     let owner = strip_cfg_test_items(&blank_comments_and_literals(&read_source(
         &repository_root().join("src/chat/run.rs"),

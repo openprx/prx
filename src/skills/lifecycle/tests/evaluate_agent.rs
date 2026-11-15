@@ -1,7 +1,7 @@
 #![cfg(test)]
 #![allow(clippy::indexing_slicing)]
 
-//! SL06 through the real agent entry (`crate::agent::run`) against a
+//! SL06 through the internal single-shot engine (`run_quiet`) against a
 //! deterministic loopback model on 127.0.0.1. No network, no real credential:
 //! the only key in play is a sentinel literal.
 

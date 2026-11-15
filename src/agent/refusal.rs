@@ -7,10 +7,6 @@
 /// User-facing sentence for every refusal. Configuration hints follow it.
 pub(crate) const GENERIC_REFUSAL_REPLY: &str = "I can't complete this request under the current policy.";
 
-/// Distinct process status for a refused single-shot `prx agent` turn.
-/// `1` remains a generic command or runtime failure.
-pub const AGENT_REFUSAL_EXIT_CODE: u8 = 2;
-
 /// Why a turn closed as Refuse. Exhaustive: a new variant must pick a hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefusalReason {
@@ -208,8 +204,6 @@ mod tests {
             ),
             "{reply}"
         );
-        assert_ne!(AGENT_REFUSAL_EXIT_CODE, 0);
-        assert_ne!(AGENT_REFUSAL_EXIT_CODE, 1);
     }
 
     #[test]
@@ -402,6 +396,5 @@ mod tests {
             render_refusal_reply("unrecognized_code", None),
             std::borrow::Cow::Borrowed(GENERIC_REFUSAL_REPLY)
         ));
-        assert_eq!(AGENT_REFUSAL_EXIT_CODE, 2);
     }
 }

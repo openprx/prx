@@ -924,7 +924,7 @@ async fn run_agent(
                 }
                 _ => config.clone().into(),
             },
-            Some(prompt),
+            prompt,
             None,
             config.default_model.clone(),
             config.default_temperature,

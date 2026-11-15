@@ -22,8 +22,6 @@
 //!   five defensive `bail!("BUG: ... handled earlier")` arms are kept here as
 //!   "should never reach" assertions, preserving the `match` exhaustiveness
 //!   over [`Commands`] (a missing arm is a compile error).
-//! - The `message.or(message_pos)` merge for `Commands::Agent` stays inside the
-//!   `Agent` arm of this dispatch, exactly as before.
 //! - The plan's standalone `enum RunMode` + `Commands -> RunMode` conversion and
 //!   the `ModeRunner` trait are deliberately **not** introduced in D3. Adding a
 //!   parallel enum + conversion layer would be a behaviour-risk with no payoff
@@ -41,7 +39,7 @@ use crate::{
     ChannelCommands, Commands, ConfigCommands, ConfigShowFormat, DoctorCommands, IntegrationCommands, ModelCommands,
 };
 use crate::{
-    agent, channels, chat, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, integrations, memory, migration,
+    channels, chat, cron, daemon, doctor, evolution_cli, fitness_cli, gateway, integrations, memory, migration,
     service, skills,
 };
 use crate::{
@@ -53,8 +51,8 @@ use crate::{
 // D5/D9: ModeRunner trait + per-mode runners
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Unified entry point for the five long-running / ctrl_c-interruptible modes
-/// (chat / agent / gateway / daemon / channel-start).
+/// Unified entry point for the four long-running / ctrl_c-interruptible modes
+/// (chat / gateway / daemon / channel-start).
 ///
 /// Each implementor owns its own constructor arguments (config / host / port /
 /// …); [`run`](ModeRunner::run) only additionally receives the external **root**
@@ -142,25 +140,6 @@ impl ModeRunner for ChatRunner {
     }
 }
 
-/// Agent loop — single-shot when `message` is set, otherwise interactive.
-pub struct AgentRunner {
-    pub config: Config,
-    pub message: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub temperature: f64,
-}
-
-#[async_trait::async_trait]
-impl ModeRunner for AgentRunner {
-    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
-        let me = *self;
-        agent::run(me.config, me.message, me.provider, me.model, me.temperature, shutdown)
-            .await
-            .map(|_| ())
-    }
-}
-
 /// HTTP gateway server (graceful drain on shutdown).
 pub struct GatewayRunner {
     pub h2_principal: Option<String>,
@@ -223,17 +202,12 @@ impl ModeRunner for ChannelStartRunner {
 /// SIGTERM on unix, ctrl_c elsewhere) that cancels the root shutdown token for
 /// this command (D5/D9 §3.3.3 explicit whitelist).
 ///
-/// Only the four "long-running + gracefully signal-interruptible" modes opt in:
-/// gateway / daemon / channel-start / **single-shot** agent. Everything else —
-/// **chat**, **interactive** agent, and every query/management subcommand —
-/// returns `false`:
-///
-/// - chat owns ctrl_c internally (single-press cancels generation, double-press
-///   exits); a dispatch-level signal task would steal the first ctrl_c and break
-///   that contract.
-/// - interactive agent reads stdin synchronously and cannot `select!` a token;
-///   registering `ctrl_c()` would also rob the process of its default
-///   termination, deadlocking the session.
+/// Only the three "long-running + gracefully signal-interruptible" modes opt in:
+/// gateway / daemon / channel-start. Everything else — **chat** (including
+/// `chat --message`) and every query/management subcommand — returns `false`:
+/// chat owns ctrl_c internally (single-press cancels generation, double-press
+/// exits); a dispatch-level signal task would steal the first ctrl_c and break
+/// that contract.
 ///
 /// `command` is borrowed (`&Commands`) — `matches!` here must not move it, or the
 /// subsequent owning `match` in [`dispatch`] would fail to compile.
@@ -245,9 +219,6 @@ pub const fn should_bind_signal(command: &Commands) -> bool {
             | Commands::Channel {
                 channel_command: ChannelCommands::Start
             }
-    ) || matches!(
-        command,
-        Commands::Agent { message_pos, message, .. } if message.is_some() || message_pos.is_some()
     )
 }
 
@@ -316,10 +287,9 @@ fn spawn_signal_task(root: CancellationToken) {
 pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
     // D5/D9 §3.3.3: single root shutdown token for this dispatch. The signal
     // source is installed via an *explicit whitelist* (see `should_bind_signal`)
-    // — only gateway / daemon / channel-start / single-shot agent get a
-    // dispatch-owned SIGINT+SIGTERM task. chat / interactive agent / query
-    // commands never do (chat owns ctrl_c internally; interactive agent must keep
-    // the process default termination). Borrow `&command` so the owning `match`
+    // — only gateway / daemon / channel-start get a dispatch-owned
+    // SIGINT+SIGTERM task. chat and query commands never do (chat owns ctrl_c
+    // internally). Borrow `&command` so the owning `match`
     // below still consumes it.
     let root_shutdown = CancellationToken::new();
     // Long-running work is normal business in an unbounded runtime, so this
@@ -351,33 +321,6 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         #[cfg(feature = "test-mock")]
         Commands::MailboxHarness { .. } => anyhow::bail!("MailboxHarness must be handled before runtime dispatch"),
         Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),
-
-        Commands::Agent {
-            workdir: _,
-            message_pos,
-            message,
-            provider,
-            model,
-            temperature,
-        } => {
-            // Accept the message either positionally (`prx agent 'msg'`, UNIX-style)
-            // or via -m/--message. clap's `conflicts_with` guarantees at most one is
-            // set, so `.or()` simply picks whichever was provided.
-            let message = message.or(message_pos);
-            // D5/D9 (A6): drive via ModeRunner with the dispatch root token. A
-            // signal task is bound only for the single-shot case (see
-            // `should_bind_signal`); interactive agent receives the same token but
-            // no signal source ever cancels it (synchronous stdin path).
-            Box::new(AgentRunner {
-                config,
-                message,
-                provider,
-                model,
-                temperature,
-            })
-            .run(root_shutdown.clone())
-            .await
-        }
 
         Commands::Chat {
             h2_limits,
@@ -792,20 +735,9 @@ mod tests {
         assert!(Box::new(ImmediateRunner).run(token).await.is_ok());
     }
 
-    // ── Signal whitelist regression (§3.3.4 quick reference). The four long-running,
-    //    gracefully-interruptible modes opt in; chat / interactive agent / all
-    //    query+management commands must NOT bind a dispatch signal task. ──
-
-    fn agent_single(message: bool, positional: bool) -> Commands {
-        Commands::Agent {
-            workdir: None,
-            message_pos: if positional { Some("hi".into()) } else { None },
-            message: if message { Some("hi".into()) } else { None },
-            provider: None,
-            model: None,
-            temperature: 0.7,
-        }
-    }
+    // ── Signal whitelist regression (§3.3.4 quick reference). The three long-running,
+    //    gracefully-interruptible modes opt in; chat / all query+management
+    //    commands must NOT bind a dispatch signal task. ──
 
     #[test]
     fn whitelist_binds_gateway_daemon_channel_start() {
@@ -820,16 +752,6 @@ mod tests {
         assert!(should_bind_signal(&Commands::Channel {
             channel_command: ChannelCommands::Start
         }));
-    }
-
-    #[test]
-    fn whitelist_binds_single_shot_agent_only() {
-        // Single-shot agent (message via -m, or positional) → bind.
-        assert!(should_bind_signal(&agent_single(true, false)));
-        assert!(should_bind_signal(&agent_single(false, true)));
-        // Interactive agent (no message at all) → must NOT bind (synchronous
-        // stdin cannot select a token; binding would steal default termination).
-        assert!(!should_bind_signal(&agent_single(false, false)));
     }
 
     fn chat_command() -> Commands {
@@ -904,10 +826,14 @@ mod tests {
 
     #[test]
     fn short_lived_and_query_commands_do_not_announce_it() {
-        // `agent` runs one turn and exits, in either shape; the notice belongs
-        // on the entry points that keep paying for the default every turn.
-        assert!(!starts_agent_runtime(&agent_single(true, false)));
-        assert!(!starts_agent_runtime(&agent_single(false, false)));
+        let mut one_shot = chat_command();
+        // `chat --message` runs one turn and exits; the notice belongs on the
+        // entry points that keep paying for the default every turn.
+        let Commands::Chat { message, .. } = &mut one_shot else {
+            panic!("test: chat_command builds Commands::Chat");
+        };
+        *message = Some("hi".into());
+        assert!(!starts_agent_runtime(&one_shot));
         // Only `channel start` is a runtime; the rest are queries.
         assert!(!starts_agent_runtime(&Commands::Channel {
             channel_command: ChannelCommands::Doctor

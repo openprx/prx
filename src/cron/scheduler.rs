@@ -699,7 +699,7 @@ async fn run_agent_job_with_origin(
                         }
                         _ => config.clone().into(),
                     },
-                    Some(prompt),
+                    prompt,
                     None,
                     model_override,
                     config.default_temperature,
