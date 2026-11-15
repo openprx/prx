@@ -116,6 +116,9 @@ mod tests {
     /// Upper bound on one tool call through the service, approval included.
     const CALL_DEADLINE: Duration = Duration::from_secs(30);
 
+    /// Upper bound on one whole test body: setup, calls and assertions.
+    const TEST_DEADLINE: Duration = Duration::from_secs(60);
+
     /// What the operator does at one prompt.
     #[derive(Debug, Clone, Copy)]
     enum Typed {
@@ -277,92 +280,104 @@ mod tests {
     /// an override run it not at all. Each call asks exactly once.
     #[tokio::test]
     async fn line_mode_answers_decide_whether_the_call_runs() {
-        assert!(
-            std::env::var_os("OPENPRX_APPROVAL_OVERRIDE").is_none(),
-            "the no-terminal case needs OPENPRX_APPROVAL_OVERRIDE unset in the test process"
-        );
-        for (typed, runs) in [
-            (Typed::Line("y"), true),
-            (Typed::Line("n"), false),
-            (Typed::Eof, false),
-            (Typed::NoTerminal, false),
-        ] {
-            let answers = TypedAnswers::new(&[typed]);
-            let session = LineSession::open(Arc::clone(&answers)).await;
-            let status = session.write("approved.txt").await;
-            assert_eq!(
-                answers.asked(),
-                1,
-                "{typed:?}: the supervised call must ask exactly once"
-            );
-            assert_eq!(
-                status == ToolExecutionStatus::Succeeded,
-                runs,
-                "{typed:?}: unexpected call status {status:?}"
-            );
-            assert_eq!(
-                session.written("approved.txt"),
-                runs,
-                "{typed:?}: the file must exist exactly when the call was approved"
-            );
+        tokio::time::timeout(TEST_DEADLINE, async {
             assert!(
-                !session.manager.is_session_allowlisted("file_write"),
-                "{typed:?}: only `a` may add the tool to the session allowlist"
+                std::env::var_os("OPENPRX_APPROVAL_OVERRIDE").is_none(),
+                "the no-terminal case needs OPENPRX_APPROVAL_OVERRIDE unset in the test process"
             );
-        }
+            for (typed, runs) in [
+                (Typed::Line("y"), true),
+                (Typed::Line("n"), false),
+                (Typed::Eof, false),
+                (Typed::NoTerminal, false),
+            ] {
+                let answers = TypedAnswers::new(&[typed]);
+                let session = LineSession::open(Arc::clone(&answers)).await;
+                let status = session.write("approved.txt").await;
+                assert_eq!(
+                    answers.asked(),
+                    1,
+                    "{typed:?}: the supervised call must ask exactly once"
+                );
+                assert_eq!(
+                    status == ToolExecutionStatus::Succeeded,
+                    runs,
+                    "{typed:?}: unexpected call status {status:?}"
+                );
+                assert_eq!(
+                    session.written("approved.txt"),
+                    runs,
+                    "{typed:?}: the file must exist exactly when the call was approved"
+                );
+                assert!(
+                    !session.manager.is_session_allowlisted("file_write"),
+                    "{typed:?}: only `a` may add the tool to the session allowlist"
+                );
+            }
+        })
+        .await
+        .expect("line_mode_answers_decide_whether_the_call_runs exceeded TEST_DEADLINE");
     }
 
     /// `a` approves this call and later calls of the same tool for the
     /// session without asking again.
     #[tokio::test]
     async fn line_mode_always_covers_later_calls_of_the_tool() {
-        let answers = TypedAnswers::new(&[Typed::Line("a")]);
-        let session = LineSession::open(Arc::clone(&answers)).await;
-        let first = session.write("first.txt").await;
-        let second = session.write("second.txt").await;
-        assert_eq!(
-            first,
-            ToolExecutionStatus::Succeeded,
-            "the `a` answer must approve the first call"
-        );
-        assert_eq!(
-            second,
-            ToolExecutionStatus::Succeeded,
-            "the session grant must approve the later call"
-        );
-        assert!(
-            session.written("first.txt") && session.written("second.txt"),
-            "both approved writes must reach the workspace"
-        );
-        assert_eq!(answers.asked(), 1, "the later call must not ask again");
-        assert!(
-            session.manager.is_session_allowlisted("file_write"),
-            "`a` must add the tool to the session allowlist"
-        );
+        tokio::time::timeout(TEST_DEADLINE, async {
+            let answers = TypedAnswers::new(&[Typed::Line("a")]);
+            let session = LineSession::open(Arc::clone(&answers)).await;
+            let first = session.write("first.txt").await;
+            let second = session.write("second.txt").await;
+            assert_eq!(
+                first,
+                ToolExecutionStatus::Succeeded,
+                "the `a` answer must approve the first call"
+            );
+            assert_eq!(
+                second,
+                ToolExecutionStatus::Succeeded,
+                "the session grant must approve the later call"
+            );
+            assert!(
+                session.written("first.txt") && session.written("second.txt"),
+                "both approved writes must reach the workspace"
+            );
+            assert_eq!(answers.asked(), 1, "the later call must not ask again");
+            assert!(
+                session.manager.is_session_allowlisted("file_write"),
+                "`a` must add the tool to the session allowlist"
+            );
+        })
+        .await
+        .expect("line_mode_always_covers_later_calls_of_the_tool exceeded TEST_DEADLINE");
     }
 
     /// A call the tool only accepts with its own grant is asked every time,
     /// even after `a` put the tool on the session allowlist.
     #[tokio::test]
     async fn line_mode_still_asks_explicit_grant_calls_after_always() {
-        let answers = TypedAnswers::new(&[Typed::Line("a"), Typed::Line("n")]);
-        let session = LineSession::open(Arc::clone(&answers)).await;
-        let publish = |proposal: &str| serde_json::json!({"action": "lifecycle_publish", "proposal_id": proposal});
-        let first = session.call("skills_manage", publish("prx-proposal-1")).await;
-        assert!(
-            session.manager.is_session_allowlisted("skills_manage"),
-            "`a` must add the tool to the session allowlist (first call status {first:?})"
-        );
-        let second = session.call("skills_manage", publish("prx-proposal-2")).await;
-        assert_eq!(
-            answers.asked(),
-            2,
-            "an explicit-grant call must be asked even with the tool on the session allowlist"
-        );
-        assert_eq!(
-            second,
-            ToolExecutionStatus::ApprovalDenied,
-            "the `n` answer to the second explicit-grant call must deny it"
-        );
+        tokio::time::timeout(TEST_DEADLINE, async {
+            let answers = TypedAnswers::new(&[Typed::Line("a"), Typed::Line("n")]);
+            let session = LineSession::open(Arc::clone(&answers)).await;
+            let publish = |proposal: &str| serde_json::json!({"action": "lifecycle_publish", "proposal_id": proposal});
+            let first = session.call("skills_manage", publish("prx-proposal-1")).await;
+            assert!(
+                session.manager.is_session_allowlisted("skills_manage"),
+                "`a` must add the tool to the session allowlist (first call status {first:?})"
+            );
+            let second = session.call("skills_manage", publish("prx-proposal-2")).await;
+            assert_eq!(
+                answers.asked(),
+                2,
+                "an explicit-grant call must be asked even with the tool on the session allowlist"
+            );
+            assert_eq!(
+                second,
+                ToolExecutionStatus::ApprovalDenied,
+                "the `n` answer to the second explicit-grant call must deny it"
+            );
+        })
+        .await
+        .expect("line_mode_still_asks_explicit_grant_calls_after_always exceeded TEST_DEADLINE");
     }
 }

@@ -1858,4 +1858,22 @@ mod tests {
             "cancelled streams without a provider usage chunk must not become real usage"
         );
     }
+
+    /// A present but malformed `cost_settlement` is a typed error that keeps
+    /// the serde cause, never a guessed class.
+    #[test]
+    fn malformed_terminal_settlement_is_a_typed_error_with_serde_cause() {
+        let payload = serde_json::json!({ "cost_settlement": "not-an-object" });
+        let err = UsageSettlementClass::of_terminal_payload(&payload)
+            .expect_err("a malformed cost_settlement must be an error, not a guessed class");
+        assert!(
+            format!("{err:#}").contains("terminal settlement record is malformed"),
+            "the error must name the malformed terminal settlement record: {err:#}"
+        );
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some()),
+            "the error chain must keep the serde_json::Error cause: {err:#}"
+        );
+    }
 }
