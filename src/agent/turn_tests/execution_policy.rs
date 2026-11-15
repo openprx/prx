@@ -12,6 +12,9 @@
 
 use super::*;
 
+/// Upper bound on one service execution in these tests; a stuck approval or tool call fails here instead of hanging the run.
+const EXECUTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct PolicyProbeTool(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait::async_trait]
@@ -404,13 +407,16 @@ async fn session_grant_approves_later_calls_without_asking() {
         });
         let service = adapter.tool_execution_service.expect("tool service");
         for _ in 0..2 {
-            let outcome = service
-                .execute(
+            let outcome = tokio::time::timeout(
+                EXECUTION_DEADLINE,
+                service.execute(
                     crate::tools::ToolExecutionCommand::new("prx_probe_write", serde_json::json!({})),
                     adapter.tool_execution_context.clone(),
                     None,
-                )
-                .await;
+                ),
+            )
+            .await
+            .expect("service execution exceeded EXECUTION_DEADLINE: the approval or tool call is stuck");
             assert_eq!(
                 outcome.status,
                 crate::tools::ToolExecutionStatus::Succeeded,

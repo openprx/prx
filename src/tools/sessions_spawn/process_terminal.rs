@@ -439,31 +439,47 @@ mod tests {
         for id in 1..=limit {
             assert_eq!(
                 admit_unconfirmed_warning(&mut warned, id, &saturation_reported),
-                UnconfirmedWarning::Warn
+                UnconfirmedWarning::Warn,
+                "launch {id} within the bound must be remembered and warned once"
             );
         }
         // A remembered launch stays silent after saturation, and the set is not cleared.
         assert_eq!(
             admit_unconfirmed_warning(&mut warned, 1, &saturation_reported),
-            UnconfirmedWarning::Suppressed
+            UnconfirmedWarning::Suppressed,
+            "saturated set must keep already-remembered launch ids silent"
         );
-        assert_eq!(warned.len(), MAX_WARNED_LAUNCHES);
+        assert_eq!(
+            warned.len(),
+            MAX_WARNED_LAUNCHES,
+            "saturated set must stay full, not be cleared"
+        );
 
         // The first launch that cannot be remembered raises the aggregate warning; later ones do not.
         let overflow = limit + 1;
         assert_eq!(
             admit_unconfirmed_warning(&mut warned, overflow, &saturation_reported),
-            UnconfirmedWarning::Unremembered { aggregate: true }
+            UnconfirmedWarning::Unremembered { aggregate: true },
+            "first launch that cannot be remembered must raise the saturation warning"
         );
         assert_eq!(
             admit_unconfirmed_warning(&mut warned, overflow + 1, &saturation_reported),
-            UnconfirmedWarning::Unremembered { aggregate: false }
+            UnconfirmedWarning::Unremembered { aggregate: false },
+            "later unremembered launches must not repeat the saturation warning"
         );
         assert_eq!(
             admit_unconfirmed_warning(&mut warned, 1, &saturation_reported),
-            UnconfirmedWarning::Suppressed
+            UnconfirmedWarning::Suppressed,
+            "remembered launch must stay silent after overflow"
         );
-        assert_eq!(warned.len(), MAX_WARNED_LAUNCHES);
-        assert!(!warned.contains(&overflow));
+        assert_eq!(
+            warned.len(),
+            MAX_WARNED_LAUNCHES,
+            "overflow launches must not be inserted into a full set"
+        );
+        assert!(
+            !warned.contains(&overflow),
+            "launch {overflow} that did not fit must not be remembered"
+        );
     }
 }

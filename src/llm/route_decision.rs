@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -220,7 +221,7 @@ impl UsageSettlementClass {
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(value) => {
                 let settlement = <crate::cost::types::CostSettlement as serde::Deserialize>::deserialize(value)
-                    .map_err(|error| anyhow::anyhow!("terminal cost settlement is malformed: {error}"))?;
+                    .with_context(|| "terminal settlement record is malformed")?;
                 Ok(Self::of(&settlement))
             }
         }

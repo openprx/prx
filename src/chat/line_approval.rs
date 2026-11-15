@@ -94,11 +94,20 @@ mod tests {
 
     #[test]
     fn terminal_answers_map_to_approval_decisions() {
-        assert!(matches!(decision_for(TerminalApproval::Once), ApprovalDecision::Grant));
-        assert!(matches!(
-            decision_for(TerminalApproval::Always),
-            ApprovalDecision::GrantForSession
-        ));
-        assert!(matches!(decision_for(TerminalApproval::Deny), ApprovalDecision::Deny));
+        assert!(
+            matches!(decision_for(TerminalApproval::Once), ApprovalDecision::Grant),
+            "terminal `once` answer must map to a single grant"
+        );
+        assert!(
+            matches!(
+                decision_for(TerminalApproval::Always),
+                ApprovalDecision::GrantForSession
+            ),
+            "terminal `always` answer must map to a session grant"
+        );
+        assert!(
+            matches!(decision_for(TerminalApproval::Deny), ApprovalDecision::Deny),
+            "terminal `deny` answer must map to a denial"
+        );
     }
 }
