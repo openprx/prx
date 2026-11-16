@@ -1637,7 +1637,11 @@ impl EffectExecutor {
                             }
                             return;
                         }
-                        let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
+                        // The reducer always supplies the canonical guard source;
+                        // a direct effect caller without one owns its history.
+                        let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| {
+                            crate::agent::turn_history::CanonicalHistory::of_caller_without_session(&history)
+                        });
                         let driver = Box::pin(drive_start_turn_stream(
                             turn_binding.clone(),
                             provider_turn_task_id,
@@ -1977,9 +1981,11 @@ pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
 /// message without shifting patch indices or weakening stale-state detection.
 fn compaction_patch_for_reducer_without_pending_user(
     patch: &crate::agent::turn_contracts::CompactionPatch,
-    source_history: &[crate::providers::traits::ChatMessage],
-    compacted_history: &[crate::providers::traits::ChatMessage],
+    source_history: &crate::agent::turn_history::CanonicalHistory,
+    compacted_history: &crate::agent::turn_history::CanonicalHistory,
 ) -> crate::agent::turn_contracts::CompactionPatch {
+    let source_history = source_history.messages();
+    let compacted_history = compacted_history.messages();
     let Some(pending_index) = source_history.len().checked_sub(1) else {
         return patch.clone();
     };
@@ -2009,31 +2015,6 @@ fn compaction_patch_for_reducer_without_pending_user(
         append_after: Vec::new(),
         guard,
     }
-}
-
-/// Rebuild the provider view after a switch compacted the source: the
-/// compacted source with its final message (the plain request) replaced by the
-/// enriched request. When the request did not survive at the tail, the
-/// enriched request is appended, so it occurs exactly once either way.
-/// Older-turn enrichment is not carried over.
-fn provider_view_from_compacted_source(
-    compacted_source: &[crate::providers::traits::ChatMessage],
-    source_request: Option<crate::agent::context_preflight::CapturedTurnRequest>,
-    enriched_request: Option<crate::agent::context_preflight::CapturedTurnRequest>,
-) -> Vec<crate::providers::traits::ChatMessage> {
-    let mut view = compacted_source.to_vec();
-    let Some(enriched) = enriched_request else {
-        return view;
-    };
-    let tail_is_request = source_request.as_ref().is_some_and(|source| {
-        view.last()
-            .is_some_and(|last| last.role == source.message().role && last.content == source.message().content)
-    });
-    if tail_is_request {
-        view.pop();
-    }
-    view.push(enriched.into_message());
-    view
 }
 
 /// What a redux rollover attempt left behind for its caller.
@@ -2076,7 +2057,7 @@ async fn send_context_degraded_notice(
 async fn apply_redux_context_rollover(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
-    compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
+    compaction_guard_history: &mut crate::agent::turn_history::CanonicalHistory,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&crate::agent::document_ingest::DocumentIngestRuntime>,
@@ -2088,12 +2069,15 @@ async fn apply_redux_context_rollover(
         return Ok(ContextRolloverOutcome::default());
     }
 
-    let current_request =
-        crate::agent::context_preflight::capture_current_turn_request_with_source(history, compaction_guard_history);
-    let guard_request = crate::agent::context_preflight::capture_current_turn_request(compaction_guard_history);
+    let current_request = crate::agent::context_preflight::capture_current_turn_request_with_source(
+        history,
+        compaction_guard_history.messages(),
+    );
+    let guard_request =
+        crate::agent::context_preflight::capture_current_turn_request(compaction_guard_history.messages());
     let patch = match crate::agent::compaction::build_configurable_compaction_patch_with_source_history(
         history,
-        compaction_guard_history,
+        compaction_guard_history.messages(),
         provider,
         model,
         config,
@@ -2172,46 +2156,55 @@ async fn apply_redux_context_rollover(
     // The patch's guard describes the source (`compaction_guard_history`), never
     // the provider view. Validate against the source before any mutation or send.
     let mut compacted_source = compaction_guard_history.clone();
-    if let Err(error) = crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_source, &patch) {
-        let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-        tracing::warn!(
-            error_len,
-            error_sha256,
-            trigger,
-            guard_history_len = patch.guard.history_len,
-            source_len = compaction_guard_history.len(),
-            provider_view_len = history.len(),
-            "context switch patch does not describe its source; nothing was changed"
-        );
-        let budget = crate::agent::context_budget::plan_context_budget(
-            history,
-            config,
-            crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
-        );
-        crate::agent::compaction::persist_context_switch_degradation(
-            audit,
-            trigger,
-            "handoff_failed",
-            budget.used_tokens,
-            budget.used_tokens,
-            budget.available_input_tokens,
-        )
-        .await;
-        return Ok(ContextRolloverOutcome {
-            replacement_len: None,
-            degraded: true,
-        });
-    }
+    let refresh_notes = match compacted_source.apply_patch(&patch) {
+        Ok(refresh_notes) => refresh_notes,
+        Err(error) => {
+            let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
+            tracing::warn!(
+                error_len,
+                error_sha256,
+                trigger,
+                guard_history_len = patch.guard.history_len,
+                source_len = compaction_guard_history.len(),
+                provider_view_len = history.len(),
+                "context switch patch does not describe its source; nothing was changed"
+            );
+            let budget = crate::agent::context_budget::plan_context_budget(
+                history,
+                config,
+                crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            crate::agent::compaction::persist_context_switch_degradation(
+                audit,
+                trigger,
+                "handoff_failed",
+                budget.used_tokens,
+                budget.used_tokens,
+                budget.available_input_tokens,
+            )
+            .await;
+            return Ok(ContextRolloverOutcome {
+                replacement_len: None,
+                degraded: true,
+            });
+        }
+    };
     let reducer_source_history = std::mem::replace(compaction_guard_history, compacted_source);
     crate::agent::context_preflight::restore_current_turn_request(
-        compaction_guard_history,
+        compaction_guard_history.durable_compaction_target(),
         guard_request.clone(),
         trigger,
         crate::agent::context_preflight::RestoredRequestPosition::Tail,
     );
-    // Provider view = compacted source whose final message (the request) is
-    // replaced by the enriched request, so the request occurs exactly once.
-    *history = provider_view_from_compacted_source(compaction_guard_history, guard_request, current_request);
+    // The one conversion: the compacted canonical source projected with the
+    // enriched request in place of the plain one (exactly once) and the
+    // summary's refresh aside after its replacement.
+    let mut projection = crate::agent::turn_history::ProjectionInputs::default().with_enriched_request(
+        guard_request.map(crate::agent::context_preflight::CapturedTurnRequest::into_message),
+        current_request.map(crate::agent::context_preflight::CapturedTurnRequest::into_message),
+    );
+    projection.set_refresh_notes(refresh_notes);
+    *history = crate::agent::turn_history::project(compaction_guard_history, &projection).into_messages();
     let budget = crate::agent::context_budget::plan_context_budget(
         history,
         config,
@@ -2230,7 +2223,7 @@ async fn apply_redux_context_rollover(
         // A projection of this request only: the guard view keeps the
         // untrimmed compacted source, which is what the session adopts below.
         let before_trim = history.len();
-        let mut projection_guard = compaction_guard_history.clone();
+        let mut projection_guard = compaction_guard_history.messages().to_vec();
         let trimmed: bool = trim_redux_driver_context_budget_after_rollover(
             history,
             &mut projection_guard,
@@ -2263,15 +2256,16 @@ async fn apply_redux_context_rollover(
     }
     let mut restored_patch = patch;
     let range_start = restored_patch.range_start();
-    let Some(guard) = crate::agent::compaction::compaction_patch_guard_for(
-        &reducer_source_history,
-        range_start,
-        reducer_source_history.len(),
-    ) else {
+    let Some(guard) = reducer_source_history.guard_from(range_start) else {
         return Err(());
     };
     restored_patch.guard = guard;
-    restored_patch.replacement = compaction_guard_history.iter().skip(range_start).cloned().collect();
+    restored_patch.replacement = compaction_guard_history
+        .messages()
+        .iter()
+        .skip(range_start)
+        .cloned()
+        .collect();
     restored_patch.append_after.clear();
     let reducer_patch = compaction_patch_for_reducer_without_pending_user(
         &restored_patch,
@@ -2616,41 +2610,10 @@ impl ReasoningProgressBatcher {
     }
 }
 
-/// The reducer owns completed text turns. The pending request is committed by
-/// the ordered turn owner, and native call/result envelopes belong only to the
-/// live worker. Remove those by position/representation, never by matching Q's
-/// text: an older turn may contain identical input. Only the leading system
-/// prompt is kept: a system message the loop inserted later (recalled context
-/// pages) is a per-request projection, not session history.
-pub(super) fn reducer_history_from_compacted_worker(
-    history: &[crate::providers::ChatMessage],
-) -> Vec<crate::providers::ChatMessage> {
-    let pending = crate::agent::history::latest_user_query_index(history);
-    history
-        .iter()
-        .enumerate()
-        .filter(|(index, message)| {
-            if Some(*index) == pending
-                || message.role == "tool"
-                || message.role == "system" && *index > 0
-                || message.role == "user" && crate::agent::turn_contracts::is_loop_written_user_note(&message.content)
-            {
-                return false;
-            }
-            message.role != "assistant"
-                || !serde_json::from_str::<serde_json::Value>(&message.content).is_ok_and(|value| {
-                    value
-                        .get("tool_calls")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|calls| !calls.is_empty())
-                })
-        })
-        .map(|(_, message)| message.clone())
-        .collect()
-}
-
 struct ReduxToolLoopEventSink {
-    reducer_history: ParkingMutex<Vec<crate::providers::ChatMessage>>,
+    /// The reducer's history in its canonical form: every reducer patch is
+    /// guarded by it.
+    reducer_history: ParkingMutex<crate::agent::turn_history::CanonicalHistory>,
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
@@ -2699,9 +2662,7 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 used_context_tokens,
             } => {
                 let mut compacted_history = source_history;
-                if let Err(error) =
-                    crate::agent::compaction::apply_compaction_patch_exact(&mut compacted_history, &patch)
-                {
+                if let Err(error) = compacted_history.apply_patch(&patch) {
                     // No mutation and no reducer patch: the reducer keeps its
                     // acknowledged history and the worker's own view proceeds.
                     let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
@@ -2716,11 +2677,12 @@ impl crate::agent::turn_contracts::ToolLoopEventSink for ReduxToolLoopEventSink 
                 }
                 let patch = {
                     let mut source = self.reducer_history.lock();
-                    let target = reducer_history_from_compacted_worker(&compacted_history);
-                    let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
+                    let target = compacted_history.reducer_form();
+                    let guard = source
+                        .guard()
                         .ok_or_else(|| anyhow::anyhow!("invalid reducer compaction source"))?;
                     let patch = crate::agent::turn_contracts::CompactionPatch {
-                        replacement: target.clone(),
+                        replacement: target.messages().to_vec(),
                         append_after: Vec::new(),
                         guard,
                     };
@@ -2827,7 +2789,7 @@ async fn drive_start_turn_stream(
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
-    mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
+    mut compaction_guard_history: crate::agent::turn_history::CanonicalHistory,
     model: String,
     temperature: f64,
     compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -2876,12 +2838,12 @@ async fn drive_start_turn_stream(
     };
 
     // Preserve a separate reducer source only if preflight changes the worker
-    // snapshot; ordinary turns move the existing guard view into the sink.
-    let mut reducer_source_history = None;
-    // The untrimmed provider view, when the preflight below trimmed the worker
-    // view: the turn builds every durable compaction from it, never from the
-    // trimmed projection.
-    let mut canonical_view = None;
+    // snapshot; ordinary turns derive the sink's source from the guard source.
+    let mut reducer_source_history: Option<crate::agent::turn_history::CanonicalHistory> = None;
+    // Whether the preflight below compacted or trimmed the worker view, so the
+    // view the turn starts on is already a fitting projection of the
+    // canonical history (`compaction_guard_history`).
+    let mut caller_rollover = false;
     // Redux-specific preflight projection stays in the adapter because it must
     // publish the exact compaction patch and injection diagnostic into reducer
     // state before the shared owner starts the visible provider turn. The
@@ -2899,9 +2861,10 @@ async fn drive_start_turn_stream(
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
         if budget.over_hard_limit {
-            if let Err(error) =
-                crate::agent::context_preflight::ensure_current_request_capacity(&compaction_guard_history, config)
-            {
+            if let Err(error) = crate::agent::context_preflight::ensure_current_request_capacity(
+                compaction_guard_history.messages(),
+                config,
+            ) {
                 let _ = action_tx
                     .send(Action::StreamFailed {
                         draft_id,
@@ -2915,16 +2878,10 @@ async fn drive_start_turn_stream(
             let turns_before = chat_history_turn_count(&history);
             let tokens_before = super::estimate_chat_history_tokens(&history);
             let injection_diagnostic =
-                redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
+                redux_injection_overbudget_diagnostic_text(&history, compaction_guard_history.messages(), config);
             let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
             let messages_before_rollover = history.len();
             let view_before_rollover = history.clone();
-            let enriched_request = crate::agent::context_preflight::capture_current_turn_request_with_source(
-                &history,
-                &compaction_guard_history,
-            );
-            let source_request =
-                crate::agent::context_preflight::capture_current_turn_request(&compaction_guard_history);
             let outcome = if compaction_off {
                 ContextRolloverOutcome::default()
             } else {
@@ -2946,14 +2903,6 @@ async fn drive_start_turn_stream(
                 }
             };
             let replacement_len = outcome.replacement_len;
-            // The rollover publishes the untrimmed compacted source and trims
-            // only its provider view; that view before the trim is the
-            // canonical one. Without a rollover the view is still untrimmed.
-            let untrimmed_view = if replacement_len.is_some() {
-                provider_view_from_compacted_source(&compaction_guard_history, source_request, enriched_request)
-            } else {
-                view_before_rollover
-            };
             // A summary published the guard view at this point. A trim-only
             // fallback did not change the reducer, so its original view remains
             // authoritative even if the worker is trimmed further below.
@@ -2968,16 +2917,18 @@ async fn drive_start_turn_stream(
                 crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
             );
             if compaction_off || after_compact.over_hard_limit {
+                // A projection of this request: the guard source stays the
+                // canonical history the turn builds its durable compactions from.
+                let mut projection_guard = compaction_guard_history.messages().to_vec();
                 trim_redux_driver_context_budget_after_rollover(
                     &mut history,
-                    &mut compaction_guard_history,
+                    &mut projection_guard,
                     config,
                     replacement_len,
                 );
             }
-            if !crate::agent::turn_history::same_messages(&history, &untrimmed_view) {
-                canonical_view = Some(untrimmed_view);
-            }
+            caller_rollover = replacement_len.is_some()
+                || !crate::agent::turn_history::same_messages(&history, &view_before_rollover);
             // The rollover produced no patch, so every message the trim above
             // removed is gone without a summary or an event to recover it from.
             if outcome.degraded
@@ -3033,12 +2984,14 @@ async fn drive_start_turn_stream(
         }
     }
 
-    // The guard source includes the pending raw request; reducer state keeps
-    // that request outside its history until ordered commit.
-    let mut reducer_history = reducer_source_history.unwrap_or(compaction_guard_history);
-    if reducer_history.last().is_some_and(|message| message.role == "user") {
-        reducer_history.pop();
-    }
+    // The sink's source is the history the reducer holds: the reducer form of
+    // the guard source (the pending raw request stays outside it until the
+    // ordered commit; a summary's refresh aside and every loop note are never
+    // part of it), built exactly as the reducer rebuilds its own history.
+    let reducer_history = reducer_source_history
+        .as_ref()
+        .unwrap_or(&compaction_guard_history)
+        .reducer_form();
     let reasoning = Arc::new(ParkingMutex::new(String::new()));
     let reasoning_progress = Arc::new(ParkingMutex::new(ReasoningProgressBatcher::default()));
     let stream_version = Arc::new(AtomicU64::new(0));
@@ -3096,7 +3049,7 @@ async fn drive_start_turn_stream(
             // The scope lets an approval collection record its request event; the
             // legacy chat loop (chat/run.rs) sets the same scope.
             memory: with_compaction_scope(crate::agent::turn_request::ToolLoopMemory::none(), compaction_audit)
-                .with_canonical_history(canonical_view)
+                .with_canonical_history(compaction_guard_history, caller_rollover)
                 .with_tool_surface_reserve(tool_surface_reserve)
                 .with_event_fabric(request_event_fabric)
                 .with_request_event_scope(

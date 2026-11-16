@@ -23,7 +23,7 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     trigger: &'static str,
 ) -> Result<ContextBudgetSnapshot> {
     let config = preflight_config(config, tool_surface);
-    let mut turn_history = TurnHistory::new(history, None);
+    let mut turn_history = TurnHistory::new(history, None, false);
     let compaction = preflight_durable_compaction(
         history,
         &mut turn_history,
@@ -36,6 +36,7 @@ pub(super) async fn preflight_context_budget_before_provider_call(
     )
     .await?;
     if compaction.replacement_len.is_some() {
+        turn_history.finish_durable_compaction(history);
         let projected = turn_history.project(history);
         turn_history.reshape(history, |view| *view = projected);
     }
@@ -66,7 +67,7 @@ pub(super) fn preflight_config(
 pub(super) struct PreflightCompaction {
     /// The canonical history before the summary or handoff this phase applied
     /// to it; taken by the caller that reports the compaction.
-    pub(super) source: Option<Vec<ChatMessage>>,
+    pub(super) source: Option<crate::agent::turn_history::CanonicalHistory>,
     /// The applied replacement's length in the provider view.
     pub(super) replacement_len: Option<usize>,
     /// Why a `switch` rollover could not stay lossless.
@@ -119,15 +120,29 @@ pub(super) async fn preflight_durable_compaction(
     // first message that may head the hot window, which in a tool round is the
     // assistant envelope after the request, so the compaction can take it. It
     // goes back after the replacement.
-    let request = capture_current_turn_request(canonical);
+    let request = capture_current_turn_request(canonical.messages());
     // A `switch` rollover that cannot stay lossless must not abort the turn.
     // Failing closed here made every session that contains tool calls answer
     // each user message with the same non-retryable error, because the tool
     // round-trip messages kept provenance unresolvable and history never
     // shrank. The view degrades to a lossy trim and the downgrade is recorded.
-    match apply_configurable_compaction_with_replacement_len(canonical, provider, model, config, audit, trigger).await {
+    match apply_configurable_compaction_with_replacement_len(
+        canonical.durable_compaction_target(),
+        provider,
+        model,
+        config,
+        audit,
+        trigger,
+    )
+    .await
+    {
         Ok(Some(replacement_len)) => {
-            restore_current_turn_request(canonical, request, trigger, RestoredRequestPosition::Tail);
+            restore_current_turn_request(
+                canonical.durable_compaction_target(),
+                request,
+                trigger,
+                RestoredRequestPosition::Tail,
+            );
             Ok(PreflightCompaction {
                 source: Some(before),
                 replacement_len: Some(replacement_len.saturating_add(replacement_offset)),
@@ -244,11 +259,6 @@ pub(crate) struct CapturedTurnRequest {
 }
 
 impl CapturedTurnRequest {
-    /// The request exactly as it stood in the history it was captured from.
-    pub(crate) const fn message(&self) -> &ChatMessage {
-        &self.message
-    }
-
     pub(crate) fn into_message(self) -> ChatMessage {
         self.message
     }

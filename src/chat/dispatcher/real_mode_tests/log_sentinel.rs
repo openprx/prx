@@ -503,7 +503,7 @@ async fn a_switch_rollover_whose_handoff_insert_fails_logs_no_stored_content() {
             os_paging: crate::config::OsPagingConfig::default(),
         };
         let mut provider_view = source.clone();
-        let mut guard_view = source.clone();
+        let mut guard_view = crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone());
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
 
         let outcome = apply_redux_context_rollover(

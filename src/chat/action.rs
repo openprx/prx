@@ -344,7 +344,7 @@ pub enum Action {
         /// injection-overbudget diagnostics. Live chat passes the same
         /// canonical view used for persistence so provider-only enrichment never
         /// becomes the reducer's guard source.
-        compaction_guard_history: Option<Vec<crate::providers::ChatMessage>>,
+        compaction_guard_history: Option<crate::agent::turn_history::CanonicalHistory>,
         /// P5 proactive budgeting: resolved context budget for this turn.
         /// `None` keeps tests and non-chat callers budget-neutral.
         compaction_config: Option<crate::config::AgentCompactionConfig>,

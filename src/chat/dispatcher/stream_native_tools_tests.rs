@@ -549,7 +549,7 @@ mod tests {
             None,
             provider,
             history.clone(),
-            history,
+            crate::agent::turn_history::CanonicalHistory::from_test_messages(history),
             FIXTURE_MODEL.to_string(),
             0.0,
             None,

@@ -405,8 +405,9 @@ pub(crate) enum ToolLoopEvent {
     },
     ContextCompactionPatch {
         patch: CompactionPatch,
-        /// Worker source guarded by the patch; adapters project their durable transcript.
-        source_history: Vec<ChatMessage>,
+        /// The canonical history the patch is guarded by (never a provider
+        /// view); adapters derive the reducer form from it.
+        source_history: crate::agent::turn_history::CanonicalHistory,
         config: crate::config::AgentCompactionConfig,
         turns_before: usize,
         tokens_before: usize,

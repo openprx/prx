@@ -32,6 +32,29 @@ impl ChatState {
             .unwrap_or(0)
     }
 
+    /// A turn's canonical guard source when the caller supplied none: the
+    /// acknowledged turns under the reducer history's leading system prompt,
+    /// plus the pending request the provider history ends with.
+    fn acknowledged_turn_source(&self, history: &[ChatMessage]) -> crate::agent::turn_history::CanonicalHistory {
+        let leading_system = self
+            .session
+            .history
+            .first()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.as_str());
+        let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+            leading_system,
+            self.session
+                .turns
+                .iter()
+                .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+        );
+        match history.last().filter(|message| message.role == "user") {
+            Some(pending) => source.with_raw_request(&pending.content),
+            None => source,
+        }
+    }
+
     pub(super) fn prompt_preview_from_history(history: &[ChatMessage]) -> String {
         history
             .iter()
@@ -121,7 +144,7 @@ impl ChatState {
         provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
-        compaction_guard_history: Option<Vec<crate::providers::ChatMessage>>,
+        compaction_guard_history: Option<crate::agent::turn_history::CanonicalHistory>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
@@ -146,13 +169,8 @@ impl ChatState {
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
-        let compaction_guard_history = compaction_guard_history.or_else(|| {
-            let mut source = self.session.history.clone();
-            if let Some(pending) = history.last().filter(|message| message.role == "user") {
-                source.push(pending.clone());
-            }
-            Some(source)
-        });
+        let compaction_guard_history =
+            compaction_guard_history.or_else(|| Some(self.acknowledged_turn_source(&history)));
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -182,7 +200,7 @@ impl ChatState {
         provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
-        compaction_guard_history: Option<Vec<crate::providers::ChatMessage>>,
+        compaction_guard_history: Option<crate::agent::turn_history::CanonicalHistory>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
@@ -205,13 +223,8 @@ impl ChatState {
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
         let chat_mode = self.session.mode;
-        let compaction_guard_history = compaction_guard_history.or_else(|| {
-            let mut source = self.session.history.clone();
-            if let Some(pending) = history.last().filter(|message| message.role == "user") {
-                source.push(pending.clone());
-            }
-            Some(source)
-        });
+        let compaction_guard_history =
+            compaction_guard_history.or_else(|| Some(self.acknowledged_turn_source(&history)));
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,

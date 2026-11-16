@@ -517,13 +517,18 @@ async fn recovery_failure_keeps_run_and_store_names_in_reply_and_chat_log() {
         "another ingress lifetime remains active",
     ] {
         assert!(reply.contains(expected), "missing {expected}: {reply}");
-        assert!(line.contains(expected), "missing {expected}: {line}");
+    }
+    for expected in [first.run_id.as_deref().unwrap(), "brain.db", "sha256="] {
+        assert!(
+            line.contains(expected),
+            "the log line names the run and the store and classifies the error: missing {expected}: {line}"
+        );
     }
     assert!(!reply.contains('/'), "full paths must stay out of the reply: {reply}");
     let store = dir.path().join("memory/brain.db");
     assert!(
-        line.contains(store.to_str().unwrap()),
-        "missing full store path: {line}"
+        !line.contains(store.to_str().unwrap()) && !line.contains("another ingress lifetime remains active"),
+        "the log line carries the error's class, never its text or the store path: {line}"
     );
     assert!(line.contains("run_id="), "missing structured run field: {line}");
 

@@ -4092,9 +4092,9 @@ Retry with a compatible model: /provider {shown} <model>",
         );
         let mut preflight_adopted = false;
         if preflight_budget.over_hard_limit {
-            let audit_source_history = original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-            let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
-            let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
+            let audit_source_history = original_legacy_chat_compaction_audit_source(persisted_history_for_turn.messages());
+            let summary_projection = bounded_legacy_chat_compaction_audit_source(persisted_history_for_turn.messages());
+            let token_metadata = legacy_compaction_token_metadata(&history, persisted_history_for_turn.messages());
             let (turns_before, tokens_before) = super::compaction::chat_history_turns_and_tokens(&history);
             // The request is already recorded (`UserTurnAdmitted` above), so the
             // source is the persisted history including it and the reducer gets
@@ -4163,12 +4163,16 @@ Retry with a compatible model: /provider {shown} <model>",
         // reducer history it guards against holds the recorded request: the
         // acknowledged snapshot already does after an adopted preflight.
         let inline_compaction = {
-            let mut reducer_source = persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input);
-            if preflight_adopted {
-                reducer_source.pop();
-            }
+            let reducer_source = if preflight_adopted {
+                super::session_store::acknowledged_canonical_history(&chat_session.session(), &system_prompt)
+            } else {
+                persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input)
+            };
             super::compaction::InlineCompactionSink::new(chat_dispatcher.clone(), turn_signal.clone(), &user_input, reducer_source)
         };
+        // The inline turn's canonical history: the acknowledged turns plus the
+        // plain request, never the enriched provider view (r6-2).
+        let inline_canonical = inline_compaction.reducer_source();
 
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
         // directly from this chat turn inherits parent_run_id = the per-turn
@@ -4243,7 +4247,7 @@ Retry with a compatible model: /provider {shown} <model>",
                                         .with_approval_ledger(binding.h2_approval_ledger()),
                                     allowed_tool_names: None,
                                 }),
-                                memory: memory_runtime.clone(),
+                                memory: memory_runtime.clone().with_canonical_history(inline_canonical.clone(), false),
                             },
                             crate::agent::turn_request::TurnDelivery {
                                 cancellation: Some(cancellation.clone()),

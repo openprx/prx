@@ -346,16 +346,29 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
         .collect()
 }
 
+/// The canonical history of `session`'s acknowledged turns under
+/// `system_prompt`: the form the reducer holds and a guard must describe.
+pub(super) fn acknowledged_canonical_history(
+    session: &session::ChatSession,
+    system_prompt: &str,
+) -> crate::agent::turn_history::CanonicalHistory {
+    crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+        Some(system_prompt),
+        session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+    )
+}
+
+/// The canonical history of the current turn: the acknowledged turns plus the
+/// plain request (never its enriched form).
 pub(super) fn persisted_history_for_current_turn(
     session: &session::ChatSession,
     system_prompt: &str,
     user_input: &str,
-) -> Vec<ChatMessage> {
-    let mut history = Vec::with_capacity(session.turns.len().saturating_add(2));
-    history.push(ChatMessage::system(system_prompt.to_string()));
-    history.extend(session_turns_to_history(session));
-    history.push(crate::agent::turn_contracts::inbound_user_message(user_input));
-    history
+) -> crate::agent::turn_history::CanonicalHistory {
+    acknowledged_canonical_history(session, system_prompt).with_raw_request(user_input)
 }
 
 pub(super) fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, system_prompt: String) {

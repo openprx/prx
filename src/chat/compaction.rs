@@ -3,7 +3,6 @@
 #[cfg(feature = "terminal-tui")]
 use super::tui;
 use super::{dispatcher, sanitize};
-use crate::agent::compaction::apply_compaction_patch_exact;
 use crate::agent::compaction::build_configurable_compaction_patch_with_source_history;
 use crate::agent::context_budget::measure_history_tokens;
 use crate::agent::document_ingest::DocumentIngestRuntime;
@@ -225,13 +224,17 @@ pub(super) async fn run_manual_compact(
         chat_dispatcher,
         commits,
     } = request;
-    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
-    let mut source_history = Vec::with_capacity(chat_session.turns.len().saturating_add(system_count));
-    if let Some(system) = history.first().filter(|message| message.role == "system") {
-        source_history.push(system.clone());
-    }
-    source_history.extend(super::session_store::session_turns_to_history(chat_session));
-    if !manual_compact_has_compactable(&source_history, config) {
+    let source_history = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+        history
+            .first()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.as_str()),
+        chat_session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+    );
+    if !manual_compact_has_compactable(source_history.messages(), config) {
         return ManualCompactOutcome::Refused {
             reason: format_nothing_to_compact_feedback(history, config),
         };
@@ -293,11 +296,32 @@ pub(super) fn provider_view_from_acked(
     current_view: &[ChatMessage],
     acked: &crate::chat::acked_session::AckedSession,
 ) -> Vec<ChatMessage> {
+    project_acked(current_view, acked, None)
+}
+
+/// The one conversion ([`crate::agent::turn_history::project`]) over the
+/// acknowledged canonical history of `acked` under the current view's
+/// leading system prompt, with `request` (plain, enriched) as its only input.
+fn project_acked(
+    current_view: &[ChatMessage],
+    acked: &crate::chat::acked_session::AckedSession,
+    request: Option<(ChatMessage, ChatMessage)>,
+) -> Vec<ChatMessage> {
     let system = current_view
         .first()
         .filter(|message| message.role == "system")
         .map(|message| message.content.as_str());
-    super::session_store::provider_view_for_session(&acked.session, system)
+    let canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+        system,
+        acked
+            .session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+    );
+    let (plain, enriched) = request.unzip();
+    let inputs = crate::agent::turn_history::ProjectionInputs::default().with_enriched_request(plain, enriched);
+    crate::agent::turn_history::project(&canonical, &inputs).into_messages()
 }
 
 /// The provider view after a turn whose commit follows a worker (automatic)
@@ -313,14 +337,22 @@ pub(super) fn provider_view_after_compacted_commit(
     plain_request: &str,
     enriched_request: &ChatMessage,
 ) -> Vec<ChatMessage> {
-    let mut view = provider_view_from_acked(current_view, acked);
     let plain = crate::agent::turn_contracts::inbound_user_message(plain_request);
-    if let Some(slot) = view.iter_mut().rev().find(|message| message.role == "user")
-        && slot.content == plain.content
-    {
-        *slot = enriched_request.clone();
-    }
-    view
+    let newest_user_is_request = acked
+        .session
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == "user")
+        .is_some_and(|turn| {
+            crate::agent::turn_contracts::stored_turn_message(turn.role.clone(), turn.content.clone()).content
+                == plain.content
+        });
+    project_acked(
+        current_view,
+        acked,
+        newest_user_is_request.then(|| (plain, enriched_request.clone())),
+    )
 }
 
 /// The provider view after a turn that failed or was cancelled once a
@@ -416,7 +448,7 @@ pub(super) fn refresh_context_budget_for_tui(
 
 pub(super) async fn build_chat_compaction_patch(
     budget_history: &[ChatMessage],
-    source_history: &[ChatMessage],
+    source_history: &crate::agent::turn_history::CanonicalHistory,
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
@@ -425,7 +457,7 @@ pub(super) async fn build_chat_compaction_patch(
 ) -> Option<crate::agent::turn_contracts::CompactionPatch> {
     match build_configurable_compaction_patch_with_source_history(
         budget_history,
-        source_history,
+        source_history.messages(),
         provider,
         model,
         config,
@@ -459,7 +491,7 @@ pub(super) async fn build_chat_compaction_patch(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_chat_compaction_patch_and_sync(
     history: &mut Vec<ChatMessage>,
-    source_history: &[ChatMessage],
+    source_history: &crate::agent::turn_history::CanonicalHistory,
     enriched_request: Option<ChatMessage>,
     patch: crate::agent::turn_contracts::CompactionPatch,
     config: &crate::config::AgentCompactionConfig,
@@ -467,25 +499,24 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
     chat_dispatcher: &dispatcher::ChatDispatcher,
     commits: &dispatcher::TurnCompletionSignal,
 ) -> ManualCompactOutcome {
-    let mut compacted = source_history.to_vec();
-    if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
-        let range_start_index: usize = patch.range_start();
-        let range_end_index: usize = patch.range_end();
-        tracing::warn!(
-            guard_history_len = patch.guard.history_len,
-            range_start_index,
-            range_end_index,
-            source_len = source_history.len(),
-            "chat compaction patch does not describe its source; nothing was changed"
-        );
-        return ManualCompactOutcome::Refused {
-            reason: format!("Compaction refused: {error}. Nothing was changed."),
-        };
-    }
-    // The loop's own bookkeeping notes the patch appends (a summary's refresh
-    // aside) are not durable turns; they are put back after the replacement.
-    let append_after = patch.append_after.clone();
-    let replacement_tail = patch.replacement.last().cloned();
+    let mut compacted = source_history.clone();
+    let refresh_notes = match compacted.apply_patch(&patch) {
+        Ok(refresh_notes) => refresh_notes,
+        Err(error) => {
+            let range_start_index: usize = patch.range_start();
+            let range_end_index: usize = patch.range_end();
+            tracing::warn!(
+                guard_history_len = patch.guard.history_len,
+                range_start_index,
+                range_end_index,
+                source_len = source_history.len(),
+                "chat compaction patch does not describe its source; nothing was changed"
+            );
+            return ManualCompactOutcome::Refused {
+                reason: format!("Compaction refused: {error}. Nothing was changed."),
+            };
+        }
+    };
     let acked = match chat_dispatcher
         .dispatch_awaited(
             crate::chat::action::Action::HistoryCompactionPatchApplied {
@@ -520,49 +551,35 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
     // appends lives only in this provider projection, never in the session.
     // A view still over budget is trimmed per request by the turn's own
     // preflight; that trim is never persisted.
-    let mut view = provider_view_from_acked(&compacted, &acked);
-    if !append_after.is_empty() {
-        let insert_at = replacement_tail
-            .as_ref()
-            .and_then(|tail| {
-                view.iter()
-                    .rposition(|message| message.role == tail.role && message.content == tail.content)
-            })
-            .map(|index| index.saturating_add(1));
-        if let Some(insert_at) = insert_at {
-            view.splice(insert_at..insert_at, append_after);
-        }
-    }
-    if let Some(enriched) = enriched_request {
-        replace_final_request(&mut view, source_history.last(), enriched);
-    }
-    *history = view;
+    // The one conversion: the acknowledged canonical history projected with
+    // the summary's refresh aside and the enriched request.
+    let acked_canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+        compacted
+            .messages()
+            .first()
+            .filter(|message| message.role == "system")
+            .map(|message| message.content.as_str()),
+        acked
+            .session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
+    );
+    let plain_request = source_history
+        .messages()
+        .last()
+        .filter(|message| message.role == "user")
+        .cloned();
+    let mut inputs =
+        crate::agent::turn_history::ProjectionInputs::default().with_enriched_request(plain_request, enriched_request);
+    inputs.set_refresh_notes(refresh_notes);
+    *history = crate::agent::turn_history::project(&acked_canonical, &inputs).into_messages();
     let (turns_after, tokens_after) = chat_history_turns_and_tokens(history);
     ManualCompactOutcome::Compacted {
         generation: crate::agent::compaction::context_handoff_generation(history),
         turns_after,
         tokens_after,
     }
-}
-
-/// Replace the view's final message, when it is the source's plain request,
-/// with the enriched request; append the enriched request when the plain one
-/// did not survive at the tail. Either way the request occurs exactly once.
-pub(super) fn replace_final_request(
-    view: &mut Vec<ChatMessage>,
-    source_request: Option<&ChatMessage>,
-    enriched: ChatMessage,
-) {
-    let tail_is_request = source_request.is_some_and(|request| {
-        request.role == "user"
-            && view
-                .last()
-                .is_some_and(|last| last.role == request.role && last.content == request.content)
-    });
-    if tail_is_request {
-        view.pop();
-    }
-    view.push(enriched);
 }
 
 pub(super) fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -868,8 +885,9 @@ pub(super) struct InlineCompactionSink {
     chat_dispatcher: dispatcher::ChatDispatcher,
     commits: dispatcher::TurnCompletionSignal,
     user_input: String,
-    /// The reducer history the next patch is guarded by.
-    reducer_history: parking_lot::Mutex<Vec<ChatMessage>>,
+    /// The reducer history the next patch is guarded by, in the canonical
+    /// form the reducer holds.
+    reducer_history: parking_lot::Mutex<crate::agent::turn_history::CanonicalHistory>,
     compacted: std::sync::atomic::AtomicBool,
 }
 
@@ -878,7 +896,7 @@ impl InlineCompactionSink {
         chat_dispatcher: dispatcher::ChatDispatcher,
         commits: dispatcher::TurnCompletionSignal,
         user_input: &str,
-        reducer_history: Vec<ChatMessage>,
+        reducer_history: crate::agent::turn_history::CanonicalHistory,
     ) -> Arc<Self> {
         Arc::new(Self {
             chat_dispatcher,
@@ -887,6 +905,12 @@ impl InlineCompactionSink {
             reducer_history: parking_lot::Mutex::new(reducer_history),
             compacted: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// The reducer history this sink guards its next patch by: the inline
+    /// turn's canonical history at its start.
+    pub(super) fn reducer_source(&self) -> crate::agent::turn_history::CanonicalHistory {
+        self.reducer_history.lock().clone()
     }
 
     /// Whether the loop compacted or trimmed its view during the turn.
@@ -900,13 +924,13 @@ impl InlineCompactionSink {
 
     async fn adopt_patch(
         &self,
-        source_history: Vec<ChatMessage>,
+        source_history: crate::agent::turn_history::CanonicalHistory,
         patch: crate::agent::turn_contracts::CompactionPatch,
         config: crate::config::AgentCompactionConfig,
     ) -> anyhow::Result<()> {
         self.mark_compacted();
         let mut compacted = source_history;
-        if let Err(error) = apply_compaction_patch_exact(&mut compacted, &patch) {
+        if let Err(error) = compacted.apply_patch(&patch) {
             let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
             tracing::warn!(
                 error_len,
@@ -917,14 +941,14 @@ impl InlineCompactionSink {
             );
             return Ok(());
         }
-        let mut target = dispatcher::reducer_history_from_compacted_worker(&compacted);
-        target.push(crate::agent::turn_contracts::inbound_user_message(&self.user_input));
+        let target = compacted.reducer_form().with_raw_request(&self.user_input);
         let reducer_patch = {
             let source = self.reducer_history.lock();
-            let guard = crate::agent::compaction::compaction_patch_guard_for(&source, 0, source.len())
+            let guard = source
+                .guard()
                 .ok_or_else(|| anyhow::anyhow!("invalid reducer compaction source"))?;
             crate::agent::turn_contracts::CompactionPatch {
-                replacement: target.clone(),
+                replacement: target.messages().to_vec(),
                 append_after: Vec::new(),
                 guard,
             }

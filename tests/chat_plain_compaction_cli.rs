@@ -1567,3 +1567,190 @@ fn a_handoff_after_a_trim_in_the_same_turn_keeps_the_trimmed_turns() {
     );
     assert_lookup_returned_the_stored_row(&sandbox, &server);
 }
+
+/// The bytes the file-mention enrichment adds to the enriched request of the
+/// [`ENRICHED_REQUEST`] turn (the mentioned file's content).
+const ENRICHMENT_MARKER: &str = "ENRICHMENT-ONLY-5e1d";
+/// A request whose provider form carries the content of the mentioned file.
+const ENRICHED_REQUEST: &str = "keep @enrichment.txt in mind";
+
+/// An enriched earlier request, then a durable compaction in the middle of a
+/// later multi-round tool turn, through real HTTP/SSE and real SQLite. The
+/// turn's canonical history is the acknowledged session plus the plain
+/// request, so the handoff resolves the earlier turn's exact provenance and
+/// neither the saved session nor any stored handoff holds the enrichment,
+/// which only ever reached the provider.
+#[test]
+fn an_enriched_earlier_request_stays_plain_through_a_mid_turn_compaction() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    std::fs::write(
+        sandbox.workspace.join("enrichment.txt"),
+        format!("{ENRICHMENT_MARKER}\n"),
+    )
+    .expect("test: write the mentioned file");
+    let seen = std::sync::Arc::new(TrimThenHandoff::default());
+    let server = LoopbackOpenAi::start(
+        MODEL,
+        Some((11, 7)),
+        script_trim_then_handoff(std::sync::Arc::clone(&seen)),
+    );
+    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+        config.autonomy.level = openprx::security::AutonomyLevel::Full;
+        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
+        config.agent.compaction.reserve_tokens = RESERVE_TOKENS;
+        config.agent.compaction.keep_recent_messages = TRIM_THEN_HANDOFF_KEEP;
+        config.memory.auto_save = false;
+    });
+    let mut chat = HeldChat::spawn(&sandbox, &[]);
+    chat.turn(ENRICHED_REQUEST, 1);
+    let enriched_events = first_message_event_ids(&sandbox, 2);
+    chat.turn(TRIM_THEN_HANDOFF, 2);
+    let saved = wait_for_saved_reply_to(&sandbox, TRIM_THEN_HANDOFF);
+    let output = chat.exit();
+    assert_clean(&output, "an enriched request, then a mid-turn compaction");
+
+    let requests = server.requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| newest_user_text(request).contains(ENRICHMENT_MARKER)),
+        "the first turn's provider request carried the file enrichment"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| newest_user_text(request).contains(TRIM_THEN_HANDOFF)
+                && compaction_script::handoff_note(request).is_some()),
+        "the tool turn handed off in the middle of the turn; saved: {saved:?}"
+    );
+    assert!(
+        saved.iter().all(|(_, content)| !content.contains(ENRICHMENT_MARKER)),
+        "the saved session holds no enrichment: {saved:?}"
+    );
+    let handoff_refs = saved_handoff_references(&saved);
+    assert!(
+        enriched_events.iter().all(|event| handoff_refs.contains(event))
+            || saved.iter().any(|(_, content)| content == ENRICHED_REQUEST),
+        "the earlier request is kept as its plain bytes or through an exact handoff reference: \
+         events {enriched_events:?}, references {handoff_refs:?}, saved {saved:?}"
+    );
+    let stored = compaction_script::stored_handoffs(&sandbox.workspace);
+    assert!(!stored.is_empty(), "the mid-turn handoff was stored");
+    let notes: Vec<String> = stored.iter().map(|handoff| handoff.note.to_string()).collect();
+    assert!(
+        notes.iter().all(|note| !note.contains(ENRICHMENT_MARKER)),
+        "no stored handoff holds the enrichment: {notes:?}"
+    );
+}
+
+/// The system prompt the compaction summarizer receives.
+const SUMMARIZER_PROMPT: &str = "context compaction summarizer";
+/// The prefix of every summary the scripted summarizer writes; the summary's
+/// ordinal follows it.
+const SUMMARY_PREFIX: &str = "SUMMARY-ORDINAL-";
+
+/// Whether `request` is a compaction summarizer call.
+fn is_summarizer_request(request: &serde_json::Value) -> bool {
+    request["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| message["role"] == "system" && message_text(message).contains(SUMMARIZER_PROMPT))
+    })
+}
+
+/// The compaction script with a summarizer that numbers its summaries and a
+/// [`MULTI_READ`] turn of [`MULTI_READ_ROUNDS`] reads.
+fn script_numbered_summaries() -> Script {
+    let mut base = script_with_multi_read();
+    let mut summaries = 0usize;
+    Box::new(move |index, request| {
+        if is_summarizer_request(request) {
+            summaries += 1;
+            return Scripted::text(&format!(
+                "## Decisions\n{SUMMARY_PREFIX}{summaries}\n## Progress\nfiller files read\n## Pending\nnone"
+            ));
+        }
+        base(index, request)
+    })
+}
+
+/// Largest `chat.log` the consecutive-summary case reads.
+const CHAT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Lines of stderr and `chat.log` that record a refused compaction patch.
+fn refused_patch_lines(sandbox: &Sandbox, stderr: &str) -> Vec<String> {
+    use std::io::Read as _;
+    let mut chat_log = String::new();
+    if let Ok(file) = std::fs::File::open(sandbox.config_dir.join("chat.log")) {
+        file.take(CHAT_LOG_MAX_BYTES)
+            .read_to_string(&mut chat_log)
+            .expect("test: read chat.log");
+    }
+    stderr
+        .lines()
+        .chain(chat_log.lines())
+        .filter(|line| {
+            line.contains("HistoryCompactionPatch rejected")
+                || line.contains("does not describe the session history")
+                || line.contains("does not match its source")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Summary compactions in consecutive turns, the first an outer rollover at a
+/// turn's start, through real HTTP/SSE and real SQLite: every summary is
+/// accepted by the session (no refused patch, no guard mismatch), and the
+/// saved session ends on the newest summary.
+#[test]
+fn consecutive_summary_compactions_after_an_outer_rollover_are_all_accepted() {
+    let sandbox = Sandbox::new();
+    write_filler_files(&sandbox.workspace, SWITCH_FILLERS);
+    let server = LoopbackOpenAi::start(MODEL, Some((11, 7)), script_numbered_summaries());
+    set_window_and_mode(
+        &sandbox,
+        &server,
+        compaction_script::SMALL_WINDOW_TOKENS,
+        openprx::config::schema::AgentCompactionMode::Safeguard,
+    );
+    let mut command = sandbox.command(&["chat", "--plain"]);
+    command.env("RUST_LOG", "warn");
+    let mut chat = HeldChat {
+        sandbox: &sandbox,
+        running: Running::spawn(command),
+    };
+    let mut replies = 0;
+    for index in 0..4 {
+        replies += 1;
+        chat.turn(&read_line(index), replies);
+    }
+    replies += 1;
+    chat.turn(MULTI_READ, replies);
+    replies += 1;
+    chat.turn(&read_line(9), replies);
+    let saved = wait_for_saved_reply_to(&sandbox, &read_line(9));
+    let output = chat.exit();
+    assert_clean(&output, "consecutive summary compactions");
+
+    let summaries = server
+        .requests()
+        .iter()
+        .filter(|request| is_summarizer_request(request))
+        .count();
+    assert!(
+        summaries >= 2,
+        "at least two summary compactions ran ({summaries}); saved: {saved:?}"
+    );
+    let refused = refused_patch_lines(&sandbox, &output.stderr);
+    assert!(
+        refused.is_empty(),
+        "no compaction patch was refused or mismatched its guard: {refused:?}"
+    );
+    let newest = format!("{SUMMARY_PREFIX}{summaries}");
+    assert!(
+        saved.iter().any(|(_, content)| content.contains(&newest)),
+        "the saved session adopted the newest summary `{newest}`: {saved:?}"
+    );
+}

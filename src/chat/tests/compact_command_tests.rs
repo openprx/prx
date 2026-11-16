@@ -209,7 +209,7 @@ async fn slow_summary_compaction_is_awaited_without_wall_clock_timeout() {
 
     let patch = build_chat_compaction_patch(
         &history,
-        &history,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(history.clone()),
         &SlowSummaryProvider,
         "slow-model",
         &config,
@@ -252,7 +252,7 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
 
     let patch = build_chat_compaction_patch(
         &enriched_history,
-        &persisted_history,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(persisted_history.clone()),
         &ImmediateSummaryProvider,
         "summary-model",
         &config,
@@ -278,7 +278,7 @@ async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() 
     );
     let outcome = apply_chat_compaction_patch_and_sync(
         &mut legacy_history,
-        &persisted_history,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(persisted_history.clone()),
         None,
         patch.clone(),
         &config,
@@ -355,7 +355,7 @@ async fn chat_compaction_helper_refuses_a_patch_for_another_source_without_any_c
 
         let outcome = apply_chat_compaction_patch_and_sync(
             &mut history,
-            &source,
+            &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
             Some(ChatMessage::user("q2 enriched")),
             patch,
             &config,
@@ -407,7 +407,7 @@ async fn chat_compaction_helper_replaces_the_plain_request_with_the_enriched_one
 
         let outcome = apply_chat_compaction_patch_and_sync(
             &mut history,
-            &source,
+            &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
             Some(ChatMessage::user("q2 ENRICHED")),
             patch,
             &config,

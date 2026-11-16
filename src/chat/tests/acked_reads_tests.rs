@@ -160,7 +160,7 @@ async fn manual_compaction_over_sanitized_past_turns_is_acknowledged_in_the_runt
         source.extend(session_turns_to_history(&saved.session));
         let patch = build_chat_compaction_patch(
             &source,
-            &source,
+            &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
             &SectionSummaryProvider,
             "summary-model",
             &config,
@@ -173,7 +173,7 @@ async fn manual_compaction_over_sanitized_past_turns_is_acknowledged_in_the_runt
 
         let outcome = apply_chat_compaction_patch_and_sync(
             &mut provider_view,
-            &source,
+            &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
             None,
             patch.clone(),
             &config,
@@ -249,7 +249,7 @@ async fn summary_compaction_of_acknowledged_turns(
     source.extend(session_turns_to_history(&acked.session));
     let patch = build_chat_compaction_patch(
         &source,
-        &source,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
         &SectionSummaryProvider,
         "summary-model",
         config,
@@ -260,7 +260,7 @@ async fn summary_compaction_of_acknowledged_turns(
     .expect("test: the history yields a summary patch");
     apply_chat_compaction_patch_and_sync(
         provider_view,
-        &source,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
         None,
         patch,
         config,
@@ -370,7 +370,7 @@ async fn preflight_compaction_over_sanitized_past_turns_is_acknowledged_with_the
             .dispatcher
             .dispatch_or_log(Action::RecordUserTurn(request.to_owned()), "test.record_user_turn");
         let source = persisted_history_for_current_turn(&saved.session, SYSTEM, request);
-        let mut provider_view = source.clone();
+        let mut provider_view = source.messages().to_vec();
         if let Some(last) = provider_view.last_mut() {
             *last = enriched.clone();
         }
@@ -756,7 +756,7 @@ async fn assert_compact_right_after_the_load_is_compacted(kind: LoadBeforeCompac
     let source = provider_view.clone();
     let patch = build_chat_compaction_patch(
         &provider_view,
-        &source,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
         &SectionSummaryProvider,
         "summary-model",
         &config,
@@ -768,7 +768,7 @@ async fn assert_compact_right_after_the_load_is_compacted(kind: LoadBeforeCompac
 
     let outcome = apply_chat_compaction_patch_and_sync(
         &mut provider_view,
-        &source,
+        &crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone()),
         None,
         patch,
         &config,

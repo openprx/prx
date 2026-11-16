@@ -183,6 +183,7 @@ fn a_user_turn_opening_with_a_reserved_marker_enters_history_defused() {
         session.add_assistant_turn("an answer", Vec::new());
         let history = persisted_history_for_current_turn(&session, "system", &current);
         let users: Vec<&str> = history
+            .messages()
             .iter()
             .filter(|message| message.role == "user")
             .map(|message| message.content.as_str())

@@ -76,7 +76,7 @@ use crate::agent::turn_contracts::ChatMode;
 use crate::agent::turn_contracts::{
     ToolCallNotification, ToolLoopCancelled, ToolLoopEvent, ToolLoopOutcome, ToolLoopTrace, emit_tool_loop_event,
 };
-use crate::agent::turn_history::{TurnHistory, same_messages};
+use crate::agent::turn_history::{CanonicalHistory, TurnHistory, same_messages};
 use crate::agent::turn_request::{ToolLoopMemory, TurnDecision, TurnDelivery, TurnRequest, TurnSchedule, TurnServices};
 #[cfg(test)]
 use crate::memory::{DocumentSearchResult, MemoryPrincipal};
@@ -416,10 +416,18 @@ async fn run_turn_unguarded(
         request_event_scope,
         tool_surface_reserve,
         canonical_history,
+        caller_rollover,
     } = memory_runtime;
-    // The untrimmed history every durable compaction of this turn is built
+    // A session authority adopts this turn's durable compactions as patches
+    // over its acknowledged history, so the turn must build them from that
+    // history, never from the provider view (I-CANON).
+    anyhow::ensure!(
+        runtime_adapter.as_ref().is_none_or(|adapter| adapter.events.is_none()) || canonical_history.is_some(),
+        "a turn that reports to a session authority requires its canonical history"
+    );
+    // The canonical history every durable compaction of this turn is built
     // from; `history` is the provider view projected from it.
-    let mut turn_history = TurnHistory::new(history, canonical_history);
+    let mut turn_history = TurnHistory::new(history, canonical_history, caller_rollover);
     anyhow::ensure!(
         Arc::ptr_eq(turn_runtime, context.runtime()),
         "turn runtime context differs from the opened decision context"
@@ -507,12 +515,17 @@ async fn run_turn_unguarded(
         if plan_context_budget(history, config, config.os_paging.eviction_threshold).over_warning {
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
-            match apply_os_paging(canonical, config, document_ingest.as_ref()).await {
+            match apply_os_paging(canonical.durable_compaction_target(), config, document_ingest.as_ref()).await {
                 Ok(true) => {
                     crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                     tracing::debug!("os-paging: pre-turn eviction applied");
-                    report_durable_compaction(&runtime_adapter, before, turn_history.canonical(history), config)
-                        .await?;
+                    report_durable_compaction(
+                        &runtime_adapter,
+                        before,
+                        turn_history.finish_durable_compaction(history),
+                        config,
+                    )
+                    .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
                 Ok(false) => {}
@@ -541,7 +554,7 @@ async fn run_turn_unguarded(
             let canonical = turn_history.canonical_mut(history);
             let before = history_before_change(&runtime_adapter, canonical);
             match apply_configurable_compaction(
-                canonical,
+                canonical.durable_compaction_target(),
                 provider,
                 model,
                 config,
@@ -551,8 +564,13 @@ async fn run_turn_unguarded(
             .await
             {
                 Ok(true) => {
-                    report_durable_compaction(&runtime_adapter, before, turn_history.canonical(history), config)
-                        .await?;
+                    report_durable_compaction(
+                        &runtime_adapter,
+                        before,
+                        turn_history.finish_durable_compaction(history),
+                        config,
+                    )
+                    .await?;
                     rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
                 }
                 Ok(false) => {}
@@ -673,7 +691,11 @@ async fn run_turn_unguarded(
         let constrained = service.agent_execution_specs(proof, context)?;
         let search_spec = service.agent_capability_search_spec(proof, context)?;
         let appended = service.agent_appended_execution_specs(proof, context)?;
-        let advertises_skills = history
+        // From the canonical history, which is never suppressed: a previous
+        // iteration's suppressed view would read as "no skills advertised" and
+        // let a later re-derived view restore the metadata without skill_read.
+        let advertises_skills = turn_history
+            .canonical(history)
             .iter()
             .any(|message| message.role == "system" && message.content.contains("<available_skills>"));
         let skill_spec = if advertises_skills && proof.tool_calls_allowed() && service.model_can_call_tools(proof) {
@@ -815,8 +837,13 @@ async fn run_turn_unguarded(
             )
             .await?;
             if let Some(before) = compaction.source.take() {
-                report_durable_compaction(&runtime_adapter, Some(before), turn_history.canonical(history), config)
-                    .await?;
+                report_durable_compaction(
+                    &runtime_adapter,
+                    Some(before),
+                    turn_history.finish_durable_compaction(history),
+                    config,
+                )
+                .await?;
                 rederive_provider_view(&mut turn_history, history, hooks, channel_name).await;
             }
             let budget = preflight_trim_projection(
@@ -1565,9 +1592,9 @@ async fn run_turn_unguarded(
                         let mut before_trim = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
                         let mut degraded_reason = None;
                         let canonical = turn_history.canonical_mut(history);
-                        let canonical_request = capture_current_turn_request(canonical);
+                        let canonical_request = capture_current_turn_request(canonical.messages());
                         let compaction = match build_configurable_compaction_patch(
-                            canonical,
+                            canonical.messages(),
                             provider,
                             model,
                             config,
@@ -1579,13 +1606,15 @@ async fn run_turn_unguarded(
                             Ok(Some(patch)) => {
                                 crate::agent::idle::beat(crate::agent::idle::ProgressKind::Compaction);
                                 let mut compacted = canonical.clone();
-                                match apply_compaction_patch_exact(&mut compacted, &patch) {
+                                match apply_compaction_patch_exact(compacted.durable_compaction_target(), &patch) {
                                     Ok(()) => {
                                         // The whole resulting history, request included, is what
                                         // the session adopts: restoring the request only in the
-                                        // view would leave the saved history without it.
+                                        // view would leave the saved history without it. A
+                                        // refresh aside moves into the projection when the
+                                        // compaction is finished.
                                         restore_current_turn_request(
-                                            &mut compacted,
+                                            compacted.durable_compaction_target(),
                                             canonical_request,
                                             "overflow_retry",
                                             RestoredRequestPosition::Tail,
@@ -1615,7 +1644,7 @@ async fn run_turn_unguarded(
                             report_durable_compaction(
                                 &runtime_adapter,
                                 Some(before),
-                                turn_history.canonical(history),
+                                turn_history.finish_durable_compaction(history),
                                 config,
                             )
                             .await?;
@@ -2262,9 +2291,9 @@ async fn run_turn_unguarded(
 /// [`report_durable_compaction`] can describe the step to it.
 fn history_before_change(
     runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
-    history: &[ChatMessage],
-) -> Option<Vec<ChatMessage>> {
-    runtime_adapter.events.as_ref().map(|_| history.to_vec())
+    canonical: &CanonicalHistory,
+) -> Option<CanonicalHistory> {
+    runtime_adapter.events.as_ref().map(|_| canonical.clone())
 }
 
 /// Report one durable in-turn compaction (a handoff, a summary or an evicted
@@ -2280,36 +2309,42 @@ fn history_before_change(
 /// Nothing is sent when nobody listens or nothing changed.
 async fn report_durable_compaction(
     runtime_adapter: &crate::agent::turn_contracts::ToolLoopRuntimeAdapter,
-    before: Option<Vec<ChatMessage>>,
-    compacted: &[ChatMessage],
+    before: Option<CanonicalHistory>,
+    compacted: &CanonicalHistory,
     config: &crate::config::AgentCompactionConfig,
 ) -> Result<()> {
     let Some(source_history) = before.filter(|_| runtime_adapter.events.is_some()) else {
         return Ok(());
     };
-    if same_messages(&source_history, compacted) {
+    if source_history == *compacted {
         return Ok(());
     }
-    let guard = crate::agent::compaction::compaction_patch_guard_for(&source_history, 0, source_history.len())
+    let guard = source_history
+        .guard()
         .ok_or_else(|| anyhow::anyhow!("invalid in-turn compaction range"))?;
+    let compacted_messages = compacted.messages();
     let patch = crate::agent::turn_contracts::CompactionPatch {
-        replacement: compacted.to_vec(),
+        replacement: compacted_messages.to_vec(),
         append_after: Vec::new(),
         guard,
     };
     let system_messages =
         |messages: &[ChatMessage]| usize::from(messages.first().is_some_and(|message| message.role == "system"));
-    let used_context_tokens = plan_context_budget(compacted, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
+    let used_context_tokens = plan_context_budget(compacted_messages, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
     emit_tool_loop_event(
         runtime_adapter,
         ToolLoopEvent::ContextCompactionPatch {
-            turns_before: source_history.len().saturating_sub(system_messages(&source_history)),
-            tokens_before: estimate_history_tokens(&source_history),
+            turns_before: source_history
+                .len()
+                .saturating_sub(system_messages(source_history.messages())),
+            tokens_before: estimate_history_tokens(source_history.messages()),
             source_history,
             patch,
             config: config.clone(),
-            turns_after: compacted.len().saturating_sub(system_messages(compacted)),
-            tokens_after: estimate_history_tokens(compacted),
+            turns_after: compacted_messages
+                .len()
+                .saturating_sub(system_messages(compacted_messages)),
+            tokens_after: estimate_history_tokens(compacted_messages),
             used_context_tokens,
         },
     )

@@ -136,6 +136,9 @@ async fn overflow_turn(
     let mut adapter = admission.adapter();
     adapter.stream_provider = streaming;
     adapter.events = Some(events.clone());
+    // The session authority this turn reports to holds exactly the turn's
+    // starting history.
+    let canonical = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.clone());
     run_turn(
         history,
         TurnRequest {
@@ -165,7 +168,7 @@ async fn overflow_turn(
             approval: None,
             approval_resolver: None,
             runtime_adapter: Some(adapter),
-            memory: ToolLoopMemory::none(),
+            memory: ToolLoopMemory::none().with_canonical_history(canonical, false),
         },
         TurnDelivery {
             cancellation: None,
@@ -279,22 +282,33 @@ async fn provider_overflow_retry_keeps_current_request() {
                             .map(|message| (message.role.clone(), message.content.clone()))
                             .collect::<Vec<_>>()
                     };
-                    assert!(crate::agent::compaction::compaction_patch_guard_matches(
-                        source_history,
-                        &patch.guard
-                    ));
+                    assert!(
+                        crate::agent::compaction::compaction_patch_guard_matches(
+                            source_history.messages(),
+                            &patch.guard
+                        ),
+                        "the patch's guard describes its canonical source history"
+                    );
                     assert_eq!(
-                        conversation(source_history),
+                        conversation(source_history.messages()),
                         conversation(before),
                         "the patch's source is the canonical history the overflowed request was projected from"
                     );
-                    let mut replayed = source_history.clone();
+                    let mut replayed = source_history.messages().to_vec();
                     crate::agent::compaction::apply_compaction_patch_exact(&mut replayed, patch)
                         .expect("test: published patch replays on its source");
+                    // The summary's refresh aside is a projection of the retry
+                    // request, never part of the patch the session adopts.
+                    let without_loop_notes = |messages: &[ChatMessage]| {
+                        conversation(messages)
+                            .into_iter()
+                            .filter(|(_, content)| !crate::agent::turn_contracts::is_loop_written_user_note(content))
+                            .collect::<Vec<_>>()
+                    };
                     assert_eq!(
                         conversation(&replayed),
-                        conversation(retry),
-                        "worker patch replays the exact retry view"
+                        without_loop_notes(retry),
+                        "worker patch replays the retry view without its loop notes"
                     );
                     assert_eq!(
                         retry.last().map(|m| m.content.as_str()),

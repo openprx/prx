@@ -138,7 +138,7 @@ async fn overflow_patch_and_ordered_commit_preserve_one_pending_request() {
             };
             let effects = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: Some(task), provider_turn_sequence: Some(1), draft_id: "prx-overflow-reducer".into(),
-                history: worker.clone(), compaction_guard_history: Some(worker), compaction_config: Some(config),
+                history: worker.clone(), compaction_guard_history: Some(crate::agent::turn_history::CanonicalHistory::from_test_messages(worker)), compaction_config: Some(config),
                 cancel: CancellationToken::new(), turn_spawn_ctx: None, turn_message_send_ctx: None, routing_input: None, turn_binding: Some(binding),
             });
             assert_eq!(state.session.history.len(), base.len(), "StartTurn leaves the pending input uncommitted");

@@ -1267,8 +1267,9 @@ fn start_turn_default_guard_includes_the_uncommitted_request() {
         .expect("original history plus pending input");
     assert_eq!(guard.len(), worker.len());
     assert_eq!(
-        guard.last().map(|message| message.content.as_str()),
-        Some("pending input")
+        guard.messages().last().map(|message| message.content.as_str()),
+        Some("pending input"),
+        "the guard source ends with the pending request"
     );
     assert_eq!(state.session.history.len(), 1, "the pending input is still uncommitted");
 }

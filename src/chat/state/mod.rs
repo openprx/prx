@@ -182,7 +182,7 @@ pub enum Effect {
         /// Original history plus the pending request, used for compaction
         /// identity before the request's ordered commit. When absent, direct
         /// callers use `history` for both the budget and guard source.
-        compaction_guard_history: Option<Vec<ChatMessage>>,
+        compaction_guard_history: Option<crate::agent::turn_history::CanonicalHistory>,
         /// P5 proactive budgeting config resolved from the selected model
         /// window. The streaming driver uses it for preflight/mid-turn trims.
         compaction_config: Option<crate::config::AgentCompactionConfig>,

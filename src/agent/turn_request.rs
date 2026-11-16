@@ -147,11 +147,15 @@ pub(crate) struct ToolLoopMemory {
     /// Where the turn records the tool-surface reserve its preflight applied,
     /// for a chat front end that budgets outside the turn.
     pub(super) tool_surface_reserve: Option<crate::agent::context_budget::ToolSurfaceReserve>,
-    /// The untrimmed history a caller projected the turn's view from, when it
-    /// trimmed that view before the turn (the chat worker's pre-turn
-    /// rollover). The turn builds every durable compaction from it rather than
-    /// from the trimmed view; `None` when the view is the acknowledged history.
-    pub(super) canonical_history: Option<Vec<crate::providers::ChatMessage>>,
+    /// The turn's canonical history (acknowledged turns plus the plain
+    /// request) when the caller has an acknowledged session (chat). The turn
+    /// builds and guards every durable compaction from it, never from the
+    /// provider view; a turn that reports to a session authority must have
+    /// one. `None` for callers whose history is their own canonical history.
+    pub(super) canonical_history: Option<crate::agent::turn_history::CanonicalHistory>,
+    /// Whether the caller compacted or trimmed the view before the turn, so
+    /// the view already is a fitting projection of `canonical_history`.
+    pub(super) caller_rollover: bool,
 }
 
 impl ToolLoopMemory {
@@ -164,6 +168,7 @@ impl ToolLoopMemory {
             request_event_scope: None,
             tool_surface_reserve: None,
             canonical_history: None,
+            caller_rollover: false,
         }
     }
 
@@ -188,10 +193,15 @@ impl ToolLoopMemory {
     /// Attach the entrypoint's configured event fabric. This deliberately
     /// travels with the other per-turn memory handles so every ingress reaches
     /// the same request-context persistence point inside the shared loop.
-    /// The untrimmed history the caller projected the turn's view from; see
-    /// the field's documentation.
-    pub(crate) fn with_canonical_history(mut self, canonical: Option<Vec<crate::providers::ChatMessage>>) -> Self {
-        self.canonical_history = canonical;
+    /// The turn's canonical history, and whether the caller's pre-turn
+    /// rollover already projected the view from it; see the fields.
+    pub(crate) fn with_canonical_history(
+        mut self,
+        canonical: crate::agent::turn_history::CanonicalHistory,
+        caller_rollover: bool,
+    ) -> Self {
+        self.canonical_history = Some(canonical);
+        self.caller_rollover = caller_rollover;
         self
     }
 

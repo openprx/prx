@@ -901,7 +901,7 @@ async fn redux_switch_without_exact_provenance_degrades_instead_of_failing_the_t
         .iter()
         .map(|message| (message.role.clone(), message.content.clone()))
         .collect::<Vec<_>>();
-    let mut guard_history = history.clone();
+    let mut guard_history = crate::agent::turn_history::CanonicalHistory::from_test_messages(history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Switch,
         reserve_tokens: 1,
@@ -1020,7 +1020,8 @@ async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_e
         "hidden ".repeat(120)
     ));
     let enriched_before_compaction = driver_history.clone();
-    let mut compaction_guard_history = original_history.clone();
+    let mut compaction_guard_history =
+        crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 5,
@@ -1170,7 +1171,8 @@ async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enr
         PMsg::user("current user"),
     ];
     let mut driver_history = original_history.clone();
-    let mut compaction_guard_history = original_history.clone();
+    let mut compaction_guard_history =
+        crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 5,

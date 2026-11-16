@@ -63,7 +63,8 @@ async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
         "\n\n[Attached file context from @path mentions]\nRECENT_ENRICHMENT_ONLY {}\n[End attached file context]",
         "hidden ".repeat(1000)
     ));
-    let mut compaction_guard_history = original_history.clone();
+    let mut compaction_guard_history =
+        crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 5,
@@ -178,7 +179,8 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
         PMsg::user("recent bulk ".repeat(40)),
     ];
     let mut driver_history = original_history.clone();
-    let mut compaction_guard_history = original_history.clone();
+    let mut compaction_guard_history =
+        crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 5,
@@ -220,9 +222,10 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
     );
     // The guard view keeps the untrimmed compaction the session adopts.
     let durable_source = compaction_guard_history.clone();
+    let mut projection_guard = compaction_guard_history.messages().to_vec();
     let _ = trim_redux_driver_context_budget_after_rollover(
         &mut driver_history,
-        &mut compaction_guard_history,
+        &mut projection_guard,
         &config,
         Some(replacement_len),
     );
@@ -267,7 +270,7 @@ async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_
     };
     assert_eq!(
         canonical(&reducer_state.session.history),
-        canonical(&durable_source),
+        canonical(durable_source.messages()),
         "the reducer saves the untrimmed compacted source, never the driver's trim"
     );
 }
@@ -325,7 +328,8 @@ async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reduce
     }
     original_history.push(PMsg::user("current request"));
     let mut driver_history = original_history.clone();
-    let mut compaction_guard_history = original_history.clone();
+    let mut compaction_guard_history =
+        crate::agent::turn_history::CanonicalHistory::from_test_messages(original_history.clone());
     let config = crate::config::AgentCompactionConfig {
         mode: crate::config::AgentCompactionMode::Safeguard,
         reserve_tokens: 10,
@@ -1255,7 +1259,7 @@ async fn redux_rollover_compacts_the_source_and_rebuilds_a_shorter_provider_view
             PROVIDER_VIEW_LEN,
             "test fixture: provider view length"
         );
-        let mut guard_history = source.clone();
+        let mut guard_history = crate::agent::turn_history::CanonicalHistory::from_test_messages(source.clone());
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 10,
@@ -1286,7 +1290,11 @@ async fn redux_rollover_compacts_the_source_and_rebuilds_a_shorter_provider_view
             "a patch whose guard describes the source must apply: {outcome:?}"
         );
         assert!(
-            guard_history.len() < SOURCE_LEN && guard_history.iter().any(|m| m.content.contains("ROLLOVER_SUMMARY")),
+            guard_history.len() < SOURCE_LEN
+                && guard_history
+                    .messages()
+                    .iter()
+                    .any(|m| m.content.contains("ROLLOVER_SUMMARY")),
             "the source must be compacted"
         );
         let last = provider_view.last().expect("test: provider view is not empty");

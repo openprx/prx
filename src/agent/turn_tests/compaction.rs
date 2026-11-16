@@ -1634,7 +1634,7 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
         };
         // An earlier trim of this turn took the two oldest rounds out of the view.
         let mut view = original.clone();
-        let mut turn_history = crate::agent::turn_history::TurnHistory::new(&view, None);
+        let mut turn_history = crate::agent::turn_history::TurnHistory::new(&view, None, false);
         turn_history.reshape(&mut view, |view| {
             view.drain(1..9);
         });
@@ -1662,7 +1662,7 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
         };
         let mut trimmed = tool_roundtrip_history_fixture(10);
         let trimmed_len = trimmed.len();
-        let mut trim_history = crate::agent::turn_history::TurnHistory::new(&trimmed, None);
+        let mut trim_history = crate::agent::turn_history::TurnHistory::new(&trimmed, None, false);
         let trim_only = crate::agent::context_preflight::preflight_durable_compaction(
             &trimmed,
             &mut trim_history,
@@ -1687,10 +1687,10 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
 
         let before = compaction
             .source
-            .as_deref()
+            .as_ref()
             .expect("an applied summary is returned as a durable compaction");
         assert!(
-            crate::agent::turn_history::same_messages(before, &original),
+            crate::agent::turn_history::same_messages(before.messages(), &original),
             "the durable compaction's source is the canonical history, the trimmed rounds included"
         );
         assert!(
@@ -1706,7 +1706,7 @@ async fn the_preflight_builds_its_durable_compaction_from_the_canonical_history_
         );
         assert!(trimmed.len() < trimmed_len, "the degraded switch did trim the view");
         assert!(
-            crate::agent::turn_history::same_messages(trim_history.canonical_mut(&trimmed), &original),
+            crate::agent::turn_history::same_messages(trim_history.canonical_mut(&trimmed).messages(), &original),
             "the trim never reached the canonical history"
         );
     })
