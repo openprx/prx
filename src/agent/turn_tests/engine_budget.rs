@@ -2467,3 +2467,226 @@ async fn off_mode_preflight_trims_without_silent_summary() {
         "Off mode must not silently insert a compaction summary"
     );
 }
+
+/// Chat provider for the skill-rebuild scenario. It serves the tool loop's
+/// `chat` calls from a script, answers the compaction summarizer's
+/// `chat_with_system` calls with a summary that carries the required
+/// sections, and records every request it is given: a tool-loop request as
+/// its messages, a summarizer call as its system prompt and input.
+struct SkillRebuildProvider {
+    responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+    requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+}
+
+impl SkillRebuildProvider {
+    fn requests(&self) -> Vec<Vec<ChatMessage>> {
+        self.requests.lock().expect("test: request log lock").clone()
+    }
+}
+
+/// Carries every `## ` header the Safeguard summary validates against.
+const SKILL_REBUILD_SUMMARY: &str = "## Decisions\nnone\n## Open TODOs\nnone\n## Constraints/Rules\nnone\n\
+     ## Pending user asks\nnone\n## Exact identifiers\nnone\n## Progress\nnone\n## Critical Context\nnone";
+
+/// The scenario is three scripted provider calls and one local compaction.
+/// Anything past this is a hang, not a slow machine.
+const SKILL_REBUILD_TEST_DEADLINE: Duration = Duration::from_secs(30);
+
+#[async_trait]
+impl Provider for SkillRebuildProvider {
+    fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+        crate::providers::traits::ProviderCapabilities {
+            native_tool_calling: true,
+            vision: false,
+        }
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<String> {
+        self.requests.lock().expect("test: request log lock").push(vec![
+            ChatMessage::system(system_prompt.unwrap_or_default()),
+            ChatMessage::user(message),
+        ]);
+        Ok(SKILL_REBUILD_SUMMARY.to_string())
+    }
+
+    async fn chat(&self, request: ChatRequest<'_>, _model: &str, _temperature: f64) -> anyhow::Result<ChatResponse> {
+        self.requests
+            .lock()
+            .expect("test: request log lock")
+            .push(request.messages.to_vec());
+        self.responses
+            .lock()
+            .expect("test: response script lock")
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("test: the scripted provider ran out of responses"))
+    }
+}
+
+/// The turn advertises skill metadata that `skill_read` cannot serve (the
+/// registry has no `skill_read`), so the metadata is suppressed on every
+/// iteration. The first tool round takes the turn into a second iteration,
+/// and the window is saturated there, so the per-provider preflight runs a
+/// durable summary compaction and rebuilds the provider view from the
+/// canonical history. A regression that re-derives the view without the
+/// suppression restores the metadata into that rebuilt request.
+#[tokio::test]
+async fn skill_metadata_stays_suppressed_across_an_in_turn_rebuild() {
+    tokio::time::timeout(
+        SKILL_REBUILD_TEST_DEADLINE,
+        Box::pin(async {
+            const SKILLS_BLOCK: &str = "## Available Skills\n<available_skills>\n<skill name=\"pdf\">Read PDF files.</skill>\n</available_skills>";
+            const OLDER_TURN_MARKER: &str = "skill-rebuild-older-turn-marker";
+            const QUESTION_MARKER: &str = "skill-rebuild-question-marker";
+
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+                name: "file_read".to_string(),
+                output: "mid turn tool output ".repeat(8),
+            })];
+            let tools_registry = crate::agent::turn_tests::admission::registry_with_search(tools_registry);
+            let tool_specs = business_tool_specs_of(&tools_registry);
+            let tool_surface = crate::agent::turn_context::measure_request_tool_surface(true, &tool_specs);
+
+            let question = format!("{QUESTION_MARKER} Use file_read. {}", "question-bulk ".repeat(1600));
+            let mut history = vec![
+                ChatMessage::system(format!("stable base system prompt\n{SKILLS_BLOCK}")),
+                ChatMessage::user(format!("{OLDER_TURN_MARKER} settled earlier")),
+                ChatMessage::assistant("settled"),
+                ChatMessage::user(question.clone()),
+            ];
+            // The window is sized on the view the first request sends, which has
+            // the metadata suppressed, so the first iteration fits and the tool
+            // round is what pushes the second one over.
+            let mut first_view = history.clone();
+            crate::agent::runtime_prompt::suppress_unreadable_skill_metadata(&mut first_view);
+            let mut config = decision_sized_fixture_config(mid_turn_floor_fixture_config(
+                &first_view,
+                tool_surface,
+                MID_TURN_SATURATED_SLACK_TOKENS,
+            ));
+            config.mode = crate::config::AgentCompactionMode::Safeguard;
+            let reserved = reserve_request_tool_surface(&fixture_main_compaction(&config), tool_surface);
+            assert!(
+                !plan_context_budget(&first_view, &reserved, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit,
+                "premise: the first iteration must fit the reserved window, or the compaction would run before any tool round"
+            );
+
+            let provider = SkillRebuildProvider {
+                responses: Arc::new(Mutex::new(VecDeque::from([
+                    ChatResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".to_string(),
+                            name: "file_read".to_string(),
+                            arguments: "{}".to_string(),
+                        }],
+                        reasoning_content: None,
+                    },
+                    scripted_text_response("done"),
+                ]))),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+
+            let tmp = TempDir::new().expect("test: temporary directory");
+            let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite memory"));
+            let mut admission_config = crate::config::Config::default();
+            admission_config.workspace_dir = tmp.path().to_path_buf();
+            admission_config.agent.compaction = config.clone();
+            let admission = crate::agent::turn_tests::admission::AdmittedTurn::with_memory(
+                admission_config,
+                &question,
+                Arc::clone(&tools_registry),
+                Arc::clone(&memory),
+            )
+            .await;
+            admission.assert_core_specs(&tool_specs);
+            let runtime = admission.memory_runtime();
+
+            let result = run_turn(
+                &mut history,
+                crate::agent::turn_request::TurnRequest {
+                    advice: None,
+                    channel_name: "cli",
+                    scope: None,
+                    mode: ChatMode::default(),
+                    silent: true,
+                    expose_stay_silent: false,
+                    multimodal: &crate::config::MultimodalConfig::default(),
+                    schedule: crate::agent::turn_request::TurnSchedule {
+                        read_only_tool_concurrency_window: 2,
+                        priority_scheduling_enabled: false,
+                        low_priority_tool_names: Vec::new(),
+                    },
+                    compaction: Some(admission.compaction()),
+                    decision: admission.decision(),
+                },
+                crate::agent::turn_request::TurnServices {
+                    provider: &provider,
+                    provider_name: "ollama",
+                    model: "prx-local-model",
+                    temperature: 0.0,
+                    tools_registry,
+                    observer: &NoopObserver,
+                    hooks: &HookManager::new(tmp.path().to_path_buf()),
+                    approval: None,
+                    approval_resolver: None,
+                    runtime_adapter: Some(admission.adapter()),
+                    memory: runtime,
+                },
+                crate::agent::turn_request::TurnDelivery {
+                    cancellation: None,
+                    on_delta: None,
+                    on_tool_call: None,
+                },
+            )
+            .await
+            .map(|(outcome, _trace)| outcome.into_text())
+            .expect("test: the turn must complete");
+
+            assert_eq!(result, "done", "the turn must finish with the model's answer after the rebuild");
+            // `history` is the provider view written back by the rebuild, so the
+            // canonical metadata is not visible here; the requests are the evidence.
+            let requests = provider.requests();
+            let summarizer_calls = requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .first()
+                        .is_some_and(|message| message.content.starts_with("You are a context compaction summarizer"))
+                })
+                .count();
+            assert!(
+                summarizer_calls >= 1,
+                "the fixture must run a durable summary compaction, or the rebuild path never ran (provider requests: {})",
+                requests.len()
+            );
+            assert_eq!(
+                requests.len(),
+                3,
+                "expected the first tool-loop request, one summarizer call and the rebuilt second tool-loop request"
+            );
+            for (index, request) in requests.iter().enumerate() {
+                assert!(
+                    !request
+                        .iter()
+                        .any(|message| message.content.contains("<available_skills>")),
+                    "provider request {index} carries skill metadata that skill_read cannot serve"
+                );
+            }
+            let rebuilt = requests.last().expect("test: the rebuilt request was recorded");
+            assert!(
+                rebuilt
+                    .iter()
+                    .any(|message| message.content.contains("[Context compacted at")),
+                "the second tool-loop request must be built from the durable compaction the rebuild applied"
+            );
+        }),
+    )
+    .await
+    .expect("test: the skill-metadata rebuild scenario must finish within its deadline");
+}
