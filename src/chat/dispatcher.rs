@@ -285,7 +285,7 @@ impl ChatTuiApprovalStrategy {
             Ok(value) => Some(value),
             Err(error) => {
                 let (error_len, error_sha256) = crate::agent::diagnostics::error_log_digest(&error);
-                tracing::error!(tool = %crate::agent::diagnostics::text_class(&request.descriptor.public_name), error_len, error_sha256, "failed to serialize runtime approval grant");
+                tracing::error!(tool = %crate::agent::diagnostics::ToolName::descriptor(&request.descriptor), error_len, error_sha256, "failed to serialize runtime approval grant");
                 None
             }
         });

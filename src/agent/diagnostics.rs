@@ -94,6 +94,60 @@ pub(crate) fn text_class(text: &str) -> LogClass {
     }
 }
 
+/// A registered tool's name, logged in plain.
+///
+/// A tool name is configuration metadata (the registry or a plugin manifest
+/// chose it), not session payload, so it needs no digest. It can only be
+/// built from a registry type ([`crate::tools::ToolSpec`],
+/// [`crate::tools::execution::ToolDescriptor`]); a
+/// bare `&str`, such as a model-written call name, cannot become one and is
+/// logged through [`text_class`]. The `architecture_boundaries` log scanner
+/// accepts these constructors and an identifier typed `ToolName`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolName<'a>(&'a str);
+
+impl<'a> ToolName<'a> {
+    /// The name a tool spec advertises to the model.
+    pub(crate) fn spec(spec: &'a crate::tools::ToolSpec) -> Self {
+        Self(&spec.name)
+    }
+
+    /// The public name of a resolved tool descriptor.
+    pub(crate) fn descriptor(descriptor: &'a crate::tools::execution::ToolDescriptor) -> Self {
+        Self(&descriptor.public_name)
+    }
+}
+
+impl std::fmt::Display for ToolName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// A configured provider kind or model id, logged in plain after the one
+/// provider-label redactor ([`crate::security::redaction::redact_provider_text`])
+/// removed any secret or URL credential it carried. It can only be built
+/// through that redactor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderLabel(String);
+
+impl ProviderLabel {
+    /// `label` through the provider-label redactor.
+    pub(crate) fn redacted(label: &str) -> Self {
+        Self(crate::security::redaction::redact_provider_text(label))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Tool arguments for the log: every credential-named value replaced and
 /// every string redacted by the one redactor.
 pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_json::Value {

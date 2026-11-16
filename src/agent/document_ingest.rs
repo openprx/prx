@@ -221,7 +221,7 @@ pub(super) async fn persist_tool_output_document(
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
             tool = %crate::agent::diagnostics::text_class(tool_name),
-            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
+            backend_kind = ?runtime.memory.backend_kind(),
             "memory backend does not support document ingest; skipping tool output persistence (status=backend_not_supported)"
         );
         return Some("backend_not_supported");
@@ -332,7 +332,7 @@ pub(super) async fn persist_untrusted_external_copy(
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
             tool = %crate::agent::diagnostics::text_class(tool_name),
-            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
+            backend_kind = ?runtime.memory.backend_kind(),
             "memory backend does not support document ingest; skipping untrusted external copy"
         );
         return;

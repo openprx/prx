@@ -1,5 +1,6 @@
 //! Process-local prompt-cache usage and conversation-prefix observations.
 
+use super::diagnostics::ProviderLabel;
 use super::turn_contracts::ScopeContext;
 use super::turn_request::ToolLoopMemory;
 use crate::llm::route_decision::{TokenUsage, TokenUsageSource};
@@ -172,11 +173,12 @@ impl Metrics {
 }
 
 pub(crate) fn record_round_trip(round: RoundTrip<'_>) {
-    let provider = crate::security::redaction::redact_provider_text(round.provider);
-    let model = crate::security::redaction::redact_provider_text(round.model);
-    let (system_prefix_changed, tools_prefix_changed) = METRICS.lock().record(&round, &provider, &model);
+    let provider: ProviderLabel = ProviderLabel::redacted(round.provider);
+    let model: ProviderLabel = ProviderLabel::redacted(round.model);
+    let (system_prefix_changed, tools_prefix_changed) =
+        METRICS.lock().record(&round, provider.as_str(), model.as_str());
     let usage_reported: bool = round.usage.source == TokenUsageSource::Reported;
-    tracing::debug!(target: "openprx::prompt_cache", provider = %crate::agent::diagnostics::text_class(&provider), model = %crate::agent::diagnostics::text_class(&model),
+    tracing::debug!(target: "openprx::prompt_cache", %provider, %model,
         system_prompt_sha256 = round.system_prompt_sha256, tools_sha256 = round.tools_sha256,
         prompt_tokens = round.usage.prompt_tokens,
         cache_read_input_tokens = round.usage.cache_read_input_tokens,

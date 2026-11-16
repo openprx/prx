@@ -81,7 +81,7 @@ pub(super) async fn apply_os_paging(
     };
     if !runtime.memory.supports_document_ingest() {
         tracing::debug!(
-            backend = %crate::agent::diagnostics::text_class(runtime.memory.name()),
+            backend_kind = ?runtime.memory.backend_kind(),
             "os-paging: backend does not support document ingest; deferring to legacy compaction"
         );
         return Ok(false);

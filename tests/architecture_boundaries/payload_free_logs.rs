@@ -17,7 +17,14 @@
 //!   a digest, an index, a duration, a kind, a flag; a call whose callee has
 //!   such a name, or is a numeric accessor ([`NUMERIC_ACCESSORS`]), is one too;
 //! - an identifier the enclosing function annotates with a scalar or reviewed
-//!   fieldless type ([`TYPED_BINDINGS`]): the compiler then proves the type.
+//!   fieldless type ([`TYPED_BINDINGS`]): the compiler then proves the type;
+//! - configuration metadata built through a typed constructor
+//!   ([`PLAIN_LABEL_CONSTRUCTORS`]) or bound to a reviewed label type: a
+//!   registered tool name (`ToolName`, built only from a tool spec or
+//!   descriptor), a provider kind or model id through the provider-label
+//!   redactor (`ProviderLabel`), a memory backend kind enum
+//!   (`MemoryBackendKind`, via `Memory::backend_kind`). A bare `&str` is
+//!   never one of these, whatever it is called.
 //!
 //! The format string's inline captures (`{name}`, `{name:?}`) are judged the
 //! same way by name; its positional arguments are arguments like any other.
@@ -70,6 +77,19 @@ const PAYLOAD_FREE_HELPERS: &[(&str, &str)] = &[
     (
         "redact_provider_text",
         "a configured provider or model label through the one redactor",
+    ),
+];
+
+/// Typed constructors of configuration metadata that is logged in plain,
+/// matched on the callee path, with the reason.
+const PLAIN_LABEL_CONSTRUCTORS: &[(&str, &str)] = &[
+    (
+        "ToolName::spec",
+        "agent::diagnostics: a registered tool's name, from the spec the registry advertises",
+    ),
+    (
+        "ToolName::descriptor",
+        "agent::diagnostics: a resolved tool descriptor's public name",
     ),
 ];
 
@@ -181,6 +201,18 @@ const TYPED_BINDINGS: &[(&str, &str)] = &[
     ("Option<u64>", "an optional number"),
     ("Option<usize>", "an optional number"),
     ("CompactReason", "fieldless enum (chat::action)"),
+    (
+        "MemoryBackendKind",
+        "fieldless enum (memory::backend); Memory::backend_kind maps every unknown name to Unknown",
+    ),
+    (
+        "ProviderLabel",
+        "agent::diagnostics: a provider kind or model id built only through the provider-label redactor",
+    ),
+    (
+        "ToolName<'_>",
+        "agent::diagnostics: a registered tool name built only from a tool spec or descriptor",
+    ),
     ("KeyModifiers", "crossterm modifier bitflags"),
     ("crossterm::event::KeyModifiers", "crossterm modifier bitflags"),
     (
@@ -376,7 +408,14 @@ fn value_is_metadata(masked_value: &str, function_text: &str) -> bool {
                 .into_iter()
                 .rev()
                 .collect();
-            if PAYLOAD_FREE_HELPERS.iter().any(|(helper, _)| *helper == callee)
+            let constructor_path: String = callee_end.split_whitespace().collect();
+            let plain_label = PLAIN_LABEL_CONSTRUCTORS.iter().any(|(constructor, _)| {
+                constructor_path
+                    .strip_suffix(constructor)
+                    .is_some_and(|before| before.is_empty() || before.ends_with("::"))
+            });
+            if plain_label
+                || PAYLOAD_FREE_HELPERS.iter().any(|(helper, _)| *helper == callee)
                 || NUMERIC_ACCESSORS.contains(&callee.as_str())
                 || is_metadata_name(&callee)
             {
@@ -567,7 +606,7 @@ pub(super) fn log_lines_carry_only_typed_metadata() {
 /// rejects every free-form form and accepts every typed one.
 #[test]
 fn payload_capable_log_arguments_sees_every_form() {
-    let source = r#"fn f(error: anyhow::Error, reason: &'static str, name: &str) {
+    let source = r#"fn f(error: anyhow::Error, reason: &'static str, name: &str, backend: MemoryBackendKind) {
     tracing::warn!(error = %error, "a");
     tracing::warn!(%error, "b");
     tracing::warn!(error = ?err, "c");
@@ -580,6 +619,9 @@ fn payload_capable_log_arguments_sees_every_form() {
     tracing::warn!(name, "j");
     tracing::warn!(detail = "static".to_string(), "literal");
     tracing::warn!("k {name}");
+    tracing::warn!(tool = %ToolName(name), "l");
+    tracing::warn!(tool = %crate::agent::diagnostics::spec(name), "m");
+    tracing::warn!(model = %model_label, "n");
     tracing::warn!(
         error = %crate::agent::diagnostics::error_class(&error),
         tool = %crate::agent::diagnostics::text_class(name),
@@ -590,8 +632,16 @@ fn payload_capable_log_arguments_sees_every_form() {
         is_terminal,
         kind = ?mode,
         sha = digest_sha256.as_deref().unwrap_or("none"),
+        tool = %crate::agent::diagnostics::ToolName::spec(spec),
+        tool = %ToolName::descriptor(&request.descriptor),
+        backend_kind = ?runtime.memory.backend_kind(),
+        backend_kind = ?backend,
         "ok {reason} {}", history.len()
     );
+}
+fn h(spec: &ToolSpec) {
+    let provider: ProviderLabel = ProviderLabel::redacted(round.provider);
+    tracing::debug!(%provider, "o");
 }
 fn g() -> Vec<Effect> {
     vec![Effect::LogTrace { level: tracing::Level::DEBUG, msg: format!("x {name}") }]
@@ -614,6 +664,9 @@ fn g() -> Vec<Effect> {
             "src/chat/x.rs::f `tool = %name`".to_string(),
             "src/chat/x.rs::f `name`".to_string(),
             "src/chat/x.rs::f `{name}`".to_string(),
+            "src/chat/x.rs::f `tool = %ToolName(name)`".to_string(),
+            "src/chat/x.rs::f `tool = %crate::agent::diagnostics::spec(name)`".to_string(),
+            "src/chat/x.rs::f `model = %model_label`".to_string(),
             "src/chat/x.rs::g `{name}`".to_string(),
         ],
         "each free-form form must be reported once, and no typed form may be"

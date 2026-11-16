@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::config::agent_name::AgentName;
+use crate::memory::backend::MemoryBackendKind;
 use crate::memory::principal::MemoryWriteContext;
 
 /// Console transcript/event partition carried on [`MemoryPrincipal`].
@@ -1374,13 +1375,17 @@ pub struct CompactionRun {
 ///
 /// The log line carries the backend name and the operation only: no key, no
 /// query, no owner id, no content.
-fn unscoped_read_is_withheld(backend: &str, context: Option<&MemoryWriteContext>, operation: &str) -> bool {
+fn unscoped_read_is_withheld(
+    backend: MemoryBackendKind,
+    context: Option<&MemoryWriteContext>,
+    operation: &'static str,
+) -> bool {
     if !context.is_some_and(|context| context.require_owner_match) {
         return false;
     }
     tracing::warn!(
-        backend = %crate::agent::diagnostics::text_class(backend),
-        operation = %crate::agent::diagnostics::text_class(operation),
+        backend_kind = ?backend,
+        operation,
         "memory backend cannot scope a read to an owner; the owner-isolated caller is served nothing"
     );
     true
@@ -1439,6 +1444,13 @@ pub trait Memory: Send + Sync {
 
     /// Backend name
     fn name(&self) -> &str;
+
+    /// The backend kind [`Self::name`] denotes; a name that is not one of
+    /// the known backends (a plugin, a wrapper) is
+    /// [`MemoryBackendKind::Unknown`]. Logs carry this kind, never the name.
+    fn backend_kind(&self) -> MemoryBackendKind {
+        crate::memory::backend::classify_memory_backend(self.name())
+    }
 
     /// Store a memory entry, optionally scoped to a session
     async fn store(
@@ -1630,7 +1642,7 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        if unscoped_read_is_withheld(self.name(), context, "recall") {
+        if unscoped_read_is_withheld(self.backend_kind(), context, "recall") {
             return Ok(Vec::new());
         }
         self.recall(query, limit, session_id).await
@@ -1661,7 +1673,7 @@ pub trait Memory: Send + Sync {
         key: &str,
         context: Option<&MemoryWriteContext>,
     ) -> anyhow::Result<Option<MemoryEntry>> {
-        if unscoped_read_is_withheld(self.name(), context, "keyed read") {
+        if unscoped_read_is_withheld(self.backend_kind(), context, "keyed read") {
             return Ok(None);
         }
         self.get(key).await
@@ -1786,7 +1798,7 @@ pub trait Memory: Send + Sync {
     /// A caller that is not owner-isolated — including one with no context at
     /// all — keeps the legacy unscoped delete unchanged.
     async fn forget_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> anyhow::Result<bool> {
-        if unscoped_read_is_withheld(self.name(), context, "forget") {
+        if unscoped_read_is_withheld(self.backend_kind(), context, "forget") {
             return Ok(false);
         }
         self.forget(key).await
