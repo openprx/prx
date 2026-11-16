@@ -355,28 +355,6 @@ pub(super) fn provider_view_after_compacted_commit(
     )
 }
 
-/// The provider view after a turn that failed or was cancelled once a
-/// compaction had been adopted during it: rebuilt from the acknowledged
-/// snapshot, so the next turn never resends the replaced cold prefix. The
-/// turn's own request is not kept: a failed or cancelled request is never
-/// part of the next turn's view (the reducer rolls its recorded copy back
-/// too), so a trailing stored copy of it is dropped.
-pub(super) fn provider_view_after_compacted_abort(
-    current_view: &[ChatMessage],
-    acked: &crate::chat::acked_session::AckedSession,
-    plain_request: &str,
-) -> Vec<ChatMessage> {
-    let mut view = provider_view_from_acked(current_view, acked);
-    let plain = crate::agent::turn_contracts::inbound_user_message(plain_request);
-    if view
-        .last()
-        .is_some_and(|message| message.role == "user" && message.content == plain.content)
-    {
-        view.pop();
-    }
-    view
-}
-
 pub(super) fn format_nothing_to_compact_feedback(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,

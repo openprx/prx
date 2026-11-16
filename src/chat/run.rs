@@ -4015,7 +4015,7 @@ Retry with a compatible model: /provider {shown} <model>",
                     // The worker's compactions and terminal precede this settlement on the
                     // action channel; the reducer never recorded a driver turn's request.
                     let settled = settle_aborted_turn(&chat_dispatcher, &turn_signal, None).await?;
-                    provider_view_after_settled_abort(&mut history, &settled, compaction_epoch_at_start, false, &user_input, None);
+                    provider_view_after_settled_abort(&mut history, &settled, compaction_epoch_at_start, false, None);
                     // The reducer's NotifyHook(Error) has already been sent; do not hooks.emit here
                     // again, to avoid duplicates.
                     #[cfg(feature = "terminal-tui")]
@@ -4069,7 +4069,6 @@ Retry with a compatible model: /provider {shown} <model>",
                         &settled,
                         compaction_epoch_at_start,
                         false,
-                        &user_input,
                         Some(history_len_before_user_turn),
                     );
                     publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
@@ -4420,7 +4419,6 @@ Retry with a compatible model: /provider {shown} <model>",
                     &settled,
                     inline_compaction_epoch_before_preflight,
                     inline_view_changed,
-                    &user_input,
                     Some(history_len_before_user_turn),
                 );
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);
@@ -4442,7 +4440,6 @@ Retry with a compatible model: /provider {shown} <model>",
                     &settled,
                     inline_compaction_epoch_before_preflight,
                     inline_view_changed,
-                    &user_input,
                     Some(history_len_before_user_turn),
                 );
                 finish_inline_provider_turn(&mut provider_turn_workers, provider_turn_task_id, None);

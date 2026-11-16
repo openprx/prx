@@ -1388,7 +1388,6 @@ async fn settle_aborted_worker_turn(
                 &settled,
                 pending.compaction_epoch_at_start,
                 false,
-                &pending.user_input,
                 len_before_user_turn,
             );
         }
@@ -2059,7 +2058,9 @@ pub(super) async fn settle_aborted_turn(
 }
 
 /// The run loop's provider view after a settled failed or cancelled turn.
-/// The aborted request is never kept. When the session was compacted at any
+/// The aborted request is never kept: the settled snapshot already excludes it
+/// (admission identity, `TurnAbortSettled`), so no text is matched to remove
+/// anything. When the session was compacted or the view was changed at any
 /// point since before the turn's preflight (`settled` carries a compaction
 /// epoch other than `compaction_epoch_before_preflight`, or the turn itself
 /// reported one), the view is rebuilt from the settled snapshot; otherwise it
@@ -2071,7 +2072,6 @@ pub(super) fn provider_view_after_settled_abort(
     settled: &crate::chat::acked_session::AckedSession,
     compaction_epoch_before_preflight: u64,
     compacted_in_turn: bool,
-    user_input: &str,
     len_before_user_turn: Option<usize>,
 ) -> bool {
     if settled.compaction_epoch == compaction_epoch_before_preflight && !compacted_in_turn {
@@ -2080,7 +2080,7 @@ pub(super) fn provider_view_after_settled_abort(
         }
         return false;
     }
-    let view = super::compaction::provider_view_after_compacted_abort(history, settled, user_input);
+    let view = super::compaction::provider_view_from_acked(history, settled);
     tracing::info!(
         messages_before = history.len(),
         messages_after = view.len(),

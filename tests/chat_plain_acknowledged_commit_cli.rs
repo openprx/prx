@@ -263,6 +263,186 @@ fn a_failed_repeat_of_a_request_keeps_the_committed_request_with_the_same_text()
     );
 }
 
+/// Bytes of the repeated question: about 1,900 tokens. Two of them with the
+/// tool reserve exceed the small window, so the repeat's request is trimmed per
+/// request; one of them with the next short line fits.
+#[cfg(not(feature = "terminal-tui"))]
+const LONG_QUESTION_BYTES: usize = 7_600;
+#[cfg(not(feature = "terminal-tui"))]
+const LONG_HEAD: &str = "LONG-REPEATED-QUESTION-72";
+#[cfg(not(feature = "terminal-tui"))]
+const LONG_TAIL: &str = "END-OF-LONG-QUESTION-72";
+#[cfg(not(feature = "terminal-tui"))]
+const SHORT_AFTER: &str = "AFTER-THE-PROJECTION-TRIM-72";
+/// A keep window larger than the history: a trim is projection-only, no handoff.
+#[cfg(not(feature = "terminal-tui"))]
+const KEEP_EVERYTHING: usize = 64;
+/// Longest wait for the cancelled repeat's connection to close.
+#[cfg(not(feature = "terminal-tui"))]
+const CANCEL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The repeated question: a long line ending in [`LONG_TAIL`].
+#[cfg(not(feature = "terminal-tui"))]
+fn long_question() -> String {
+    let filler = "lorem ipsum dolor sit amet ".repeat(LONG_QUESTION_BYTES / 27 + 1);
+    let head = format!("{LONG_HEAD} ");
+    let body_len = LONG_QUESTION_BYTES - head.len() - LONG_TAIL.len() - 1;
+    format!("{head}{} {LONG_TAIL}", &filler[..body_len])
+}
+
+/// The first long question gets an empty reply; its repeat gets `fault`;
+/// the short line and anything else get a plain reply.
+#[cfg(not(feature = "terminal-tui"))]
+fn script_repeating_long_question(fault: Scripted) -> Script {
+    let mut long_calls = 0usize;
+    Box::new(move |_, request| {
+        let last = last_user_text(request);
+        if last.ends_with(SHORT_AFTER) {
+            return Scripted::text("AFTER-OK");
+        }
+        if !last.ends_with(LONG_TAIL) {
+            return Scripted::text("ok");
+        }
+        long_calls += 1;
+        if long_calls == 1 {
+            Scripted::text(EMPTY_AFTER_SANITIZE)
+        } else {
+            fault.clone()
+        }
+    })
+}
+
+/// The provider requests whose newest user line is the long question.
+#[cfg(not(feature = "terminal-tui"))]
+fn long_question_requests(server: &LoopbackOpenAi) -> Vec<serde_json::Value> {
+    server
+        .requests()
+        .into_iter()
+        .filter(|request| last_user_text(request).ends_with(LONG_TAIL))
+        .collect()
+}
+
+/// Commit the long question with an empty reply, repeat it in a turn that is
+/// trimmed per request and then fails (`fault`) or is cancelled, then send a
+/// short line. The committed first question must stay in the SQLite row and
+/// in the next request, exactly once.
+#[cfg(not(feature = "terminal-tui"))]
+fn repeat_after_projection_trim(fault: Scripted, cancel: bool) {
+    let sandbox = Sandbox::new();
+    let server = LoopbackOpenAi::start(MODEL, Some(USAGE), script_repeating_long_question(fault));
+    write_config(&sandbox.config_dir, &server.provider(), MODEL, |config| {
+        config.workspace_dir.clone_from(&sandbox.workspace);
+        config.autonomy.level = openprx::security::AutonomyLevel::Full;
+        config.agent.compaction.mode = openprx::config::schema::AgentCompactionMode::Switch;
+        config.agent.compaction.max_context_tokens = compaction_script::SMALL_WINDOW_TOKENS;
+        config.agent.compaction.reserve_tokens = 256;
+        config.agent.compaction.keep_recent_messages = KEEP_EVERYTHING;
+        config.memory.auto_save = false;
+    });
+    let question = long_question();
+    let mut chat = spawn_plain(&sandbox);
+    chat.send(&question);
+    wait_for_saved_turns(&sandbox, 1);
+    chat.send(&question);
+    let started = Instant::now();
+    while long_question_requests(&server).len() < 2 {
+        assert!(
+            started.elapsed() < TURN_DEADLINE,
+            "the repeated question was never sent to the provider within TURN_DEADLINE"
+        );
+        std::thread::sleep(POLL);
+    }
+    if cancel {
+        chat.interrupt();
+        let started = Instant::now();
+        while server.stalls_closed_by_client() == 0 {
+            assert!(
+                started.elapsed() < CANCEL_DEADLINE,
+                "the cancelled repeat's connection was not closed within CANCEL_DEADLINE"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+    chat.send(SHORT_AFTER);
+    wait_for_saved_turns(&sandbox, 3);
+    let output = finish(chat);
+
+    // A failed turn makes plain chat exit non-zero; the commits are acknowledged.
+    assert!(!output.stderr.contains("panicked"), "stderr: {}", output.stderr);
+    assert!(
+        !output.stdout.contains("history commit") && !output.stderr.contains("history commit"),
+        "no unconfirmed history commit; stdout: {}\nstderr: {}",
+        output.stdout,
+        output.stderr
+    );
+    assert_eq!(
+        saved_turns(&sandbox),
+        vec![
+            ("user".to_owned(), question),
+            ("user".to_owned(), SHORT_AFTER.to_owned()),
+            ("assistant".to_owned(), "AFTER-OK".to_owned()),
+        ],
+        "the committed first question stays in the SQLite row; only the aborted repeat is gone"
+    );
+    let requests = long_question_requests(&server);
+    let repeat = requests
+        .get(1)
+        .expect("test: the repeated question reached the provider");
+    assert!(
+        user_texts_containing(repeat, LONG_HEAD) < 2,
+        "the repeated request was trimmed per request (the first question left out): {}",
+        user_texts_containing(repeat, LONG_HEAD)
+    );
+    let after_request = server
+        .requests()
+        .into_iter()
+        .rev()
+        .find(|request| last_user_text(request).ends_with(SHORT_AFTER))
+        .expect("test: the request after the failed or cancelled repeat was sent");
+    assert_eq!(
+        user_texts_containing(&after_request, LONG_HEAD),
+        1,
+        "the next request carries the committed first question exactly once: {}",
+        after_request["messages"]
+    );
+}
+
+/// The user messages of `request` whose text contains `needle`.
+#[cfg(not(feature = "terminal-tui"))]
+fn user_texts_containing(request: &serde_json::Value, needle: &str) -> usize {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user" && text_of(message).contains(needle))
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+/// PR #207 review r9: a failed repeat, after a projection-only trim, must not
+/// remove the earlier committed request from the next provider view.
+#[cfg(not(feature = "terminal-tui"))]
+#[test]
+fn a_failed_repeat_after_a_projection_trim_keeps_the_committed_request() {
+    repeat_after_projection_trim(
+        Scripted::Error {
+            status: 400,
+            message: "scripted refusal of this request".to_owned(),
+        },
+        false,
+    );
+}
+
+/// PR #207 review r9, cancelled variant: the repeat is held open and Ctrl-C
+/// cancels it after a projection-only trim.
+#[cfg(not(feature = "terminal-tui"))]
+#[test]
+fn a_cancelled_repeat_after_a_projection_trim_keeps_the_committed_request() {
+    repeat_after_projection_trim(Scripted::Stall, true);
+}
+
 /// Controller ruling (G6, input-channel close): EOF on stdin after a turn
 /// ends the chat with exit code 0.
 #[test]

@@ -589,11 +589,15 @@ impl ChatState {
         let content = last_turn.content.clone();
         let title_from_user = crate::chat::session::truncate_title(&content);
         self.session.turns.pop();
+        // The mirror gets the request pushed with its turn (`RecordUserTurn`) and
+        // nothing is pushed after it while the admission is open, so its trailing
+        // user message is this request (compaction may have rewritten its text).
+        // Matching the text here could remove an earlier committed request.
         if self
             .session
             .history
             .last()
-            .is_some_and(|message| message.role == "user" && message.content == content)
+            .is_some_and(|message| message.role == "user")
         {
             self.session.history.pop();
         }
