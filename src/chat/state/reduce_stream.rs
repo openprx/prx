@@ -34,7 +34,9 @@ impl ChatState {
 
     /// A turn's canonical guard source when the caller supplied none: the
     /// acknowledged turns under the reducer history's leading system prompt,
-    /// plus the pending request the provider history ends with.
+    /// plus the pending request the provider history ends with. A request
+    /// recorded by an open admission is already a turn: it keeps its
+    /// `Request` origin by its recorded position and is not appended again.
     fn acknowledged_turn_source(&self, history: &[ChatMessage]) -> crate::agent::turn_history::CanonicalHistory {
         let leading_system = self
             .session
@@ -42,13 +44,19 @@ impl ChatState {
             .first()
             .filter(|message| message.role == "system")
             .map(|message| message.content.as_str());
-        let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
-            leading_system,
-            self.session
-                .turns
-                .iter()
-                .map(|turn| (turn.role.as_str(), turn.content.as_str())),
-        );
+        let turns = self
+            .session
+            .turns
+            .iter()
+            .map(|turn| (turn.role.as_str(), turn.content.as_str()));
+        if let Some(open) = self.open_request() {
+            return crate::agent::turn_history::CanonicalHistory::from_acknowledged_with_request(
+                leading_system,
+                turns,
+                open.turn,
+            );
+        }
+        let source = crate::agent::turn_history::CanonicalHistory::from_acknowledged(leading_system, turns);
         match history.last().filter(|message| message.role == "user") {
             Some(pending) => source.with_raw_request(&pending.content),
             None => source,
@@ -577,6 +585,21 @@ impl ChatState {
         }
         self.control.open_admission = None;
         self.rollback_trailing_answerless_user_turn()
+    }
+
+    /// The request the open admission recorded, at the position a rollback
+    /// removes ([`Self::rollback_trailing_answerless_user_turn`]): the
+    /// trailing user turn. Published with every snapshot, so a reader can
+    /// tell the pending request from an acknowledged turn by its admission,
+    /// never by its text.
+    pub(super) fn open_request(&self) -> Option<crate::chat::acked_session::OpenRequest> {
+        let admission = self.control.open_admission?;
+        let turn = self.session.turns.len().checked_sub(1)?;
+        self.session
+            .turns
+            .get(turn)
+            .filter(|request| request.role == "user")
+            .map(|_| crate::chat::acked_session::OpenRequest { admission, turn })
     }
 
     fn rollback_trailing_answerless_user_turn(&mut self) -> bool {

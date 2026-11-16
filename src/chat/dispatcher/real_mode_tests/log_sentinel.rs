@@ -150,6 +150,7 @@ fn sentinel_effects() -> Vec<crate::chat::state::Effect> {
         load_epoch: state.session.load_epoch,
         revision: state.session.revision.saturating_add(1),
         compaction_epoch: state.session.compaction_epoch,
+        open_request: None,
     };
     effects.push(crate::chat::state::Effect::PublishSession(commit));
     effects.push(crate::chat::state::Effect::AutoTitleSession(format!("auto {SENTINEL}")));
@@ -311,6 +312,7 @@ async fn stream_failure_retry_and_store_error_logs_carry_no_free_text() {
                 load_epoch: 1,
                 revision: 1,
                 compaction_epoch: 0,
+                open_request: None,
             }))
             .await;
         let (persistence_error, publication) = persistence_only.take_action_results();

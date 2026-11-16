@@ -24,8 +24,23 @@ pub struct AckedSession {
     pub revision: u64,
     /// The reducer's compaction epoch at this snapshot.
     pub compaction_epoch: u64,
+    /// The admitted request this snapshot holds while its admission is open.
+    pub open_request: Option<OpenRequest>,
     /// The canonical (unsanitized) runtime form of the session.
     pub session: Arc<ChatSession>,
+}
+
+/// The request a snapshot holds while its admission is open: recorded at
+/// admission (`UserTurnAdmitted`), not yet committed, and removed by a
+/// rollback of that admission. A snapshot holds one only when a save ran
+/// during the open admission (an adopted preflight or in-turn compaction).
+/// `turn` is its index in `session.turns`: the reducer keeps the request as
+/// the trailing turn while its admission is open, and a rollback removes
+/// exactly that turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenRequest {
+    pub admission: crate::chat::action::AdmissionId,
+    pub turn: usize,
 }
 
 impl AckedSession {
@@ -37,6 +52,7 @@ impl AckedSession {
             load_epoch: 0,
             revision: 0,
             compaction_epoch: 0,
+            open_request: None,
             session: Arc::new(ChatSession::new("", "")),
         }
     }
@@ -54,6 +70,7 @@ pub struct SessionCommit {
     pub load_epoch: u64,
     pub revision: u64,
     pub compaction_epoch: u64,
+    pub open_request: Option<OpenRequest>,
 }
 
 impl SessionCommit {
@@ -64,6 +81,7 @@ impl SessionCommit {
             load_epoch: self.load_epoch,
             revision: self.revision,
             compaction_epoch: self.compaction_epoch,
+            open_request: self.open_request,
             session: Arc::new(self.session.clone()),
         }
     }
@@ -77,6 +95,7 @@ impl From<ChatSession> for SessionCommit {
             load_epoch: 1,
             revision: 1,
             compaction_epoch: 0,
+            open_request: None,
         }
     }
 }
@@ -363,6 +382,7 @@ mod tests {
             load_epoch,
             revision,
             compaction_epoch: 0,
+            open_request: None,
             session: Arc::new(session),
         }
     }

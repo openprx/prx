@@ -109,6 +109,7 @@ impl ChatState {
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
             compaction_epoch: self.session.compaction_epoch,
+            open_request: None,
         };
         vec![
             if persist {
@@ -195,6 +196,7 @@ impl ChatState {
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
             compaction_epoch: self.session.compaction_epoch,
+            open_request: self.open_request(),
             session: Arc::new(self.build_session_snapshot()),
         }
     }
@@ -207,6 +209,7 @@ impl ChatState {
             load_epoch: self.session.load_epoch,
             revision: self.session.revision,
             compaction_epoch: self.session.compaction_epoch,
+            open_request: self.open_request(),
         }
     }
 

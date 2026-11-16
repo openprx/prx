@@ -4089,7 +4089,6 @@ Retry with a compatible model: /provider {shown} <model>",
             &legacy_budget_config,
             crate::agent::context_budget::PRE_TURN_FLUSH_THRESHOLD,
         );
-        let mut preflight_adopted = false;
         if preflight_budget.over_hard_limit {
             let audit_source_history = original_legacy_chat_compaction_audit_source(persisted_history_for_turn.messages());
             let summary_projection = bounded_legacy_chat_compaction_audit_source(persisted_history_for_turn.messages());
@@ -4128,7 +4127,6 @@ Retry with a compatible model: /provider {shown} <model>",
                 // that is never persisted).
                 super::compaction::ManualCompactOutcome::NoDurableCompaction
             };
-            preflight_adopted = matches!(preflight_outcome, super::compaction::ManualCompactOutcome::Compacted { .. });
             persist_legacy_chat_compaction_audit(
                 mem.as_ref(),
                 &runtime_envelope,
@@ -4159,14 +4157,17 @@ Retry with a compatible model: /provider {shown} <model>",
         // The inline loop hands its in-turn compactions to the reducer instead
         // of keeping them as private mutations of `history`; after the turn the
         // view follows the acknowledged session (`reconcile_inline_turn`). The
-        // reducer history it guards against holds the recorded request: the
-        // acknowledged snapshot already does after an adopted preflight.
+        // reducer history it guards against holds the recorded request once:
+        // after an adopted preflight the acknowledged snapshot already holds
+        // it, identified by this turn's admission, and it keeps its `Request`
+        // origin, so an in-turn compaction that keeps it records it once.
         let inline_compaction = {
-            let reducer_source = if preflight_adopted {
-                super::session_store::acknowledged_canonical_history(&chat_session.session(), &system_prompt)
-            } else {
-                persisted_history_for_current_turn(&chat_session.session(), &system_prompt, &user_input)
-            };
+            let reducer_source = super::session_store::canonical_history_for_admitted_turn(
+                &chat_session.acked(),
+                &system_prompt,
+                admission,
+                &user_input,
+            );
             super::compaction::InlineCompactionSink::new(chat_dispatcher.clone(), turn_signal.clone(), &user_input, reducer_source)
         };
         // The inline turn's canonical history: the acknowledged turns plus the

@@ -589,6 +589,7 @@ async fn assert_delayed_writes_of_the_first_load_are_never_read(kind: NewLoad) {
         load_epoch: first_acked.load_epoch,
         revision: first_acked.revision + 10,
         compaction_epoch: first_acked.compaction_epoch,
+        open_request: None,
     };
     let (loaded, persist) = new_load(kind, &first);
     let expected = turn_pairs(&loaded);

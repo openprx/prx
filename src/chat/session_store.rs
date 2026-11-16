@@ -348,7 +348,7 @@ pub(super) fn session_turns_to_history(session: &session::ChatSession) -> Vec<Ch
 
 /// The canonical history of `session`'s acknowledged turns under
 /// `system_prompt`: the form the reducer holds and a guard must describe.
-pub(super) fn acknowledged_canonical_history(
+fn acknowledged_canonical_history(
     session: &session::ChatSession,
     system_prompt: &str,
 ) -> crate::agent::turn_history::CanonicalHistory {
@@ -369,6 +369,50 @@ pub(super) fn persisted_history_for_current_turn(
     user_input: &str,
 ) -> crate::agent::turn_history::CanonicalHistory {
     acknowledged_canonical_history(session, system_prompt).with_raw_request(user_input)
+}
+
+/// The canonical history of the acknowledged snapshot `acked` under
+/// `leading_system`. A request the snapshot holds while its admission is
+/// open keeps its `Request` origin (identified by the admission's recorded
+/// position, never by text), so it is never taken for an acknowledged turn.
+pub(super) fn canonical_history_of_acked(
+    acked: &crate::chat::acked_session::AckedSession,
+    leading_system: Option<&str>,
+) -> crate::agent::turn_history::CanonicalHistory {
+    let turns = acked
+        .session
+        .turns
+        .iter()
+        .map(|turn| (turn.role.as_str(), turn.content.as_str()));
+    match acked.open_request {
+        Some(open) => crate::agent::turn_history::CanonicalHistory::from_acknowledged_with_request(
+            leading_system,
+            turns,
+            open.turn,
+        ),
+        None => crate::agent::turn_history::CanonicalHistory::from_acknowledged(leading_system, turns),
+    }
+}
+
+/// The canonical history an admitted turn starts from, read from the
+/// acknowledged snapshot `acked`. When the snapshot already holds the request
+/// of `admission` (a compaction adopted during the open admission, such as
+/// the outer preflight, saved it), that stored turn is the request and keeps
+/// its `Request` origin; otherwise the plain request is appended as the
+/// pending request. Either way the history holds the request exactly once.
+pub(super) fn canonical_history_for_admitted_turn(
+    acked: &crate::chat::acked_session::AckedSession,
+    system_prompt: &str,
+    admission: Option<crate::chat::action::AdmissionId>,
+    user_input: &str,
+) -> crate::agent::turn_history::CanonicalHistory {
+    let holds_request =
+        admission.is_some_and(|admission| acked.open_request.is_some_and(|open| open.admission == admission));
+    if holds_request {
+        canonical_history_of_acked(acked, Some(system_prompt))
+    } else {
+        acknowledged_canonical_history(&acked.session, system_prompt).with_raw_request(user_input)
+    }
 }
 
 pub(super) fn upsert_leading_system_prompt(history: &mut Vec<ChatMessage>, system_prompt: String) {

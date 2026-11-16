@@ -181,6 +181,30 @@ fn the_reducer_form_leaves_out_the_pending_request_and_this_turns_rounds_by_prov
 }
 
 #[test]
+fn a_snapshot_that_holds_the_admitted_request_keeps_it_pending() {
+    let turns = [("user", "question"), ("assistant", "answer"), ("user", "request")];
+    let appended =
+        CanonicalHistory::from_acknowledged(Some("sys"), turns.iter().take(2).copied()).with_raw_request("request");
+
+    let held = CanonicalHistory::from_acknowledged_with_request(Some("sys"), turns.iter().copied(), 2);
+
+    assert_eq!(
+        held, appended,
+        "the held request has the bytes of the request a turn appends, so a guard over it describes the reducer's history"
+    );
+    assert_eq!(
+        contents(held.reducer_form().messages()),
+        vec!["sys", "question", "answer"],
+        "the reducer form leaves out the held request by its recorded position"
+    );
+    assert_eq!(
+        contents(held.reducer_form().with_raw_request("request").messages()),
+        vec!["sys", "question", "answer", "request"],
+        "a compaction that keeps the held request in its hot tail records it once"
+    );
+}
+
+#[test]
 fn an_acknowledged_answer_shaped_like_a_tool_call_envelope_stays_in_the_reducer_form() {
     let json_answer = r#"{"tool_calls":[{"id":"example"}]}"#;
     let marker_answer = format!(

@@ -108,17 +108,51 @@ impl CanonicalHistory {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
+        Self::from_stored_turns(leading_system, turns, None)
+    }
+
+    /// A snapshot that holds the turn's admitted request (a compaction saved
+    /// it while its admission was open): as [`Self::from_acknowledged`], but
+    /// the stored turn at `request_turn` (an index into `turns`, given by the
+    /// admission's recorded position, never found by its text) keeps its
+    /// [`MessageOrigin::Request`] origin. The reducer form leaves it out, so
+    /// a later durable compaction that keeps it in its hot tail records it
+    /// once, exactly as for a request appended by [`Self::with_raw_request`].
+    /// The message bytes are the stored turn's, which the reducer's own
+    /// history holds, so a guard over this history describes the reducer's.
+    pub(crate) fn from_acknowledged_with_request<'a, I>(
+        leading_system: Option<&str>,
+        turns: I,
+        request_turn: usize,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        Self::from_stored_turns(leading_system, turns, Some(request_turn))
+    }
+
+    fn from_stored_turns<'a, I>(leading_system: Option<&str>, turns: I, request_turn: Option<usize>) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
         let mut messages: Vec<ChatMessage> = leading_system
             .map(|prompt| ChatMessage::system(prompt.to_owned()))
             .into_iter()
             .collect();
-        messages.extend(
-            turns
-                .into_iter()
-                .filter(|(role, _)| matches!(*role, "user" | "assistant"))
-                .map(|(role, content)| stored_turn_message(role.to_owned(), content.to_owned())),
-        );
-        Self::with_origin(messages, MessageOrigin::Acknowledged)
+        let mut origins = vec![MessageOrigin::Acknowledged; messages.len()];
+        for (index, (role, content)) in turns.into_iter().enumerate() {
+            if !matches!(role, "user" | "assistant") {
+                continue;
+            }
+            let origin = if Some(index) == request_turn && role == "user" {
+                MessageOrigin::Request
+            } else {
+                MessageOrigin::Acknowledged
+            };
+            messages.push(stored_turn_message(role.to_owned(), content.to_owned()));
+            origins.push(origin);
+        }
+        Self { messages, origins }
     }
 
     /// `self` with the turn's plain request appended as inbound user text.

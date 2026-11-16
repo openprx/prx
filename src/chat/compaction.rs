@@ -311,14 +311,7 @@ fn project_acked(
         .first()
         .filter(|message| message.role == "system")
         .map(|message| message.content.as_str());
-    let canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
-        system,
-        acked
-            .session
-            .turns
-            .iter()
-            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
-    );
+    let canonical = super::session_store::canonical_history_of_acked(acked, system);
     let (plain, enriched) = request.unzip();
     let inputs = crate::agent::turn_history::ProjectionInputs::default().with_enriched_request(plain, enriched);
     crate::agent::turn_history::project(&canonical, &inputs).into_messages()
@@ -531,17 +524,13 @@ pub(super) async fn apply_chat_compaction_patch_and_sync(
     // preflight; that trim is never persisted.
     // The one conversion: the acknowledged canonical history projected with
     // the summary's refresh aside and the enriched request.
-    let acked_canonical = crate::agent::turn_history::CanonicalHistory::from_acknowledged(
+    let acked_canonical = super::session_store::canonical_history_of_acked(
+        &acked,
         compacted
             .messages()
             .first()
             .filter(|message| message.role == "system")
             .map(|message| message.content.as_str()),
-        acked
-            .session
-            .turns
-            .iter()
-            .map(|turn| (turn.role.as_str(), turn.content.as_str())),
     );
     let plain_request = source_history
         .messages()

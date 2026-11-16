@@ -1763,6 +1763,374 @@ fn consecutive_summary_compactions_after_an_outer_rollover_are_all_accepted() {
     );
 }
 
+/// PR #207 review r10. Non-TUI only: the inline turn records its request at
+/// admission, so an adopted outer preflight saves a snapshot that already
+/// holds it. The TUI build runs every turn on a detached provider worker,
+/// which records the request only at its commit (and, in this scenario, its
+/// overflow recovery writes no summary), so the case does not arise there.
+#[cfg(not(feature = "terminal-tui"))]
+mod hot_request {
+    use super::*;
+
+    /// The marker of the request that an outer preflight and then an in-turn
+    /// compaction both keep in their hot tail (PR #207 review r10).
+    const HOT_REQUEST_MARKER: &str = "HOT-REQUEST-R10";
+    /// The reply of the hot request once the provider answers it.
+    const HOT_REPLY: &str = "HOT-REQUEST-ANSWERED";
+    /// Ordinary turns before the hot request.
+    const HOT_PRIOR_TURNS: usize = 2;
+    /// Bytes of each earlier line (about 1,900 tokens; its `[Current session
+    /// context]` quote in a later request is cut to 3 KiB).
+    const HOT_PRIOR_BYTES: usize = 6_000;
+    /// Bytes of the hot request (about 4,500 tokens).
+    const HOT_REQUEST_BYTES: usize = 14_000;
+    /// The window of the hot-request cases, in tokens: about 9,600 for history
+    /// after the response and tool reserves. Sized so that the earlier turns
+    /// never compact (about 5,900 tokens at the second), the hot request crosses
+    /// the hard limit at its admission (about 11,300) so its outer preflight
+    /// summarizes, the summarized view fits (about 7,600, the earlier lines left
+    /// only as session-context quotes), and the next turn fits with the request
+    /// once (about 8,600), so it compacts nothing.
+    const HOT_WINDOW_TOKENS: usize = 12_000;
+    /// The provider's refusal that makes the in-turn recovery compact.
+    const OVERFLOW_REFUSAL: &str = "This model's maximum context length is 8192 tokens (context_length_exceeded)";
+
+    /// `bytes` bytes of prose opening with `label`.
+    fn labelled_prose(label: &str, bytes: usize) -> String {
+        let line = format!("{label} lorem ipsum dolor sit amet consectetur adipiscing elit. ");
+        let body = line.repeat(bytes / line.len() + 1);
+        body[..bytes].trim_end().to_owned()
+    }
+
+    /// How the hot request's turn ends after its in-turn compaction.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum HotRequestEnd {
+        Answered,
+        Failed,
+        Cancelled,
+    }
+
+    /// Numbered summaries; the first call of the hot request is refused as a
+    /// context overflow (`overflowed` is set), every later call of it gets
+    /// `after_recovery` (`after_recovery_served` counts them); everything else
+    /// is answered `NOTED`.
+    fn script_hot_request(
+        after_recovery: Scripted,
+        overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        after_recovery_served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Script {
+        let mut summaries = 0usize;
+        Box::new(move |_, request| {
+            if is_summarizer_request(request) {
+                summaries += 1;
+                return Scripted::text(&format!(
+                    "## Decisions\n{SUMMARY_PREFIX}{summaries}\n## Progress\nearlier lines noted\n## Pending\nnone"
+                ));
+            }
+            if is_memory_flush_request(request) {
+                return Scripted::text(compaction_script::NOTED);
+            }
+            let newest = newest_user_message_text(request);
+            // The next turn's request quotes the hot request in its session
+            // context; it is routed by the line it ends with.
+            if !newest.ends_with(ORDINARY) && newest.contains(HOT_REQUEST_MARKER) {
+                if !overflowed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return Scripted::Error {
+                        status: 400,
+                        message: OVERFLOW_REFUSAL.to_owned(),
+                    };
+                }
+                after_recovery_served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return after_recovery.clone();
+            }
+            Scripted::text(compaction_script::NOTED)
+        })
+    }
+
+    /// The text of the newest user message of `request`.
+    fn newest_user_message_text(request: &serde_json::Value) -> String {
+        request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().rev().find(|message| message["role"] == "user"))
+            .map(|message| message_text(message).trim_end().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Each message of `request` as its role and the first and last bytes of
+    /// its text, for failure messages.
+    fn message_outline(request: &serde_json::Value) -> String {
+        const EDGE_CHARS: usize = 48;
+        request["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| {
+                        let text = message_text(message);
+                        let chars: Vec<char> = text.chars().collect();
+                        let head: String = chars.iter().take(EDGE_CHARS).collect();
+                        let tail: String = chars.iter().skip(chars.len().saturating_sub(EDGE_CHARS)).collect();
+                        format!("{}[{}]: {head} ... {tail}", message["role"], chars.len())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A main call of the hot request's turn (not a summary, not the next turn).
+    fn is_hot_call(request: &serde_json::Value) -> bool {
+        let newest = newest_user_message_text(request);
+        !is_summarizer_request(request)
+            && !is_memory_flush_request(request)
+            && !newest.ends_with(ORDINARY)
+            && newest.contains(HOT_REQUEST_MARKER)
+    }
+
+    /// The system prompt of the memory flush a compaction writes first.
+    const MEMORY_FLUSH_PROMPT: &str = "memory flush notes before context compaction";
+
+    /// Whether `request` is the memory flush call before a compaction.
+    fn is_memory_flush_request(request: &serde_json::Value) -> bool {
+        request["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "system" && message_text(message).contains(MEMORY_FLUSH_PROMPT))
+        })
+    }
+
+    /// The user messages of `request` that are the hot request `line` (the
+    /// provider form may prefix it with enrichment, never append to it).
+    fn hot_request_copies(request: &serde_json::Value, line: &str) -> usize {
+        request["messages"].as_array().map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "user" && message_text(message).trim_end().ends_with(line))
+                .count()
+        })
+    }
+
+    /// PR #207 review r10: the admitted request keeps its pending provenance
+    /// across an adopted outer preflight. The request is admitted over the
+    /// window, so the preflight summarizes the earlier turns and the saved
+    /// session holds the request; the provider then refuses the first call as an
+    /// overflow, and the in-turn recovery summarizes again while the request is
+    /// still in its hot tail. Through real HTTP/SSE and real SQLite, the request
+    /// is saved and resent once after an answer, and not at all after a failure
+    /// or a cancellation.
+    fn hot_request_through_two_compactions(end: HotRequestEnd) {
+        let sandbox = Sandbox::new();
+        let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let after_recovery_served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let after_recovery = match end {
+            HotRequestEnd::Answered => Scripted::text(HOT_REPLY),
+            HotRequestEnd::Failed => Scripted::Error {
+                status: 400,
+                message: "scripted refusal of this request".to_owned(),
+            },
+            HotRequestEnd::Cancelled => Scripted::Stall,
+        };
+        let server = LoopbackOpenAi::start(
+            MODEL,
+            Some((11, 7)),
+            script_hot_request(
+                after_recovery,
+                std::sync::Arc::clone(&overflowed),
+                std::sync::Arc::clone(&after_recovery_served),
+            ),
+        );
+        set_window_and_mode(
+            &sandbox,
+            &server,
+            HOT_WINDOW_TOKENS,
+            openprx::config::schema::AgentCompactionMode::Safeguard,
+        );
+        let mut command = sandbox.command(&["chat", "--plain"]);
+        command.env("RUST_LOG", "warn");
+        let mut chat = HeldChat {
+            sandbox: &sandbox,
+            running: Running::spawn(command),
+        };
+        for index in 0..HOT_PRIOR_TURNS {
+            chat.turn(&labelled_prose(&format!("PRIOR-{index}"), HOT_PRIOR_BYTES), index + 1);
+        }
+        let requests_before_hot = server.requests().len();
+        let hot = labelled_prose(HOT_REQUEST_MARKER, HOT_REQUEST_BYTES);
+        let mut replies = HOT_PRIOR_TURNS;
+        if end == HotRequestEnd::Answered {
+            replies += 1;
+            chat.turn(&hot, replies);
+        } else {
+            chat.command(&hot);
+            let started = Instant::now();
+            while after_recovery_served.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    started.elapsed() < TURN_DEADLINE,
+                    "the hot request's call after the recovery was not sent within TURN_DEADLINE"
+                );
+                std::thread::sleep(POLL);
+            }
+        }
+        if end == HotRequestEnd::Cancelled {
+            chat.interrupt();
+            let started = Instant::now();
+            while server.stalls_closed_by_client() == 0 {
+                assert!(
+                    started.elapsed() < CANCEL_DEADLINE,
+                    "the cancelled call's connection was not closed within CANCEL_DEADLINE"
+                );
+                std::thread::sleep(POLL);
+            }
+        }
+        replies += 1;
+        chat.command(ORDINARY);
+        let started = Instant::now();
+        while assistant_reply_count(&sandbox.workspace) < replies {
+            if started.elapsed() >= TURN_DEADLINE {
+                let output = chat.exit();
+                let outlines: Vec<String> = server.requests().iter().map(message_outline).collect();
+                panic!(
+                    "the turn after the hot request ({end:?}) did not reply within TURN_DEADLINE\nrequests: {outlines:#?}\nstdout: {}\nstderr: {}",
+                    output.stdout, output.stderr
+                );
+            }
+            std::thread::sleep(POLL);
+        }
+        let saved = wait_for_saved_ordinary_turn(&sandbox);
+        let output = chat.exit();
+
+        assert!(
+            !output.stderr.contains("panicked"),
+            "no panic on stderr: {}",
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("history commit") && !output.stderr.contains("history commit"),
+            "no unconfirmed history commit; stdout: {}\nstderr: {}",
+            output.stdout,
+            output.stderr
+        );
+        if end != HotRequestEnd::Failed {
+            assert_clean(
+                &output,
+                "a hot request through an outer preflight and an in-turn compaction",
+            );
+        }
+        let refused = refused_patch_lines(&sandbox, &output.stderr);
+        assert!(
+            refused.is_empty(),
+            "no compaction patch was refused or mismatched its guard: {refused:?}"
+        );
+
+        // Both compactions ran in the hot request's turn and kept it hot.
+        assert!(
+            overflowed.load(std::sync::atomic::Ordering::SeqCst),
+            "the provider refused the hot request's first call as an overflow"
+        );
+        let requests = server.requests();
+        let next_call = requests
+            .iter()
+            .position(|request| {
+                !is_summarizer_request(request)
+                    && !is_memory_flush_request(request)
+                    && newest_user_message_text(request).ends_with(ORDINARY)
+            })
+            .expect("test: the turn after the hot request reached the provider");
+        let first_hot_call = requests
+            .iter()
+            .enumerate()
+            .skip(requests_before_hot)
+            .find(|(_, request)| is_hot_call(request))
+            .map(|(index, _)| index)
+            .expect("test: the hot request reached the provider");
+        let last_hot_call = requests
+            .iter()
+            .rposition(is_hot_call)
+            .expect("test: the hot request reached the provider");
+        // The summaries of the hot request's own turn: its outer preflight and
+        // its in-turn recovery, all before its last call.
+        let turn_summaries: Vec<usize> = requests
+            .iter()
+            .enumerate()
+            .take(last_hot_call)
+            .skip(requests_before_hot)
+            .filter(|(_, request)| is_summarizer_request(request))
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            turn_summaries.iter().any(|index| *index < first_hot_call),
+            "the outer preflight summarized before the hot request's first call; summaries at {turn_summaries:?}, first call at {first_hot_call}; turn requests: {:#?}",
+            requests[requests_before_hot..]
+                .iter()
+                .map(message_outline)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            turn_summaries.iter().any(|index| *index > first_hot_call),
+            "the in-turn recovery summarized after the refused call; summaries at {turn_summaries:?}, first call at {first_hot_call}"
+        );
+        for index in &turn_summaries {
+            assert!(
+                !requests[*index].to_string().contains(HOT_REQUEST_MARKER),
+                "summary request {index} folded the hot request; it must stay in the hot tail: {}",
+                message_outline(&requests[*index])
+            );
+        }
+        let summaries_through_the_turn = requests[..next_call]
+            .iter()
+            .filter(|request| is_summarizer_request(request))
+            .count();
+        let newest_summary = format!("{SUMMARY_PREFIX}{summaries_through_the_turn}");
+        assert!(
+            saved.iter().any(|(_, content)| content.contains(&newest_summary)),
+            "the saved session adopted the in-turn summary `{newest_summary}`: {saved:?}"
+        );
+
+        // Request multiplicity in SQLite and in the next provider request.
+        let expected_copies = usize::from(end == HotRequestEnd::Answered);
+        let saved_copies = saved
+            .iter()
+            .filter(|(role, content)| role == "user" && content.contains(HOT_REQUEST_MARKER))
+            .count();
+        assert_eq!(
+            saved_copies, expected_copies,
+            "the saved session holds the hot request {expected_copies} time(s) ({end:?}): {saved:?}"
+        );
+        if end == HotRequestEnd::Answered {
+            assert_eq!(
+                saved
+                    .iter()
+                    .filter(|(role, content)| role == "assistant" && content.contains(HOT_REPLY))
+                    .count(),
+                1,
+                "the saved session holds the hot request's answer once: {saved:?}"
+            );
+        }
+        let next_request = &requests[next_call];
+        assert_eq!(
+            hot_request_copies(next_request, &hot),
+            expected_copies,
+            "the next provider request carries the hot request {expected_copies} time(s) ({end:?}): {}",
+            next_request["messages"]
+        );
+    }
+
+    #[test]
+    fn a_hot_request_after_an_adopted_preflight_is_saved_and_resent_once() {
+        hot_request_through_two_compactions(HotRequestEnd::Answered);
+    }
+
+    #[test]
+    fn a_failed_hot_request_after_an_adopted_preflight_leaves_no_copy() {
+        hot_request_through_two_compactions(HotRequestEnd::Failed);
+    }
+
+    #[test]
+    fn a_cancelled_hot_request_after_an_adopted_preflight_leaves_no_copy() {
+        hot_request_through_two_compactions(HotRequestEnd::Cancelled);
+    }
+}
+
 /// The question whose committed answer reads like a native tool-call envelope.
 const JSON_QUESTION: &str = "JSON-ANSWER reply with the example envelope";
 /// An ordinary final answer that reads like a tool-call envelope: it names no

@@ -841,6 +841,39 @@ fn a_failed_request_never_removes_an_earlier_committed_request_with_the_same_tex
     }
 }
 
+/// PR #207 review r10: a snapshot saved while an admission is open names
+/// that admission's request by its recorded position; a settled admission
+/// publishes none.
+#[test]
+fn a_snapshot_during_an_open_admission_names_its_request_by_position() {
+    let mut state = s();
+    let _ = state.reduce(Action::RecordUserTurn("Q".to_string()));
+    let admission = crate::chat::action::AdmissionId::next();
+    let _ = state.reduce(Action::UserTurnAdmitted {
+        admission,
+        content: "Q".to_string(),
+    });
+
+    assert_eq!(
+        state.acked_session_seed().open_request,
+        Some(crate::chat::acked_session::OpenRequest { admission, turn: 1 }),
+        "the open admission's request is the trailing turn, not the earlier one with the same text"
+    );
+
+    let settled = state.reduce(Action::TurnAbortSettled {
+        admission: Some(admission),
+    });
+    let saved_open_request = settled.iter().find_map(|effect| match effect {
+        Effect::SaveSession(commit) => Some(commit.open_request),
+        _ => None,
+    });
+    assert_eq!(
+        saved_open_request,
+        Some(None),
+        "the settlement saves a snapshot without an open request"
+    );
+}
+
 /// Step3-8b: StreamCancelled / StreamFailed / StreamCompleted with a mismatched draft_id → no-op
 #[test]
 fn test_redux_stream_terminal_actions_wrong_id_noop() {
