@@ -294,6 +294,53 @@ pub(super) fn dispatch_child_bottom_switch(
     })
 }
 
+/// What a key may reveal in a log. No variant can hold a character: a
+/// character key is `Char`, a modifier key is `Modifier`, and a named key
+/// (Enter, Esc, arrows, F-keys) is its static name, which is not content.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum KeyLogClass {
+    Char,
+    Modifier,
+    Named(&'static str),
+}
+
+impl KeyLogClass {
+    /// The loggable text of the class: `char`, `modifier`, or a named key's name.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Char => "char",
+            Self::Modifier => "modifier",
+            Self::Named(name) => name,
+        }
+    }
+}
+
+/// The loggable class of a key: the only way a key reaches a log line.
+#[must_use]
+pub(crate) const fn key_log_class(code: KeyCode) -> KeyLogClass {
+    match code {
+        KeyCode::Char(_) => KeyLogClass::Char,
+        KeyCode::Modifier(_) => KeyLogClass::Modifier,
+        KeyCode::F(_) => KeyLogClass::Named("F"),
+        KeyCode::Enter => KeyLogClass::Named("Enter"),
+        KeyCode::Esc => KeyLogClass::Named("Esc"),
+        KeyCode::Tab => KeyLogClass::Named("Tab"),
+        KeyCode::BackTab => KeyLogClass::Named("BackTab"),
+        KeyCode::Backspace => KeyLogClass::Named("Backspace"),
+        KeyCode::Delete => KeyLogClass::Named("Delete"),
+        KeyCode::Insert => KeyLogClass::Named("Insert"),
+        KeyCode::Left => KeyLogClass::Named("Left"),
+        KeyCode::Right => KeyLogClass::Named("Right"),
+        KeyCode::Up => KeyLogClass::Named("Up"),
+        KeyCode::Down => KeyLogClass::Named("Down"),
+        KeyCode::Home => KeyLogClass::Named("Home"),
+        KeyCode::End => KeyLogClass::Named("End"),
+        KeyCode::PageUp => KeyLogClass::Named("PageUp"),
+        KeyCode::PageDown => KeyLogClass::Named("PageDown"),
+        _ => KeyLogClass::Named("other"),
+    }
+}
+
 /// Resolve a [`KeyEvent`] against the global shortcut table layered above the
 /// input box. See [`KeyDispatch`] for the priority order. The function is
 /// pure: it consumes a mutable reference to [`TuiState`] only to forward the
@@ -301,30 +348,15 @@ pub(super) fn dispatch_child_bottom_switch(
 ///
 /// Pure on its own, no I/O — kept here so unit tests can exercise the binding
 /// table without touching crossterm / ratatui terminals.
-/// The loggable class of a key: `char` keys never log which character was
-/// typed, `modifier` keys only their class; named keys (Enter, Esc, arrows,
-/// F-keys) are not content and are returned for the log.
-#[must_use]
-pub(crate) const fn key_log_class(code: &KeyCode) -> (&'static str, Option<&KeyCode>) {
-    match code {
-        KeyCode::Char(_) => ("char", None),
-        KeyCode::Modifier(_) => ("modifier", None),
-        named => ("named", Some(named)),
-    }
-}
-
 pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // [DIAG] trace every key that enters the dispatch function so we can
     // correlate raw events (tui_input_event) with what the handler sees.
-    let (key_class, named_key) = key_log_class(&key.code);
-    let key_class: &'static str = key_class;
-    let named_key: Option<&KeyCode> = named_key;
+    let key_class = key_log_class(key.code);
     let modifiers: KeyModifiers = key.modifiers;
     let kind: crossterm::event::KeyEventKind = key.kind;
     let input_first_line_chars: usize = state.input.lines.first().map_or(0, |line| line.chars().count());
     tracing::debug!(
-        key_class,
-        named_key = ?named_key,
+        key_class = key_class.label(),
         modifiers = ?modifiers,
         kind = ?kind,
         input_lines_before = state.input.lines.len(),

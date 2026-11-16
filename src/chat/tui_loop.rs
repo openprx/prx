@@ -116,15 +116,12 @@ pub(super) fn should_log_tui_key_event(key: &crossterm::event::KeyEvent) -> bool
 pub(super) fn log_tui_input_event(ev: &crossterm::event::Event) {
     match ev {
         crossterm::event::Event::Key(k) if should_log_tui_key_event(k) => {
-            let (key_class, named_key) = crate::chat::tui::key_log_class(&k.code);
-            let key_class: &'static str = key_class;
-            let named_key: Option<&crossterm::event::KeyCode> = named_key;
+            let key_class = crate::chat::tui::key_log_class(k.code);
             let modifiers: crossterm::event::KeyModifiers = k.modifiers;
             let kind: crossterm::event::KeyEventKind = k.kind;
             tracing::info!(
                 event_type = "Key",
-                key_class,
-                named_key = ?named_key,
+                key_class = key_class.label(),
                 modifiers = ?modifiers,
                 kind = ?kind,
                 "tui_input_event"

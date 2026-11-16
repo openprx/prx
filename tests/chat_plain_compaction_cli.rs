@@ -1680,14 +1680,21 @@ fn script_numbered_summaries() -> Script {
 const CHAT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Lines of stderr and `chat.log` that record a refused compaction patch.
+/// `chat.log` is read up to [`CHAT_LOG_MAX_BYTES`] plus one byte; more than
+/// the limit fails the test, so no refusal beyond a prefix goes unseen.
 fn refused_patch_lines(sandbox: &Sandbox, stderr: &str) -> Vec<String> {
     use std::io::Read as _;
-    let mut chat_log = String::new();
+    let mut chat_log_bytes = Vec::new();
     if let Ok(file) = std::fs::File::open(sandbox.config_dir.join("chat.log")) {
-        file.take(CHAT_LOG_MAX_BYTES)
-            .read_to_string(&mut chat_log)
+        file.take(CHAT_LOG_MAX_BYTES + 1)
+            .read_to_end(&mut chat_log_bytes)
             .expect("test: read chat.log");
     }
+    assert!(
+        u64::try_from(chat_log_bytes.len()).is_ok_and(|len| len <= CHAT_LOG_MAX_BYTES),
+        "chat.log exceeds CHAT_LOG_MAX_BYTES ({CHAT_LOG_MAX_BYTES} bytes); refused patches past the cap would be unseen"
+    );
+    let chat_log = String::from_utf8_lossy(&chat_log_bytes);
     stderr
         .lines()
         .chain(chat_log.lines())

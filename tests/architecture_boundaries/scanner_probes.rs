@@ -476,6 +476,12 @@ planted_violation_probes! {
     probe_payload_free_logs_kind_named_text: log_lines_carry_only_typed_metadata,
         "src/chat/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
         "pub fn d0_planted_log(tool_kind: &str) {\n    tracing::warn!(tool_kind, \"failed\");\n}\n";
+    probe_payload_free_logs_char: log_lines_carry_only_typed_metadata,
+        "src/chat/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_log(typed: char) {\n    tracing::warn!(typed = %typed, \"failed\");\n}\n";
+    probe_payload_free_logs_key_code: log_lines_carry_only_typed_metadata,
+        "src/chat/d0_planted_probe.rs", Planted::NewFile, Reads::ProductionText,
+        "pub fn d0_planted_log(key: &KeyEvent) {\n    let named_key: Option<&KeyCode> = Some(&key.code);\n    tracing::warn!(named_key = ?named_key, \"failed\");\n}\n";
     probe_raw_label_log_field: provider_labels_never_reach_a_log_field_raw,
         "src/providers/context_window.rs", Planted::AppendedTo, Reads::ProductionText,
         "pub fn d0_planted_label(provider: &str) {\n    tracing::warn!(provider, \"planted\");\n}\n";

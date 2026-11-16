@@ -21,8 +21,8 @@
 //! - a value whose declared type is typed ([`TypeIndex`] reads every
 //!   production struct field, method and function return type, constant,
 //!   fieldless enum and struct of typed fields in `src/`): a scalar
-//!   ([`SCALAR_TYPES`]), a reviewed type ([`REVIEWED_TYPES`],
-//!   [`REVIEWED_EXACT_TYPES`]), a typed-by-construction type, or a reference,
+//!   ([`SCALAR_TYPES`], which has no `char`: a character is text), a reviewed
+//!   type ([`REVIEWED_TYPES`]), a typed-by-construction type, or a reference,
 //!   `Option` or tuple of them. An identifier's type comes from its binding
 //!   in scope: a parameter or `let` annotation, a typed initializer, a
 //!   destructured digest helper ([`DIGEST_HELPERS`]), a struct or annotated
@@ -115,7 +115,6 @@ const PLAIN_LABEL_CONSTRUCTORS: &[(&str, &str)] = &[
 /// Scalar types: a number, a flag, a duration or a compile-time label.
 const SCALAR_TYPES: &[&str] = &[
     "bool",
-    "char",
     "u8",
     "u16",
     "u32",
@@ -155,17 +154,9 @@ const REVIEWED_TYPES: &[(&str, &str)] = &[
     ("KeyModifiers", "crossterm modifier bitflags"),
     ("KeyEventKind", "crossterm press, repeat or release"),
     ("Level", "a tracing level"),
-];
-
-/// Exact types reviewed in one spelling, with the reason.
-const REVIEWED_EXACT_TYPES: &[(&str, &str)] = &[
     (
-        "Option<&KeyCode>",
-        "a named key only: key_log_class maps every character key to None",
-    ),
-    (
-        "Option<&crossterm::event::KeyCode>",
-        "a named key only: key_log_class maps every character key to None",
+        "KeyLogClass",
+        "a key's loggable class (chat::tui::keys): `Char` and `Modifier` carry no payload and the named variant holds only a static name",
     ),
 ];
 
@@ -637,12 +628,6 @@ impl TypeIndex {
         let declared = normalized_str(raw);
         let declared = declared.trim();
         if declared == "&'static str" || declared == "()" {
-            return true;
-        }
-        if REVIEWED_EXACT_TYPES
-            .iter()
-            .any(|(exact, _)| normalized_str(exact) == declared)
-        {
             return true;
         }
         if let Some(rest) = declared.strip_prefix('&') {
@@ -1731,5 +1716,32 @@ fn k(scheduler: &TurnScheduler, id: u64) {
             "src/chat/x.rs::k `input = %task.input`".to_string(),
         ],
         "each free-form form must be reported once, and no typed form may be"
+    );
+}
+
+/// A `char` is text, and a `KeyCode` can hold one: neither is logged. A named
+/// key reaches a log only as the `KeyLogClass` that `key_log_class` returns.
+#[test]
+fn character_and_key_code_forms_are_judged_by_their_declared_types() {
+    let source = r#"impl KeyLogClass { pub(crate) const fn label(self) -> &'static str { "char" } }
+pub(crate) fn key_log_class(code: KeyCode) -> KeyLogClass { KeyLogClass::Char }
+fn keys(key: &KeyEvent, typed: char) {
+    let key_class = key_log_class(key.code);
+    tracing::debug!(key_class = key_class.label(), "accepted");
+    tracing::warn!(typed = %typed, "rejected");
+    let named_key: Option<&KeyCode> = Some(&key.code);
+    tracing::warn!(named_key = ?named_key, "rejected");
+}
+"#;
+    let masked = strip_cfg_test_items(&blank_comments_and_literals(source));
+    let index = TypeIndex::of_masked_sources([masked.as_str()]);
+    let found = payload_capable_log_arguments("src/chat/x.rs", source, &index);
+    assert_eq!(
+        found,
+        vec![
+            "src/chat/x.rs::keys `typed = %typed`".to_string(),
+            "src/chat/x.rs::keys `named_key = ?named_key`".to_string(),
+        ],
+        "a char and a KeyCode must be reported, and a KeyLogClass must not"
     );
 }
